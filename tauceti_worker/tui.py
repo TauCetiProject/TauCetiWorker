@@ -9,7 +9,16 @@ import sys
 from pathlib import Path
 
 from .agents import _shq
-from .config import Config, _only_label, _skip_label, extra_roadmap_prompt, roadmap_areas, roadmap_only, roadmap_skip
+from .config import (
+    Config,
+    _only_label,
+    _skip_label,
+    extra_roadmap_prompt,
+    roadmap_areas,
+    roadmap_only,
+    roadmap_skip,
+    roadmap_targets,
+)
 from .constants import ALLOWED_TASKS, KIND_BY_NAME, KIND_KEYS, TAUCETI
 from .github import GitHub
 from .paths import entry_cmd
@@ -182,12 +191,14 @@ def launch_cmd(
     roadmap_skip: str | None = None,
     github_account: str | None = None,
     extra_roadmap_prompt: str | None = None,
+    roadmap_targets: Path | None = None,
 ) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
     `roadmap_only`/`roadmap_skip` (the raw env values for the current roadmap dials) are embedded as
     --roadmap-only/--roadmap-skip so the copied/logged command reproduces what [o]/[x] set instead of
     silently reverting to the shell default. They are passed through verbatim (an explicit empty string
-    is meaningful and overrides an inherited env var), and only omitted when unset (None)."""
+    is meaningful and overrides an inherited env var), and only omitted when unset (None). A target
+    list is embedded as an absolute path, since the command may be pasted elsewhere."""
     cmd = entry_cmd() + ["work"]
     account = github_account if github_account is not None else os.environ.get("TAUCETI_GITHUB_ACCOUNT")
     if account is not None:
@@ -208,6 +219,8 @@ def launch_cmd(
         cmd.append(f"--extra-roadmap-prompt={extra_roadmap_prompt}")  # one argument: the text may start with `-`
     if (branches := os.environ.get("TAUCETI_OWN_BRANCHES")) is not None:
         cmd.append(f"--own-branches={branches}")
+    if roadmap_targets is not None:
+        cmd += ["--roadmap-targets", str(Path(roadmap_targets).expanduser().resolve())]
     return cmd
 
 
@@ -826,13 +839,27 @@ def _dashboard_app(cfg, loader=None):
             one = " ".join(
                 _shq(a)
                 for a in launch_cmd(
-                    None, self.model_dial, self.bubble, False, roadmap_only(), skip, extra_roadmap_prompt=guidance
+                    None,
+                    self.model_dial,
+                    self.bubble,
+                    False,
+                    roadmap_only(),
+                    skip,
+                    extra_roadmap_prompt=guidance,
+                    roadmap_targets=roadmap_targets(),
                 )
             )
             loop = " ".join(
                 _shq(a)
                 for a in launch_cmd(
-                    None, self.model_dial, self.bubble, True, roadmap_only(), skip, extra_roadmap_prompt=guidance
+                    None,
+                    self.model_dial,
+                    self.bubble,
+                    True,
+                    roadmap_only(),
+                    skip,
+                    extra_roadmap_prompt=guidance,
+                    roadmap_targets=roadmap_targets(),
                 )
             )
             copied = True
@@ -861,6 +888,7 @@ def _dashboard_app(cfg, loader=None):
                         github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
                         extra_roadmap_prompt=guidance,
                         own_branches=os.environ.get("TAUCETI_OWN_BRANCHES"),
+                        roadmap_targets=str(targets) if (targets := roadmap_targets()) is not None else None,
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",

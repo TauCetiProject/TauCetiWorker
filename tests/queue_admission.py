@@ -891,6 +891,47 @@ class AdmissionTests(unittest.TestCase):
         self.assertLess(reads.index(1), reads.index(4), "new revocations must not wait for the old pass list")
         self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
 
+    def test_an_emergency_request_is_evaluated_again_ahead_of_every_urgent_backlog(self):
+        for number in (1, 2, 3, 4):
+            self.ready(number)
+        self.intake.run_once()
+        self.assertEqual(sorted(row["number"] for row in self.controller.inputs()), [1, 2, 3, 4])
+        # A canonical advance makes every PR urgent at once.
+        for number in (1, 2, 3, 4):
+            self.intake.invalidate(number)
+        current = self.intake.state.get(3)
+        self.controller.set_setting("emergency_enabled", True, "t")
+        request = self.controller.request_emergency(REPO, 3, "kim-em", surface="test")
+        self.assertTrue(request["accepted"], request)
+        work = self.intake.state.get(3)
+        self.assertGreater(work["generation"], current["generation"], "the request itself is fresh work")
+        self.assertEqual(work["head_sha"], self.github.prs[3]["head_sha"])
+        for kwargs in ({"prefer_urgent": True}, {"prefer_urgent": False}, {"urgent_only": True}):
+            self.assertEqual(self.intake.state.next_due(**kwargs)["number"], 3, kwargs)
+        reads = []
+        original = self.github.admission_snapshot
+
+        def observe(repo, number, **kwargs):
+            reads.append(number)
+            return original(repo, number, **kwargs)
+
+        self.github.admission_snapshot = observe
+        self.intake.run_once()
+        self.assertEqual(reads[0], 3)
+        self.assertTrue(self.intake.is_current(3, self.github.prs[3]["head_sha"]))
+
+    def test_an_already_current_emergency_request_still_gets_a_fresh_evaluation(self):
+        head = self.ready(1)
+        self.intake.run_once()
+        self.assertTrue(self.intake.is_current(1, head))
+        self.controller.set_setting("emergency_enabled", True, "t")
+        self.assertTrue(self.controller.request_emergency(REPO, 1, "kim-em", surface="test")["accepted"])
+        self.assertFalse(self.intake.is_current(1, head))
+        before = len(self.controller.store.journal_entries("admission-evaluated"))
+        self.intake.run_once()
+        self.assertEqual(len(self.controller.store.journal_entries("admission-evaluated")), before + 1)
+        self.assertTrue(self.intake.is_current(1, head))
+
     def test_pending_review_change_cannot_be_inserted_while_its_read_is_quota_blocked(self):
         self.ready()
         self.intake.run_once()

@@ -65,6 +65,35 @@ class AdmissionStateTests(unittest.TestCase):
         self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 3)
         self.assertEqual(self.state.next_due(prefer_urgent=False)["number"], 1)
 
+    def test_a_pending_emergency_request_comes_before_every_other_selection(self):
+        from tauceti_queue.controller import URGENT_EMERGENCY
+        from tauceti_queue.store import dumps
+
+        self.assertEqual(URGENT_EMERGENCY, 2)
+        for number in (1, 2, 3):
+            self.state.dirty(number, urgent=True)
+            self.now += 1
+        self.state.observe(4, "head", "v1")  # neither urgent nor first in line
+        flagged = {"emergency": {"actor": "admin", "requested_at": self.now}}
+        common = {"repository": "o/r", "number": 4, "head_sha": "head", "approved_at": self.now}
+        self.store.insert("inputs", **common, state="cancelled", urgent=2, evidence=dumps(flagged))
+        self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 1, "a terminal input asks nothing")
+        native = self.store.insert(
+            "inputs", **common, state="waiting", urgent=2, evidence=dumps(flagged), source_identity='{"x":1}'
+        )
+        self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 1, "another source's PR 4")
+        native_state = AdmissionState(self.store, "o/r", clock=lambda: self.now, inputs=("o/r", '{"x":1}'))
+        self.assertEqual(native_state.next_due(prefer_urgent=False)["number"], 4)
+        self.store.update("inputs", {"id": native}, source_identity="other")
+        self.store.insert("inputs", **common, state="waiting", urgent=2, evidence=dumps({}))
+        self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 1, "urgent=2 alone is not a request")
+        self.store.insert("inputs", **common, state="reserved", urgent=2, evidence=dumps(flagged))
+        for kwargs in ({"prefer_urgent": True}, {"prefer_urgent": False}, {"urgent_only": True}):
+            self.assertEqual(self.state.next_due(**kwargs)["number"], 4, kwargs)
+        self.assertEqual([row["number"] for row in self.state.due()], [4, 1, 2, 3])
+        self.state.complete(self.state.get(4), "v1", "review4", "already-approved")
+        self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 1)
+
     def test_paced_evaluation_keeps_fifo_place_until_complete(self):
         for number in range(1, 4):
             self.state.observe(number, "head", "v1")

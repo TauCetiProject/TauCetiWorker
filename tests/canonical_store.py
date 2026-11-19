@@ -772,6 +772,108 @@ class Canonical(unittest.TestCase):
         self.assertTrue(held.exists() and later.exists())
         self.assertEqual(report["published_local"], len(found) - 2)
 
+    def test_a_reused_descriptor_never_charges_its_flags_to_another_file(self):
+        # A fake /proc/<pid> whose fd 7 is a symlink, like the real one; `_pin` follows it.
+        process = self.root / "proc"
+        (process / "fd").mkdir(parents=True)
+        (process / "fdinfo").mkdir()
+        output = self.root / "A.olean"
+        output.write_bytes(b"read-only output")
+        (process / "fd/7").symlink_to(output)
+        dev, ino = output.stat().st_dev, output.stat().st_ino
+        with open(output, "rb") as stream:
+            mount = canonical._fdinfo("/proc/self", str(stream.fileno()))["mnt_id"]
+        scan = SimpleNamespace(inodes=True, internal={"14"})
+
+        def fd(info):
+            (process / "fdinfo/7").write_text(info)
+            return canonical._descriptor(str(process), "7", scan)
+
+        def busy(found, key):
+            return canonical.Guard(writable=found).busy(SimpleNamespace(st_dev=key[0], st_ino=key[1]))
+
+        def pins(*observed):
+            # What fd 7 names at the pin before the fdinfo read and at the pin after it.
+            files = [
+                None
+                if o is None
+                else (o[0], o[1] and str(o[1]), SimpleNamespace(st_dev=o[2], st_ino=o[3], st_mode=stat.S_IFREG))
+                for o in observed
+            ]
+            return patch.object(canonical, "_pin", side_effect=files)
+
+        writable = "flags:\t0100002\nmnt_id:\t{}\nino:\t{}\n"
+        self.assertEqual(fd(f"flags:\t0100000\nmnt_id:\t{mount}\nino:\t{ino}\n"), set())  # Read-only.
+        self.assertEqual(fd(writable.format(mount, ino)), {(dev, ino), (None, ino)})
+        self.assertEqual(fd(writable.format("14", ino)), set())  # Pipes and sockets never count.
+        # The original false positive: read-only output O (inode 5) before the read, writable lock
+        # L (inode 6) at the read and after it. Only L is busy.
+        with pins((mount, 5, 10, 5), (mount, 6, 10, 6)):
+            found = fd(writable.format(mount, 6))
+        self.assertFalse(busy(found, (10, 5)))
+        self.assertTrue(busy(found, (10, 6)))
+        # Writable A before and at the read, then A moves to an already-scanned fd and B, sharing
+        # A's kernel inode in one overlayfs mount, takes this one: A stays busy.
+        with pins((mount, 42, 10, 42), (mount, 42, 20, 42)):
+            found = fd(writable.format(mount, 42))
+        self.assertTrue(busy(found, (10, 42)))
+        # NFS without 64-bit inode numbers: the kernel inode is not the reported `st_ino`, and the
+        # pin supplies the reported one.
+        kernel = (1 << 32) + 3
+        with pins((mount, kernel, 10, 3), None):
+            found = fd(writable.format(mount, kernel))
+        self.assertTrue(busy(found, (10, 3)))
+        # Out of descriptors: a pin is a plain stat of unknown identity, which still counts.
+        with pins((None, None, 10, 3), None):
+            found = fd(writable.format(mount, kernel))
+        self.assertTrue(busy(found, (10, 3)))
+        with pins((None, None, 10, 3)):
+            self.assertTrue(busy(fd("pos:\t0\n"), (10, 3)))
+        # Writable, then closed before either pin could see it: busy by inode.
+        with patch.object(canonical, "_pin", return_value=None):
+            self.assertEqual(fd(writable.format(mount, 6)), {(None, 6)})
+        self.assertEqual(fd("pos:\t0\n"), {(dev, ino)})  # Unreadable flags: the file pinned before.
+        (process / "fdinfo/7").unlink()  # Closed since listed.
+        self.assertEqual(canonical._descriptor(str(process), "7", scan), set())
+        # Kernels whose fdinfo names no inode judge each fd as main always did: stat first, and a
+        # file whose flags then cannot be read counts as writable.
+        scan.inodes = False
+        self.assertEqual(fd("flags:\t0100000\n"), set())
+        self.assertEqual(fd("flags:\t0100002\n"), {(dev, ino)})
+        (process / "fdinfo/7").unlink()
+        self.assertEqual(canonical._descriptor(str(process), "7", scan), {(dev, ino)})
+
+    def test_a_writer_handed_to_an_already_scanned_descriptor_stays_busy(self):
+        output = self.root / "A.olean"
+        output.write_bytes(b"being written")
+        writer = os.open(output, os.O_WRONLY)
+        spare = os.open(os.devnull, os.O_RDONLY)
+        self.addCleanup(os.close, spare)
+        scan = canonical._Scan()
+        fdinfo = canonical.Path.read_text
+
+        def hand_off(path, *args, **kwargs):
+            text = fdinfo(path, *args, **kwargs)
+            if path.name == str(writer):
+                os.dup2(writer, spare)  # The writer moves to a descriptor already scanned...
+                os.close(writer)  # ...and this one closes.
+            return text
+
+        with patch.object(canonical.Path, "read_text", hand_off):
+            found = canonical._descriptor(f"/proc/{os.getpid()}", str(writer), scan)
+        self.assertTrue(canonical.Guard(writable=set(found)).busy(output.stat()))
+
+    def test_the_live_scan_sees_our_writer_and_not_our_pipes(self):
+        output = self.root / "A.olean"
+        output.write_bytes(b"being written")
+        with open(output, "r+b"):
+            reader, writer = os.pipe()
+            self.addCleanup(os.close, reader)
+            self.addCleanup(os.close, writer)
+            found = canonical.open_for_writing()
+            self.assertTrue(canonical.Guard(writable=found).busy(output.stat()))
+        self.assertNotIn((None, os.fstat(writer).st_ino), found)
+
     def test_budget_and_host_slots_bound_relinking_and_it_resumes(self):
         modules = [f"TauCeti.M{i}" for i in range(4)]
         checkout = self.checkout("w", *modules)
@@ -1053,6 +1155,11 @@ class Canonical(unittest.TestCase):
         for path in (first, second):
             result = lake(path, "build", "Fx")
             self.assertEqual(result.returncode, 0, result.stdout)
+        try:
+            # Relinking defers every decision without the helper, so there is nothing to check.
+            cache.native(first, env, self.pool)
+        except (OSError, subprocess.SubprocessError) as error:
+            self.skipTest(f"Lake hash helper cannot be built with {toolchain}: {error}")
         self.assertTrue(list(first.rglob("*.setup.json")))
         self.assertNotEqual(
             (first / ".lake/build/lib/lean/Fx/A.olean").stat().st_ino,
