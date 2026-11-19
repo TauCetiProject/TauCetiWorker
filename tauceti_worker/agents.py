@@ -27,7 +27,7 @@ if TYPE_CHECKING:  # annotations only; importing at runtime would invert the lay
     from .work_units import RoundOpts, Worker
 
 from . import build_caches
-from .config import Config, Die, NoProgress, log
+from .config import Config, Die, NoProgress, log, warn_red
 from .constants import (
     AUTHORING_DEFAULTS,
     CLAUDE_CMD,
@@ -178,8 +178,8 @@ _CODEX_MODEL_ERROR_MESSAGE = re.compile(
 _CODEX_MODEL_ACCESS_PROMPT = "Reply with exactly OK. Do not use tools."
 
 
-def _codex_error_details(transcript: str) -> tuple[int | None, str | None]:
-    """Parse Codex JSONL's terminal HTTP status/message; never classify raw transcript text."""
+def _codex_error_details(transcript: str) -> tuple[int | None, str | None, str | None]:
+    """Parse Codex JSONL's terminal HTTP status/message/code; never classify raw transcript text."""
     failed_payload = error_payload = None
     for line in transcript.splitlines():
         line = line.strip()
@@ -201,38 +201,45 @@ def _codex_error_details(transcript: str) -> tuple[int | None, str | None]:
                 error_payload = event["message"]
 
     for payload in (failed_payload, error_payload):
-        if not isinstance(payload, str):
-            continue
-        try:
-            decoded = json.loads(payload)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(decoded, dict):
-            continue
-        error = decoded.get("error")
-        error = error if isinstance(error, dict) else {}
-        status = decoded.get("status", error.get("status"))
-        if isinstance(status, bool):
-            status = None
-        elif isinstance(status, str) and status.lstrip("-").isdigit():
-            status = int(status)
-        if not isinstance(status, int):
-            status = None
-        message = error.get("message") or decoded.get("message")
-        return status, message if isinstance(message, str) else None
-    return None, None
+        if details := _codex_payload_details(payload):
+            return details
+    return None, None, None
+
+
+def _codex_payload_details(payload) -> tuple[int | None, str | None, str | None] | None:
+    """Decode one Codex error payload into its HTTP status, message and error code."""
+    if not isinstance(payload, str):
+        return None
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    error = decoded.get("error")
+    error = error if isinstance(error, dict) else {}
+    status = decoded.get("status", error.get("status"))
+    if isinstance(status, bool):
+        status = None
+    elif isinstance(status, str) and status.lstrip("-").isdigit():
+        status = int(status)
+    if not isinstance(status, int):
+        status = None
+    message = error.get("message") or decoded.get("message")
+    code = error.get("code") or decoded.get("code")
+    return status, message if isinstance(message, str) else None, code if isinstance(code, str) else None
+
+
+def _codex_model_rejected(status: int | None, message: str | None, code: str | None) -> bool:
+    return bool(
+        status in _CODEX_MODEL_ERROR_STATUSES
+        and (code == "model_not_found" or isinstance(message, str) and _CODEX_MODEL_ERROR_MESSAGE.search(message))
+    )
 
 
 def _codex_model_unavailable(returncode: int, transcript: str) -> bool:
     """Only a structured client rejection naming model access confirms an entitlement miss."""
-    if returncode == 0:
-        return False
-    status, message = _codex_error_details(transcript)
-    return bool(
-        status in _CODEX_MODEL_ERROR_STATUSES
-        and isinstance(message, str)
-        and _CODEX_MODEL_ERROR_MESSAGE.search(message)
-    )
+    return returncode != 0 and _codex_model_rejected(*_codex_error_details(transcript))
 
 
 def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[str]:
@@ -273,7 +280,7 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
 
 
 def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -> NoProgress:
-    status, message = _codex_error_details(result.stdout or "")
+    status, message, _ = _codex_error_details(result.stdout or "")
     detail = message or (result.stderr or "").strip()[-1000:] or f"exit {result.returncode}"
     status_text = f"HTTP {status}: " if status is not None else ""
     return NoProgress(
@@ -328,22 +335,56 @@ def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> Author
             raise _codex_probe_failure(profile.model, first)
 
         if fp is not None:
-            cfg.quota_cache.mkdir(parents=True, exist_ok=True)
-            _write_json_atomic(
-                cache_path,
-                {
-                    "fetched_at": int(time.time()),
-                    "fp": fp,
-                    "primary_model": profile.model,
-                    "fallback_model": fallback,
-                    "available": available,
-                },
-            )
+            _record_codex_model_access(cfg, fp, profile, available)
 
     if available:
         return replace(profile, fallback_model=None)
     log(f"codex: {profile.model} is unavailable to this subscription; using {fallback}")
     return replace(profile, model=fallback, model_source="subscription fallback", fallback_model=None)
+
+
+def _record_codex_model_access(cfg: Config, fp: str, profile: AuthoringProfile, available: bool) -> None:
+    cfg.quota_cache.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(
+        cfg.quota_cache / "codex-model-access.json",
+        {
+            "fetched_at": int(time.time()),
+            "fp": fp,
+            "primary_model": profile.model,
+            "fallback_model": profile.fallback_model,
+            "available": available,
+        },
+    )
+
+
+def note_codex_round_rejection(cfg: Config, profile: AuthoringProfile, selected: AuthoringProfile) -> None:
+    """Cache a model miss that the authoring round itself hit, so the next round takes the fallback.
+
+    The probe runs the host's `codex`; a Bubble round runs the sandbox image's, which can reject a
+    model the host CLI accepts. ``profile`` is the unresolved default, ``selected`` what the round ran.
+    """
+    run = take_last_agent_run()
+    if not run or run.get("provider") != "codex" or not run.get("rc") or run.get("saw_work"):
+        return
+    details = _codex_payload_details(run.get("terminal_failure"))
+    if not details or not _codex_model_rejected(*details):
+        return
+    detail = details[1] or details[2] or f"HTTP {details[0]}"
+    if selected.model != profile.model:
+        warn_red(f"codex: the authoring round rejected the fallback model {selected.model} ({detail})")
+        return
+    fp = Quota(cfg).codex_account_fingerprint()
+    if fp is not None:
+        _record_codex_model_access(cfg, fp, profile, False)
+    warn_red(
+        f"codex: the authoring round rejected {profile.model} ({detail}) although the host model-access "
+        f"probe accepted it; the sandbox Codex CLI may be older than the host's. "
+        + (
+            f"Later rounds use {profile.fallback_model} until the cached result expires."
+            if fp is not None
+            else "No Codex account fingerprint, so the miss is not cached."
+        )
+    )
 
 
 def _kiro_model_ids(payload) -> set[str]:
@@ -507,14 +548,33 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
 
 
 def self_tested_guidance(policy: str) -> str:
-    from .worker_sources import repository_url
+    from .self_tested_label import enabled
+    from .worker_sources import current
 
-    if (
-        policy != "ordinary"
-        or os.environ.get("TAUCETI_SELF_TESTED", "0") != "1"
-        or repository_url().lower() != "https://github.com/taucetiproject/tauceti"
-    ):
+    if policy != "ordinary" or enabled():
         return ""
+    comment_requests = getattr(current(), "supports_label_requests", True)
+    # Most authors lack triage permission on TauCeti; send them straight to the comment request
+    # rather than through a label edit GitHub will deny.
+    permission = (
+        "First check whether you can edit labels: `gh api repos/TauCetiProject/TauCeti --jq .permissions.triage`. "
+        if comment_requests
+        else ""
+    )
+    fallback = (
+        (
+            " If that check did not print `true`, you lack label permissions: do not run `gh pr edit` with "
+            "`--add-label` or `--remove-label`. Instead confirm you are the PR author and its head still "
+            "matches the verified commit, then post a new standalone `self-tested` comment with "
+            "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
+            "The comment handler is asynchronous; do not post duplicate requests while it runs. "
+        )
+        if comment_requests
+        else " "
+    )
+    remove_fallback = (
+        " (or post `-self-tested` as the PR author if you lack label permissions)" if comment_requests else ""
+    )
     return (
         "### Apply the self-tested label after verification\n"
         "For an ordinary mathematics PR entirely under `TauCeti/`, after the final source changes "
@@ -524,12 +584,32 @@ def self_tested_guidance(policy: str) -> str:
         "have not changed; this adds no verification pass.\n"
         "Apply the `self-tested` label to the PR. Create new PRs through the existing "
         "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
-        "confirm the live PR commit matches your verified commit, then use "
+        "confirm the live PR commit matches your verified commit. " + permission + "If you can, use "
         "`gh pr edit <number> --repo TauCetiProject/TauCeti "
-        "--add-label self-tested`. A push clears the label, so reapply it after testing subsequent changes. "
-        "If a concurrent push workflow removes the label again, confirm the commit still matches "
-        "and reapply it once. Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
-        "The trusted picker checks eligibility; reviews and all staging tests still run.\n\n"
+        "--add-label self-tested`."
+        + fallback
+        + "Keep the label in place through fix/rebase pushes after local verification succeeds. "
+        "The label is a persistent author declaration, not a per-commit receipt. "
+        "Remove it only when local verification of the current head actually fails, with `gh pr edit <number> "
+        "--repo TauCetiProject/TauCeti --remove-label self-tested`" + remove_fallback + ". Do not leave it on work you "
+        "cannot stand behind. Never remove `self-tested` (or post `-self-tested`) to request or re-trigger PR CI, "
+        "or because of `awaiting-CI` or `ci-failed` labels; those concern PR CI, not your local verification. "
+        "Do not apply it for infrastructure or pin changes, or full-lint/lint-repair requests. "
+        "After the round, the worker also applies the label to pushed heads with a successful complete "
+        "matching verification receipt. Admission checks trusted-author and source-scope eligibility directly; reviews and all staging tests still run.\n\n"
+    )
+
+
+def quality_scope() -> str:
+    """Which quality-pass checks agents run: all of them under `--full-quality`, else the duplicate and
+    proof-length checks, named as the template titles them. A PR keeps the template its branch was cut
+    with, which numbers proof length Q5 of five checks or Q3 of three (TauCeti#40207)."""
+    if os.environ.get("TAUCETI_FULL_QUALITY", "0") == "1":
+        return "Run every check."
+    return (
+        "Run only the Mathlib duplicates, Tau Ceti duplicates and Proofs of at most 50 lines checks: Q1, Q2 "
+        "and Q5 when the template has five checks, Q1 to Q3 when it has three. Each other line, such as "
+        "Hypotheses or Section variables, reads `declined — not run`."
     )
 
 
@@ -1041,7 +1121,9 @@ def run_agent_host(
     _LAST_AGENT_FAILURE = None
     from . import round_storage
 
-    with host_build_cache_context(cwd, env, logdir, **({"queue_mathlib": True} if queue_mathlib else {})) as prefix:
+    # Worker rounds wait for a cache with their dependencies; the queue's repair service builds its own.
+    cache_options = {"queue_mathlib": True} if queue_mathlib else {"cache_wait": True}
+    with host_build_cache_context(cwd, env, logdir, **cache_options) as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
@@ -1498,6 +1580,7 @@ KIRO_BUBBLE_MIN_VERSION = "0.7.31"
 # cache miss is non-fatal here. The custom domain is also what TauCeti's own CI publishes and reads
 # through (the LAKE_CACHE_*_PUBLIC repo variables). Keep the two in step.
 TAUCETI_CACHE_DOMAIN = os.environ.get("TAUCETI_CACHE_DOMAIN", "cache.taucetiproject.org")
+CACHE_PROBE_USER_AGENT = "tauceti-worker (+https://github.com/kim-em/TauCetiWorker)"
 TAUCETI_CACHE_SERVICE = os.environ.get("TAUCETI_CACHE_SERVICE", "tauceti-public")
 TAUCETI_CACHE_ARTIFACT_URL = os.environ.get("TAUCETI_CACHE_ARTIFACT_URL", f"https://{TAUCETI_CACHE_DOMAIN}/artifacts")
 TAUCETI_CACHE_REVISION_URL = os.environ.get("TAUCETI_CACHE_REVISION_URL", f"https://{TAUCETI_CACHE_DOMAIN}/revisions")
@@ -1515,6 +1598,22 @@ class AgentLaunchUnavailable(BuildCacheUnavailable):
     """A process creation failure before the agent existed."""
 
 
+class BuildCacheWait(BuildCacheUnavailable):
+    """The published TauCeti cache does not match this round's dependencies yet (build_cache_wait).
+
+    A deferral, like ProgressPreparationUnavailable: no failure, no attempt, other work next.
+    """
+
+    state = "waiting-build-cache"
+
+    def __init__(self, message: str, *, retry_at: float | None = None, commit: str = ""):
+        super().__init__(message)
+        self.retry_at = retry_at
+        self.commit = commit
+        # Activity records the round as waiting on this dependency (activity.Round.finish).
+        self.failure = dict(dependency="build-cache", reason=commit[:12] or "unpublished")
+
+
 _LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
 
 
@@ -1526,8 +1625,13 @@ def lake_cache_max_revs(env: dict) -> str:
 
 
 @contextlib.contextmanager
-def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False):
-    """Keep the public service available through repairs, merges and dependency changes."""
+def host_build_cache_context(
+    cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False, cache_wait: bool = False
+):
+    """Keep the public service available through repairs, merges and dependency changes.
+
+    ``cache_wait=True`` (worker agent rounds) raises BuildCacheWait instead of starting on a
+    cache whose dependencies differ from the checkout's (see build_cache_wait)."""
     from .build_resources import defaults
 
     defaults(env)
@@ -1543,13 +1647,18 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, queue_mathli
             return contextlib.nullcontext([])
         return shared_mathlib.view(cwd, env, logdir, _cache_fetch)
 
+    from .build_cache_wait import ENABLE
+
     if queue_mathlib:
         env["TAUCETI_QUEUE_MATHLIB"] = "1"
+    if cache_wait:
+        env[ENABLE] = "1"
     try:
         with _host_build_cache_context(cwd, env, logdir, mathlib_view) as prefix:
             yield prefix
     finally:
         env.pop("TAUCETI_QUEUE_MATHLIB", None)
+        env.pop(ENABLE, None)
 
 
 @contextlib.contextmanager
@@ -1602,6 +1711,10 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
                 try:
                     try:
                         prepare_host_build_caches(cwd, env, logdir, report=report)
+                    except BuildCacheWait:
+                        if prefix:
+                            shared_mathlib.preparation_status(env)  # Mathlib itself is ready
+                        raise
                     except expanded_cache.Unavailable as error:
                         if prefix:
                             shared_mathlib.preparation_status(env, error=error)
@@ -1649,6 +1762,7 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
     from . import expanded_cache
 
     prefix = json.loads(env.get("TAUCETI_SHARED_MATHLIB_VIEW", "[]"))
+    wait = None
     with expanded_cache.preparation(
         cwd,
         env,
@@ -1671,7 +1785,12 @@ def prepare_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None
             30,
         ),
     ) as warm_env:
-        warm_host_build_caches(cwd, warm_env, logdir, report=report)
+        try:
+            warm_host_build_caches(cwd, warm_env, logdir, report=report)
+        except BuildCacheWait as error:
+            wait = error  # finish preparation first: a later round keeps what was downloaded and hydrated
+    if wait is not None:
+        raise wait
 
 
 def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: float | None) -> int:
@@ -1866,10 +1985,20 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         return
     if not TAUCETI_CACHE_SERVICE:
         return
+    from . import build_cache_wait
+
     base = ["lake", "cache", "get", "--service", TAUCETI_CACHE_SERVICE, "--repo", TAUCETI]
     result = fetch("TauCeti", [*base, f"--max-revs={max_revs}"])
     if result == "workspace-error":
         return
+    waits = env.get(build_cache_wait.ENABLE) == "1"
+    # Before the main fetch adds its own map: which revision this fetch actually installed.
+    installed = (
+        build_cache_wait.installed_revision(cwd, env.get("LAKE_CACHE_DIR"), max_revs)
+        if waits and result == "ready"
+        else None
+    )
+    main_hit = None
 
     def git(*args: str) -> str:
         p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
@@ -1889,6 +2018,7 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
             if status != "miss":
                 if status == "workspace-error":
                     return
+                main_hit = revision
                 break
         else:
             origin = git("config", "--get", "remote.origin.url")
@@ -1902,6 +2032,8 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
             )
     elif result == "miss":
         unavailable("TauCeti main cache has no published outputs in the requested history")
+    if waits:
+        build_cache_wait.check(cwd, env, head=head, main=main, installed=installed, main_hit=main_hit)
     if result == "miss":
         env["TAUCETI_PR_CACHE_MISS"] = "1"
         log("warning: PR history is uncached; current main artifacts are ready for the rebase")
@@ -1968,7 +2100,11 @@ def tauceti_cache_unreachable_reason() -> str | None:
         return None
     url = f"{TAUCETI_CACHE_REVISION_URL}/"
     try:
-        with urllib.request.urlopen(url, timeout=30):
+        # Cloudflare fronts the cache and answers 403 to Python's default `Python-urllib/x.y` user
+        # agent (a bot rule), which this probe would then report as "bucket not publicly readable"
+        # and stop every round. curl and Lake, which identify themselves, get the healthy 404.
+        req = urllib.request.Request(url, headers={"User-Agent": CACHE_PROBE_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30):
             return None
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):

@@ -55,26 +55,11 @@ class Integration(unittest.TestCase):
             actor = SourceActor.from_native(repository.forge, reviewer.current_user())
             queue_actor = SourceActor.from_native(repository.forge, api.current_user())
             identity = RepositoryIdentity(repository, row["id"])
-            publishers = NativePublishers(
-                identity,
-                frozenset({actor.principal}),
-                frozenset({queue_actor.principal}),
-                frozenset({queue_actor.principal}),
-                generation="1" * 32,
-            )
+            publishers = NativePublishers(identity, frozenset({queue_actor.principal}))
             admission = NativeAdmissionPolicy(publishers, rubrics=("proof",), prefix="Math/", allow_files=())
             clone = root / "controller"
             subprocess.run(["git", "init", "-q", str(clone)], check=True, capture_output=True)
             source = ForgejoSourceAdapter(identity, api, clone, token=tokens["queue"], admission_policy=admission)
-            publisher = ForgejoSourceAdapter(
-                identity, reviewer, clone, token=tokens["reviewer"], admission_policy=admission
-            )
-            publisher_policy_store = Store(str(root / "publisher-policy.sqlite"))
-            try:
-                source.configure_publisher_policy(publisher_policy_store)
-                publisher.configure_publisher_policy(publisher_policy_store)
-            finally:
-                publisher_policy_store.close()
             name = repository.name
             base = source.ref_sha(name, "heads/main")
             contributor.request(
@@ -102,73 +87,39 @@ class Integration(unittest.TestCase):
                 "mode": "review",
             }
             body = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 " + json.dumps(meta) + "-->\nProof checked."
-            # Old/imported comments are not native authority, even when posted by
-            # an otherwise configured publisher and tied to the same Git SHA.
-            reviewer.post_comment(repository, number, body)
+            red = body.replace('"green"', '"blocking_request"')
             for context in ("build", "scope"):
-                api.request(
-                    "POST",
-                    f"repos/{name}/statuses/{head}",
-                    {"context": context, "state": "success", "description": source.ci_status_description},
-                )
-            snapshot = source.admission_snapshot(name, number)
-            self.assertFalse(admission.evaluate(snapshot)[0]["merge"])
-            intent = publisher.prepare_publication(name, number, head, body, "review-native", sequence=1)
-            comment_id = publisher.publish(intent)
-            # A write-only publisher reconciles its own accepted receipt without
-            # the repo-admin permission needed to inspect another user's ACL.
-            self.assertEqual(publisher.publish(intent), comment_id)
+                api.request("POST", f"repos/{name}/statuses/{head}", {"context": context, "state": "success"})
+            self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["review_safe"])
+            # Any author's newest completed scoreboard decides, as on GitHub.
+            reviewer.post_comment(repository, number, body)
             snapshot = source.admission_snapshot(name, number)
             self.assertTrue(admission.evaluate(snapshot)[0]["merge"])
             self.assertEqual(snapshot.paths, ("Math/A.lean",))
             with patch.object(source, "fetch_refs", side_effect=AssertionError("refetched immutable Git objects")):
                 self.assertTrue(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
-            # A copied native body cannot borrow the configured actor's identity.
-            contributor.post_comment(repository, number, admission.bind_comment(body, actor))
-            self.assertEqual(len(source.admission_snapshot(name, number).comments), 1)
-            # Forgejo writers can edit another author's comments. The immutable
-            # native status receipt, not the surviving author field, protects it.
-            contributor.edit_comment(
-                repository, int(comment_id), intent["body"].replace('"green"', '"blocking_request"')
-            )
+            contributor.post_comment(repository, number, red)
             self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["review_safe"])
-            repaired = publisher.prepare_publication(
-                name, number, head, body + "\nRestored intended publication.", "review-native-restored", sequence=2
-            )
-            publisher.publish(repaired)
+            contributor.post_comment(repository, number, body + "\nRe-reviewed.")
             self.assertTrue(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
-            red = body.replace('"green"', '"blocking_request"')
-            withdrawn = publisher.prepare_publication(name, number, head, red, "review-native-red", sequence=3)
-            red_id = publisher.publish(withdrawn)
-            self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
-            contributor.request("DELETE", f"repos/{name}/issues/comments/{red_id}")
+            # Like GitHub, Forgejo accepts commit statuses only from repository writers.
+            admin.request("PUT", f"repos/{name}/collaborators/contributor", {"permission": "read"})
+            with self.assertRaises(ForgeError) as refused:
+                contributor.request("POST", f"repos/{name}/statuses/{head}", {"context": "build", "state": "failure"})
+            self.assertEqual(refused.exception.status, 403)
+            contributor.post_comment(repository, number, red)
             self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["review_safe"])
-            restored = publisher.prepare_publication(
-                name, number, head, body + "\nNew confirmed verdict.", "review-native-current", sequence=4
-            )
-            publisher.publish(restored)
+            contributor.post_comment(repository, number, body + "\nRe-reviewed by a reader.")
             self.assertTrue(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
-            # Latest trusted status wins; an ordinary contributor's same-name
-            # green status cannot hide a trusted failure.
-            api.request(
-                "POST",
-                f"repos/{name}/statuses/{head}",
-                {"context": "build", "state": "failure", "description": source.ci_status_description},
-            )
-            contributor.request(
-                "POST",
-                f"repos/{name}/statuses/{head}",
-                {"context": "build", "state": "success", "description": source.ci_status_description},
-            )
+            reviewer.request("POST", f"repos/{name}/statuses/{head}", {"context": "build", "state": "failure"})
             self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
-            api.request(
-                "POST",
-                f"repos/{name}/statuses/{head}",
-                {"context": "build", "state": "success", "description": source.ci_status_description},
-            )
-            # Revocation is a current native ACL read, never a cached login grant.
+            reviewer.request("POST", f"repos/{name}/statuses/{head}", {"context": "build", "state": "success"})
+            self.assertTrue(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
+            # A status counts only while its creator can still write: a current native ACL read.
             admin.request("PUT", f"repos/{name}/collaborators/reviewer", {"permission": "read"})
             self.assertFalse(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
+            api.request("POST", f"repos/{name}/statuses/{head}", {"context": "build", "state": "success"})
+            self.assertTrue(admission.evaluate(source.admission_snapshot(name, number))[0]["merge"])
             admin.request("PUT", f"repos/{name}/collaborators/reviewer", {"permission": "write"})
             original = api.request
 
@@ -217,36 +168,6 @@ class Integration(unittest.TestCase):
                     store, source, str(clone), name, revision="native-source-fixture", clock=clock, candidate_ci=ci
                 )
                 controller.set_setting("publication_enabled", True, "disposable fixture")
-                recovery_id = controller.enqueue_source_recovery(
-                    name, number, head, "Retry after conflict", key="native-recovery-retry"
-                )
-                recovery_entry = store.row("outbox", {"id": recovery_id})
-                original_publish = source.publish
-
-                def lose_accepted_publication(intent):
-                    original_publish(intent)
-                    raise OSError("lost accepted recovery response")
-
-                with patch.object(source, "publish", side_effect=lose_accepted_publication):
-                    controller._drain_outbox(clock())
-                pending_recovery = store.row("outbox", {"id": recovery_entry["id"]})
-                self.assertEqual(pending_recovery["state"], "pending")
-                frozen_recovery = json.loads(pending_recovery["payload"])["native_intent"]
-                comments_after_accept = len(api.comments(repository, number))
-                clock.advance(60)
-                with patch.object(
-                    source, "prepare_outbox_comment", side_effect=AssertionError("intent was re-prepared")
-                ):
-                    controller._drain_outbox(clock())
-                settled = store.row("outbox", {"id": recovery_entry["id"]})
-                self.assertEqual(settled["state"], "done")
-                self.assertEqual(json.loads(settled["payload"])["native_intent"], frozen_recovery)
-                self.assertEqual(len(api.comments(repository, number)), comments_after_accept)
-                clear_id = controller.enqueue_source_recovery(
-                    name, number, head, "Recovered", key="native-recovery-clear", clear=True
-                )
-                self.assertGreater(clear_id, recovery_id)
-                controller._drain_outbox(clock())
                 poller = AdmissionPoller(controller, source, name, admission, clock=clock)
                 summary = poller.run_once()
                 self.assertEqual(summary["errors"], [])
@@ -266,17 +187,6 @@ class Integration(unittest.TestCase):
                     source._git("show", "-s", "--format=%an <%ae>", frozen.request.head).stdout, accepted_author
                 )
                 execution.add(frozen, classification="passed")
-                reviewing = publisher.prepare_publication(
-                    name, number, head, body + "\nRefreshed verdict.", "review-native-current", sequence=5
-                )
-                with patch.object(reviewer, "post_comment", side_effect=ForgeError("publication outage", status=503)):
-                    with self.assertRaises(ForgeError):
-                        publisher.publish(reviewing)
-                clock.advance(60)
-                controller.tick()
-                self.assertNotEqual(source.ref_sha(name, "heads/main"), frozen.request.head)
-                self.assertIsNone(store.get_setting(f"source-ci:promotion-hold:{attempts[0]['id']}"))
-                publisher.publish(reviewing)
                 clock.advance(60)
                 controller.tick()
                 self.assertEqual(source.ref_sha(name, "heads/main"), frozen.request.head)

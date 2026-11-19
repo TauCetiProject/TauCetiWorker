@@ -1,7 +1,7 @@
 """Source and infrastructure findings of a completed candidate run.
 
 The controller hands `CandidateRun.diagnostics` to the repair task unchanged and classifies the run
-by them: dicts with `kind` (`compiler`, `audit`, `lint` or `infrastructure`), `module` and
+by them: dicts with `kind` (`compiler`, `audit`, `lint`, `policy` or `infrastructure`), `module` and
 `message` (`tauceti_queue/ports.py`). The source findings are read from the `sandboxed-build` job
 log with the patterns bors-ng's `priv/failure_diagnostics.py` uses, which the staging CI contract
 guarantees (every independently failing module is reported; audit and lint findings carry the
@@ -10,15 +10,18 @@ defining module path):
 | log line | finding |
 | --- | --- |
 | `error: TauCeti/A/B.lean:12:3: error: ...` or `TauCeti/A/B.lean:12:3: error: ...` | `compiler` on `TauCeti.A.B` |
-| `audit-driver: import TauCeti.X failed, environment already contains '...' from TauCeti.Y` | `audit` (duplicate declaration) on both modules |
+| `audit-driver: import TauCeti.X failed, environment already contains '...' from M` | `audit` (duplicate declaration) on `TauCeti.X`, and on `M` when it is a project module |
 | `duplicate-declarations: name is declared in both M and N` | `audit` on the project modules |
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON findings) | `lint` on the defining path, `unknown` kept when the linter could not locate it |
 | `Some required targets logged failures:` followed by `- TauCeti.A.B` lines | `compiler` on each target, only when no located finding exists |
 | `TauCeti/A.lean: missing project import ...` and other located import-header findings | `compiler` on the importing module |
+| `MEMBER-POLICY-REJECTED {...}` (the source member review-size policy's JSON record of one member) | `policy` naming that member by its accepted head and source identity |
 
 Infrastructure findings come from the run and jobs rather than the log: a cancelled, timed out or
-startup-failed run, a lost runner (the job log says so), and a finalizer that failed to publish the
-`build` status. Logs are untrusted text: they are matched, never executed, and the read is bounded.
+startup-failed run, a lost runner (the job log says so), and a failed finalizer, which may not have
+published the `build` status (it also exits nonzero after posting a failed one, so the controller
+ignores this finding once the run's own `build` status is bound). Logs are untrusted text: they are
+matched, never executed, and the read is bounded.
 """
 
 from __future__ import annotations
@@ -33,18 +36,30 @@ PATH = r"TauCeti(?:/[A-Za-z0-9_\-]+)+\.lean"
 MODULE = r"TauCeti(?:\.[A-Za-z0-9_]+)+"
 SOURCE = re.compile(r"^(?:error: )?(" + PATH + r"):(\d+):(\d+):\s*(?:error:|error\b)")
 LAKE = re.compile(r"^error: (" + PATH + r"):(\d+):(\d+):")
+ANY_MODULE = r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*"
+# The second module is the earlier definition: a project module, or a dependency's (a Mathlib bump can
+# add a declaration a project module already defines). Findings name only the project modules.
 AUDIT = re.compile(
     r"^audit-driver: import ("
     + MODULE
     + r") failed, environment already contains '([^'\r\n]{1,512})' from ("
-    + MODULE
+    + ANY_MODULE
     + r")$"
 )
-ANY_MODULE = r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*"
 DUPLICATE = re.compile(
     r"^duplicate-declarations: (\S{1,1024}) is declared in both (" + ANY_MODULE + r") and (" + ANY_MODULE + r")$"
 )
 ENV_LOCATIONS = "LINT-ENV-LOCATIONS "
+# One line per member the source member review-size policy rejects (TauCetiTools
+# `ci_candidate_workflow.member_size_policy`): `source_pr` (the PR number), `source` (the repository
+# identity record), `source_forge`, `head` (the accepted head), `reasons`, the measured sizes and,
+# from a TauCetiTools that measures the batch chain, `measured`, `batch_commit` and `parent`.
+MEMBER_POLICY_REJECTED = "MEMBER-POLICY-REJECTED "
+# A record's `measured`: `batch-commit` (the member's own commit in the batch chain against its
+# `parent`, which a repair in the batch can change) or `accepted-head` (against its merge base).
+MEASURED_BATCH_COMMIT = "batch-commit"
+MEASURED_ACCEPTED_HEAD = "accepted-head"
+SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 ENV_PATH = re.compile(r"TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)+\.lean")
 IMPORT_HEADER = re.compile(
     r"^(TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)*\.lean): "
@@ -84,6 +99,11 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
         if len(located) >= MAX_FINDINGS:
             break
         line = STAMP.sub("", ANSI.sub("", raw.rstrip("\r\n").lstrip("﻿")))
+        if line.startswith(MEMBER_POLICY_REJECTED):
+            finding = member_policy_finding(line[len(MEMBER_POLICY_REJECTED) :])
+            if finding is not None:
+                located.setdefault(("policy", finding["member_head"], finding["source_pr"]), finding)
+            continue
         if line.startswith(ENV_LOCATIONS):
             for finding in environment_findings(line[len(ENV_LOCATIONS) :]):
                 located.setdefault(("lint", finding["module"], finding.get("declaration")), finding)
@@ -97,6 +117,8 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
             continue
         if (audit := AUDIT.fullmatch(line)) and all(len(m) <= 512 for m in audit.groups()):
             for module in (audit.group(1), audit.group(3)):
+                if not module.startswith("TauCeti."):
+                    continue
                 located.setdefault(
                     ("audit", module, audit.group(2)),
                     _finding("audit", module, line, path=path_of(module), declaration=audit.group(2)),
@@ -147,6 +169,49 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
     if runner_lost is not None:
         findings.append(runner_lost)
     return findings
+
+
+def member_policy_finding(payload: str) -> dict | None:
+    """A `policy` finding naming the member a review-size rejection record describes, or None when the
+    record is malformed: the queue then attributes the failure as it would without the line."""
+    try:
+        data = json.loads(payload[: 16 * 1024])
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    number, head = data.get("source_pr"), data.get("head")
+    if type(number) is not int or number <= 0 or not isinstance(head, str) or not SHA.fullmatch(head):
+        return None
+    reasons = [str(r)[:200] for r in data.get("reasons") or [] if isinstance(r, str)][:8]
+    sizes = {k: data[k] for k in ("additions", "deletions", "files") if type(data.get(k)) is int}
+    forge = data.get("source_forge") if isinstance(data.get("source_forge"), str) else ""
+    # Where the policy measured the member: its own commit in the batch chain against that commit's
+    # parent (repairable in the batch), or its accepted head against its merge base (a record without
+    # the field comes from a TauCetiTools that measured only that, which no repair can change).
+    chained = {
+        k: data[k] for k in ("batch_commit", "parent") if isinstance(data.get(k), str) and SHA.fullmatch(data[k])
+    }
+    repairable = data.get("measured") == MEASURED_BATCH_COMMIT and len(chained) == 2
+    measured = MEASURED_BATCH_COMMIT if repairable else MEASURED_ACCEPTED_HEAD
+    sizes_text = ", ".join(f"{k} {v}" for k, v in sizes.items())
+    where = f"its batch commit {chained['batch_commit'][:12]}" if repairable else head[:12]
+    message = f"member review-size policy rejected #{number} at {where}: " + ("; ".join(reasons) or "rejected")
+    finding = _finding(
+        "policy",
+        "",
+        message + (f" ({sizes_text})" if sizes_text else ""),
+        source_pr=number,
+        member_head=head,
+        source_forge=forge[:512],
+        reasons=reasons,
+        measured=measured,
+        **(chained if repairable else {}),
+        **sizes,
+    )
+    if isinstance(data.get("source"), dict):
+        finding["source"] = data["source"]
+    return finding
 
 
 def environment_findings(payload: str) -> list[dict]:
@@ -209,7 +274,8 @@ def infrastructure_findings(run: dict, jobs: Iterable[dict], *, build_status_pos
                     job=name,
                 )
             )
-        elif job.get("conclusion") == "failure" and name == "finalize-merge-group-build":
+        # A stub caller of a reusable pr-build prefixes job names with `<caller job> / `.
+        elif job.get("conclusion") == "failure" and name.rsplit(" / ", 1)[-1] == "finalize-merge-group-build":
             findings.append(
                 _finding(
                     "infrastructure",

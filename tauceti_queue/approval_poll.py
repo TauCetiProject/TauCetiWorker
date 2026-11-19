@@ -270,6 +270,7 @@ def _consumed(row: dict[str, Any], decision: eligibility.Decision) -> bool:
         "landed-externally",
         "problem-anticipated",
         "empty-commit",
+        "queue-withdrawn",
     )
 
 

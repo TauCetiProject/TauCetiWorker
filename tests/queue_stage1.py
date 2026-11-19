@@ -162,7 +162,6 @@ class Stage1(unittest.TestCase):
             forge,
             ".github/workflows/pr-build.yml",
             cc.RepositoryIdentity(RepositoryRef(GITHUB, "team/Tools"), 13),
-            "d" * 40,
             "main",
             "main",
             True,

@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_queue import feeds, webhook
+from tauceti_queue import diff_guard, feeds, webhook
 from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller, policy
 from tauceti_queue.fakes import make_controller, reopen_controller
 from tauceti_queue.github_adapter import GitHubClient, RateLimited, RequestDeferred
@@ -56,6 +56,10 @@ class AdmissionTests(unittest.TestCase):
         for context in ("build", "scope"):
             self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
         return head
+
+    def ready_statuses(self, head):
+        for context in ("build", "scope"):
+            self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
 
     def event(self, kind, payload, delivery=""):
         receiver = webhook.WebhookReceiver(self.controller, self.github, repositories=[REPO])
@@ -117,31 +121,62 @@ class AdmissionTests(unittest.TestCase):
         with mock.patch.dict(table, {"quality-pass": {REPO: None}}):
             self.assertEqual(named.rubrics_for(101), self.config.rubrics)
 
-    def test_self_tested_reviewed_head_enters_existing_staging_without_build_success(self):
+    def test_persistent_self_tested_enters_staging_without_any_ci_receipt(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]
+        del self.github.statuses[(head, "scope")]
         self.github.labels[1].add("self-tested")
-        self.github.statuses[(head, "self-tested/1")] = Status(
-            "success", "PR CI skipped: self-tested.", "", self.clock(), None
-        )
+        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         self.assertEqual(self.intake.run_once()["approved"], 1)
         self.controller.tick()
         self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
-        self.assertTrue(self.controller.store.rows("members"))
         self.assertNotIn((head, "build"), self.github.statuses)
+        self.assertNotIn((head, "self-tested/1"), self.github.statuses)
 
-    def test_label_and_dedicated_status_changes_invalidate_admission(self):
+    def self_tested(self, files):
+        head = self.github.create_pr(1, files)
+        self.review(1)
+        self.github.labels[1].add("self-tested")
+        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
+        return head
+
+    def test_self_tested_heads_must_pass_the_pr_level_diff_guards(self):
+        long = "".join(f"theorem t{i} : {i} = {i} := rfl\n" for i in range(1251))
+        head = self.self_tested({"TauCeti/Long.lean": long})
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.controller.inputs(), [])
+        decision = json.loads(self.intake.state.get(1)["decision"])
+        self.assertIn(
+            f"TauCeti/Long.lean: new Lean files must be at most {diff_guard.ci_git.NEW_FILE_LINE_CAP} lines",
+            decision["reason"],
+        )
+        comments = [json.loads(row["payload"]) for row in self.controller.store.rows("outbox", {"kind": "comment"})]
+        self.assertEqual(len(comments), 1)
+        self.assertIn("cannot join the merge queue", comments[0]["body"])
+        self.assertIn(f"diff-guard:{head}", comments[0]["marker"])
+        # Re-evaluating the same head does not repeat the explanation.
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.assertEqual(len(self.controller.store.rows("outbox", {"kind": "comment"})), 1)
+
+    def test_self_tested_heads_within_the_diff_guards_are_admitted(self):
+        self.self_tested({"TauCeti/Short.lean": "-- short\n" * 1000})
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual(self.controller.store.rows("outbox", {"kind": "comment"}), [])
+
+    def test_ci_built_heads_rely_on_pr_ci_for_the_diff_guards(self):
+        with mock.patch("tauceti_queue.diff_guard.violations") as measure:
+            self.ready()
+            self.assertEqual(self.intake.run_once()["approved"], 1)
+        measure.assert_not_called()
+
+    def test_untrusted_label_and_label_removal_cannot_bypass_ci(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]
-        self.assertEqual(self.intake.run_once()["approved"], 0)
         self.github.labels[1].add("self-tested")
-        self.github.statuses[(head, "self-tested/2")] = Status("success", "other PR", "", self.clock(), None)
-        self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.run_once()["approved"], 0)
-        self.github.statuses[(head, "self-tested/1")] = Status(
-            "success", "PR CI skipped: self-tested.", "", self.clock(), None
-        )
-        self.event("status", {"sha": head, "context": "self-tested/1"})
+        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
+        self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.run_once()["approved"], 1)
         generation = self.intake.state.get(1)["generation"]
         self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})
@@ -410,6 +445,25 @@ class AdmissionTests(unittest.TestCase):
         self.clock.advance(7200)
         self.assertEqual(self.intake.run_once()["approved"], 1)
 
+    def test_lowering_the_floor_releases_waits_recorded_under_the_old_one(self):
+        self.ready()
+        self.github.client = GitHubClient(None, lambda *args: (200, {}, b"{}"), clock=self.clock)
+        original = self.github.admission_snapshot
+        until = self.clock() + 3600
+
+        def floored(*args, **kwargs):
+            raise RequestDeferred("floor", retry_at=until, resource="core:background")
+
+        self.github.admission_snapshot = floored
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.summary()["next_attempt_at"], until)
+        self.github.admission_snapshot = original
+        self.assertEqual(self.intake.run_once()["evaluated"], 0, "held until the reset under the old floor")
+        self.controller.set_setting("github_background_floor", 100, "operator")
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual(self.github.client.background_floor, 100)
+        self.assertNotIn("core:background", self.controller.store.get_setting(self.intake.state.resource_key, {}))
+
     def test_discovery_server_cooldown_protects_new_dirty_work_after_restart(self):
         self.ready()
         until = self.clock() + 7200
@@ -503,6 +557,67 @@ class AdmissionTests(unittest.TestCase):
         self.intake = AdmissionPoller(self.controller, self.github, REPO, changed, clock=self.clock)
         self.assertEqual(self.intake.run_once()["approved"], 0)
         self.assertEqual(self.controller.inputs()[0]["state"], "cancelled")
+
+    def test_missing_source_refusal_is_readmitted_through_a_fresh_admission_read(self):
+        for number in (1, 2):
+            head = self.github.create_pr(number, {f"TauCeti/P{number}.lean": "module\nimport TauCeti.Later\n"})
+            self.review(number, comment=10 + number)
+            for context in ("build", "scope"):
+                self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
+        self.assertEqual(self.intake.run_once()["approved"], 2)
+        self.controller.tick()
+        self.assertEqual([r["reason"] for r in self.controller.inputs()], ["missing-source"] * 2)
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.get(1)["disposition"], "withdrawn")
+        self.github.prs[2]["state"] = "closed"
+        self.intake.invalidate(2)
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.get(2)["disposition"], "closed")
+        refused = self.controller.input_for(REPO, 1)
+        approved_at = refused["approved_at"]
+        self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
+        self.controller.tick()
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "missing-source-recheck"))
+        self.assertFalse(self.intake.is_current(1, row["head_sha"]), "admission reads the PR again first")
+        self.assertEqual(self.controller.input_for(REPO, 2)["reason"], "closed", "a closed PR leaves the recheck")
+        # Admission restores the input only when its fresh read would admit the head as it stands.
+        self.github.labels[1] = {"hold"}
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+        self.github.labels[1] = set()
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.intake.state.get(1)["disposition"], "readmitted")
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual((row["id"], row["state"], row["approved_at"]), (refused["id"], "waiting", approved_at))
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "inserted")
+        self.assertEqual(self.controller.status()["counters"].get("missing_source_rechecks"), 1)
+
+    def test_a_blocking_label_whose_delivery_was_missed_holds_until_it_goes(self):
+        self.ready()
+        self.intake.run_once()
+        approved = self.controller.input_for(REPO, 1)
+        self.github.labels[1] = {"wip"}  # no delivery: only admission's next read sees it
+        self.github.statuses.pop((approved["head_sha"], "scope"))  # held whatever the evaluation decides
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual((row["id"], row["state"], row["blocked_labels"]), (approved["id"], "waiting", '["wip"]'))
+        self.ready_statuses(approved["head_sha"])
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.github.labels[1] = set()
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.controller.tick()
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual(
+            (row["id"], row["state"], row["approved_at"]), (approved["id"], "inserted", approved["approved_at"])
+        )
 
     def test_manual_reapproval_clears_withdrawal_intent(self):
         head = self.ready()

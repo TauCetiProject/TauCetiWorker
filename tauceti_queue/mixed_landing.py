@@ -36,11 +36,7 @@ def configure(registry):
     }:
         raise ValueError("mixed admission requires separate main writer and mirror roles")
     writer = value["forgejo_writer_id"]
-    if (
-        type(writer) is not int
-        or not 0 < writer < 2**63
-        or writer in registry.profile.reviewers | {registry.profile.publisher}
-    ):
+    if type(writer) is not int or not 0 < writer < 2**63 or writer == registry.profile.publisher:
         raise ValueError("Forgejo main writer must be a separate configured native actor")
     for key in ("forgejo_token_file", "github_credentials_dir"):
         if not isinstance(value[key], str) or not Path(value[key]).is_absolute():

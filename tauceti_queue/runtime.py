@@ -26,7 +26,9 @@ Status document layout (all times are UTC ISO 8601; absent sections are `null`):
     conditions      list of the first-line conditions from "Production monitoring", each
                     {"condition": ..., "since": ..., "detail": ...}
     head            batch, version, base, tip, members, claim, ci {run_id, runner, host,
-                    started_at, phases[{name, started_at, updated_at, progress}]}, waiting_for
+                    started_at, phases[{name, started_at, updated_at, progress}]}, waiting_for;
+                    `tauceti-queue status` adds ci.build_progress from the public live build
+                    report (`build_progress.py`) while the run is in progress
     open_batch      batch, size, oldest_member_age_seconds
     approved_waiting  count of approved inputs not yet inserted
     pending_task    the claimable repair or conflict task, if any
@@ -50,6 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from . import stuck_heads
 from .config import STATUS_SCHEMA, Config
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -298,6 +301,19 @@ def summarize(document: Mapping[str, Any], now: datetime | None = None) -> str:
                 f"{outcome}{(': ' + ci['outcome_detail']) if ci.get('outcome_detail') else ''}  "
                 f"started {_when(ci.get('started_at'))} ({_age(ci.get('started_at'), now)} ago)"
             )
+            step = ci.get("current_step")
+            if isinstance(step, Mapping):
+                lines.append(
+                    f"  step {step.get('index', '?')}/{step.get('total', '?')} {step.get('name', '?')} "
+                    f"({step.get('job', '?')}), running {_age(step.get('started_at'), now)}"
+                )
+            progress = ci.get("build_progress")
+            if isinstance(progress, Mapping) and ci.get("status") == "in_progress":
+                from . import build_progress
+
+                line = build_progress.text(progress, (now or datetime.now(UTC)).timestamp())
+                if line:
+                    lines.append("  " + line)
             phases = list(ci.get("phases") or [])
             if len(phases) > 6:
                 lines.append(f"    ({len(phases) - 6} earlier phases)")
@@ -326,6 +342,9 @@ def summarize(document: Mapping[str, Any], now: datetime | None = None) -> str:
     count = waiting.get("count") if isinstance(waiting, Mapping) else document.get("approved_waiting")
     urgent = waiting.get("urgent") if isinstance(waiting, Mapping) else None
     lines.append(f"approved waiting: {count if count is not None else '?'}" + (f" ({urgent} urgent)" if urgent else ""))
+    stuck = stuck_heads.summary(document.get("stuck_heads"), now.timestamp() if now else time.time())
+    if stuck:
+        lines.append(stuck)
     task = document.get("pending_task")
     if task:
         lines.append(

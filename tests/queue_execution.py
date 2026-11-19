@@ -199,7 +199,7 @@ class Dispatches(unittest.TestCase):
         self.assertEqual(self.attempt()["dispatch_state"], "accepted")
         self.assertEqual(self.attempt()["request_id"], attempt["request_id"])
 
-    def test_unknown_send_is_not_automatically_retried_after_timeout(self):
+    def test_unknown_send_with_no_run_is_resent_once_after_timeout(self):
         self.approve()
         calls = []
 
@@ -210,16 +210,17 @@ class Dispatches(unittest.TestCase):
         self.backend.dispatch_candidate = unknown
         self.controller.tick()
         initial = self.attempt()
-        self.clock.advance(86400)
-        for _ in range(3):
-            self.controller.tick()
+        self.clock.advance(60)
+        self.controller.tick()
         self.assertEqual(calls, [1])
-        self.assertEqual(self.attempt()["id"], initial["id"])
         self.assertEqual(self.attempt()["outcome"], "pending")
         self.assertEqual(self.controller.status()["head"]["ci"]["dispatch_state"], "uncertain")
-        retry = self.controller.retry_ci(PROJECT, "operator")
-        self.assertTrue(retry["retried"])
-        self.assertEqual(retry["forgotten"], 1)
+        self.clock.advance(86400)
+        self.controller.tick()
+        settled = self.controller.store.row("ci_attempts", {"id": initial["id"]})
+        self.assertEqual(settled["outcome"], "infrastructure")
+        self.assertTrue(settled["outcome_detail"].startswith("no-run:"))
+        self.clock.advance(3600)
         self.controller.tick()
         self.assertEqual(calls, [1, 1])
         self.assertNotEqual(self.attempt()["request_id"], initial["request_id"])

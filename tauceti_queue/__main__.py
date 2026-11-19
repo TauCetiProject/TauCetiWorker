@@ -27,6 +27,11 @@
         permission with the same predicate as the security audit. `--token-file` instead reads a
         private dedicated bearer, requires an explicit queue origin and refuses redirects. Native
         controls still require source-bound enrollment and current source admin permission.
+    tauceti-queue emergency [cancel] REPO PR [--reason TEXT] [--url URL] [--token TOKEN | --token-file FILE]
+        Request (or with `cancel`, withdraw) the emergency lane for an approved PR through
+        `/admin/emergency` (`/admin/emergency-cancel`): the PR becomes the next head in a batch of its
+        own. The same token handling and admin check as `settings set`; refused `disabled` until the
+        `emergency_enabled` setting is true.
     tauceti-queue import-bors --feed URL|FILE [--candidates URL|FILE ...] [--dry-run] [--release-head]
         The cutover import (`tauceti_queue.bors_import`): read Bors's observation feed and candidate
         journals, post them to the service's `/admin/import-bors` endpoint, print what was (or, with
@@ -192,6 +197,7 @@ class Service:
                 wired.http,
             )
             self.native_http.prebound_socket = listener
+            self.controller.public_url = self.config.public_url
             self.loop_module = _optional("loop")
             return
         module = _optional("controller")
@@ -217,7 +223,10 @@ class Service:
             revision=self.runtime.revision.sha,
             canonical_branch=self.config.canonical_branch or None,
             mixed=mixed,
+            revision_map_probe=module.revision_map_published,
         )
+        self.controller.public_url = self.config.public_url
+        self.controller.stuck_heads_report = str(self.config.ci_recovery_report)
         self.loop_module = _optional("loop")
         poll_module = _optional("approval_poll")
         if poll_module is not None and hasattr(self.github, "list_open_pull_requests"):
@@ -478,6 +487,9 @@ def cmd_status(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = 
     except RuntimeError as exc:
         _log(str(exc))
         return 1
+    from . import build_progress
+
+    build_progress.attach(document, fetch)
     if args.json:
         print(json.dumps(document, indent=2, sort_keys=True))
     else:
@@ -658,6 +670,43 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
         return 1
 
 
+# --- emergency -------------------------------------------------------------------------------------
+
+
+def cmd_emergency(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
+    words = list(args.words)
+    cancel = len(words) == 3 and words[0] == "cancel"
+    if cancel:
+        words = words[1:]
+    if len(words) != 2:
+        _log("usage: tauceti-queue emergency [cancel] REPO PR [--reason TEXT]")
+        return 2
+    repo, raw = words
+    try:
+        pr = int(raw)
+        if pr <= 0:
+            raise ValueError
+    except ValueError:
+        _log(f"PR must be a positive integer, got {raw!r}")
+        return 2
+    body: dict[str, Any] = {"repo": repo, "pr": pr}
+    if not cancel:
+        body["reason"] = args.reason or ""
+    try:
+        base, fetch = _operator_target(args, fetch)
+        document = fetch(
+            base + ("/admin/emergency-cancel" if cancel else "/admin/emergency"),
+            method="POST",
+            body=body,
+            token=_operator_token(args.token, getattr(args, "token_file", None)),
+        )
+    except RuntimeError as exc:
+        _log(str(exc))
+        return 1
+    print(json.dumps(document, indent=2, sort_keys=True))
+    return 0 if document.get("accepted") or document.get("cancelled") else 1
+
+
 # --- import-bors and reconcile-approvals -----------------------------------------------------------
 
 
@@ -763,6 +812,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
     )
 
+    emergency = commands.add_parser(
+        "emergency",
+        help="request or withdraw the emergency lane for an approved PR",
+        description="tauceti-queue emergency [cancel] REPO PR: post to /admin/emergency or /admin/emergency-cancel.",
+    )
+    emergency.add_argument("words", nargs="+", metavar="[cancel] REPO PR")
+    emergency.add_argument("--reason", help="why the PR must land now (journaled with the request)")
+    emergency.add_argument("--url", help="service base URL (default: the configured listen address)")
+    emergency.add_argument("--config", help="configuration file used to find the listen address")
+    emergency_token = emergency.add_mutually_exclusive_group()
+    emergency_token.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    emergency_token.add_argument(
+        "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
+    )
+
     importer = commands.add_parser("import-bors", help="import Bors's approved PRs and running head at the cutover")
     importer.add_argument("--feed", required=True, help="Bors's observation feed (active-batches): a URL or a file")
     importer.add_argument(
@@ -808,6 +872,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_check_config(args)
         if args.command == "settings":
             return cmd_settings(args)
+        if args.command == "emergency":
+            return cmd_emergency(args)
         if args.command == "import-bors":
             return cmd_import_bors(args)
         if args.command == "reconcile-approvals":

@@ -95,9 +95,7 @@ class NativeBootstrap:
         authority = NativeQueueAuthority(
             approved.source,
             control_policy=self.control_policy,
-            forbidden_control_principals=self.publishers.reviews
-            | self.publishers.statuses
-            | self.publishers.recoveries,
+            forbidden_control_principals=self.publishers.recoveries,
         )
         try:
             access = QueueRepositoryAccess.from_effective(
@@ -130,13 +128,8 @@ class NativeBootstrap:
             or git_access.actor.principal != access.actor.principal
         ):
             raise SourceAccessDenied("native Git publication credential belongs to another actor or repository")
-        if (
-            access.actor.principal not in self.publishers.statuses
-            or access.actor.principal not in self.publishers.recoveries
-        ):
-            raise SourceAccessDenied("controller source actor is not an approved status and recovery publisher")
-        if access.actor.principal in self.publishers.reviews:
-            raise SourceAccessDenied("controller publication actor must be separate from trusted review publishers")
+        if access.actor.principal not in self.publishers.recoveries:
+            raise SourceAccessDenied("controller source actor is not an approved recovery publisher")
         ledger = RequestLedger(
             store, config.content_clone, approved, self.configuration, workflow_revision=self.workflow_revision
         )
@@ -147,8 +140,6 @@ class NativeBootstrap:
             prefix=root.replace(".", "/") + "/",
             allow_files=review_policy.default_allow_files(root)
             + [s for s in config.admission_extra_files.split(",") if s],
-            base_branch=approved.base_branch,
-            clock=clock,
         )
         source = ForgejoSourceAdapter(
             approved.source,

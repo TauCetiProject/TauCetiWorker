@@ -16,7 +16,8 @@ such as `roadmap`, `review`, `fix`, or `security-audit`; fallback candidates are
 not additional rounds. All supported round types appear even when their counts
 are zero; the prepared summary publishes the worker taxonomy for other consumers.
 No-work surveys have their own row. Admission/GitHub
-waiting attempts and dry runs are excluded. Failed/interrupted rounds are
+waiting attempts, rounds waiting for a matching TauCeti build cache (`waiting-build-cache`,
+recorded with dependency `build-cache` and the commit) and dry runs are excluded. Failed/interrupted rounds are
 included, with a failure subset (including timeouts). Running rounds and
 processes interrupted without a finish receipt are separate. The current
 "workers working" count is distinct workers with an active work round, excluding
