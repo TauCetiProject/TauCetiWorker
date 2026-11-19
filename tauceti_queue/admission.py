@@ -95,8 +95,7 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
             "statuses": {
                 key: (source.get("statuses", {}).get(key) or "").lower()
                 for key in sorted(
-                    set(CONTEXTS)
-                    | {k for k in source.get("statuses", {}) if k.startswith(("self-tested/", "_native_"))}
+                    set(CONTEXTS) | {k for k in source.get("statuses", {}) if k.startswith("self-tested/")}
                 )
             },
         }
@@ -107,13 +106,14 @@ def recovery_heads(comments):
     return policy.rebase_request_heads(comments) | policy.rebase_request_heads(comments, stalled=True)
 
 
-def relevant_comment(comment):
+def relevant_comment(comment, *, native=False):
+    """Native recovery requests are author-checked when evaluated, not here."""
     body = comment.get("body") or ""
     return (
         policy.SCOREBOARD_MARKER in body
         or bool(recovery_heads([comment]))
-        or body.startswith("Merge-queue recovery for head `")
-        and "<!--tauceti-source:v2 " in body
+        or native
+        and body.startswith("Merge-queue recovery for head `")
     )
 
 
@@ -343,7 +343,6 @@ class AdmissionPoller:
                 kind == "status"
                 and detail.get("context") not in CONTEXTS
                 and not str(detail.get("context", "")).startswith("self-tested/")
-                and not str(detail.get("context", "")).startswith(("tauceti-review/", "tauceti-recovery/"))
             ):
                 return
             if kind == "check_run" and detail.get("name") == "merge eligibility":
@@ -485,13 +484,6 @@ class AdmissionPoller:
             with deferred(urgent=revocation) if deferred is not None else nullcontext():
                 self._evaluate(work, summary)
         except Exception as error:
-            if (
-                getattr(error, "publication_kind", None) == "recovery"
-                and getattr(error, "number", None) == work["number"]
-            ):
-                reconcile = getattr(self.controller, "reconcile_source_recovery", None)
-                if reconcile is not None:
-                    reconcile(work["number"], getattr(error, "head", None), getattr(error, "nonce", None))
             self.state.defer(
                 work,
                 self._retry_at(error),
@@ -635,7 +627,6 @@ class AdmissionPoller:
                 and result["review_safe"]
                 and not labels & KEEP
                 and requested
-                and not result.get("recovery_authority_hold")
             ):
                 held, labelled = pull.head_sha in requested, "needs-rebase" in labels
                 if held != labelled:
@@ -666,7 +657,7 @@ class AdmissionPoller:
                     self.clock(),
                 )
                 disposition = "closed" if pull.state != "open" else "draft"
-            elif not result["review_safe"] or result.get("recovery_authority_hold"):
+            elif not result["review_safe"]:
                 withdrawn = self.controller._withdraw(self.repo, pull.number, "review-unsafe", "tauceti-queue policy")
                 summary["revoked"] += int(withdrawn["withdrawn"])
                 disposition = "review-unsafe"

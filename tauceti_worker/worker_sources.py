@@ -160,7 +160,6 @@ def native_source(cfg):
 
 
 def source_config(cfg, source):
-    source.review_publication_policy = review_publication_policy(cfg, source)
     suffix = hashlib.sha256(
         json.dumps({"repository": source.repository.key, "id": source.identity.native_id}, sort_keys=True).encode()
     ).hexdigest()[:24]
@@ -173,15 +172,6 @@ def source_config(cfg, source):
         sbcache=state / "cache/scoreboard",
         logdir=cfg.logdir / "sources" / suffix,
     )
-
-
-def review_publication_policy(cfg, source):
-    explicit = os.environ.get("TAUCETI_NATIVE_REVIEW_POLICY")
-    if explicit:
-        return explicit
-    candidate = cfg.home / ".config/tauceti-forgejo/review-publication.json"
-    canonical = source.repository.key == "forgejo:https://git.taucetiproject.org/taucetiproject/tauceti"
-    return str(candidate) if canonical and candidate.is_file() else None
 
 
 @contextlib.contextmanager
@@ -246,12 +236,6 @@ def activate(source, cfg):
         from .paths import self_env
 
         os.environ.update(self_env())
-        publication_policy = review_publication_policy(cfg, source)
-        if publication_policy:
-            os.environ.update(
-                TAUCETI_NATIVE_REVIEW_POLICY=publication_policy,
-                TAUCETI_NATIVE_REVIEW_PUBLISHER="tauceti_worker.native_review_publisher:QueueReviewPublisher",
-            )
         yield
     finally:
         os.environ.clear()

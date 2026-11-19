@@ -53,8 +53,6 @@ private regular files as required by the existing control-policy loader.
   "schema": "tauceti-queue.mixed-sources/v1",
   "github": {"forge": {"kind": "github", "url": "https://github.com"}, "name": "team/Math", "id": 101},
   "forgejo": {"forge": {"kind": "forgejo", "url": "https://git.example.org"}, "name": "team/Math", "id": 41},
-  "authority_generation": "11111111111111111111111111111111",
-  "reviewer_ids": [3],
   "publisher_id": 4,
   "source_token_file": "/home/operator/.config/tauceti-queue/native-source-token",
   "execution": {
@@ -70,19 +68,20 @@ private regular files as required by the existing control-policy loader.
 }
 ```
 
-Observation needs only the schema, source identities, reviewer/publisher IDs and
-source token path. Admission additionally requires execution and mirror roles.
+Observation needs only the schema, source identities, publisher ID and
+source token path. Older profiles' `reviewer_ids` and `authority_generation`
+keys are accepted and ignored. Admission additionally requires execution and mirror roles.
 `check-config` validates the profile shape; it does not prove enabled-mode
 readiness. Startup also validates policy/configuration bytes, stored source
-bindings, authority history, credentials and remote repository identities.
+bindings, credentials and remote repository identities.
 Execution-main selection happens when preparing a new CI request, so an
 execution outage or invalid new caller does not prevent the service from
 starting and serving existing work. Request preparation reports and retries
 the execution error through the existing CI freeze-error path.
 Validate an enabled configuration against a disposable queue before applying it
 to the live service. A configuration check alone is insufficient for rollout.
-The source account needs repository access sufficient for current native
-publisher ACL checks. In admission mode its authenticated native ID must match
+The source account needs repository access sufficient to read the
+repository permissions of commit-status creators. In admission mode its authenticated native ID must match
 `publisher_id` before source publication or retention. Protect the native CI
 retention namespace for that actor. The protected-main writer must use a
 separate actor and token. The GitHub execution App role is repository-ID-scoped
@@ -90,72 +89,25 @@ with `contents:write, actions:write`; the follower mirror uses its separate
 `contents:write, workflows:write` role. No role is inferred from `gh` login or a
 similarly named account on the other host.
 
-Native review admission uses the existing revision-bound native publication
-protocol, including immutable status receipts, current publisher ACLs, body
-hashes and recovery holds. Ordinary scoreboards alone do not authorize admission:
-Forgejo writers can edit another author's comment. Managed native reviewers use
-the common Review publisher with
-`tauceti_worker.native_review_publisher:QueueReviewPublisher`. Provision a private
-`~/.config/tauceti-forgejo/review-publication.json` on the publishing host:
+Native review admission is the same as GitHub's. The shared review policy
+counts the newest completed scoreboard for the current head and merge base,
+whoever posted it; the hard boundary is CI, scope, the axiom audit and
+bump-guard. Reviewers publish with the common Review poster, as on GitHub, and
+older boards carrying a `tauceti-source:v2` provenance block still count. Only
+recovery holds are author-bound: a `Merge-queue recovery for head` comment
+counts from `publisher_id`, as GitHub counts it from the queue's bot logins.
 
-```json
-{
-  "schema": "tauceti-native-review-publisher/v1",
-  "publishers": {
-    "source": {"forge": {"kind": "forgejo", "url": "https://forge.example"}, "name": "team/Math", "id": 41},
-    "generation": "<effective publisher generation from the queue profile>",
-    "reviews": [7], "statuses": [8], "recoveries": [8]
-  },
-  "publisher_host_id": "<publishing host /etc/machine-id>",
-  "ledger": "/home/operator/.local/state/tauceti/native-review-publications/outbox.sqlite3"
-}
-```
+Forgejo, like GitHub, accepts `POST /repos/{owner}/{repo}/statuses/{sha}` only
+from users with write access to the repository's code. Forgejo Actions also
+posts statuses, as its system user, for any workflow a PR brings, under a
+context the workflow names. A native `build`, `scope`, `bump-guard` or
+`self-tested/*` status therefore counts only if its creator currently has
+write, admin or owner permission. Mixed admission ignores native statuses
+altogether and requires exact candidate CI.
 
-Project only `MixedProfile.publishers().record()` from the queue's current policy;
-this file needs no queue execution, mirror or main-writer credentials. The worker
-uses its existing source token and automatically selects the backend inside native
-rounds when this profile exists. Managed fleet services should explicitly set
-`TAUCETI_NATIVE_REVIEW_POLICY` to keep publication configured if the file becomes
-unavailable; publication then fails closed. Its directory must be owned by the
-operator with mode `0700`, the file must have mode `0600`, and its path must contain
-no symlinks. Other repositories must select their policy explicitly; the default
-is only for canonical Tau Ceti. Optional `publisher_host_id` prevents accidentally
-copying the authority to a different host with an independent allocator.
-The Review engine must report native publication protocol 2; Worker probes this
-before review inference. Ordinary standalone Review comments remain discussion
-unless a trusted backend is configured.
-
-Distribute an updated projection whenever queue publisher authority changes.
-Authority generations are random, not ordered; differing historical CI receipts
-cannot identify which policy is current. Verify the host projection against the
-queue's authoritative profile during deployment and trust changes.
-
-All reviewers of this source must share the single durable outbox and its sequence
-allocator on the publishing host. Keep this host as the publication authority until
-an equally durable shared allocator is deployed for multiple publishing hosts.
-Verdicts use the existing `ForgejoSourceAdapter.prepare_publication` / `publish`
-protocol. Before inference the backend validates the source, actor and local
-policy and reserves an ordered run with a nonce. Common Review retains this opaque
-reservation with the paid body. A delayed older output cannot obtain a newer
-sequence merely by retrying after another worker publishes. No extra early
-scoreboard is posted, so unchanged-review behavior stays shared with GitHub.
-
-Intents freeze before remote writes; common Review recovery retries the same paid
-output and intent. Both Worker survey and Review handoff read receipt-selected
-boards. Immutable history is retained, and superseded output cannot revive an
-older verdict. Periodic integrity checks use per-PR locks, bounded sweeps and
-bounded repair attempts, including after scratch cleanup. Repairs remain within
-the original run's sequence interval, before later runs. Retained negative facts
-are delivered even if the PR closes or moves to another head. Repeated damage,
-sequence conflicts and unsupported outbox versions require operator repair.
-Never bypass this gate to make a canary enter the queue.
-
-The explicit `authority_generation` is a fresh nonzero 128-bit value; rotate it
-when changing native review authority and never reuse a retired generation.
-Credential-path, caller, mirror and review-authority changes preserve paid repair
-claims, which bind to the enrolled repositories, queue epoch and CI scope.
-Landing always rechecks current review authority. A trust change can require fresh publication of the retained review;
-it does not require paying for the review again.
+Credential-path, caller and mirror changes preserve paid repair claims, which
+bind to the enrolled repositories, queue epoch and CI scope. Landing always
+rechecks the current review verdict.
 
 The execution policy must enroll both exact repository identities in its
 `member_sources` array. Its `source` is the Forgejo **retention** repository;

@@ -617,34 +617,6 @@ class Controller:
         self.native_source = bool(source_identity and source_identity.repository.forge.kind == "forgejo")
         if self.native_source and candidate_ci is None:
             raise ValueError("Forgejo source requires qualified source CI; legacy GitHub execution is unavailable")
-        if self.native_source:
-            configure_publishers = getattr(self.source, "configure_publisher_policy", None)
-            if configure_publishers is not None:
-                with store.transaction():
-                    if configure_publishers(store):
-                        # A rotation/restore never re-signs a positive release.
-                        # Retired source history already holds affected heads;
-                        # no historical comments need to be replayed here.
-                        for entry in store.rows("outbox", {"kind": "comment"}, order="id"):
-                            body = loads(entry["payload"], {})
-                            publication = body.get("publication") or {}
-                            if (
-                                publication.get("kind") == "recovery"
-                                and publication.get("clear")
-                                and entry["state"] == "pending"
-                            ):
-                                store.update(
-                                    "outbox",
-                                    {"id": entry["id"]},
-                                    state="done",
-                                    done_at=clock(),
-                                    result="reconciliation-required: clear predates authority rotation",
-                                )
-                        store.journal(
-                            clock(),
-                            "native-publisher-rotation",
-                            generation=self.source.admission_policy.publishers.generation,
-                        )
         self.provenance_repository = source_identity.repository.key if self.native_source else repository
         self.revision = revision
         self.clock = clock
@@ -9744,70 +9716,6 @@ class Controller:
 
     # --- outbox ------------------------------------------------------------------------------------
 
-    def enqueue_source_recovery(self, repo, number, head, explanation, *, key, clear=False):
-        """Trusted controller operation; holds and clears share the existing outbox allocator."""
-        if (
-            not self.native_source
-            or type(number) is not int
-            or number < 1
-            or not isinstance(head, str)
-            or re.fullmatch(r"[0-9a-f]{40}", head) is None
-            or type(clear) is not bool
-            or not isinstance(explanation, str)
-            or not isinstance(key, str)
-            or not key
-        ):
-            raise ValueError("native recovery requires a qualified accepted head and durable intent key")
-        with self._lock, self.store.transaction():
-            self._check_repo(repo)
-            body = (
-                f"Merge-queue recovery for head `{head}`\n\n"
-                + explanation.replace("<!--tauceti-", "&lt;!--tauceti-")
-                + f"\n\n<!--tauceti-rebase:v1 {head}-->"
-            )
-            outbox_key = "native-recovery:" + key
-            payload = {
-                "number": number,
-                "body": body,
-                "marker": outbox_key,
-                "publication": {"kind": "recovery", "head": head, "clear": clear},
-            }
-            existing = self.store.row("outbox", {"key": outbox_key})
-            if existing is not None:
-                previous = loads(existing["payload"], {})
-                previous.pop("native_intent", None)
-                if previous != payload:
-                    raise ValueError("native recovery key was reused for a different decision")
-            self._enqueue("comment", outbox_key, payload)
-            return self.store.row("outbox", {"key": outbox_key})["id"]
-
-    def reconcile_source_recovery(self, number, head, nonce):
-        """Republish only the latest desired owned fact, never an older hold over a newer clear."""
-        if not self.native_source or not head or not nonce:
-            return False
-        with self._lock, self.store.transaction():
-            latest = None
-            for entry in self.store.rows("outbox", {"kind": "comment"}, order="id"):
-                if entry.get("result") == "reconciliation-required: clear predates authority rotation":
-                    continue
-                payload = loads(entry["payload"], {})
-                publication = payload.get("publication") or {}
-                if (
-                    payload.get("number") == number
-                    and publication.get("kind") == "recovery"
-                    and publication.get("head") == head
-                ):
-                    latest = payload
-            if latest is None or (latest.get("native_intent") or {}).get("nonce") != nonce:
-                return False
-            key = "native-republish:" + nonce
-            if self.store.row("outbox", {"key": key}) is not None:
-                return False
-            latest.pop("native_intent", None)
-            self._enqueue("comment", key, latest)
-            self.store.journal(self.clock(), "native-publication-requeued", number=number, nonce=nonce)
-            return True
-
     def _enqueue(self, kind: str, key: str, payload: dict[str, Any]) -> None:
         now = self.clock()
         if self.store.row("outbox", {"key": key}) is not None:
@@ -9875,51 +9783,6 @@ class Controller:
                 payload = loads(current["payload"], {})
                 if current["kind"] == "notify":
                     payload["_retry"] = current["attempts"] > 0
-                prepare_comment = getattr(self.source, "prepare_outbox_comment", None)
-                if self.native_source and payload.get("publication") and not self.setting("publication_enabled"):
-                    return
-                frozen = payload.get("native_intent")
-                wrong_generation = bool(
-                    frozen
-                    and self.native_source
-                    and frozen.get("generation") != self.source.admission_policy.publishers.generation
-                )
-                if wrong_generation and payload.get("publication", {}).get("clear"):
-                    with self._lock:
-                        self._outbox_done(
-                            current,
-                            loads(current["history"], []),
-                            "reconciliation-required: clear predates authority rotation",
-                            now,
-                        )
-                    return
-                if (
-                    self.native_source
-                    and current["kind"] == "comment"
-                    and ("native_intent" not in payload or wrong_generation)
-                    and prepare_comment is not None
-                ):
-                    if payload.get("publication") and not self.setting("publication_enabled"):
-                        return
-                    intent = prepare_comment(
-                        self.repository,
-                        payload["number"],
-                        payload["body"],
-                        payload["marker"],
-                        sequence=current["id"],
-                        publication=payload.get("publication"),
-                    )
-                    if intent is not None:
-                        # Freeze before the first status/comment POST. A restart
-                        # or uncertain response must retain both nonce and order.
-                        with self._lock, self.store.transaction():
-                            pending = self._pending_entry(current)
-                            if pending is None:
-                                return
-                            payload = loads(pending["payload"], {})
-                            if "native_intent" not in payload or wrong_generation:
-                                payload["native_intent"] = intent
-                                self.store.update("outbox", {"id": current["id"]}, payload=dumps(payload))
                 result = self._perform(current["kind"], payload, now)
         except Exception as caught:  # noqa: BLE001 - every adapter failure is recorded and retried
             error = caught
@@ -9928,16 +9791,6 @@ class Controller:
             if current is None:
                 return
             if error is not None:
-                from .forgejo_source import PublisherNotGranted
-
-                if self.native_source and current["kind"] == "comment" and isinstance(error, PublisherNotGranted):
-                    self._outbox_done(
-                        current,
-                        loads(current["history"], []),
-                        "reconciliation-required: source publication grant is unavailable",
-                        now,
-                    )
-                    return
                 self._outbox_failed(current, loads(current["history"], []), error, now)
             else:
                 self._outbox_done(current, loads(current["history"], []), result, now)
@@ -9973,9 +9826,6 @@ class Controller:
                 done_at=now,
                 result=result,
             )
-            publication = loads(entry["payload"], {}).get("publication")
-            if self.native_source and self.admission is not None and publication and result.startswith("comment "):
-                self.admission.invalidate(loads(entry["payload"], {})["number"], head="", urgent=True)
 
     def _outbox_failed(self, entry: dict[str, Any], history: list[Any], error: Exception, now: float) -> None:
         attempts = entry["attempts"] + 1
@@ -10021,43 +9871,6 @@ class Controller:
             self.source.update_ref(repo, payload["ref"], payload["sha"])
             return "retained"
         if kind == "comment":
-            if "native_intent" in payload and self.native_source:
-                from .forgejo_source import PublicationDamaged, PublicationSuperseded
-
-                if (
-                    payload.get("publication", {}).get("kind") != "recovery"
-                    or payload["native_intent"].get("kind") != "recovery"
-                ):
-                    return "reconciliation-required: unsupported queued native publication"
-
-                try:
-                    return "comment " + str(self.source.publish(payload["native_intent"]))
-                except PublicationSuperseded as error:
-                    known = bool(error.nonce) and any(
-                        (loads(e["payload"], {}).get("native_intent") or {}).get("nonce") == error.nonce
-                        for e in self.store.rows("outbox", {"kind": "comment"})
-                    )
-                    if not known:
-                        with self._lock:
-                            self.store.journal(
-                                now,
-                                "native-publication-history-mismatch",
-                                number=payload["number"],
-                                remote_sequence=error.sequence,
-                                remote_nonce=error.nonce,
-                            )
-                            self.log.warning(
-                                "native publication for #%s requires restore reconciliation (remote sequence %s)",
-                                payload["number"],
-                                error.sequence,
-                            )
-                        return "reconciliation-required: remote publication is absent from the local outbox; reconcile restore"
-                    return "superseded native publication"
-                except PublicationDamaged:
-                    repaired = self.reconcile_source_recovery(
-                        payload["number"], payload["publication"]["head"], payload["native_intent"]["nonce"]
-                    )
-                    return "native publication requeued" if repaired else "superseded damaged native publication"
             return "comment " + str(
                 self.source.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )

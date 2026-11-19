@@ -441,12 +441,9 @@ class ForgejoReadSource:
                 and number is not None
             )
             if shared:
-                from .source_identity import advisory_policy, advisory_scope
+                from .source_identity import advisory_scope
 
                 shared_scope = advisory_scope(self, number)
-                policy = advisory_policy(self)
-                if policy is None:
-                    raise ReadInvalidated("publication policy unavailable for advisory read")
                 global_epoch = transport.shared_generation(advisory_scope(self, None))
 
                 def fresh_fetch():
@@ -456,7 +453,7 @@ class ForgejoReadSource:
                         return bounded_fetch()
 
                 value = transport.shared_read(
-                    [*shared_scope, operation, args, policy, global_epoch],
+                    [*shared_scope, operation, args, global_epoch],
                     fresh_fetch,
                     # A survey read names the PR's (updatedAt, head) as its revision, and
                     # shared_read serves only that revision, so the observation answers until
@@ -467,11 +464,8 @@ class ForgejoReadSource:
                     generation_scope=shared_scope,
                     coalesce_failures=True,
                 )
-                # A cached projection never survives a credential/origin or
-                # publication-policy change in this process.
+                # A cached projection never survives a credential/origin change in this process.
                 self._bound()
-                if advisory_policy(self) != policy:
-                    raise ReadInvalidated("publication policy changed during advisory read")
             elif cache_only:
                 value, hit = self.cache.peek(key, ttl=self.ttl, scope=(self.repository.key, number)), True
             elif cacheable:

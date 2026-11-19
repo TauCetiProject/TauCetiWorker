@@ -82,19 +82,20 @@ def _token(path):
 
 
 def _publishers(value, source):
-    _fields(value, {"generation", "reviews", "statuses", "recoveries"})
-    roles = {}
-    for role in ("reviews", "statuses", "recoveries"):
-        ids = value[role]
-        if (
-            not isinstance(ids, list)
-            or not 0 < len(ids) <= 256
-            or any(type(number) is not int or not 0 < number < 2**63 for number in ids)
-            or len(set(ids)) != len(ids)
-        ):
-            raise ValueError("invalid native publisher identities")
-        roles[role] = frozenset(PrincipalRef(source.repository.forge, str(number)) for number in ids)
-    return NativePublishers(source, **roles, generation=value["generation"])
+    # Older profiles also name a generation and review/status allowlists; scoreboards and
+    # statuses no longer use them, so they are ignored like MixedProfile's retired keys.
+    retired = {"generation", "reviews", "statuses"}
+    if not isinstance(value, dict) or not {"recoveries"} <= set(value) <= {"recoveries", *retired}:
+        raise ValueError("invalid launch fields")
+    ids = value["recoveries"]
+    if (
+        not isinstance(ids, list)
+        or not 0 < len(ids) <= 256
+        or any(type(number) is not int or not 0 < number < 2**63 for number in ids)
+        or len(set(ids)) != len(ids)
+    ):
+        raise ValueError("invalid native publisher identities")
+    return NativePublishers(source, frozenset(PrincipalRef(source.repository.forge, str(number)) for number in ids))
 
 
 @dataclass(frozen=True)

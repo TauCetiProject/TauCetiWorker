@@ -332,12 +332,4 @@ def publish_native_reviews(cfg, prs=()):
     if source.anonymous_discovery:
         return False
     with activate(source, cfg):
-        import os
-        from types import SimpleNamespace
-
-        if os.environ.get("TAUCETI_NATIVE_REVIEW_PUBLISHER"):
-            from .native_review_publisher import QueueReviewPublisher
-
-            if QueueReviewPublisher(SimpleNamespace(source=source)).reconcile(numbers=prs):
-                return True
         return pending(source, cfg, numbers=prs)

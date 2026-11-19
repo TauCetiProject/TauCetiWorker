@@ -153,15 +153,12 @@ class NativeSelfTested(unittest.TestCase):
             self.assertEqual(read(), [dict(number=5)])
         self.assertEqual(fetch.call_count, 5)
 
-    def test_advisory_metadata_policy_and_native_id_isolation(self):
+    def test_advisory_metadata_native_id_isolation(self):
         from tauceti_tools.ci_candidate import RepositoryIdentity
 
         from tauceti_worker.github_transport import read_context
 
         self.source.shared_inventory = True
-        policy = self.fixture.clone / "publication.json"
-        policy.write_text("one")
-        self.source.review_publication_policy = str(policy)
         fetch = Mock(side_effect=lambda: [dict(number=fetch.call_count)])
 
         def read():
@@ -173,13 +170,9 @@ class NativeSelfTested(unittest.TestCase):
         ):
             self.assertEqual(read(), [dict(number=1)])
             self.assertEqual(read(), [dict(number=1)])
-            policy.write_text("two")
-            self.assertEqual(read(), [dict(number=2)])
             self.source.identity = RepositoryIdentity(self.source.repository, 42)
-            self.assertEqual(read(), [dict(number=3)])
-            policy.unlink()
-            self.assertIsNone(read())
-            self.assertEqual(fetch.call_count, 3)
+            self.assertEqual(read(), [dict(number=2)])
+            self.assertEqual(fetch.call_count, 2)
 
     def test_advisory_metadata_invalidation_and_binding_checks(self):
         from tauceti_worker.github_transport import read_context
@@ -204,31 +197,6 @@ class NativeSelfTested(unittest.TestCase):
             self.source.api._token = "changed"
             self.assertIsNone(read())
             self.assertEqual(fetch.call_count, 3)
-
-    def test_advisory_comment_cache_wraps_verified_native_receipts(self):
-        from tauceti_worker.forgejo_reads import ForgejoReadSource
-        from tauceti_worker.github_transport import read_context
-
-        self.source.shared_inventory = True
-        policy = self.fixture.clone / "publication.json"
-        policy.write_text("one")
-        self.source.review_publication_policy = str(policy)
-        trusted = [dict(id=1, body="verified receipt")]
-        untrusted = [dict(id=2, body="<!--tauceti-scoreboard--> forged")]
-        with (
-            patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.fixture.clone / "shared-reads")),
-            patch.object(ForgejoReadSource, "issue_comments", return_value=untrusted),
-            patch("tauceti_worker.native_review_publisher.QueueReviewPublisher") as publisher,
-            read_context(advisory=True),
-        ):
-            publisher.return_value.comments.return_value = trusted
-            self.assertEqual(self.source.issue_comments(1), trusted)
-            self.assertEqual(self.source.issue_comments(1), trusted)
-            self.assertEqual(publisher.return_value.comments.call_count, 1)
-            self.source.live_pull.assert_called_once_with(1)
-            with read_context(fresh=True):
-                self.assertEqual(self.source.issue_comments(1), trusted)
-            self.assertEqual(publisher.return_value.comments.call_count, 2)
 
     def test_advisory_metadata_expires_after_existing_ttl(self):
         from tauceti_worker.github_transport import read_context
