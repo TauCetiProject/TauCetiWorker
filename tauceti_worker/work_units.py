@@ -10,6 +10,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -1951,7 +1952,7 @@ def _do_fixlike(
 
     `charged` names the per-PR counters the caller already spent, so a provider outage can hand them
     back (see _refund_infra_failure)."""
-    from .build_resources import MaintenanceStop, queue_owned
+    from .build_resources import CLOSED_BY_AGENT, MaintenanceStop, closed_by_round, queue_owned
 
     pr, head = c.pr, c.head
     p = next((x for x in sv.open_prs if x.number == pr), None)
@@ -2229,6 +2230,14 @@ def _do_fixlike(
                     if c.progress is None:
                         c.progress = {}
                     c.progress["published"] = published_after
+    if rc == 0 and closed_by_round(c) or stop.outcome and rc in STOPPED_AGENT_CODES:
+        # The agent closed its own PR (verified supersession or final resolution): a completed
+        # round with its own outcome, whether it exited by itself or was stopped after closing.
+        # Any other exit after a closure (a crash, incomplete cleanup) keeps its failure.
+        from .activity import observation
+
+        observation(CLOSED_BY_AGENT)
+        rc = 0
     if rc == 0:
         w.rs.bust(pr)
     elif not foreign:
@@ -2236,6 +2245,10 @@ def _do_fixlike(
         # provider later fails. Do not turn its scope into repeated paid tasks.
         _refund_infra_failure(w, c, label, charged)  # raises NoProgress when the provider was at fault
     return rc
+
+
+# How an agent ends when MaintenanceStop cancels it: SIGTERM, or SIGKILL after the grace period.
+STOPPED_AGENT_CODES = frozenset({-signal.SIGTERM, -signal.SIGKILL, 128 + signal.SIGTERM, 128 + signal.SIGKILL})
 
 
 # Appended to the last per-head repair prompt of an owned PR (see _progressed_direct for the rule).
