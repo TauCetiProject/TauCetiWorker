@@ -160,3 +160,24 @@ Fleet uses this interface from a compatible Worker runtime instead of duplicatin
 the grammar. Its counts describe the file; the worker round additionally overlays
 forge evidence. `_fleet-protocol` and the running manager advertise
 `targets_inspect: 1` and `roadmap_targets: 1`.
+
+## Maintenance priority
+
+A configured list also gives the account's marked pull requests priority within
+`rebase`, `fix-ci`, `fix`, and own-PR `review` queues. Complete and partial target
+markers both count when their area and id name an item in the file, including
+items marked done: their PRs may still need repair or review. Other authors'
+review positions and automatic Mathlib bump priority stay unchanged. Listed work
+never jumps across stages: an unlisted rebase still precedes a listed fix, and
+lint repair and progress reports keep their existing order. Unlisted eligible
+pull requests remain available after the listed ones.
+
+Priority uses the current source's surveyed PR inventory. For a compact GitHub
+survey, an optional mirror inventory supplies marker bodies only when the PR
+number and head match; unavailable coverage keeps the ordinary ordering without
+a direct GitHub fallback. A native source uses its own markers, so equal numbers
+on another forge do not confer priority. In a mixed-source round, stage selection
+across sources remains unchanged; the selected source's candidates are ordered
+within that stage. `--pr` still limits which candidates can run. If the file
+cannot be read or parsed, maintenance keeps its usual order and logs the reason;
+roadmap authoring retains the foundation's stricter file validation.
