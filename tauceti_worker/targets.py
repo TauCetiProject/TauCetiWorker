@@ -642,11 +642,17 @@ def inferred_needs(targets: Targets, item: TargetItem) -> list[TargetItem]:
     return [dep for slug in item.needs if (dep := targets.find(slug)) is not None and inferred(dep) is not None]
 
 
-def render_report(item: TargetItem, needs: list[TargetItem], path: str) -> str:
-    """The bullet, under the assignment, that lets the round report an inferred prerequisite wanting."""
+def render_report(targets: Targets, item: TargetItem, needs: list[TargetItem], path: str) -> str:
+    """The bullet, under the assignment, that lets the round report an inferred prerequisite
+    wanting: each such prerequisite's area and whole line, in any area, then how to report it."""
     names = ", ".join(f"`{dep.slug}`" for dep in needs)
+    lines = "\n".join(f"  {dep.area}: {render_item(targets, dep)}" for dep in needs)
     return f"""\
-  - {names} {"is" if len(needs) == 1 else "are"} marked `[x]` because the worker read the base branch's source, not because a pull request for {"it" if len(needs) == 1 else "them"} merged; each `inferred:` clause names the declarations taken as evidence. If you find one of them missing, or present but unusable for `{item.slug}` (a different statement, too weak, or proved with `sorry`), write its slug on a line of its own to `{path}` and say in your final message what is missing. The worker opens such a prerequisite again; it reads nothing else from that file, and only these slugs.
+  - {names} {"is" if len(needs) == 1 else "are"} marked `[x]` because the worker read the base branch's source, not because a pull request for {"it" if len(needs) == 1 else "them"} merged; each `inferred:` clause names the declarations taken as evidence:
+  ```
+{lines}
+  ```
+  If you find one of them missing, or present but unusable for `{item.slug}` (a different statement, too weak, or proved with `sorry`), write its slug on a line of its own to `{path}` and say in your final message what is missing. The worker opens such a prerequisite again; it reads nothing else from that file, and only these slugs.
 """
 
 

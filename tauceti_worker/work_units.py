@@ -3292,7 +3292,7 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
             shutil.rmtree(report[0], ignore_errors=True)
             report[0].mkdir(parents=True)
             shown = "/opt/target-report" if bubble else str(report[0])
-            assignment += render_report(item, needs, f"{shown}/prerequisites.txt")
+            assignment += render_report(live, item, needs, f"{shown}/prerequisites.txt")
         os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))
         report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
     elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)

@@ -275,7 +275,7 @@ class Reopen(Tmp):
         needs = t.inferred_needs(listed, item)
         self.assertEqual([dep.slug for dep in needs], ["tail-sigma"])
         self.assertEqual(t.inferred_needs(listed, listed.find("strong-law")), [])
-        bullet = t.render_report(item, needs, "/x/prerequisites.txt")
+        bullet = t.render_report(listed, item, needs, "/x/prerequisites.txt")
         self.assertIn("`tail-sigma` is marked `[x]` because the worker read the base branch's source", bullet)
         self.assertIn("`/x/prerequisites.txt`", bullet)
         directory = self.tmp / "report"
@@ -287,6 +287,19 @@ class Reopen(Tmp):
         with patch("tauceti_worker.activity.current_round_id", return_value="0123456789abcdef"):
             work._reopen_reported((directory, item, needs))
         self.assertIn("by zero-one round 0123456789ab)", self.path.read_text())
+
+
+class CrossArea(unittest.TestCase):
+    def test_an_inferred_prerequisite_in_another_area_is_shown_whole(self):
+        text = LIST + "\n## Analysis\n- [ ] `next` — Layer 1, the next result (needs: `tail-sigma`)\n"
+        listed = t.parse_targets(text)
+        item = listed.find("next")
+        prompt = t.render_assignment(listed, item) + t.render_report(listed, item, t.inferred_needs(listed, item), "/r")
+        self.assertIn(
+            f"  Probability: - [x] `tail-sigma` — Layer 1, the tail sigma-algebra (inferred: "
+            f"{TAIL}#TailSigma.measure on 2026-01-01; needs: none)",
+            prompt,
+        )
 
 
 class AuthoringRound(Tmp):
