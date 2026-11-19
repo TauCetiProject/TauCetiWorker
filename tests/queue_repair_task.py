@@ -38,6 +38,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -3715,6 +3716,173 @@ class Preflight(Fixture):
         repair_task.make_client(self.config(token=None))
         self.assertEqual(os.environ["GH_TOKEN"], "dedicated")
         self.assertNotIn("GITHUB_TOKEN", os.environ)
+
+
+class WorkerAsTheQueueApp(Fixture):
+    """``TAUCETI_QUEUE_GITHUB_APP``: the worker mints App installation tokens and a local-worker bearer."""
+
+    PEM = None
+
+    def app(self, permissions=None):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from tauceti_queue import github_app
+
+        if WorkerAsTheQueueApp.PEM is None:
+            WorkerAsTheQueueApp.PEM = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+            )
+        credentials = github_app.AppCredentials(
+            app_id=5607007,
+            slug="tauceti-queue",
+            installation_id=178451644,
+            private_key_pem=self.PEM,
+            webhook_secret=b"",
+        )
+        clock = [1_800_000_000.0]
+        minted = []
+
+        def transport(method, url, headers, body):
+            minted.append(json.loads(body))
+            expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock[0] + 3600))
+            granted = permissions or {"contents": "write", "workflows": "write", "metadata": "read"}
+            payload = {"token": f"ghs_installation{len(minted)}", "expires_at": expires, "permissions": granted}
+            return 201, {}, json.dumps(payload).encode()
+
+        app = repair_task.WorkerApp(credentials, transport, clock=lambda: clock[0])
+        environment = patch.dict(
+            os.environ, {"TAUCETI_QUEUE_GITHUB_APP": str(self.root / "app"), "GITHUB_TOKEN": "personal"}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        for key in ("TAUCETI_QUEUE_TOKEN", "TAUCETI_QUEUE_TOKEN_FILE"):
+            os.environ.pop(key, None)
+        installed = patch.object(repair_task, "_worker_app", app)
+        installed.start()
+        self.addCleanup(installed.stop)
+        return app, credentials, clock, minted
+
+    def test_the_service_bearer_is_a_fresh_local_worker_bearer(self):
+        from tauceti_queue import github_app
+
+        app, credentials, clock, minted = self.app()
+        client = repair_task.make_client(self.config(token=None))
+        first = client.token()
+        self.assertTrue(github_app.verify_local_worker_bearer(credentials, first, clock[0]))
+        clock[0] += 600
+        self.assertTrue(github_app.verify_local_worker_bearer(credentials, client.token(), clock[0]))
+        self.assertFalse(github_app.verify_local_worker_bearer(credentials, first, clock[0]), "an old one expires")
+        self.assertEqual(minted, [], "the service bearer spends no GitHub request")
+        self.assertEqual(repair_task.admin_login(), "tauceti-queue[bot]")
+
+    def test_gh_and_git_get_a_current_installation_token_with_narrowed_permissions(self):
+        app, _, clock, minted = self.app()
+        self.assertIsNone(repair_task.refresh_github_token())
+        self.assertEqual(os.environ["GH_TOKEN"], "ghs_installation1")
+        self.assertNotIn("GITHUB_TOKEN", os.environ)
+        self.assertEqual(minted, [{"permissions": repair_task.WORKER_APP_PERMISSIONS}])
+        repair_task.verify_admin(PROJECT)
+        self.assertEqual(len(minted), 1, "the token is reused while it is fresh")
+        clock[0] += 3600 - 60
+        repair_task.verify_admin(PROJECT)
+        self.assertEqual(os.environ["GH_TOKEN"], "ghs_installation2", "renewed before it expires")
+        checks = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
+        self.assertTrue(checks["github token"]["ok"], checks["github token"])
+        self.assertEqual(checks["repository access"]["detail"], f"tauceti-queue[bot] with contents write on {PROJECT}")
+        self.assertNotIn("ghs_installation", json.dumps(checks))
+
+    def test_an_installation_without_contents_write_stops_the_worker(self):
+        from tauceti_worker.config import Die
+
+        self.app(permissions={"contents": "read", "metadata": "read"})
+        with self.assertRaises(Die):
+            repair_task.verify_admin(PROJECT)
+
+    def test_an_unmintable_token_defers_rather_than_using_another(self):
+        from tauceti_queue import github_app
+        from tauceti_worker.config import NoProgress
+
+        app, *_ = self.app()
+        os.environ["GH_TOKEN"] = "personal"
+        with patch.object(app.tokens, "token", side_effect=github_app.CredentialsError("HTTP 502", retryable=True)):
+            with self.assertRaises(NoProgress):
+                repair_task.verify_admin(PROJECT)
+        self.assertEqual(os.environ["GH_TOKEN"], "personal", "unchanged; the push path then refuses to push")
+
+    def test_loading_the_app_hides_the_hosts_gh_login(self):
+        from tauceti_queue import github_app
+
+        self.app()
+        directory = self.root / "app"
+        directory.mkdir()
+        (directory / "github-app.json").write_text(json.dumps({"id": 1, "installation_id": 2, "slug": "tauceti-queue"}))
+        (directory / "github-private-key.pem").write_bytes(self.PEM)
+        os.environ.update(GH_TOKEN="personal", GH_CONFIG_DIR=str(HOME / ".config" / "gh"))
+        with patch.object(repair_task, "_worker_app", None):
+            app = repair_task.worker_app()
+            self.assertIsInstance(app.credentials, github_app.AppCredentials)
+        self.assertNotIn("GH_TOKEN", os.environ)
+        self.assertEqual(list(Path(os.environ["GH_CONFIG_DIR"]).iterdir()), [])
+
+    def test_git_asks_only_gh_for_github_credentials(self):
+        personal = self.root / "personal-gitconfig"
+        personal.write_text(
+            '[credential "https://github.com"]\n\thelper = !f() { echo username=me; echo password=personal; }; f\n'
+            "[http]\n\textraHeader = Authorization: Basic personal\n[user]\n\tname = Kept\n"
+        )
+        environment = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(personal)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        repair_task.pin_app_credentials()
+
+        def config(*args):
+            result = subprocess.run(["git", "config", *args], capture_output=True, text=True, check=False)
+            return result.stdout.splitlines()
+
+        self.assertEqual(config("--get-all", "user.name"), ["Kept"], "the user's own config still applies")
+        self.assertEqual(config("--get-urlmatch", "http.extraHeader", "https://github.com/"), [""])
+        helpers = config("--get-urlmatch", "credential.helper", "https://github.com")
+        self.assertTrue(helpers[-1].endswith(" auth git-credential"), helpers)
+        filled = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"},
+            check=False,
+        )
+        self.assertNotIn("personal", filled.stdout)
+
+    def test_a_push_without_a_mintable_token_does_not_run(self):
+        from tauceti_queue import github_app
+
+        app, *_ = self.app()
+        task = types.SimpleNamespace(
+            task_id="7", repository=PROJECT, submission_ref="refs/tauceti-queue/submissions/7/1"
+        )
+        with (
+            patch.object(app.tokens, "token", side_effect=github_app.CredentialsError("HTTP 502", retryable=True)),
+            patch.object(repair_task, "require_task_execution"),
+            patch.object(repair, "run_logged", side_effect=AssertionError("pushed")),
+        ):
+            record = repair_task.push_result(self.config(token=None), task, self.root, "a" * 40, self.root, None)
+            self.assertEqual((record["ok"], record["rc"]), (False, 75))
+            self.assertEqual(repair_task.check_submission_access(self.config(token=None), task, self.root)["rc"], 75)
+
+    def test_the_app_and_a_worker_token_together_are_refused(self):
+        from tauceti_worker.config import Die
+
+        self.app()
+        os.environ["TAUCETI_QUEUE_TOKEN"] = "worker-token"
+        with patch.object(repair_task, "_worker_app", None), self.assertRaises(Die):
+            repair_task.worker_app()
+
+    def test_agents_inherit_neither_the_app_directory_nor_a_token(self):
+        self.app()
+        changes = repair.isolation_env(self.root / "isolation", {})
+        for key in ("GH_TOKEN", "GITHUB_TOKEN", "TAUCETI_QUEUE_GITHUB_APP", "TAUCETI_QUEUE_CONFIG"):
+            self.assertIsNone(changes[key], key)
 
 
 def pairs(argv: list[str], flag: str) -> list[tuple[str, str]]:

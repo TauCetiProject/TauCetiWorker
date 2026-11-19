@@ -1586,6 +1586,16 @@ class GitHubAdapter:
         """Bors's reviewer check: a collaborator with push access."""
         return self.collaborator_permission(repo or self.repo, login) in REVIEWER_PERMISSIONS
 
+    def app_credentials(self) -> github_app.AppCredentials | None:
+        """The App credentials this adapter mints installation tokens with, when it has them."""
+        credentials = getattr(self._tokens, "credentials", None)
+        return credentials if isinstance(credentials, github_app.AppCredentials) else None
+
+    def local_worker_login(self) -> str | None:
+        """The login a co-located repair worker's `github_app.local_worker_bearer` resolves to."""
+        credentials = self.app_credentials()
+        return github_app.local_worker_login(credentials) if credentials is not None else None
+
     def user_for_token(self, token: str) -> tuple[str, int] | None:
         """The login and id a bearer token authenticates as, or None when GitHub rejects it (401).
 

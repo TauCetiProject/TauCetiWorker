@@ -1706,6 +1706,15 @@ class Tasks(ControllerCase):
         result = self.controller.submit_task(task.task_id, task.claim_token, head["tip"])
         self.assertTrue(result.accepted, "the submission's admin check serves the same stale answer")
 
+    def test_the_local_worker_login_claims_and_submits_without_a_github_admin_read(self):
+        head = self.failing_head()
+        self.controller.local_worker_login = "tauceti-queue[bot]"
+        self.github.unavailable = "rate limited for 2400s"
+        task = self.controller.claim_task("worker-1", "tauceti-queue[bot]")
+        self.assertIsNotNone(task, "the server resolves this login only from a bearer signed with the App's key")
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, head["tip"]).accepted)
+        self.assertEqual([c for c in self.github.calls if c[0] == "repository_admin"], [])
+
     def test_admin_answers_survive_a_restart_during_an_outage(self):
         self.failing_head()
         self.assertIsNotNone(self.controller.claim_task("worker-1", "admin-worker"))

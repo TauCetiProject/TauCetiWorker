@@ -2276,6 +2276,8 @@ def isolation_env(
     changes["GITHUB_TOKEN"] = None
     changes["TAUCETI_QUEUE_TOKEN"] = None
     changes["TAUCETI_QUEUE_TOKEN_FILE"] = None
+    changes["TAUCETI_QUEUE_GITHUB_APP"] = None
+    changes["TAUCETI_QUEUE_CONFIG"] = None
     empty_gh = root / "gh-config-empty"
     empty_gh.mkdir(parents=True, exist_ok=True)
     changes["GH_CONFIG_DIR"] = str(empty_gh)

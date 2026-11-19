@@ -10,6 +10,7 @@ restarts, revalidated in the background, revocable), the controller
 error mapping (403, 404, 400, 500), the urgent-lane request validation and the emergency endpoints.
 """
 
+import dataclasses
 import http.client
 import json
 import sys
@@ -23,7 +24,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 from queue_feeds import FakeSource  # noqa: E402
 
-from tauceti_queue import feeds, server, webhook  # noqa: E402
+from tauceti_queue import feeds, github_app, server, webhook  # noqa: E402
 from tauceti_queue.github_adapter import PullRequest  # noqa: E402
 from tauceti_queue.ports import GitHubUnavailable  # noqa: E402
 
@@ -663,6 +664,94 @@ class ServerTest(unittest.TestCase):
             self.assertTrue(poller.requested)
         finally:
             self.server.poller = None
+
+
+class LocalWorkerBearer(ServerTest):
+    """A co-located repair worker authenticates with a bearer signed by the App's private key."""
+
+    CREDENTIALS = github_app.AppCredentials(
+        app_id=5607007, slug="tauceti-queue", installation_id=178451644, private_key_pem=b"key", webhook_secret=b""
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        credentials = cls.CREDENTIALS
+        original = FakeAdapter.__init__
+
+        class AppAdapter(FakeAdapter):
+            def __init__(self):
+                original(self)
+                self.tokens["ghp_impostor"] = ("tauceti-queue[bot]", 9)
+
+            def app_credentials(self):
+                return credentials
+
+        cls.controller = FakeController()
+        cls.adapter = AppAdapter()
+        cls.clock = [1_793_775_999.0]
+        config = server.ServerConfig(
+            webhook_secret=SECRET,
+            repositories={1: TAUCETI},
+            adapter=cls.adapter,
+            host="127.0.0.1",
+            port=0,
+            revision="abc123",
+            clock=lambda: cls.clock[0],
+        )
+        cls.server = server.create_server(cls.controller, config)
+        cls.port = cls.server.server_address[1]
+        server.serve_in_thread(cls.server)
+
+    def local(self, *, at=None, credentials=None):
+        issued = self.clock[0] if at is None else at
+        return self.bearer(github_app.local_worker_bearer(credentials or self.CREDENTIALS, issued))
+
+    def test_the_worker_endpoints_accept_it_as_the_app_without_asking_github(self):
+        lookups, admin_checks = self.adapter.lookups, self.adapter.admin_checks
+        status, body = self.request("POST", "/tasks/claim", {"worker": "w1"}, self.local())
+        self.assertEqual((status, body["task"]), (200, "repair-2650"))
+        self.assertEqual(self.controller.calls[-1], ("claim_task", "w1", "tauceti-queue[bot]"))
+        status, _ = self.request("POST", "/tasks/7/renew", {"claim_token": "t1"}, self.local(at=self.clock[0] - 299))
+        self.assertEqual(status, 200)
+        self.assertEqual((self.adapter.lookups, self.adapter.admin_checks), (lookups, admin_checks))
+
+    def test_admin_endpoints_refuse_it(self):
+        admin_checks = self.adapter.admin_checks
+        for path, body in (
+            ("/admin/settings", {"insertion_age_window": 8}),
+            ("/admin/urgent", {"repo": TAUCETI, "pr": 42}),
+            ("/admin/retry-ci", {}),
+            ("/admin/revoke-identity", {"login": "kim-em"}),
+            ("/admin/primary", {"primary": "github"}),
+            ("/admin/rebuild-head", {}),
+            ("/admin/evict-native", {"withdraw": [1]}),
+            ("/admin/emergency", {"repo": TAUCETI, "pr": 42, "reason": "r"}),
+            ("/admin/emergency-cancel", {"repo": TAUCETI, "pr": 42}),
+            ("/admin/import-bors", {"observation": {}}),
+            ("/admin/reconcile-approvals", {}),
+        ):
+            status, answer = self.request("POST", path, body, self.local())
+            self.assertEqual(status, 403, (path, answer))
+        self.assertEqual(self.controller.calls, [])
+        self.assertEqual(self.adapter.admin_checks, admin_checks, "no GitHub admin read is spent on it")
+
+    def test_stale_future_or_forged_bearers_and_impostor_tokens_are_refused(self):
+        other = dataclasses.replace(self.CREDENTIALS, private_key_pem=b"another key")
+        for headers in (
+            self.local(at=self.clock[0] - 301),
+            self.local(at=self.clock[0] + 61),
+            self.local(credentials=other),
+            self.bearer(github_app.LOCAL_WORKER_PREFIX + "1793775999.00"),
+            self.bearer(github_app.LOCAL_WORKER_PREFIX + "x.y"),
+            self.bearer("ghp_impostor"),
+        ):
+            self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "w1"}, headers)[0], 401, headers)
+        self.assertEqual(self.controller.calls, [])
+
+    def test_a_server_without_app_credentials_refuses_it(self):
+        auth = server.BearerAuth(FakeAdapter(), ttl=60, clock=lambda: self.clock[0])
+        header = "Bearer " + github_app.local_worker_bearer(self.CREDENTIALS, self.clock[0])
+        self.assertIsNone(auth.resolve(header))
 
 
 class PersistentIdentities(unittest.TestCase):

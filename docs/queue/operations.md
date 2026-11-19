@@ -468,7 +468,26 @@ succeeds before then continues the claim.
   `/run/current-system/sw/bin/bwrap`. A host without it may set `TAUCETI_QUEUE_SANDBOX=0` in the
   environment file, which runs builds unsandboxed and says so in the log on every build.
 - **Credentials**, by name; never print their values.
-  - The GitHub token of the worker's dedicated account, which must be a repository admin on
+  - On the queue service's host, the queue App: `TAUCETI_QUEUE_GITHUB_APP` names the directory holding
+    `github-app.json` and `github-private-key.pem` (the service's own `~/.config/tauceti-queue`). The
+    worker mints installation tokens itself, narrowed to contents write, workflows write and metadata
+    read, kept in memory and renewed five minutes before they expire; it exports the current one as
+    `GH_TOKEN` for its own `gh` calls and for the submission push through `gh auth git-credential`,
+    and points its `gh` at an empty config so the host's gh login is never read. Its git reads a
+    private global config that includes `~/.gitconfig` and then resets every GitHub credential helper
+    and `http.extraHeader`, leaving `gh auth git-credential` alone, so no personal helper answers a
+    fetch or push and no storing helper keeps the token. Its local check
+    before claiming is that the installation reads the repository with contents write. To the service
+    it presents `github_app.local_worker_bearer`: a timestamp and an HMAC keyed by the App's private
+    key, minted per request and accepted for five minutes. The service verifies it with its own copy
+    of the key, with no GitHub request, and resolves it to the App's bot login (`tauceti-queue[bot]`),
+    which may claim, renew, release, checkpoint, submit and report inference; every `/admin/` route
+    refuses it, and no GitHub token can resolve to that login. Trust: any process that can read the
+    App's private key can now act as a repair worker. Such a process can already mint installation
+    tokens that push to the content repository and act as the queue itself, so this adds no new
+    holder of power; the bearer does not expose the key, and a captured one is a worker credential
+    for at most five minutes. Rotating the App key revokes it.
+  - Elsewhere, the GitHub token of the worker's dedicated account, which must be a repository admin on
     `TauCetiProject/TauCeti`: the service applies `security_audit.require_admin` to the login the
     bearer token resolves to at claim and at submit, and the worker applies the same predicate before
     claiming. It is read from `TAUCETI_QUEUE_TOKEN_FILE` (a mode 0600 file), else

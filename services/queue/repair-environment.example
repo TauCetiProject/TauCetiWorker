@@ -20,11 +20,16 @@ TAUCETI_QUEUE_POLL_SECONDS=60
 TAUCETI_QUEUE_CLONE=/home/operator/TauCetiQueue-data/repair-clone
 TAUCETI_QUEUE_TASK_ROOT=/home/operator/TauCetiQueue-data/repair
 
-# Credentials, by location. Required: the GitHub token of the worker's dedicated account
-# (repository admin on TauCetiProject/TauCeti) in a mode 0600 file. The worker refuses to start
-# without it and never falls back to $GH_TOKEN or `gh auth token`, the operator's personal token.
-# Use an account other than the operator's: every token of one user shares that user's quota.
-TAUCETI_QUEUE_TOKEN_FILE=/home/operator/.config/tauceti-queue/repair-github-token
+# Credentials, by location; exactly one of the two. A worker on the queue service's host acts as the
+# queue's GitHub App: the directory holding its github-app.json and github-private-key.pem. It mints
+# its own installation tokens for its GitHub calls and pushes, and authenticates to the service with
+# a short-lived bearer signed by the App key (docs/queue/operations.md, "Repair worker").
+TAUCETI_QUEUE_GITHUB_APP=/home/operator/.config/tauceti-queue
+# A worker elsewhere: the GitHub token of its dedicated account (repository admin on
+# TauCetiProject/TauCeti) in a mode 0600 file. The worker refuses to start without a credential and
+# never falls back to $GH_TOKEN or `gh auth token`, the operator's personal token. Use an account
+# other than the operator's: every token of one user shares that user's quota.
+#TAUCETI_QUEUE_TOKEN_FILE=/home/operator/.config/tauceti-queue/repair-github-token
 
 # The repair agent's providers, tried in this order for each task (docs/queue/repair-task.md,
 # "Providers"):
