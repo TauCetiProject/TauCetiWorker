@@ -697,6 +697,10 @@ class GitHubAdapter:
         self._admission_reads: dict = {}
         self._admission_listing: dict = {}
         self._admission_comment_pages: dict = {}
+        # Decision 38 step 4, slice 2: take the merge base from the clone instead of the compare
+        # API when it is unambiguous there (set from `admission_local_merge_base` each pass).
+        self.local_merge_base = False
+        self.merge_base_sources = {"local": 0, "compare": 0}
 
     # -- pull requests
 
@@ -1206,6 +1210,31 @@ class GitHubAdapter:
         # ambiguous: retain the target identity and let the compare API resolve a fresh decision.
         return bases[0] if len(bases) == 1 else ",".join([*bases, base])
 
+    def _local_merge_base(self, base: str, head: str) -> str | None:
+        """The merge base compare would report, from the clone, or None when the clone cannot vouch
+        for it: a shallow clone (history may be cut), a missing object, or not exactly one base.
+
+        `base` and `head` are the exact OIDs this read fetched; the fence after the read still
+        requires both to be unchanged, so a moved head or target discards the result.
+        """
+        if not self.clone_dir or not SHA.fullmatch(base) or not SHA.fullmatch(head):
+            return None
+        if any(os.environ.get(name) for name in ("GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE")):
+            return None  # an environment that rewrites ancestry
+        try:
+            if chain.git(self.clone_dir, "rev-parse", "--is-shallow-repository").strip() != "false":
+                return None
+            grafts = chain.git(self.clone_dir, "rev-parse", "--git-path", "info/grafts").strip()
+            if os.path.exists(os.path.join(self.clone_dir, grafts)):
+                return None  # grafts change ancestry without making the clone shallow
+            if not chain.object_exists(self.clone_dir, base) or not chain.object_exists(self.clone_dir, head):
+                return None
+            # Replacement refs change ancestry too; GitHub's answer ignores them.
+            bases = chain.git(self.clone_dir, "--no-replace-objects", "merge-base", "--all", base, head).split()
+        except chain.ChainError:
+            return None
+        return bases[0] if len(bases) == 1 and SHA.fullmatch(bases[0]) else None
+
     def admission_snapshot(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """Read complete current inputs and the exact reviewed diff; never run a PR's code."""
         progress = self._admission_reads.get((repo, number))
@@ -1225,11 +1254,20 @@ class GitHubAdapter:
             self.fetch_refs(repo, missing)
         # The pending head stays reachable across local GC until it is replaced or closed.
         chain.git(self.clone_dir, "update-ref", f"{chain.REF_NAMESPACE}/admission/{number}", pull.head_sha)
+        if progress.get("merge_base_source") == "local" and not self.local_merge_base:
+            # The setting was turned off while this read waited: compare answers, as it now must.
+            progress.pop("merge_base", None)
+            progress.pop("merge_base_source", None)
         if "merge_base" not in progress:
-            _, compare = self.client.get_json(
-                f"repos/{repo}/compare/{pull.base_sha}...{pull.head_sha}", params={"per_page": 1}
-            )
-            progress["merge_base"] = ((compare or {}).get("merge_base_commit") or {}).get("sha")
+            local = self._local_merge_base(pull.base_sha, pull.head_sha) if self.local_merge_base else None
+            if local is not None:
+                progress["merge_base"], progress["merge_base_source"] = local, "local"
+            else:
+                _, compare = self.client.get_json(
+                    f"repos/{repo}/compare/{pull.base_sha}...{pull.head_sha}", params={"per_page": 1}
+                )
+                progress["merge_base"] = ((compare or {}).get("merge_base_commit") or {}).get("sha")
+                progress["merge_base_source"] = "compare"
         merge_base = progress["merge_base"]
         if not isinstance(merge_base, str) or not SHA.fullmatch(merge_base):
             raise GitHubError("compare did not return a complete merge base")
@@ -1301,6 +1339,8 @@ class GitHubAdapter:
             self._admission_reads.pop((repo, number), None)
             raise GitHubError("PR inputs changed while admission was reading source evidence")
         self._admission_reads.pop((repo, number), None)
+        source = progress.get("merge_base_source", "compare")
+        self.merge_base_sources[source] = self.merge_base_sources.get(source, 0) + 1
         return ports.AdmissionSnapshot(
             fresh,
             merge_base,

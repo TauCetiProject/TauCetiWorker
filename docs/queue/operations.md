@@ -874,6 +874,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `approval_poll_interval_seconds` | `900` | integer, at least 1 |
 | `github_background_floor` | `1000` | integer, at least 0; queue App requests left at which admission reads wait for the reset |
 | `admission_evidence_mode` | `off` | `off` or `shadow`; see "Admission evidence shadow" below |
+| `admission_local_merge_base` | `false` | true takes a GitHub PR's merge base from the local clone when it is complete and the merge base is unique there, instead of the compare API; `status.admission.merge_base_sources` counts both |
 | `membership_label` | `bors-staging` | text |
 | `repaired_label` | `repaired-in-queue` | text; empty disables |
 | `insertion_probe_budget_seconds` | `20` | integer, at least 0 |
