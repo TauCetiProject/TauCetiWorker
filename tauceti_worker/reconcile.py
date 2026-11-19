@@ -15,7 +15,7 @@ completion" in the same document). The pieces:
     settle(targets, seen)          pure: the edits that pull request states imply
     audit(targets, roadmap)        pure but for reading STATUS.md: inferred ticks a coverage header refutes
     candidates(live)               the open items an inference look may ask about, most blocking first
-    confirmed(checkout, verdict)   a model verdict reduced to declarations the checkout has
+    confirmed(checkout, verdict)   a model verdict reduced to declarations the checkout has (`identity`)
     reopen(slugs, seen, by)        take back inferred ticks a dependent's round found wanting
     publish(path, compute)         compute the edits on the published list and publish them
     run(w, c, profile)             one reconciliation, under the list's lock
@@ -473,7 +473,6 @@ _LEAN_DECLARATION = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:protected|private|noncomputable|scoped|unsafe|partial|nonrec)\s+)*"
     r"(?:theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)\s+([^\s:({\[]+)"
 )
-_LEAN_SCOPE = re.compile(r"^\s*(?:(namespace)\s+(\S+)|(?:noncomputable\s+)?(section)\b|(end)\b)")
 
 
 def _code(text: str) -> str:
@@ -503,49 +502,39 @@ def _code(text: str) -> str:
     return "".join(out)
 
 
-def declarations(text: str) -> set[str]:
-    """The fully qualified names a Lean file declares, from its `namespace`/`section`/`end` nesting
-    and `_root_.` prefixes. A reading of the source's lines, not an elaboration."""
-    scopes: list[list[str]] = []
-    found = set()
-    for line in _code(text).splitlines():
-        scope = _LEAN_SCOPE.match(line)
-        if scope and scope.group(1):
-            scopes.append(scope.group(2).split("."))
-        elif scope and scope.group(3):
-            scopes.append([])
-        elif scope and scope.group(4):
-            if scopes:
-                scopes.pop()
-        elif declared_here := _LEAN_DECLARATION.match(line):
-            name = declared_here.group(1)
-            if name.startswith("_root_."):
-                found.add(name[len("_root_.") :])
-            else:
-                found.add(".".join([*(part for parts in scopes for part in parts), name]))
-    return found
+def names(text: str) -> set[str]:
+    """The last name components a Lean file declares, read outside comments and strings."""
+    found = (_LEAN_DECLARATION.match(line) for line in _code(text).splitlines())
+    return {m.group(1).rsplit(".", 1)[-1] for m in found if m}
 
 
-def canonical(checkout: Path, file: str, name: str) -> str | None:
-    """`path#Full.Name` for a declaration the checkout's file declares, with the path normalized and
-    the name resolved to the one fully qualified declaration it is a dot-suffix of; None when the
-    path leaves the checkout or the name matches no declaration, or more than one."""
+def identity(file: str, name: str) -> str | None:
+    """`path#name` for evidence: the path normalized, the name cut to its last component, so the
+    namespace a declaration is spelled with never makes it different evidence. None for a path that
+    leaves the checkout or a name that is not one."""
     path = posixpath.normpath(file)
     if not _FILE.fullmatch(path) or path.startswith("/") or ".." in path.split("/") or not _NAME.fullmatch(name):
         return None
+    return f"{path}#{name.rsplit('.', 1)[-1]}"
+
+
+def canonical(checkout: Path, file: str, name: str) -> str | None:
+    """`identity(file, name)` when the checkout's file declares a name with that last component."""
+    found = identity(file, name)
+    if found is None:
+        return None
+    path, _, last = found.partition("#")
     try:
-        text = (checkout / path).read_text()
+        return found if last in names((checkout / path).read_text()) else None
     except (OSError, UnicodeDecodeError):
         return None
-    matches = {full for full in declarations(text) if full == name or full.endswith("." + name)}
-    return f"{path}#{matches.pop()}" if len(matches) == 1 else None
 
 
 def confirmed(checkout: Path, verdict, refused: Iterable[frozenset[str]] = ()) -> frozenset[str] | None:
-    """The canonical `path#Full.Name` evidence (`canonical`) of `verdict` when it is `{"landed":
-    true, "evidence": [{"file": ..., "declaration": ...}, ...]}` with one to MAX_EVIDENCE entries,
-    each resolving to a declaration of the checkout, and the evidence is not within what a
-    `reopened:` clause (`refused`, compared canonically too) already found wanting; None otherwise."""
+    """The evidence (`canonical`) of `verdict` when it is `{"landed": true, "evidence": [{"file":
+    ..., "declaration": ...}, ...]}` with one to MAX_EVIDENCE entries, each declared in the
+    checkout, and it is not within what a `reopened:` clause (`refused`, read as `identity` too)
+    already found wanting; None otherwise."""
     if not (isinstance(verdict, dict) and verdict.get("landed") is True):
         return None
     entries = verdict.get("evidence")
@@ -562,7 +551,7 @@ def confirmed(checkout: Path, verdict, refused: Iterable[frozenset[str]] = ()) -
 
     def known(reference: str) -> str:
         path, _, name = reference.partition("#")
-        return canonical(checkout, path, name) or reference
+        return identity(path, name) or reference
 
     return None if any(found <= {known(r) for r in wanting} for wanting in refused) else found
 

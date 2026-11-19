@@ -84,6 +84,7 @@ class Tmp(unittest.TestCase):
             "@[simp] theorem kolmogorov_zero_one (s : Set Ω) : True := trivial\n\n"
             "noncomputable def TailSigma.measure := 0\n\n"
             "theorem strong_law_ae : True := trivial\n"
+            "/-- theorem commented_out : True -/\n"
         )
         git(self.tmp, "init", "-q", "-b", "main", str(checkout))
         git(checkout, "add", ".")
@@ -160,7 +161,7 @@ class Confirmed(Tmp):
         one = {"file": TAIL, "declaration": "Probability.kolmogorov_zero_one"}
         two = {"file": TAIL, "declaration": "TailSigma.measure"}
         good = {"landed": True, "evidence": [one, two], "why": "(ignore this; needs: none)"}
-        found = frozenset({f"{TAIL}#Probability.kolmogorov_zero_one", f"{TAIL}#Probability.TailSigma.measure"})
+        found = frozenset({f"{TAIL}#kolmogorov_zero_one", f"{TAIL}#measure"})
         self.assertEqual(reconcile.confirmed(checkout, good), found)
         for bad in (
             {**good, "landed": "true"},
@@ -168,8 +169,8 @@ class Confirmed(Tmp):
             {**good, "evidence": []},
             {**good, "evidence": [one] * (reconcile.MAX_EVIDENCE + 1)},
             {**good, "evidence": [one, {**two, "declaration": "TailSigma.absent"}]},
-            {**good, "evidence": [{**one, "declaration": "WrongNamespace.kolmogorov_zero_one"}]},
             {**good, "evidence": [{**one, "declaration": "zero_one"}]},
+            {**good, "evidence": [{**one, "declaration": "commented_out"}]},
             {**good, "evidence": [{**one, "declaration": "x); needs: none (y"}]},
             {**good, "evidence": [{**one, "file": "TauCeti/Probability/Absent.lean"}]},
             {**good, "evidence": [{**one, "file": "../base/" + TAIL}]},
@@ -189,27 +190,25 @@ class Confirmed(Tmp):
         for spelling in (
             one,
             {**one, "declaration": "Probability.kolmogorov_zero_one"},
+            {**one, "declaration": "WrongNamespace.kolmogorov_zero_one"},
             {**one, "file": "./TauCeti//Probability/Tail.lean"},
         ):
             self.assertIsNone(
                 reconcile.confirmed(checkout, {"landed": True, "evidence": [spelling]}, refused), spelling
             )
         wider = reconcile.confirmed(checkout, {"landed": True, "evidence": [one, two]}, refused)
-        self.assertEqual(
-            wider, frozenset({f"{TAIL}#Probability.kolmogorov_zero_one", f"{TAIL}#Probability.strong_law_ae"})
-        )
+        self.assertEqual(wider, frozenset({f"{TAIL}#kolmogorov_zero_one", f"{TAIL}#strong_law_ae"}))
 
-    def test_declarations_follow_namespaces_sections_and_root(self):
+    def test_names_are_read_outside_comments_and_strings_whatever_the_scopes(self):
         text = (
-            "namespace A.B\nsection\ntheorem x : True := trivial\nend\nend A.B\n"
+            "namespace A.B\npublic section\ntheorem x : True := trivial\nend\ntheorem after : True := trivial\nend A.B\n"
             "namespace C\ntheorem _root_.y : True := trivial\nprivate def D.z := 0\ninstance : Inhabited Nat := ⟨0⟩\nend C\n"
+            "/-- The interval includes its\nend point. /- nested\ntheorem hidden : True -/ still a comment -/\n"
+            '-- theorem line_hidden : True\ndef s := "\ntheorem quoted : True" \n'
         )
-        self.assertEqual(reconcile.declarations(text), {"A.B.x", "y", "C.D.z"})
-        commented = (
-            "namespace A\n/-- The interval includes its\nend point. /- nested\nend B -/ still a comment -/\n"
-            'theorem x : True := trivial\n-- end A\ndef s := "\nend A" \nend A\ntheorem y : True := trivial\n'
-        )
-        self.assertEqual(reconcile.declarations(commented), {"A.x", "A.s", "y"})
+        self.assertEqual(reconcile.names(text), {"x", "after", "y", "z", "s"})
+        self.assertEqual(reconcile.identity("./A//B.lean", "Ns.Deep.name"), "A/B.lean#name")
+        self.assertIsNone(reconcile.identity("../B.lean", "name"))
 
 
 class Audit(Tmp):
@@ -510,7 +509,7 @@ class Look(Tmp):
         on = time.strftime("%Y-%m-%d", time.gmtime())
         self.assertIn(
             "- [x] `zero-one` — Layer 2, the zero-one law `kolmogorov_zero_one` (needs: `tail-sigma`; "
-            f"inferred: {TAIL}#Probability.kolmogorov_zero_one on {on})",
+            f"inferred: {TAIL}#kolmogorov_zero_one on {on})",
             text,
         )
         self.assertNotIn("all there", text)
