@@ -17,7 +17,7 @@ The mirror lives at `~/.local/share/tauceti-forgejo-mirror/TauCeti.git`:
 | refs | content |
 | --- | --- |
 | `refs/heads/*`, `refs/pull/*`, `refs/tauceti-claims/*`, ... | the base repository's refs, exactly as Forgejo had them at the last accepted fetch |
-| `refs/forks/<owner>/*` | every ref of `<owner>/TauCeti` (forks are discovered through the Forgejo API each run, and remembered) |
+| `refs/forks/<owner>/*` | every ref of `<owner>`'s fork, whatever it is named (forks are discovered through the Forgejo API each run, and remembered) |
 | `refs/tauceti-mirror/staging/*` | the raw result of the latest fetch; never restore from these |
 
 `health.json` (per-source last attempt, last success, ref count and last error) and
@@ -33,9 +33,16 @@ in one ref transaction, and only when the staged result passes these checks:
 - at most 10% of the accepted refs (or 10 refs, whichever is larger) disappeared
   (`--max-loss-percent`, `--loss-allowance`).
 
-A source that fails a check keeps its previous accepted refs, and the run exits 1, so the unit
+Base refs that would land in `refs/forks/` or `refs/tauceti-mirror/` are dropped. A source that
+fails a check keeps its previous accepted refs, and the run exits 1, so the unit
 shows as failed. Every run writes one JSON line per source to the journal, at priority `err`
 for a refusal. A refused state stays refused on later runs; the accepted copy never decays.
+
+Git cannot delete `refs/heads/a` and create `refs/heads/a/b` (or the reverse) in one transaction.
+Only in that case the run deletes the conflicting refs first and applies the rest in a second
+transaction, putting the conflicting refs back if that fails. It writes the accepted refs to
+`apply-backup-<source>.txt` beforehand and removes the file afterwards; `check` reports a leftover
+one.
 
 The repository also keeps reflogs for every ref (`core.logAllRefUpdates=always`). Automatic gc is
 off and `gc.pruneExpire=never`: the daily `git gc` packs objects but never deletes one, so every

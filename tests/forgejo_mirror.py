@@ -119,7 +119,7 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(self.mirrored(), expected)
         self.assertEqual(git(self.mirror, "config", "core.logAllRefUpdates"), "always")
         self.assertEqual(git(self.mirror, "config", "gc.pruneExpire"), "never")
-        self.assertEqual(self.health()["forks"], ["alice"])
+        self.assertEqual(self.health()["forks"], ["alice/TauCeti"])
         self.assertIsNone(self.health()["sources"]["base"]["last_error"])
         snapshots = list((self.mirror.parent / "snapshots").glob("refs-*.txt.gz"))
         self.assertEqual(len(snapshots), 1)
@@ -157,6 +157,58 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(self.run_mirror()[0], 0)
         self.assertEqual(self.mirrored()["refs/heads/roadmap/a/b"], sha)
         self.assertNotIn("refs/heads/roadmap/a", self.mirrored())
+
+    def test_reverse_directory_change_and_failed_second_transaction(self):
+        self.forge.set_ref("Org/TauCeti", "refs/heads/roadmap/x/y", self.base_refs["refs/heads/main"])
+        self.assertEqual(self.run_mirror()[0], 0)
+        # roadmap/x/y becomes roadmap/x, which needs two transactions.
+        self.forge.delete_ref("Org/TauCeti", "refs/heads/roadmap/x/y")
+        self.forge.set_ref("Org/TauCeti", "refs/heads/roadmap/x", self.base_refs["refs/heads/main"])
+        moved = self.forge.commit()
+        self.forge.set_ref("Org/TauCeti", "refs/heads/roadmap/a", moved)
+        before = self.mirrored()
+        # A held lock makes the second transaction fail; the first must be undone.
+        lock = self.mirror / "refs/heads/roadmap/a.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("")
+        code, events = self.run_mirror()
+        self.assertEqual(code, 1, events)
+        self.assertEqual(self.mirrored(), before)
+        self.assertEqual(list(self.mirror.parent.glob("apply-backup-*")), [])
+        lock.unlink()
+        self.assertEqual(self.run_mirror()[0], 0)
+        refs = self.mirrored()
+        self.assertEqual(refs["refs/heads/roadmap/a"], moved)
+        self.assertIn("refs/heads/roadmap/x", refs)
+        self.assertNotIn("refs/heads/roadmap/x/y", refs)
+
+    def test_base_refs_cannot_enter_the_mirror_namespaces(self):
+        sha = self.base_refs["refs/heads/main"]
+        self.forge.set_ref("Org/TauCeti", "refs/forks/alice/heads/feature", sha)
+        self.forge.set_ref("Org/TauCeti", "refs/tauceti-mirror/archive", sha)
+        for _ in range(2):
+            code, events = self.run_mirror("--fork", "alice")
+            self.assertEqual(code, 0, events)
+            refs = self.mirrored()
+            self.assertEqual(refs["refs/forks/alice/heads/feature"], self.fork_sha)
+            self.assertNotIn("refs/tauceti-mirror/archive", git(self.mirror, "for-each-ref", "--format=%(refname)"))
+
+    def test_fork_with_its_own_name(self):
+        self.forge.set_ref("bob/Other", "refs/heads/work", self.fork_sha)
+        self.forge.set_ref("bob/TauCeti", "refs/heads/unrelated", self.base_refs["refs/heads/main"])
+        self.assertEqual(self.run_mirror("--fork", "bob/Other")[0], 0)
+        self.assertEqual(self.mirrored()["refs/forks/bob/heads/work"], self.fork_sha)
+        self.assertNotIn("refs/forks/bob/heads/unrelated", self.mirrored())
+
+    def test_deleted_refs_keep_their_objects_through_gc(self):
+        doomed = self.forge.commit()
+        self.forge.set_ref("Org/TauCeti", "refs/heads/doomed", doomed)
+        self.assertEqual(self.run_mirror()[0], 0)
+        self.forge.delete_ref("Org/TauCeti", "refs/heads/doomed")
+        self.assertEqual(self.run_mirror()[0], 0)
+        self.assertNotIn("refs/heads/doomed", self.mirrored())
+        git(self.mirror, "gc", "--quiet")
+        self.assertEqual(git(self.mirror, "cat-file", "-t", doomed), "commit")
 
     def assert_refused(self, reason_part):
         before = self.mirrored()
@@ -245,6 +297,17 @@ class MirrorTests(unittest.TestCase):
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertTrue(any(value.startswith("Authorization: Basic ") for value in values))
         self.assertNotIn("secret-token", " ".join(values))  # base64-encoded with the user name
+
+    def test_discovered_forks_use_their_full_names(self):
+        self.forge.set_ref("carol/TauCeti-work", "refs/heads/x", self.fork_sha)
+        argv = ["--repo", str(self.mirror), "fetch", "--base-url", str(self.forge.root), "--repository", "Org/TauCeti"]
+        original = mirror.discover_forks
+        mirror.discover_forks = lambda *args: ["carol/TauCeti-work"]
+        self.addCleanup(setattr, mirror, "discover_forks", original)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(mirror.main(argv), 0)
+        self.assertEqual(self.mirrored()["refs/forks/carol/heads/x"], self.fork_sha)
+        self.assertEqual(self.health()["forks"], ["carol/TauCeti-work"])
 
     def test_fork_discovery_failure_keeps_known_forks(self):
         self.assertEqual(self.run_mirror("--fork", "alice")[0], 0)

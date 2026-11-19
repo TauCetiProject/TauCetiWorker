@@ -11,7 +11,7 @@ as failed and the journal records why.
 Layout of the mirror repository:
 
   refs/...                          the base repository's refs, exactly as Forgejo has them
-  refs/forks/<owner>/...            every ref of the fork owned by <owner>
+  refs/forks/<owner>/...            every ref of <owner>'s fork (Forgejo allows one per owner)
   refs/tauceti-mirror/staging/...   raw fetch results, not yet accepted (never restore these)
 
 Uses only the standard library and git.
@@ -120,7 +120,11 @@ def live_refs(repo: Path, source: Source) -> dict[str, str]:
 def staged_refs(repo: Path, source: Source) -> dict[str, str]:
     """The staging copy, renamed to where it would live once accepted."""
     raw = list_refs(repo, source.staging_prefix)
-    return {source.live_prefix + name[len(source.staging_prefix) :]: sha for name, sha in raw.items()}
+    staged = {source.live_prefix + name[len(source.staging_prefix) :]: sha for name, sha in raw.items()}
+    if source.live_prefix == "refs/":
+        # The base repository may not write into the mirror's own namespaces.
+        staged = {name: sha for name, sha in staged.items() if not name.startswith(PRIVATE)}
+    return staged
 
 
 def ensure_repo(repo: Path) -> None:
@@ -182,8 +186,12 @@ def assess(source: Source, live: dict[str, str], staged: dict[str, str], max_los
     return True, details
 
 
-def apply(repo: Path, live: dict[str, str], staged: dict[str, str]) -> None:
-    """Move the accepted copy to the staged one in a single all-or-nothing ref transaction."""
+def apply(repo: Path, live: dict[str, str], staged: dict[str, str], backup: Path) -> None:
+    """Move the accepted copy to the staged one in a single all-or-nothing ref transaction.
+
+    If a second transaction is unavoidable, the accepted refs are first written to `backup`,
+    which is removed again once both transactions succeed or the first is undone.
+    """
     deletes = [f"delete {name} {sha}" for name, sha in sorted(live.items()) if name not in staged]
     updates = [
         f"update {name} {sha} {live.get(name, '0' * len(sha))}"
@@ -193,14 +201,34 @@ def apply(repo: Path, live: dict[str, str], staged: dict[str, str]) -> None:
     if not deletes and not updates:
         return
     try:
-        git(repo, "update-ref", "--stdin", input="\n".join(["start", *deletes, *updates, "prepare", "commit"]) + "\n")
+        transaction(repo, deletes + updates)
+        return
     except MirrorError:
-        # A ref that becomes a directory (refs/heads/a -> refs/heads/a/b) cannot be deleted and
-        # created in one transaction by the files backend. Delete first, then update.
-        if deletes:
-            git(repo, "update-ref", "--stdin", input="\n".join(["start", *deletes, "prepare", "commit"]) + "\n")
-        if updates:
-            git(repo, "update-ref", "--stdin", input="\n".join(["start", *updates, "prepare", "commit"]) + "\n")
+        # The files backend cannot delete refs/heads/a and create refs/heads/a/b (or the reverse)
+        # in one transaction. Only then: delete the conflicting refs first, apply the rest in a
+        # second transaction, and put the conflicting refs back if that fails.
+        conflicts = {
+            name: sha
+            for name, sha in live.items()
+            if name not in staged
+            and any(other.startswith(name + "/") or name.startswith(other + "/") for other in staged)
+        }
+        if not conflicts:
+            raise
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    backup.write_text("".join(f"{sha} {name}\n" for name, sha in sorted(live.items())))
+    transaction(repo, [f"delete {name} {sha}" for name, sha in sorted(conflicts.items())])
+    try:
+        transaction(repo, [line for line in deletes if line.split(" ")[1] not in conflicts] + updates)
+    except MirrorError:
+        transaction(repo, [f"create {name} {sha}" for name, sha in sorted(conflicts.items())])
+        backup.unlink()
+        raise
+    backup.unlink()
+
+
+def transaction(repo: Path, lines: list[str]) -> None:
+    git(repo, "update-ref", "--stdin", input="\n".join(["start", *lines, "prepare", "commit"]) + "\n")
 
 
 def api_get(url: str, token_file: Path | None, timeout: float = 30):
@@ -212,12 +240,13 @@ def api_get(url: str, token_file: Path | None, timeout: float = 30):
 
 
 def discover_forks(base_url: str, repository: str, token_file: Path | None) -> list[str]:
+    """Full names (owner/name) of the repository's forks; a fork may have a different name."""
     owners = []
     page = 1
     while True:
         url = f"{base_url.rstrip('/')}/api/v1/repos/{repository}/forks?limit=50&page={page}"
         batch = api_get(url, token_file)
-        owners += [item["owner"]["login"] for item in batch]
+        owners += [item["full_name"] for item in batch]
         if len(batch) < 50:
             return owners
         page += 1
@@ -288,19 +317,21 @@ def run(args) -> int:
     health = read_health(health_path)
     now = dt.datetime.now(dt.UTC)
 
-    owners = list(dict.fromkeys(args.fork + health.get("forks", [])))
+    name = args.repository.split("/", 1)[1]
+    # A bare owner means a fork with the base repository's name.
+    owners = list(dict.fromkeys(f if "/" in f else f"{f}/{name}" for f in args.fork + health.get("forks", [])))
     if args.discover_forks:
         try:
             owners = list(dict.fromkeys(owners + discover_forks(base_url, args.repository, token_file)))
         except Exception as error:  # the API being down must not stop the git mirror
             log("warning", "fork-discovery-failed", error=str(error)[:500], known=owners)
-    name = args.repository.split("/", 1)[1]
     sources = [Source("base", f"{base_url}/{args.repository}.git", "refs/")]
-    for owner in owners:
-        if not valid_owner(owner):
-            log("warning", "fork-owner-skipped", owner=owner)
+    for full_name in owners:
+        owner = full_name.split("/", 1)[0]
+        if not valid_owner(owner) or any(source.live_prefix == f"{FORKS}{owner}/" for source in sources):
+            log("warning", "fork-skipped", fork=full_name, reason="invalid owner or a second fork of the same owner")
             continue
-        sources.append(Source(f"fork-{owner}", f"{base_url}/{owner}/{name}.git", f"{FORKS}{owner}/"))
+        sources.append(Source(f"fork-{owner}", f"{base_url}/{full_name}.git", f"{FORKS}{owner}/"))
 
     status = EXIT_OK
     results = dict(health.get("sources", {}))
@@ -318,7 +349,7 @@ def run(args) -> int:
                 ok = True
             details["seconds"] = round(time.monotonic() - started, 1)
             if ok:
-                apply(repo, live, staged)
+                apply(repo, live, staged, state_dir / f"apply-backup-{source.name}.txt")
                 record.update(last_success=now.isoformat(), refs=details["staged"], last_error=None)
                 log("info", "mirrored", **details)
             else:
@@ -366,6 +397,8 @@ def check(args) -> int:
             stale[name] = {"minutes": None if age is None else round(age), "last_error": record.get("last_error")}
     if not health.get("sources") or "base" not in health["sources"]:
         stale["base"] = {"minutes": None, "last_error": "no recorded run"}
+    for backup in state_dir.glob("apply-backup-*.txt"):
+        stale[backup.name] = {"minutes": None, "last_error": "an interrupted apply left this list of accepted refs"}
     print(json.dumps({"stale": stale, "health": health}, indent=1, sort_keys=True))
     return EXIT_REFUSED if stale else EXIT_OK
 
@@ -380,7 +413,9 @@ def parse(argv):
     fetch_parser = sub.add_parser("fetch", help="fetch every source once and accept sane results")
     fetch_parser.add_argument("--base-url", default="https://git.taucetiproject.org")
     fetch_parser.add_argument("--repository", default="TauCetiProject/TauCeti")
-    fetch_parser.add_argument("--fork", action="append", default=[], metavar="OWNER", help="always mirror this fork")
+    fetch_parser.add_argument(
+        "--fork", action="append", default=[], metavar="OWNER[/NAME]", help="always mirror this fork"
+    )
     fetch_parser.add_argument("--no-fork-discovery", dest="discover_forks", action="store_false")
     fetch_parser.add_argument("--token-file", help="read-only Forgejo token (default: anonymous)")
     fetch_parser.add_argument("--user", default="tauceti-mirror-reader", help="user name sent with --token-file")
