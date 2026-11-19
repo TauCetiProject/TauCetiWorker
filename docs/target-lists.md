@@ -273,8 +273,9 @@ its `inferred:` clause dropped and
 `reopened: <its evidence> by <item> round <round id>` added, but only while its
 `inferred:` clause still names the evidence that round was shown. It waits up to
 two minutes for the list's lock, and does not move the look gap; a report it
-cannot apply then is kept in the worker's state and tried again before each of
-that worker's later roadmap rounds. Each prerequisite is shown to the round
+cannot apply then is kept in the worker's state, with the list it was made
+against, and tried again on that list before each of that worker's later
+roadmap rounds. Each prerequisite is shown to the round
 with its area and whole line, whichever area it is in. A tick
 earned by a merged pull request (`landed:`, or an `[x]` without `inferred:`) is
 never opened this way.

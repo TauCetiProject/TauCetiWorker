@@ -1060,14 +1060,15 @@ def reported(file: Path, allowed: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(slug for slug in slugs if slug in allowed))
 
 
-def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str) -> int | None:
+def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str, listed: Path | None = None) -> int | None:
     """Open again each of `slugs` that is in `seen` and is still ticked by inference on exactly the
     evidence `seen` gives for it (what the reporting round was shown), dropping its `inferred:`
     clause and recording that evidence and `by` in a `reopened:` clause, so the same evidence does
     not tick it again. Waits up to REOPEN_WAIT seconds for the list's lock and does not move the
     look gap. Returns how many items were opened, or None when the list could not be locked, read
-    or written, so that the report can be tried again (`keep_pending`)."""
-    listed = roadmap_targets()
+    or written, so that the report can be tried again (`keep_pending`). `listed` is the target list
+    the round was handed, by default the worker's current one."""
+    listed = listed if listed is not None else roadmap_targets()
     slugs = [slug for slug in dict.fromkeys(slugs) if slug in seen]
     if listed is None or not slugs:
         return 0
@@ -1116,31 +1117,45 @@ def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str) -> in
         os.close(fd)
 
 
-def keep_pending(file: Path, slugs: list[str], seen: dict[str, frozenset[str]], by: str) -> None:
-    """Record a report `reopen` could not apply, for `retry_pending`."""
+def keep_pending(file: Path, listed: Path, slugs: list[str], seen: dict[str, frozenset[str]], by: str) -> None:
+    """Record a report `reopen` could not apply to the target list `listed`, for `retry_pending`."""
     try:
         rows = json.loads(file.read_text())
     except (OSError, ValueError):
         rows = []
     rows = rows if isinstance(rows, list) else []
-    rows.append({"slugs": slugs, "seen": {slug: sorted(found) for slug, found in seen.items()}, "by": by})
+    rows.append(
+        {
+            "list": str(listed.resolve()),
+            "slugs": slugs,
+            "seen": {slug: sorted(found) for slug, found in seen.items()},
+            "by": by,
+        }
+    )
     with contextlib.suppress(OSError):
         file.parent.mkdir(parents=True, exist_ok=True)
         _replace_json(file, rows)
 
 
 def retry_pending(file: Path) -> None:
-    """Apply again each report `keep_pending` recorded, keeping those that still cannot be."""
+    """Apply again each report `keep_pending` recorded to the target list it was made against,
+    whatever list the worker has now, keeping those that still cannot be applied. One whose list is
+    gone is dropped."""
     try:
         rows = json.loads(file.read_text())
     except (OSError, ValueError):
         return
     left = []
     for row in rows if isinstance(rows, list) else ():
-        if not isinstance(row, dict) or not isinstance(row.get("seen"), dict):
+        if not isinstance(row, dict) or not isinstance(row.get("seen"), dict) or not isinstance(row.get("list"), str):
+            continue
+        listed = Path(row["list"])
+        if not listed.is_file():
+            log(f"reconcile: a kept report names {listed}, which is gone; dropped")
             continue
         seen = {slug: frozenset(found) for slug, found in row["seen"].items() if isinstance(found, list)}
-        if reopen([s for s in row.get("slugs") or () if isinstance(s, str)], seen, str(row.get("by") or "")) is None:
+        slugs = [s for s in row.get("slugs") or () if isinstance(s, str)]
+        if reopen(slugs, seen, str(row.get("by") or ""), listed) is None:
             left.append(row)
     with contextlib.suppress(OSError):
         if left:

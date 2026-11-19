@@ -311,10 +311,25 @@ class Reopen(Tmp):
         directory = self.tmp / "report"
         directory.mkdir()
         (directory / "prerequisites.txt").write_text("tail-sigma\n")
-        work._reopen_reported((directory, item, needs))
+        work._reopen_reported((directory, item, needs, self.path))
         text = self.path.read_text()
         self.assertEqual(t.parse_targets(text).find("tail-sigma").status, "done")
         self.assertNotIn("reopened:", text)
+
+    def test_a_kept_report_applies_only_to_the_list_it_was_made_against(self):
+        pending = self.tmp / "pending.json"
+        reconcile.keep_pending(pending, self.path, ["tail-sigma"], {"tail-sigma": SEEN}, "zero-one round abc")
+        other = self.tmp / "other" / "targets.md"
+        other.parent.mkdir()
+        other.write_text(LIST.replace("a synthetic goal", "another goal"))
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": str(other)}):
+            reconcile.retry_pending(pending)
+        self.assertEqual(other.read_text(), LIST.replace("a synthetic goal", "another goal"))
+        self.assertEqual(t.parse_targets(self.path.read_text()).find("tail-sigma").status, "open")
+        self.assertFalse(pending.exists())
+        reconcile.keep_pending(pending, self.tmp / "gone.md", ["tail-sigma"], {"tail-sigma": SEEN}, "x")
+        reconcile.retry_pending(pending)
+        self.assertFalse(pending.exists())
 
     def test_the_round_wiring_reads_the_report_and_names_the_round(self):
         listed = t.parse_targets(self.path.read_text())
@@ -328,11 +343,11 @@ class Reopen(Tmp):
         directory = self.tmp / "report"
         directory.mkdir()
         work._reopen_reported(None)
-        work._reopen_reported((directory, item, needs))
+        work._reopen_reported((directory, item, needs, self.path))
         self.assertEqual(t.parse_targets(self.path.read_text()).find("tail-sigma").status, "done")
         (directory / "prerequisites.txt").write_text("tail-sigma\n")
         with patch("tauceti_worker.activity.current_round_id", return_value="0123456789abcdef"):
-            work._reopen_reported((directory, item, needs))
+            work._reopen_reported((directory, item, needs, self.path))
         self.assertIn("by zero-one round 0123456789ab)", self.path.read_text())
 
 
