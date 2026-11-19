@@ -803,6 +803,11 @@ def worker_app() -> WorkerApp | None:
 
 
 _app_git_config: tuple[tuple[str, str], ...] = ()
+# Every git process holding a GitHub credential runs without hooks: a hook in an agent's worktree (its
+# own ``.git/hooks``, a ``core.hooksPath`` or a ``core.fsmonitor`` in its config) would otherwise run
+# with the token in reach. Command scope wins over the repository's config, and git finds no hook
+# under /dev/null.
+_NO_GIT_HOOKS = (("core.hooksPath", os.devnull), ("core.fsmonitor", "false"))
 
 
 def pin_app_credentials() -> None:
@@ -852,12 +857,13 @@ def pin_app_credentials() -> None:
 
 def app_git_environment(url: str | None = None) -> dict[str, str]:
     """The ``GIT_CONFIG_*`` variables of a git process that pushes as the App and inherits no other
-    command-scope config: only the pins of ``pin_app_credentials`` (none outside App mode). With
-    ``url``, also reset the extra headers for exactly that URL, which a repository's config for that
-    URL would otherwise win over (git prefers the longest matching URL)."""
+    command-scope config: the hook reset, and the pins of ``pin_app_credentials`` (none outside App
+    mode). With ``url``, also reset the extra headers for exactly that URL, which a repository's
+    config for that URL would otherwise win over (git prefers the longest matching URL)."""
     pins = _app_git_config
     if pins and url:
         pins = (*pins, (f"http.{url}.extraHeader", ""))
+    pins = (*_NO_GIT_HOOKS, *pins)
     env = {"GIT_CONFIG_COUNT": str(len(pins))}
     for index, (key, value) in enumerate(pins):
         env[f"GIT_CONFIG_KEY_{index}"] = key
@@ -924,8 +930,28 @@ def use_worker_token(token: str) -> None:
     """Make the worker's own ``gh`` calls (admin checks, submission pushes) use its dedicated token.
 
     Agents never inherit it: their environment clears ``GH_TOKEN`` and points gh at an empty config."""
+    disable_git_hooks()
     os.environ["GH_TOKEN"] = token
     os.environ.pop("GITHUB_TOKEN", None)
+
+
+def disable_git_hooks() -> None:
+    """Add the hook resets to the worker's own command-scope git config, once: every git process the
+    worker runs (checkouts, status, fetches, ref updates, pushes) then holds its token without
+    running hooks."""
+    try:
+        count = max(int(os.environ.get("GIT_CONFIG_COUNT", "0")), 0)
+    except ValueError:
+        count = 0
+    last = {}
+    for index in range(count):
+        last[os.environ.get(f"GIT_CONFIG_KEY_{index}", "").lower()] = os.environ.get(f"GIT_CONFIG_VALUE_{index}")
+    if all(last.get(key.lower()) == value for key, value in _NO_GIT_HOOKS):
+        return
+    for index, (key, value) in enumerate(_NO_GIT_HOOKS, count):
+        os.environ[f"GIT_CONFIG_KEY_{index}"] = key
+        os.environ[f"GIT_CONFIG_VALUE_{index}"] = value
+    os.environ["GIT_CONFIG_COUNT"] = str(count + len(_NO_GIT_HOOKS))
 
 
 def verify_admin(repository: str) -> None:
@@ -2071,7 +2097,9 @@ def check_submission_access(cfg: RunnerConfig, task: Task, logdir: Path) -> dict
             "git",
             "-c",
             "push.followTags=false",
+            *(argument for key, value in _NO_GIT_HOOKS for argument in ("-c", f"{key}={value}")),
             "push",
+            "--no-verify",
             "--dry-run",
             "--porcelain",
             "--force",
