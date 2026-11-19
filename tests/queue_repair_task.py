@@ -1167,6 +1167,24 @@ class Fixture(unittest.TestCase):
     def client(self, cfg: repair_task.RunnerConfig, worker: str | None = None) -> repair_task.TaskClient:
         return repair_task.TaskClient(cfg.service, TOKEN, worker or cfg.worker)
 
+    def pre_rebase_task(self) -> dict:
+        """Task 1 as a ``pre_rebase`` task on its own base that resolves member 2's commit onto member 1's."""
+        task = self.service.tasks[1]
+        task.update(kind="pre_rebase")
+        task["diagnostics"] = [
+            {
+                "kind": "conflict",
+                "source_pr": f"{PROJECT}#2",
+                "commit": self.content.members[1]["commit"],
+                "paths": ["TauCeti/Two.lean"],
+                "onto": self.content.base,
+                "message": "replaying the open batch conflicts",
+                "pending": [f"{PROJECT}#3"],
+                "clean_prefix_tip": self.content.members[0]["commit"],
+            }
+        ]
+        return task
+
     def agent_calls(self) -> list[dict]:
         path = self.stub_dir / "agent-calls.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
@@ -5085,7 +5103,7 @@ class Records(unittest.TestCase):
             repair_task.prompt_context(task, None), repair_task.task_findings(task), chain, seed
         )
         self.assertIn("#10: feat: add 10", inline)
-        self.assertNotIn(".tauceti-repair", inline)
+        self.assertNotIn("members.jsonl", inline)
 
     def test_the_shell_limit_is_the_repair_task_s_own(self):
         from tauceti_worker import agents
@@ -5286,7 +5304,7 @@ class WorkerAudits(Fixture):
         self.assertFalse(compilation["full_checks"])
 
     def test_staging_pre_rebase_retains_build_receipt_without_full_check_claim(self):
-        self.service.tasks[1].update(kind="pre_rebase")
+        self.pre_rebase_task()
         self.service.tasks[1]["extra"]["checks_owner"] = "staging"
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
@@ -5656,7 +5674,7 @@ class HeadHandoff(Fixture):
             self.assertEqual(repair_audit.helper_checks(group), 0)
 
     def test_waiting_pre_rebase_runs_full_checks(self):
-        self.service.tasks[1].update(kind="pre_rebase")
+        self.pre_rebase_task()
         self.service.tasks[1]["extra"]["checks_owner"] = "worker"
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
@@ -5668,7 +5686,7 @@ class HeadHandoff(Fixture):
         self.assertEqual(notes["pre_rebase_verification"]["scope"], "full")
 
     def run_check_handoff(self, check):
-        self.service.tasks[1].update(kind="pre_rebase")
+        self.pre_rebase_task()
         self.service.tasks[1]["extra"]["checks_owner"] = "worker"
         self.service.renew_after = 0.05
         cfg = self.config()
