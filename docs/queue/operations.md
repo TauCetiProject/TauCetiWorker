@@ -1167,7 +1167,10 @@ persistent infrastructure failures; automatic retries continue with capped backo
 To land an approved PR ahead of the queue (a harness or staging fix, a broken `main`), a repository
 admin comments `bors emergency` on it (withdraw with `bors emergency-`), or runs
 `uv run tauceti-queue emergency TauCetiProject/TauCeti <pr> --reason "<why>"` (`emergency cancel ...`
-to withdraw; `POST /admin/emergency` and `/admin/emergency-cancel` underneath). Use this, not an admin
+to withdraw; `POST /admin/emergency` and `/admin/emergency-cancel` underneath). The command waits up
+to 15 minutes for the answer, since the controller answers only once it holds its lock, which
+recording a large batch's landing can keep for minutes; if the answer is lost anyway, the request
+may still have been applied, so check `status`. Use this, not an admin
 merge: an admin merge supersedes the running head's CI and leaves `main` on a revision only `ci.yml`
 publishes, while the emergency lane lands the PR through the queue, as the next head in a batch of
 its own, on a pass of its own staging run, with its Lake cache published. With `emergency_evict` off

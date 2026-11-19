@@ -451,6 +451,24 @@ class EmergencyCommand(Base):
             self.assertEqual(cli.cmd_emergency(args, fetch=fetch), 2)
         self.assertIn("positive integer", err.getvalue())
 
+    def test_emergency_waits_out_a_long_controller_lock_and_reports_a_lost_answer(self):
+        timeouts = []
+
+        def fetch(url, method="GET", body=None, token=None, timeout=10, **_kwargs):
+            timeouts.append(timeout)
+            if len(timeouts) > 1:
+                raise TimeoutError("timed out")
+            return {"accepted": True}
+
+        parser = cli.build_parser()
+        argv = ["emergency", "TauCetiProject/TauCeti", "42", "--url", "http://q", "--token", "t"]
+        with captured():
+            self.assertEqual(cli.cmd_emergency(parser.parse_args(argv), fetch=fetch), 0)
+        self.assertGreaterEqual(timeouts[0], 600, "a landing can hold the controller lock for minutes")
+        with captured() as (_out, err):
+            self.assertEqual(cli.cmd_emergency(parser.parse_args(argv), fetch=fetch), 1)
+        self.assertIn("may still apply the request", err.getvalue())
+
 
 class SettingsCommand(Base):
     def test_show_and_set(self):
