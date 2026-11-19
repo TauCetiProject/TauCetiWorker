@@ -3793,13 +3793,14 @@ class Controller:
                 failure = f"{type(error).__name__}: {str(error)[:200]}"
             else:
                 failure = None if report is not None else "no live report for the run"
-            # One journal line when reads start failing or recover, not one a minute.
-            if failure != self._live_failure:
-                log = self.log
+            # One journal line when reads start failing and one when they recover, not one a minute.
+            if (failure is None) != (self._live_failure is None):
                 if failure is None:
-                    log.info("live build progress for run %s attempt %s readable again", *key)
+                    self.log.info("live build progress for run %s attempt %s readable again", *key)
                 else:
-                    log.warning("live build progress for run %s attempt %s unavailable: %s", key[0], key[1], failure)
+                    self.log.warning(
+                        "live build progress for run %s attempt %s unavailable: %s", key[0], key[1], failure
+                    )
                 self._live_failure = failure
             with self._live_lock:
                 try:

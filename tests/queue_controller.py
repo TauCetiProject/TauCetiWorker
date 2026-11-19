@@ -1173,15 +1173,24 @@ class LostRuns(ControllerCase):
     def test_failing_reads_are_logged_once_and_their_recovery_too(self):
         advanced, _reads, inline = self.live_reports()
         self.github.start_runs()
+        advanced["at"] = self.clock()
         with inline:
             self.observe()
-            failing = mock.Mock(side_effect=RuntimeError("HTTP 403: blocked"))
+            outcomes = iter([RuntimeError("HTTP 403: blocked"), OSError("timed out"), None, RuntimeError("HTTP 500")])
+
+            def failing(run_id, run_attempt):
+                outcome = next(outcomes)
+                if outcome is not None:
+                    raise outcome
+                return None
+
             working = self.controller.live_progress
             self.controller.live_progress = failing
             with self.assertLogs(self.controller.log, "WARNING") as logged:
-                for _ in range(3):
+                for _ in range(4):
                     self.observe(LIVE_PROGRESS_SECONDS)
-            self.assertEqual(len([m for m in logged.output if "unavailable" in m and "HTTP 403" in m]), 1)
+            # Different errors and a missing report within one outage: still one line.
+            self.assertEqual(len([m for m in logged.output if "unavailable" in m]), 1, logged.output)
             self.controller.live_progress = working
             advanced["at"] = self.clock()
             with self.assertLogs(self.controller.log, "INFO") as logged:
