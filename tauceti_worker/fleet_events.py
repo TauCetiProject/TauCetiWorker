@@ -96,7 +96,9 @@ def mutation(value, result):
         method = next((args[i + 1] for i, arg in enumerate(args[:-1]) if arg in ("-X", "--method")), "")
         method = next((arg.split("=", 1)[1] for arg in args if arg.startswith("--method=")), method).upper()
         if args[:2] == ["pr", "close"]:
-            publication = "closure"
+            # `gh pr close` also succeeds on a PR someone else already closed; that is not ours.
+            already = "already closed" in (text + (result.stderr or "")).lower()
+            publication = None if already else "closure"
         elif _replaces_description(args, method):
             publication = "description"
         elif method in ("", "POST") and (

@@ -41,20 +41,35 @@ def admission_pause(snapshot, *, worker=None, model=None, now=None):
         return "waiting for calibration session cost"
     if money(snapshot["available"]) <= 0 or money(snapshot["available"]) < money(snapshot["admission_threshold"]):
         return "waiting for funding"
-    if worker is not None and model:
-        first = min(
-            (
-                item
-                for item in waiting
-                if item.get("model") == model
-                and item["reason"] in {"waiting for funding", "waiting behind another worker"}
-            ),
-            key=lambda item: (item["since"], item["ticket"]),
-            default=None,
+    if (
+        worker is not None
+        and model
+        and queue_blocks(
+            money(snapshot["available"]), money(snapshot["admission_threshold"]), waiting, worker, model, now
         )
-        if first and first["worker"] != worker:
-            return "waiting behind another worker"
+    ):
+        return "waiting behind another worker"
     return None
+
+
+def queue_blocks(available, estimate, waiting, worker, model, now):
+    """Preserve older waiters' funding without serializing a fully funded fleet."""
+    queue = sorted(
+        (
+            item
+            for item in waiting
+            if now - item["seen"] < 120
+            and item.get("model") == model
+            and item["reason"] in {"waiting for funding", "waiting behind another worker"}
+        ),
+        key=lambda item: (item["since"], item["ticket"]),
+    )
+    earlier = []
+    for item in queue:
+        if item["worker"] == worker:
+            break
+        earlier.append(item)
+    return bool(earlier) and available < estimate + sum((money(v["estimate"]) for v in earlier), Decimal(0))
 
 
 def process_identity(pid=None):
@@ -671,17 +686,6 @@ class Budget:
             if now - previous.get("seen", 0) >= 120:
                 previous = {}
             ticket = previous.get("ticket", uuid.uuid4().hex)
-            first = min(
-                (
-                    v
-                    for v in queue.values()
-                    if now - v["seen"] < 120
-                    and v["reason"] in {"waiting for funding", "waiting behind another worker"}
-                    and v.get("model") == model
-                ),
-                key=lambda v: (v["since"], v["ticket"]),
-                default=None,
-            )
             reason = None
             if resume and any(s.get("resume") == resume for s in live):
                 reason = "provider session already being resumed"
@@ -691,7 +695,7 @@ class Budget:
                 reason = "waiting for calibration session cost"
             elif available <= 0 or available < estimate:
                 reason = "waiting for funding"
-            elif first and first["worker"] != worker:
+            elif queue_blocks(available, estimate, queue.values(), worker, model, now):
                 reason = "waiting behind another worker"
             if reason:
                 wait = dict(

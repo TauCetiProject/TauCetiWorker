@@ -82,6 +82,9 @@ class GitHubSourceExecution:
             raise ValueError("invalid execution discovery page bound")
         self.tokens, self.clock, self.max_pages = tokens, clock, max_pages
         self.transport = transport or UrllibTransport()
+        # One client for every cancellation, so a rate limit GitHub reports to one cancel is
+        # honoured by the next instead of each cancel rediscovering it with fresh requests.
+        self.cancel_client = GitHubClient(self.tokens, self.transport, clock=clock)
         opener = (
             None
             if reader_factory is not None
@@ -145,17 +148,22 @@ class GitHubSourceExecution:
         RequestLedger.check_configuration(policy, configuration)
         if RequestLedger.binding(policy) != RequestLedger.binding(enrolled_policy) or policy.execution_branch != "main":
             raise ValueError("protected caller changes enrolled repository or credential roles")
-        content(policy.workflow)  # The configured caller must exist at this exact revision.
+        # The configured caller must exist at this exact revision. Which harness it may run is
+        # enforced by the runner groups (TauCetiTools main only) and by result verification.
+        content(policy.workflow)
         return revision, policy, configuration
 
     def _post(self, frozen, path, payload=None, *, token=None):
+        return self._send(frozen.policy.execution.repository.name, path, payload, token=token)
+
+    def _send(self, name, path, payload=None, *, token=None):
         # No generic retrying API client: a lost POST response is not permission
         # to send the same dispatch again. The token is resource-scoped when minted,
         # (or by GitHub's native job-token contract), so a name reused between
         # observation and POST cannot select another repo.
         return self.transport(
             "POST",
-            GITHUB.api_url + "/repos/" + frozen.policy.execution.repository.name + path,
+            GITHUB.api_url + "/repos/" + name + path,
             {
                 "Authorization": "Bearer " + (self.tokens.token() if token is None else token),
                 "Accept": "application/vnd.github+json",
@@ -287,6 +295,11 @@ class GitHubSourceExecution:
         """Fresh run identity/status only; old artifact expiry is irrelevant."""
         return self._metadata(frozen, run_id)[1]
 
+    def deleted(self, frozen, run_id):
+        """Whether GitHub answers 404 for the run. Other read failures raise."""
+        name = frozen.policy.execution.repository.name
+        return GitHubAdapter(GitHubClient(self.tokens, self.transport), name).read_run(name, run_id) is None
+
     def observe(self, frozen, run_id, *, owned=False):
         reader, run = self._metadata(frozen, run_id)
         ownership = result = None
@@ -335,6 +348,25 @@ class GitHubSourceExecution:
             except Exception:
                 pass  # Optional context cannot erase a verified failure or create a pass.
         return CandidateObservation(run, ownership, result, absent)
+
+    def progress(self, frozen, run):
+        """`run` with the job and step phases and placement GitHub reports for its attempt.
+
+        One jobs listing, no logs. The phases are observational context for status and the
+        stall report; they are never ownership or verdict evidence.
+        """
+        name = frozen.policy.execution.repository.name
+        adapter = GitHubAdapter(GitHubClient(self.tokens, self.transport), name)
+        details = adapter.candidate_run(
+            name, {"id": run.run_id, "run_attempt": run.attempt}, with_jobs=True, with_diagnostics=False
+        )
+        return replace(
+            run,
+            phases=details.phases,
+            runner_name=details.runner_name,
+            runner_labels=details.runner_labels,
+            host=details.host,
+        )
 
     def _result_absent(self, reader, frozen, run):
         """A failed artifact download is not evidence of an absent verdict.
@@ -475,19 +507,54 @@ class GitHubSourceExecution:
                     unavailable = True
         return observations, unavailable
 
-    def cancel(self, frozen, run_id, *, proof):
-        # The coordinator calls this only for a ledger-owned run. Recheck the
-        # native repository/caller/harness before the idempotent cancellation.
+    def cancel(self, execution, run_id, *, request_digest, proof):
+        """Cancel a ledger-owned run from its stored ownership row alone.
+
+        `execution` is the ledger's bound execution repository and `proof` the stored receipt that
+        established ownership of `run_id` for `request_digest`. Neither the frozen request nor its
+        execution policy is parsed again, so an attempt frozen under an older policy schema stays
+        cancellable. The native repository is rechecked before the idempotent cancellation.
+
+        Requests go through the shared `cancel_client` in deferred mode: nothing sleeps or retries
+        here. A rate limit (on the read or the cancel POST, whose headers are recorded too) raises
+        `RateLimited` carrying GitHub's deadline, which the caller persists on its cancel intent."""
+        if not isinstance(run_id, str) or not run_id.isascii() or not run_id.isdecimal() or run_id.startswith("0"):
+            raise ValueError("invalid execution run ID")
         if (
             not isinstance(proof, dict)
             or proof.get("kind") not in {"request", "result"}
-            or proof.get("request_digest") != frozen.request.digest
-            or str(proof.get("run_id")) != run_id
+            or not isinstance(request_digest, str)
+            or proof.get("request_digest") != request_digest
+            or type(proof.get("run_id")) is not int
+            or str(proof["run_id"]) != run_id
         ):
             raise ValueError("cancellation requires the stored request ownership proof")
-        if self.status(frozen, run_id).status == "completed":
+        if (
+            not isinstance(execution, cc.RepositoryIdentity)
+            or execution.repository.forge != GITHUB
+            or execution.native_id != self.tokens.repository_id
+        ):
+            raise ValueError("execution credential belongs to another repository ID")
+        name = execution.repository.name
+        client = self.cancel_client
+        with client.deferred_requests(urgent=True):
+            status, raw = client.get_json(f"repos/{name}/actions/runs/{run_id}", tolerate=(404,))
+        if status == 404:
+            return "already-completed"  # GitHub deleted the run: it can never run again.
+        repository = raw.get("repository") if isinstance(raw, dict) else None
+        if (
+            not isinstance(repository, dict)
+            or raw.get("id") != int(run_id)
+            or raw.get("event") != "repository_dispatch"
+            or repository.get("id") != execution.native_id
+            or repository.get("full_name") != name
+        ):
+            raise ValueError("owned execution run belongs to another repository or event")
+        if raw.get("status") == "completed":
             return "already-completed"
-        status, _headers, _body = self._post(frozen, "/actions/runs/" + run_id + "/cancel")
+        path = "/actions/runs/" + run_id + "/cancel"
+        status, headers, body = self._send(name, path)
+        client.record_response("POST", "repos/" + name + path, status, headers or {}, body or b"")
         if status == 202:
             return "cancelled"
         if status == 409:

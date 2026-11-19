@@ -41,7 +41,8 @@ While fixing, use incremental builds or the failing shared phase. Run the shared
   outside the checkout, edit it, then run
   `gh pr edit __PR__ --repo TauCetiProject/TauCeti --body-file <file>`. Answer a `quality-pass`
   finding the same way: run the checks it names (all of them when the block is missing) and fix
-  or add the block. If the description is all you changed, there is nothing to commit: reply on
+  or add the block. __QUALITY_SCOPE__
+  If the description is all you changed, there is nothing to commit: reply on
   the finding's thread (as above) saying what you ran and updated, because an edit to the
   description alone starts no re-review. If the template has no such block, the branch predates
   the quality pass: skip this step.

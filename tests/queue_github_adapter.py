@@ -159,6 +159,34 @@ class AppAuth(unittest.TestCase):
         self.assertEqual(source.token(), "ghs_two")
         self.assertEqual(source.refreshes, 3)
 
+    def test_team_membership_is_read_by_the_queue_app_only_with_members_permission(self):
+        pem, _ = key_pair()
+        clock = Clock(app.parse_github_time("2027-01-15T09:00:00Z"))
+        transport = FakeTransport()
+        token_url = "https://api.github.com/app/installations/178451644/access_tokens"
+        transport.add(
+            "POST",
+            token_url,
+            201,
+            {"token": "ghs_one", "expires_at": "2027-01-15T10:00:00Z", "permissions": {"contents": "write"}},
+        )
+        source = app.InstallationTokenSource(credentials(pem), transport, clock=clock)
+        client = ga.GitHubClient(source, transport, clock=clock, sleep=clock.sleep)
+        adapter = ga.GitHubAdapter(client, repo=TAUCETI)
+        path = "orgs/TauCetiProject/teams/self-tested/memberships/alice"
+        with self.assertRaises(ga.RequestDeferred) as missing:
+            adapter.team_member_read(path)
+        self.assertIn("Members: read", str(missing.exception))
+        self.assertEqual(missing.exception.retry_at, clock.now + ga.MEMBERS_PERMISSION_RETRY_SECONDS)
+        self.assertEqual(len(transport.calls), 1, "no membership request without the permission")
+        source.invalidate()
+        transport.responses[f"POST {token_url}"] = [
+            (201, {}, {"token": "ghs_two", "expires_at": "2027-01-15T10:00:00Z", "permissions": {"members": "read"}})
+        ]
+        transport.add("GET", f"https://api.github.com/{path}", 200, {"state": "active"})
+        self.assertEqual(adapter.team_member_read(path), {"state": "active"})
+        self.assertEqual(transport.calls[-1][2]["Authorization"], "Bearer ghs_two")
+
     def test_execution_token_is_minted_for_an_immutable_repository_id_on_every_refresh(self):
         pem, _ = key_pair()
         transport = FakeTransport()
@@ -468,6 +496,11 @@ class Adapter(unittest.TestCase):
         self.assertEqual(len(t.calls), 2)
         a, _ = setup(jobs=[{"id": 55, "name": "sandboxed-build"}, {"id": 56, "name": "sandboxed-build"}])
         self.assertEqual(a.declaration_names(TAUCETI, HEAD)["reason"], "build_job_ambiguous")
+        # A stub caller of the reusable pr-build prefixes its job names.
+        a, _ = setup(
+            jobs=[{"id": 55, "name": "pr-build / sandboxed-build", "status": "completed", "conclusion": "success"}]
+        )
+        self.assertEqual(a.declaration_names(TAUCETI, HEAD)["added"], {"TauCeti.A": ["Ns.shared", "Ns.α"]})
         self.assertEqual(dn.parse_log("DECLARATION-NAMES " + json.dumps(raw), BASE)["reason"], "head_mismatch")
         for invalid in [
             dict(raw, complete=False, added={}),
@@ -513,6 +546,21 @@ class Adapter(unittest.TestCase):
         a = adapter(transport)
         self.assertEqual(a.pr_merge_base(TAUCETI, 42, HEAD), "d" * 40)
         self.assertIsNone(a.pr_merge_base(TAUCETI, 42, "e" * 40), "a moved head gets no merge base")
+
+    def test_main_ci_run_is_one_unretried_call(self):
+        transport = FakeTransport()
+        url = f"https://api.github.com/repos/{TAUCETI}/actions/workflows/ci.yml/runs?head_sha={BASE}&event=push&per_page=1"
+        run = {"id": 7, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/x/runs/7"}
+        transport.add("GET", url, 200, {"workflow_runs": [run]})
+        transport.add("GET", url.replace(BASE, HEAD), 200, {"workflow_runs": []})
+        transport.add("GET", url.replace(BASE, "d" * 40), 502, {})
+        a = adapter(transport)
+        found = a.main_ci_run(TAUCETI, BASE)
+        self.assertEqual((found.run_id, found.conclusion, found.html_url), ("7", "failure", run["html_url"]))
+        self.assertIsNone(a.main_ci_run(TAUCETI, HEAD))
+        with self.assertRaises(ga.GitHubError):
+            a.main_ci_run(TAUCETI, "d" * 40)
+        self.assertEqual(sum("/actions/workflows/ci.yml/" in call[1] for call in transport.calls), 3)
 
     def test_cancel_run(self):
         transport = FakeTransport()

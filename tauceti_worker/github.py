@@ -616,7 +616,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int | None = N
     if source is not None:
         from .source_cli import execute
 
-        return execute(argv[1:] if argv[0] == "gh" else argv, source)
+        return execute(argv[1:] if argv[0] == "gh" else argv, source, cwd=cwd)
     waited = 0
     attempt = 0
     tries = 0
@@ -927,6 +927,20 @@ class GitHub:
     def add_label(self, pr: int, name: str) -> bool:
         result = self._gh(["api", "-X", "POST", f"repos/{self.repo}/issues/{int(pr)}/labels", "-f", f"labels[]={name}"])
         return result.returncode == 0
+
+    def pull_for_head(self, owner: str, branch: str) -> int | None:
+        """The number of the one open PR whose head is `owner:branch`, fresh; None when absent or unreadable."""
+        if not re.fullmatch(r"[A-Za-z0-9-]+", owner) or not branch or any(ch in branch for ch in "&?# "):
+            return None
+        with transport.read_context(fresh=True):
+            result = self._gh(["api", f"repos/{self.repo}/pulls?state=open&head={owner}:{branch}"])
+        if result.returncode:
+            return None
+        try:
+            rows = json.loads(result.stdout)
+        except ValueError:
+            return None
+        return int(rows[0]["number"]) if isinstance(rows, list) and len(rows) == 1 else None
 
     def bump_repair_requested(self, pr: int, head: str) -> int | None:
         """Fresh proof of a stopped singleton, never a pending retry or speculative label."""

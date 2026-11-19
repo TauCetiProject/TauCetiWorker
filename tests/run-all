@@ -54,6 +54,7 @@ trap 'rm -rf "$RUN_ROOT"' EXIT
 # stdlib-only python tests, run with the project interpreter
 RUN_STDLIB=(
   build_resources.py
+  build_cache_wait.py
   activity.py
   activity_git.py
   activity_costs.py
@@ -70,6 +71,7 @@ RUN_STDLIB=(
   queue_repair_task.py
   queue_repair_locks.py
   queue_repair_cleanup.py
+  queue_install_releases.py
   queue_repair_cache.py
   queue_claude_stdin.py
   expanded_cache.py
@@ -86,8 +88,11 @@ RUN_STDLIB=(
   auto_stage_priority.py
   automatic_bump.py
   bump_attestation.py
+  self_tested_label.py
+  native_self_tested.py
   authoring_profiles.py
   bubble_cache.py
+  cache_probe_user_agent.py
   bubble_version.py
   branch_claim_repo.py
   build_status_rollup.py
@@ -105,6 +110,8 @@ RUN_STDLIB=(
   fork_authoring.py
   fleet_capacity.py
   forge_inventory.py
+  forgejo_mirror.py
+  forgejo_restore.py
   forge_contracts.py
   forgejo_reads.py
   github_accounts.py
@@ -141,6 +148,7 @@ RUN_STDLIB=(
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py
+  oauth_user_agent.py
   observability_failures.py
   open_pr_pages.py
   overlaps.py
@@ -202,6 +210,8 @@ RUN_STDLIB=(
   queue_statistics.py
   queue_admission_state.py
   queue_admission.py
+  queue_admission_evidence.py
+  queue_insertion_check.py
   queue_admission_adapter.py
   queue_config.py
   queue_cli.py
@@ -232,6 +242,7 @@ RUN_STDLIB=(
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
+  round_crash_reasons.py
   round_file_changes.py
   round_group_sweep.py
   resources.py
@@ -241,6 +252,8 @@ RUN_STDLIB=(
   scoreboard_trust.py
   security_audit.py
   security_audit_served.py
+  security_audit_pool.py
+  security_audit_claude.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py

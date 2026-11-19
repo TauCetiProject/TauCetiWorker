@@ -23,8 +23,8 @@ abstract transport must not make a computable operation noncomputable.
 
 If `.github/pull_request_template.md` in this checkout has a `Quality pass:` block, run its
 checks, which the template explains, over every declaration you add or change. Fix what they
-find and fill in the block's lines, one per check, for the PR body. If the template has no
-such block, skip this.
+find and fill in the block's lines, one per check, for the PR body. __QUALITY_SCOPE__
+If the template has no such block, skip this.
 
 Keep one coherent topic per PR. For each removed public declaration explain
 whether Mathlib supplies it, a representation change replaces it, or surviving

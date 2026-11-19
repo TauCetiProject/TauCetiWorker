@@ -66,3 +66,10 @@ guests acquire the new setup when they finish and are replaced.
 This is a start-time gate with independent random retries. Existing compilers
 continue running and several processes may pass a check together. It reduces
 contention but does not reserve memory or guarantee freedom from OOM failures.
+
+Operators diagnosing stock Lean asynchronous elaboration shutdown hangs can set
+`TAUCETI_LEAN_SERIAL_ELAB=1`. For compiler invocations naming a `.lean` input,
+the wrapper supplies the supported `-DElab.async=false` option. Explicit caller
+options take precedence; server sessions and discovery probes stay unchanged.
+This changes elaboration scheduling without patching Lean/Lake or weakening
+proof checking. Remove the setting to restore normal scheduling.

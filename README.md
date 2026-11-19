@@ -334,7 +334,9 @@ cannot discard an earlier source finding or explained code uncertainty, includin
 one retained only in native history.
 
 Coverage continuations, recognized provider failures and mechanical output repairs
-share at most three launches per invocation, with 5- and 10-second delays. Failed
+share at most three charged launches per invocation, with 5- and 10-second delays.
+A protocol-4 coverage turn that serves new pages is not charged, so reading continues
+in the same invocation, up to 60 launches in total. Failed
 launches and partial turns are archived under `service-error-N/`, `output-error-N/`
 or `coverage-turn-N/`. Native history, reader receipts and goal bookkeeping are
 durable while the subprocess runs, so a restart retains evidence written before
@@ -404,10 +406,52 @@ pacing only when explicitly selected; hard limits still apply.
 This phase can run alone or alongside bump/progress maintenance. It cannot use `--pr` or authoring-model overrides,
 and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
 `--agent claude` uses Haiku, with ordinary subscription pacing and no expensive fallback.
+To bill Haiku reviews to the Claude API instead, set
+`TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE` to an absolute path to a mode-0600 file
+containing only the key. Only the isolated client process receives it, and retained
+evidence records a placeholder instead of the key.
 It uses its own isolated launcher regardless of the ordinary host/Bubble setting.
 The active GitHub credential must have repository-admin permission, checked before
 spending and again before updating the cursor. New toolchain tags must be at or
 behind the cursor; see [the policy](https://github.com/TauCetiProject/TauCeti/blob/main/docs/security-audit.md).
+
+To catch up a large backlog, an admin can run several isolated reviewers at once
+on the same audit state:
+
+```bash
+python3 -m tauceti_worker.security_audit pool --state /path/to/worker/state/security-audit \
+  --parallel 8
+```
+
+The pool plans a window of consecutive batches ahead of the cursor, each exactly as
+`work` would plan it from that batch's start, and inspects them concurrently in
+separate attempt directories. The cursor advances only through the ordinary admin
+update, one batch at a time and only past validated passes, so a later batch that
+finishes first waits for its predecessors. A finding or incomplete verdict is
+binding: it is never inspected again, nothing beyond it advances, and the usual
+block and alert are recorded. Operational failures with no recorded judgment get
+at most two more attempts before blocking. An operational block left at the cursor
+by an ordinary round is archived and inspected afresh; source findings never are.
+Passing results persist under `pool/` and are reused after a restart only when the
+rebuilt input is byte-identical and still the next main prefix. While the pool
+holds `pool.lock`, ordinary audit rounds for that state defer to it. A GitHub rate
+limit defers admin checks and cursor updates until reset without failing reviews.
+
+Each new batch gets the first available reviewer: Codex `gpt-6-luna` while the Codex
+subscription is under pace, then Haiku on the Claude subscription while that is under
+pace, then Haiku billed to the API key in `TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE`
+regardless of pace. With none available, new batches wait. Pacing is the ordinary
+`work` verdict, and `--ignore-quota` overrides soft pacing only. A batch keeps its
+provider for life, and retries continue the reviewer's own session: Codex resumes its
+native rollout, and protocol-4 Haiku resumes its Claude session (`claude -p --resume`),
+which the Worker retains under the attempt's `claude-projects/`. Haiku may return
+`unfinished` with no findings to continue reading, exactly as Luna does. Any earlier
+finding or uncertainty in the session or the captured stream-json output binds the
+batch, and a fresh Haiku attempt starts only when no valid session is retained and
+that output holds none. Claude retries prefer the same credential, moving from the
+subscription to the API key when the subscription goes over pace. `--agent codex` or
+`--agent claude` pins one provider. The ledger and `pool/` result files record each
+review's provider, model and credential kind, never the key.
 
 An admin initializes the protections and original audited snapshot once with:
 
@@ -805,4 +849,6 @@ Request diagnostics include JSON field names and distinguish closed-PR history
 scans from open inventories. Progress batches complete labelled histories with
 independent cursors rather than caching a potentially incomplete reporting window.
 
-Use `tauceti work --self-tested` (or `self_tested = true` in a worker definition) to instruct source-changing agents to apply the `self-tested` label to eligible mathematics PRs after successful local verification. The existing shared checks cover `lake build --iofail && lake test && lake lint`; no additional verification pass is needed. Use `--no-self-tested` to disable the prompting. Reviews and staging tests remain required.
+Use `tauceti work --self-tested` (or `self_tested = true` in a worker definition) to instruct source-changing agents to apply the `self-tested` label to eligible mathematics PRs after successful local verification. The existing shared checks cover `lake build --iofail && lake test && lake lint`; no additional verification pass is needed. Use `--no-self-tested` to disable the prompting. If direct labelling lacks permission, agents can request the label with a new standalone `self-tested` PR comment; only the PR author can use that command, and it declares that the author runs local verification. The label persists through fix/rebase pushes; remove it if verification fails or is incomplete. Members of `TauCetiProject/self-tested` have triage access after accepting their organisation invitation. Reviews and staging tests remain required.
+
+Agents run three of the PR template's quality-pass checks by default, Q1, Q2 and Q5, and begin each other line `declined — not run`. Use `tauceti work --full-quality` (or `full_quality = true` in a worker definition) to have them run all five.
