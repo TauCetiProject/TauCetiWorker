@@ -337,6 +337,19 @@ class EvidenceTests(unittest.TestCase):
         self.deliver("push", {"ref": ref, "after": "b" * 40, "repository": {"full_name": REPO, "pushed_at": 200}})
         self.deliver("push", {"ref": ref, "after": "a" * 40, "repository": {"full_name": REPO, "pushed_at": 100}})
         self.assertEqual(cache.store.get_setting(cache.tip_key)["sha"], "b" * 40)
+        self.deliver("push", {"ref": ref, "after": "c" * 40, "repository": {"full_name": REPO, "pushed_at": 200}})
+        self.assertEqual(cache.store.get_setting(cache.tip_key)["sha"], "")  # a tie: no push tip
+        # Two comment counts with one timestamp: order unknown, so the PR needs a full read.
+        at = self.rows("admission_evidence")[0]["count_updated_at"]
+        self.deliver(
+            "issue_comment",
+            {
+                "action": "created",
+                "issue": {"number": 1, "pull_request": {}, "comments": 5, "updated_at": iso(at)},
+                "comment": {"id": 40, "body": "x", "user": {"login": "a", "id": 1}, "updated_at": iso(at)},
+            },
+        )
+        self.assertEqual(cache.view(1)["status"], "unseeded")
 
     def test_same_second_relevance_change_unseeds(self):
         self.controller.set_setting("admission_evidence_mode", "shadow", "test")

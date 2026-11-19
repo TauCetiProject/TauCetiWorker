@@ -100,7 +100,9 @@ class EvidenceCache:
                 pushed = pushed if type(pushed) in (int, float) else _time(pushed)
                 current = self.store.get_setting(self.tip_key, {})
                 if len(after) == 40 and pushed and pushed >= current.get("pushed_at", 0):
-                    value = {"sha": after, "pushed_at": pushed, "at": now}
+                    # Two pushes with one `pushed_at`: order unknown, so no push tip until the next.
+                    tie = pushed == current.get("pushed_at") and after != current.get("sha")
+                    value = {"sha": "" if tie else after, "pushed_at": pushed, "at": now}
                     self.store.set_setting(self.tip_key, value, "admission evidence", now)
 
     def _row(self, number):
@@ -118,6 +120,9 @@ class EvidenceCache:
         row = self._row(number)
         if at < row["count_updated_at"] or (seeded_at is not None and row["received_at"] > seeded_at):
             return
+        if seeded_at is None and at == row["count_updated_at"] and count != row["comments_count"]:
+            # Two counts with one timestamp: order unknown, so the PR needs a full read.
+            self.store.update("admission_evidence", {"id": row["id"]}, seeded_at=0)
         self.store.update(
             "admission_evidence",
             {"id": row["id"]},
@@ -231,8 +236,9 @@ class EvidenceCache:
                 self.store.update("admission_evidence_statuses", {"id": row["id"]}, **values)
             return
         # The row came from a full read, which gives no status id: order by creation time instead.
+        # Anything created while the read ran (with a margin for clock skew) may or may not be in it.
         created = _time(payload.get("updated_at") or payload.get("created_at"))
-        if created > row["seeded_at"] + STATUS_SKEW_SECONDS:
+        if created > max(row["seeded_until"], row["seeded_at"]) + STATUS_SKEW_SECONDS:
             self.store.update("admission_evidence_statuses", {"id": row["id"]}, **values)
         elif created >= row["seeded_at"] - STATUS_SKEW_SECONDS and state != row["state"]:
             self.store.update("admission_evidence_statuses", {"id": row["id"]}, ambiguous=1, received_at=now)
@@ -274,7 +280,14 @@ class EvidenceCache:
                     self.store.update("admission_evidence_comments", {"id": row["id"]}, deleted=1, received_at=started)
             for context, state in snapshot.statuses.items():
                 key = {"repository": self.repository, "sha": pull.head_sha, "context": context}
-                values = {"state": state, "status_id": 0, "seeded_at": started, "received_at": started, "ambiguous": 0}
+                values = {
+                    "state": state,
+                    "status_id": 0,
+                    "seeded_at": started,
+                    "seeded_until": now,
+                    "received_at": started,
+                    "ambiguous": 0,
+                }
                 row = self.store.row("admission_evidence_statuses", key)
                 if row is None:
                     self.store.insert("admission_evidence_statuses", **key, **values)
@@ -326,7 +339,9 @@ class EvidenceCache:
         return {
             "status": "seeded",
             "row": row,
-            "tip": tip.get("sha") or row["base_sha"],
+            # A push delivered after the PR's last full read is newer than that read's base;
+            # otherwise the read's base is the authoritative one.
+            "tip": tip["sha"] if tip.get("sha") and tip.get("at", 0) > row["seeded_at"] else row["base_sha"],
             "labels": tuple(loads(row["labels"], [])),
             "comment_ids": tuple(c["comment_id"] for c in live),
             "comments": tuple(
@@ -444,7 +459,7 @@ class Shadow:
             return {"outcome": "paths-unknown", "fields": differ, "raced": raced}
         if sorted(paths) != sorted(snapshot.paths):
             differ.append("paths")
-        if set(differ) & {"head", "head_ref", "head_repo", "author", "labels", "paths", "base_ref"}:
+        if set(differ) & {"head", "head_ref", "head_repo", "author", "labels", "paths", "base_ref", "merge_base"}:
             # Self-tested eligibility and the diff guards were measured only on the real inputs.
             return settle(self_tested="unavailable")
         shadow_pull = dataclasses.replace(pull, body=row["body"], labels=view["labels"])

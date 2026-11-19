@@ -933,10 +933,10 @@ and context) in `admission_evidence*` tables, filled from verified webhook deliv
 full read (`tauceti_queue/admission_evidence.py`). Before each full read refreshes the cache, the
 same policy evaluates the cached evidence, with the merge base and paths from the local clone, and
 `status.admission.evidence.shadow` counts the outcome: `match`, `race` (a delivery arrived during
-the read), `unseeded`, `gap` (GitHub's comment count disagrees), `merge-base-unknown`,
+the read), `unseeded`, `gap` (GitHub's comment count disagrees), `status-order-unknown`, `merge-base-unknown`,
 `paths-unknown` or `mismatch`, with the differing fields and, for a verdict difference, its
 direction (`cache-would-admit`, `cache-would-refuse`, `cache-keeps`, `cache-revokes`); mismatches
-are also journaled as `admission-shadow`. The shadow makes no GitHub request and never changes a
+are also journaled as `admission-shadow`, and `with_differences` counts every comparison that found a difference, whatever its outcome. The shadow makes no GitHub request and never changes a
 decision; `off` (the default) writes nothing. Switch it live with `tauceti-queue settings set
 admission_evidence_mode shadow`.
 

@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS admission_evidence_statuses (
     status_id INTEGER NOT NULL DEFAULT 0,
     sender TEXT NOT NULL DEFAULT '',
     seeded_at REAL NOT NULL DEFAULT 0,
+    seeded_until REAL NOT NULL DEFAULT 0,
     ambiguous INTEGER NOT NULL DEFAULT 0,
     received_at REAL NOT NULL DEFAULT 0
 );
