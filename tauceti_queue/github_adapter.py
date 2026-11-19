@@ -1311,13 +1311,16 @@ class GitHubAdapter:
         ):
             return self._full_snapshot(repo, number, generation)
         author = node.get("author") or {}
+        login = author.get("login", "") if node.get("author") is not None else "ghost"
+        if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
+            login += "[bot]"  # REST's login for an App, which self-tested bump checks compare
         pull = PullRequest(
             number=number,
             head_sha=head,
             base_ref=node.get("baseRefName", ""),
             title=node.get("title") or "",
             body=node.get("body") or "",
-            author_login=author.get("login", "") if node.get("author") is not None else "ghost",
+            author_login=login,
             state="open" if node.get("state") == "OPEN" else "closed",
             draft=bool(node.get("isDraft")),
             labels=tuple(s["name"] for s in labels.get("nodes", ())),
@@ -1361,7 +1364,11 @@ class GitHubAdapter:
                 pull.state,
                 pull.draft,
                 sorted(pull.labels),
-            ) or (fresh.body, fresh.comments_count) != (pull.body, pull.comments_count):
+            ) or (fresh.body, fresh.comments_count, _timestamp(fresh.updated_at)) != (
+                pull.body,
+                pull.comments_count,
+                _timestamp(pull.updated_at),
+            ):
                 raise GitHubError("PR inputs changed while admission was reading source evidence")
         self.snapshot_sources["single"] += 1
         self.merge_base_sources["local"] = self.merge_base_sources.get("local", 0) + 1
@@ -1967,7 +1974,7 @@ query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       headRefOid headRefName baseRefOid baseRefName state isDraft merged body title updatedAt
       headRepository { nameWithOwner }
-      author { login ... on User { databaseId } ... on Bot { databaseId } }
+      author { __typename login ... on User { databaseId } ... on Bot { databaseId } }
       labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
       comments(first: 100) { totalCount """
     + ADMISSION_COMMENT_FIELDS

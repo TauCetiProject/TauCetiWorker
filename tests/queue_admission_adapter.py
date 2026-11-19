@@ -796,6 +796,43 @@ class SingleReadTests(unittest.TestCase):
         self.assertEqual(adapter.snapshot_sources, {"single": 0, "full": 1})
         self.assertTrue(any("/compare/" in str(call) for call in transport.calls))
 
+    def test_an_app_author_reads_as_rest_names_it(self):
+        document = self.single()
+        document["data"]["repository"]["pullRequest"]["author"] = {"__typename": "Bot", "login": "tauceti-review-bot"}
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, document)
+        snapshot = self.adapter(transport).admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(snapshot.pull.author_login, "tauceti-review-bot[bot]")
+
+    def test_live_self_tested_reads_fence_the_update_time_too(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
+        raw = pr_json(
+            head={"sha": self.head},
+            base={"ref": "main", "sha": self.base},
+            labels=[{"name": "self-tested"}],
+            comments=1,
+            updated_at="2026-11-19T01:05:00Z",  # a scoreboard edited during the live reads
+        )
+
+        def fence(raw):
+            document = fence_document(raw)
+            document["data"]["repository"]["pullRequest"]["labels"] = connection([{"name": "self-tested"}])
+            return document
+
+        transport.add("POST", "https://api.github.com/graphql", 200, fence(raw))
+        adapter = self.adapter(transport)
+        adapter.team_member_read = lambda path: {"state": "active"}
+        with self.assertRaises(ga.GitHubError):
+            adapter.admission_snapshot_single(TAUCETI, 42)
+        # The same fence at the same update time passes.
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
+        transport.add("POST", "https://api.github.com/graphql", 200, fence({**raw, "updated_at": self.TS}))
+        adapter = self.adapter(transport)
+        adapter.team_member_read = lambda path: {"state": "active"}
+        self.assertEqual(adapter.admission_snapshot_single(TAUCETI, 42).pull.head_sha, self.head)
+
     def test_live_self_tested_reads_are_fenced_again(self):
         transport = FakeTransport()
         transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))

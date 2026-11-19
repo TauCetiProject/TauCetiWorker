@@ -444,9 +444,24 @@ class AdmissionPoller:
                 return
             if kind == "check_run" and detail.get("name") == "merge eligibility":
                 return
-            if self.evidence_mode() == "events" and getattr(self._delivery, "unchanged", None) is payload:
-                return  # the cache already held this state for this commit and context
             sha = detail.get("head_sha") or detail.get("sha")
+            if self.evidence_mode() == "events" and getattr(self._delivery, "unchanged", None) is payload:
+                rows = self.controller.store.rows("admission_work", {"repository": self.repo, "head_sha": sha})
+                cached = self.controller.store.row(
+                    "admission_evidence_statuses",
+                    {"repository": self.repo, "sha": sha, "context": detail.get("context")},
+                )
+                if (
+                    rows
+                    and cached is not None
+                    and all(
+                        r["generation"] == r["evaluated_generation"] and cached["seeded_at"] >= r["attempted_at"]
+                        for r in rows
+                    )
+                ):
+                    # The last completed evaluation of every PR at this head installed exactly this
+                    # state from its own read, and no delivery has changed it since.
+                    return
             if sha and self.controller.store.row("ci_attempts", {"head_sha": sha}):
                 return  # the service's candidate CI is output, not PR review evidence
             numbers = {p["number"] for p in detail.get("pull_requests", ()) if p.get("number")}

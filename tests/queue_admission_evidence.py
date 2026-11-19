@@ -400,6 +400,17 @@ class EvidenceTests(unittest.TestCase):
             self.deliver("status", {"id": 2, "sha": head, "context": "build", "state": "success"})
             self.assertEqual(self.intake.state.get(1)["generation"] != generation, dirtied, mode)
             self.intake.run_once()
+        # A state a delivery (not the last read) installed is never treated as already evaluated.
+        later = iso(self.clock() + 3600)
+        self.deliver("status", {"id": 4, "sha": head, "context": "scope", "state": "failure", "updated_at": later})
+        self.intake.run_once()
+        generation = self.intake.state.get(1)["generation"]
+        self.intake.evidence.store.update(
+            "admission_evidence_statuses", {"repository": REPO, "sha": head, "context": "scope"}, status_id=4
+        )
+        self.deliver("status", {"id": 5, "sha": head, "context": "scope", "state": "failure", "updated_at": later})
+        self.assertNotEqual(self.intake.state.get(1)["generation"], generation)
+        self.intake.run_once()
         # A status that does change the state still dirties the PR in events mode.
         generation = self.intake.state.get(1)["generation"]
         self.deliver("status", {"id": 3, "sha": head, "context": "build", "state": "failure"})

@@ -237,11 +237,13 @@ class EvidenceCache:
         if row is None:
             self.store.insert("admission_evidence_statuses", **key, **values)
             return True
-        unchanged = not row["ambiguous"] and row["state"] == state
+        # "Unchanged" means more than equal: the cached state must be the one the last full read
+        # itself installed (no delivery since), so the evaluation that read it saw exactly this.
+        unchanged = not row["ambiguous"] and row["state"] == state and row["status_id"] == 0 and row["seeded_at"] > 0
         if row["status_id"] > 0:
             if row["status_id"] < status_id:
                 self.store.update("admission_evidence_statuses", {"id": row["id"]}, **values)
-            return not unchanged
+            return True
         # The row came from a full read, which gives no status id: order by creation time instead.
         # Anything created while the read ran (with a margin for clock skew) may or may not be in it.
         created = _time(payload.get("updated_at") or payload.get("created_at"))
