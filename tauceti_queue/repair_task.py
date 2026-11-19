@@ -2409,7 +2409,11 @@ def _run_task(
                     + (f"; skipped: {skipped}" if skipped else "")
                 )
             if not artifacts["available"] and (
-                task.kind in repair.REBASE_KINDS or toolchain_changed(worktree, revisions[0], start_tip)
+                task.kind in repair.REBASE_KINDS
+                # A build-failure repair only: a preparation discovers its failures with the warm build
+                # (a repair works from the task's diagnostics, without the stream), and audit/lint
+                # findings are verified by the worker, which a cold tree cannot do.
+                or (task.kind == "repair" and not known_checks and toolchain_changed(worktree, revisions[0], start_tip))
             ):
                 artifacts["cold"] = True
             outcome["artifacts"] = {k: v for k, v in artifacts.items() if k != "incremental_build"} | {
@@ -2575,6 +2579,7 @@ def _run_task(
                 and not continuation
                 and task.kind in ("repair", "prepare")
                 and cfg.parallel_agents > 1
+                and not (outcome.get("artifacts") or {}).get("cold")
             ):
                 # Independent failing groups are repaired by concurrent agents first; what they leave
                 # (nothing, a group that failed, a build that still fails) goes to the usual agent below.

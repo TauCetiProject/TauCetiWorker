@@ -1776,6 +1776,25 @@ class ToolchainBumpWithoutArtifacts(Fixture):
         self.assertTrue(self.state()["artifacts"]["cold"], "a resumed claim still knows the build is cold")
         self.assertEqual(len(self.agent_calls()), 1)
         self.assertIn("The build is cold", self.agent_calls()[0]["prompt"])
+        self.assertNotIn("stream_build", outcome, "nothing to stream from without artifacts")
+
+    def test_parallel_agents_are_not_dispatched_cold(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config(parallel_agents=3)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertNotIn("parallel", outcome)
+
+    def test_a_preparation_is_still_released(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        raw = self.content.task(kind="prepare")
+        raw["diagnostics"] = []
+        self.service.tasks = {1: raw}
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "artifacts_unavailable")
+        self.assertEqual(self.agent_calls(), [])
 
     def test_the_toolchain_change_is_read_from_the_chain(self):
         clone = self.content.bare.parent / "seed"
