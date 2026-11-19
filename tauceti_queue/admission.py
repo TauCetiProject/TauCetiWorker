@@ -294,6 +294,33 @@ class AdmissionPoller:
         work = self.state.get(number)
         return bool(work and work["head_sha"] == head and work["generation"] == work["evaluated_generation"])
 
+    def insertion_check(self, number, head):
+        """None when the PR's admission inputs still match those admission evaluated for `head`, else
+        why not. Runs without the controller lock, before an approved head joins a batch.
+
+        `is_current` only consults local records, so a missed webhook would let a revoked review or
+        a failed status reach a batch until the next discovery. Behind `admission_insertion_check`,
+        this re-reads the inputs and compares their digest with the evaluated one. Any difference,
+        or a read that fails, holds the insertion (fail closed) and the PR is evaluated again.
+        """
+        if not self.controller.setting("admission_insertion_check"):
+            return None
+        read = getattr(self.adapter, "admission_insertion_source", None)
+        if read is None:
+            return None  # an adapter without the read keeps today's local check
+        work = self.state.get(number)
+        if not work or work["head_sha"] != head or work["generation"] != work["evaluated_generation"]:
+            return "not evaluated at this head"
+        try:
+            source = read(self.repo, number, head)
+        except Exception as error:  # noqa: BLE001 - an unreadable source never admits
+            return f"unavailable: {error}"
+        if source.get("head") != head:
+            return "head moved"
+        if self._version(source) != work["evaluated_version"]:
+            return "inputs changed since evaluation"
+        return None
+
     def interval(self):
         pending = self.state.summary()["next_attempt_at"]
         deadline = self._discovery_at if pending is None else min(self._discovery_at, pending)

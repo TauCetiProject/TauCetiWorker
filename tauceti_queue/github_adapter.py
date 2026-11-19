@@ -1496,24 +1496,7 @@ class GitHubAdapter:
             if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
                 raise GitHubError("incomplete review comments")
             for comment in connection["nodes"]:
-                if not isinstance(comment, dict) or not isinstance(comment.get("databaseId"), int):
-                    raise GitHubError("incomplete review comment")
-                author = comment.get("author") or {}
-                login = author.get("login", "")
-                # GraphQL Bot.login omits REST's suffix. Preserve the same actor identity
-                # for trusted recovery holds and stable source versions across both APIs.
-                if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
-                    login += "[bot]"
-                comments.append(
-                    {
-                        "id": comment["databaseId"],
-                        "body": comment.get("body", ""),
-                        "created_at": comment.get("createdAt", ""),
-                        "updated_at": comment.get("updatedAt", ""),
-                        "html_url": comment.get("url", ""),
-                        "author": login,
-                    }
-                )
+                comments.append(_graphql_comment(comment))
             page = connection.get("pageInfo")
             if not isinstance(page, dict) or (page.get("hasNextPage") and not page.get("endCursor")):
                 raise GitHubError("incomplete review comment pagination")
@@ -1528,6 +1511,64 @@ class GitHubAdapter:
                 ADMISSION_COMMENTS_QUERY, {"owner": owner, "name": name, "number": number, "after": cursor}
             )
             connection = ((data.get("repository") or {}).get("pullRequest") or {}).get("comments")
+
+    def admission_insertion_source(self, repo: str, number: int, head: str) -> dict:
+        """The PR's admission inputs now, in the shape `admission.source_version` digests, for the
+        check before an approved head joins a batch (decision 38 step 4, slice 3).
+
+        One GraphQL read (plus pages for PRs with over 100 comments or labels), at essential
+        priority: it guards insertion, like the final fence guards evaluation. Every comment is
+        read, so a scoreboard edited or deleted since evaluation changes the result.
+        """
+        owner, name = repo.split("/", 1)
+        with self.client.deferred_requests(urgent=True):
+            data = self.client.graphql(
+                INSERTION_CHECK_QUERY, {"owner": owner, "name": name, "number": number, "head": head}
+            )
+            repository = data.get("repository") or {}
+            node, commit = repository.get("pullRequest"), repository.get("object")
+            if not isinstance(node, dict) or not isinstance(commit, dict) or commit.get("oid") != head:
+                raise GitHubError("incomplete insertion check")
+            labels = node.get("labels") or {}
+            if not isinstance(labels.get("pageInfo"), dict):
+                raise GitHubError("incomplete insertion check labels")
+            names = (
+                self.labels(repo, number)
+                if labels["pageInfo"].get("hasNextPage")
+                else [s["name"] for s in labels.get("nodes", ())]
+            )
+            comments, connection = [], node.get("comments")
+            while True:
+                if not isinstance(connection, dict) or not isinstance(connection.get("nodes"), list):
+                    raise GitHubError("incomplete insertion check comments")
+                comments.extend(_graphql_comment(comment) for comment in connection["nodes"])
+                page = connection.get("pageInfo")
+                if not isinstance(page, dict) or (page.get("hasNextPage") and not page.get("endCursor")):
+                    raise GitHubError("incomplete insertion check comment pagination")
+                if not page.get("hasNextPage"):
+                    break
+                more = self.client.graphql(
+                    ADMISSION_COMMENTS_QUERY,
+                    {"owner": owner, "name": name, "number": number, "after": page["endCursor"]},
+                )
+                connection = ((more.get("repository") or {}).get("pullRequest") or {}).get("comments")
+        statuses = {
+            s["context"]: str(s.get("state") or "").lower()
+            for s in (commit.get("status") or {}).get("contexts", ())
+            if s.get("context") in ("build", "scope", "bump-guard", f"self-tested/{number}")
+        }
+        return {
+            "head": node.get("headRefOid", ""),
+            "base_sha": node.get("baseRefOid", ""),
+            "base_ref": node.get("baseRefName", ""),
+            "state": str(node.get("state") or "").lower(),
+            "draft": bool(node.get("isDraft")),
+            "body": node.get("body") or "",
+            "labels": names,
+            "comments": comments,
+            "statuses": statuses,
+            "diff_version": self._diff_version(node.get("baseRefOid", ""), node.get("headRefOid", "")),
+        }
 
     def list_open_pull_requests(
         self, repo: str, *, review_app_id: int, admission=False, on_page=None
@@ -1794,6 +1835,45 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
 }
 """
 )
+
+
+INSERTION_CHECK_QUERY = (
+    """
+query($owner: String!, $name: String!, $number: Int!, $head: GitObjectID!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid baseRefOid baseRefName state isDraft body
+      labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
+      comments(first: 100) { """
+    + ADMISSION_COMMENT_FIELDS
+    + """ }
+    }
+    object(oid: $head) { ... on Commit { oid status { contexts { context state } } } }
+  }
+}
+"""
+)
+
+
+def _graphql_comment(comment) -> dict:
+    """A GraphQL issue comment in the REST-like shape admission reads."""
+    if not isinstance(comment, dict) or not isinstance(comment.get("databaseId"), int):
+        raise GitHubError("incomplete review comment")
+    author = comment.get("author") or {}
+    login = author.get("login", "")
+    # GraphQL Bot.login omits REST's suffix. Preserve the same actor identity
+    # for trusted recovery holds and stable source versions across both APIs.
+    if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
+        login += "[bot]"
+    return {
+        "id": comment["databaseId"],
+        "body": comment.get("body", ""),
+        "created_at": comment.get("createdAt", ""),
+        "updated_at": comment.get("updatedAt", ""),
+        "html_url": comment.get("url", ""),
+        "author": login,
+    }
 
 
 def _rest_check_run(run: dict, head_sha: str, app_id) -> dict:

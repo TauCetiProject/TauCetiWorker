@@ -95,6 +95,12 @@ class AdmissionInputs:
         if port is not None:
             return port.withdraw(int(number), head)
 
+    def insertion_check(self, number, head):
+        if isinstance(number, SourceNumber):
+            return None  # Forgejo keeps its own checks until slice 7 of decision 38 step 4
+        check = getattr(self.github, "insertion_check", None)
+        return None if check is None else check(int(number), head)
+
     def invalidate(self, number, **kwargs):
         port = self._for(number)
         if port is not None:
