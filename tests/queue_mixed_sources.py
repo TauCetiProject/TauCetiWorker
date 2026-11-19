@@ -375,7 +375,7 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.assertTrue(poller.is_current(1, head))
         self.assertFalse(self.controller.admission.readmit(number, "f" * 40))
         self.assertTrue(self.controller.admission.readmit(number, head))
-        self.assertFalse(poller.is_current(1, head), "re-read before the input can be inserted")
+        self.assertFalse(poller.is_current(1, head), "re-read before the input can be restored")
         work = poller.state.get(1)
         self.controller.store.update("admission_work", {"id": work["id"]}, disposition="closed")
         self.assertFalse(self.controller.admission.readmit(number, head))

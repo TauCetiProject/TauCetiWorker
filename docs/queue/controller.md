@@ -192,17 +192,19 @@ cannot repair the prospective tree. Those cases receive the ordinary missing-sou
 A genuinely new module in another batch still waits for that batch to land before re-probing.
 
 A missing-source refusal is not final for its head. The refusal records a dependency fingerprint
-(`evidence.missing_source_watch`): on the canonical commit, the blob at each gap's importer and at
-its missing source, and the active batches whose tip introduces a source the PR imports. Whenever
-the canonical commit or an active batch's tip moves, `_recheck_missing_sources` recomputes it for
-each PR's newest refusal; when it differs (the source landed or entered a batch, or an importer
-changed), the input waits again at its original age (`missing-source-recheck` in the journal,
-counter `missing_source_rechecks`) and is probed like any waiting input, which refuses it again if
-a gap remains. The refusal comment is keyed by head, so a repeated refusal posts nothing new.
-Admission (`readmit`) re-reads the PR before the input can be inserted, and refuses when it last
-saw another head or the PR closed, became a draft or is not review-safe; closing, drafting,
-pushing or withdrawing a refused PR also drops its refusal from the recheck. Refusals recorded
-before the fingerprint existed compare against the base of the batch that refused them.
+(`evidence.missing_source_watch`): for each gap, the blobs at its importer and at its missing source
+on the canonical commit, and the distinct such pairs at active batch tips that differ from it.
+Whenever the canonical commit or an active batch's tip moves, `_recheck_missing_sources` recomputes
+it for each PR's newest refusal. When it differs (the source landed, entered or left a batch, or an
+importer changed), the refusal becomes `missing-source-recheck` (journal `missing-source-recheck`)
+and admission (`readmit`) reads the PR again. If that read would admit the head (open, not a draft,
+review-safe, scoreboard green, no blocking label), `restore_missing_source` returns the same input
+to waiting at its original age (journal `missing-source-readmitted`, counter
+`missing_source_rechecks`), and it is probed like any waiting input, which refuses it again if a
+gap remains. The refusal comment is keyed by head, so a repeated refusal posts nothing new.
+Closing, drafting, pushing to or withdrawing a refused PR drops its refusal from the recheck.
+Refusals recorded before the fingerprint existed compare against the base of the batch that
+refused them, without batches.
 
 Background preparation (item 8 of "Pipeline acceleration behind the head" in the plan): while the
 head waits on CI or is being repaired, an open batch is built as assembled on its own base (never on

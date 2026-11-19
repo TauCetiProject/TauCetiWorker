@@ -339,6 +339,14 @@ class NativePoller:
                         and current["state"] in {"waiting", "reserved", "inserted", "landed"}
                     ):
                         disposition = current["state"]
+                    elif (
+                        controller.setting("forgejo_admission_enabled")
+                        and (
+                            restored := controller.restore_missing_source(number, snapshot.pull.head_sha, snapshot.pull)
+                        )
+                        is not None
+                    ):
+                        disposition = restored
                     elif self._cancelled(work, snapshot, authorization, comment, meta):
                         disposition = "withdrawn"
                     elif not controller.setting("forgejo_admission_enabled"):

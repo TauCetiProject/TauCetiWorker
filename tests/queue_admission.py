@@ -566,17 +566,27 @@ class AdmissionTests(unittest.TestCase):
         self.intake.invalidate(2)
         self.intake.run_once()
         self.assertEqual(self.intake.state.get(2)["disposition"], "closed")
-        approved_at = self.controller.input_for(REPO, 1)["approved_at"]
+        refused = self.controller.input_for(REPO, 1)
+        approved_at = refused["approved_at"]
         self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
         self.controller.tick()
         row = self.controller.input_for(REPO, 1)
-        self.assertEqual((row["state"], row["approved_at"]), ("waiting", approved_at))
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "missing-source-recheck"))
         self.assertFalse(self.intake.is_current(1, row["head_sha"]), "admission reads the PR again first")
-        self.assertEqual(self.controller.input_for(REPO, 2)["state"], "cancelled", "a closed PR stays out")
+        self.assertEqual(self.controller.input_for(REPO, 2)["reason"], "closed", "a closed PR leaves the recheck")
+        # Admission restores the input only when its fresh read would admit the head as it stands.
+        self.github.labels[1] = {"hold"}
         self.assertEqual(self.intake.run_once()["approved"], 0)
-        self.assertEqual(self.intake.state.get(1)["disposition"], "already-approved")
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+        self.github.labels[1] = set()
+        self.intake.invalidate(1)
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.intake.state.get(1)["disposition"], "readmitted")
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual((row["id"], row["state"], row["approved_at"]), (refused["id"], "waiting", approved_at))
         self.controller.tick()
         self.assertEqual(self.controller.input_for(REPO, 1)["state"], "inserted")
+        self.assertEqual(self.controller.status()["counters"].get("missing_source_rechecks"), 1)
 
     def test_manual_reapproval_clears_withdrawal_intent(self):
         head = self.ready()
