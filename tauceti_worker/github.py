@@ -919,9 +919,10 @@ class GitHub:
                     raise error
                 try:
                     return json.loads(result.stdout)
-                except (ValueError, TypeError) as error:
+                except (ValueError, TypeError):
+                    error = GitHubError("target landing evidence is malformed")
                     failures.append(error)
-                    raise
+                    raise error from None
 
             def comments():
                 rows = self.issue_comments(number)

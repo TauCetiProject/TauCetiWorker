@@ -150,6 +150,10 @@ class LiveView(unittest.TestCase):
         rows.append({"number": 301, "body": marker("Algebra", "a"), "baseRefName": "main", "state": "CLOSED"})
         self.assertEqual(t.verified_landings(listed.items(), rows, source), {("Algebra", "a"): 301})
         source.target_queue_landed.assert_called_once_with(301, "main")
+        source.target_queue_landed.reset_mock()
+        done = t.overlay_live(listed, set(), {("Algebra", "a")})
+        t.verified_landings(done.items(), rows, source)
+        source.target_queue_landed.assert_not_called()
 
     def test_complete_recent_history_does_not_trigger_dependency_searches(self):
         listed = t.parse_targets(

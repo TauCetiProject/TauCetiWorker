@@ -288,7 +288,7 @@ def verified_landings(items: Iterable[TargetItem], rows: Iterable[dict], source)
     row would turn one bounded listing into hundreds of unnecessary authenticated reads.
     """
     items = list(items)
-    by_key = {(it.area, it.slug): it for it in items}
+    by_key = {(it.area, it.slug): it for it in items if it.status != "done"}
     verified = []
     for row in rows:
         if row.get("state") != "CLOSED":

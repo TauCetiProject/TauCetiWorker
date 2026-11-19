@@ -191,7 +191,12 @@ class ForgejoWorkerSource(ForgejoReadSource):
                         output, _, _ = execute(plan(parse_command(["api", path])), self.api)
                         return json.loads(output)
                     return self.api.request("GET", path)
-                except (ForgeError, OSError, ValueError) as error:
+                except ForgeError as error:
+                    if error.status in (404, 422) and ("/compare/" in path or "/git/commits/" in path):
+                        return None  # An untrusted candidate names no usable landed commit.
+                    failures.append(error)
+                    raise
+                except (OSError, ValueError) as error:
                     failures.append(error)
                     raise
 
@@ -212,6 +217,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
                 read_comments=comments,
                 native=True,
                 subject=subject,
+                alternate_subjects=(f"{self.repository.key}#{number}",),
             )
             if failures:
                 raise failures[0]
@@ -219,7 +225,9 @@ class ForgejoWorkerSource(ForgejoReadSource):
 
         result = self._read("target_queue_landed", [number, branch], fetch)
         if result is None:
-            raise Incomplete("native target landing evidence is unavailable")
+            from .config import SourceUnavailable
+
+            raise SourceUnavailable("native target landing evidence is unavailable")
         return result
 
     def issue_list(self, repository, **options):

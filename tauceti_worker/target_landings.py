@@ -145,6 +145,7 @@ def queue_landed(
     read_json: Callable[[str], object],
     native: bool = False,
     subject: str | None = None,
+    alternate_subjects: tuple[str, ...] = (),
 ) -> bool:
     """Prove a queue landing using source-bound, optionally cached adapter reads.
 
@@ -155,17 +156,26 @@ def queue_landed(
     if type(number) is not int or number <= 0 or (native and subject is None):
         return False
     subject = subject or f"{repository}#{number}"
-    if not subject.endswith(f"#{number}"):
+    subjects = (subject, *alternate_subjects)
+    if any(not isinstance(value, str) or not value.endswith(f"#{number}") for value in subjects):
         return False
     try:
         comments = read_comments()
         if not isinstance(comments, (list, tuple)):
             return False
-        for sha in landing_candidates(comments, subject, branch, native=native):
-            if commit_on_base(read_json, repository, branch, sha, native=native) and (
-                not native or native_commit_binds(read_json, repository, sha, subject)
-            ):
-                return True
+        observed = {}
+
+        def read(path):
+            if path not in observed:
+                observed[path] = read_json(path)
+            return observed[path]
+
+        for expected in subjects:
+            for sha in landing_candidates(comments, expected, branch, native=native):
+                if commit_on_base(read, repository, branch, sha, native=native) and (
+                    not native or native_commit_binds(read, repository, sha, expected)
+                ):
+                    return True
     except Exception:
         return False
     return False

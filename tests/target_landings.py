@@ -5,6 +5,8 @@ import copy
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import target_landings as proof
@@ -155,6 +157,23 @@ class Proof(unittest.TestCase):
         self.assertTrue(check())
         self.assertEqual(self.calls, list(self.responses))
 
+    def test_subjects_match_both_real_queue_modes(self):
+        from tauceti_tools.ci_candidate import RepositoryIdentity
+        from tauceti_tools.forge import Forge, RepositoryRef
+
+        from tauceti_queue.controller import Controller
+        from tauceti_queue.mixed_identity import SourceNumber
+
+        repository = RepositoryRef(Forge("forgejo", "https://forge.example"), REPO)
+        queue = SimpleNamespace(provenance_repository=repository.key)
+        standalone = Controller._source_pr(queue, 7)
+        mixed = Controller._source_pr(queue, SourceNumber(7, RepositoryIdentity(repository, 91)))
+        self.assertEqual(standalone, f"{repository.key}#7")
+        self.assertEqual(mixed.casefold(), f"{repository.key}@91#7".casefold())
+        for subject in (standalone, mixed):
+            self.native(subject=subject)
+            self.assertTrue(self.check(native=True, subject=mixed, alternate_subjects=(standalone,)))
+
     def test_native_subject_includes_forge_and_repository_id(self):
         check = self.native()
         for wrong in [NATIVE.replace("@91", "@92"), NATIVE.replace("forge.example", "other.example"), SUBJECT]:
@@ -215,6 +234,56 @@ class Proof(unittest.TestCase):
                 )
             )
         self.assertFalse(self.check(subject="team/Math#8"))
+
+
+class NativeAdapter(unittest.TestCase):
+    def source(self, comments, *, branch_error=None):
+        from tauceti_tools.ci_candidate import RepositoryIdentity
+        from tauceti_tools.forge import Forge, ForgeError, RepositoryRef
+
+        from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+        repository = RepositoryRef(Forge("forgejo", "https://forge.example"), REPO)
+        api = Mock(forge=repository.forge, _token="fixture", max_bytes=1024 * 1024, max_pages=100)
+        source = ForgejoWorkerSource(RepositoryIdentity(repository, 91), api, token_file=None)
+        source.issue_comments = Mock(return_value=comments)
+
+        def read(method, path):
+            self.assertEqual(method, "GET")
+            if "/branches/" in path:
+                if branch_error is not None:
+                    raise branch_error
+                return {"name": "release/next", "commit": {"id": TIP}}
+            if "/compare/" in path and "f" * 40 in path:
+                raise ForgeError("nominated object does not exist", status=404)
+            if f"{TIP}...{SHA}" in path:
+                return {"total_commits": 0, "commits": []}
+            if f"{SHA}...{TIP}" in path:
+                return {"total_commits": 2, "commits": [{"sha": TIP}]}
+            raise AssertionError(path)
+
+        api.request.side_effect = read
+        return source
+
+    def test_forged_missing_object_does_not_stall_or_hide_a_valid_landing(self):
+        subject = f"forgejo:https://forge.example/{REPO}@91#7"
+        invalid = comment(subject, sha="f" * 40, login="contributor")
+        valid = comment(subject, login="contributor")
+        with patch.object(proof, "native_commit_binds", return_value=True):
+            self.assertFalse(self.source([invalid]).target_queue_landed(7, "release/next"))
+            self.assertTrue(self.source([invalid, valid]).target_queue_landed(7, "release/next"))
+
+    def test_missing_branch_or_comments_report_source_unavailable(self):
+        from tauceti_tools.forge import ForgeError
+
+        from tauceti_worker.config import SourceUnavailable
+
+        subject = f"forgejo:https://forge.example/{REPO}@91#7"
+        source = self.source([comment(subject)], branch_error=ForgeError("base unavailable", status=404))
+        with self.assertRaises(SourceUnavailable):
+            source.target_queue_landed(7, "release/next")
+        with self.assertRaises(SourceUnavailable):
+            self.source(None).target_queue_landed(7, "release/next")
 
 
 if __name__ == "__main__":
