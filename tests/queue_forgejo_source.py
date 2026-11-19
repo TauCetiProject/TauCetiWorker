@@ -394,6 +394,11 @@ class NativeSource(unittest.TestCase):
             items[0].admission["discovery_version"], self.source._discovery_version(self.source._pull(newest[0]))
         )
         self.assertEqual(len(paths), 2)  # the second page held the first older update
+        # A server that caps pages below the requested size: a short page does not end the read.
+        pages = {1: newest[:1], 2: newest[1:], 3: []}
+        paths.clear()
+        items, _, complete = self.source.list_recent_pull_requests("team/Math", since=since, page_size=2)
+        self.assertEqual(([i.number for i in items], complete, len(paths)), ([9, 5], True, 3))
         # A bounded read that never reaches `since` says so, so the caller lists in full.
         items, _, complete = self.source.list_recent_pull_requests("team/Math", since=0, page_size=2, max_pages=1)
         self.assertFalse(complete)

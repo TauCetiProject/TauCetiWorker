@@ -379,6 +379,10 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             )
             if not isinstance(rows, list):
                 raise Incomplete("native recent pull listing is malformed")
+            if not rows:
+                # Only an empty page ends the listing: the server may cap pages below `page_size`.
+                self._bound(repo)
+                return items, newest, True
             for row in rows:
                 pull = self._pull(row)
                 updated = _forge_time(pull.updated_at)
@@ -389,9 +393,6 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                     self._bound(repo)
                     return items, newest, True
                 items.append(self._listed(pull))
-            if len(rows) < page_size:
-                self._bound(repo)
-                return items, newest, True
         self._bound(repo)
         return items, newest, False
 
