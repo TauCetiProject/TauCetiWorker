@@ -261,7 +261,12 @@ class AdmissionPoller:
             relevant_labels=lambda: KEEP | controller._no_repair_labels() | ADMISSION_LABELS,
             base_branch=controller.canonical_branch,
         )
-        self.shadow = Shadow(self.evidence, self.policy, journal=controller.store.journal)
+        self.shadow = Shadow(
+            self.evidence,
+            self.policy,
+            journal=controller.store.journal,
+            blocking_labels=controller._blocking_labels,
+        )
         # Restore retry deadlines as-is. Discovery is due at startup independently of pending work.
         saved = controller.store.get_setting("state:admission_discovery", {})
         self._discovery_at = float(saved.get("retry_at", 0))
@@ -334,7 +339,8 @@ class AdmissionPoller:
             log.warning("admission evidence: %s delivery not recorded: %s", kind, error)
 
     def evidence_status(self):
-        return {"mode": self.evidence_mode(), "shadow": self.shadow.summary()}
+        mode = self.evidence_mode()
+        return {"mode": mode} if mode == "off" else {"mode": mode, "shadow": self.shadow.summary()}
 
     def handle_event(self, kind, payload):
         """Persist before webhook acknowledgement. No GitHub call or policy evaluation here."""

@@ -37,11 +37,14 @@ class EvidenceTests(unittest.TestCase):
         def snapshot(repo, number, *, generation=0):
             # The production adapter's fresh pull carries base sha, updated_at and the comment count.
             result = plain(repo, number, generation=generation)
+            self.clock.advance(2)  # reads take time; deliveries meanwhile are newer than the read
             pull = result.pull
             full = PullRequest(
                 **{f.name: getattr(pull, f.name) for f in dataclasses.fields(pull)},
                 base_sha=self.repo.main_sha(),
                 updated_at=self.updated.get(number, iso(self.clock())),
+                head_ref=f"branch-{number}",
+                head_repo=REPO,
                 comments_count=len(self.github.review_comments.get(number, [])),
             )
             return dataclasses.replace(result, pull=full)
@@ -80,7 +83,8 @@ class EvidenceTests(unittest.TestCase):
 
     def deliver(self, kind, payload):
         receiver = webhook.WebhookReceiver(self.controller, self.github, repositories=[REPO])
-        return receiver.handle(webhook.Delivery(kind, "", {**payload, "repository": {"full_name": REPO}}))
+        repository = {**payload.get("repository", {}), "full_name": REPO}
+        return receiver.handle(webhook.Delivery(kind, "", {**payload, "repository": repository}))
 
     def comment_event(self, number, comment, action="created"):
         self.deliver(
@@ -91,6 +95,7 @@ class EvidenceTests(unittest.TestCase):
                     "number": number,
                     "pull_request": {},
                     "comments": len(self.github.review_comments.get(number, [])),
+                    "updated_at": iso(self.clock()),
                 },
                 "comment": comment,
             },
@@ -116,7 +121,7 @@ class EvidenceTests(unittest.TestCase):
         self.evaluate()
         self.assertEqual(self.rows("admission_evidence"), [])
         self.assertEqual(self.rows("admission_evidence_statuses"), [])
-        self.assertEqual(self.shadow()["compared"] if "compared" in self.shadow() else 0, 0)
+        self.assertEqual(self.intake.evidence_status(), {"mode": "off"})
         self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
 
     def test_mode_is_validated(self):
@@ -188,6 +193,9 @@ class EvidenceTests(unittest.TestCase):
         self.deliver("status", {"id": 7, "sha": head, "context": "build", "state": "failure"})
         self.deliver("status", {"id": 6, "sha": head, "context": "build", "state": "success"})
         self.deliver("status", {"id": 8, "sha": head, "context": "deploy", "state": "success"})
+        self.deliver("status", {"id": 9, "sha": head, "context": "self-tested/1", "state": "success"})
+        self.assertEqual(len(self.rows("admission_evidence_statuses")), 2)
+        cache.store.execute("DELETE FROM admission_evidence_statuses WHERE context='self-tested/1'")
         statuses = self.rows("admission_evidence_statuses")
         self.assertEqual([(s["context"], s["state"]) for s in statuses], [("build", "failure")])
         # Comments: an older edit never replaces a newer one, and a deletion is final.
@@ -256,10 +264,87 @@ class EvidenceTests(unittest.TestCase):
         self.evaluate()
         self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
 
-    def test_canonical_push_moves_the_tip(self):
+    def pull_payload(self, number=1, **fields):
+        pr = self.github.prs[number]
+        return {
+            "number": number,
+            "head": {"sha": pr["head_sha"], "ref": f"branch-{number}", "repo": {"full_name": REPO}},
+            "base": {"ref": "main", "sha": self.repo.main_sha()},
+            "state": "open",
+            "body": pr["body"],
+            "user": {"login": pr["author_login"]},
+            "labels": [],
+            **fields,
+        }
+
+    def test_differences_the_policy_ignores_are_still_reported(self):
         self.controller.set_setting("admission_evidence_mode", "shadow", "test")
-        self.deliver("push", {"ref": f"refs/heads/{self.controller.canonical_branch}", "after": "a" * 40})
-        self.assertEqual(self.controller.store.get_setting(self.intake.evidence.tip_key)["sha"], "a" * 40)
+        self.ready()
+        self.evaluate()
+        # A delivery says another author and branch; the next full read disagrees.
+        self.clock.advance(60)
+        payload = self.pull_payload(user={"login": "mallory"}, comments=1, updated_at=iso(self.clock()))
+        self.deliver("pull_request", {"action": "edited", "pull_request": payload})
+        self.clock.advance(60)
+        self.evaluate()
+        recent = self.shadow()["recent"][-1]
+        self.assertEqual(
+            (recent["outcome"], recent["fields"], recent["self_tested"]), ("mismatch", ["author"], "unavailable")
+        )
+        # A comment GitHub counts but the cache never saw is a gap, not a match.
+        self.clock.advance(60)
+        self.github.review_comments[1].append({"id": 20, "body": "nice", "user": {"login": "a", "id": 1}})
+        self.evaluate()
+        self.assertEqual(self.shadow()["recent"][-1]["outcome"], "mismatch")
+        self.assertIn("comment_ids", self.shadow()["recent"][-1]["fields"])
+        self.assertGreaterEqual(self.shadow()["with_differences"], 2)
+
+    def test_old_deliveries_do_not_rewind_seeded_evidence(self):
+        self.controller.set_setting("admission_evidence_mode", "shadow", "test")
+        head = self.ready()
+        self.evaluate()  # seeds build=success with no status id
+        cache = self.intake.evidence
+        seeded = self.rows("admission_evidence")[0]["count_updated_at"]
+        # A status created well before the read arrives late: ignored.
+        self.deliver(
+            "status",
+            {"id": 3, "sha": head, "context": "build", "state": "pending", "updated_at": iso(self.clock() - 3600)},
+        )
+        self.assertEqual(cache.view(1)["statuses"]["build"], "success")
+        # One created around the read with another state: order unknown, never "seeded".
+        self.deliver(
+            "status", {"id": 4, "sha": head, "context": "build", "state": "failure", "updated_at": iso(self.clock())}
+        )
+        self.assertEqual(cache.view(1)["status"], "status-order-unknown")
+        # One created well after the read: newer, accepted.
+        self.deliver(
+            "status",
+            {"id": 5, "sha": head, "context": "build", "state": "failure", "updated_at": iso(self.clock() + 3600)},
+        )
+        self.assertEqual(cache.view(1)["statuses"]["build"], "failure")
+        # An old comment delivery cannot rewind GitHub's comment count.
+        self.deliver(
+            "issue_comment",
+            {
+                "action": "edited",
+                "issue": {"number": 1, "pull_request": {}, "comments": 0, "updated_at": iso(seeded - 600)},
+                "comment": self.board(1, at=seeded - 600),
+            },
+        )
+        self.assertEqual(self.rows("admission_evidence")[0]["comments_count"], 1)
+        # Pushes to main are ordered by the repository's pushed_at.
+        ref = f"refs/heads/{self.controller.canonical_branch}"
+        self.deliver("push", {"ref": ref, "after": "b" * 40, "repository": {"full_name": REPO, "pushed_at": 200}})
+        self.deliver("push", {"ref": ref, "after": "a" * 40, "repository": {"full_name": REPO, "pushed_at": 100}})
+        self.assertEqual(cache.store.get_setting(cache.tip_key)["sha"], "b" * 40)
+
+    def test_same_second_relevance_change_unseeds(self):
+        self.controller.set_setting("admission_evidence_mode", "shadow", "test")
+        self.ready()
+        self.evaluate()
+        board = self.github.review_comments[1][0]
+        self.comment_event(1, {**board, "body": "plain words now"}, "edited")
+        self.assertEqual(self.intake.evidence.view(1)["status"], "unseeded")
 
 
 if __name__ == "__main__":

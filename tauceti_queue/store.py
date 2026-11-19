@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS admission_evidence (
     head_repo TEXT NOT NULL DEFAULT '',
     pr_updated_at REAL NOT NULL DEFAULT 0,
     comments_count INTEGER NOT NULL DEFAULT -1,
+    count_updated_at REAL NOT NULL DEFAULT 0,
     seeded_at REAL NOT NULL DEFAULT 0,
     received_at REAL NOT NULL DEFAULT 0
 );
@@ -171,6 +172,8 @@ CREATE TABLE IF NOT EXISTS admission_evidence_statuses (
     state TEXT NOT NULL DEFAULT '',
     status_id INTEGER NOT NULL DEFAULT 0,
     sender TEXT NOT NULL DEFAULT '',
+    seeded_at REAL NOT NULL DEFAULT 0,
+    ambiguous INTEGER NOT NULL DEFAULT 0,
     received_at REAL NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS admission_evidence_status ON admission_evidence_statuses (repository, sha, context);

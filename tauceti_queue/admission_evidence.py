@@ -20,8 +20,10 @@ Deliveries can arrive out of order. A PR row moves only forward in GitHub's `upd
 comment only forward in its own `updated_at`, a status only forward in its status id. A full read
 replaces the cached evidence it covers, except rows a delivery wrote after the read began.
 
-The merge base the shadow uses comes from the local clone (`git merge-base --all`), against the
-newest canonical tip a `push` delivery or full read reported, and must be unique. Anything the
+The merge base the shadow uses comes from the local clone (`git merge-base --all`, bounded in
+time and never inside a store transaction), against the canonical tip of the newest `push`
+delivery (by the repository's `pushed_at`), or the PR's cached base when none arrived, and must
+be unique. Anything the
 cache cannot vouch for (never seeded, a comment count that disagrees with GitHub's, an ambiguous
 or uncomputable merge base) is recorded as such instead of as a verdict.
 
@@ -33,9 +35,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
+import subprocess
 from datetime import datetime
 
-from . import chain
 from .store import dumps, loads
 
 log = logging.getLogger(__name__)
@@ -44,6 +47,10 @@ MODES = ("off", "shadow")
 CONTEXTS = ("build", "scope", "bump-guard")
 ADMISSION_LABELS = frozenset({"needs-rebase", "self-tested", "full-lint", "lint-repair"})
 MISMATCH_LIMIT = 20
+GIT_TIMEOUT_SECONDS = 30
+# A status delivery for a (sha, context) a full read seeded carries no comparable status id; within
+# this many seconds of the read, a different state is "order unknown" rather than newer or older.
+STATUS_SKEW_SECONDS = 120
 
 
 def _time(value) -> float:
@@ -68,46 +75,64 @@ class EvidenceCache:
         self.base_branch = base_branch
         self.tip_key = f"state:admission_evidence_tip:{repository}"
 
+    def _key(self, number):
+        return {"repository": self.repository, "number": number}
+
     # -- writes from deliveries
 
     def apply_event(self, kind, payload) -> None:
-        """Record what one verified delivery says. Never reads GitHub, never decides."""
+        """Record what one verified delivery says. Never reads GitHub or git, never decides."""
         now = self.clock()
         with self.store.transaction():
             if kind == "pull_request":
                 self._pull(payload.get("pull_request") or {}, now, payload.get("number"))
             elif kind == "issue_comment":
                 issue = payload.get("issue") or {}
-                if "pull_request" not in issue or not isinstance(issue.get("number"), int):
+                if "pull_request" not in issue or type(issue.get("number")) is not int:
                     return
                 self._comment(issue["number"], payload.get("comment") or {}, payload.get("action"), now)
-                if isinstance(issue.get("comments"), int):
-                    self._ensure(issue["number"], now)
-                    self.store.update(
-                        "admission_evidence",
-                        {"repository": self.repository, "number": issue["number"]},
-                        comments_count=issue["comments"],
-                        received_at=now,
-                    )
+                self._count(issue["number"], issue.get("comments"), _time(issue.get("updated_at")), now)
             elif kind == "status":
                 self._status(payload, now)
             elif kind == "push" and payload.get("ref") == f"refs/heads/{self.base_branch}":
                 after = str(payload.get("after") or "")
-                if len(after) == 40:
-                    self.store.set_setting(self.tip_key, {"sha": after, "at": now}, "admission evidence", now)
+                pushed = (payload.get("repository") or {}).get("pushed_at")
+                pushed = pushed if type(pushed) in (int, float) else _time(pushed)
+                current = self.store.get_setting(self.tip_key, {})
+                if len(after) == 40 and pushed and pushed >= current.get("pushed_at", 0):
+                    value = {"sha": after, "pushed_at": pushed, "at": now}
+                    self.store.set_setting(self.tip_key, value, "admission evidence", now)
 
-    def _ensure(self, number, now):
-        if self.store.row("admission_evidence", {"repository": self.repository, "number": number}) is None:
-            self.store.insert("admission_evidence", repository=self.repository, number=number, received_at=now)
+    def _row(self, number):
+        row = self.store.row("admission_evidence", self._key(number))
+        if row is None:
+            # A placeholder, not a delivery: it must not look newer than a read that seeds it.
+            self.store.insert("admission_evidence", **self._key(number), received_at=0)
+            row = self.store.row("admission_evidence", self._key(number))
+        return row
+
+    def _count(self, number, count, at, now, *, seeded_at=None):
+        """GitHub's comment count, ordered by the issue's own `updated_at`, never rewound."""
+        if type(count) is not int:
+            return
+        row = self._row(number)
+        if at < row["count_updated_at"] or (seeded_at is not None and row["received_at"] > seeded_at):
+            return
+        self.store.update(
+            "admission_evidence",
+            {"id": row["id"]},
+            comments_count=count,
+            count_updated_at=at,
+            received_at=now if seeded_at is None else max(row["received_at"], seeded_at),
+        )
 
     def _pull(self, pull, now, number=None, *, seeded_at=None):
         number = pull.get("number") or number
         if type(number) is not int or number <= 0:
             return
-        self._ensure(number, now)
-        row = self.store.row("admission_evidence", {"repository": self.repository, "number": number})
+        row = self._row(number)
         updated = _time(pull.get("updated_at"))
-        if seeded_at is None and row["pr_updated_at"] and updated < row["pr_updated_at"]:
+        if seeded_at is None and updated < row["pr_updated_at"]:
             return  # an older delivery than what the cache holds
         if seeded_at is not None and row["received_at"] > seeded_at:
             return  # a delivery after the read began is newer than the read; keep it
@@ -125,32 +150,24 @@ class EvidenceCache:
             "labels": dumps(labels),
             "author": str(user.get("login") or ""),
             "pr_updated_at": updated,
-            "received_at": now,
+            "received_at": now if seeded_at is None else seeded_at,
         }
-        if isinstance(pull.get("comments"), int):
-            values["comments_count"] = pull["comments"]
         if seeded_at is not None:
             values["seeded_at"] = seeded_at
         elif updated == row["pr_updated_at"] and any(
-            row[k] != values[k] for k in ("head_sha", "base_sha", "base_ref", "state", "draft", "body", "labels")
+            row[k] != values[k]
+            for k in ("head_sha", "base_sha", "base_ref", "state", "draft", "body", "labels", "head_ref", "head_repo")
         ):
             values["seeded_at"] = 0  # two versions with one timestamp: order unknown, so fail closed
         self.store.update("admission_evidence", {"id": row["id"]}, **values)
-        if values["base_ref"] == self.base_branch and len(values["base_sha"]) == 40:
-            self._tip(values["base_sha"], now)
-
-    def _tip(self, sha, now):
-        current = self.store.get_setting(self.tip_key, {})
-        if not current.get("sha") or (
-            current["sha"] != sha and self._git("merge-base", "--is-ancestor", current["sha"], sha) is not None
-        ):
-            self.store.set_setting(self.tip_key, {"sha": sha, "at": now}, "admission evidence", now)
+        self._count(number, pull.get("comments"), updated, now, seeded_at=seeded_at)
 
     def _comment(self, number, comment, action, now, *, seeded_at=None):
         if type(comment.get("id")) is not int:
             return
-        key = {"repository": self.repository, "number": number, "comment_id": comment["id"]}
+        key = {**self._key(number), "comment_id": comment["id"]}
         row = self.store.row("admission_evidence_comments", key)
+        received = now if seeded_at is None else seeded_at
         updated = _time(comment.get("updated_at") or comment.get("created_at"))
         if action == "deleted":
             if row is None:
@@ -162,29 +179,30 @@ class EvidenceCache:
             return
         if seeded_at is not None and row is not None and row["received_at"] > seeded_at:
             return
+        relevant = bool(self.relevant_comment(comment))
+        body = str(comment.get("body") or "") if relevant else ""
         if (
             seeded_at is None
             and row is not None
             and updated == row["updated_at"]
-            and row["relevant"]
-            and row["body"] != str(comment.get("body") or "")
+            and (row["relevant"] or relevant)
+            and (row["relevant"] != int(relevant) or row["body"] != body)
         ):
-            # Two bodies with one timestamp: order unknown, so the PR needs a full read.
-            self.store.update("admission_evidence", {"repository": self.repository, "number": number}, seeded_at=0)
+            # Two versions with one timestamp, at least one of them read by admission: order
+            # unknown, so the PR needs a full read.
+            self.store.update("admission_evidence", self._key(number), seeded_at=0)
         user = comment.get("user") or {}
-        author = comment.get("author") or user.get("login") or ""
-        relevant = bool(self.relevant_comment(comment))
         values = {
-            "author": str(author),
+            "author": str(comment.get("author") or user.get("login") or ""),
             "author_id": int(user.get("id") or 0),
             "app_id": int((comment.get("performed_via_github_app") or {}).get("id") or 0),
             "relevant": int(relevant),
-            "body": str(comment.get("body") or "") if relevant else "",
+            "body": body,
             "created_at": str(comment.get("created_at") or ""),
             "updated_text": str(comment.get("updated_at") or ""),
             "html_url": str(comment.get("html_url") or ""),
             "updated_at": updated,
-            "received_at": now,
+            "received_at": received,
         }
         if row is None:
             self.store.insert("admission_evidence_comments", **key, **values)
@@ -197,24 +215,33 @@ class EvidenceCache:
             return
         key = {"repository": self.repository, "sha": sha, "context": context}
         row = self.store.row("admission_evidence_statuses", key)
-        if row is not None and row["status_id"] >= status_id:
-            return
+        state = str(payload.get("state") or "").lower()
         values = {
-            "state": str(payload.get("state") or "").lower(),
+            "state": state,
             "status_id": status_id,
             "sender": str((payload.get("sender") or {}).get("login") or ""),
             "received_at": now,
+            "ambiguous": 0,
         }
         if row is None:
             self.store.insert("admission_evidence_statuses", **key, **values)
-        else:
+            return
+        if row["status_id"] > 0:
+            if row["status_id"] < status_id:
+                self.store.update("admission_evidence_statuses", {"id": row["id"]}, **values)
+            return
+        # The row came from a full read, which gives no status id: order by creation time instead.
+        created = _time(payload.get("updated_at") or payload.get("created_at"))
+        if created > row["seeded_at"] + STATUS_SKEW_SECONDS:
             self.store.update("admission_evidence_statuses", {"id": row["id"]}, **values)
+        elif created >= row["seeded_at"] - STATUS_SKEW_SECONDS and state != row["state"]:
+            self.store.update("admission_evidence_statuses", {"id": row["id"]}, ambiguous=1, received_at=now)
 
     # -- writes from full reads
 
     def seed(self, snapshot, started) -> None:
-        """Replace the cached evidence for one PR with an authoritative full read that began at
-        `started`, keeping anything a delivery wrote after that moment."""
+        """Install an authoritative full read of one PR that began at `started`, keeping anything a
+        delivery wrote after that moment."""
         pull = snapshot.pull
         now = self.clock()
         record = {
@@ -242,53 +269,66 @@ class EvidenceCache:
                 if type(comment.get("id")) is int:
                     seen.add(comment["id"])
                     self._comment(pull.number, comment, "seeded", now, seeded_at=started)
-            for row in self.store.rows(
-                "admission_evidence_comments", {"repository": self.repository, "number": pull.number, "deleted": 0}
-            ):
+            for row in self.store.rows("admission_evidence_comments", {**self._key(pull.number), "deleted": 0}):
                 if row["comment_id"] not in seen and row["received_at"] <= started:
-                    self.store.update("admission_evidence_comments", {"id": row["id"]}, deleted=1, received_at=now)
+                    self.store.update("admission_evidence_comments", {"id": row["id"]}, deleted=1, received_at=started)
             for context, state in snapshot.statuses.items():
                 key = {"repository": self.repository, "sha": pull.head_sha, "context": context}
+                values = {"state": state, "status_id": 0, "seeded_at": started, "received_at": started, "ambiguous": 0}
                 row = self.store.row("admission_evidence_statuses", key)
                 if row is None:
-                    self.store.insert("admission_evidence_statuses", **key, state=state, status_id=0, received_at=now)
+                    self.store.insert("admission_evidence_statuses", **key, **values)
                 elif row["received_at"] <= started:
-                    self.store.update("admission_evidence_statuses", {"id": row["id"]}, state=state, received_at=now)
+                    self.store.update("admission_evidence_statuses", {"id": row["id"]}, **values)
 
     # -- reads
 
     def _git(self, *args):
+        """A bounded, read-only git question; None when it cannot be answered."""
         if not self.clone:
             return None
         try:
-            return chain.git(self.clone, *args)
-        except Exception:  # noqa: BLE001 - an unanswerable git question is "unknown"
+            result = subprocess.run(
+                ["git", "-C", self.clone, *args],
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"},
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
             return None
+        return result.stdout if result.returncode == 0 else None
 
     def view(self, number):
-        """The cached evidence for one PR, or why the cache cannot vouch for it."""
-        row = self.store.row("admission_evidence", {"repository": self.repository, "number": number})
-        if row is None or not row["seeded_at"]:
-            return {"status": "unseeded"}
-        comments = self.store.rows(
-            "admission_evidence_comments",
-            {"repository": self.repository, "number": number},
-            order="comment_id",
-        )
+        """The cached evidence for one PR, read in one transaction, or why the cache cannot vouch for it."""
+        with self.store.transaction():
+            row = self.store.row("admission_evidence", self._key(number))
+            if row is None or not row["seeded_at"]:
+                return {"status": "unseeded"}
+            comments = self.store.rows("admission_evidence_comments", self._key(number), order="comment_id")
+            statuses = [
+                s
+                for s in self.store.rows(
+                    "admission_evidence_statuses", {"repository": self.repository, "sha": row["head_sha"]}
+                )
+                if relevant_context(s["context"], number)
+            ]
+            tip = self.store.get_setting(self.tip_key, {})
         live = [c for c in comments if not c["deleted"]]
-        if row["state"] == "open" and not row["draft"] and row["comments_count"] != len(live):
-            return {"status": "gap", "detail": f"{len(live)} cached comments, GitHub counts {row['comments_count']}"}
-        statuses = {
-            s["context"]: s["state"]
-            for s in self.store.rows(
-                "admission_evidence_statuses", {"repository": self.repository, "sha": row["head_sha"]}
-            )
-            if relevant_context(s["context"], number)
-        }
+        received = max([row["received_at"], tip.get("at", 0), *(r["received_at"] for r in comments + statuses)])
+        if row["state"] == "open" and not row["draft"]:
+            if row["comments_count"] != len(live):
+                detail = f"{len(live)} cached comments, GitHub counts {row['comments_count']}"
+                return {"status": "gap", "detail": detail, "received_at": received}
+            if any(s["ambiguous"] for s in statuses):
+                return {"status": "status-order-unknown", "received_at": received}
         return {
             "status": "seeded",
             "row": row,
+            "tip": tip.get("sha") or row["base_sha"],
             "labels": tuple(loads(row["labels"], [])),
+            "comment_ids": tuple(c["comment_id"] for c in live),
             "comments": tuple(
                 {
                     "id": c["comment_id"],
@@ -301,17 +341,16 @@ class EvidenceCache:
                 for c in live
                 if c["relevant"]
             ),
-            "statuses": statuses,
-            "received_at": max([row["received_at"], *(c["received_at"] for c in comments)]),
+            "statuses": {s["context"]: s["state"] for s in statuses},
+            "received_at": received,
         }
 
-    def merge_base(self, head, base_sha):
-        """The unique local merge base of `head` with the newest known canonical tip, or None."""
-        tip = self.store.get_setting(self.tip_key, {}).get("sha") or base_sha
-        if not tip:
-            return None, tip
+    def merge_base(self, tip, head):
+        """The unique local merge base of `head` with `tip`, or None."""
+        if not tip or not head:
+            return None
         bases = (self._git("merge-base", "--all", tip, head) or "").split()
-        return (bases[0] if len(bases) == 1 else None), tip
+        return bases[0] if len(bases) == 1 else None
 
     def paths(self, base, head):
         raw = self._git("diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base, head, "--")
@@ -321,28 +360,35 @@ class EvidenceCache:
 class Shadow:
     """Evaluate the cached evidence beside each real evaluation and record the comparison."""
 
-    def __init__(self, cache, policy, *, journal):
+    def __init__(self, cache, policy, *, journal, blocking_labels):
         self.cache, self.policy = cache, policy
         self.journal = journal
+        self.blocking_labels = blocking_labels  # callable(pull): labels that make `approve` refuse
         self.key = f"state:admission_shadow:{cache.repository}"
 
     def compare(self, snapshot, result, started, authorization="") -> dict:
-        """Compare cached evidence with a completed full read, then seed the cache from the read."""
+        """Compare the cache as it stood with a completed full read, then seed the cache from the read."""
         outcome = self._outcome(snapshot, result, started, authorization)
         self._record(snapshot.pull.number, snapshot.pull.head_sha, outcome)
         self.cache.seed(snapshot, started)
         return outcome
 
+    def _admits(self, verdict, pull):
+        return bool(verdict.get("merge") and pull.base_ref == self.cache.base_branch and not self.blocking_labels(pull))
+
     def _outcome(self, snapshot, result, started, authorization):
         pull = snapshot.pull
         view = self.cache.view(pull.number)
+        raced = view.get("received_at", 0) > started
         if view["status"] != "seeded":
-            return {"outcome": view["status"], "detail": view.get("detail", "")}
+            return {"outcome": view["status"], "detail": view.get("detail", ""), "raced": raced}
         row = view["row"]
-        raced = view["received_at"] > started
         relevant = self.cache.relevant_labels()
         cached = {
             "head": row["head_sha"],
+            "head_ref": row["head_ref"],
+            "head_repo": row["head_repo"],
+            "author": row["author"],
             "base_ref": row["base_ref"],
             "state": row["state"],
             "draft": bool(row["draft"]),
@@ -351,6 +397,9 @@ class Shadow:
         }
         real = {
             "head": pull.head_sha,
+            "head_ref": getattr(pull, "head_ref", ""),
+            "head_repo": getattr(pull, "head_repo", ""),
+            "author": pull.author_login,
             "base_ref": pull.base_ref,
             "state": pull.state,
             "draft": bool(pull.draft),
@@ -358,18 +407,15 @@ class Shadow:
             "labels": sorted({s.lower() for s in pull.labels} & relevant),
         }
         differ = sorted(k for k in cached if cached[k] != real[k])
+
+        def settle(**extra):
+            outcome = "match" if not differ else ("race" if raced else "mismatch")
+            return {"outcome": outcome, "fields": differ, **extra}
+
         if pull.state != "open" or pull.draft:
-            return {"outcome": ("race" if raced else "mismatch") if differ else "match", "fields": differ}
-        merge_base, tip = self.cache.merge_base(row["head_sha"], row["base_sha"])
-        if merge_base is None:
-            return {"outcome": "merge-base-unknown", "fields": differ, "tip": tip}
-        if merge_base != snapshot.merge_base_sha:
-            differ.append("merge_base")
-        paths = self.cache.paths(merge_base, row["head_sha"])
-        if paths is None:
-            return {"outcome": "paths-unknown", "fields": differ}
-        if sorted(paths) != sorted(snapshot.paths):
-            differ.append("paths")
+            return settle()
+        if sorted(view["comment_ids"]) != sorted(c["id"] for c in snapshot.comments if type(c.get("id")) is int):
+            differ.append("comment_ids")
 
         def comments(rows):
             return sorted(
@@ -387,18 +433,24 @@ class Shadow:
             differ.append("comments")
         if view["statuses"] != snapshot.statuses:
             differ.append("statuses")
-        if differ and any(k in differ for k in ("head", "paths")):
-            # Self-tested eligibility and diff guards were measured on the real head and paths only.
-            return {"outcome": "race" if raced else "mismatch", "fields": differ}
+        merge_base = self.cache.merge_base(view["tip"], row["head_sha"])
+        if merge_base is None:
+            # Not computable here; any difference already found is still recorded below.
+            return {"outcome": "merge-base-unknown", "fields": differ, "raced": raced}
+        if merge_base != snapshot.merge_base_sha:
+            differ.append("merge_base")
+        paths = self.cache.paths(merge_base, row["head_sha"])
+        if paths is None:
+            return {"outcome": "paths-unknown", "fields": differ, "raced": raced}
+        if sorted(paths) != sorted(snapshot.paths):
+            differ.append("paths")
+        if set(differ) & {"head", "head_ref", "head_repo", "author", "labels", "paths", "base_ref"}:
+            # Self-tested eligibility and the diff guards were measured only on the real inputs.
+            return settle(self_tested="unavailable")
+        shadow_pull = dataclasses.replace(pull, body=row["body"], labels=view["labels"])
         shadow_snapshot = dataclasses.replace(
             snapshot,
-            pull=dataclasses.replace(
-                pull,
-                head_sha=row["head_sha"],
-                base_ref=row["base_ref"],
-                body=row["body"],
-                labels=view["labels"],
-            ),
+            pull=shadow_pull,
             merge_base_sha=merge_base,
             paths=paths,
             comments=view["comments"],
@@ -410,15 +462,15 @@ class Shadow:
             differ.append("verdict")
         if cached_authorization != authorization:
             differ.append("authorization")  # the scoreboard that would be recorded as approval intent
-        outcome = "match" if not differ else ("race" if raced else "mismatch")
-        detail = {"outcome": outcome, "fields": differ}
+        extra = {}
         if "verdict" in differ:
-            detail["shadow"] = {k: verdict.get(k) for k in keys}
-            if bool(verdict.get("merge")) != bool(result.get("merge")):
-                detail["direction"] = "cache-would-admit" if verdict.get("merge") else "cache-would-refuse"
-            elif bool(verdict.get("review_safe")) != bool(result.get("review_safe")):
-                detail["direction"] = "cache-keeps" if verdict.get("review_safe") else "cache-revokes"
-        return detail
+            extra["shadow"] = {k: verdict.get(k) for k in keys}
+        cache_admits, real_admits = self._admits(verdict, shadow_pull), self._admits(result, pull)
+        if cache_admits != real_admits:
+            extra["direction"] = "cache-would-admit" if cache_admits else "cache-would-refuse"
+        elif bool(verdict.get("review_safe")) != bool(result.get("review_safe")):
+            extra["direction"] = "cache-keeps" if verdict.get("review_safe") else "cache-revokes"
+        return settle(**extra)
 
     def _record(self, number, head, outcome):
         store = self.cache.store
@@ -427,10 +479,13 @@ class Shadow:
             summary = store.get_setting(self.key, {})
             counts = summary.setdefault("counts", {})
             counts[outcome["outcome"]] = counts.get(outcome["outcome"], 0) + 1
+            summary["compared"] = summary.get("compared", 0) + 1
+            if outcome.get("fields"):
+                # Durable, whatever the outcome: a difference is never hidden by an unknown verdict.
+                summary["with_differences"] = summary.get("with_differences", 0) + 1
             if outcome.get("direction"):
                 directions = summary.setdefault("directions", {})
                 directions[outcome["direction"]] = directions.get(outcome["direction"], 0) + 1
-            summary["compared"] = summary.get("compared", 0) + 1
             summary["since"] = summary.get("since") or now
             summary["at"] = now
             if outcome["outcome"] != "match":
@@ -438,7 +493,7 @@ class Shadow:
                 recent = summary.setdefault("recent", [])
                 recent.append({"at": now, "number": number, "head": head, **outcome})
                 del recent[:-MISMATCH_LIMIT]
-                if outcome["outcome"] == "mismatch":
+                if outcome.get("fields") and outcome["outcome"] != "race":
                     self.journal(now, "admission-shadow", number=number, head=head, **outcome)
             store.set_setting(self.key, summary, "admission shadow", now)
 
