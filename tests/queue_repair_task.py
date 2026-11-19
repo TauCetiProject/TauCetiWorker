@@ -58,6 +58,7 @@ os.environ["HOME"] = str(HOME)
 os.environ["TAUCETI_CACHE_SERVICE"] = ""  # the worker's own cache warming is not exercised here
 os.environ["TAUCETI_WORKER_ID"] = "queue-repair-test"
 os.environ["GH_TOKEN"] = "worker-token"
+os.environ["TAUCETI_QUEUE_TOKEN"] = "worker-token"
 for key in ("TAUCETI_RUNTIME_STATUS", "TAUCETI_FLEET_ADMISSION_FILE", "CLAUDE_CONFIG_DIR", "TAUCETI_STREAM"):
     os.environ.pop(key, None)
 
@@ -273,7 +274,7 @@ launch = {
 }
 started = time.time()
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "TAUCETI_QUEUE_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
 fcntl.flock(call_lock, fcntl.LOCK_UN)
 call_lock.close()
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
@@ -1215,6 +1216,7 @@ class HappyPath(Fixture):
         self.assertNotIn("repair task 1", prompt, "task identifiers are not in the prompt")
         self.assertNotIn(f"Source-PR: {PROJECT}#3", prompt, "the member listings are in the file")
         self.assertIsNone(calls[0]["env"]["GH_TOKEN"])
+        self.assertIsNone(calls[0]["env"]["TAUCETI_QUEUE_TOKEN"], "the worker's own token stays out of agents")
         self.assertTrue(calls[0]["env"]["GIT_CONFIG_VALUE_0"].endswith("no-push"))
         self.assertTrue(calls[0]["env"]["CLAUDE_CONFIG_DIR"].startswith(str(self.root / "state")))
         self.assertEqual(calls[0]["cwd"], str(self.root / "state" / "worktrees" / "task-1"))
@@ -3660,7 +3662,7 @@ class Preflight(Fixture):
         checks = repair_task.preflight(cfg, min_free_gib=0)
         by_name = {c["check"]: c for c in checks}
         self.assertTrue(all(c["ok"] for c in checks), checks)
-        self.assertEqual(by_name["github token"]["detail"], "from $GH_TOKEN")
+        self.assertEqual(by_name["github token"]["detail"], "from $TAUCETI_QUEUE_TOKEN")
         self.assertEqual(by_name["repository admin"]["detail"], f"stub-worker on {PROJECT}")
         self.assertIn("revision fakefakefak", by_name["service"]["detail"])
         self.assertIn(str(self.content.bare), by_name["content clone"]["detail"])
@@ -3686,6 +3688,33 @@ class Preflight(Fixture):
 
         with self.assertRaises(Die):
             repair_task.worker_token()
+
+    def test_no_silent_fallback_to_a_personal_token(self):
+        from tauceti_worker.config import Die
+
+        personal = patch.dict(os.environ, {"GH_TOKEN": "personal", "GITHUB_TOKEN": "personal"})
+        personal.start()
+        self.addCleanup(personal.stop)
+        for key in ("TAUCETI_QUEUE_TOKEN_FILE", "TAUCETI_QUEUE_TOKEN"):
+            os.environ.pop(key, None)
+        with patch("subprocess.run", side_effect=AssertionError("gh auth token")):
+            with self.assertRaises(Die) as refused:
+                repair_task.worker_token()
+        self.assertIn("TAUCETI_QUEUE_TOKEN_FILE", str(refused.exception))
+        self.assertEqual(repair_task.token_source(), "none configured")
+        checks = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
+        self.assertFalse(checks["github token"]["ok"])
+        self.assertFalse(checks["repository admin"]["ok"], "the operator's gh login is not checked instead")
+
+    def test_the_worker_token_is_the_one_its_own_gh_calls_use(self):
+        token_file = self.root / "token"
+        token_file.write_text("dedicated\n")
+        environment = patch.dict(os.environ, {"TAUCETI_QUEUE_TOKEN_FILE": str(token_file), "GITHUB_TOKEN": "personal"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        repair_task.make_client(self.config(token=None))
+        self.assertEqual(os.environ["GH_TOKEN"], "dedicated")
+        self.assertNotIn("GITHUB_TOKEN", os.environ)
 
 
 def pairs(argv: list[str], flag: str) -> list[tuple[str, str]]:
@@ -3790,12 +3819,12 @@ class SandboxedBuilds(Fixture):
         self.assertIn(repair_sandbox.DISABLE_VARIABLE, detail)
 
     def test_preflight_runs_true_in_the_sandbox(self):
-        by_name = {c["check"]: c for c in repair_task.preflight(self.config(), min_free_gib=0)}
+        by_name = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
         self.assertTrue(by_name["build sandbox"]["ok"], by_name["build sandbox"])
         self.assertIn(str(BIN / "bwrap"), by_name["build sandbox"]["detail"])
         self.assertEqual(self.bwrap_calls()[-1]["argv"][-2:], ["--", "true"])
         (BIN / "sandbox-env.json").write_text("{}")  # the stub now fails, as a broken bwrap would
-        by_name = {c["check"]: c for c in repair_task.preflight(self.config(), min_free_gib=0)}
+        by_name = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
         self.assertFalse(by_name["build sandbox"]["ok"])
 
 

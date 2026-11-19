@@ -26,11 +26,21 @@ uv run python scripts/tauceti_queue_github_app.py url
 Open the printed URL as an organization owner, set a webhook secret in the form (GitHub does not
 accept one through the URL), and create the App. The URL requests exactly these repository
 permissions: contents write, pull requests write, issues write, checks read, statuses write,
-actions write, workflows write, metadata read; and subscribes to these events: pull request,
+actions write, workflows write, metadata read, and the organization permission members read; and subscribes to these events: pull request,
 pull request review, issue comment, status, check run, check suite, push, workflow run. Pass
 `--webhook-url https://<host>/webhook/github` once the service host exists. Without it GitHub creates
 the App with no webhook and discards the event subscription, so both are added on the App's settings
 page later (Public endpoint, step 7); the API can edit an App webhook but not create one.
+
+Admission checks the `self-tested` route's team membership
+(`orgs/TauCetiProject/teams/self-tested/memberships/<login>`) with the App's own installation token,
+which needs **Organization permissions > Members: Read-only**. The App registered on 2026-11-04 lacks
+it: add it under
+[Permissions & events](https://github.com/organizations/TauCetiProject/settings/apps/tauceti-queue/permissions),
+then an organization owner accepts the changed permissions on the installation. Until then a
+self-tested PR's evaluation is deferred (15 minutes at a time) with that reason; it is neither
+admitted nor withdrawn, and no personal token is used instead. `SELF_TESTED_TEAM_TOKEN` in the
+service environment names an explicit token for this read instead of the App.
 
 For the deployed **primary intake**, narrow the App subscriptions in
 [Permissions & events](https://github.com/organizations/TauCetiProject/settings/apps/tauceti-queue/permissions):
@@ -458,12 +468,18 @@ succeeds before then continues the claim.
   `/run/current-system/sw/bin/bwrap`. A host without it may set `TAUCETI_QUEUE_SANDBOX=0` in the
   environment file, which runs builds unsandboxed and says so in the log on every build.
 - **Credentials**, by name; never print their values.
-  - The GitHub token of the worker's account, which must be a repository admin on
+  - The GitHub token of the worker's dedicated account, which must be a repository admin on
     `TauCetiProject/TauCeti`: the service applies `security_audit.require_admin` to the login the
     bearer token resolves to at claim and at submit, and the worker applies the same predicate before
-    claiming. Source order: `TAUCETI_QUEUE_TOKEN_FILE` (a mode 0600 file), `TAUCETI_QUEUE_TOKEN`,
-    `GH_TOKEN`, `GITHUB_TOKEN`, else `gh auth token` from the account's gh login. The same account's
-    git credentials push the submission ref (`gh auth setup-git`, or the token in the helper).
+    claiming. It is read from `TAUCETI_QUEUE_TOKEN_FILE` (a mode 0600 file), else
+    `TAUCETI_QUEUE_TOKEN`; without either the worker refuses to start. It never falls back to
+    `GH_TOKEN`, `GITHUB_TOKEN` or `gh auth token`: on a shared host those are an operator's personal
+    token, whose hourly quota every agent on that account shares. Use an account other than the
+    operator's (a second token of the same user shares the same quota). The worker exports the token
+    as `GH_TOKEN` for its own `gh` calls, so its admin checks and the git push of the submission ref
+    (through `gh auth setup-git`'s helper) use the same account; agents never inherit it. Make
+    `gh auth git-credential` the only GitHub credential helper (as `gh auth setup-git` writes it),
+    so no stored personal token answers the push first.
   - One credential per provider in the chain `TAUCETI_QUEUE_PROVIDERS` (default `claude,codex,api`;
     [repair-task.md](repair-task.md), "Providers"). `claude`: Claude Code's credentials in
     `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`), copied into the task's isolated config

@@ -60,7 +60,7 @@ The semantics are the controller's (`tauceti_queue/controller.py`, `docs/queue/c
 worker_notes)`, exchanging the `Task` and `Adoption` records of `tauceti_queue/ports.py`. The HTTP
 surface is stream F's server (`tauceti_queue/server.py`, `docs/queue/github.md`): `POST` with a JSON
 body and `Authorization: Bearer <GitHub token of the worker's account>` (the file named by
-`$TAUCETI_QUEUE_TOKEN_FILE`, else `$TAUCETI_QUEUE_TOKEN`, else `$GH_TOKEN`/`$GITHUB_TOKEN`, else
+`$TAUCETI_QUEUE_TOKEN_FILE`, else `$TAUCETI_QUEUE_TOKEN`; never `$GH_TOKEN`, `$GITHUB_TOKEN` or
 `gh auth token`), the token resolved to a login, a `None`
 result as `204`, a bare JSON value as the body otherwise, and errors as `{"error": message}`. The
 worker identity is `body.worker` (the runner also sends it as `X-TauCeti-Worker`).

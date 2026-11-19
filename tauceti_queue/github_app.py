@@ -239,6 +239,12 @@ class InstallationTokenSource:
                 self._current = current
             return current.value
 
+    def granted_permissions(self) -> dict[str, str]:
+        """The permissions GitHub granted the current installation token (minting one if needed)."""
+        self.token()
+        with self._lock:
+            return dict(self._current.permissions) if self._current is not None else {}
+
     def invalidate(self) -> None:
         """Drop the cached token, for example after GitHub answers 401 with it."""
         with self._lock:

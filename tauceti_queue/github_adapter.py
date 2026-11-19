@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import dataclasses
 import json
+import logging
 import os
 import re
 import subprocess
@@ -66,8 +67,11 @@ COMMENT_MARKER = "<!-- tauceti-queue {marker} -->"
 # Bors treats collaborators with push access as reviewers (`auto_reviewer_required_perm: :push`).
 REVIEWER_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 MAX_LOG_BYTES = 64 * 1024 * 1024
+# How long a self-tested evaluation waits when the App cannot read team membership.
+MEMBERS_PERMISSION_RETRY_SECONDS = 900
 
 Transport = github_app.Transport
+log = logging.getLogger(__name__)
 Phase = CandidatePhase
 
 
@@ -1107,6 +1111,23 @@ class GitHubAdapter:
         record = declaration_names.parse_log(log, head_sha)
         return {**record, "run_id": run_id, "run_attempt": attempt, "job_id": job["id"]}
 
+    def team_member_read(self, path: str):
+        """A team-membership read for the self-tested route, made by the queue App itself.
+
+        It needs the App's organization `members: read` permission. Without it the read is
+        deferred with a clear reason instead of falling back to a user token or answering "not a
+        member": an unknown membership never grants admission and never withdraws one.
+        """
+        granted = getattr(self._tokens or self.client._tokens, "granted_permissions", None)
+        if granted is not None and "members" not in granted():
+            log.warning("self-tested team membership needs the queue App's organization Members: read permission")
+            raise RequestDeferred(
+                "self-tested team membership needs the queue App's organization Members: read permission",
+                retry_at=self.client._clock() + MEMBERS_PERMISSION_RETRY_SECONDS,
+                resource="members-permission",
+            )
+        return self.client.get_json(path)[1]
+
     def eligibility_checks(self, repo: str, head: str) -> list[dict]:
         """Every `merge eligibility` check run on `head`, any App (`filter=all`), as Bors lists them."""
         return self.client.paginate(
@@ -1178,7 +1199,7 @@ class GitHubAdapter:
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
-        from tauceti_tools.self_tested import eligible, gh_read, requested
+        from tauceti_tools.self_tested import eligible, requested
 
         local = False
         if requested(pull.labels):
@@ -1191,7 +1212,11 @@ class GitHubAdapter:
                 "user": {"login": pull.author_login},
             }
             local = eligible(
-                raw, repo, paths=paths, read=lambda path: self.client.get_json(path)[1], member_read=gh_read
+                raw,
+                repo,
+                paths=paths,
+                read=lambda path: self.client.get_json(path)[1],
+                member_read=self.team_member_read,
             )
         # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
         guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()

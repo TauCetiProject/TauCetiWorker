@@ -58,7 +58,6 @@ import re
 import shutil
 import signal
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -729,18 +728,21 @@ class ClaimLease(threading.Thread):
 
 def token_source() -> str:
     """Where ``worker_token`` reads the token from (named, never the value): ``TAUCETI_QUEUE_TOKEN_FILE``
-    (a mode 0600 file, the service unit's choice), the environment, else gh's store."""
+    (a mode 0600 file, the service unit's choice), else ``TAUCETI_QUEUE_TOKEN``."""
     path = os.environ.get("TAUCETI_QUEUE_TOKEN_FILE")
     if path:
         return f"file {path}"
-    for key in ("TAUCETI_QUEUE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
-        if os.environ.get(key):
-            return f"${key}"
-    return "gh auth token"
+    if os.environ.get("TAUCETI_QUEUE_TOKEN"):
+        return "$TAUCETI_QUEUE_TOKEN"
+    return "none configured"
 
 
 def worker_token() -> str:
-    """The GitHub token of the worker's account: a token file, the usual environment, else gh's store."""
+    """The GitHub token of the worker's dedicated account: the token file, else ``TAUCETI_QUEUE_TOKEN``.
+
+    There is deliberately no fallback to ``GH_TOKEN``, ``GITHUB_TOKEN`` or ``gh auth token``: on a
+    shared host those are the operator's personal token, whose quota every agent on the account
+    shares, and the worker must never draw on it silently."""
     from tauceti_worker.config import Die
 
     path = os.environ.get("TAUCETI_QUEUE_TOKEN_FILE")
@@ -752,15 +754,21 @@ def worker_token() -> str:
         if not token:
             raise Die(f"the queue token file {path} is empty")
         return token
-    for key in ("TAUCETI_QUEUE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
-        value = os.environ.get(key)
-        if value:
-            return value.strip()
-    result = subprocess.run(["gh", "auth", "token"], text=True, capture_output=True, check=False)
-    token = result.stdout.strip()
-    if result.returncode != 0 or not token:
-        raise Die("no GitHub token for the queue service: set TAUCETI_QUEUE_TOKEN_FILE or log in with gh")
-    return token
+    value = (os.environ.get("TAUCETI_QUEUE_TOKEN") or "").strip()
+    if value:
+        return value
+    raise Die(
+        "no GitHub token for the queue repair worker: set TAUCETI_QUEUE_TOKEN_FILE to a mode 0600 file holding"
+        " the token of the worker's dedicated repository-admin account (GH_TOKEN and gh's login are not used)"
+    )
+
+
+def use_worker_token(token: str) -> None:
+    """Make the worker's own ``gh`` calls (admin checks, submission pushes) use its dedicated token.
+
+    Agents never inherit it: their environment clears ``GH_TOKEN`` and points gh at an empty config."""
+    os.environ["GH_TOKEN"] = token
+    os.environ.pop("GITHUB_TOKEN", None)
 
 
 def verify_admin(repository: str) -> None:
@@ -2817,7 +2825,9 @@ def make_client(cfg: RunnerConfig) -> TaskClient:
         if not cfg.token:
             raise TaskBindingMismatch("an explicit native queue bearer is required; GitHub fallback is unavailable")
         return TaskClient(cfg.service, cfg.token, cfg.worker, binding=cfg.binding)
-    return TaskClient(cfg.service, cfg.token or worker_token(), cfg.worker)
+    token = cfg.token or worker_token()
+    use_worker_token(token)
+    return TaskClient(cfg.service, token, cfg.worker)
 
 
 def claim_and_run(
@@ -3277,13 +3287,18 @@ def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
         check("providers", bool(cfg.providers), ", ".join(cfg.providers) + f"; rate {cfg.rate or 'default'} ({curve})")
     except ValueError as error:
         check("providers", False, f"rate {cfg.rate!r}: {error}")
+    token_ok = False
     try:
-        cfg.token or worker_token()
+        use_worker_token(cfg.token or worker_token())
+        token_ok = True
         check("github token", True, f"from {token_source()}")
     except Exception as error:
         check("github token", False, str(error))
     try:
         from tauceti_worker.security_audit import api
+
+        if not token_ok:
+            raise RuntimeError("not checked without the worker's own token")
 
         login = str(api("user").get("login") or "")
         admin = api(f"repos/{cfg.repository}").get("permissions", {}).get("admin") is True
