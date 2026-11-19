@@ -269,10 +269,10 @@ def observe(targets: Targets, read: list[Source]) -> Seen:
 
 def _git(path: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
     """Git in the list's clone, with the operator's identity, credentials and hooks even inside a
-    source's activation."""
+    source's activation. Paths are literal, so a list named like a glob names only itself."""
     from .worker_sources import operator_environment
 
-    argv = ["git", "-C", str(path.parent), *args]
+    argv = ["git", "--literal-pathspecs", "-C", str(path.parent), *args]
     try:
         return subprocess.run(
             argv,

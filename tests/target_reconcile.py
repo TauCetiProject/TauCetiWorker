@@ -291,6 +291,21 @@ class Publish(Tmp):
         self.assertEqual(reconcile.publish(first, left, again, ["n"]), again)
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", again)
 
+    def test_a_list_named_like_a_glob_is_committed_alone(self):
+        first = self.clone("first")
+        named = first.with_name("targets[1].md")
+        git(first.parent, "mv", "targets.md", named.name)
+        (first.parent / "targets1.md").write_text("notes\n")
+        git(first.parent, "add", "targets1.md")
+        git(first.parent, "commit", "-q", "-m", "rename")
+        git(first.parent, "push", "-q", "origin", "HEAD:main")
+        (first.parent / "targets1.md").write_text("unfinished notes\n")
+        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
+        self.assertEqual(reconcile.publish(named, EXAMPLE, a, ["n"]), a)
+        self.assertEqual(git(first.parent, "show", "--name-only", "--format=", "HEAD"), "targets[1].md")
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets1.md")
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets1.md"), "notes")
+
     def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
         from tauceti_worker.source_identity import SourceActor
         from tauceti_worker.worker_sources import activate
