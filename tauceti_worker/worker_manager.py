@@ -50,6 +50,9 @@ _WORKER_KEYS = {
     "github_state_token_file",
     "id",
     "github_account",
+    "github",
+    "forgejo",
+    "new_pr_forge",
     "enabled",
     "agent",
     "only",
@@ -64,6 +67,7 @@ _WORKER_KEYS = {
     "stuck_issues",
     "extra_roadmap_prompt",
     "self_tested",
+    "full_quality",
     "source",
     "author_model",
     "author_effort",
@@ -306,6 +310,9 @@ class WorkerSpec:
     github_state_url: str | None = None
     github_state_token_file: str | None = None
     github_account: str | None = None
+    github: bool = True
+    forgejo: bool = False
+    new_pr_forge: str | None = None
     enabled: bool = True
     agent: str = "auto"
     only: tuple[str, ...] = ()
@@ -323,6 +330,7 @@ class WorkerSpec:
     stuck_issues: bool = True
     extra_roadmap_prompt: str | None = None
     self_tested: bool = False
+    full_quality: bool = False
     source: str | None = None
     author_model: str | None = None
     author_effort: str | None = None
@@ -376,6 +384,9 @@ class WorkerSpec:
             enabled=enabled,
             agent=agent,
             github_account=_string(raw.get("github_account"), f"workers[{index}].github_account", optional=True),
+            github=_boolean(raw.get("github", True), f"workers[{index}].github"),
+            forgejo=_boolean(raw.get("forgejo", False), f"workers[{index}].forgejo"),
+            new_pr_forge=_string(raw.get("new_pr_forge"), f"workers[{index}].new_pr_forge", optional=True),
             only=only,
             sandbox=sandbox,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
@@ -391,6 +402,7 @@ class WorkerSpec:
                 raw.get("roadmap_extra_identities", []), f"workers[{index}].roadmap_extra_identities"
             ),
             self_tested=_boolean(raw.get("self_tested", False), f"workers[{index}].self_tested"),
+            full_quality=_boolean(raw.get("full_quality", False), f"workers[{index}].full_quality"),
             respect_claims=_boolean(raw.get("respect_claims", True), f"workers[{index}].respect_claims"),
             reactions=_boolean(raw.get("reactions", True), f"workers[{index}].reactions"),
             stuck_issues=_boolean(raw.get("stuck_issues", True), f"workers[{index}].stuck_issues"),
@@ -406,6 +418,13 @@ class WorkerSpec:
             restart=restart,
             env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
         )
+        from .config import Die
+        from .worker_sources import resolve_selection
+
+        try:
+            resolve_selection(spec.github, spec.forgejo, spec.new_pr_forge)
+        except Die as error:
+            raise WorkersError(f"workers[{index}]: {error}") from None
         if spec.github_account is not None:
             try:
                 validate_github_account(spec.github_account)
@@ -435,6 +454,12 @@ class WorkerSpec:
 
     def as_dict(self) -> dict:
         value: dict = {"id": self.id, "enabled": self.enabled}
+        if not self.github:
+            value["github"] = False
+        if self.forgejo:
+            value["forgejo"] = True
+        if self.new_pr_forge is not None:
+            value["new_pr_forge"] = self.new_pr_forge
         if self.max_open_prs != MAX_OPEN_PRS:
             value["max_open_prs"] = self.max_open_prs
         if self.agent != "auto":
@@ -461,6 +486,8 @@ class WorkerSpec:
             value["roadmap_extra_identities"] = list(self.roadmap_extra_identities)
         if self.self_tested:
             value["self_tested"] = True
+        if self.full_quality:
+            value["full_quality"] = True
         if not self.respect_claims:
             value["respect_claims"] = False
         if not self.reactions:
@@ -499,6 +526,10 @@ class WorkerSpec:
 
     def work_argv(self) -> list[str]:
         argv = self_argv("work", "--loop", "--worker-id", self.id)
+        if not self.github or self.forgejo:
+            argv += ["--github" if self.github else "--no-github", "--forgejo" if self.forgejo else "--no-forgejo"]
+        if self.new_pr_forge is not None:
+            argv += ["--new-pr-forge", self.new_pr_forge]
         if self.conf:
             argv += ["--conf", self.conf]
         argv += ["--max-open-prs", str(self.max_open_prs)]
@@ -543,6 +574,8 @@ class WorkerSpec:
                 argv += [flag, field]
         if self.self_tested:
             argv.append("--self-tested")
+        if self.full_quality:
+            argv.append("--full-quality")
         if self.extra_roadmap_prompt is not None:
             # One argument: free text may begin with `-`, which argparse would otherwise read as a flag.
             argv.append(f"--extra-roadmap-prompt={self.extra_roadmap_prompt}")
@@ -1063,7 +1096,16 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
             applied = previous.as_dict()
     old = dict(applied)
     desired = spec.as_dict()
-    for field in ("max_open_prs", "github_state_url", "github_state_token_file", "self_tested"):
+    for field in (
+        "max_open_prs",
+        "github_state_url",
+        "github_state_token_file",
+        "self_tested",
+        "full_quality",
+        "github",
+        "forgejo",
+        "new_pr_forge",
+    ):
         old.pop(field, None)
         desired.pop(field, None)
     if old != desired:
@@ -1164,6 +1206,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     "config": str(config),
                     "error": last_error,
                     "self_tested": 1,
+                    "source_selection": 1,
                     "graceful_restart": 1,
                 }
             if action == "restart":
@@ -1722,6 +1765,7 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             "checking-quota": "checking quota",
             "waiting-github": "waiting for GitHub",
             "waiting-quota": "waiting for quota",
+            "waiting-build-cache": "waiting for a build cache",
         }.get(state, state)
         heading = f"{item['id']} — {display_state}"
         if item["desired"] == "stopped" or state in {"missing", "restarting", "stale", "stopped", "stopping"}:
@@ -1757,7 +1801,12 @@ def _worker_status_lines(config: Path, snapshots: list[dict], online: bool, *, w
             if item.get("wait_detail"):
                 cause += f" ({item['wait_detail']})"
             lines.extend(_status_field("waiting", [f"{item['wait_dependency']}: {cause}"], width))
-        if item.get("next_action_at") and state in {"backoff", "waiting-github", "waiting-quota"}:
+        if item.get("next_action_at") and state in {
+            "backoff",
+            "waiting-github",
+            "waiting-quota",
+            "waiting-build-cache",
+        }:
             label = "retry" if state == "backoff" else "recheck"
             lines.extend(_status_field(label, [_format_until(item["next_action_at"])], width))
         if budget := item.get("budget"):
@@ -2200,7 +2249,15 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
         for token in flags:
             if token in ("--loop", "--host"):
                 continue
-            if token in ("--ignore-quota", "--auto-refresh", "--stream", "--isolate-home", "--bubble", "--self-tested"):
+            if token in (
+                "--ignore-quota",
+                "--auto-refresh",
+                "--stream",
+                "--isolate-home",
+                "--bubble",
+                "--self-tested",
+                "--full-quality",
+            ):
                 values[
                     {
                         "--ignore-quota": "ignore_quota",
@@ -2209,6 +2266,7 @@ def parse_legacy_config(path: Path) -> list[WorkerSpec]:
                         "--isolate-home": "isolate_home",
                         "--bubble": "bubble",
                         "--self-tested": "self_tested",
+                        "--full-quality": "full_quality",
                     }[token]
                 ] = True
                 continue
@@ -2332,6 +2390,7 @@ def add_workers_parser(subparsers) -> None:
         "(see `tauceti work --help`)",
     )
     add.add_argument("--self-tested", action="store_true", help="apply the self-tested label after local verification")
+    add.add_argument("--full-quality", action="store_true", help="run all five quality-pass checks, not Q1, Q2, Q5")
     add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
     add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")
@@ -2420,6 +2479,7 @@ def cmd_workers(args) -> int:
                     "ignore_quota": args.ignore_quota,
                     "auto_refresh": args.auto_refresh,
                     "self_tested": args.self_tested,
+                    "full_quality": args.full_quality,
                     "roadmap_skip": [item for item in args.roadmap_skip.split(",") if item],
                     "stream": args.stream,
                     "isolate_home": args.isolate_home,

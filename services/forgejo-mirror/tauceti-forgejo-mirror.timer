@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the Forgejo TauCeti mirror every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=10s
+RandomizedDelaySec=30s
+Unit=tauceti-forgejo-mirror.service
+
+[Install]
+WantedBy=timers.target

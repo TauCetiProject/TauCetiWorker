@@ -41,9 +41,33 @@ def repository_url(name=TAUCETI):
     ).url
 
 
+def canonical_mathematics_source():
+    """The enrolled TauCeti content repositories, with native identity checked too."""
+    source = current()
+    if source is None:
+        return repository_url().lower() == "https://github.com/taucetiproject/tauceti"
+    return (
+        source.repository.key == "forgejo:https://git.taucetiproject.org/taucetiproject/tauceti"
+        and source.identity.native_id == 1
+    )
+
+
 def pull_url(number):
     source = current()
     return (source.repository if source else RepositoryRef(GITHUB, TAUCETI)).pull_url(number)
+
+
+def resolve_selection(github, forgejo, new_pr_forge=None):
+    """Validate the source switches shared by direct and managed workers."""
+    if not github and not forgejo:
+        raise Die("enable at least one source with --github or --forgejo")
+    requested = "both" if github and forgejo else "github" if github else "forgejo"
+    destination = new_pr_forge or "github"
+    if destination not in ("github", "forgejo"):
+        raise Die("new PR forge must be github or forgejo")
+    if requested != "both" and destination != requested and new_pr_forge is not None:
+        raise Die("the new PR forge must be among the selected forges")
+    return requested, destination
 
 
 def configure(args):
@@ -61,14 +85,7 @@ def configure(args):
         # project configuration must never turn an ordinary worker into a trial.
         github = True if github is None else github
         forgejo = False if forgejo is None else forgejo
-    if not github and not forgejo:
-        raise Die("enable at least one source with --github or --forgejo")
-    requested = "both" if github and forgejo else "github" if github else "forgejo"
-    destination = getattr(args, "new_pr_forge", None) or "github"
-    if destination not in ("github", "forgejo"):
-        raise Die("new PR forge must be github or forgejo")
-    if requested != "both" and destination != requested and getattr(args, "new_pr_forge", None) is not None:
-        raise Die("the new PR forge must be among the selected forges")
+    requested, destination = resolve_selection(github, forgejo, getattr(args, "new_pr_forge", None))
     if (getattr(args, "pr", None) or os.environ.get("TAUCETI_PR", "").strip()) and requested == "both":
         raise Die("numeric --pr targets need one source: use --no-github --forgejo or --no-forgejo")
     if (
@@ -121,10 +138,10 @@ def native_source(cfg):
         path = str(cfg.home / ".config/tauceti-forgejo/worker-token")
     if path is None:
         raise Die("set TAUCETI_FORGEJO_TOKEN_FILE to a private Forgejo credential file")
-    from tauceti_queue.control_policy_file import read_control_policy
+    from tauceti_tools.git_credentials import read_private_token
 
     try:
-        token = read_control_policy(Path(path)).decode("ascii").strip()
+        token = read_private_token(Path(path))
     except FileNotFoundError:
         token = None
         path = None
@@ -133,11 +150,13 @@ def native_source(cfg):
     from .paths import ensure_ssl_cert_file
 
     ensure_ssl_cert_file()
-    return ForgejoWorkerSource(
+    source = ForgejoWorkerSource(
         RepositoryIdentity(repository, int(raw_id)),
         Forgejo(repository.forge, token=token),
         token_file=Path(path) if path else None,
     )
+    source.shared_inventory = True
+    return source
 
 
 def source_config(cfg, source):
@@ -171,12 +190,12 @@ def activate(source, cfg):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         real_gh = original.get("TAUCETI_REAL_GH") or shutil.which("gh")
         wrapper = directory / "gh"
-        wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -m tauceti_worker.source_cli "$@"\n')
+        wrapper.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -P -m tauceti_worker.source_cli "$@"\n')
         wrapper.chmod(0o700)
         source.write_cli_configuration(cfg.state / "gh-project.toml")
         claim_wrapper = directory / "claim-source"
         claim_wrapper.write_text(
-            "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -m tauceti_worker.source_claims "$@"\n'
+            "#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' -P -m tauceti_worker.source_claims "$@"\n'
         )
         claim_wrapper.chmod(0o700)
         env = scoped_git_environment(source.repository.forge, token_file=source.token_file, purpose="workspace")

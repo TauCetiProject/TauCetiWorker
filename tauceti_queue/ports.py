@@ -85,6 +85,9 @@ class AdmissionSnapshot:
     statuses: dict[str, str]
     diff_version: str = ""
     discovery_version: str = ""
+    self_tested: bool = False  # Inline trusted-author/scope eligibility, never a workflow receipt.
+    # Failed PR-level diff guards (diff_guard.violations) for heads admission measured; empty passes.
+    diff_guard: tuple[str, ...] = ()
 
     def source(self) -> dict[str, Any]:
         return {
@@ -290,6 +293,14 @@ class ExecutionPort(Protocol):
         ...
 
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None: ...
+
+    def main_ci_run(self, repo: str, sha: str) -> CandidateRun | None:
+        """The newest `ci.yml` push run for `sha` (one REST call, never retried or slept on), without jobs.
+
+        `None` when there is none: `ci.yml` coalesces bursts of pushes, so an intermediate SHA may have
+        no run. The controller reads it only to tell whether an escalated batch's base is broken.
+        """
+        ...
 
 
 class GitHubPort(SourcePort, ExecutionPort, Protocol):

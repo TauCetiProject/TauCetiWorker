@@ -42,7 +42,7 @@ import time
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
-from tauceti_queue import diagnostics, repair_sandbox, repair_tools
+from tauceti_queue import diagnostics, diff_guard, repair_sandbox, repair_tools
 from tauceti_queue.mixed_identity import public
 
 DEFAULT_REPOSITORY = "TauCetiProject/TauCeti"
@@ -481,6 +481,36 @@ def pr_number(source_pr: str) -> int:
     return from_source_pr(source_pr)
 
 
+def review_size_violations(clone: Path, base: str, tip: str) -> list[dict]:
+    """The staging member review-size policy on each commit of ``base..tip`` against its parent.
+
+    Staging (TauCetiTools ``ci_candidate_workflow.member_size_policy``) measures each member's commit as
+    it sits in the batch chain against that commit's parent, with the shared ``ci_git.pr_guards`` this
+    also measures admission (``diff_guard``); so a repair that splits a member's change inside the batch
+    counts.
+    One ``{pr, commit, parent, violations}`` per commit that fails; an unreadable chain yields nothing
+    (``chain.validate`` reports it) and an unmeasurable diff is left to CI.
+    """
+    try:
+        commits = read_chain(clone, base, tip)
+    except RuntimeError:
+        return []
+    found = []
+    with diff_guard.ci_git.repository_reader(clone) as reader:
+        for commit in commits:
+            if commit.empty:
+                continue
+            try:
+                result = diff_guard.ci_git.pr_guards(reader, commit.parent, commit.sha, scope=False)
+            except ValueError:
+                continue
+            if result["violations"]:
+                found.append(
+                    {"pr": commit.pr, "commit": commit.sha, "parent": commit.parent, "violations": result["violations"]}
+                )
+    return found
+
+
 def chain_report(
     clone: Path, base: str, prior_tip: str | None, tip: str, members: list[str], *, prior_base: str | None = None
 ) -> dict:
@@ -490,8 +520,10 @@ def chain_report(
     trailers, count); ``compare`` is ``chain.compare`` against the prior chain ``prior_base..prior_tip``
     (append-only messages, provenance per member), the controller's own order of checks. ``unexplained``
     lists the members whose content changed without an appended explanation, which the plan says the
-    same attempt must add. ``ok`` is the validation verdict together with the append-only check; a
-    missing explanation alone does not make it false.
+    same attempt must add. ``review_size`` is the staging member review-size policy on each commit
+    against its parent (``review_size_violations``); a commit it rejects is a problem, since staging
+    would reject the chain. ``ok`` is the validation verdict together with the append-only and
+    review-size checks; a missing explanation alone does not make it false.
     """
     prior_base = prior_base or base
     record: dict = {"base": base, "tip": tip, "prior_base": prior_base, "prior_tip": prior_tip}
@@ -520,6 +552,13 @@ def chain_report(
             problems.append(f"compare: {error}")
     elif prior_tip == tip:
         record["compare"] = {"ok": True, "unchanged": True}
+    record["review_size"] = review_size_violations(clone, base, tip)
+    for entry in record["review_size"]:
+        member = f"#{entry['pr']}" if entry["pr"] is not None else "a commit"
+        problems += [
+            f"review-size: {member} (commit {entry['commit'][:12]} against its parent): {violation}"
+            for violation in entry["violations"]
+        ]
     record["edited"] = edited
     record["unexplained"] = unexplained
     record["problems"] = problems
@@ -1001,6 +1040,7 @@ def prepare_artifacts(
 LISTINGS_DIR = ".tauceti-repair"
 LISTINGS_FILE = "members.jsonl"  # one JSON object per member, in chain order
 CHECK_FILE = "check"  # the agent's one validation command, written beside the listings
+GUARDS_FILE = "ci_git.py"  # the shared PR-level diff guards the check script runs on each commit
 STEP_FILE = "step"  # steps the rebase through members already on main, stopping at real conflicts
 BUILD_FILE = repair_tools.BUILD_FILE  # builds only the named modules, one Lake build at a time
 LANDED_SHOWN = 30  # members already on main listed in the prompt itself; the rest are in the listings file
@@ -1192,7 +1232,8 @@ CHECK_SCRIPT = '''#!/usr/bin/env python3
 Written by the queue's repair worker; it verifies what the queue's own validation will: a linear
 chain on the target commit, one commit per recorded member in the recorded order, the `Source-PR:`
 and `Accepted-Head:` trailers and the ` (#N)` subject suffix kept, every original message preserved
-as a prefix of the new one, no rebase in progress and a clean working tree.
+as a prefix of the new one, no rebase in progress and a clean working tree; then what staging's
+member review-size policy will: each member's commit against its parent within the caps.
 """
 import json
 import re
@@ -1228,6 +1269,37 @@ def trailers(message: str) -> dict:
     return found
 
 
+sys.path.insert(0, str(HERE))
+try:
+    import ci_git  # the shared PR-level diff guards, copied beside this script from the worker's TauCetiTools
+except ImportError:
+    ci_git = None
+
+
+def guards(shas: list) -> dict:
+    """The staging member review-size policy on each commit against its parent: `{{sha: (parent,
+    result)}}`, with no result where it cannot be measured here (the worker measures it again)."""
+    measured = {{}}
+    try:
+        with ci_git.repository_reader(ROOT) as reader:
+            for sha in shas:
+                parent = git("rev-parse", f"{{sha}}^").strip()
+                try:
+                    measured[sha] = (parent, ci_git.pr_guards(reader, parent, sha, scope=False))
+                except ValueError:
+                    measured[sha] = (parent, None)
+    except (AttributeError, OSError, subprocess.SubprocessError):
+        pass
+    return measured
+
+
+if sys.argv[1:2] == ["--size"]:
+    if len(sys.argv) != 3:
+        fail("usage: check --size <commit>")
+    sha = git("rev-parse", "--verify", f"{{sys.argv[2]}}^{{{{commit}}}}").strip()
+    parent, result = guards([sha]).get(sha, ("", None))
+    print(json.dumps({{"commit": sha, "parent": parent, **(result or {{"error": "not measurable"}})}}, indent=1))
+    sys.exit(1 if result is None or result["violations"] else 0)
 members = [json.loads(line) for line in (HERE / "members.jsonl").read_text().splitlines() if line.strip()]
 for state in ("rebase-merge", "rebase-apply"):
     path = git("rev-parse", "--git-path", state).strip()
@@ -1257,6 +1329,18 @@ for member, sha in zip(members, shas):
         fail(f"{{where}}: the subject no longer ends in `{{suffix}}`")
     if not message.rstrip().startswith(original.rstrip()):
         fail(f"{{where}}: the original message of {{member['commit'][:12]}} is not a prefix of the new one")
+# Staging's member review-size policy: each member's commit against its parent in this chain.
+measured = guards(shas)
+for member, sha in zip(members, shas):
+    parent, result = measured.get(sha, ("", None))
+    if result is not None and result["violations"]:
+        fail(
+            f"position {{member['position']}}, commit {{sha[:12]}} (#{{member['pr']}}): the staging review-size "
+            f"policy measures this commit against its parent {{parent[:12]}} and rejects it: "
+            + " ".join(result["violations"])
+            + " Split the change inside this member's commit (for example a long new file into smaller "
+            "files), or leave the member out."
+        )
 print("ok")
 '''
 
@@ -1319,6 +1403,8 @@ def write_listings(
     check = directory / CHECK_FILE
     check.write_text(check_script(context.base, context.repository))
     check.chmod(0o755)
+    # The check script's review-size guard: the same shared `ci_git` the worker's own check imports.
+    (directory / GUARDS_FILE).write_bytes(Path(diff_guard.ci_git.__file__).read_bytes())
     repair_tools.write_build_script(directory, worker_verifies=context.worker_verifies)
     if context.kind in REBASE_KINDS and (context.conflict or {}).get("previous_base"):
         step = directory / STEP_FILE
@@ -1689,7 +1775,8 @@ def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list
     lines = [
         "## Do not edit",
         "",
-        "The authors of these PRs opted out of repair (`dont-repair-in-queue`). Do not change their content or their messages:",
+        "These PRs must not be edited: their authors opted out of repair (`dont-repair-in-queue`), or they change "
+        "control files outside the native path policy. Do not change their content or their messages:",
         "",
     ]
     for number in guarded:
@@ -1780,6 +1867,39 @@ def _editing_section(context: PromptContext, chain: list[ChainCommit], base_shor
         + " folds them into the chain, keeping each commit's message and author and adding the explanation after the "
         "trailers. A contribution reduced to nothing stays as an empty commit, never a dropped one.",
     ]
+
+
+def _review_size_section(check_command: str | None) -> list[str]:
+    """What a `policy` finding (staging's member review-size policy) asks of the repair."""
+    ci_git = diff_guard.ci_git
+    # TauCetiTools split the shared line cap into added and removed caps; read either layout so
+    # this prompt works against TauCetiTools on both sides of that change.
+    added_cap = getattr(ci_git, "REVIEW_ADDED_LINE_CAP", None) or ci_git.REVIEW_LINE_CAP
+    removed_cap = getattr(ci_git, "REVIEW_REMOVED_LINE_CAP", None) or ci_git.REVIEW_LINE_CAP
+    lines = [
+        "## The review-size policy",
+        "",
+        "The `policy` findings above are staging's member review-size policy, not a build error. It measures each "
+        "member's commit as it sits in this chain against that commit's parent, that is the diff that lands for "
+        f"the member, with PR CI's caps: a new Lean file at most {ci_git.NEW_FILE_LINE_CAP} lines, and at most "
+        f"{added_cap} added lines, {removed_cap} removed lines and {ci_git.REVIEW_FILE_CAP} "
+        "files per member (Lake-pin bumps are exempt from the line caps).",
+        "",
+        "Splitting the change inside the batch is a valid repair: for example split a too-long new file into two "
+        "or more smaller files (each importing what it needs, with its importers updated), keeping the result in "
+        "that member's own commit and explaining the split in its message. Do not move the content into another "
+        "member's commit. A member that cannot be brought within the caps without changing its mathematics may be "
+        "left out instead, as described below.",
+        "",
+    ]
+    if check_command:
+        lines += [
+            f"`{check_command}` runs this policy on every commit against its parent after its chain checks; it must "
+            f"print `ok`. `{check_command} --size <commit>` prints one commit's measured sizes and violations "
+            "against its parent as JSON, while you work.",
+            "",
+        ]
+    return lines
 
 
 def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainCommit], clone: Path) -> str:
@@ -1952,6 +2072,8 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
             where_text = f" in `{finding['module']}` ({_owner_text(owners, chain)})" if finding.get("module") else ""
             lines.append(f"- {finding['kind']}{where_text}: {finding['message']}")
         lines.append("")
+        if any(finding.get("kind") == "policy" for finding in findings["other"]):
+            lines += _review_size_section(check_command)
     if context.named_modules:
         lines.append(
             "Modules the journal's diagnostics name: " + ", ".join(f"`{m}`" for m in context.named_modules) + "."
@@ -2156,6 +2278,10 @@ def isolation_env(
         changes["TAUCETI_REPAIR_CLAUDE_ENV_FILE"] = str(prepare_claude_shell_env(Path(changes["CLAUDE_CONFIG_DIR"])))
     changes["GH_TOKEN"] = None
     changes["GITHUB_TOKEN"] = None
+    changes["TAUCETI_QUEUE_TOKEN"] = None
+    changes["TAUCETI_QUEUE_TOKEN_FILE"] = None
+    changes["TAUCETI_QUEUE_GITHUB_APP"] = None
+    changes["TAUCETI_QUEUE_CONFIG"] = None
     empty_gh = root / "gh-config-empty"
     empty_gh.mkdir(parents=True, exist_ok=True)
     changes["GH_CONFIG_DIR"] = str(empty_gh)

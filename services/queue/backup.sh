@@ -30,7 +30,9 @@ if [ -z "$DATABASE" ]; then
   if command -v tauceti-queue >/dev/null; then
     DATABASE="$(tauceti-queue check-config --print database)"
   else
-    DATABASE="$(cd "${TAUCETI_QUEUE_CHECKOUT:-$HOME/TauCetiQueue}" && uv run tauceti-queue check-config --print database)"
+    # The code this copy of the script belongs to: the controller's release when the backup timer
+    # runs it (tauceti-queue-backup.service), whichever checkout or release when run by hand.
+    DATABASE="$(cd "$(dirname "$0")/../.." && UV_NO_SYNC=1 uv run tauceti-queue check-config --print database)"
   fi
 fi
 [ -f "$DATABASE" ] || { echo "backup.sh: no database at $DATABASE (nothing to back up yet)" >&2; exit 0; }

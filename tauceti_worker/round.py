@@ -12,8 +12,8 @@ import sys
 import threading
 import time
 
-from .config import Config, Die, log
-from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_TIMEOUT
+from .config import ClaimCollision, Config, Die, log
+from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, ROUND_LOCK_WAIT, ROUND_TIMEOUT
 from .github import claims_repo
 from .paths import CLAIM_SH, self_argv, self_env
 
@@ -47,15 +47,18 @@ class RoundContext:
     def __enter__(self) -> RoundContext:
         self.cfg.state.mkdir(parents=True, exist_ok=True)
         path = self.cfg.state / "round.lock"
+        # spawn_round sets this for a loop's rounds; a one-off round refuses at once. Popped so the
+        # round's own children (an agent running `tauceti work`) do not inherit it.
+        wait = float(os.environ.pop("TAUCETI_ROUND_LOCK_WAIT", "0") or 0)
         fd = os.open(path, os.O_CREAT | os.O_WRONLY, 0o644)
         os.set_inheritable(fd, False)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        if not lock_round(fd, wait, f"worker '{self.cfg.wid}' round.lock is held"):
             os.close(fd)
-            raise Die(
-                f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time"
-            ) from None
+            message = f"another round for worker '{self.cfg.wid}' holds {path} — one round per worker at a time"
+            if wait:
+                # Not a failed round: the loop reselects shortly, without failure backoff.
+                raise ClaimCollision(f"{message} (still held after {wait:.0f}s)")
+            raise Die(message)
         self._fd = fd
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
         signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
@@ -151,6 +154,29 @@ class RoundContext:
         return False
 
 
+def lock_round(fd: int, wait: float, what: str) -> bool:
+    """Take an exclusive flock on `fd`, waiting up to `wait` seconds for its holder to let go.
+
+    A loop's next round can find its worker's lock briefly held by another worker's round that is
+    removing this worker's leftover worktree (round_worktrees.sweep), or by a round of a loop that was
+    restarted while it ran. Waiting turns either into a short delay instead of a failed round."""
+    deadline = time.monotonic() + wait
+    waiting = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if waiting:
+                log(f"{what}: acquired after waiting")
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            if not waiting:
+                log(f"{what}: waiting up to {wait:.0f}s for its holder to release it")
+                waiting = True
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
+
 def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT) -> subprocess.Popen:
     """Spawn one round as a child in its OWN session (so the loop can kill the whole group). Invokes
     the current interpreter directly on this file (NOT via the uv shebang) to avoid a uv wrapper
@@ -158,6 +184,7 @@ def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT) -> subpro
     cmd = self_argv("_round", *argv_tail)
     env = self_env()
     env["TAUCETI_ROUND_DEADLINE"] = str(time.time() + timeout)
+    env["TAUCETI_ROUND_LOCK_WAIT"] = str(ROUND_LOCK_WAIT)
     return subprocess.Popen(cmd, start_new_session=True, env=env)
 
 

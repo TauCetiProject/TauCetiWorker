@@ -186,6 +186,6 @@ def recover(worker, *, numbers=()):
         from .config import log
 
         log("review recovery: paid output awaits its original publisher or record repair; affected heads withheld")
-    if result.returncode not in (82, 84, 86):
+    if result.returncode not in (82, 84, 86, 87):
         raise NoProgress("rendered review output remains retained for publication retry")
     return False

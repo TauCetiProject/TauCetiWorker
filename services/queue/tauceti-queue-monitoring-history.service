@@ -1,0 +1,27 @@
+# Tau Ceti queue public history report (docs/queue/monitoring.md), run hourly by
+# tauceti-queue-monitoring-history.timer. `services/queue/install-monitoring.sh` installs both.
+# Extra arguments come from ~/.config/tauceti-queue/monitoring-environment, as for
+# tauceti-queue-monitoring.service.
+#
+# WARNING: never add a systemd drop-in (*.service.d/*.conf) for this unit: drop-ins silently
+# override what install-monitoring.sh installs, and the installer refuses to run while one exists.
+# The installer renders this file with the code paths below pointing at the unit's own release
+# directory, ~/TauCetiQueue-releases/<sha>-<time> (services/queue/release.sh). It runs origin/main
+# HEAD; running any other revision requires explicit permission from a human operator and must be
+# undone as soon as the change lands on main.
+
+[Unit]
+Description=Tau Ceti queue public history report
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/queue/monitoring.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/TauCetiQueue
+EnvironmentFile=-%h/.config/tauceti-queue/monitoring-environment
+Environment=PYTHONUNBUFFERED=1
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_queue.monitoring_history --database %h/TauCetiQueue-data/queue.sqlite3 --clone %h/TauCetiQueue-data/clone --worker-root %h/TauCetiQueue-data/repair --worker-root %h/TauCetiQueue-data/repair-2 --worker-root %h/TauCetiQueue-data/repair-3 $TAUCETI_QUEUE_MONITORING_ARGS --baseline %h/TauCetiQueue-data/reports/bors-baseline-2026-11-03.json --output %h/TauCetiQueue-data/monitoring/history.json --publish-url https://ci-data.taucetiproject.org/ingest/operations/history --token-file %h/TauCetiQueue-data/monitoring/token
+Nice=10
+# The whole-pilot window peaked at 445 MB on 2026-11-18.
+MemoryMax=1G
+UMask=0077
