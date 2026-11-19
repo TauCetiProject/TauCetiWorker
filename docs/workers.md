@@ -1,16 +1,29 @@
 # Persistent workers
 
-Worker data (`state/`, `checkouts/` and `logs/`) lives in one data root. An
-installed package (`uv tool install`, pip, a Fleet runtime) uses
+Worker data (`state/`, `checkouts/`, `logs/` and `host-repositories/`) lives in
+one data root. An installed package (`uv tool install`, pip) uses
 `$XDG_DATA_HOME/tauceti`, else `~/Library/Application Support/tauceti/data` on
 macOS, else `~/.local/share/tauceti`, so upgrading or reinstalling the code keeps
-it. A source checkout keeps it beside the code, gitignored. For the legacy
-TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects another absolute directory;
-round, verification and cleanup subprocesses inherit it, and bundled scripts and
-prompts remain with the code. Changing the location does not move data: the
-cleanup collector deletes data an earlier installation left in its package
-directory, and on Fleet hosts other runtimes' roots, once no worker or round
-holds their locks.
+it. A Fleet runtime uses `<fleet data>/worker-data/root` (normally
+`~/.local/share/tauceti-fleet/worker-data/root`), shared by every runtime
+revision; it keeps `~/.local/share/tauceti` only while that holds worker state
+and the fixed root does not. A source checkout keeps it beside the code,
+gitignored. For the legacy TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects
+another absolute directory; round, verification and cleanup subprocesses inherit
+it, and bundled scripts and prompts remain with the code. Changing the location
+does not move data: the cleanup collector deletes data an earlier installation
+left in its package directory, and on Fleet hosts other runtimes' roots, once no
+worker or round holds their locks.
+
+A data root inside a virtualenv looks disposable, so `tauceti doctor` fails and
+a worker loop refuses to start when it would create data there. Data already
+inside one only draws a warning; move it out by renaming each part into the new
+root and leaving a symbolic link at the old name. While workers run, swap the
+part with a link created beside it in one step (`mv --exchange`, coreutils 9.5),
+then rename the swapped-out directory into the new root: a separate rename and
+`ln -s` leave a moment where a worker can recreate an empty part at the old name. The collector treats a root
+whose parts are symbolic links into another as an alias: it collects the target
+once, through the selected root, and never stages or deletes it through the link.
 
 ## Fleet admission and reporting
 
@@ -67,6 +80,52 @@ Persistent workers are declarative. You describe the workers you want in
 `workers.toml`, and a manager process reconciles reality against that file:
 starting missing workers, stopping removed ones, restarting changed ones, and
 backing off repeated failures. They do not belong to a terminal session.
+
+## Source selection
+
+Worker definitions select the same sources as `tauceti work`. Existing definitions
+keep their GitHub-only defaults. For a Forgejo worker, set:
+
+```toml
+github = false
+forgejo = true
+new_pr_forge = "forgejo"
+```
+
+Set both source booleans to `true` to maintain PRs from both sources. New PRs use
+`new_pr_forge`, independently of maintenance selection. Configure all three fields
+for native authoring; without an explicit destination, new PRs still default to GitHub.
+These fields are available in `workers.toml`. Credentials use the existing
+private Forgejo token-file configuration. Source changes wait for the worker's
+current round to finish; other workers retain their running processes and settings.
+
+## Locally verified publications
+
+With `self_tested = true` and `TAUCETI_VERIFY_HELPER=1`, the worker applies
+`self-tested` after an authoring or repair round publishes ordinary mathematics
+entirely under `TauCeti/`. Every verification phase must succeed in that round,
+and the receipt's source inventory must exactly match the published commit.
+Pin changes, infrastructure changes and full-lint/lint-repair requests do not
+qualify. This is the same eligibility check for GitHub and Forgejo.
+
+Both forges use the same add-label flow through their source adapters; no picker
+or separate status publication is required. Provision the `self-tested`
+repository label on Forgejo before enabling this route. This rollout does not
+change publisher grants.
+
+The label is a persistent author declaration. Keep it through fix/rebase pushes
+after successful verification; remove it when verification fails or is
+incomplete. Authors can apply it themselves after verification, and the worker
+also applies it when it finds the complete matching receipt after a round.
+An unavailable or invalid receipt never produces an automatic label. Ordinary
+PR-CI eligibility is checked independently at admission.
+
+Forgejo does not currently run an individual Actions build for each PR. Reviews
+still run, and every mixed merge-queue candidate requires its full CI build and
+audits before landing, including self-tested members. Source statuses cannot
+replace that candidate CI. For live deployments, preserve every per-worker
+`env` entry, including any `TAUCETI_ROUND_WORKTREES=0` opt-out; the verification
+helper can also be enabled in the worker manager's service environment.
 
 ## Dependency bumps
 
@@ -360,6 +419,59 @@ Archive seeding skips duplicates, and an archive removed concurrently by pool co
 is an individual cache miss for Lake to fetch. Native fetch arguments and Mathlib snapshot
 keys/inventory checks are unchanged.
 
+A worker's build tree outlives its rounds, so it can hold modules an earlier round compiled
+locally. When CI has published outputs for the same input hash and they differ from the
+local ones, Lake would still trust the local trace. Locally built bytes need not match CI's,
+and every module downstream would then miss the cache and compile locally. After hydration,
+preparation therefore removes each such module's trace (and its `.hash` sidecars), and Lake
+restores CI's outputs by hard link. Modules CI has not published are the agent's own work and
+are left alone. The receipt counts `ci_disagreeing_traces`, `ci_disagreeing_removed` and
+`ci_disagreeing_skipped` (deferred because a file was busy).
+
+#### Waiting for a matching TauCeti cache
+
+`lake cache get --max-revs=N` installs the newest published revision in the last N commits.
+When CI has not yet published a commit that changed dependencies (a Mathlib bump, say), that
+revision predates the change, none of its outputs apply, and the round would compile all of
+TauCeti, which cannot finish within the round limit. Host agent rounds (roadmap, overlap-fix,
+and the PR rounds fix, fix-ci, rebase, bump and lint-repair) therefore check the cache before
+the agent starts. The revision Lake installed is the first commit in `git rev-list HEAD -n N`
+whose revision map is in the round's download directory, which is the same rule Lake follows
+(maps seeded from the pool included). Its `lake-manifest.json` package revisions and
+`lean-toolchain` are compared with the checkout's dependency files as prepared. A rebase round
+prepares with main's files, so main's cache is the one it needs. For a PR round, the main
+revision fetched alongside also counts. If either matches, the round proceeds. A fallback with
+the same dependencies is logged as a same-dependency fallback and only the commits in between
+rebuild.
+
+Otherwise the round ends as `waiting-build-cache` (exit 79): no failure, no attempt charged,
+downloaded and hydrated outputs kept, and the worker selects other work after 5 seconds.
+`tauceti workers status` shows the state, the commit and the recheck time. The round writes
+`<pool>/cache-waits/<commit>-<dependencies>.json`, keyed by the head and the dependency files it
+prepared, with a retry time five minutes ahead. It records the stage and the revision whose map
+would serve those dependencies: the head for its own, main for main's (a rebase round). Until the
+retry time, other workers on the host skip the same stage on that head, and skip roadmap and
+overlap-fix while a wait on main is recorded (roadmap reports `waiting-build-cache` itself, since
+it is the last candidate). A fix of a head whose rebase is waiting is not held. At most every
+30 seconds per host, a selecting worker sends an anonymous `HEAD` request for that revision's
+map, `<TAUCETI_CACHE_REVISION_URL>/TauCetiProject/TauCeti/tc/<toolchain>/<revision>.jsonl`, with
+the prepared toolchain mangled as Lake does (`leanprover--lean4---v4.36.0`); a 200 removes the
+wait. When the retry time passes, the next round to select that work claims the check for two
+minutes, together with its own later candidates, and goes through. Only cache preparation
+re-arms the retry time, so a round that claims and then declines lets the claim lapse for the
+next one. A successful check on main clears every wait on main. Any error reading or writing
+markers, or probing, lets work proceed, including the round that could not record its wait. A marker
+that exists but cannot be read is left alone rather than restarted. At most once an hour per
+host, selection deletes every marker whose first wait is more than seven days old, whatever its
+head or stage; released PR waits are kept until then, so a spent grace is not granted again.
+
+A wait older than an hour logs one warning per host and commit, naming the URL CI should have
+published. Rounds on main wait without limit: main always gets a cache, and building anyway
+only occupies the host. A PR whose own head changes dependencies relative to main only gets a
+cache once CI builds that PR, which may never succeed, so after two hours of waiting its rounds
+proceed on the fallback cache as before, letting the repair agent work on the PR. Bubble rounds,
+bump attestation and the queue's repair service do not wait.
+
 The existing pool status receipt also records mapping/seed/install counts and per-phase
 elapsed and CPU seconds for seeding, fetching, transfer, expansion/hydration, and Mathlib
 view preparation. CPU includes the preparator and reaped children. Phases can be nested,
@@ -371,8 +483,8 @@ The pool defaults to `~/.cache/tauceti/builds` under the login user's home. Conf
 cache overrides are preserved. Only directories carrying a valid TauCeti ownership record
 are collected; an arbitrary nonempty directory is never adopted or deleted.
 
-`TAUCETI_ROUND_WORKTREES=1` (off by default; set it in a host's `workers.toml` `env` table)
-makes every round work in its own linked worktree of one bare host clone,
+Every round works in its own linked worktree (a host opts out with `TAUCETI_ROUND_WORKTREES=0` in
+its `workers.toml` `env` table) of one bare host clone,
 `<state>/host-repositories/TauCeti.git` (override with `TAUCETI_HOST_REPOSITORIES`). The worktree
 sits at the worker's usual checkout path, detached at `origin/main`; the host clone is fetched at
 most once a minute under `host-repositories/TauCeti.lock`. At round end the worktree is removed

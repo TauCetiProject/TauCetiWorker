@@ -267,7 +267,6 @@ class WorkflowCredentials(unittest.TestCase):
             config.source,
             config.execution,
             "b" * 40,
-            config.harness_revision,
             config.config_digest,
             5,
             7,
@@ -361,14 +360,17 @@ class WorkflowCredentials(unittest.TestCase):
         proof = reader.add("202")
         posts = []
 
-        def cancel(*args):
-            posts.append(args)
+        def cancel(method, url, headers, body):
+            if method == "GET":
+                return 200, {}, json.dumps(reader.runs[url.rsplit("/", 1)[1]]).encode()
+            posts.append((method, url, headers, body))
             return 202, {}, b""
 
         adapter = GitHubSourceExecution(source, transport=cancel, reader_factory=lambda *_: reader)
         self.assertEqual(adapter.status(frozen, "202").run_id, "202")
         self.assertEqual(posts, [])
-        self.assertEqual(adapter.cancel(frozen, "202", proof=proof), "cancelled")
+        cancelled = adapter.cancel(frozen.policy.execution, "202", request_digest=frozen.request.digest, proof=proof)
+        self.assertEqual(cancelled, "cancelled")
         self.assertEqual(len(posts), 1)
         self.assertTrue(posts[0][1].endswith("/actions/runs/202/cancel"))
         with self.assertRaises(DispatchNotAccepted) as caught:

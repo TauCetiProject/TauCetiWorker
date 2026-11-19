@@ -19,6 +19,14 @@ from pathlib import Path
 from . import github_transport as tr
 from .github_forks import ForkUnknown, discover
 
+# Agents read this on stderr. It must not suggest that the publication happened, or an agent may
+# take a step that depends on it, such as closing a PR whose explanation comment was never posted.
+NOT_POSTED = (
+    "TauCeti: this publication is NOT confirmed as posted to GitHub. It is retained for "
+    "retry/reconciliation, which may never post it. Do not repeat it, and do not act as if it were visible "
+    "(for example, do not close a PR whose explanation it carries). No paid work needs to be repeated."
+)
+
 
 def directory(env=None):
     env = os.environ if env is None else env
@@ -40,6 +48,27 @@ def _flag(args, *flags):
 def local_operation(args):
     """Commands that modify a local checkout but publish nothing to GitHub."""
     return args[:2] in (["pr", "checkout"], ["repo", "clone"])
+
+
+def label_edit(args):
+    """A `gh pr|issue edit` that only adds or removes labels.
+
+    Label edits are idempotent, so they are never retained: a denied or lost one simply fails
+    to the caller, who may repeat it. A retained intent would block later rounds on the PR."""
+    if args[:2] not in (["pr", "edit"], ["issue", "edit"]) or len(args) < 3:
+        return False
+    labels, rest = False, iter(args[3:])
+    for arg in rest:
+        if arg in ("--add-label", "--remove-label"):
+            labels = True
+            next(rest, None)
+        elif arg.startswith(("--add-label=", "--remove-label=")):
+            labels = True
+        elif arg in ("--repo", "-R"):
+            next(rest, None)
+        elif not arg.startswith("--repo="):
+            return False
+    return labels
 
 
 def semantic_key(payload):
@@ -139,6 +168,7 @@ def prepare(argv, env, cwd=None, input=None):
         or env.get("TAUCETI_OUTBOX_REPLAY") == "1"
         or tr.proxy_readonly(argv[1:])
         or local_operation(argv[1:])
+        or label_edit(argv[1:])
     ):
         return None
     args = list(argv[1:])
@@ -447,9 +477,7 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
     tr.atomic(path, value)
     tr.event({"kind": "publication_deferred", "status": value["status"], "intent": path.stem})
     result.github_deferred = True
-    result.stderr = (
-        result.stderr or ""
-    ) + "\nTauCeti: publication retained for retry/reconciliation; no paid work needs to be repeated.\n"
+    result.stderr = (result.stderr or "") + "\n" + NOT_POSTED + "\n"
 
 
 def archive(path, value, reason, **evidence):
@@ -819,6 +847,10 @@ def drain(env=None):
             ):
                 remaining.append(path.stem)
                 continue  # Preserve malformed legacy evidence without blocking other repairs.
+            if label_edit(value["argv"]):
+                # Older proxies retained label edits, which nothing can reconcile.
+                archive(path, value, "Label edits are not retained publications")
+                continue
             destination = target(value)
             if value.get("retry_at", 0) > time.time():
                 remaining.append(path.stem)

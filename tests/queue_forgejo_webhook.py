@@ -8,14 +8,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from queue_ci_requests import policy
-from tauceti_tools.forge import PrincipalRef
 
 from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller
 from tauceti_queue.fakes import make_controller
@@ -37,12 +35,6 @@ class Webhooks(unittest.TestCase):
             clock=clock,
         )
         self.source = policy().source
-        self.adapter.admission_policy = SimpleNamespace(
-            publishers=SimpleNamespace(
-                reviews=frozenset({PrincipalRef(self.source.repository.forge, "8")}),
-                recoveries=frozenset({PrincipalRef(self.source.repository.forge, "7")}),
-            )
-        )
         self.secret = b"dedicated-source-hook-secret" * 2
         self.receiver = ForgejoWebhookReceiver(self.controller, self.source, self.secret)
         self.payload = {
@@ -166,7 +158,7 @@ class Webhooks(unittest.TestCase):
         self.assertEqual(self.send(issue, event="issue_comment", delivery="not-a-pr"), "ignored")
         self.assertIsNone(self.poller.state.get(2))
 
-    def test_output_and_nonpublisher_markers_are_ignored_but_moderated_publisher_comments_are_urgent(self):
+    def test_own_output_is_ignored_but_any_authors_scoreboard_change_is_urgent(self):
         from tauceti_worker.source_identity import SourceActor
 
         self.controller.source_actor = SourceActor.from_native(
@@ -180,13 +172,10 @@ class Webhooks(unittest.TestCase):
             "comment": {"body": "<!--tauceti-scoreboard-->"},
         }
         self.assertEqual(self.send(payload, event="issue_comment"), "ignored")
+        self.assertIsNone(self.poller.state.get(1))
         payload["sender"] = {"id": 99}
         payload["comment"]["user"] = {"id": 99}
-        self.assertEqual(self.send(payload, event="issue_comment", delivery="non-publisher"), "ignored")
-        self.assertIsNone(self.poller.state.get(1))
-        payload["comment"]["user"] = {"id": 8}
-        payload["action"] = "edited"
-        self.assertEqual(self.send(payload, event="issue_comment", delivery="moderation"), "invalidated")
+        self.assertEqual(self.send(payload, event="issue_comment", delivery="contributor"), "invalidated")
         self.assertEqual(self.poller.state.get(1)["urgent"], 1)
 
     def test_malformed_native_structures_are_refused_as_bad_payloads(self):

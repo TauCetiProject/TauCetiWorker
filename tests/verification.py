@@ -197,6 +197,14 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.environ.start()
         self.addCleanup(self.environ.stop)
 
+    def on_main(self, name, contents):
+        """Land a change outside the library on main: a candidate edit there fails the scope guard."""
+        write(self.root, name, contents)
+        git(self.root, "commit", "-qam", f"main changes {name}")
+        self.base = git(self.root, "rev-parse", "HEAD")
+        git(self.root, "update-ref", "refs/remotes/origin/main", self.base)
+        os.environ["TAUCETI_VERIFY_BASE"] = self.base
+
     def verify(self, **kwargs):
         with contextlib.redirect_stderr(io.StringIO()):
             result = Verification(self.root, self.state, **kwargs).run()
@@ -287,8 +295,8 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["commands"][-1]["exit"], 23)
         os.environ.pop("FIXTURE_MODE")
-        # Candidate-owned style scripts cannot replace the shared implementation.
-        write(self.root, "scripts/lint-style.sh", "false | cat\n")
+        # Candidate-owned style scripts cannot replace the shared implementation, even once main has them.
+        self.on_main("scripts/lint-style.sh", "false | cat\n")
         result = self.verify(stage="lint")
         self.assertEqual(result["status"], "success", result.get("error"))
 
@@ -691,7 +699,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
 
     def test_explicit_lint_modules_are_bound_inputs(self):
         modules = write(self.home, "lint-modules.txt", "TauCeti.B\n")
-        write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
+        self.on_main("scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertEqual(result["status"], "success", result.get("error"))
         lint = next(c for c in result["commands"] if "environment" in c["argv"])
