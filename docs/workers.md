@@ -18,7 +18,10 @@ worker or round holds their locks.
 A data root inside a virtualenv looks disposable, so `tauceti doctor` fails and
 a worker loop refuses to start when it would create data there. Data already
 inside one only draws a warning; move it out by renaming each part into the new
-root and leaving a symbolic link at the old name. The collector treats a root
+root and leaving a symbolic link at the old name. While workers run, swap the
+part with a link created beside it in one step (`mv --exchange`, coreutils 9.5),
+then rename the swapped-out directory into the new root: a separate rename and
+`ln -s` leave a moment where a worker can recreate an empty part at the old name. The collector treats a root
 whose parts are symbolic links into another as an alias: it collects the target
 once, through the selected root, and never stages or deletes it through the link.
 

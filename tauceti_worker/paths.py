@@ -82,22 +82,25 @@ def virtualenv_data(root: Path) -> list[tuple[Path, Path, bool]]:
     return found
 
 
-def refuse_virtualenv_data_root(root: Path | None = None) -> None:
-    """Refuse to create worker data inside a virtualenv; warn about data already there.
+def refuse_virtualenv_data_root(root: Path | None = None, *, warn: bool = True) -> None:
+    """Refuse to start worker data inside a virtualenv; warn about worker state already there.
 
-    Existing data is not refused: stopping every worker on a host whose root is still pinned
+    Established state is not refused: stopping every worker on a host whose root is still pinned
     inside a runtime would be an outage, and the data has to be moved out by hand first."""
     from .config import Die, warn_red
 
     root = legacy_data_root() if root is None else root
     found = virtualenv_data(root)
-    if missing := [part for part, _venv, exists in found if not exists]:
+    if not found:
+        return
+    if not (root / "state").is_dir():
         raise Die(
-            f"worker data root {root} is inside the virtualenv {found[0][1]}; it would create "
-            f"{', '.join(map(str, missing))} there. Set TAUCETI_LEGACY_DATA_ROOT to a directory outside it."
+            f"worker data root {root} is inside the virtualenv {found[0][1]}, where it would look disposable. "
+            "Set TAUCETI_LEGACY_DATA_ROOT to a directory outside it."
         )
-    for part, venv, _exists in found:
-        warn_red(f"worker data {part} is inside the virtualenv {venv}; move it out of the runtime")
+    if warn:
+        for part, venv, _exists in found:
+            warn_red(f"worker data {part} is inside the virtualenv {venv}; move it out of the runtime")
 
 
 def held_lock_files() -> set[tuple[int, int]] | None:

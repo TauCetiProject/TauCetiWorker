@@ -697,14 +697,16 @@ class LegacyDataRoot(unittest.TestCase):
             self.assertEqual(paths.virtualenv_data(outside), [])
             paths.refuse_virtualenv_data_root(outside)
             with self.assertRaisesRegex(Die, "inside the virtualenv"):
-                paths.refuse_virtualenv_data_root(package)  # it would create new data there
-            for part in paths.DATA_PARTS:
-                (package / part).mkdir()
+                paths.refuse_virtualenv_data_root(package)  # it would start new data there
+            (package / "state").mkdir()  # an established root, even without the optional parts
             with patch("tauceti_worker.config.warn_red") as warned:
-                paths.refuse_virtualenv_data_root(package)  # existing data: reported, not an outage
-            self.assertEqual(warned.call_count, len(paths.DATA_PARTS))
+                paths.refuse_virtualenv_data_root(package)  # reported, not an outage
+                self.assertEqual(warned.call_count, len(paths.DATA_PARTS))
+                paths.refuse_virtualenv_data_root(package, warn=False)  # a loop's round
+                self.assertEqual(warned.call_count, len(paths.DATA_PARTS))
             outside.mkdir()
             for part in paths.DATA_PARTS:
+                (package / part).mkdir(exist_ok=True)
                 (package / part).rename(outside / part)
                 (package / part).symlink_to(outside / part)
             self.assertEqual(paths.virtualenv_data(package), [])
@@ -776,6 +778,37 @@ class LegacyDataRoot(unittest.TestCase):
                 for part in paths.DATA_PARTS:
                     self.assertEqual((old / part).readlink(), fixed / part)
             self.assertEqual((fixed / "state/w/recovery/saved/patch.diff").read_text(), "unpublished")
+            # A root of its own that merely shares host-repositories is still collected.
+            other = fleet / "worker-runtimes/other/lib/python3.13/site-packages/tauceti_worker"
+            (other / "state/v").mkdir(parents=True)
+            (other / "host-repositories").symlink_to(fixed / "host-repositories")
+            with (
+                patch.dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=str(fixed)),
+                patch.object(retention.Config, "resolve", return_value=SimpleNamespace(home=home)),
+                patch.object(retention, "legacy_project", return_value=True),
+            ):
+                self.assertEqual(retention.data_roots(), [fixed, other])
+                self.assertEqual(retention.retired_roots(), [])  # shares a real directory: kept
+
+    def test_purge_owns_the_fleet_default_root(self):
+        from tauceti_worker import purge
+
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            home = base / "home"
+            package = home / ".local/share/tauceti-fleet/worker-runtimes/r/lib/python3.13/site-packages/tauceti_worker"
+            fixed = home / ".local/share/tauceti-fleet/worker-data/root"
+            self.retired_fixture(fixed)
+            package.mkdir(parents=True)
+            with self.purging(base, home, package), patch.object(sys, "platform", "linux"):
+                planned, _roots, overridden, _refused = purge.plan()
+                self.assertIn(fixed, planned)
+                self.assertEqual([item for item in overridden if "LEGACY" in item], [])
+            with self.purging(base, home, package, TAUCETI_LEGACY_DATA_ROOT=str(base / "custom")):
+                (base / "custom/state").mkdir(parents=True)
+                planned, _roots, overridden, _refused = purge.plan()
+                self.assertNotIn(base / "custom/state", planned)
+                self.assertIn(f"TAUCETI_LEGACY_DATA_ROOT={base / 'custom'}", overridden)
 
     def test_default_and_invalid_override(self):
         with patch.dict(os.environ, {}, clear=False):

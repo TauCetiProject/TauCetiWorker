@@ -1039,11 +1039,15 @@ def data_roots():
             roots.add(path)
     # A root whose parts are symbolic links into another is an alias, not a second root: collecting
     # both would take the same state lock twice and sweep the same data twice. Real data first.
-    kept, seen = [selected], _data_parts(selected)
+    # Roots that merely share a part (say host-repositories) are still collected separately.
+    kept, seen, states = [selected], _data_parts(selected), {os.path.realpath(selected / "state")}
     for path in sorted(roots - {selected}, key=lambda root: (_links_parts(root), root)):
-        if not (parts := _data_parts(path)) & seen:
-            kept.append(path)
-            seen |= parts
+        parts, state = _data_parts(path), os.path.realpath(path / "state")
+        if parts <= seen or state in states:
+            continue
+        kept.append(path)
+        seen |= parts
+        states.add(state)
     return [selected, *sorted(kept[1:])]
 
 
