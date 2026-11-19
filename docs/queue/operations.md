@@ -771,6 +771,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `outbox_retry_max_seconds` | `900` | integer, at least 0 |
 | `polling_interval_seconds` | `60` | integer, at least 0 |
 | `approval_poll_interval_seconds` | `900` | integer, at least 1 |
+| `github_background_floor` | `1000` | integer, at least 0; queue App requests left at which admission reads wait for the reset |
 | `membership_label` | `bors-staging` | text |
 | `repaired_label` | `repaired-in-queue` | text; empty disables |
 | `insertion_probe_budget_seconds` | `20` | integer, at least 0 |
@@ -830,7 +831,7 @@ Build changes invalidate decisions independently of PR `updated_at`; queue outpu
 comments do not. A normal advance of the target that leaves the merge base unchanged creates no
 new evaluation. Missing or incomplete source reads never imply approval or removal of unseen work.
 
-Pending PRs have no invocation, PR-count, fixed-reserve or lifetime-attempt allowance. REST and
+Pending PRs have no invocation, PR-count or lifetime-attempt allowance. REST and
 GraphQL waits retain their absolute server deadline. Intake does not sleep on an exhausted bucket;
 other runnable work proceeds. Resident pagination buffers retain pages already read during a quota
 wait. After a process restart the database still owns pending work and deadlines, and source
@@ -838,7 +839,7 @@ reconciliation restores observations. There are no admission workflow reruns or 
 
 PRs waiting for the same API resource share its observed deadline in the existing database.
 Advancing that deadline does not create another attempt or write for every waiting PR. Source
-failures remain local to their PR, and urgent revocations can bypass background pacing while still
+failures remain local to their PR, and urgent revocations can bypass the background floor while still
 respecting actual server cooldowns. Startup restores these waits into the shared client, including
 for newly observed PRs. Expected resource waits count as `deferred`, rather than poll errors.
 
@@ -847,9 +848,12 @@ does not require repeated rounds through the entire backlog. New input and genui
 failures rejoin at the current time; a changing or failing PR therefore lets other work proceed.
 The last-attempt timestamp and oldest-pending age remain separate diagnostics.
 
-Background reads are paced across each resource's remaining window, using REST requests and
-reported GraphQL point costs separately. Queue/CI calls, queued-review revocations and final
-head/CI fences receive priority. Source preparation resumes at the next eligible read without
+Background reads run at full speed while the queue App installation has more than
+`github_background_floor` requests left in the current window (REST requests and GraphQL points
+are separate buckets). At or below the floor they stop until that bucket resets: the evaluation
+is deferred to the reset time, and the floor stays available to queue/CI calls, commands,
+queued-review revocations and final head/CI fences, which receive priority. The floor applies only
+to the installation's quota; requests made with another token are never counted against it. Source preparation resumes at the next eligible read without
 restarting from its first request. The final fence reads current CI independently of PR timestamps.
 An approved input with a pending review change cannot be inserted until evaluation completes;
 the same check protects a replay that was already in progress when the change arrived.

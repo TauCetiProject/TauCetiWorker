@@ -119,6 +119,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "outbox_retry_max_seconds": 900,
     "polling_interval_seconds": 60,
     "approval_poll_interval_seconds": 900,
+    # Admission's background GitHub reads stop while the queue App installation has at most this
+    # many requests left (GraphQL: points), until the window resets; the rest is kept for landing,
+    # dispatch and commands.
+    "github_background_floor": 1000,
     "membership_label": "bors-staging",
     # Added to a landed member whose commit the queue modified (one with an edit summary in its landing
     # comment); created in the repository on first use. Empty disables it.

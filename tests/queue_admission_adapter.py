@@ -1,6 +1,9 @@
 """Complete source pagination, resource waits and safe git diff reads for primary intake."""
 
+import base64
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -8,7 +11,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from queue_github_adapter import BASE, HEAD, TAUCETI, FakeTransport, client, pr_json
+from queue_github_adapter import BASE, HEAD, TAUCETI, Clock, FakeTransport, StaticTokens, client, pr_json
 
 from tauceti_queue import github_adapter as ga
 from tauceti_queue.admission import source_version
@@ -168,47 +171,132 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(clock.slept, [60])
         self.assertEqual(len(transport.calls), 2)
 
-    def test_background_paces_actual_quota_and_leaves_essential_requests_available(self):
+    def test_background_reads_run_at_full_speed_above_the_floor(self):
         transport = FakeTransport()
         transport.add(
             "GET",
             "https://api.github.com/background",
             200,
             {},
-            {"x-ratelimit-remaining": "10", "x-ratelimit-reset": "1800000100"},
+            {"x-ratelimit-remaining": "1001", "x-ratelimit-reset": "1800003600"},
         )
-        transport.add("GET", "https://api.github.com/essential", 200, {})
+        c, clock = client(transport)
+        with c.deferred_requests():
+            for _ in range(5):
+                c.get_json("background")
+        self.assertEqual(len(transport.calls), 5)
+        self.assertEqual(clock.slept, [])
+
+    def test_background_waits_for_reset_at_the_floor_and_essential_requests_continue(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/background",
+            200,
+            {},
+            {"x-ratelimit-remaining": "1000", "x-ratelimit-reset": "1800003600"},
+        )
+        transport.add(
+            "GET",
+            "https://api.github.com/essential",
+            200,
+            {},
+            {"x-ratelimit-remaining": "999", "x-ratelimit-reset": "1800003600"},
+        )
         c, clock = client(transport)
         with c.deferred_requests():
             c.get_json("background")
             with self.assertRaises(ga.RequestDeferred) as paused:
                 c.get_json("background")
-        self.assertEqual(paused.exception.retry_at, clock.now + 10)
+        self.assertEqual(paused.exception.retry_at, 1800003601)
         self.assertEqual(paused.exception.resource, "core:background")
         c.get_json("essential")
         with c.deferred_requests(urgent=True):
             c.get_json("essential")
         self.assertEqual(len(transport.calls), 3)
         self.assertEqual(clock.slept, [])
+        # After the reset background reads resume at full speed.
+        clock.now = paused.exception.retry_at
+        transport.add(
+            "GET",
+            "https://api.github.com/after",
+            200,
+            {},
+            {"x-ratelimit-remaining": "7149", "x-ratelimit-reset": "1800007200"},
+        )
+        with c.deferred_requests():
+            c.get_json("after")
+            c.get_json("after")
+        self.assertEqual(len(transport.calls), 5)
 
-    def test_graphql_background_pacing_uses_points_not_http_request_count(self):
+    def test_the_floor_is_a_setting(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/background",
+            200,
+            {},
+            {"x-ratelimit-remaining": "500", "x-ratelimit-reset": "1800003600"},
+        )
+        c, _ = client(transport)
+        c.background_floor = 100
+        with c.deferred_requests():
+            c.get_json("background")
+            c.get_json("background")
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_graphql_floor_uses_reported_points(self):
         transport = FakeTransport()
         transport.add(
             "POST",
             "https://api.github.com/graphql",
             200,
-            {"data": {"rateLimit": {"cost": 20, "remaining": 100, "resetAt": "2027-01-15T08:01:40Z"}}},
-            {"x-ratelimit-remaining": "100", "x-ratelimit-reset": "1800000100"},
+            {"data": {"rateLimit": {"cost": 20, "remaining": 990, "resetAt": "2027-01-15T08:01:40Z"}}},
+            {"x-ratelimit-remaining": "4000", "x-ratelimit-reset": "1800000100"},
         )
-        c, clock = client(transport)
+        c, _ = client(transport)
         with c.deferred_requests():
             c.graphql("query { rateLimit { cost remaining resetAt } }")
             with self.assertRaises(ga.RequestDeferred) as paused:
                 c.graphql("query { rateLimit { cost remaining resetAt } }")
-        self.assertEqual(paused.exception.retry_at, clock.now + 20)
+        self.assertEqual(paused.exception.resource, "graphql:background")
+        self.assertEqual(paused.exception.retry_at, ga._timestamp("2027-01-15T08:01:40Z") + 1)
         self.assertEqual(len(transport.calls), 1)
 
-    def test_paced_snapshot_advances_through_its_reads_instead_of_repeating_first_request(self):
+    def test_snapshot_reads_without_pauses_while_quota_is_plentiful(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- source\n"}, "head", push_to="refs/pull/42/head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            transport = FakeTransport()
+            raw = pr_json(head={"sha": head}, base={"ref": "main", "sha": base})
+
+            def headers(remaining, reset=1800000020):
+                return {"x-ratelimit-remaining": str(remaining), "x-ratelimit-reset": str(reset)}
+
+            url = f"https://api.github.com/repos/{TAUCETI}"
+            transport.add("GET", url + "/pulls/42", 200, raw, headers(4))
+            transport.add(
+                "GET",
+                url + f"/compare/{base}...{head}?per_page=1",
+                200,
+                {"merge_base_commit": {"sha": base}},
+                headers(3),
+            )
+            transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, [], headers(2))
+            transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw, build="FAILURE"))
+            c, clock = client(transport)
+            c.background_floor = 0
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)
+            with c.deferred_requests():
+                snapshot = adapter.admission_snapshot(TAUCETI, 42, generation=1)
+            self.assertEqual(snapshot.pull.head_sha, head)
+            self.assertEqual(snapshot.statuses["build"], "failure")
+            self.assertEqual(len(transport.calls), 4)
+            self.assertEqual(clock.slept, [])
+
+    def test_snapshot_deferred_at_the_floor_resumes_after_reset_without_repeating_reads(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = FakeRepo(directory)
             base = repo.main_sha()
@@ -239,10 +327,10 @@ class SourceTests(unittest.TestCase):
                         snapshot = adapter.admission_snapshot(TAUCETI, 42, generation=1)
                         break
                     except ga.RequestDeferred as pending:
-                        self.assertLess(pending.retry_at, 1800000040, "pacing must make source progress")
+                        self.assertLess(pending.retry_at, 1800000040, "the wait ends at the reset")
                         clock.now = pending.retry_at
             self.assertEqual(snapshot.pull.head_sha, head)
-            self.assertEqual(snapshot.statuses["build"], "failure", "CI must be read fresh after all pacing waits")
+            self.assertEqual(snapshot.statuses["build"], "failure", "CI must be read fresh after the wait")
             self.assertEqual(len(transport.calls), 4)
             self.assertEqual(clock.slept, [])
 
@@ -453,6 +541,116 @@ class SourceTests(unittest.TestCase):
             self.assertFalse(marker.exists(), "diff drivers supplied through repository config must not execute")
             pulls = adapter.list_open_pull_requests(TAUCETI, review_app_id=0, admission=True)
             self.assertEqual(source_version(snapshot.source(), "policy"), source_version(pulls[0].admission, "policy"))
+
+
+class BumpGuardFloorTests(unittest.TestCase):
+    """PR #43422: a self-tested Mathlib bump's guard needs 19 reads, and restarts from its first."""
+
+    REPO = "TauCetiProject/TauCeti"
+
+    def setUp(self):
+        from unittest import mock
+
+        from tauceti_tools import self_tested
+
+        self.self_tested = self_tested
+        environment = mock.patch.dict("os.environ")
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("SELF_TESTED_TEAM_TOKEN", "TAUCETI_TEAM_TOKEN", "TAUCETI_SELF_TESTED_TEAM", "TAUCETI_BASE_BRANCH"):
+            os.environ.pop(name, None)
+        self_tested._MEMBERS.clear()
+        guard = self_tested._bump_policy()
+
+        def run_guard(api, command, directory, env):
+            for upstream in ("a", "b", "c"):
+                api.request("GET", f"repos/leanprover-community/mathlib4/commits/{upstream}")
+            return subprocess.CompletedProcess(command, 0, "pins accepted", "")
+
+        patcher = mock.patch.object(guard, "run_mathlib_guard", run_guard)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def quota(self, clock, remaining):
+        state = {"remaining": remaining, "reset": clock.now + 600, "calls": []}
+
+        def transport(method, url, headers, body):
+            if clock.now >= state["reset"]:
+                state.update(remaining=7150, reset=clock.now + 3600)
+            state["remaining"] -= 1
+            path = url.removeprefix("https://api.github.com/")
+            state["calls"].append(path)
+            if "/issues/7/events" in path:
+                data = [{"id": 1, "event": "labeled", "label": {"name": "self-tested"}, "actor": {"login": "kim-em"}}]
+            elif "/teams/self-tested/memberships/" in path:
+                data = {"state": "active"}
+            elif path.endswith("/branches/main"):
+                data = {"commit": {"sha": "b" * 40}}
+            elif "/compare/" in path:
+                data = {"merge_base_commit": {"sha": "c" * 40}}
+            elif "/contents/" in path:
+                name = path.split("/contents/", 1)[1].split("?", 1)[0]
+                if name.startswith("lakefile"):
+                    return 404, self.headers(state), b"{}"
+                data = {"type": "file", "encoding": "base64", "content": base64.b64encode(b"{}").decode()}
+            else:
+                data = {"sha": path.rsplit("/", 1)[-1]}
+            return 200, self.headers(state), json.dumps(data).encode()
+
+        return transport, state
+
+    @staticmethod
+    def headers(state):
+        return {"x-ratelimit-remaining": str(state["remaining"]), "x-ratelimit-reset": str(int(state["reset"]))}
+
+    def pull(self):
+        return {
+            "number": 7,
+            "state": "open",
+            "labels": [{"name": "self-tested"}],
+            "base": {"ref": "main"},
+            "head": {"sha": "d" * 40, "ref": "bump-mathlib/2026-11-18", "repo": {"full_name": self.REPO}},
+            "user": {"login": "tauceti-review-bot[bot]"},
+        }
+
+    def evaluate(self, c, clock):
+        """Admission's loop: a deferred evaluation is retried from scratch at its retry time."""
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                with c.deferred_requests():
+                    return attempts, self.self_tested.eligible(
+                        self.pull(),
+                        self.REPO,
+                        paths=["lake-manifest.json", "lean-toolchain"],
+                        read=lambda path: c.get_json(path)[1],
+                    )
+            except ga.RequestDeferred as pending:
+                self.assertLessEqual(attempts, 3, "a deferred bump guard must finish after the reset")
+                clock.now = pending.retry_at
+
+    def test_bump_guard_completes_in_one_pass_while_quota_is_plentiful(self):
+        clock = Clock()
+        transport, state = self.quota(clock, 7000)
+        c = ga.GitHubClient(StaticTokens(), transport, clock=clock, sleep=clock.sleep)
+        attempts, verdict = self.evaluate(c, clock)
+        self.assertEqual((attempts, verdict), (1, True))
+        self.assertEqual(len(state["calls"]), 19)
+        self.assertEqual(clock.slept, [])
+
+    def test_bump_guard_near_the_floor_defers_cleanly_and_completes_after_reset(self):
+        clock = Clock()
+        transport, state = self.quota(clock, 1010)
+        c = ga.GitHubClient(StaticTokens(), transport, clock=clock, sleep=clock.sleep)
+        reset = state["reset"]
+        attempts, verdict = self.evaluate(c, clock)
+        self.assertEqual((attempts, verdict), (2, True))
+        # The first pass stopped at the floor, spending nothing below it. The restart after the
+        # reset ran the whole guard again; only the team membership came from the one-minute cache.
+        self.assertEqual(len(state["calls"]), 10 + 18)
+        self.assertEqual(clock.now, reset + 1)
+        self.assertEqual(clock.slept, [])
 
 
 if __name__ == "__main__":

@@ -56,6 +56,8 @@ from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
 
 API = github_app.API
 API_VERSION = "2022-11-28"
+# Installation requests (GraphQL: points) left in a window below which background reads wait for the reset.
+DEFAULT_BACKGROUND_FLOOR = 1000
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
 STAGING_WORKFLOW = "pr-build.yml"
@@ -210,6 +212,7 @@ class GitHubClient:
         api: str = API,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        background_floor: int = DEFAULT_BACKGROUND_FLOOR,
     ) -> None:
         self._tokens = tokens
         self._transport = transport
@@ -220,6 +223,9 @@ class GitHubClient:
         self._priority = threading.Condition(self._lock)
         self._essential: dict[str, int] = {}
         self._resource_limits: dict[str, dict] = {}
+        # Background reads stop while a bucket has at most this many requests (GraphQL: points)
+        # left, until it resets; essential requests keep the reserved floor.
+        self.background_floor = background_floor
         self._background_at: dict[str, float] = {}
         self._local = threading.local()
         self._blocked_until: dict[str, float] = {}
@@ -265,12 +271,9 @@ class GitHubClient:
         with self._lock:
             return self.remaining, self.reset_at
 
-    def _record(self, headers: dict[str, str], resource="core", *, cost=None) -> None:
+    def _record(self, headers: dict[str, str], resource="core") -> None:
         with self._lock:
             record = self._resource_limits.setdefault(resource, {})
-            previous_remaining, previous_reset = record.get("remaining"), record.get("reset_at")
-            if isinstance(cost, int) and cost > 0:
-                record["cost"] = cost
             try:
                 if "x-ratelimit-remaining" in headers:
                     record["remaining"] = int(headers["x-ratelimit-remaining"])
@@ -285,25 +288,24 @@ class GitHubClient:
                 self.limit = record.get("limit")
                 self.reset_at = record.get("reset_at")
             remaining, reset = record.get("remaining"), record.get("reset_at")
-            now = self._clock()
-            observed = "x-ratelimit-remaining" in headers or cost is not None
-            if observed and remaining is not None and reset is not None and reset > now:
+            if (
+                "x-ratelimit-remaining" in headers
+                and remaining is not None
+                and reset is not None
+                and reset > self._clock()
+            ):
                 if remaining <= 0:
                     self._blocked_until[resource] = reset + 1
-                else:
-                    # Background reads share the real remaining window; essential requests
-                    # consume their share immediately and their responses adjust this spacing.
-                    next_at = now + record.get("cost", 1) * (reset - now) / remaining
-                    if previous_reset == reset and previous_remaining is not None and remaining <= previous_remaining:
-                        next_at = max(next_at, self._background_at.get(resource, 0))
-                    self._background_at[resource] = min(reset + 1, next_at)
+                elif remaining <= self.background_floor:
+                    # The floor is reserved for essential requests until the window resets.
+                    self._background_at[resource] = max(self._background_at.get(resource, 0), reset + 1)
 
     # -- requests
 
     def _send(self, method, url, headers, body, *, resource, deferred):
         # Essential queue/CI requests never wait for background intake. Before each intake
-        # request, let already-active essential work finish on that bucket. There is no fixed
-        # quota reserve; unrelated buckets and essential requests remain free to run.
+        # request, let already-active essential work finish on that bucket. Unrelated buckets
+        # and essential requests remain free to run.
         with self._priority:
             while deferred and self._essential.get(resource, 0):
                 self._priority.wait()
@@ -322,8 +324,9 @@ class GitHubClient:
         """Background intake persists waits instead of sleeping inside a source read.
 
         This is thread-local: essential queue and command calls retain their existing retry
-        behavior. A known exhausted bucket refuses new reads until its original deadline;
-        trying another PR cannot move that deadline further away.
+        behavior. Background reads run at full speed until a bucket of the installation reaches
+        `background_floor`, then wait for its reset. A known exhausted bucket refuses new reads
+        until its original deadline; trying another PR cannot move that deadline further away.
         """
         previous = getattr(self._local, "deferred", False)
         prior_background = getattr(self._local, "background", False)
@@ -380,7 +383,7 @@ class GitHubClient:
                     next_at = self._background_at.get(resource, 0)
                 if next_at > self._clock():
                     raise RequestDeferred(
-                        "background read paced by remaining GitHub capacity",
+                        f"background reads wait for the GitHub quota reset at the {self.background_floor}-request floor",
                         retry_at=next_at,
                         resource=resource + ":background",
                     )
@@ -570,7 +573,7 @@ class GitHubClient:
             reset = _timestamp(rate.get("resetAt"))
             if reset is not None:
                 headers["x-ratelimit-reset"] = str(reset)
-            self._record(headers, "graphql", cost=rate["cost"])
+            self._record(headers, "graphql")
         return data
 
     def fetch_bare(self, url: str) -> tuple[int, bytes]:

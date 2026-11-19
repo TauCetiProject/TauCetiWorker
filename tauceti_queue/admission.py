@@ -401,6 +401,9 @@ class AdmissionPoller:
                 return self._run(reason)
 
     def _run(self, reason):
+        client = getattr(self.adapter, "client", None)
+        if client is not None and hasattr(client, "background_floor"):
+            client.background_floor = int(self.controller.setting("github_background_floor"))
         configure_polling = getattr(self.adapter, "configure_admission_polling", None)
         if configure_polling is not None:
             configure_polling(

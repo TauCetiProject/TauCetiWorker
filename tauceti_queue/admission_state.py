@@ -65,7 +65,7 @@ class AdmissionState:
 
     def _pending_query(self, columns="a.*"):
         # A shared resource wait is one deadline, not a new failed attempt for every PR.
-        # Urgent revocations use essential priority and may bypass background pacing.
+        # Urgent revocations use essential priority and may bypass the background quota floor.
         ready = (
             "CASE WHEN a.urgent=1 AND a.retry_resource LIKE '%:background' "
             "AND EXISTS(SELECT 1 FROM inputs i WHERE i.repository=a.repository "
