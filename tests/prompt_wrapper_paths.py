@@ -28,6 +28,7 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -46,7 +47,8 @@ WRAPPERS = ("git-safe-push", "gh-safe-pr-create", "claim.sh")
 # The keys each call site passes, so a prompt that grows a placeholder without a substitution fails
 # here rather than reaching an agent. Mirrors work_units._do_fixlike / do_roadmap.
 VERIFY = dict(LOCAL_VERIFICATION="(local verification rules)")
-FIXLIKE = dict(PR=123, AGENT="Claude Code", BIN="/bin", SCOPE_POLICY="ordinary", **VERIFY)
+QUALITY = dict(QUALITY_SCOPE="(quality scope)")
+FIXLIKE = dict(PR=123, AGENT="Claude Code", BIN="/bin", SCOPE_POLICY="ordinary", **VERIFY, **QUALITY)
 CALL_SITES = {
     "pr-outcome.md": dict(
         PR=123,
@@ -54,7 +56,9 @@ CALL_SITES = {
         CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
-    "overlap-fix.md": dict(ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY),
+    "overlap-fix.md": dict(
+        ISSUE=123, BODY="Evidence", FORK="alice/TauCeti", FORK_OWNER="alice", BIN="/bin", **VERIFY, **QUALITY
+    ),
     "fix.md": FIXLIKE,
     "fix-ci.md": FIXLIKE,
     "rebase.md": FIXLIKE,
@@ -76,6 +80,7 @@ CALL_SITES = {
         TARGET_LIST="",
         BIN="/bin",
         **VERIFY,
+        **QUALITY,
     ),
 }
 NO_WRAPPER = {"overlap-scan.md", "pr-outcome.md", "local-verification.md"}
@@ -226,6 +231,94 @@ def main():
             for directory in (PROMPTS, PROMPTS / "v0")
         ]
         check(f"{name}: both variants say the same about the quality pass", lines[0] and lines[0] == lines[1])
+
+    # 8) Agents run the duplicate and proof-length checks and decline the others unless the operator
+    # chose --full-quality (TAUCETI_FULL_QUALITY=1), in every quality-pass prompt of either variant.
+    for full in (None, "0", "1"):
+        environment = {k: v for k, v in os.environ.items() if k != "TAUCETI_FULL_QUALITY"}
+        if full is not None:
+            environment["TAUCETI_FULL_QUALITY"] = full
+        for helper in ("0", "1"):
+            environment["TAUCETI_VERIFY_HELPER"] = helper
+            with patch.dict(os.environ, environment, clear=True):
+                scope = tc.agents.quality_scope()
+                for name in QUALITY_PASS:
+                    text = fill_prompt(PROMPTS / name, **dict(CALL_SITES[name], QUALITY_SCOPE=scope))
+                    if full == "1":
+                        ok = "Run every check." in text and "Run only" not in text
+                    else:
+                        ok = "Run only the Mathlib duplicates" in text and "`declined — not run`" in text
+                    check(f"{name}: quality scope (TAUCETI_FULL_QUALITY={full}, TAUCETI_VERIFY_HELPER={helper})", ok)
+
+    # 9) The default picks its checks by their titles, and the numbers it gives agree with both
+    # template shapes. A PR keeps the template its branch was cut with: five checks, with proof
+    # length Q5, or the three of TauCeti#40207, with proof length Q3.
+    shapes = {
+        "five": (
+            "Q1 Mathlib duplicates",
+            "Q2 Tau Ceti duplicates, on main and in open PRs",
+            "Q3 Hypotheses",
+            "Q4 Section variables",
+            "Q5 Proofs of at most 50 lines",
+        ),
+        "three": (
+            "Q1 Mathlib duplicates",
+            "Q2 Tau Ceti duplicates, on main and in open PRs",
+            "Q3 Proofs of at most 50 lines",
+        ),
+    }
+    expected = {
+        "five": (["Q1", "Q2", "Q5"], "Q1, Q2 and Q5 when the template has five checks"),
+        "three": (["Q1", "Q2", "Q3"], "Q1 to Q3 when it has three"),
+    }
+    with patch.dict(os.environ, {"TAUCETI_FULL_QUALITY": "0"}):
+        scope = tc.agents.quality_scope()
+    selected, _, rest = scope.partition(":")
+    for shape, rows in shapes.items():
+        run = [row.split(" ", 1)[0] for row in rows if row.split(" ", 1)[1].split(",")[0] in selected]
+        numbers, stated = expected[shape]
+        check(f"default scope runs {', '.join(numbers)} of the {shape}-check template", run == numbers)
+        check(f"default scope numbers the {shape}-check template's checks the same way", stated in rest)
+    check("default scope declines every other check", "Each other line" in rest and "`declined — not run`" in rest)
+
+    # 10) A supersession closure names its replacement unambiguously and closes only after its
+    # evidence comment is visible. A `#N` in a commit subject is usually a Forgejo PR number, and
+    # a comment the gh wrapper retained was never posted.
+    outcome = fill_prompt(PROMPTS / "pr-outcome.md", **CALL_SITES["pr-outcome.md"])
+    head = CALL_SITES["pr-outcome.md"]["HEAD"]
+    check(
+        "pr-outcome.md: marker names the forge and replacement commit",
+        f"tauceti-superseded:v2 head={head} main=<full-main-SHA> by=<forge>#<N>@<replacement-SHA>" in outcome
+        and "by=#" not in outcome,
+    )
+    check(
+        "pr-outcome.md: Forgejo replacements are verified through the Source-PR trailer",
+        "`Source-PR: forgejo:...#N`" in outcome and "do not look it up with `gh pr view N`" in outcome,
+    )
+    order = [
+        outcome.find("if gh pr comment 123 --repo TauCetiProject/TauCeti --body-file"),
+        outcome.find(f'select(contains("tauceti-superseded:v2 head={head}"))'),
+        outcome.find("gh pr close 123 --repo TauCetiProject/TauCeti"),
+    ]
+    check("pr-outcome.md: comment, re-read for the marker, then close", -1 not in order and order == sorted(order))
+    check(
+        "pr-outcome.md: a held or failed comment leaves the PR open",
+        "exits 77 or prints `NOT confirmed as posted`" in outcome
+        and "do not close" in outcome
+        and "Leave the PR\nopen" in outcome,
+    )
+    # Run the example block with a stub `gh`: it closes only after a posted, visible comment.
+    block = outcome.split("```")[1].replace("<evidence-file>", "/dev/null")
+    for comment_exit, visible, closes in ((0, 1, True), (77, 1, False), (1, 1, False), (0, 0, False)):
+        stub = (
+            f'gh() {{ case "$2" in comment) return {comment_exit};; view) echo {visible};; '
+            "close) echo CLOSED;; esac; }\n"
+        )
+        ran = subprocess.run(["bash", "--noprofile", "--norc", "-c", stub + block], capture_output=True, text=True)
+        check(
+            f"pr-outcome.md: comment exit {comment_exit}, {visible} visible marker(s) -> close={closes}",
+            ran.returncode == 0 and ("CLOSED" in ran.stdout) == closes,
+        )
 
     print("FAIL" if fails else "PASS")
     return 1 if fails else 0

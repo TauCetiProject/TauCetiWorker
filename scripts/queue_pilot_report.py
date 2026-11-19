@@ -405,6 +405,15 @@ def prediction_metrics(events, attempts):
     }
 
 
+def pr_identity(member):
+    """A hashable identity for one landed member. A landing event names a GitHub PR by its number
+    and a native-forge PR by its encoded identity (`tauceti_queue.mixed_identity.encode`), whose
+    number alone could equal a GitHub PR's."""
+    if isinstance(member, dict) and "__tauceti_queue_pull__" in member:
+        return (json.dumps(member["__tauceti_queue_pull__"], sort_keys=True), int(member["number"]))
+    return member
+
+
 def analyse(snapshot, baseline, since=None, until=None):
     if snapshot.get("schema") != SNAPSHOT_SCHEMA:
         raise ValueError("unexpected queue snapshot schema")
@@ -513,7 +522,7 @@ def analyse(snapshot, baseline, since=None, until=None):
         )
     attempts = [a for a in tables["ci_attempts"] if start <= a["dispatched_at"] < end]
     # A unique input can be represented by several attempts; throughput counts only landings.
-    prs = {p for h in heads for p in h["landed_prs"]}
+    prs = {pr_identity(p) for h in heads for p in h["landed_prs"]}
     input_map = {i["id"]: i for i in tables["inputs"]}
     inserted_in_window = [m for m in tables["members"] if start <= m["added_at"] < end]
     timing_inconsistencies = [

@@ -202,6 +202,25 @@ class ObservabilityTests(unittest.TestCase):
             with patch.object(tr, "_install_proxy", side_effect=OSError("shim unavailable")):
                 tr.install_proxy()
 
+    def test_each_runtime_keeps_its_own_gh_launcher(self):
+        # During a live rollout old and new runtimes share one host. Neither may
+        # redirect the other's gh calls into its own routing code.
+        with tempfile.TemporaryDirectory() as raw:
+            environment = {"TAUCETI_GITHUB_SHARED_DIR": raw, "TAUCETI_REAL_GH": "/bin/true", "PATH": "/usr/bin"}
+            launchers = {}
+            for runtime in ("/runtimes/old/bin/python", "/runtimes/new/bin/python", "/runtimes/old/bin/python"):
+                with patch.dict(os.environ, environment), patch.object(tr.sys, "executable", runtime):
+                    tr._install_proxy()
+                    proxy = Path(os.environ["TAUCETI_GITHUB_SHARED_PACING"])
+                    self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(proxy.parent))
+                    launchers.setdefault(runtime, proxy)
+                    self.assertEqual(launchers[runtime], proxy)
+            old, new = launchers["/runtimes/old/bin/python"], launchers["/runtimes/new/bin/python"]
+            self.assertNotEqual(old.parent, new.parent)
+            self.assertIn("/runtimes/old/bin/python", old.read_text())
+            self.assertIn("/runtimes/new/bin/python", new.read_text())
+            self.assertEqual((Path(raw) / "bin").stat().st_mode & 0o777, 0o700)
+
     def test_console_failure_does_not_prevent_file_logging(self):
         broken = io.StringIO()
         broken.close()

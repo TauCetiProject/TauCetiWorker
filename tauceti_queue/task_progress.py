@@ -12,6 +12,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
+from . import mixed_tasks
 from .task_identity import TASK_SCHEMA, TaskBinding
 
 SCHEMA = "tauceti.queue.task-progress/v1"
@@ -106,10 +107,20 @@ def summarize(raw, final=None):
         "cost": cost,
     }
     if "schema" in task or "binding" in task:
-        if task.get("schema") != TASK_SCHEMA or "repository" in task:
+        if task.get("schema") == mixed_tasks.SCHEMA and "binding" not in task:
+            record["task_binding"] = mixed_tasks.public_binding(task.get("mixed_binding"))
+        elif task.get("schema") != TASK_SCHEMA or "repository" in task:
             raise ValueError("unknown task identity in progress checkpoint")
-        record["task_binding"] = TaskBinding.parse(task.get("binding")).record()
+        else:
+            record["task_binding"] = TaskBinding.parse(task.get("binding")).record()
     return record
+
+
+def binding_record(value):
+    """The public record of a task's stored queue binding: a native task's or a mixed task's."""
+    if isinstance(value, dict) and value.get("schema") == mixed_tasks.SCHEMA:
+        return mixed_tasks.public_binding(value)
+    return TaskBinding.parse(value).record()
 
 
 def public(record):
@@ -144,7 +155,7 @@ def public(record):
         },
     }
     if "task_binding" in record:
-        observation["task_binding"] = TaskBinding.parse(record["task_binding"]).record()
+        observation["task_binding"] = binding_record(record["task_binding"])
     return observation
 
 
