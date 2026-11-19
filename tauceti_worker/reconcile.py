@@ -772,7 +772,7 @@ def publish(path: Path, compute, *, check=None) -> list[str] | None:
     if fetched.returncode != 0:
         log(f"reconcile: fetch from {remote} failed ({one_line(fetched.stderr)}); nothing published")
         return None
-    name = _git(path, "ls-files", "--full-name", "--", _spec(path)).stdout.strip()
+    name = _git(path, "ls-files", "-z", "--full-name", "--", _spec(path)).stdout.split("\0")[0]
     # A tracked branch the remote does not have yet starts from the clone's own commit.
     base = tracking if _git(path, "rev-parse", "-q", "--verify", tracking).returncode == 0 else "HEAD"
     with tempfile.TemporaryDirectory(prefix="reconcile-") as tmp:

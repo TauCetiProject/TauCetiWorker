@@ -343,6 +343,15 @@ class Publish(Tmp):
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets1.md"), "notes")
         self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets1.md")
 
+    def test_a_list_whose_name_git_would_quote_is_published(self):
+        first = self.clone("first")
+        named = first.with_name("cibles é.md")
+        git(first.parent, "mv", "targets.md", named.name)
+        git(first.parent, "commit", "-q", "-m", "rename")
+        git(first.parent, "push", "-q", "origin", "HEAD:main")
+        self.assertEqual(len(reconcile.publish(named, tick("strong-law"))), 1)
+        self.assertIn("- [x] `strong-law`", git(self.tmp / "remote.git", "show", "main:cibles é.md"))
+
     def test_a_commit_hook_keeps_its_own_glob_matching(self):
         first = self.clone("first")
         self.hook(first, "pre-commit", "[ -z \"$(git diff --cached --name-only -- '*.md')\" ] || exit 1\n")
