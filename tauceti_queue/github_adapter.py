@@ -296,23 +296,53 @@ class GitHubClient:
             ):
                 if remaining <= 0:
                     self._blocked_until[resource] = reset + 1
-                elif remaining <= self.background_floor:
-                    # The floor is reserved for essential requests until the window resets.
-                    self._background_at[resource] = max(self._background_at.get(resource, 0), reset + 1)
+
+    def _background_hold(self, resource) -> float:
+        """When background reads of `resource` may resume (the caller holds `_lock`).
+
+        At or below `background_floor` that is the window's reset: the floor is reserved for
+        essential requests. A wait restored from before a restart holds until its own deadline.
+        """
+        record = self._resource_limits.get(resource, {})
+        remaining, reset = record.get("remaining"), record.get("reset_at")
+        hold = self._background_at.get(resource, 0)
+        if remaining is not None and reset is not None and remaining <= self.background_floor:
+            hold = max(hold, reset + 1)
+        return hold
+
+    def _floor_deferral(self, resource) -> RequestDeferred | None:
+        with self._lock:
+            hold = self._background_hold(resource)
+        if hold <= self._clock():
+            return None
+        return RequestDeferred(
+            f"background reads wait for the GitHub quota reset at the {self.background_floor}-request floor",
+            retry_at=hold,
+            resource=resource + ":background",
+        )
 
     # -- requests
 
-    def _send(self, method, url, headers, body, *, resource, deferred):
+    def _send(self, method, url, headers, body, *, resource, deferred, floor=False, record=None):
         # Essential queue/CI requests never wait for background intake. Before each intake
-        # request, let already-active essential work finish on that bucket. Unrelated buckets
-        # and essential requests remain free to run.
+        # request, let already-active essential work finish on that bucket, then check the floor
+        # again with their responses recorded. Unrelated buckets and essential requests remain
+        # free to run.
         with self._priority:
             while deferred and self._essential.get(resource, 0):
                 self._priority.wait()
             if not deferred:
                 self._essential[resource] = self._essential.get(resource, 0) + 1
+        if floor:
+            pending = self._floor_deferral(resource)
+            if pending is not None:
+                raise pending
         try:
-            return self._transport(method, url, headers, body)
+            status, response_headers, data = self._transport(method, url, headers, body)
+            response_headers = {k.lower(): v for k, v in response_headers.items()}
+            if record is not None:
+                record(response_headers)
+            return status, response_headers, data
         finally:
             if not deferred:
                 with self._priority:
@@ -379,14 +409,9 @@ class GitHubClient:
                     raise RateLimited("GitHub resource wait", retry_at=deadline, resource=blocked_resource)
                 self._sleep(deadline - self._clock())
             if background:
-                with self._lock:
-                    next_at = self._background_at.get(resource, 0)
-                if next_at > self._clock():
-                    raise RequestDeferred(
-                        f"background reads wait for the GitHub quota reset at the {self.background_floor}-request floor",
-                        retry_at=next_at,
-                        resource=resource + ":background",
-                    )
+                pending = self._floor_deferral(resource)
+                if pending is not None:
+                    raise pending
         body = None if json_body is None else json.dumps(json_body).encode()
         accepted = set(ok) | set(tolerate)
         attempt = 0
@@ -409,17 +434,24 @@ class GitHubClient:
                 used_installation = True
             with self._lock:
                 self.requests += 1
+            # GET /user uses an operator/worker bearer, and GET /app uses an App JWT. Neither is
+            # the installation bucket used for queue/intake work, so neither is recorded or floored.
             status, response_headers, data = self._send(
-                method, url, headers, body, resource=resource, deferred=background
+                method,
+                url,
+                headers,
+                body,
+                resource=resource,
+                deferred=background,
+                floor=background and token is None,
+                record=(
+                    None
+                    if token is not None
+                    else lambda seen: self._record(
+                        seen, seen.get("x-ratelimit-resource") or (resource if not record_limit else "core")
+                    )
+                ),
             )
-            response_headers = {k.lower(): v for k, v in response_headers.items()}
-            if token is None:
-                # GET /user uses an operator/worker bearer, and GET /app uses an App JWT.
-                # Neither is the installation bucket used for queue/intake work.
-                self._record(
-                    response_headers,
-                    response_headers.get("x-ratelimit-resource") or (resource if not record_limit else "core"),
-                )
             if status in accepted:
                 return Response(status, response_headers, data)
             if status == 401 and used_installation and attempt == 1:

@@ -245,6 +245,58 @@ class SourceTests(unittest.TestCase):
             c.get_json("background")
         self.assertEqual(len(transport.calls), 2)
 
+    def test_a_changed_floor_applies_to_the_next_read(self):
+        transport = FakeTransport()
+        transport.add(
+            "GET",
+            "https://api.github.com/background",
+            200,
+            {},
+            {"x-ratelimit-remaining": "500", "x-ratelimit-reset": "1800003600"},
+        )
+        c, _ = client(transport)
+        with c.deferred_requests():
+            c.get_json("background")
+            with self.assertRaises(ga.RequestDeferred):
+                c.get_json("background")
+            c.background_floor = 100
+            c.get_json("background")
+            c.background_floor = 1000
+            with self.assertRaises(ga.RequestDeferred):
+                c.get_json("background")
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_a_background_read_waiting_on_essential_work_sees_its_response(self):
+        essential_started, release = threading.Event(), threading.Event()
+
+        def transport(method, url, headers, body):
+            if url.endswith("/essential"):
+                essential_started.set()
+                release.wait(5)
+                return 200, {"x-ratelimit-remaining": "1000", "x-ratelimit-reset": "1800003600"}, b"{}"
+            return 200, {"x-ratelimit-remaining": "999", "x-ratelimit-reset": "1800003600"}, b"{}"
+
+        c, _ = client(transport)
+        thread = threading.Thread(target=lambda: c.get_json("essential"))
+        thread.start()
+        essential_started.wait(5)
+        outcome = {}
+
+        def background():
+            try:
+                with c.deferred_requests():
+                    c.get_json("background")
+                outcome["sent"] = True
+            except ga.RequestDeferred as error:
+                outcome["deferred"] = error.retry_at
+
+        waiting = threading.Thread(target=background)
+        waiting.start()
+        release.set()
+        thread.join(5)
+        waiting.join(5)
+        self.assertEqual(outcome, {"deferred": 1800003601})
+
     def test_graphql_floor_uses_reported_points(self):
         transport = FakeTransport()
         transport.add(
