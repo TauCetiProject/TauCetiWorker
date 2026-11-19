@@ -45,7 +45,7 @@ authority after cutover.
 | `lint-full.yml`, `nightly-verify.yml`, `warm-dependencies.yml`, `shadow-audits.yml` | Defer these legacy scheduled/manual paths until qualified and rehearsed. `lint-full` includes a repair PR writer. Preserve required build/audit/cache/dependency checks in the approved candidate/main path; absence of an equivalent required check blocks that class of contribution. |
 | `ci-live-summary.yml`, `fleet-smoke.yml` | Optional execution diagnostics. Default to fenced in the minimal migration; re-enable only after source/execution routing, output destinations, and runner behavior are verified. Native GitHub run/job/log commands remain available to operators. |
 | `ci-live-tests.yml`, `hosted-cap-contract.yml`, `infrastructure-tests.yml`, `test-labels-from-comments.yml`, `website-tests.yml` | These existing infrastructure/test paths need their own compatibility decision. Default to fenced until tested against the new configuration; keep support-repository CI running. Any check required for a proposed infrastructure/control change must have equivalent verified evidence before that change is admitted. |
-| `stuck-alerts.yml`, `toolchain-tags.yml`, `zulip-healthcheck.yml`, `zulip-pr-backfill.yml` | Fence legacy notifications and GitHub-source reporting. Record temporary human monitoring duties. No test notifications go to production destinations. |
+| `toolchain-tags.yml`, `zulip-healthcheck.yml`, `zulip-pr-backfill.yml` | Fence legacy notifications and GitHub-source reporting. Record temporary human monitoring duties. No test notifications go to production destinations. |
 
 Fencing automation is not a policy waiver. If a contribution needs a specialized
 check that the Stage 1 path cannot perform, hold that contribution until its
