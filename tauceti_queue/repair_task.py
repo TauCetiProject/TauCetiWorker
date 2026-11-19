@@ -55,6 +55,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -801,30 +802,67 @@ def worker_app() -> WorkerApp | None:
     return _worker_app
 
 
+_app_git_config: tuple[tuple[str, str], ...] = ()
+
+
 def pin_app_credentials() -> None:
     """Make the worker's gh and git use only the App installation token in ``GH_TOKEN``.
 
     gh reads an empty private config, so it never falls back to the host's gh login. git reads a
-    private global config that includes the user's own and then resets every GitHub credential
-    helper and extra header, leaving ``gh auth git-credential`` alone: no personal helper answers a
-    fetch or push first, and no storing helper keeps an installation token."""
+    private global config that includes the user's own, and every GitHub credential helper and extra
+    header is reset in command scope (``GIT_CONFIG_COUNT``), which git reads after the system, global
+    and repository configs, leaving ``gh auth git-credential`` alone: no personal helper answers a
+    fetch or push first, no storing helper keeps an installation token, and no Authorization header
+    left in a repository's own config (as actions/checkout leaves one) travels with the request."""
     import tempfile
 
+    global _app_git_config
     private = Path(tempfile.mkdtemp(prefix="tauceti-queue-gh-"))
     (private / "gh").mkdir()
     original = os.environ.get("GIT_CONFIG_GLOBAL") or str(Path.home() / ".gitconfig")
     include = f"[include]\n\tpath = {original}\n" if Path(original).is_file() else ""
     gh = shutil.which("gh") or "gh"
+    _app_git_config = (
+        ("credential.https://github.com.helper", ""),
+        ("credential.https://github.com.helper", f"!{shlex.quote(gh)} auth git-credential"),
+        ("http.extraHeader", ""),
+        ("http.https://github.com/.extraHeader", ""),
+    )
+    # The same resets in the global config too: agents' isolation replaces the command-scope config,
+    # and they must not get the host's own helpers and headers back through the include.
     (private / "gitconfig").write_text(
         include
         + '[credential "https://github.com"]\n\thelper =\n'
-        + f"\thelper = !{gh} auth git-credential\n"
+        + f"\thelper = !{shlex.quote(gh)} auth git-credential\n"
         + '[http]\n\textraHeader =\n[http "https://github.com/"]\n\textraHeader =\n'
     )
+    try:
+        count = max(int(os.environ.get("GIT_CONFIG_COUNT", "0")), 0)
+    except ValueError:
+        count = 0
+    for index, (key, value) in enumerate(_app_git_config, count):
+        os.environ[f"GIT_CONFIG_KEY_{index}"] = key
+        os.environ[f"GIT_CONFIG_VALUE_{index}"] = value
+    os.environ["GIT_CONFIG_COUNT"] = str(count + len(_app_git_config))
     os.environ["GH_CONFIG_DIR"] = str(private / "gh")
     os.environ["GIT_CONFIG_GLOBAL"] = str(private / "gitconfig")
     os.environ.pop("GH_TOKEN", None)
     os.environ.pop("GITHUB_TOKEN", None)
+
+
+def app_git_environment(url: str | None = None) -> dict[str, str]:
+    """The ``GIT_CONFIG_*`` variables of a git process that pushes as the App and inherits no other
+    command-scope config: only the pins of ``pin_app_credentials`` (none outside App mode). With
+    ``url``, also reset the extra headers for exactly that URL, which a repository's config for that
+    URL would otherwise win over (git prefers the longest matching URL)."""
+    pins = _app_git_config
+    if pins and url:
+        pins = (*pins, (f"http.{url}.extraHeader", ""))
+    env = {"GIT_CONFIG_COUNT": str(len(pins))}
+    for index, (key, value) in enumerate(pins):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    return env
 
 
 def refresh_github_token() -> str | None:
@@ -2067,6 +2105,7 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
         if k == "GIT_CONFIG_GLOBAL" or not k.startswith(("TAUCETI_PUSH_", "TAUCETI_CLAIM_", "GIT_CONFIG_"))
     }
     env.update(
+        app_git_environment(remote),
         TAUCETI_PUSH_REF=task.submission_ref,
         TAUCETI_PUSH_EXPECT=expect or "",
         TAUCETI_PUSH_REMOTE=remote,
@@ -2075,7 +2114,7 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
     )
     record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
     if record["rc"] == 78 and not expect:
-        observed = git(worktree, "ls-remote", remote, task.submission_ref, check=False).split()
+        observed = git(worktree, "ls-remote", remote, task.submission_ref, check=False, env=env).split()
         if observed:
             env["TAUCETI_PUSH_EXPECT"] = observed[0]
             record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
