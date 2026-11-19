@@ -363,6 +363,33 @@ class Mixed(MixedFixture, unittest.TestCase):
         poller.withdraw(99, None)
         self.assertEqual(poller.state.get(99)["cancelled_head_sha"], "*")
 
+    def test_native_listing_runs_once_per_approval_poll_interval_and_evaluations_continue(self):
+        registry = self.registry()
+        poller = NativePoller(registry, self.controller)
+        self.native.create_pr(1, {"One.lean": "one\n"})
+
+        def listings():
+            return sum(name == "list_open_pull_requests" for name, _ in self.native.calls)
+
+        poller.run_once()
+        self.assertEqual(listings(), 1)
+        interval = self.controller.setting("approval_poll_interval_seconds")
+        self.assertGreater(interval, registry.poll_seconds)
+        # Work dirtied between listings is evaluated without listing again.
+        self.native.create_pr(2, {"Two.lean": "two\n"})
+        poller.invalidate(2, head=self.native.prs[2]["head_sha"])
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["evaluated"], 1)
+        self.assertEqual(listings(), 1)
+        self.assertLessEqual(poller.interval(), interval)
+        self.clock.advance(interval - registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(listings(), 2)
+        # A requested discovery (a canonical push, a setting change) still lists at once.
+        poller.request_discovery()
+        poller.run_once()
+        self.assertEqual(listings(), 3)
+
     def test_native_readmit_rereads_admission_and_refuses_another_head_or_a_closed_pr(self):
         registry = self.registry()
         head = self.native.create_pr(1, {"Native.lean": "native\n"})

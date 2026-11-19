@@ -253,7 +253,12 @@ class NativePoller:
                 for row in controller.store.rows("admission_work", {"repository": self.state.repository}):
                     if row["number"] not in seen and row["disposition"] != "closed":
                         self.state.observe(row["number"], row["head_sha"], "absent:" + registry.mode, urgent=True)
-                next_at = controller.clock() + registry.poll_seconds
+                # The full listing (about 50 s for 1,100 open PRs) runs at most once per
+                # approval-poll interval, as GitHub discovery does; the time between is spent
+                # evaluating. Re-listing every pass left little time for evaluations.
+                next_at = controller.clock() + max(
+                    registry.poll_seconds, controller.setting("approval_poll_interval_seconds")
+                )
             except Exception as error:
                 summary["errors"].append(type(error).__name__)
                 next_at = controller.clock() + controller.setting("outbox_retry_seconds")

@@ -26,7 +26,11 @@ same private process lock.
 in the existing admission ledger. It does not approve native inputs or mutate
 Forgejo. GitHub admissions, worker claims, builds and landings continue through
 the existing queue. Native discovery errors appear in status without stopping
-GitHub discovery. `admit` enables native inputs in that same queue, including
+GitHub discovery. The poller lists every open Forgejo PR at most once per
+`approval_poll_interval_seconds` (or at once when discovery is requested, for
+example by re-enabling Forgejo admission), and spends the passes in between,
+each bounded by `reconcile_interval_seconds`, on evaluations. Landing still
+re-reads every Forgejo member's source and review before it promotes. `admit` enables native inputs in that same queue, including
 qualified repair tasks and exact candidate CI. Pause new native acceptance with
 the authenticated runtime setting, keeping `forgejo_mode = "admit"`:
 
