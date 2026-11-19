@@ -645,7 +645,7 @@ def _infer(w, profile, live: Targets, roadmap: Path | None) -> list[Change]:
     return changes
 
 
-def _git(path: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+def _git(path: Path, *args: str, timeout: int = 120, env: dict | None = None) -> subprocess.CompletedProcess:
     """Git in the list's clone, with the operator's identity, credentials and hooks even inside a
     source's activation. Paths are literal, so a list named like a glob names only itself."""
     from .worker_sources import operator_environment
@@ -657,10 +657,50 @@ def _git(path: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProc
             capture_output=True,
             text=True,
             timeout=timeout,
-            env={**operator_environment(), "GIT_TERMINAL_PROMPT": "0"},
+            env={**operator_environment(), "GIT_TERMINAL_PROMPT": "0", **(env or {})},
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return subprocess.CompletedProcess(argv, 124, "", str(error))
+
+
+def _change_id(path: Path, commit: str) -> str | None:
+    """What `commit` changed, as a stable identity: its diff against its parent, which must touch the
+    list alone, without the index and hunk-position lines a rebase can move. None otherwise."""
+    names = _git(path, "diff", "--name-only", f"{commit}~1", commit)
+    own = _git(path, "ls-files", "--full-name", "--", path.name).stdout.strip()
+    if names.returncode or names.stdout.strip() != own:
+        return None
+    diff = _git(path, "diff", f"{commit}~1", commit, "--", path.name).stdout.splitlines()
+    return "\n".join(line for line in diff if not line.startswith(("index ", "@@")))
+
+
+def _withdraw(path: Path, base: str, ours: str) -> bool:
+    """Commit, on whatever HEAD now is, the list as committed there with this look's edits taken
+    back (`_taken_back`), through a scratch index so nothing else the clone has staged is touched."""
+    shown = _git(path, "show", f"HEAD:./{path.name}")
+    fixed = _taken_back(base, ours, "", shown.stdout) if shown.returncode == 0 else None
+    if fixed is None:
+        return False
+    if fixed == shown.stdout:
+        return True
+    entry = _git(path, "ls-files", "-s", "--full-name", "--", path.name).stdout.split()
+    if len(entry) < 4:
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "list").write_text(fixed)
+        scratch = {"GIT_INDEX_FILE": str(Path(tmp) / "index")}
+        blob = _git(path, "hash-object", "-w", "--", str(Path(tmp) / "list")).stdout.strip()
+        head = _git(path, "rev-parse", "HEAD").stdout.strip()
+        steps = (
+            ("read-tree", head),
+            ("update-index", "--cacheinfo", f"{entry[0]},{blob},{entry[3]}"),
+        )
+        if not blob or any(_git(path, *step, env=scratch).returncode for step in steps):
+            return False
+        tree = _git(path, "write-tree", env=scratch).stdout.strip()
+        message = f"Withdraw unpublished inference in {path.name}"
+        commit = _git(path, "commit-tree", tree, "-p", head, "-m", message).stdout.strip()
+        return bool(tree and commit) and _git(path, "update-ref", "HEAD", commit, head).returncode == 0
 
 
 def _tracked(path: Path) -> bool:
@@ -821,6 +861,7 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
     if tracked and merged != theirs:
         message = f"Reconcile {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
         committed = _git(path, "commit", "-q", "-m", message, "--", path.name)
+        made = _change_id(path, "HEAD") if committed.returncode == 0 else None
         if committed.returncode != 0:
             log(
                 f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); the edit waits for a later look"
@@ -841,9 +882,20 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
         return None
     if not pushed and own is not None:
         # An inferred tick is published in the look that made it or not at all: a later push could
-        # carry it onto a goal or item line it was never given. HEAD is this look's commit (see
-        # `_push`), and it can also hold the operator's uncommitted edits, so only this look's edit
-        # is taken out of the file, which stays uncommitted; a line the rebased parent has stays.
+        # carry it onto a goal or item line it was never given. When HEAD is still this look's
+        # commit it is undone; when another commit has landed on it since (the lock is per list,
+        # not per clone), a commit withdrawing the edit goes on top instead. The file can also
+        # hold the operator's uncommitted edits, so only this look's edit is taken out of it.
+        if made is None or _change_id(path, "HEAD") != made:
+            withdrawn = _withdraw(path, base, ours)
+            undone = _taken_back(base, ours, "", path.read_text()) if withdrawn else None
+            if undone is None:
+                log(f"reconcile: the unpushed inference in {path.parent} could not be withdrawn; remove it by hand")
+            else:
+                _git(path, "reset", "-q", "HEAD", "--", path.name)
+                _write(path, undone)
+                log("reconcile: the inferred ticks were withdrawn on top of a later commit; the next look asks again")
+            return None
         parent = _git(path, "show", f"HEAD~1:./{path.name}")
         undone = _taken_back(base, ours, parent.stdout if parent.returncode == 0 else "", path.read_text())
         if undone is None or _git(path, "reset", "-q", "--soft", "HEAD~1").returncode != 0:

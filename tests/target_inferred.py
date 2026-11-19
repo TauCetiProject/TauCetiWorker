@@ -631,6 +631,24 @@ class Publication(Tmp):
         self.assertEqual(t.parse_targets(first.read_text()).find("zero-one").status, "open")
         self.assertIn("a rewritten goal", first.read_text())
 
+    def test_a_tick_taken_back_after_another_commit_keeps_that_commit(self):
+        first = self.clone("first")
+        _, still, ticked = self.ticked()
+        hook = first.parent / ".git" / "hooks" / "post-commit"
+        hook.write_text(
+            "#!/bin/sh\n[ -f other-list.md ] && exit 0\n"
+            "echo other > other-list.md && git add other-list.md && git commit -q -m 'other list'\n"
+            "git remote set-url --push origin /nonexistent/remote.git\n"
+        )
+        hook.chmod(0o755)
+        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
+        log = git(first.parent, "log", "--format=%s", "@{upstream}..HEAD").splitlines()
+        self.assertIn("other list", log)
+        self.assertEqual(t.parse_targets(first.read_text()).find("zero-one").status, "open")
+        committed = git(first.parent, "show", "HEAD:targets.md") + "\n"
+        self.assertEqual(t.parse_targets(committed).find("zero-one").status, "open")
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+
     def test_a_tick_another_host_already_published_leaves_the_rebased_clone_alone(self):
         first, second = self.clone("first"), self.clone("second")
         _, still, ticked = self.ticked()
