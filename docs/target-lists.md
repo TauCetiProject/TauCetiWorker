@@ -184,7 +184,7 @@ A pull request the merge queue closed counts as merged only with the landing
 proof [Live statuses](#live-statuses) describes, read from its own forge; one
 whose proof is refused counts as closed unmerged, and one without proof leaves
 the item as it is. A round that selects only `reconcile` chooses no model and
-does not wait for one under pace.
+does not wait for one under pace, unless inferred completion (below) is on.
 
 An `in flight:` clause is removed when its item is settled. The `closed:` clause
 is passed to the next agent given the item, like any other clause. The merged
