@@ -135,6 +135,22 @@ class Format(unittest.TestCase):
 
 
 class LiveView(unittest.TestCase):
+    def test_unrelated_or_partial_queue_closures_do_not_spend_proof_reads(self):
+        listed = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x\n")
+        rows = [
+            {"number": i + 1, "body": marker("Algebra", f"other{i}"), "baseRefName": "main", "state": "CLOSED"}
+            for i in range(200)
+        ]
+        rows.append(
+            {"number": 300, "body": marker("Algebra", "a", partial=True), "baseRefName": "main", "state": "CLOSED"}
+        )
+        source = SimpleNamespace(target_queue_landed=Mock(return_value=True))
+        self.assertEqual(t.verified_landings(listed.items(), rows, source), {})
+        source.target_queue_landed.assert_not_called()
+        rows.append({"number": 301, "body": marker("Algebra", "a"), "baseRefName": "main", "state": "CLOSED"})
+        self.assertEqual(t.verified_landings(listed.items(), rows, source), {("Algebra", "a"): 301})
+        source.target_queue_landed.assert_called_once_with(301, "main")
+
     def test_complete_recent_history_does_not_trigger_dependency_searches(self):
         listed = t.parse_targets(
             "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
@@ -218,7 +234,13 @@ class LiveView(unittest.TestCase):
     def test_bors_landings_count_as_merged(self):
         rows = [
             {"number": 1, "state": "MERGED", "title": "feat: a", "body": ""},
-            {"number": 2, "state": "CLOSED", "title": "[Merged by Bors] - feat: b", "body": ""},
+            {
+                "number": 2,
+                "state": "CLOSED",
+                "title": "[Merged by Bors] - feat: b",
+                "body": marker("A", "a"),
+                "baseRefName": "main",
+            },
             {"number": 3, "state": "CLOSED", "title": "feat: c", "body": ""},
         ]
         gh = tc.GitHub("org/repo")
@@ -227,10 +249,15 @@ class LiveView(unittest.TestCase):
             patch.dict(os.environ, {"TAUCETI_GITHUB_CACHE_BYPASS": "1"}),
             patch.object(gh, "target_queue_landed", return_value=False) as proof,
         ):
-            self.assertEqual([d["number"] for d in gh.merged_prs(t.MERGED_SEARCH, limit=50)], [1])
-            proof.assert_called_once_with(2, None)
+            found = gh.merged_prs(t.MERGED_SEARCH, limit=50)
+            self.assertEqual([d["number"] for d in found], [1, 2])
+            self.assertEqual(found[1]["state"], "CLOSED")
+            proof.assert_not_called()  # Discovery never validates unrelated target markers.
+            item = t.TargetItem("A", "a", "open", "x")
+            self.assertEqual(t.verified_landings([item], found, gh), {})
+            proof.assert_called_once_with(2, "main")
             proof.return_value = True
-            self.assertEqual([d["number"] for d in gh.merged_prs(t.MERGED_SEARCH, limit=50)], [1, 2])
+            self.assertEqual(t.verified_landings([item], found, gh), {("A", "a"): 2})
             argv = gh._gh.call_args.args[0]
             self.assertEqual(argv[argv.index("--state") + 1], "closed")
             self.assertEqual(argv[argv.index("--limit") + 1], "50")

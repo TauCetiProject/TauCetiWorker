@@ -266,6 +266,8 @@ def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int
     done: dict[Key, int] = {}
     base = content_base()
     for d in merged:
+        if d.get("state") == "CLOSED":
+            continue  # An editable title alone is never evidence of completion.
         if d.get("baseRefName") != base:
             continue
         keys, partial = marker_keys(d.get("body"))
@@ -277,6 +279,29 @@ def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int
             if key in excused and not named:
                 done.setdefault(key, d.get("number"))
     return done
+
+
+def verified_landings(items: Iterable[TargetItem], rows: Iterable[dict], source) -> dict[Key, int]:
+    """Verify queue closures only when they could complete one of these targets.
+
+    Recent history contains markers for unrelated roadmap work too. Fetching proof for every
+    row would turn one bounded listing into hundreds of unnecessary authenticated reads.
+    """
+    items = list(items)
+    by_key = {(it.area, it.slug): it for it in items}
+    verified = []
+    for row in rows:
+        if row.get("state") != "CLOSED":
+            verified.append(row)
+            continue
+        relevant = [by_key[key] for key in marker_keys(row.get("body"))[0] if key in by_key]
+        promoted = {**row, "state": "MERGED"}
+        if not relevant or not landed(relevant, [promoted]):
+            continue
+        verifier = getattr(source, "target_queue_landed", None)
+        if verifier is not None and verifier(row.get("number"), content_base()):
+            verified.append(promoted)
+    return landed(items, verified)
 
 
 def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
@@ -296,7 +321,7 @@ def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
         for d in rows:
             inflight |= marker_keys(d.get("body"))[0]
         recent = source.merged_prs(f"{MERGED_SEARCH} base:{content_base()} sort:updated-desc", limit=MERGED_LIMIT)
-        done |= set(landed(targets.items(), recent))
+        done |= set(verified_landings(targets.items(), recent, source))
         if not getattr(recent, "complete", False):
             incomplete.append(source)
     # Resolve dependencies BEFORE eligibility, rather than only searching already eligible
@@ -351,7 +376,7 @@ class GitHubMarkerReads:
         self._rows: list[dict] | None = None
         self._items: dict[str, list[dict]] = {}
 
-    def _read(self, fetch) -> list[dict]:
+    def _read(self, fetch):
         from .config import GitHubUnavailable
         from .github import GitHubError
         from .worker_sources import shared_github_environment
@@ -377,14 +402,31 @@ class GitHubMarkerReads:
         term = '"' + _ID_TERM.format(ident) + ('" is:open' if state == "OPEN" else f'" base:{content_base()}')
         if term not in self._items:
             self._items[term] = self._read(lambda: self.gh.target_marker_prs(limit=30, search=term))
-        return [d for d in self._items[term] if d.get("state") == state and body_matches(d.get("body") or "", phrases)]
+        return [
+            d
+            for d in self._items[term]
+            if (
+                d.get("state") == state
+                or (
+                    state == "MERGED"
+                    and d.get("state") == "CLOSED"
+                    and str(d.get("title") or "").startswith("[Merged by Bors] - ")
+                )
+            )
+            and body_matches(d.get("body") or "", phrases)
+        ]
 
     def open_prs(self) -> list[dict]:
         return [d for d in self._listing() if d.get("state") == "OPEN"]
 
     def merged_prs(self, search: str, *, limit: int = MERGED_LIMIT) -> list[dict]:
         phrases = search_phrases(search)
-        rows = [d for d in self._listing() if d.get("state") == "MERGED"]
+        rows = [
+            d
+            for d in self._listing()
+            if d.get("state") == "MERGED"
+            or (d.get("state") == "CLOSED" and str(d.get("title") or "").startswith("[Merged by Bors] - "))
+        ]
         return MergedPRs(
             [d for d in rows if body_matches(d.get("body") or "", phrases)][:limit],
             complete=len(self._listing()) < MERGED_LIMIT,
@@ -396,6 +438,9 @@ class GitHubMarkerReads:
     def open_beyond_listing(self, search: str) -> list[dict]:
         return self._beyond(search, "OPEN")
 
+    def target_queue_landed(self, number, branch):
+        return self._read(lambda: self.gh.target_queue_landed(number, branch))
+
 
 def _item_search(item: TargetItem) -> str:
     return '"' + _ID_TERM.format(item.slug.replace('"', "")) + f'" {MERGED_SEARCH} base:{content_base()}'
@@ -406,10 +451,10 @@ def landed_pr(item: TargetItem, gh) -> int | None:
     among the closed pull requests that carry a marker, then, when that does not settle it and the
     source can look further (`merged_beyond_listing`), that. Raises GitHubError when it fails."""
     key, search = (item.area, item.slug), _item_search(item)
-    found = landed([item], gh.merged_prs(search, limit=30)).get(key)
+    found = verified_landings([item], gh.merged_prs(search, limit=30), gh).get(key)
     beyond = getattr(gh, "merged_beyond_listing", None)
     if found is None and beyond is not None:
-        found = landed([item], beyond(search, limit=30)).get(key)
+        found = verified_landings([item], beyond(search, limit=30), gh).get(key)
     return found
 
 

@@ -3104,6 +3104,12 @@ class _SharedGitHubReads:
         with shared_github_environment():
             return self.gh.merged_prs(search, limit=limit)
 
+    def target_queue_landed(self, number, branch):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.target_queue_landed(number, branch)
+
 
 def _target_reads(source):
     from .worker_sources import current

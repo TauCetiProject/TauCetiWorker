@@ -133,11 +133,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
             # queue lands a pull request by squash and closes it, unmerged, under BORS_MERGED_PREFIX.
             if (row if keyword is None else row.get("pull_request") or {}).get("merged") is True:
                 return True
-            return (
-                row.get("state") == "closed"
-                and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
-                and self.target_queue_landed(row["number"], content_base())
-            )
+            return row.get("state") == "closed" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
 
         def base(row):
             if keyword is not None:  # an issue search row names no base branch
@@ -165,12 +161,15 @@ class ForgejoWorkerSource(ForgejoReadSource):
                     "body": r.get("body") or "",
                     "url": self.repository.pull_url(r["number"]),
                     "baseRefName": r["baseRefName"],
+                    "state": "MERGED"
+                    if (r if keyword is None else r.get("pull_request") or {}).get("merged") is True
+                    else "CLOSED",
                 }
                 for r in rows[:limit]
             ]
             return {"rows": found, "complete": complete}
 
-        result = self._read("merged_prs", ["verified-v2", search, limit], fetch)
+        result = self._read("merged_prs", ["candidates-v3", search, limit], fetch)
         if result is None:
             raise SourceUnavailable("Forgejo merged pull request listing is unavailable")
         return MergedPRs(result["rows"], complete=result["complete"])
