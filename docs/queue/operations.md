@@ -491,6 +491,16 @@ stops it, and `--check` reports the cached verification's age. The worker runs
 on the service host today; it only needs the service URL, so it can run on any host meeting the
 requirements below (the service's `repair_concurrency` setting bounds how many hold a task at once).
 
+Repairs run below the CI and staging VMs that share their host. Every repair unit runs in
+`tauceti-repair.slice` (installed by `install-repair.sh` beside TauCetiFleet's `tauceti-fleet.slice`
+under `tauceti.slice`, with `CPUWeight=10` and `IOWeight=10` against the fleet slice's 100), at
+`Nice=10` with `IOSchedulingClass=idle`; every thread and child inherits these, bwrap sandboxes
+and the agent's processes included, and the background publisher's transient unit is started in
+the same slice with the same settings. The slice weight is what counts against the VMs: the cgroup
+CPU controller shares a busy host between sibling slices by weight, so a reniced process in
+`app.slice` competes as `app.slice` does. A `renice` by hand affects only the thread it names, not
+the other threads of a multithreaded process such as `lake` or the worker, nor their later children.
+
 Queue repair sessions using Claude (subscription or API) give Bash EOF on its default stdin.
 The worker atomically writes `bash-env.sh` beside its persistent private Claude config and selects
 it with the CLI's session `--settings` override. This intentionally overrides inherited, user and

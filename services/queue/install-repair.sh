@@ -88,7 +88,7 @@ override_warning() {
 }
 # Drop-ins silently override the installed unit (and each other), so the running code stops being
 # the checkout's. A template drop-in (tauceti-queue-repair@.service.d) applies to every instance.
-dropin_dirs=("$UNIT_DIR/$UNIT.d")
+dropin_dirs=("$UNIT_DIR/$UNIT.d" "$UNIT_DIR/tauceti-repair.slice.d")
 if [ -n "$INSTANCE" ]; then dropin_dirs+=("$UNIT_DIR/tauceti-queue-repair@.service.d"); fi
 for dir in "${dropin_dirs[@]}"; do
   for dropin in "$dir"/*.conf; do
@@ -166,6 +166,9 @@ fi
 # Only this worker's unit: an instance gets its own file rendered from the template, so installing
 # one worker never changes what another (re)starts from.
 release_render_unit "$UNIT_SOURCE" "$UNIT"
+# The slice every repair worker runs in (its weights put repairs below the CI and staging VMs). It
+# names no release, so it is installed as it is and never keeps a release from being collected.
+install -m 0644 services/queue/tauceti-repair.slice "$UNIT_DIR/tauceti-repair.slice"
 systemctl --user daemon-reload
 fragment="$(systemctl --user show -p FragmentPath --value "$UNIT")"
 [ "$fragment" = "$UNIT_DIR/$UNIT" ] || die "systemd loads $UNIT from ${fragment:-nothing}, not $UNIT_DIR/$UNIT"

@@ -48,6 +48,13 @@ StandardError=journal
 SyslogIdentifier=tauceti-queue-repair
 LimitNOFILE=65536
 UMask=0077
+# Repairs yield to CI and staging builds on the same host (tauceti-repair.slice). Every thread and
+# child inherits the niceness and IO class from the exec, and the slice's weights cover any process
+# in the unit's cgroup, including bwrap sandboxes and the agent's. Background publications join the
+# slice too (tauceti_queue/repair_publish.py). Not CPUWeight=idle: the claim lease must keep renewing.
+Slice=tauceti-repair.slice
+Nice=10
+IOSchedulingClass=idle
 
 [Install]
 WantedBy=default.target

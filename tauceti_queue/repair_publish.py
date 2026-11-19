@@ -37,6 +37,11 @@ TRUE = ("1", "true", "yes", "on")
 FALSE = ("0", "false", "no", "off")
 WHEN = ("after", "before", "off")  # TAUCETI_REPAIR_PUBLISH: after the submission, before the push, never
 NICE = 10  # the niceness of the rehash and the upload
+# A publisher in a transient unit starts from the user manager, not the worker, so it inherits none
+# of the worker unit's priority: it joins the workers' slice (services/queue/tauceti-repair.slice)
+# and takes the same niceness and IO class as services/queue/tauceti-queue-repair.service.
+SLICE = "tauceti-repair.slice"
+UNIT_PRIORITY = ("Nice=10", "IOSchedulingClass=idle")
 RECORD = "publish.json"  # the background publication's record, in the task's logs/
 BACKGROUND_LOG = "publish.log"
 SPEC = "publish-spec.json"
@@ -641,6 +646,8 @@ def start_background(
                     "--collect",
                     f"--unit={unit}",
                     f"--working-directory={PROJECT_ROOT}",
+                    f"--slice={SLICE}",
+                    *(f"--property={p}" for p in UNIT_PRIORITY),
                     f"--property=StandardOutput=append:{record['log']}",
                     f"--property=StandardError=append:{record['log']}",
                     *(f"--setenv={k}={child_env[k]}" for k in (*UNIT_ENV, *repair.LAKE_ENV_KEYS) if k in child_env),

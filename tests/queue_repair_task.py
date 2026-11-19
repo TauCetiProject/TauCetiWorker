@@ -3178,11 +3178,25 @@ class PublishOutputs(Fixture):
         self.assertTrue(record["unit"].startswith(f"tauceti-repair-publish-7-{self.content.tip[:12]}-"))
         args = (self.stub_dir / "systemd-run-args").read_text().splitlines()
         self.assertEqual(args[:3], ["--user", "--quiet", "--collect"])
+        # the transient unit starts from the user manager, so it is given the worker's priority
+        self.assertIn("--slice=tauceti-repair.slice", args)
+        self.assertIn("--property=Nice=10", args)
+        self.assertIn("--property=IOSchedulingClass=idle", args)
         self.assertIn(f"--setenv=LAKE_CACHE_DIR={env['LAKE_CACHE_DIR']}", args)
         self.assertFalse([a for a in args if "gh-secret" in a or "INVOCATION_ID" in a], args)
         self.assertEqual(args[-2:], ["tauceti_queue.repair_publish", str(logdir / repair_publish.SPEC)])
         self.assertNotIn(self.KEY, "\n".join(args))
         self.assertEqual(json.loads((logdir / repair_publish.RECORD).read_text())["state"], "running")
+
+    def test_the_publisher_takes_the_repair_units_priority(self):
+        """The background publisher's transient unit matches what the repair units set, so publication
+        never runs above the worker that started it."""
+        for name in ("tauceti-queue-repair.service", "tauceti-queue-repair@.service"):
+            text = (Path(__file__).resolve().parents[1] / "services/queue" / name).read_text()
+            with self.subTest(unit=name):
+                self.assertEqual(re.findall(r"^Slice=(.*)$", text, re.M), [repair_publish.SLICE])
+                for prop in repair_publish.UNIT_PRIORITY:
+                    self.assertEqual(re.findall(rf"^{prop.split('=')[0]}=(.*)$", text, re.M), [prop.split("=", 1)[1]])
 
     def test_without_a_key_or_when_switched_off_nothing_is_put(self):
         for settings, reason in (
