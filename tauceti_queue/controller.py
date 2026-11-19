@@ -4335,8 +4335,7 @@ class Controller:
                 self.store.update(
                     "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="admission-recheck"
                 )
-                self._release_claim(claim, "admission-recheck", now)
-                self.admission.invalidate(row["number"], head=row["head_sha"], urgent=True)
+                self._release_claim(claim, "admission-recheck", now)  # the check re-dirtied the PR if needed
                 self._count("insertion_checks_held")
                 self.store.journal(
                     now, "insertion-check-held", batch["id"], number=row["number"], head=row["head_sha"], reason=held

@@ -1513,6 +1513,16 @@ class GitHubAdapter:
             connection = ((data.get("repository") or {}).get("pullRequest") or {}).get("comments")
 
     def admission_insertion_source(self, repo: str, number: int, head: str) -> dict:
+        """See `_insertion_source`. A read that needed more than one page is repeated and must come
+        back the same, so a scoreboard edited while later pages loaded cannot pass unseen."""
+        source, pages = self._insertion_source(repo, number, head)
+        if pages > 1:
+            again, _ = self._insertion_source(repo, number, head)
+            if again != source:
+                raise GitHubError("PR inputs changed while the insertion check was reading them")
+        return source
+
+    def _insertion_source(self, repo: str, number: int, head: str) -> tuple[dict, int]:
         """The PR's admission inputs now, in the shape `admission.source_version` digests, for the
         check before an approved head joins a batch (decision 38 step 4, slice 3).
 
@@ -1532,6 +1542,7 @@ class GitHubAdapter:
             labels = node.get("labels") or {}
             if not isinstance(labels.get("pageInfo"), dict):
                 raise GitHubError("incomplete insertion check labels")
+            pages = 1 + bool(labels["pageInfo"].get("hasNextPage"))
             names = (
                 self.labels(repo, number)
                 if labels["pageInfo"].get("hasNextPage")
@@ -1547,6 +1558,7 @@ class GitHubAdapter:
                     raise GitHubError("incomplete insertion check comment pagination")
                 if not page.get("hasNextPage"):
                     break
+                pages += 1
                 more = self.client.graphql(
                     ADMISSION_COMMENTS_QUERY,
                     {"owner": owner, "name": name, "number": number, "after": page["endCursor"]},
@@ -1557,7 +1569,7 @@ class GitHubAdapter:
             for s in (commit.get("status") or {}).get("contexts", ())
             if s.get("context") in ("build", "scope", "bump-guard", f"self-tested/{number}")
         }
-        return {
+        source = {
             "head": node.get("headRefOid", ""),
             "base_sha": node.get("baseRefOid", ""),
             "base_ref": node.get("baseRefName", ""),
@@ -1569,6 +1581,7 @@ class GitHubAdapter:
             "statuses": statuses,
             "diff_version": self._diff_version(node.get("baseRefOid", ""), node.get("headRefOid", "")),
         }
+        return source, pages
 
     def list_open_pull_requests(
         self, repo: str, *, review_app_id: int, admission=False, on_page=None
@@ -1861,7 +1874,8 @@ def _graphql_comment(comment) -> dict:
     if not isinstance(comment, dict) or not isinstance(comment.get("databaseId"), int):
         raise GitHubError("incomplete review comment")
     author = comment.get("author") or {}
-    login = author.get("login", "")
+    # A deleted account: GraphQL returns no author where REST names the placeholder `ghost`.
+    login = author.get("login", "") if comment.get("author") is not None else "ghost"
     # GraphQL Bot.login omits REST's suffix. Preserve the same actor identity
     # for trusted recovery holds and stable source versions across both APIs.
     if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):

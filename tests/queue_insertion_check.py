@@ -101,6 +101,28 @@ class InsertionCheckTests(unittest.TestCase):
         self.controller.tick()
         self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
 
+    def test_a_digest_that_never_matches_stops_reading_until_the_backoff_ends(self):
+        self.controller.set_setting("admission_insertion_check", True, "test")
+        self.approved()
+        plain, reads = self.github._admission_source, []
+
+        def differs(repo, number, head):
+            reads.append(number)
+            return {**plain(number), "body": "what the check reads, never what evaluation read"}
+
+        self.github.admission_insertion_source = differs
+        self.controller.tick()  # read differs: held, and the PR evaluated again
+        self.intake.run_once()  # the evaluation reads the same inputs as before
+        self.controller.tick()  # same evaluation: held without another read
+        self.controller.tick()
+        self.assertEqual(self.controller.inputs()[0]["state"], "waiting")
+        self.assertEqual(self.counter("insertion_checks_held"), 3)
+        self.assertEqual(len(reads), 1)
+        self.clock.advance(self.controller.setting("approval_poll_interval_seconds") + 1)
+        self.controller.tick()  # the backoff ended: read again, still held
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(self.controller.inputs()[0]["state"], "waiting")
+
 
 if __name__ == "__main__":
     unittest.main()

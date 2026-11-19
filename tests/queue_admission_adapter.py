@@ -650,6 +650,23 @@ class SourceTests(unittest.TestCase):
             changed = adapter.admission_insertion_source(TAUCETI, 42, head)
             self.assertNotEqual(source_version(snapshot.source(), "p"), source_version(changed, "p"))
 
+    def test_deleted_authors_read_alike_in_both_apis(self):
+        node = {"databaseId": 7, "body": "b", "createdAt": "t", "updatedAt": "t", "url": "", "author": None}
+        self.assertEqual(ga._graphql_comment(node)["author"], "ghost")  # REST names a deleted user `ghost`
+
+    def test_a_paged_insertion_read_is_repeated_and_must_agree(self):
+        transport = FakeTransport()
+        c, _ = client(transport)
+        adapter = ga.GitHubAdapter(c, repo=TAUCETI)
+        reads = iter([({"body": "first"}, 2), ({"body": "edited meanwhile"}, 2), ({"body": "same"}, 2)])
+        adapter._insertion_source = lambda repo, number, head: next(reads)
+        with self.assertRaises(ga.GitHubError):
+            adapter.admission_insertion_source(TAUCETI, 42, HEAD)
+        reads = iter([({"body": "same"}, 2), ({"body": "same"}, 2)])
+        self.assertEqual(adapter.admission_insertion_source(TAUCETI, 42, HEAD), {"body": "same"})
+        reads = iter([({"body": "one page"}, 1)])
+        self.assertEqual(adapter.admission_insertion_source(TAUCETI, 42, HEAD), {"body": "one page"})
+
 
 class BumpGuardFloorTests(unittest.TestCase):
     """PR #43422: a self-tested Mathlib bump's guard needs 19 reads, and restarts from its first."""
