@@ -1193,7 +1193,11 @@ revision and start time (`service.revision`, `service.started_at`), and the effe
 the newest `updated_at` among the phases; `tauceti-queue status` prints exactly these.
 
 A reconciliation pass holds the controller lock, and `/status` waits at most two seconds for it
-(`/healthz` half a second). When a pass runs longer, the endpoints answer with the snapshot the last
+(`/healthz` and `/status/summary` half a second). `/status/summary` is the small subset the
+monitoring publisher reads every few seconds (`schema`, `generated_at`, `canonical_sha`, `service`,
+`settings`, `inference_hold`, the head's `id` and `stall`, `alerts`, `stuck_heads` and the snapshot
+markers), without the tasks' diagnostics and the waiting inputs that make the full document
+megabytes. When a pass runs longer, the endpoints answer with the snapshot the last
 pass or operator action took, marked `snapshot: true` with its age in `stale_seconds`; a live read has
 neither key. The feeds (`/repositories/1/active-batches`, `/repositories/1/candidates`) read the store
 directly and never wait for the lock. A pass itself is bounded: insertion probes stop after

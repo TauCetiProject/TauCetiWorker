@@ -245,6 +245,38 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(body["github"], {"requests": 12, "rate_limit_remaining": 4800})
         self.assertEqual(set(body["webhooks"]), {"received", "duplicates", "ignored"})
 
+    def test_status_summary_omits_bulk_sections_and_waits_briefly(self):
+        full = {
+            "queue": {"approved_waiting": 3},
+            "settings": {"insertion_age_window": 16},
+            "head": {"id": 7, "stall": None, "task": {"diagnostics": ["x" * 3_000_000]}},
+            "alerts": ["x"],
+            "tasks": [{"diagnostics": "big"}],
+            "waiting": {"inputs": []},
+            "open_batches": [],
+            "snapshot": True,
+            "stale_seconds": 4.0,
+        }
+
+        def status(*, wait=None):
+            self.controller.status_waits.append(wait)
+            return dict(full)
+
+        with patch.object(self.controller, "status", status):
+            status, body = self.request("GET", "/status/summary")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.status_waits[-1], server.HEALTHZ_LOCK_WAIT_SECONDS)
+        self.assertEqual(
+            body,
+            {
+                "settings": {"insertion_age_window": 16},
+                "head": {"id": 7, "stall": None},
+                "alerts": ["x"],
+                "snapshot": True,
+                "stale_seconds": 4.0,
+            },
+        )
+
     def test_frozen_admission_header_only_for_native_observation(self):
         def fetch(path):
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)

@@ -937,7 +937,7 @@ def main(argv=None):
     parser.add_argument("--clone", type=Path)
     parser.add_argument("--worker-root", type=Path, action="append", default=[])
     parser.add_argument("--public-repository", action="append", default=[])
-    parser.add_argument("--status-url", default="http://127.0.0.1:8780/status")
+    parser.add_argument("--status-url", default="http://127.0.0.1:8780/status/summary")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--publish-url")
     parser.add_argument("--token-file", type=Path)
@@ -994,6 +994,25 @@ def main(argv=None):
         return run(args, stop, facts, opener, publisher)
 
 
+def read_status(url, *, timeout=3):
+    """The controller's status sections this projection reads; empty when the controller is unavailable.
+
+    `/status/summary` omits the megabytes of task diagnostics and waiting inputs and never waits long
+    for a reconciliation pass. A controller older than that route answers 404; read the full document.
+    """
+    try:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return json.loads(response.read(MAX_BYTES))
+        except urllib.error.HTTPError as error:
+            if error.code != 404 or not url.endswith("/status/summary"):
+                raise
+        with urllib.request.urlopen(url.removesuffix("/summary"), timeout=timeout) as response:
+            return json.loads(response.read(MAX_BYTES))
+    except (OSError, ValueError, http.client.HTTPException):
+        return {}
+
+
 def run(args, stop, facts, opener, publisher):
     task_observations = TaskObservations()
     retry_seconds = args.interval
@@ -1001,11 +1020,7 @@ def run(args, stop, facts, opener, publisher):
         iteration_started = time.monotonic()
         succeeded = False
         try:
-            try:
-                with urllib.request.urlopen(args.status_url, timeout=3) as response:
-                    status = json.loads(response.read(MAX_BYTES))
-            except (OSError, ValueError, http.client.HTTPException):
-                status = {}
+            status = read_status(args.status_url)
             observation = project(
                 args.database,
                 status=status,
