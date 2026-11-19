@@ -27,7 +27,7 @@ if TYPE_CHECKING:  # annotations only; importing at runtime would invert the lay
     from .work_units import RoundOpts, Worker
 
 from . import build_caches
-from .config import Config, Die, NoProgress, log
+from .config import Config, Die, NoProgress, log, warn_red
 from .constants import (
     AUTHORING_DEFAULTS,
     CLAUDE_CMD,
@@ -178,8 +178,8 @@ _CODEX_MODEL_ERROR_MESSAGE = re.compile(
 _CODEX_MODEL_ACCESS_PROMPT = "Reply with exactly OK. Do not use tools."
 
 
-def _codex_error_details(transcript: str) -> tuple[int | None, str | None]:
-    """Parse Codex JSONL's terminal HTTP status/message; never classify raw transcript text."""
+def _codex_error_details(transcript: str) -> tuple[int | None, str | None, str | None]:
+    """Parse Codex JSONL's terminal HTTP status/message/code; never classify raw transcript text."""
     failed_payload = error_payload = None
     for line in transcript.splitlines():
         line = line.strip()
@@ -201,38 +201,45 @@ def _codex_error_details(transcript: str) -> tuple[int | None, str | None]:
                 error_payload = event["message"]
 
     for payload in (failed_payload, error_payload):
-        if not isinstance(payload, str):
-            continue
-        try:
-            decoded = json.loads(payload)
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(decoded, dict):
-            continue
-        error = decoded.get("error")
-        error = error if isinstance(error, dict) else {}
-        status = decoded.get("status", error.get("status"))
-        if isinstance(status, bool):
-            status = None
-        elif isinstance(status, str) and status.lstrip("-").isdigit():
-            status = int(status)
-        if not isinstance(status, int):
-            status = None
-        message = error.get("message") or decoded.get("message")
-        return status, message if isinstance(message, str) else None
-    return None, None
+        if details := _codex_payload_details(payload):
+            return details
+    return None, None, None
+
+
+def _codex_payload_details(payload) -> tuple[int | None, str | None, str | None] | None:
+    """Decode one Codex error payload into its HTTP status, message and error code."""
+    if not isinstance(payload, str):
+        return None
+    try:
+        decoded = json.loads(payload)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    error = decoded.get("error")
+    error = error if isinstance(error, dict) else {}
+    status = decoded.get("status", error.get("status"))
+    if isinstance(status, bool):
+        status = None
+    elif isinstance(status, str) and status.lstrip("-").isdigit():
+        status = int(status)
+    if not isinstance(status, int):
+        status = None
+    message = error.get("message") or decoded.get("message")
+    code = error.get("code") or decoded.get("code")
+    return status, message if isinstance(message, str) else None, code if isinstance(code, str) else None
+
+
+def _codex_model_rejected(status: int | None, message: str | None, code: str | None) -> bool:
+    return bool(
+        status in _CODEX_MODEL_ERROR_STATUSES
+        and (code == "model_not_found" or isinstance(message, str) and _CODEX_MODEL_ERROR_MESSAGE.search(message))
+    )
 
 
 def _codex_model_unavailable(returncode: int, transcript: str) -> bool:
     """Only a structured client rejection naming model access confirms an entitlement miss."""
-    if returncode == 0:
-        return False
-    status, message = _codex_error_details(transcript)
-    return bool(
-        status in _CODEX_MODEL_ERROR_STATUSES
-        and isinstance(message, str)
-        and _CODEX_MODEL_ERROR_MESSAGE.search(message)
-    )
+    return returncode != 0 and _codex_model_rejected(*_codex_error_details(transcript))
 
 
 def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[str]:
@@ -273,7 +280,7 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
 
 
 def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -> NoProgress:
-    status, message = _codex_error_details(result.stdout or "")
+    status, message, _ = _codex_error_details(result.stdout or "")
     detail = message or (result.stderr or "").strip()[-1000:] or f"exit {result.returncode}"
     status_text = f"HTTP {status}: " if status is not None else ""
     return NoProgress(
@@ -328,22 +335,56 @@ def resolve_codex_model_access(cfg: Config, profile: AuthoringProfile) -> Author
             raise _codex_probe_failure(profile.model, first)
 
         if fp is not None:
-            cfg.quota_cache.mkdir(parents=True, exist_ok=True)
-            _write_json_atomic(
-                cache_path,
-                {
-                    "fetched_at": int(time.time()),
-                    "fp": fp,
-                    "primary_model": profile.model,
-                    "fallback_model": fallback,
-                    "available": available,
-                },
-            )
+            _record_codex_model_access(cfg, fp, profile, available)
 
     if available:
         return replace(profile, fallback_model=None)
     log(f"codex: {profile.model} is unavailable to this subscription; using {fallback}")
     return replace(profile, model=fallback, model_source="subscription fallback", fallback_model=None)
+
+
+def _record_codex_model_access(cfg: Config, fp: str, profile: AuthoringProfile, available: bool) -> None:
+    cfg.quota_cache.mkdir(parents=True, exist_ok=True)
+    _write_json_atomic(
+        cfg.quota_cache / "codex-model-access.json",
+        {
+            "fetched_at": int(time.time()),
+            "fp": fp,
+            "primary_model": profile.model,
+            "fallback_model": profile.fallback_model,
+            "available": available,
+        },
+    )
+
+
+def note_codex_round_rejection(cfg: Config, profile: AuthoringProfile, selected: AuthoringProfile) -> None:
+    """Cache a model miss that the authoring round itself hit, so the next round takes the fallback.
+
+    The probe runs the host's `codex`; a Bubble round runs the sandbox image's, which can reject a
+    model the host CLI accepts. ``profile`` is the unresolved default, ``selected`` what the round ran.
+    """
+    run = take_last_agent_run()
+    if not run or run.get("provider") != "codex" or not run.get("rc") or run.get("saw_work"):
+        return
+    details = _codex_payload_details(run.get("terminal_failure"))
+    if not details or not _codex_model_rejected(*details):
+        return
+    detail = details[1] or details[2] or f"HTTP {details[0]}"
+    if selected.model != profile.model:
+        warn_red(f"codex: the authoring round rejected the fallback model {selected.model} ({detail})")
+        return
+    fp = Quota(cfg).codex_account_fingerprint()
+    if fp is not None:
+        _record_codex_model_access(cfg, fp, profile, False)
+    warn_red(
+        f"codex: the authoring round rejected {profile.model} ({detail}) although the host model-access "
+        f"probe accepted it; the sandbox Codex CLI may be older than the host's. "
+        + (
+            f"Later rounds use {profile.fallback_model} until the cached result expires."
+            if fp is not None
+            else "No Codex account fingerprint, so the miss is not cached."
+        )
+    )
 
 
 def _kiro_model_ids(payload) -> set[str]:

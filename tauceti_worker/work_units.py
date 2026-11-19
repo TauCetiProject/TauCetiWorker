@@ -31,6 +31,7 @@ from .agents import (
     fill_prompt,
     host_agent_argv,
     local_verification,
+    note_codex_round_rejection,
     prepare_checkout,
     quality_scope,
     resolve_authoring_profile,
@@ -216,6 +217,8 @@ class RoundOpts:
     dry_run: bool
     source: str | None = None  # local directory or Git URL used read-only by a single-area roadmap PR
     authoring_profile: AuthoringProfile | None = None
+    # The unresolved default that authoring_profile was resolved from, kept for every later candidate.
+    codex_default_profile: AuthoringProfile | None = None
     # --account: the Codex account this round is REQUIRED to spend under. Checked, never switched to.
     account: str | None = None
     # The two UNDOCUMENTED review throttles (see throttle_review). 0 = off, which is the default and
@@ -1470,6 +1473,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         # Resolve Sol/Luna before the banner and before opening the authoring checkout. The probe is
         # checkout-independent and the selected profile is then consumed exactly once by either backend.
         opts.authoring_profile = resolve_codex_model_access(w.cfg, profile)
+        opts.codex_default_profile = profile
     if needs_kiro_probe:
         # `--list-models` is authenticated but sends no model prompt. Require
         # the exact pin before entering either backend; Kiro Auto is never a
@@ -1549,7 +1553,12 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
             if not api_mode():
                 raise
             raise admission_failure(str(error)) from None
-        rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
+        codex_default = getattr(opts, "codex_default_profile", None) if profile else None
+        try:
+            rc = _run_github_stage(stage, fn, w, sv, c, opts, bubble)
+        finally:
+            if codex_default is not None:
+                note_codex_round_rejection(w.cfg, codex_default, opts.authoring_profile)
     if c.pr and stage in FILE_CHANGE_STAGES:
         pre = c.progress
         if pre is not None:
