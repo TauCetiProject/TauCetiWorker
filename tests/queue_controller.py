@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO))
 from tauceti_queue import chain, diagnostics, feeds  # noqa: E402
 from tauceti_queue.controller import (  # noqa: E402
     DEFAULT_SETTINGS,
+    LIVE_PROGRESS_SECONDS,
     LOG_GRACE_SECONDS,
     LOST_IN_PROGRESS,
     MERGED_TITLE_PREFIX,
@@ -30,6 +31,7 @@ from tauceti_queue.controller import (  # noqa: E402
     ControllerError,
     ControllerLock,
     TaskError,
+    live_progress_at,
 )
 from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.ports import AGENT_INSTRUCTION  # noqa: E402
@@ -1047,6 +1049,157 @@ class LostRuns(ControllerCase):
         self.assertEqual(attempt["outcome"], "pending", attempt["outcome_detail"])
         self.assertGreater(attempt["last_progress_at"], before + 2 * threshold)
         self.assertEqual(self.controller.status()["head"]["ci"]["updated_at"], self.github.runs[0].updated_at)
+
+    def live_reports(self):
+        """An inline background thread and a report whose counters last advanced at `advanced["at"]`."""
+        from datetime import UTC, datetime
+
+        from tauceti_queue import controller as controller_module
+
+        class Inline:
+            def __init__(self, target, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        iso = lambda t: datetime.fromtimestamp(t, UTC).isoformat().replace("+00:00", "Z")  # noqa: E731
+        advanced = {"at": None, "observed": None}
+        reads = []
+
+        def live(run_id, run_attempt):
+            reads.append((run_id, run_attempt))
+            if advanced["at"] is None:
+                return None
+            observed = advanced["observed"] if advanced["observed"] is not None else self.clock()
+            return {"completed_tasks": 1000, "observed_at": iso(observed), "last_progress_at": iso(advanced["at"])}
+
+        self.controller.live_progress = live
+        return advanced, reads, mock.patch.object(controller_module.threading, "Thread", Inline)
+
+    def test_advancing_live_build_counts_hold_off_the_stall_until_they_stop(self):
+        # A staging build step lasts hours with no step change; its live Lake counts still move.
+        advanced, reads, inline = self.live_reports()
+        self.github.start_runs()
+        with inline:
+            self.observe()
+            run = self.attempt()
+            interval = self.controller.setting("stall_interval_seconds")
+            for _ in range(4):
+                self.clock.advance(300)
+                advanced["at"] = self.clock() - 5
+                self.observe(1)
+                self.assertIsNone(self.controller.status()["head"]["stall"])
+            self.assertGreater(self.clock() - run["last_progress_at"], interval, "the step phases alone would stall")
+            self.assertEqual(reads[-1], (str(run["run_id"]), run["run_attempt"] or 1))
+            # The counts stop: a stall from their last advance.
+            stopped = advanced["at"]
+            self.observe(interval)
+            stall = self.controller.status()["head"]["stall"]
+            self.assertEqual(stall["since"], stopped + interval)
+            # A report that stops coming, or fails, never moves the time back.
+            self.controller.live_progress = mock.Mock(side_effect=OSError("down"))
+            self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertEqual(self.controller.status()["head"]["stall"]["since"], stopped + interval)
+        self.assertEqual(self.attempt()["outcome"], "pending")
+
+    def test_live_counts_are_read_while_github_is_unavailable_and_survive_a_restart(self):
+        advanced, _reads, inline = self.live_reports()
+        self.github.start_runs()
+        interval = self.controller.setting("stall_interval_seconds")
+        with inline:
+            self.observe()
+            with mock.patch.object(type(self.controller), "_fetch_canonical", side_effect=OSError("git down")):
+                for _ in range(4):
+                    self.clock.advance(300)
+                    advanced["at"] = self.clock() - 5
+                    self.observe(1)
+                    self.assertIsNone(self.controller.status()["head"]["stall"])
+            self.observe(1)  # persists the watermark on the reconciliation thread
+            last = advanced["at"]
+            restarted = reopen_controller(self.root, self.github, self.repo, self.clock)
+            restarted.live_progress = mock.Mock(side_effect=OSError("ci-data down"))
+            restarted.tick()
+            self.assertIsNone(restarted.status()["head"]["stall"])
+            self.clock.advance(last + interval - self.clock())
+            self.assertEqual(restarted.status()["head"]["stall"]["since"], last + interval)
+
+    def test_a_frozen_report_from_a_fast_clock_does_not_renew_progress(self):
+        advanced, _reads, inline = self.live_reports()
+        self.github.start_runs()
+        interval = self.controller.setting("stall_interval_seconds")
+        with inline:
+            self.observe()
+            start = self.clock()
+            # Slightly ahead of this clock: believed, but capped once, when first seen.
+            advanced.update(at=start + 120, observed=start + 120)
+            self.observe(LIVE_PROGRESS_SECONDS)
+            first_seen = self.clock()
+            for _ in range(3):
+                self.observe(LIVE_PROGRESS_SECONDS)
+            self.clock.advance(first_seen + interval - self.clock())
+            self.assertEqual(self.controller.status()["head"]["stall"]["since"], first_seen + interval)
+            # Far ahead: not believed at all.
+            advanced.update(at=self.clock() + 86400, observed=self.clock() + 86400)
+            self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertEqual(self.controller.status()["head"]["stall"]["since"], first_seen + interval)
+
+    def test_a_slow_read_never_blocks_the_tick_or_lands_out_of_order(self):
+        self.github.start_runs()
+        self.observe()
+        release, started = threading.Event(), threading.Event()
+        calls = []
+
+        def slow(run_id, run_attempt):
+            calls.append(run_id)
+            started.set()
+            release.wait(10)
+            return None
+
+        self.controller.live_progress = slow
+        self.observe(LIVE_PROGRESS_SECONDS)
+        self.assertTrue(started.wait(5))
+        # Ticks and status go on while the read is blocked, and no second read starts.
+        self.observe(LIVE_PROGRESS_SECONDS)
+        self.assertIsNotNone(self.controller.status()["head"])
+        self.assertEqual(len(calls), 1)
+        release.set()
+        for _ in range(100):
+            if not self.controller._live_reading:
+                break
+            time.sleep(0.01)
+        self.assertFalse(self.controller._live_reading)
+
+    def test_a_failed_watermark_write_does_not_stop_polling(self):
+        advanced, reads, inline = self.live_reports()
+        self.github.start_runs()
+        with inline:
+            self.observe()
+            advanced["at"] = self.clock()
+            self.observe(LIVE_PROGRESS_SECONDS)
+            store = self.controller.store
+            with mock.patch.object(store, "set_setting", side_effect=sqlite3.OperationalError("locked")):
+                self.controller._read_live_progress(self.clock() + LIVE_PROGRESS_SECONDS)
+            self.assertFalse(self.controller._live_reading)
+            count = len(reads)
+            self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertGreater(len(reads), count)
+
+    def test_live_progress_time_ignores_reports_without_counts_or_from_the_future(self):
+        self.assertEqual(live_progress_at(None, 100), (None, None))
+        self.assertEqual(live_progress_at({"completed_tasks": None, "observed_at": "x"}, 100), (None, None))
+        bad = {"completed_tasks": 1, "observed_at": "bad", "last_progress_at": "bad"}
+        self.assertEqual(live_progress_at(bad, 100), (None, None))
+        report = {
+            "completed_tasks": 1,
+            "observed_at": "1970-01-01T00:01:40Z",
+            "last_progress_at": "1970-01-01T00:03:20Z",
+        }
+        self.assertEqual(live_progress_at(report, 1000), ("1970-01-01T00:03:20Z", 100))
+        self.assertEqual(
+            live_progress_at(dict(report, observed_at="1970-01-01T00:04:00Z"), 150), ("1970-01-01T00:03:20Z", 150)
+        )
+        self.assertEqual(live_progress_at(report, 100 - 301 - 100), (None, None))
 
     def test_queued_run_is_never_lost(self):
         self.observe()

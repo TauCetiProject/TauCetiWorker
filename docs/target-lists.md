@@ -53,13 +53,16 @@ first `## ` heading is shown to the agent with the items of its area.
   slug as the first backtick token, then ` — ` and a description. Slugs are
   unique across the file. A slug becomes the claim key `author/<Area>/<slug>`
   and the `id` of the pull request's target marker, so it should not change
-  once work has started.
+  once work has started. Slugs use letters, digits, `_`, `-` and `.`, start
+  with a letter or digit, and contain neither `..` nor a trailing `.lock` or `.`.
+  This keeps them valid both in Git claim refs and in target markers.
 - A trailing parenthesised group holds `key: value` clauses separated by `;`,
   with no parentheses inside. `needs:` is a comma list of slugs from any area,
   or `none`. `partial: #N, #M` names merged GitHub pull requests that did not
   complete the item; a Forgejo pull request is named by its URL, in any case. Every other clause is passed to the agent as written.
-- An item line that does not parse is logged and skipped. A `needs:` slug the
-  file never defines is logged and blocks nothing.
+- Malformed item lines, empty/invalid or duplicate slugs, undefined `needs:`
+  references and dependency cycles reject the list before any model starts.
+  Prerequisites may appear later in the file or in another area.
 
 The file is read at the start of each roadmap round, so an edit takes effect on
 the next round. The worker never writes to it.
@@ -73,8 +76,17 @@ The marks in the file go stale between edits, so each round overlays them:
   flight.
 - A merged one, into the branch the worker authors against
   (`TAUCETI_BASE_BRANCH`, default `main`), marks it done, unless its marker also says `"partial":true` or
-  the item's `partial:` clause names the pull request. A pull request Bors
-  landed, closed under a `[Merged by Bors] - ` title, counts as merged.
+  the item's `partial:` clause names the pull request. A pull request closed by the queue counts only with verified landing evidence
+  on the configured base branch. A `[Merged by Bors] - ` title is only a hint:
+  on GitHub the queue App’s canonical landing record must name an ancestor of
+  the base; on Forgejo that landed commit must also bind the exact forge,
+  repository ID and PR in its queue trailers and contain a nonempty change.
+  Missing or forged proof never unlocks dependent work. For older queue
+  landings without verifiable records, an operator can explicitly mark `[x]`.
+  Native comparisons exceeding the client’s response bound also establish no
+  completion; they do not stall the whole source. Per-item searches remain bounded
+  (30 matching PRs), so exceptionally long partial-PR histories may likewise need
+  an explicit operator completion. Source response bounds remain enforced.
 
 The overlay only moves an item forward: `[x]` in the file stays done and `[~]`
 stays in flight until the file changes. The merged side reads, on each forge,
@@ -82,9 +94,13 @@ the 200 most recent pull requests merged into the base branch that carry a targe
 the most recently updated, on Forgejo the most recently created among the closed
 pull requests its client's page bound reaches). A marker counts whatever the
 spacing of its JSON. An older
-landing is still found before its item is assigned again (see below), but it
-no longer unlocks the items that need it, so tick an item `[x]` in the file to
-make its landing permanent.
+landing is searched by item before eligibility is computed for any unresolved
+prerequisite, so it continues to unlock dependent items after leaving this recent
+window. Candidate items are also checked before assignment. These reads preserve
+partial-marker, explicit `partial:` and base-branch checks. Complete recent
+listings avoid these per-item reads, and completed/in-flight items do not trigger
+searches for their own prerequisites. Ticking `[x]` in the
+file records an operator completion and avoids repeated historical lookups.
 
 ## Selection
 
@@ -129,7 +145,8 @@ read, still author nothing. Off by default; without a list it does nothing.
 
 A roadmap round under a list costs, on each forge it reads, one listing of
 open pull requests, one search for recent landings, and one search per candidate
-tried, plus one claim push per candidate. The GitHub searches are shared
+tried, plus one item search per unresolved prerequisite missing from the recent
+landings, and one claim push per candidate. The GitHub searches are shared
 between workers of one account on a host for two minutes.
 
 ## What the agent sees
@@ -148,3 +165,35 @@ marker; in a Forgejo round its `gh pr create` goes through the source-bound
 While an authoring round runs, the worker's runtime status file carries
 `roadmap_target`, the item as `<Area>/<slug>`. The loop clears it between
 rounds. An open-work round leaves it empty and says why in `target`.
+
+## Fleet inspection contract
+
+`tauceti _targets-inspect --file /absolute/path/targets.md` reads and validates
+the file offline and emits `tauceti-target-list/v1` JSON with canonical items,
+areas and saved-file summary counts. It performs no forge, credential or model
+reads. Invalid files exit nonzero with a diagnostic rather than a success object.
+Fleet uses this interface from a compatible Worker runtime instead of duplicating
+the grammar. Its counts describe the file; the worker round additionally overlays
+forge evidence. `_fleet-protocol` and the running manager advertise
+`targets_inspect: 1` and `roadmap_targets: 1`.
+
+## Maintenance priority
+
+A configured list also gives the account's marked pull requests priority within
+`rebase`, `fix-ci`, `fix`, and own-PR `review` queues. Complete and partial target
+markers both count when their area and id name an item in the file, including
+items marked done: their PRs may still need repair or review. Other authors'
+review positions and automatic Mathlib bump priority stay unchanged. Listed work
+never jumps across stages: an unlisted rebase still precedes a listed fix, and
+lint repair and progress reports keep their existing order. Unlisted eligible
+pull requests remain available after the listed ones.
+
+Priority uses the current source's surveyed PR inventory. For a compact GitHub
+survey, an optional mirror inventory supplies marker bodies only when the PR
+number and head match; unavailable coverage keeps the ordinary ordering without
+a direct GitHub fallback. A native source uses its own markers, so equal numbers
+on another forge do not confer priority. In a mixed-source round, stage selection
+across sources remains unchanged; the selected source's candidates are ordered
+within that stage. `--pr` still limits which candidates can run. If the file
+cannot be read or parsed, maintenance keeps its usual order and logs the reason;
+roadmap authoring retains the foundation's stricter file validation.

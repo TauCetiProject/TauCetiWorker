@@ -4,7 +4,10 @@ Description=Backstop for Tau Ceti maintenance workflow scheduling
 [Service]
 Type=oneshot
 WorkingDirectory=%h
-ExecStart=%h/.local/share/tauceti/workflow-backstop/current/bin/tauceti-workflow-backstop --repo TauCetiProject/TauCeti --state %S/tauceti/workflow-backstop/state.json --execute
+ExecStart=%h/.local/share/tauceti/workflow-backstop/current/bin/tauceti-workflow-backstop --repo TauCetiProject/TauCeti --state %S/tauceti/workflow-backstop/state.json --github-app-dir %d --execute
+# The queue App's key reaches the sandbox through systemd's private credentials directory (%d).
+LoadCredential=github-app.json:%h/.config/tauceti-queue/github-app.json
+LoadCredential=github-private-key.pem:%h/.config/tauceti-queue/github-private-key.pem
 Environment=PATH=%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
 StateDirectory=tauceti/workflow-backstop
 StateDirectoryMode=0700

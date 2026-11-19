@@ -7,12 +7,25 @@ from collections.abc import Callable
 
 from .store import Store, dumps
 
+# `inputs.urgent` of an input with an emergency request (`Controller.URGENT_EMERGENCY`).
+URGENT_EMERGENCY = 2
+
 
 class AdmissionState:
-    def __init__(self, store: Store, repository: str, *, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        store: Store,
+        repository: str,
+        *,
+        clock: Callable[[], float] = time.time,
+        inputs: tuple[str, str] | None = None,
+    ):
+        """`inputs` names the controller's `inputs` rows this ledger's PRs are: their repository and
+        `source_identity`. By default those of a GitHub ledger, `(repository, "")`."""
         self.store = store
         self.repository = repository
         self.clock = clock
+        self.inputs = inputs or (repository, "")
         self.resource_key = f"state:admission_resources:{repository}"
         self._recheck_turn = False
 
@@ -85,6 +98,14 @@ class AdmissionState:
     def _pending_query(self, columns="a.*"):
         # A shared resource wait is one deadline, not a new failed attempt for every PR.
         # Urgent revocations use essential priority and may bypass the background quota floor.
+        # `emergency`: the PR's live input carries an emergency request, which waits on this
+        # evaluation before its batch can be built, so it goes ahead of all other pending work.
+        # Uncorrelated, so it is evaluated once per query rather than once per pending PR.
+        emergency = (
+            "a.number IN (SELECT e.number FROM inputs e WHERE e.repository=? AND e.source_identity=? "
+            "AND e.state IN ('waiting','reserved','inserted') "
+            f"AND e.urgent={URGENT_EMERGENCY} AND json_extract(e.evidence,'$.emergency') IS NOT NULL)"
+        )
         ready = (
             "CASE WHEN a.urgent=1 AND a.retry_resource LIKE '%:background' "
             "AND EXISTS(SELECT 1 FROM inputs i WHERE i.repository=a.repository "
@@ -92,18 +113,18 @@ class AdmissionState:
             "ELSE MAX(a.next_attempt_at,COALESCE(d.value,0)) END"
         )
         query = (
-            f"SELECT {columns}, {ready} AS ready_at FROM admission_work a "
+            f"SELECT {columns}, {ready} AS ready_at, {emergency} AS emergency FROM admission_work a "
             "LEFT JOIN json_each(?) d ON d.key=a.retry_resource "
             "WHERE a.repository=? AND a.generation!=a.evaluated_generation "
         )
-        return query, (dumps(self.store.get_setting(self.resource_key, {})), self.repository)
+        return query, (*self.inputs, dumps(self.store.get_setting(self.resource_key, {})), self.repository)
 
     def due(self) -> list[dict]:
         """A finite current generation; no PR-count ceiling and no lifetime retry limit."""
         query, params = self._pending_query()
         return self.store.query(
             query
-            + "AND ready_at<=? ORDER BY a.urgent DESC,a.recheck,"
+            + "AND ready_at<=? ORDER BY emergency DESC,a.urgent DESC,a.recheck,"
             + "COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id",
             (*params, self.clock()),
         )
@@ -117,16 +138,17 @@ class AdmissionState:
         place; failures, and source changes after an attempt, rejoin at the current time, while a
         change before any attempt keeps the place. Alternating priority and FIFO selections give
         both revocations and ordinary pending PRs service under continuing traffic. Real changes and
-        periodic rechecks likewise take turns, so neither starves the other.
+        periodic rechecks likewise take turns, so neither starves the other. A PR whose emergency
+        request waits on admission comes before all of these, in every selection.
         """
-        order = "a.urgent DESC, " if prefer_urgent else ""
+        order = "emergency DESC, " + ("a.urgent DESC, " if prefer_urgent else "")
         if not urgent_only:
             order += "a.recheck DESC, " if self._recheck_turn else "a.recheck, "
         query, params = self._pending_query()
         rows = self.store.query(
             query
             + "AND ready_at<=? "
-            + ("AND a.urgent=1 " if urgent_only else "")
+            + ("AND (a.urgent=1 OR emergency) " if urgent_only else "")
             + f"ORDER BY {order}COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id LIMIT 1",
             (*params, self.clock()),
         )

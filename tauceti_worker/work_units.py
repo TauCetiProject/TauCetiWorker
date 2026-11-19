@@ -424,6 +424,63 @@ def focus_prs(sv: Survey, opts) -> None:
             log(f"  --pr #{pr}: {pr_focus_reason(sv, opts, pr)}")
 
 
+def target_list_prs(w, sv, stages) -> set[int]:
+    """Listed owned PRs in stages where priority can matter; never adds discovery authority.
+
+    Ordinary/native inventories already carry parsed markers. A compact GitHub survey omits
+    bodies, so only its optional mirror inventory may fill those in, joined to the same head.
+    Missing mirror coverage keeps the usual order instead of falling back to direct GitHub.
+    """
+    path = roadmap_targets()
+    if path is None:
+        return set()
+    own = {p.number: p for p in sv.open_prs if sv.owns(p) and not p.automatic_bump}
+    competing = set()
+    for stage in stages:
+        if stage not in ("rebase", "fix-ci", "fix", "review"):
+            continue
+        numbers = {c.pr for c in sv.kind(stage).actionable} & own.keys()
+        if len(numbers) > 1:
+            competing.update(numbers)
+    if not competing:
+        return set()
+    from .targets import load_targets
+
+    try:
+        targets = load_targets(path)
+    except Die as error:
+        log(f"target list: maintenance keeps its usual order ({error})")
+        return set()
+    keys = {json.dumps([item.area, item.slug], separators=(",", ":")) for item in targets.items()}
+    markers = {number: own[number].work_targets for number in competing}
+    if (
+        not hasattr(sv, "source_actor")
+        and not getattr(sv, "target_inventory_available", False)
+        and github_state_enabled()
+    ):
+        from .github_state import read
+        from .github_transport import read_context
+        from .survey import work_target_keys
+
+        try:
+            with read_context(retry=False):
+                available, rows = read(w.gh.repo, "open_prs", _optional=True)
+        except (Die, ForgeError, OSError):
+            available, rows = False, None
+        if available:
+            for row in rows or ():
+                if (
+                    isinstance(row, dict)
+                    and type(row.get("number")) is int
+                    and row["number"] in competing
+                    and row.get("headRefOid") == own[row["number"]].head_oid
+                    and isinstance(row.get("body"), str)
+                ):
+                    number = row["number"]
+                    markers[number] = tuple(set(markers[number]) | set(work_target_keys(row["body"])))
+    return {number for number, values in markers.items() if keys.intersection(values)}
+
+
 class NoEligibleWork(NoProgress):
     """Selection exhausted its candidates without launching a paid unit."""
 
@@ -666,7 +723,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     claim_collision = False
     from .state_repair import retry_key
 
-    for stage, c in cascade(sv, [stage for stage in round_stages(opts) if want(opts.only, stage)]):
+    stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
+    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages)):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue
@@ -3105,6 +3163,12 @@ class _SharedGitHubReads:
 
         with shared_github_environment():
             return self.gh.merged_prs(search, limit=limit)
+
+    def target_queue_landed(self, number, branch):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.target_queue_landed(number, branch)
 
 
 def _target_reads(source):

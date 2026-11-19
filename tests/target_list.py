@@ -9,7 +9,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -72,21 +71,143 @@ class Format(unittest.TestCase):
         self.assertTrue(parsed.preamble.startswith("Goal: the strong law"))
         self.assertIsNone(parsed.find("second-moment-route"))
 
-    def test_unmarked_file_is_refused_and_bad_lines_are_skipped(self):
+    def test_unmarked_file_and_malformed_lines_are_refused(self):
         with self.assertRaisesRegex(tc.Die, "tauceti-targets:v1"):
             t.parse_targets("## Algebra\n- [ ] `a` — text\n")
-        with patch.object(t, "log") as log:
-            parsed = t.parse_targets(
-                "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] no slug\n- [ ] `a` - b (needs: c, `d`)\n"
-            )
-        self.assertEqual([(it.slug, it.needs) for it in parsed.items()], [("a", ("c", "d"))])
-        self.assertIn("1 malformed item line(s), first at line 3", log.call_args_list[0].args[0])
-        self.assertIn("undefined slug(s), which block nothing: c, d", log.call_args_list[1].args[0])
+        with self.assertRaisesRegex(tc.Die, "malformed item line.*line 3"):
+            t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] no slug\n- [ ] `a` - b (needs: c, `d`)\n")
         with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(tc.Die, "roadmap targets: .*absent.md"):
             t.load_targets(Path(tmp) / "absent.md")
 
+    def test_dependency_graph_is_validated_before_selection(self):
+        prefix = "<!-- tauceti-targets:v1 -->\n## Algebra\n"
+        for body, error in (
+            ("- [ ] `a` — x (needs: missing)\n", "undefined slug.*missing"),
+            ("- [ ] `a` — x\n## Topology\n- [ ] `a` — y\n", "duplicate slug.*a"),
+            ("- [ ] `a` — x (needs: a)\n", "dependency cycle"),
+            ("- [ ] `a` — x (needs: b)\n- [ ] `b` — y (needs: a)\n", "dependency cycle"),
+            ("- [ ] `` — x\n", "malformed item|invalid slug"),
+            ("- [ ] `a` — x (needs:)\n", "malformed item"),
+            ("- [ ] `a` — x (needs: none; needs: none)\n", "malformed item"),
+            *[
+                (f"- [ ] `{slug}` — x\n", "invalid slug")
+                for slug in ("a..b", "x:y", "lemma[1]", "foo.lock", "a~1", "a}", "a.")
+            ],
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(tc.Die, error):
+                t.parse_targets(prefix + body)
+
+    def test_large_valid_graph_does_not_recurse(self):
+        text = "<!-- tauceti-targets:v1 -->\n## Algebra\n- [x] `a0` — root\n"
+        text += "".join(f"- [ ] `a{i}` — item (needs: a{i - 1})\n" for i in range(1, 1200))
+        parsed = t.parse_targets(text)
+        self.assertEqual([it.slug for it in t.eligible_items(parsed, "Algebra")], ["a1"])
+
+    def test_offline_inspection_uses_canonical_parser_and_summary(self):
+        parsed = t.parse_targets(EXAMPLE)
+        info = t.describe_targets(parsed)
+        self.assertEqual(info["schema"], "tauceti-target-list/v1")
+        self.assertEqual(info["areas"], ["MeasureTheory", "Probability"])
+        self.assertEqual(info["summary"], {"total": 4, "done": 1, "inflight": 1, "eligible": 1, "blocked": 1})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "targets.md"
+            path.write_text(EXAMPLE)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), patch.object(tc, "pin_github_account", side_effect=AssertionError):
+                self.assertEqual(tc.main(["_targets-inspect", "--file", str(path)]), 0)
+            self.assertEqual(json.loads(output.getvalue()), info)
+
+    def test_console_inspection_failure_does_not_mutate_runtime_or_scripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "targets.md"
+            path.write_text("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x (needs: missing)\n")
+            output, errors = io.StringIO(), io.StringIO()
+            with (
+                patch.object(sys, "argv", ["tauceti", "_targets-inspect", "--file", str(path)]),
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(errors),
+                patch.object(tc, "_ensure_scripts_executable", side_effect=AssertionError("script mutation")),
+                patch.object(tc, "report_failure", side_effect=AssertionError("runtime mutation")),
+            ):
+                self.assertEqual(tc.cli_main(), 2)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("undefined slug", errors.getvalue())
+
 
 class LiveView(unittest.TestCase):
+    def test_unrelated_or_partial_queue_closures_do_not_spend_proof_reads(self):
+        listed = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x\n")
+        rows = [
+            {"number": i + 1, "body": marker("Algebra", f"other{i}"), "baseRefName": "main", "state": "CLOSED"}
+            for i in range(200)
+        ]
+        rows.append(
+            {"number": 300, "body": marker("Algebra", "a", partial=True), "baseRefName": "main", "state": "CLOSED"}
+        )
+        source = SimpleNamespace(target_queue_landed=Mock(return_value=True))
+        self.assertEqual(t.verified_landings(listed.items(), rows, source), {})
+        source.target_queue_landed.assert_not_called()
+        rows.append({"number": 301, "body": marker("Algebra", "a"), "baseRefName": "main", "state": "CLOSED"})
+        self.assertEqual(t.verified_landings(listed.items(), rows, source), {("Algebra", "a"): 301})
+        source.target_queue_landed.assert_called_once_with(301, "main")
+        source.target_queue_landed.reset_mock()
+        done = t.overlay_live(listed, set(), {("Algebra", "a")})
+        t.verified_landings(done.items(), rows, source)
+        source.target_queue_landed.assert_not_called()
+
+    def test_complete_recent_history_does_not_trigger_dependency_searches(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        source = SimpleNamespace(open_prs=lambda: [], merged_prs=Mock(return_value=t.MergedPRs([], complete=True)))
+        t.live_targets(listed, source)
+        source.merged_prs.assert_called_once()
+
+    def test_done_and_inflight_items_do_not_search_their_prerequisites(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        for source in (
+            github(open_bodies=[marker("Algebra", "next")]),
+            github(merged=[(7, marker("Algebra", "next"))]),
+        ):
+            source.merged_prs = Mock(wraps=source.merged_prs)
+            t.live_targets(listed, source)
+            source.merged_prs.assert_called_once()
+
+    def test_old_prerequisite_unlocks_children_on_every_read(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        source = github(
+            merged=[(500 + i, marker("Algebra", f"unrelated{i}")) for i in range(200)],
+            older=[(7, marker("Algebra", "old"))],
+        )
+        for _ in range(2):
+            live = t.live_targets(listed, source)
+            self.assertEqual(status(live), {"old": "done", "next": "open"})
+            self.assertEqual([it.slug for it in t.candidates(live, "auto", ())], ["next"])
+
+    def test_old_partial_or_other_base_does_not_unlock_children(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        for row in (
+            {"number": 7, "body": marker("Algebra", "old", partial=True), "baseRefName": "main"},
+            {"number": 7, "body": marker("Algebra", "old"), "baseRefName": "other"},
+        ):
+            source = SimpleNamespace(open_prs=lambda: [], merged_prs=lambda *a, row=row, **kw: [row])
+            live = t.live_targets(listed, source)
+            self.assertEqual(status(live)["old"], "open")
+            self.assertNotIn("next", [it.slug for it in t.eligible_items(live, "Algebra")])
+
+    def test_old_completion_from_another_source_unlocks_children(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        live = t.live_targets(listed, github(), [github(older=[(7, marker("Algebra", "old"))])])
+        self.assertEqual(status(live)["old"], "done")
+
     def test_markers(self):
         body = (
             marker("A", "x")
@@ -117,13 +238,30 @@ class LiveView(unittest.TestCase):
     def test_bors_landings_count_as_merged(self):
         rows = [
             {"number": 1, "state": "MERGED", "title": "feat: a", "body": ""},
-            {"number": 2, "state": "CLOSED", "title": "[Merged by Bors] - feat: b", "body": ""},
+            {
+                "number": 2,
+                "state": "CLOSED",
+                "title": "[Merged by Bors] - feat: b",
+                "body": marker("A", "a"),
+                "baseRefName": "main",
+            },
             {"number": 3, "state": "CLOSED", "title": "feat: c", "body": ""},
         ]
         gh = tc.GitHub("org/repo")
         gh._gh = Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr=""))
-        with patch.dict(os.environ, {"TAUCETI_GITHUB_CACHE_BYPASS": "1"}):
-            self.assertEqual([d["number"] for d in gh.merged_prs(t.MERGED_SEARCH, limit=50)], [1, 2])
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_CACHE_BYPASS": "1"}),
+            patch.object(gh, "target_queue_landed", return_value=False) as proof,
+        ):
+            found = gh.merged_prs(t.MERGED_SEARCH, limit=50)
+            self.assertEqual([d["number"] for d in found], [1, 2])
+            self.assertEqual(found[1]["state"], "CLOSED")
+            proof.assert_not_called()  # Discovery never validates unrelated target markers.
+            item = t.TargetItem("A", "a", "open", "x")
+            self.assertEqual(t.verified_landings([item], found, gh), {})
+            proof.assert_called_once_with(2, "main")
+            proof.return_value = True
+            self.assertEqual(t.verified_landings([item], found, gh), {("A", "a"): 2})
             argv = gh._gh.call_args.args[0]
             self.assertEqual(argv[argv.index("--state") + 1], "closed")
             self.assertEqual(argv[argv.index("--limit") + 1], "50")
@@ -145,8 +283,8 @@ class Selection(unittest.TestCase):
         self.assertEqual(self.slugs(landed), ["kolmogorov-zero-one", "strong-law"])
         self.assertEqual(self.slugs(landed, only="Probability", skip=["Probability"]), ["strong-law"])
         self.assertEqual(self.slugs(landed, only="any", skip=["MeasureTheory"]), ["strong-law"])
-        undefined = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — b (needs: `nowhere`)\n")
-        self.assertEqual(self.slugs(undefined), ["a"])
+        with self.assertRaisesRegex(tc.Die, "undefined slug.*nowhere"):
+            t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — b (needs: `nowhere`)\n")
         mixed = t.parse_targets(
             "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — open\n- [x] `b` — done\n- [ ] `c` — x (needs: a, `b`)\n"
         )
@@ -246,7 +384,8 @@ class Round(unittest.TestCase):
         """gh-safe-pr-create's verdict on a pull request body, with `true` standing in for gh."""
         if not (self.tmp / "bin").exists():
             (self.tmp / "bin").mkdir()
-            (self.tmp / "bin" / "gh").symlink_to(shutil.which("true"))
+            (self.tmp / "bin" / "gh").write_text("#!/bin/sh\nexit 0\n")
+            (self.tmp / "bin" / "gh").chmod(0o755)
         env = {"PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "TAUCETI_TARGET_MARKER": required}
         script = REPO / "scripts" / "gh-safe-pr-create"
         return subprocess.run([script, "--body", body], env=env, capture_output=True).returncode
@@ -257,7 +396,8 @@ class Round(unittest.TestCase):
         self.author()
         complete, partial = os.environ["TAUCETI_TARGET_MARKER"].splitlines()
         (self.tmp / "bin").mkdir()
-        (self.tmp / "bin" / "gh").symlink_to(shutil.which("true"))
+        (self.tmp / "bin" / "gh").write_text("#!/bin/sh\nexit 0\n")
+        (self.tmp / "bin" / "gh").chmod(0o755)
         script = REPO / "scripts" / "gh-safe-pr-create"
         inner = f'env PATH={self.tmp / "bin"}:"$PATH" {shlex.quote(str(script))} --body "$TCW_BODY"'
         cfg = SimpleNamespace(state=self.tmp / "state", home=self.tmp / "home", wid="w", logdir=self.tmp / "logs")
@@ -446,9 +586,14 @@ class Forgejo(unittest.TestCase):
         unmerged = dict(self.pull(7, marker("Algebra", "b"), merged=False), title="Prove b")
         self.closed = [[landed, unmerged]]
         listed = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x\n- [ ] `b` — y\n")
-        self.assertEqual(status(t.live_targets(listed, self.source)), {"a": "done", "b": "open"})
-        self.found = [[{"number": 6, "title": title, "body": landed["body"], "state": "closed"}]]
-        self.assertEqual(t.landed_pr(listed.find("a"), self.source), 6)
+        with patch.object(self.source, "target_queue_landed", return_value=False) as proof:
+            self.assertEqual(status(t.live_targets(listed, self.source)), {"a": "open", "b": "open"})
+            proof.assert_called_once_with(6, "main")
+            proof.return_value = True
+            self.source.cache.invalidate()
+            self.assertEqual(status(t.live_targets(listed, self.source)), {"a": "done", "b": "open"})
+            self.found = [[{"number": 6, "title": title, "body": landed["body"], "state": "closed"}]]
+            self.assertEqual(t.landed_pr(listed.find("a"), self.source), 6)
 
     def test_partial_clause_names_a_forgejo_pull_request_by_url(self):
         url = self.repo.pull_url(5)

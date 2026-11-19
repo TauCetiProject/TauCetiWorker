@@ -99,7 +99,12 @@ elif command == "is-active":
     sys.exit(0 if pid_of(rest[0]) else 3)
 elif command == "show":
     prop, unit = rest[1], rest[2]
-    print(pid_of(unit) if prop == "MainPID" else fragment(unit) if prop == "FragmentPath" else "")
+    if prop == "ControlGroup":
+        # where systemd put the running process: its unit's slice, under tauceti.slice when it names one
+        slice_ = None if os.environ.get("FAKE_SYSTEMD_IGNORES_SLICE") else setting(unit, "Slice")
+        print((f"/user.slice/tauceti.slice/{slice_}/{unit}" if slice_ else f"/user.slice/app.slice/{unit}") if pid_of(unit) else "")
+    else:
+        print(pid_of(unit) if prop == "MainPID" else fragment(unit) if prop == "FragmentPath" else "")
 elif command == "list-units":
     pass
 else:
@@ -348,6 +353,36 @@ class Releases(unittest.TestCase):
         log = self.run_script("install.sh", expect=1)
         self.assertIn("drop-in", log)
         self.assertFalse(self.releases.exists())
+
+    def test_repair_workers_run_in_the_low_priority_slice(self):
+        """Every repair unit the installer writes runs niced, at the lowest best-effort IO priority and in tauceti-repair.slice, below
+        the fleet's VMs; the slice is installed as it is, naming no release."""
+        self.run_script("install-repair.sh", "--wait", "10")
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        for unit in ("tauceti-queue-repair.service", "tauceti-queue-repair@2.service"):
+            self.assertEqual(self.setting(unit, "Slice"), "tauceti-repair.slice", unit)
+            self.assertEqual(self.setting(unit, "Nice"), "10", unit)
+            self.assertEqual(self.setting(unit, "IOSchedulingClass"), "best-effort", unit)
+            self.assertEqual(self.setting(unit, "IOSchedulingPriority"), "7", unit)
+        slice_unit = (self.units / "tauceti-repair.slice").read_text()
+        self.assertEqual(slice_unit, (REPO / "services/queue/tauceti-repair.slice").read_text())
+        self.assertNotIn("TauCetiQueue-releases", slice_unit, "the slice must not keep a release alive")
+        self.assertEqual(re.findall(r"^CPUWeight=(\d+)$", slice_unit, re.M), ["10"])
+        self.assertEqual(re.findall(r"^IOWeight=(\d+)$", slice_unit, re.M), ["10"])
+
+    def test_repair_install_fails_when_the_worker_is_not_in_its_slice(self):
+        self.env["FAKE_SYSTEMD_IGNORES_SLICE"] = "1"
+        log = self.run_script("install-repair.sh", "--wait", "4", expect=2)
+        self.assertIn("not tauceti-repair.slice", log)
+
+    def test_repair_slice_drop_in_is_refused(self):
+        dropins = self.units / "tauceti-repair.slice.d"
+        dropins.mkdir()
+        (dropins / "override.conf").write_text("[Slice]\nCPUWeight=100\n")
+        log = self.run_script("install-repair.sh", "--wait", "10", expect=1)
+        self.assertIn("drop-in", log)
+        self.assertFalse(self.releases.exists())
+        self.assertFalse((self.units / "tauceti-repair.slice").exists())
 
     def test_failed_fetch_stops_the_install_rather_than_using_the_cached_origin(self):
         self.origin.rename(self.root / "origin-gone")
