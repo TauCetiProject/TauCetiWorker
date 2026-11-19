@@ -306,24 +306,47 @@ def open_for_writing():
         except OSError:
             continue
         for descriptor in descriptors:
-            try:
-                info = os.stat(descriptor.path)
-            except OSError:
-                continue
-            if not stat.S_ISREG(info.st_mode):
-                continue
-            key = info.st_dev, info.st_ino
-            if key in found:
-                continue
-            try:
-                text = Path(entry.path, "fdinfo", descriptor.name).read_text()
-                flags = int(next(line.split()[1] for line in text.splitlines() if line.startswith("flags:")), 8)
-            except (OSError, StopIteration, ValueError):
-                found.add(key)
-                continue
-            if flags & (os.O_WRONLY | os.O_RDWR):
-                found.add(key)
+            opened = _descriptor(entry.path, descriptor.name)
+            if opened is not None:
+                found.add(opened)
     return found
+
+
+def _descriptor(process, fd):
+    """The `(dev, ino)` that `process`'s `fd` holds open for writing, or None.
+
+    The process keeps opening and closing files while it is scanned, so `fd` may be closed and
+    reused at any moment. Its flags are read first and only a writable fd is stat'ed; `fdinfo`'s
+    `ino` line then ties those flags to the file stat'ed, so a reused fd never charges one file's
+    flags to another (a read-only checkout output must not look busy because a lock file took
+    over its fd). A writable file whose fd moved on was closed during the scan, like any file
+    closed just before it. Flags that cannot be read count as writable.
+    """
+    try:
+        text = Path(process, "fdinfo", fd).read_text()
+    except FileNotFoundError:
+        return None  # Closed since the fd was listed.
+    except OSError:
+        text = ""
+    fields = {}
+    for line in text.splitlines():
+        field, _, value = line.partition(":")
+        fields.setdefault(field.strip(), value.strip())
+    try:
+        flags = int(fields["flags"], 8)
+    except (KeyError, ValueError):
+        flags = None
+    if flags is not None and not flags & (os.O_WRONLY | os.O_RDWR):
+        return None
+    try:
+        info = os.stat(os.path.join(process, "fd", fd))
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    if "ino" in fields and fields["ino"] != str(info.st_ino):
+        return None  # Reused for another file after its flags were read.
+    return info.st_dev, info.st_ino
 
 
 def probe(checkout, private_store, directory, *, prefix=(), env=None):
