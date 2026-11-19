@@ -53,7 +53,8 @@ Evicted members wait again at their original age with their approvals.
 Forgejo refuses every push while a broken ref exists, and git cannot delete one remotely. Someone
 with root on the server (Joscha or Sebastian in November) pastes the block `check` printed. It
 runs in a subshell with `set -e`, changes to the repository directory
-(`/var/lib/forgejo/repositories/taucetiproject/tauceti.git`; override with `check --server-path`)
+(`/var/lib/forgejo/repositories/taucetiproject/tauceti.git`, derived from the repository or the
+`--fork`; override with `check --server-path`)
 and stops at the first failure. It removes the listed broken refs (shell-quoted) and any empty
 loose ref files, moves an empty `packed-refs` aside, and shows `git for-each-ref` and
 `git fsck --connectivity-only` output.

@@ -135,11 +135,14 @@ class Target:
         return self.fork.split("/", 1)[0] if self.fork else None
 
     @property
-    def url(self) -> str:
+    def full_name(self) -> str:
         if not self.fork:
-            return f"{self.base_url}/{self.repository}.git"
-        full = self.fork if "/" in self.fork else f"{self.fork}/{self.repository.split('/', 1)[1]}"
-        return f"{self.base_url}/{full}.git"
+            return self.repository
+        return self.fork if "/" in self.fork else f"{self.fork}/{self.repository.split('/', 1)[1]}"
+
+    @property
+    def url(self) -> str:
+        return f"{self.base_url}/{self.full_name}.git"
 
     @property
     def mirror_prefix(self) -> str:
@@ -200,7 +203,8 @@ def cmd_check(args) -> int:
         say("Forgejo refuses pushes while broken refs exist. As root (or the Forgejo service user) on the")
         say("server, paste this block; it stops at the first failure:")
         say()
-        for line in root_commands(args.server_path, broken):
+        server_path = args.server_path or f"/var/lib/forgejo/repositories/{target.full_name.lower()}.git"
+        for line in root_commands(server_path, broken):
             say(f"  {line}")
         say()
         say("Then rerun check; once it reports no broken refs, run restore.")
@@ -557,17 +561,19 @@ def verify(args, target: Target, items: list[Item]) -> int:
                         f"  PR #{pull['number']}: branch {head.get('ref')} was not restored (no copy found or excluded)"
                     )
                 continue
-            if item.status in ("exists-different", "missing-object"):
-                continue
+            if item.status == "missing-object":
+                continue  # already counted
+            # A ref left as found must show the SHA it was found at.
+            expected = item.detail.get("remote") if item.status == "exists-different" else item.sha
             checked += 1
             pull_head = remote.get(f"refs/pull/{pull['number']}/head")
-            if head.get("sha") != item.sha:
+            if head.get("sha") != expected:
                 wrong += 1
                 if wrong <= 30:
-                    say(f"  PR #{pull['number']}: api head {head.get('sha')}, planned {item.sha}")
-            elif pull_head != item.sha:
+                    say(f"  PR #{pull['number']}: api head {head.get('sha')}, expected {expected}")
+            elif pull_head != expected:
                 lagging += 1
-        say(f"open PRs: {checked - wrong}/{checked} base-repository PRs show the planned head in the API")
+        say(f"open PRs: {checked - wrong}/{checked} base-repository PRs show the expected head in the API")
         if lagging:
             say(f"  {lagging} of them have no matching refs/pull/N/head yet; Forgejo rewrites it after a push")
         if unplanned:
@@ -596,7 +602,10 @@ def parse(argv):
     parser.add_argument("--results", default="~/.local/share/tauceti-forgejo-mirror/restore-results.json")
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check", help="report broken refs and print the root commands that clear them")
-    check.add_argument("--server-path", default="/var/lib/forgejo/repositories/taucetiproject/tauceti.git")
+    check.add_argument(
+        "--server-path",
+        help="repository directory on the server (default: /var/lib/forgejo/repositories/<owner>/<name>.git)",
+    )
     restore = sub.add_parser("restore", help="plan, and with --execute push, the missing refs")
     restore.add_argument("--execute", action="store_true", help="push (default: dry run)")
     restore.add_argument("--mirror", default="~/.local/share/tauceti-forgejo-mirror/TauCeti.git")

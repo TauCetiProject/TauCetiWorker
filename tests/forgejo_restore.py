@@ -176,7 +176,7 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(refs(self.target), self.expected())
         self.assertTrue(all(item["status"] == "pushed" for item in self.results().values()))
-        self.assertIn("2/2 base-repository PRs show the planned head", out)
+        self.assertIn("2/2 base-repository PRs show the expected head", out)
         # Rerunning is harmless: everything is present.
         code, out = self.run_restore("--execute")
         self.assertEqual(code, 0, out)
@@ -195,7 +195,11 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(plan["refs/heads/roadmap/b"]["status"], "exists-different")
         self.assertEqual(plan["refs/heads/roadmap/c"]["status"], "present")
         self.assertIn("exists-different", out)
+        self.pulls.append(self.pull(12, "roadmap/b", other))
         self.assertEqual(self.run_restore(command="verify")[0], 0)
+        self.pulls[-1]["head"]["sha"] = ""  # Forgejo has not recomputed the PR yet
+        self.assertEqual(self.run_restore(command="verify")[0], 1)
+        self.pulls[-1]["head"]["sha"] = other
         git(self.target, "update-ref", "-d", "refs/heads/roadmap/b")
         code, out = self.run_restore(command="verify")
         self.assertEqual(code, 1)
@@ -276,7 +280,7 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("main MISSING", out)
         self.assertIn("rm -f -- refs/heads/tauceti-ci/x/candidate refs/tauceti-claims/v2/abc", out)
-        self.assertIn("cd -- /var/lib/forgejo/repositories/taucetiproject/tauceti.git", out)
+        self.assertIn("cd -- /var/lib/forgejo/repositories/org/tauceti.git", out)
         self.assertIn("find refs -type f -empty -delete", out)
         # restore refuses while the server still has broken refs
         with mock.patch.object(restore, "ls_remote", lambda *args, **kw: broken):
@@ -284,6 +288,11 @@ class RestoreTests(unittest.TestCase):
         self.put(self.target, "refs/heads/main", self.main)
         code, out = self.run_restore(command="check")
         self.assertEqual(code, 0, out)
+        # A fork's commands enter the fork's directory.
+        with mock.patch.object(restore, "ls_remote", lambda *args, **kw: broken):
+            code, out = self.run_restore(command="check", fork="alice/Other")
+        self.assertIn("cd -- /var/lib/forgejo/repositories/alice/other.git", out)
+        self.assertNotIn("org/tauceti.git", out)
 
     def test_root_commands_quote_ref_names_and_stop_on_failure(self):
         lines = restore.root_commands("/srv/repo dir", ["refs/heads/a;id"])
