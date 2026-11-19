@@ -269,10 +269,10 @@ def observe(targets: Targets, read: list[Source]) -> Seen:
 
 def _git(path: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
     """Git in the list's clone, with the operator's identity, credentials and hooks even inside a
-    source's activation. Paths are literal, so a list named like a glob names only itself."""
+    source's activation."""
     from .worker_sources import operator_environment
 
-    argv = ["git", "--literal-pathspecs", "-C", str(path.parent), *args]
+    argv = ["git", "-C", str(path.parent), *args]
     try:
         return subprocess.run(
             argv,
@@ -285,8 +285,13 @@ def _git(path: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProc
         return subprocess.CompletedProcess(argv, 124, "", str(error))
 
 
+def _spec(path: Path) -> str:
+    """The list as a pathspec that matches its own name only, whatever glob characters it holds."""
+    return f":(literal){path.name}"
+
+
 def _tracked(path: Path) -> bool:
-    return _git(path, "ls-files", "--error-unmatch", "--", path.name).returncode == 0
+    return _git(path, "ls-files", "--error-unmatch", "--", _spec(path)).returncode == 0
 
 
 def _upstream(path: Path) -> tuple[str, str] | None:
@@ -418,7 +423,7 @@ def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
         return None
     if tracked and merged != theirs:
         message = f"Reconcile {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
-        committed = _git(path, "commit", "-q", "-m", message, "--", path.name)
+        committed = _git(path, "commit", "-q", "-m", message, "--", _spec(path))
         if committed.returncode != 0:
             log(
                 f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); the edit waits for a later look"

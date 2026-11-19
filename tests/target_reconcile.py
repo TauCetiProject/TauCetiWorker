@@ -306,6 +306,15 @@ class Publish(Tmp):
         self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets1.md")
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets1.md"), "notes")
 
+    def test_a_commit_hook_keeps_its_own_glob_matching(self):
+        first = self.clone("first")
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\n[ -z \"$(git diff --cached --name-only -- '*.md')\" ] || exit 1\n")
+        hook.chmod(0o755)
+        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
+        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", EXAMPLE)
+
     def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
         from tauceti_worker.source_identity import SourceActor
         from tauceti_worker.worker_sources import activate
