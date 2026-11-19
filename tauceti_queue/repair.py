@@ -1872,13 +1872,17 @@ def _editing_section(context: PromptContext, chain: list[ChainCommit], base_shor
 def _review_size_section(check_command: str | None) -> list[str]:
     """What a `policy` finding (staging's member review-size policy) asks of the repair."""
     ci_git = diff_guard.ci_git
+    # TauCetiTools split the shared line cap into added and removed caps; read either layout so
+    # this prompt works against TauCetiTools on both sides of that change.
+    added_cap = getattr(ci_git, "REVIEW_ADDED_LINE_CAP", None) or ci_git.REVIEW_LINE_CAP
+    removed_cap = getattr(ci_git, "REVIEW_REMOVED_LINE_CAP", None) or ci_git.REVIEW_LINE_CAP
     lines = [
         "## The review-size policy",
         "",
         "The `policy` findings above are staging's member review-size policy, not a build error. It measures each "
         "member's commit as it sits in this chain against that commit's parent, that is the diff that lands for "
         f"the member, with PR CI's caps: a new Lean file at most {ci_git.NEW_FILE_LINE_CAP} lines, and at most "
-        f"{ci_git.REVIEW_LINE_CAP} added lines, {ci_git.REVIEW_LINE_CAP} removed lines and {ci_git.REVIEW_FILE_CAP} "
+        f"{added_cap} added lines, {removed_cap} removed lines and {ci_git.REVIEW_FILE_CAP} "
         "files per member (Lake-pin bumps are exempt from the line caps).",
         "",
         "Splitting the change inside the batch is a valid repair: for example split a too-long new file into two "
