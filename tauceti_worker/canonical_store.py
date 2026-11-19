@@ -290,7 +290,8 @@ def writers(checkout):
 def open_for_writing():
     """Every `(dev, ino)` some process of this user holds open for writing (Linux `/proc` only).
 
-    One scan per relink pass. An fd whose flags cannot be read counts as writable.
+    One scan per relink pass. An fd whose flags cannot be read counts as writable; a writable
+    inode whose fd changed under the scan is kept as `(None, ino)` (see `_descriptor`).
     """
     if not os.path.isdir("/proc/self/fd"):
         return set()
@@ -306,47 +307,76 @@ def open_for_writing():
         except OSError:
             continue
         for descriptor in descriptors:
-            opened = _descriptor(entry.path, descriptor.name)
-            if opened is not None:
-                found.add(opened)
+            found |= _descriptor(entry.path, descriptor.name)
     return found
 
 
-def _descriptor(process, fd):
-    """The `(dev, ino)` that `process`'s `fd` holds open for writing, or None.
-
-    The process keeps opening and closing files while it is scanned, so `fd` may be closed and
-    reused at any moment. Its flags are read first and only a writable fd is stat'ed; `fdinfo`'s
-    `ino` line then ties those flags to the file stat'ed, so a reused fd never charges one file's
-    flags to another (a read-only checkout output must not look busy because a lock file took
-    over its fd). A writable file whose fd moved on was closed during the scan, like any file
-    closed just before it. Flags that cannot be read count as writable.
-    """
+def _fdinfo(process, fd):
+    """`fd`'s `fdinfo` fields, `None` if the fd is closed, `{}` if they cannot be read."""
     try:
         text = Path(process, "fdinfo", fd).read_text()
     except FileNotFoundError:
-        return None  # Closed since the fd was listed.
+        return None
     except OSError:
-        text = ""
+        return {}
     fields = {}
     for line in text.splitlines():
         field, _, value = line.partition(":")
         fields.setdefault(field.strip(), value.strip())
-    try:
-        flags = int(fields["flags"], 8)
-    except (KeyError, ValueError):
-        flags = None
-    if flags is not None and not flags & (os.O_WRONLY | os.O_RDWR):
-        return None
-    try:
-        info = os.stat(os.path.join(process, "fd", fd))
-    except OSError:
-        return None
-    if not stat.S_ISREG(info.st_mode):
-        return None
-    if "ino" in fields and fields["ino"] != str(info.st_ino):
-        return None  # Reused for another file after its flags were read.
-    return info.st_dev, info.st_ino
+    return fields
+
+
+def _descriptor(process, fd):
+    """The `(dev, ino)` keys that `process`'s `fd` holds open for writing (usually none or one).
+
+    The process keeps opening, closing and `dup2`ing descriptors while it is scanned, so `fd` may
+    name another file between two looks at it. Its flags are read first, and only a writable fd
+    is stat'ed, to tell a file from a pipe or socket. The stat is trusted only if `fdinfo` reads the same flags, mount and `ino` on both
+    sides of it and that `ino` is the stat's: a reused fd never charges one file's flags to
+    another (a read-only checkout output must not look busy because a lock file took over its
+    fd). A writable inode is kept as `(None, ino)`, which `Guard.busy` matches on any device:
+    `fdinfo` names no device, and a writable inode whose fd keeps changing or closes may still be
+    open through another fd. Flags that cannot be read count as writable. Like any snapshot, a
+    writer moved to an already-scanned fd before this fd is first read is not seen; the guard's
+    fingerprint re-check still catches a writer that writes.
+    """
+    found = set()
+    path = os.path.join(process, "fd", fd)
+    for _ in range(3):
+        before = _fdinfo(process, fd)
+        if before is None:
+            return found  # Closed: nothing more to learn from this fd.
+        try:
+            flags = int(before["flags"], 8)
+        except (KeyError, ValueError):
+            flags = None
+        if flags is not None and not flags & (os.O_WRONLY | os.O_RDWR):
+            return found
+        ino = before.get("ino", "")
+        wildcard = (None, int(ino)) if ino.isdigit() else None
+        fresh = wildcard is not None and wildcard not in found  # Not an earlier look's evidence.
+        if wildcard is not None:
+            found.add(wildcard)
+        try:
+            info = os.stat(path)
+        except OSError:
+            return found
+        if not ino.isdigit():
+            # Flags unreadable or no `ino` line (older kernels): count the file stat'ed.
+            if stat.S_ISREG(info.st_mode):
+                found.add((info.st_dev, info.st_ino))
+            return found
+        after = _fdinfo(process, fd)
+        stable = after is not None and all(after.get(k) == before.get(k) for k in ("flags", "mnt_id", "ino"))
+        if stable and int(ino) == info.st_ino:
+            # A regular file keeps its any-device key: the fd could still have named a file on
+            # another device with this inode number at the stat (A, B, A between the reads).
+            # Pipes and sockets are dropped, so their inode numbers never make outputs busy; only
+            # an A, pipe, A swap with a pipe of A's inode number between the reads defeats this.
+            if fresh and not stat.S_ISREG(info.st_mode):
+                found.discard(wildcard)
+            return found
+    return found
 
 
 def probe(checkout, private_store, directory, *, prefix=(), env=None):
@@ -430,7 +460,7 @@ class Guard:
 
     def busy(self, info):
         key = info.st_dev, info.st_ino
-        return key in self.opened or key in self.writable
+        return key in self.opened or key in self.writable or (None, info.st_ino) in self.writable
 
     def idle(self, *pairs, recent_ok=False):
         """True if every `(path, inspected_info)` is quiescent right now."""
@@ -687,7 +717,7 @@ class Pass:
             except FileNotFoundError:
                 canonical_info = None
             if canonical_info is not None:
-                if (canonical_info.st_dev, canonical_info.st_ino) in self.writable:
+                if self.guard.busy(canonical_info):
                     self.count("deferred_busy")  # Neither trusted nor re-recorded while writable.
                     return
                 sha, size, intact = expected(self.directory, name, self.deadline)

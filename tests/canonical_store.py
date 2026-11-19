@@ -773,7 +773,7 @@ class Canonical(unittest.TestCase):
         self.assertEqual(report["published_local"], len(found) - 2)
 
     def test_a_reused_descriptor_never_charges_its_flags_to_another_file(self):
-        # A fake /proc/<pid>: its fd may close and be reused between the fdinfo read and the stat.
+        # A fake /proc/<pid>: its fd may change between the fdinfo read and the stat.
         process = self.root / "proc"
         (process / "fd").mkdir(parents=True)
         (process / "fdinfo").mkdir()
@@ -788,15 +788,54 @@ class Canonical(unittest.TestCase):
             (process / "fdinfo/7").write_text(f"pos:\t0\nflags:\t{flags}\nmnt_id:\t1\nino:\t{ino}\n")
             return canonical._descriptor(str(process), "7")
 
-        self.assertIsNone(fd(output, "0100000", output.stat().st_ino))  # Read-only.
-        self.assertEqual(fd(output, "0100002", output.stat().st_ino), key)  # Writable.
+        self.assertEqual(fd(output, "0100000", output.stat().st_ino), set())  # Read-only.
+        self.assertEqual(fd(output, "0100002", output.stat().st_ino), {(None, key[1])})  # Writable.
         # A lock file opened for writing held the fd when its flags were read; by the stat the fd
-        # names the read-only output, which must not look busy.
-        self.assertIsNone(fd(output, "0100002", lock.stat().st_ino))
+        # names the read-only output, which must not look busy. The lock may still be open
+        # elsewhere (`dup2`), so it stays busy by inode.
+        found = fd(output, "0100002", lock.stat().st_ino)
+        self.assertEqual(found, {(None, lock.stat().st_ino)})
+        self.assertFalse(canonical.Guard(writable=found).busy(output.stat()))
+        (process / "fd/7").unlink()  # Writable, then closed before the stat: still busy by inode.
+        self.assertEqual(canonical._descriptor(str(process), "7"), {(None, lock.stat().st_ino)})
+        self.assertEqual(fd(output, "0100002", ""), {key})  # No `ino` line (older kernels): as before.
         (process / "fdinfo/7").write_text("pos:\t0\n")  # Flags unknown: counts as writable.
-        self.assertEqual(canonical._descriptor(str(process), "7"), key)
+        self.assertEqual(canonical._descriptor(str(process), "7"), {key})
         (process / "fdinfo/7").unlink()  # Closed since listed.
-        self.assertIsNone(canonical._descriptor(str(process), "7"))
+        self.assertEqual(canonical._descriptor(str(process), "7"), set())
+        # Both fdinfo reads name writable A, but at the stat the fd named B, on another device with
+        # the same inode number: A stays busy wherever it lives.
+        fd(output, "0100002", key[1])
+        other = SimpleNamespace(st_dev=key[0] + 1, st_ino=key[1], st_mode=stat.S_IFREG | 0o444)
+        with patch.object(canonical.os, "stat", lambda path: other):
+            found = canonical._descriptor(str(process), "7")
+        self.assertTrue(canonical.Guard(writable=found).busy(SimpleNamespace(st_dev=key[0], st_ino=key[1])))
+        # A pipe or socket's inode number never makes a file busy.
+        pipe = SimpleNamespace(st_dev=key[0], st_ino=key[1], st_mode=stat.S_IFIFO | 0o600)
+        with patch.object(canonical.os, "stat", lambda path: pipe):
+            self.assertEqual(canonical._descriptor(str(process), "7"), set())
+        guard = canonical.Guard(writable={(None, lock.stat().st_ino)})
+        self.assertTrue(guard.busy(lock.stat()))
+        self.assertFalse(guard.busy(output.stat()))
+
+    def test_a_writer_handed_to_an_already_scanned_descriptor_stays_busy(self):
+        output = self.root / "A.olean"
+        output.write_bytes(b"being written")
+        writer = os.open(output, os.O_WRONLY)
+        spare = os.open(os.devnull, os.O_RDONLY)
+        self.addCleanup(os.close, spare)
+        fdinfo = canonical.Path.read_text
+
+        def hand_off(path, *args, **kwargs):
+            text = fdinfo(path, *args, **kwargs)
+            if path.name == str(writer):
+                os.dup2(writer, spare)  # The writer moves to a descriptor already scanned...
+                os.close(writer)  # ...and this one closes before the stat.
+            return text
+
+        with patch.object(canonical.Path, "read_text", hand_off):
+            found = canonical._descriptor(f"/proc/{os.getpid()}", str(writer))
+        self.assertTrue(canonical.Guard(writable=set(found)).busy(output.stat()))
 
     def test_budget_and_host_slots_bound_relinking_and_it_resumes(self):
         modules = [f"TauCeti.M{i}" for i in range(4)]
