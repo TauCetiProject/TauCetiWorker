@@ -6,7 +6,9 @@ import argparse
 import contextlib
 import datetime as dt
 import fcntl
+import functools
 import json
+import os
 import re
 import subprocess
 import time
@@ -48,17 +50,71 @@ def repository_name(value: str) -> str:
     return value
 
 
+# An App installation token for the backstop reads workflows and runs and dispatches them.
+APP_PERMISSIONS = {"actions": "write", "metadata": "read"}
+
+
+def app_tokens(directory: Path, repository_id: int | None):
+    """Installation tokens from App credentials in ``directory``, restricted to the backstop's needs.
+
+    The directory holds ``github-app.json`` and ``github-private-key.pem``. A pinned repository ID
+    narrows each token to that repository; before the first execution pins it, the token is limited
+    only by APP_PERMISSIONS and the installation's repository selection.
+    """
+    from tauceti_queue import github_app
+    from tauceti_queue.github_adapter import UrllibTransport
+
+    try:
+        credentials = github_app.load_execution_credentials(directory)
+        return github_app.InstallationTokenSource(
+            credentials, UrllibTransport(timeout=45), repository_id=repository_id, permissions=APP_PERMISSIONS
+        )
+    except (OSError, ValueError, github_app.CredentialsError) as exc:
+        raise ObservationError(f"GitHub App credentials unavailable: {type(exc).__name__}") from None
+
+
 class GitHub:
-    """Bounded gh transport using the existing authenticated operator account."""
+    """Bounded gh transport using the ambient gh account, or App installation tokens if given.
 
-    def __init__(self, repo: str):
+    ``tokens`` maps a repository ID (or None before identity is known) to a token source. The
+    first repository read narrows an unpinned source to the repository it observed.
+    """
+
+    def __init__(self, repo: str, tokens=None, repository_id: int | None = None):
         self.repo = repository_name(repo)
+        self.tokens = tokens
+        self.repository_id = repository_id
+        self.source = None
 
-    @staticmethod
-    def command(*args: str) -> str:
-        """Run one gh request with a 45-second bound, returning stdout or an observation error."""
+    def environment(self) -> dict[str, str] | None:
+        """The gh environment: inherited, or carrying a fresh installation token with no fallback."""
+        if self.tokens is None:
+            return None
+        from tauceti_queue.github_app import CredentialsError
+
         try:
-            result = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=45)
+            if self.source is None:
+                self.source = self.tokens(self.repository_id)
+            token = self.source.token()
+        except (CredentialsError, OSError, ValueError) as exc:
+            raise ObservationError(f"GitHub App token unavailable: {exc}"[:500]) from None
+        # gh treats an empty GH_TOKEN as unset and would fall back to stored credentials.
+        if not isinstance(token, str) or not token or not all(33 <= ord(char) <= 126 for char in token):
+            raise ObservationError("GitHub App returned an invalid installation token")
+        # Pin github.com so a configured enterprise host cannot select other credentials.
+        environment = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST")
+        }
+        environment.update(GH_TOKEN=token, GH_HOST="github.com")
+        return environment
+
+    def command(self, *args: str) -> str:
+        """Run one gh request with a 45-second bound, returning stdout or an observation error."""
+        environment = self.environment()
+        try:
+            result = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=45, env=environment)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ObservationError(f"GitHub command unavailable: {type(exc).__name__}") from None
         if result.returncode:
@@ -80,7 +136,11 @@ class GitHub:
 
     def repository(self) -> dict:
         """Read repository identity, default branch, and admission state."""
-        return self.read(f"repos/{self.repo}")
+        value = self.read(f"repos/{self.repo}")
+        if self.tokens is not None and self.repository_id is None and type(value.get("id")) is int:
+            # Later requests in this cycle use tokens restricted to the observed repository.
+            self.repository_id, self.source = value["id"], None
+        return value
 
     def workflow(self, name: str) -> dict:
         """Read whether the named workflow remains enabled."""
@@ -274,6 +334,12 @@ def main(argv=None) -> int:
     parser.add_argument("--state", required=True, type=Path)
     parser.add_argument("--execute", action="store_true", help="dispatch overdue workflows; default is a preview")
     parser.add_argument("--include-alerts", action="store_true", help="also permit the existing Zulip alert reconciler")
+    parser.add_argument(
+        "--github-app-dir",
+        type=Path,
+        help="authenticate gh with an installation token from this App credential directory "
+        "(github-app.json, github-private-key.pem) instead of the ambient gh account",
+    )
     args = parser.parse_args(argv)
     try:
         with contextlib.ExitStack() as stack:
@@ -286,8 +352,11 @@ def main(argv=None) -> int:
                     print(json.dumps({"decision": "locked"}))
                     return 0
             state = load_state(args.state)
+            tokens = None
+            if args.github_app_dir is not None:
+                tokens = functools.partial(app_tokens, args.github_app_dir)
             rows = reconcile(
-                GitHub(args.repo),
+                GitHub(args.repo, tokens, state["repo_id"]),
                 state,
                 execute=args.execute,
                 include_alerts=args.include_alerts,
