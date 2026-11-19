@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -2733,6 +2734,75 @@ class NoRepair(ControllerCase):
         self.assertIn("could not attribute the change to another PR, file or finding", body)
         self.assertIn("> Emptied; it would not build.", body)
         self.assertEqual(self.controller.status()["anticipated"], [], "nothing to follow")
+
+
+class BlockingLabelAfterApproval(ControllerCase):
+    """A blocking label (`hold`, `wip`, ...) added to an approved PR keeps it out of batches until it goes."""
+
+    def label_event(self, number, action, name, labels, **pull):
+        self.github.labels[number] = set(labels)
+        self.controller.handle_event(
+            "pull_request",
+            {
+                "action": action,
+                "number": number,
+                "label": {"name": name},
+                "pull_request": {"number": number, "labels": [{"name": label} for label in labels], **pull},
+            },
+        )
+
+    def held(self, number):
+        row = self.controller.input_for(PROJECT, number)
+        return row["state"], json.loads(row["blocked_labels"])
+
+    def test_a_waiting_input_is_held_while_labelled_and_placed_once_it_goes(self):
+        head, result = self.approve(101, {"A.lean": "a\n"})
+        self.label_event(101, "labeled", "Hold", ["Hold"])
+        self.assertEqual(self.held(101), ("waiting", ["hold"]))
+        self.controller.tick()
+        self.assertEqual(self.controller.store.count("members"), 0, "a held input joins no batch")
+        self.assertEqual(self.controller.status()["waiting"]["inputs"][0]["blocked_labels"], ["hold"])
+        self.label_event(101, "labeled", "wip", ["Hold", "wip"])
+        self.label_event(101, "unlabeled", "Hold", ["wip"])
+        self.controller.tick()
+        self.assertEqual(self.held(101), ("waiting", ["wip"]), "wip still blocks")
+        self.label_event(101, "unlabeled", "wip", [])
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual((row["id"], row["approved_at"]), (result["input"]["id"], result["input"]["approved_at"]))
+        self.controller.tick()
+        self.assertEqual(self.held(101), ("inserted", []))
+
+    def test_a_delivery_without_a_label_list_applies_its_one_label(self):
+        self.approve(101, {"A.lean": "a\n"})
+        for action in ("labeled", "unlabeled"):
+            self.controller.handle_event(
+                "pull_request", {"action": action, "number": 101, "label": {"name": "wip"}, "pull_request": {}}
+            )
+            self.assertEqual(self.held(101), ("waiting", ["wip"] if action == "labeled" else []))
+
+    def test_a_label_arriving_during_the_probe_keeps_the_input_out(self):
+        self.approve(101, {"A.lean": "a\n"})
+        build = chain.build
+
+        def label_then_build(*args, **kwargs):
+            self.label_event(101, "labeled", "hold", ["hold"])
+            return build(*args, **kwargs)
+
+        with mock.patch.object(chain, "build", label_then_build):
+            self.controller.tick()
+        self.assertEqual(self.held(101), ("waiting", ["hold"]))
+        self.assertEqual(self.controller.store.count("members"), 0)
+
+    def test_a_member_is_not_withdrawn_by_a_blocking_label(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.label_event(101, "labeled", "hold", ["hold"])
+        self.assertEqual(self.held(101), ("inserted", ["hold"]), "kept in its batch, recorded should it return")
+
+    def test_a_delivery_for_another_head_is_ignored(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.label_event(101, "labeled", "hold", ["hold"], head={"sha": "f" * 40})
+        self.assertEqual(self.held(101), ("waiting", []))
 
 
 class EditSummary(ControllerCase):

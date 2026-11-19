@@ -777,6 +777,9 @@ class AdmissionPoller:
                             "admission_generation": work["generation"],
                         },
                     )
+            if current and current["head_sha"] == pull.head_sha:
+                # Corrects a missed label delivery, whatever this evaluation decides.
+                self.controller.note_blocking_labels(current, pull.labels)
             if current and current["head_sha"] != pull.head_sha:
                 self.controller._pull_request_event(
                     {"number": pull.number, "action": "synchronize", "pull_request": {"head": {"sha": pull.head_sha}}},

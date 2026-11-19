@@ -1593,8 +1593,10 @@ class Controller:
         current = self._input_for(number)
         if current is None:
             return
-        if action in ("labeled", "unlabeled") and self._no_repair_event(current, payload, now):
-            return
+        if action in ("labeled", "unlabeled"):
+            self._blocking_label_event(current, payload, now)
+            if self._no_repair_event(current, payload, now):
+                return
         if current["state"] == INPUT_INSERTED:
             # Scenario 21: closing, relabelling, re-reviewing a member changes nothing; the content lands.
             self.store.journal(now, "member-event-ignored", number=number, action=action, batch_id=current["batch_id"])
@@ -1621,6 +1623,60 @@ class Controller:
         elif action == "converted_to_draft":
             self.store.update("inputs", {"id": current["id"]}, state=INPUT_CANCELLED, reason="draft")
             self.store.journal(now, "withdrawn", number=number, reason="draft")
+
+    def _blocking_label_event(self, current: dict[str, Any], payload: dict[str, Any], now: float) -> None:
+        """A `labeled`/`unlabeled` delivery refreshes a live input's `blocked_labels`: from the delivery's
+        label list when it has one, else by the one label it names. A delivery for another head is
+        ignored. Deliveries can arrive out of order; with admission, the delivery also has the PR
+        evaluated again before it can be placed, and that read's labels are the ones that stand."""
+        if current["state"] not in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
+            return
+        pull = payload.get("pull_request") or {}
+        if (pull.get("head") or {}).get("sha") not in (None, current["head_sha"]):
+            return
+        if isinstance(pull.get("labels"), list):
+            labels = {str(label.get("name") if isinstance(label, dict) else label) for label in pull["labels"]}
+        else:
+            name = str((payload.get("label") or {}).get("name") or "").lower()
+            labels = set(loads(current["blocked_labels"], []))
+            if payload.get("action") == "labeled":
+                labels.add(name)
+            else:
+                labels.discard(name)
+        self.note_blocking_labels(current, labels, now)
+
+    def note_blocking_labels(self, current: dict[str, Any], labels: Any, now: float | None = None) -> None:
+        """Record which blocking labels (`BLOCKING_LABELS`) the PR of a live input carries.
+
+        `approve` refuses these labels; one added after approval keeps a waiting input out of every
+        batch (ordinary, control lane and emergency) while it stays, and the input keeps its state, age
+        and approval, so removing the label is all it takes to place it again. An inserted member stays
+        in its batch (membership is fixed); its labels are recorded so that, if the batch sends it back
+        to waiting, the hold applies. Called for label deliveries and by admission and eligibility with
+        the labels of their fresh read, so a missed delivery is corrected there."""
+        blocked = sorted({str(label).lower() for label in labels or ()} & BLOCKING_LABELS)
+        with self._lock:
+            current = self.store.row("inputs", {"id": current["id"]})
+            if current is None or current["state"] not in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
+                return
+            if blocked == loads(current["blocked_labels"], []):
+                return
+            now = self.clock() if now is None else now
+            with self.store.transaction():
+                self.store.update("inputs", {"id": current["id"]}, blocked_labels=dumps(blocked))
+                self.store.journal(
+                    now,
+                    "blocked-label" if blocked else "blocked-label-cleared",
+                    number=current["number"],
+                    head=current["head_sha"],
+                    labels=blocked,
+                )
+            self._wake.set()
+            self._refresh_snapshot()
+
+    @staticmethod
+    def _label_blocked(row: dict[str, Any]) -> bool:
+        return bool(loads(row["blocked_labels"], []))
 
     def _no_repair_event(self, current: dict[str, Any], payload: dict[str, Any], now: float) -> bool:
         """A `labeled`/`unlabeled` event that changes the PR's `no_repair` opt-out, applied to a waiting
@@ -3126,7 +3182,7 @@ class Controller:
         """`_waiting` without the inputs the active lane takes, which ordinary insertion never probes: a
         GitHub input enters an ordinary batch only once it is classified as not a control-file change
         (one approved while the tick ran is classified in the next)."""
-        rows = self._waiting()
+        rows = [row for row in self._waiting() if not self._label_blocked(row)]
         if not self.setting("forgejo_placement_enabled"):
             rows = [row for row in rows if not isinstance(row["number"], SourceNumber)]
         if not self._control_lane_active():
@@ -3195,7 +3251,7 @@ class Controller:
             return
         self._classify_control_inputs(now)
         canonical = self._canonical
-        rows = [row for row in self._waiting() if self._control_input(row)]
+        rows = [row for row in self._waiting() if self._control_input(row) and not self._label_blocked(row)]
         if canonical is None or not rows:
             return
         lane = self._lane_batch()
@@ -4136,6 +4192,14 @@ class Controller:
                     self.store.update("inputs", {"id": row["id"]}, batch_id=None)
                 self._release_claim(claim, "input-withdrawn", now)
             return False
+        if self._label_blocked(fresh):
+            # A blocking label arrived while the probe ran: it waits, unplaced, until the label goes.
+            with self.store.transaction():
+                self.store.update(
+                    "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="blocked-label"
+                )
+                self._release_claim(claim, "blocked-label", now)
+            return False
         if failure is not None:
             with self.store.transaction():
                 self.store.update(
@@ -4930,6 +4994,8 @@ class Controller:
                 continue
             if isinstance(row["number"], SourceNumber) and not self.setting("forgejo_placement_enabled"):
                 continue  # held with every Forgejo input while placement is paused; the request is kept
+            if row["state"] == INPUT_WAITING and self._label_blocked(row):
+                continue  # held while a blocking label stays; the request is kept
             if row["state"] == INPUT_WAITING:
                 return self._build_emergency(row, now)
             owner = self.store.row("batches", {"id": row["batch_id"]}) if row["batch_id"] is not None else None
@@ -10695,6 +10761,7 @@ class Controller:
             "probes": row["probes"],
             "last_probe": row["last_probe"],
             "control": self._control_input(row),
+            "blocked_labels": loads(row["blocked_labels"], []),
         }
 
     def _open_batch_summary(self, batch: dict[str, Any], now: float) -> dict[str, Any]:

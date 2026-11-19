@@ -203,6 +203,14 @@ to waiting at its original age (journal `missing-source-readmitted`, counter
 `missing_source_rechecks`), and it is probed like any waiting input, which refuses it again if a
 gap remains. The refusal comment is keyed by head, so a repeated refusal posts nothing new.
 Closing, drafting, pushing to or withdrawing a refused PR drops its refusal from the recheck.
+
+A blocking label (`hold`, `wip` and the others `approve` refuses) added to a PR whose input is
+waiting or reserved is recorded in the input's `blocked_labels` (journal `blocked-label`), from the
+`labeled` delivery or, when that was missed, from admission's or eligibility's next read of the PR.
+While it is set the input stays waiting but no batch takes it: ordinary insertion, the control lane
+and the emergency lane skip it, and a probe that was already running returns it to waiting
+(`last_probe` `blocked-label`). It keeps its approval and age, so once the labels go (journal
+`blocked-label-cleared`) it is placed like any waiting input. A batch member is not touched.
 Refusals recorded before the fingerprint existed compare against the base of the batch that
 refused them, without batches.
 

@@ -57,6 +57,10 @@ class AdmissionTests(unittest.TestCase):
             self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
         return head
 
+    def ready_statuses(self, head):
+        for context in ("build", "scope"):
+            self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
+
     def event(self, kind, payload, delivery=""):
         receiver = webhook.WebhookReceiver(self.controller, self.github, repositories=[REPO])
         return receiver.handle(webhook.Delivery(kind, delivery, {**payload, "repository": {"full_name": REPO}}))
@@ -590,6 +594,30 @@ class AdmissionTests(unittest.TestCase):
         self.controller.tick()
         self.assertEqual(self.controller.input_for(REPO, 1)["state"], "inserted")
         self.assertEqual(self.controller.status()["counters"].get("missing_source_rechecks"), 1)
+
+    def test_a_blocking_label_whose_delivery_was_missed_holds_until_it_goes(self):
+        self.ready()
+        self.intake.run_once()
+        approved = self.controller.input_for(REPO, 1)
+        self.github.labels[1] = {"wip"}  # no delivery: only admission's next read sees it
+        self.github.statuses.pop((approved["head_sha"], "scope"))  # held whatever the evaluation decides
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual((row["id"], row["state"], row["blocked_labels"]), (approved["id"], "waiting", '["wip"]'))
+        self.ready_statuses(approved["head_sha"])
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.github.labels[1] = set()
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.controller.tick()
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual(
+            (row["id"], row["state"], row["approved_at"]), (approved["id"], "inserted", approved["approved_at"])
+        )
 
     def test_manual_reapproval_clears_withdrawal_intent(self):
         head = self.ready()
