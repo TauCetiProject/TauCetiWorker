@@ -426,6 +426,15 @@ class Mixed(MixedFixture, unittest.TestCase):
         poller.run_once()
         self.assertEqual(self.native_input()["state"], "cancelled")
 
+    def test_native_insertion_is_held_while_a_blocking_label_is_on_the_pr(self):
+        poller, head = self.native_approved()
+        self.native.labels[1] = {"hold"}  # added after approval; the fixture's listed facts omit labels
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "waiting")
+        self.native.labels[1] = set()
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "inserted")
+
     def test_native_insertion_is_held_while_the_source_cannot_be_read(self):
         poller, head = self.native_approved()
 

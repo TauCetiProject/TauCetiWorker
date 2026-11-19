@@ -250,6 +250,10 @@ class NativePoller:
             self.state.observe(int(number), pull.head_sha, version, urgent=True)
             self.wake()
             return "source changed since evaluation"
+        blocked = self.controller._blocking_labels(pull)
+        if blocked:
+            # Approval refuses these labels; one added after approval keeps the head out too.
+            return "blocked-label: " + ", ".join(blocked)
         return None
 
     def run_once(self, *, reason="interval"):
