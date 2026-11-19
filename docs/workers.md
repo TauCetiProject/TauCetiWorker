@@ -702,6 +702,13 @@ action that names a different `--config` file reports the conflict instead of
 switching it.
 
 That is a systemd user service on Linux and NixOS, or a LaunchAgent on macOS.
+On Linux the service runs in `tauceti-workers.slice` and each worker moves itself
+into its own transient scope there, as Fleet workers do. Restarting the service (to
+adopt a new Worker runtime, for example) then adopts the running workers instead of
+stopping their rounds. A service installed before this change keeps its workers in the
+service itself: rerun `tauceti workers service install` and restart the service once,
+at a quiet moment, to move to scopes.
+
 Two platform caveats:
 
 - On Linux systems that stop the user manager after the last logout,
