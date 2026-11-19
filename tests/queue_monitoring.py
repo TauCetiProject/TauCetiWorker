@@ -317,6 +317,24 @@ url = "https://private.invalid"
         self.assertEqual([c["kind"] for c in value["conditions"]], ["inference_hold", "promotion_failed"])
         self.assertNotIn("secret provider token", json.dumps(value))
 
+    def test_stuck_heads_are_published_as_bounded_conditions_without_pr_detail(self):
+        now = self.clock()
+        stuck = {
+            "state": "fresh",
+            "observed_at": now - 60,
+            "count": 31,
+            "heads": [{"pr": 40000 + n, "last_push_at": now - 4 * 3600 - n} for n in range(30)],
+        }
+        alert = "31 PR heads stuck without CI or a final state for 7h (oldest 4h)"
+        value = self.export(status={"stuck_heads": stuck, "alerts": [alert]})
+        kinds = [c["kind"] for c in value["conditions"]]
+        self.assertEqual(kinds, ["stuck_heads_observed"] + ["stuck_head"] * 30 + ["stuck_heads_truncated"])
+        self.assertEqual(value["conditions"][1]["since"], monitoring.iso(now - 4 * 3600))
+        self.assertNotIn("40000", json.dumps(value["conditions"]))
+        for state in ("stale", "missing", "unconfigured"):
+            value = self.export(status={"stuck_heads": dict(stuck, state=state)})
+            self.assertEqual(value["conditions"], [])
+
     def test_unclaimed_head_task_is_distinct_from_build_silence_without_duplicate_alert(self):
         head = self.controller.status()["head"]
         value = self.export(

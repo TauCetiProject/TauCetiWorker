@@ -155,6 +155,7 @@ its source (`default`, `file`, `env:VARIABLE`, `hostname`) and the problems that
 | `database` | `~/.local/state/tauceti-queue/queue.sqlite3` | the SQLite file |
 | `credentials_dir` | `~/.config/tauceti-queue` | where the three App credential files live |
 | `log_dir` | `~/.local/state/tauceti-queue/logs` | the service's own log files |
+| `ci_recovery_report` | `~/.local/state/tauceti-ci-recovery/stuck-heads.json` | the CI recovery pass's stuck-head report, read for status and its alert ([escalation.md](escalation.md), "Stuck PR heads") |
 | `listen_host`, `listen_port` | `127.0.0.1`, `8780` | the local listen address the tunnel forwards to |
 | `public_url` | `https://queue.taucetiproject.org` | the public base; the webhook address is `<public_url>/webhook/github` |
 | `reconcile_interval_seconds` | `30` | the loop's cadence between event-driven wakeups |
