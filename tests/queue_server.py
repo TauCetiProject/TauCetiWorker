@@ -249,7 +249,7 @@ class ServerTest(unittest.TestCase):
         full = {
             "queue": {"approved_waiting": 3},
             "settings": {"insertion_age_window": 16},
-            "head": {"id": 7, "stall": None},
+            "head": {"id": 7, "stall": None, "task": {"diagnostics": ["x" * 3_000_000]}},
             "alerts": ["x"],
             "tasks": [{"diagnostics": "big"}],
             "waiting": {"inputs": []},

@@ -705,7 +705,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _status_summary(self) -> dict:
         status = self._status(wait=HEALTHZ_LOCK_WAIT_SECONDS)
-        return {key: status[key] for key in STATUS_SUMMARY_KEYS if key in status}
+        summary = {key: status[key] for key in STATUS_SUMMARY_KEYS if key in status}
+        if isinstance(summary.get("head"), dict):
+            # The head's task carries the same bulky diagnostics as `tasks`; keep its identity and stall.
+            summary["head"] = {key: summary["head"][key] for key in ("id", "stall") if key in summary["head"]}
+        return summary
 
     def _healthz(self) -> dict:
         # The liveness probe must answer within a second even while a tick holds the controller lock.
