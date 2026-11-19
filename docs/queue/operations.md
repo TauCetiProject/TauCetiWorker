@@ -838,6 +838,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `polling_interval_seconds` | `60` | integer, at least 0 |
 | `approval_poll_interval_seconds` | `900` | integer, at least 1 |
 | `github_background_floor` | `1000` | integer, at least 0; queue App requests left at which admission reads wait for the reset |
+| `admission_evidence_mode` | `off` | `off` or `shadow`; see "Admission evidence shadow" below |
 | `membership_label` | `bors-staging` | text |
 | `repaired_label` | `repaired-in-queue` | text; empty disables |
 | `insertion_probe_budget_seconds` | `20` | integer, at least 0 |
@@ -924,6 +925,20 @@ to the installation's quota; requests made with another token are never counted 
 restarting from its first request. The final fence reads current CI independently of PR timestamps.
 An approved input with a pending review change cannot be inserted until evaluation completes;
 the same check protects a replay that was already in progress when the change arrived.
+
+Admission evidence shadow (decision 38 step 4, slice 1). With `admission_evidence_mode` set to
+`shadow`, the service keeps each GitHub PR's admission evidence (head, base, labels, body, every
+comment id with the bodies of scoreboards and recovery requests, and the newest status per head
+and context) in `admission_evidence*` tables, filled from verified webhook deliveries and from each
+full read (`tauceti_queue/admission_evidence.py`). Before each full read refreshes the cache, the
+same policy evaluates the cached evidence, with the merge base and paths from the local clone, and
+`status.admission.evidence.shadow` counts the outcome: `match`, `race` (a delivery arrived during
+the read), `unseeded`, `gap` (GitHub's comment count disagrees), `merge-base-unknown`,
+`paths-unknown` or `mismatch`, with the differing fields and, for a verdict difference, its
+direction (`cache-would-admit`, `cache-would-refuse`, `cache-keeps`, `cache-revokes`); mismatches
+are also journaled as `admission-shadow`. The shadow makes no GitHub request and never changes a
+decision; `off` (the default) writes nothing. Switch it live with `tauceti-queue settings set
+admission_evidence_mode shadow`.
 
 Manual withdrawal records a separate head/authorization fence, even before the first policy
 evaluation. CI/configuration changes, incidental review edits and repeated polls cannot revive it.
