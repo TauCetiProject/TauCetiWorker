@@ -1206,6 +1206,8 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     "self_tested": 1,
                     "source_selection": 1,
                     "graceful_restart": 1,
+                    "roadmap_targets": 1,
+                    "targets_inspect": 1,
                 }
             if action == "restart":
                 wid = req.get("id")

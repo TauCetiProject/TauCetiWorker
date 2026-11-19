@@ -921,6 +921,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_workers_parser(sub)
     add_budget_parser(sub)
     sub.add_parser("_fleet-protocol", help=argparse.SUPPRESS)
+    target_info = sub.add_parser("_targets-inspect", help=argparse.SUPPRESS)
+    target_info.add_argument("--file", type=Path, required=True)
 
     # Hidden internal subcommands.
     r = sub.add_parser("_round", add_help=False)
@@ -974,6 +976,11 @@ def main(argv: list[str] | None = None) -> int:
     selected_conf, remaining = conf_argument(list(sys.argv[1:] if argv is None else argv))
     args = parser.parse_args(remaining)
     cmd = args.cmd
+    if cmd == "_targets-inspect":
+        from .targets import describe_targets, load_targets
+
+        print(json.dumps(describe_targets(load_targets(args.file)), ensure_ascii=False))
+        return 0
     if cmd in (None, "work", "_round", "status"):
         from .worker_sources import configure
 
@@ -1037,6 +1044,7 @@ def main(argv: list[str] | None = None) -> int:
                     "activity": 1,
                     "roadmap_focus": 1,
                     "roadmap_targets": 1,
+                    "targets_inspect": 1,
                     "self_tested": 1,
                     "source_selection": 1,
                     "graceful_restart": 1,
@@ -1869,6 +1877,17 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
 
 def cli_main() -> int:
     """Console-script entry point (also used by ./tauceti). Maps the worker's exceptions to exit codes."""
+    from tauceti_tools.project import conf_argument
+
+    _, arguments = conf_argument(sys.argv[1:])
+    if arguments[:1] == ["_targets-inspect"]:
+        # Fleet's offline parser must not repair installed scripts or write failure/runtime
+        # records merely because an operator is validating a proposed list.
+        try:
+            return main() or 0
+        except Die as error:
+            print(f"tauceti: {error}", file=sys.stderr)
+            return 2
     # A service has no login shell to provide NIX_SSL_CERT_FILE, and uv's standalone CPython may not
     # know the host's CA-bundle path. Repair the process environment before quota telemetry and child
     # launches; this also gives other TLS-using subprocesses the same host trust store.
