@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 
@@ -118,6 +119,7 @@ class AdmissionInputs:
 # Recent listings re-read PRs updated this long before the newest update already seen, so an update
 # whose time Forgejo recorded slightly out of order is not skipped.
 RECENT_MARGIN_SECONDS = 120
+COMMENT_FEED_PAGES = 200  # the most pages of the comment feed one pass reads
 
 
 class NativePoller:
@@ -135,6 +137,12 @@ class NativePoller:
         # (its own clock, less a margin) are listed every pass (`forgejo_recent_listing`).
         self._recent_at = 0
         self._recent_since = None
+        # Scoreboard edits do not move a Forgejo PR's update time, so between listings the
+        # repository comment feed is read too. Its position survives restarts.
+        self._comments_key = f"state:forgejo_comment_since:{self.state.repository}"
+        self._comments_since = controller.store.get_setting(self._comments_key, None)
+        self._comments_seen = {}
+        self._comments_at = 0
         self.wake = lambda: None
         configure = getattr(registry.native, "configure_admission_polling", None)
         if configure is not None:
@@ -144,7 +152,7 @@ class NativePoller:
         due = self.state.summary()["next_attempt_at"]
         next_at = self._discovery_at if due is None else min(self._discovery_at, due)
         if self._recent_enabled():
-            next_at = min(next_at, self._recent_at)
+            next_at = min(next_at, self._recent_at, self._comments_at)
         return max(0, next_at - self.controller.clock())
 
     def _recent_enabled(self):
@@ -163,7 +171,60 @@ class NativePoller:
     def _observe_listed(self, pull):
         details = pull.admission or {}
         version = self._listed_version(pull, details.get("discovery_version"))
-        self.state.observe(pull.number, pull.head_sha, version, recheck_after=details.get("recheck_seconds", 0))
+        # Facts the listing cannot see are rechecked after `forgejo_recheck_seconds`; changes it
+        # can see, and comment edits from the feed, are noticed within a pass.
+        recheck = self.controller.setting("forgejo_recheck_seconds") if details.get("recheck_seconds") else 0
+        self.state.observe(pull.number, pull.head_sha, version, recheck_after=recheck)
+
+    def _reevaluate(self, work, *, urgent=False):
+        """Evaluate a PR again for evidence its listed facts do not show, keeping those facts:
+        they did not change, and the check before insertion compares them with the evaluated ones."""
+        with self.controller.store.transaction():
+            self.state.dirty(work["number"], urgent=urgent)
+            self.controller.store.update(
+                "admission_work", {"id": work["id"]}, observed_version=work["observed_version"]
+            )
+
+    def _read_comment_feed(self, summary):
+        from .admission import relevant_comment
+        from .forgejo_source import _forge_time
+
+        registry, controller = self.registry, self.controller
+        since = self._comments_since
+        # One read drains the window: 200 pages of 50 is far beyond a pass's comments (about two
+        # a minute on production), and a deletion during the read can still shift a comment past it, which the review check before insertion and the rechecks cover.
+        rows, newest, complete = registry.native.list_recent_comments(
+            registry.profile.forgejo.repository.name, since=since, max_pages=COMMENT_FEED_PAGES
+        )
+        dirtied = set()
+        for number, row in rows:
+            body = row.get("body") or ""
+            key = (row["id"], row.get("updated_at"), hashlib.sha256(body.encode()).hexdigest())
+            if key in self._comments_seen:
+                continue
+            # A new ordinary comment cannot change a verdict (and moves the PR's update time
+            # anyway); an edit can, even one that removes a scoreboard marker.
+            edited = _forge_time(row.get("updated_at")) > _forge_time(row.get("created_at"))
+            if not edited and not relevant_comment(row, native=True):
+                continue
+            self._comments_seen[key] = _forge_time(row.get("updated_at"))
+            work = self.state.get(number)
+            if work is not None and work["disposition"] != "closed" and number not in dirtied:
+                self._reevaluate(work)
+                dirtied.add(number)
+        summary["comment_feed"] = {"read": len(rows), "dirtied": len(dirtied)}
+        if not complete:
+            # Unread pages may hold older edits: keep the position (rechecks stay the backstop).
+            summary["errors"].append("comment feed: more than one bounded read")
+        elif newest:
+            self._comments_since = max(since, newest - RECENT_MARGIN_SECONDS)
+            controller.store.set_setting(
+                self._comments_key, self._comments_since, "native queue policy", controller.clock()
+            )
+            # Edits older than the new position cannot be listed again; forget them.
+            self._comments_seen = {k: v for k, v in self._comments_seen.items() if v >= self._comments_since}
+        if dirtied:
+            self.wake()
 
     def request_discovery(self):
         self._serial += 1
@@ -279,10 +340,43 @@ class NativePoller:
             self.state.observe(int(number), pull.head_sha, version, urgent=True)
             self.wake()
             return "source changed since evaluation"
+        decision = loads(work["decision"], {})
+        evaluated_base = (decision.get("evidence") or {}).get("merge_base_sha")
+        merge_base = getattr(self.registry.native, "_merge_base", None)
+        if evaluated_base and merge_base is not None:
+            # The listed facts omit the target tip; a merge base that moved under the same head
+            # (part of the PR landed through another) changes the reviewed diff.
+            try:
+                current_base = merge_base(self.registry.profile.forgejo.repository.name, pull)
+            except Exception as error:  # noqa: BLE001 - an unknown merge base never admits
+                return f"merge base unavailable: {type(error).__name__}"
+            if current_base != evaluated_base:
+                self._reevaluate(work, urgent=True)
+                self.wake()
+                return "merge base changed since evaluation"
         blocked = self.controller._blocking_labels(pull)
         if blocked:
             # Approval refuses these labels; one added after approval keeps the head out too.
             return "blocked-label: " + ", ".join(blocked)
+        # Scoreboard edits move neither the PR's update time nor its comment count, and the
+        # comment feed is best effort, so the review itself is read and judged once more here.
+        snapshot_of = getattr(self.registry.native, "admission_snapshot", None)
+        if snapshot_of is not None and work["authorization_key"]:
+            try:
+                snapshot = snapshot_of(self.registry.profile.forgejo.repository.name, int(number))
+                result, authorization, *_ = self.registry.native.admission_policy.evaluate(snapshot)
+            except Exception as error:  # noqa: BLE001 - an unreadable review never admits
+                return f"review unavailable: {type(error).__name__}"
+            if (
+                snapshot.pull.head_sha != head
+                or not result.get("merge")
+                or not result.get("review_safe")
+                or head in result.get("recovery_heads", ())
+                or authorization != work["authorization_key"]
+            ):
+                self._reevaluate(work, urgent=True)
+                self.wake()
+                return "review changed since evaluation"
         return None
 
     def run_once(self, *, reason="interval"):
@@ -346,6 +440,19 @@ class NativePoller:
             except Exception as error:
                 summary["errors"].append("recent: " + type(error).__name__)
             self._recent_at = controller.clock() + registry.poll_seconds
+        if (
+            self._recent_enabled()
+            and callable(getattr(registry.native, "list_recent_comments", None))
+            and controller.clock() >= self._comments_at
+        ):
+            if self._comments_since is None:
+                # First run: start a recheck interval back, so recent edits are not missed.
+                self._comments_since = self._recent_since - controller.setting("forgejo_recheck_seconds")
+            try:
+                self._read_comment_feed(summary)
+            except Exception as error:
+                summary["errors"].append("comments: " + type(error).__name__)
+            self._comments_at = controller.clock() + registry.poll_seconds
         started = time.monotonic()
         while not self.stopping.is_set():
             work = self.state.next_due()

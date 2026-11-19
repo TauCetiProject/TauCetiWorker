@@ -900,6 +900,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `emergency_evict` | `false` | `true` or `false`; let the emergency batch take the head from a running head that is neither about to land nor publishing its final oleans |
 | `forgejo_placement_enabled` | `true` | `true` or `false`; `false` keeps waiting Forgejo inputs out of insertion while Forgejo is unavailable ([mixed-sources.md](mixed-sources.md), "Landing GitHub work while Forgejo is unavailable") |
 | `forgejo_recent_listing` | `true` | `true` or `false`; between full Forgejo listings, list the open Forgejo PRs updated since the last listing on every pass ([mixed-sources.md](mixed-sources.md)) |
+| `forgejo_recheck_seconds` | `21600` | integer, at least 0; a settled Forgejo PR whose listed facts are unchanged is evaluated again this long after its last attempt ([mixed-sources.md](mixed-sources.md)) |
 | `control_lane_enabled` | `false` | `true` or `false`; stage GitHub control-file PRs in their own lane batch ([mixed-sources.md](mixed-sources.md), "The control-file lane") |
 
 Escalations (withdrawals, bisections, the start and end of an infrastructure backoff) are sent as Zulip direct messages when

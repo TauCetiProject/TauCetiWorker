@@ -7,6 +7,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -502,6 +503,134 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.clock.advance(registry.poll_seconds)
         poller.run_once()
         self.assertEqual(len(recent_calls), 1)
+
+    def test_a_scoreboard_edit_from_the_comment_feed_dirties_its_settled_pr_once(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        feed = []
+        self.native.list_recent_comments = lambda repo, *, since, **kw: (list(feed), 0.0, True)
+        head = self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        work = poller.state.get(1)
+        self.assertEqual(work["generation"], work["evaluated_generation"])
+        board = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 {}-->"
+        feed[:] = [
+            (1, {"id": 50, "body": board, "updated_at": "2026-11-19T04:30:00Z"}),
+            (1, {"id": 51, "body": "thanks!", "updated_at": "2026-11-19T04:30:00Z"}),
+        ]
+        self.clock.advance(registry.poll_seconds)
+        poller.stopping.set()  # read the feed, evaluate nothing yet
+        summary = poller.run_once()
+        poller.stopping.clear()
+        self.assertEqual(summary["comment_feed"], {"read": 2, "dirtied": 1})
+        self.assertNotEqual(poller.state.get(1)["generation"], poller.state.get(1)["evaluated_generation"])
+        poller.run_once()  # evaluated; the same edit, listed again, is not dirtied again
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["comment_feed"]["dirtied"], 0)
+        self.assertTrue(poller.is_current(1, head))
+
+    def test_feed_edits_that_drop_a_marker_count_and_an_incomplete_read_keeps_its_place(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        feed, complete = [], [True]
+        newest = datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp()
+        self.native.list_recent_comments = lambda repo, *, since, **kw: (list(feed), newest, complete[0])
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        listed = poller.state.get(1)["observed_version"]
+        position = poller._comments_since
+        feed[:] = [
+            (
+                1,
+                {
+                    "id": 50,
+                    "body": "no longer a scoreboard",
+                    "created_at": "2026-11-19T03:00:00Z",
+                    "updated_at": "2026-11-19T04:30:00Z",
+                },
+            )
+        ]
+        complete[0] = False
+        self.clock.advance(registry.poll_seconds)
+        poller.stopping.set()
+        summary = poller.run_once()
+        poller.stopping.clear()
+        self.assertEqual(summary["comment_feed"]["dirtied"], 1)  # an edit, whatever it says now
+        self.assertEqual(poller.state.get(1)["observed_version"], listed)  # listed facts kept
+        self.assertEqual(poller._comments_since, position)  # unread pages may hold older edits
+        complete[0] = True
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(poller._comments_since, newest - 120)
+
+    def test_native_insertion_rejudges_a_review_no_listing_or_feed_reported(self):
+        poller, head = self.native_approved()
+        original = self.native.admission_policy.evaluate
+
+        def revoked(snapshot):  # the scoreboard was edited to red; nothing else changed
+            result, *rest = original(snapshot)
+            return ({**result, "merge": False, "review_safe": False}, *rest)
+
+        self.native.admission_policy.evaluate = revoked
+        self.controller.tick()
+        row = self.native_input()
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "admission-recheck"))
+        self.assertFalse(poller.is_current(1, head))
+        poller.run_once()
+        self.assertEqual(self.native_input()["state"], "cancelled")
+
+    def test_native_insertion_is_held_when_the_merge_base_moved(self):
+        poller, head = self.native_approved()
+        work = poller.state.get(1)
+        decision = loads(work["decision"], {})
+        decision.setdefault("evidence", {})["merge_base_sha"] = "e" * 40
+        self.controller.store.update("admission_work", {"id": work["id"]}, decision=dumps(decision))
+        self.native._merge_base = lambda repo, pull: "f" * 40
+        self.controller.tick()
+        row = self.native_input()
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "admission-recheck"))
+        self.assertFalse(poller.is_current(1, head))
+
+    def test_the_comment_feed_position_survives_a_restart(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        positions = []
+
+        def feed(repo, *, since, **kw):
+            positions.append(since)
+            return [], datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp(), True
+
+        self.native.list_recent_comments = feed
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        # The first read starts a recheck interval before the newest listed update.
+        listed = datetime(2026, 11, 19, 4, tzinfo=UTC).timestamp()
+        self.assertLess(positions[0], listed - self.controller.setting("forgejo_recheck_seconds") + 1)
+        restarted = NativePoller(registry, self.controller)
+        self.assertEqual(restarted._comments_since, datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp() - 120)
+
+    def test_rechecks_follow_their_own_interval(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        self.native.list_open_pull_requests = lambda repo, **kw: [
+            dataclasses.replace(p, admission={**(p.admission or {}), "recheck_seconds": 900, "updated_at": ""})
+            for p in NativeFake.list_open_pull_requests(self.native, repo, **kw)
+        ]
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        poller.run_once()
+        self.controller.set_setting("forgejo_recheck_seconds", 3600, "operator")
+        self.clock.advance(1800)
+        poller.request_discovery()
+        poller.stopping.set()
+        poller.run_once()
+        poller.stopping.clear()
+        work = poller.state.get(1)
+        self.assertEqual(work["generation"], work["evaluated_generation"])  # 30 min: no recheck yet
+        self.clock.advance(1801)
+        poller.request_discovery()
+        poller.stopping.set()
+        poller.run_once()
+        poller.stopping.clear()
+        self.assertEqual(poller.state.get(1)["recheck"], 1)
 
     def test_an_incomplete_recent_listing_asks_for_a_full_one(self):
         registry, poller, recent_calls = self.recent_fixture()
