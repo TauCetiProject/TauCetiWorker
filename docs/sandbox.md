@@ -101,10 +101,12 @@ A user in the `incus` group is served by `incus-user` and gets a restricted
 project of their own, without the root-equivalent access `incus-admin` grants.
 Such a project accepts a disk device only when its source lies under the
 project's allowed paths (the user's home directory, for a project `incus-user`
-creates) and is reached without crossing an absolute symlink. The worker hands
-Bubble every mount by its resolved path, so the roadmap and review-engine
+creates) and is reached without crossing an absolute symlink. On Linux the worker hands
+Bubble every explicit mount by its resolved host path, so the roadmap and review-engine
 checkouts, which are links into the shared repository store, arrive as the
-snapshots they point to.
+snapshots they point to. Container paths and read/write modes are preserved.
+Darwin host paths keep their original spelling because resolving `/tmp` or
+`/var` to `/private` paths may change what the Colima VM can access.
 
 What the worker mounts must itself sit under an allowed path: its state and
 data directories, the Python environment it is installed in,
