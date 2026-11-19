@@ -201,15 +201,18 @@ separate cache keys.
 
 Disposable review-state sidecars live below `sbcache/sources/<digest>/`, in private
 leaf directories with atomic private-file replacement. Best-effort pruning bounds
-recognized cache files across credential scopes to 384 files and 16 MiB after
-quiescent writes. It ignores unrelated files, outboxes and symlinks. These files
+recognized cache files across credential scopes to 8,192 files and 64 MiB after
+quiescent writes, above the live set of about three files per open PR. It ignores unrelated files, outboxes and symlinks. These files
 are disposable observations, not publication journals or durable decisions.
 Source file ages start before the request. Atomic replacements attempt a
 nonblocking directory lock and retain a later existing record when an older
 request finishes last. Lock contention skips the cache write.
-Source sidecars expire at the adapter's triage TTL even if the PR's update clock
-stays unchanged. Native Forgejo 17 does not move that clock for comment edits or
-deletions; forced reads bypass sidecars and the memory cache immediately.
+Source sidecars and the shared discussion and review-thread observations behind
+them are keyed on the PR's (updatedAt, head) and answer survey triage until that key
+changes, a write invalidates the PR, or `TAUCETI_SOURCE_FACTS_TTL` (6 hours) passes.
+Native Forgejo 17 does not move that clock for comment edits or deletions, so the
+backstop bounds that blind spot for triage; dispatch's forced reads bypass sidecars
+and every cache before acting on the selected PR.
 
 The adapter normalizes discussion/review timestamps to fixed-width UTC. Scoreboard
 selection orders equal timestamps by native comment ID. Typed PR projections
@@ -287,6 +290,17 @@ identities. Ownership, roadmap pressure, status-label counts and repair ownershi
 checks compare native IDs on the selected origin. A login rename preserves
 ownership; login reuse, unknown/ghost authors and another origin do not grant it.
 The existing GitHub survey JSON shape stays unchanged.
+
+An automatic worker survey uses one shared listing (60 seconds, failed pages
+retried in place) for ranking: ownership, labels, draft state, pending publication
+and local review counters. It then reads review history for at most
+`TAUCETI_SURVEY_DETAIL_READS` (4) PRs that no cached observation describes at their
+current (updatedAt, head), in the cascade's order (automatic bumps, ambiguous owned
+mergeability, owned PRs, other reviews) with a random order within each group, and
+stops at the first PR read that is fix or review work. Every other PR is classified
+from its cached observation or left for a later survey; a survey never falls back to
+reading every PR. Explicit `--pr` targets are read in full. A selected-state refresh
+replaces that PR's row in the shared listing instead of expiring it.
 
 Native `build` statuses are excluded from source survey CI classification. Native
 false mergeability remains unknown. This inventory provides no verified execution,

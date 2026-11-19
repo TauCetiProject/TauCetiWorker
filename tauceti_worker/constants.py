@@ -243,6 +243,18 @@ SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
+# Native source surveys list every open PR once, then read review history for at most this many PRs
+# that no cached observation describes at their current (head, updatedAt). Every other PR is
+# classified from the cache or left for a later survey, so a survey's cost does not grow with the
+# number of open PRs. Explicit `--pr` targets are always read.
+SURVEY_DETAIL_READS = max(1, int(os.environ.get("TAUCETI_SURVEY_DETAIL_READS", "4")))
+
+# How long a native source's discussion and review-thread observation, keyed on the PR's
+# (updatedAt, head), may answer survey triage. Forgejo does not move updatedAt for comment edits or
+# deletions, so this bounds that blind spot. Such reads are `assumed`, never `fresh`; dispatch
+# re-reads the selected PR before acting on it.
+SOURCE_FACTS_TTL = int(os.environ.get("TAUCETI_SOURCE_FACTS_TTL", str(6 * 3600)))
+
 # Agents.
 OPENROUTER_MODELS = {
     "deepseek": os.environ.get("DEEPSEEK_MODEL", "deepseek/deepseek-v4-pro"),
