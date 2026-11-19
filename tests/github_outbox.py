@@ -54,10 +54,13 @@ print("{}")
     result = subprocess.run(
         command + args, env={**env, "TAUCETI_TEST_GH_FAIL": "1"}, cwd=work, capture_output=True, text=True
     )
-    assert result.returncode == 1 and "publication retained" in result.stderr
+    # The agent reading stderr must not believe a retained publication is on GitHub.
+    assert result.returncode == 1 and outbox.NOT_POSTED in result.stderr, result.stderr
+    assert "NOT confirmed as posted to GitHub" in outbox.NOT_POSTED
     started = time.time()
     result = subprocess.run(command + args, env=env, cwd=work, capture_output=True, text=True)
     assert result.returncode == 77 and "Traceback" not in result.stderr, result.stderr
+    assert outbox.NOT_POSTED in result.stderr, result.stderr
     assert len(calls.read_text().splitlines()) == 3, "an ambiguous write cannot be repeated by the shell entry point"
     with patch.dict(os.environ, env):
         block = tr.blocking_event_since(started)

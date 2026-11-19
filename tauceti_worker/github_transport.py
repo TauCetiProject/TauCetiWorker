@@ -1487,6 +1487,7 @@ if __name__ == "__main__":
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from tauceti_worker.config import GitHubUnavailable
         from tauceti_worker.constants import EX_GITHUB_WAIT
+        from tauceti_worker.github_outbox import NOT_POSTED
 
         try:
             p = execute(["gh", *args], wait=os.environ.get("TAUCETI_GITHUB_EPHEMERAL") != "1")
@@ -1494,9 +1495,7 @@ if __name__ == "__main__":
             # The shell caller cannot catch Python exceptions. Preserve the
             # infrastructure wait marker for its owning worker's stage guard.
             record_block("publication", error.retry_at or time.time() + 60)
-            p = subprocess.CompletedProcess(
-                args, EX_GITHUB_WAIT, "", f"gh: {error}; publication retained for recovery\n"
-            )
+            p = subprocess.CompletedProcess(args, EX_GITHUB_WAIT, "", f"gh: {error}.\n{NOT_POSTED}\n")
         finally:
             if not readonly:
                 invalidate(args)
