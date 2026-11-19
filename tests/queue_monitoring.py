@@ -705,5 +705,119 @@ class PublisherCadence(unittest.TestCase):
                 stop.wait.assert_called_once_with(expected_wait)
 
 
+def trim_one_batch_at_a_time(observation, budget):
+    """The previous trimming loop, one full encoding per removed batch, as the reference result."""
+    encode = monitoring.encode
+    while len(encode(observation)) > budget:
+        terminal = [b for b in observation["batches"] if b["state"] not in ("head", "open")]
+        if terminal:
+            drop = min(terminal, key=lambda b: int(b["id"]))["id"]
+            observation["batches"] = [b for b in observation["batches"] if b["id"] != drop]
+            for name in ("members", "attempts", "tasks", "events"):
+                observation[name] = [r for r in observation[name] if r["batch_id"] != drop]
+        else:
+            name = max(
+                (k for k in ("members", "inputs", "attempts", "tasks", "events") if observation[k]),
+                key=lambda k: len(encode(observation[k])),
+                default=None,
+            )
+            if name is None:
+                raise ValueError("metadata exceeds public projection budget")
+            observation[name] = observation[name][: max(0, len(observation[name]) - 100)]
+            observation["collection_complete"][name] = False
+        observation["truncated"] = True
+        observation["coverage"] = "partial"
+
+
+class ProjectionBudget(unittest.TestCase):
+    """The byte budget removes the same records as trimming one batch at a time, in a few encodings."""
+
+    @staticmethod
+    def observation(terminal, active, members_per_batch):
+        import random
+
+        rng = random.Random(terminal * 1000 + active)
+        names = ("batches", "inputs", "members", "attempts", "tasks", "events")
+        value = {
+            "schema": monitoring.SCHEMA,
+            "coverage": "observed",
+            "truncated": False,
+            "collection_complete": dict.fromkeys(names, True),
+            **{name: [] for name in names},
+        }
+        for number in range(1, terminal + active + 1):
+            batch = str(number)
+            state = "landed" if number <= terminal else ("head" if number == terminal + 1 else "open")
+            value["batches"].append({"id": batch, "state": state})
+            for _ in range(rng.randint(0, members_per_batch)):
+                ident = str(len(value["members"]) + 1)
+                value["members"].append({"id": ident, "batch_id": batch, "title": "x" * rng.randint(0, 400)})
+                value["inputs"].append({"id": ident, "title": "y" * rng.randint(0, 200)})
+            for name in ("attempts", "tasks", "events"):
+                for _ in range(rng.randint(0, 3)):
+                    value[name].append(
+                        {"id": str(len(value[name]) + 1), "batch_id": batch, "x": "z" * rng.randint(0, 99)}
+                    )
+        rng.shuffle(value["batches"])
+        return value
+
+    def assert_same_as_reference(self, value, budget):
+        expected = json.loads(json.dumps(value))
+        trim_one_batch_at_a_time(expected, budget)
+        full = []
+        real = monitoring.encode
+
+        def counted(item):
+            if isinstance(item, dict) and "schema" in item:
+                full.append(item)
+            return real(item)
+
+        with patch.object(monitoring, "encode", counted):
+            monitoring.fit(value, budget)
+        self.assertEqual(value, expected)
+        self.assertLessEqual(len(monitoring.encode(value)), budget)
+        return len(full)
+
+    def test_terminal_history_is_shortened_oldest_first(self):
+        value = self.observation(terminal=200, active=3, members_per_batch=20)
+        size = len(monitoring.encode(value))
+        for fraction in (0.95, 0.6, 0.3, 0.1):
+            with self.subTest(fraction=fraction):
+                encodings = self.assert_same_as_reference(json.loads(json.dumps(value)), int(size * fraction))
+                self.assertLessEqual(encodings, 3)
+
+    def test_active_only_overflow_trims_the_largest_collection(self):
+        value = self.observation(terminal=5, active=4, members_per_batch=400)
+        size = len(monitoring.encode(value))
+        for fraction in (0.9, 0.5, 0.2):
+            with self.subTest(fraction=fraction):
+                self.assert_same_as_reference(json.loads(json.dumps(value)), int(size * fraction))
+
+    def test_a_fitting_projection_is_encoded_once_and_left_alone(self):
+        value = self.observation(terminal=3, active=2, members_per_batch=5)
+        expected = json.loads(json.dumps(value))
+        self.assertEqual(self.assert_same_as_reference(value, 10**9), 1)
+        self.assertEqual(value, expected)
+
+    def test_flag_bytes_count_toward_an_exact_fit(self):
+        # Clearing the flags saves bytes of their own; a budget met only with them still fits.
+        for terminal, active in ((0, 1), (1, 1), (6, 1)):
+            value = self.observation(terminal=terminal, active=active, members_per_batch=3)
+            value["members"] = value["members"][:1] or [{"id": "1", "batch_id": "1"}]
+            for slack in range(-3, 4):
+                with self.subTest(terminal=terminal, slack=slack):
+                    budget = len(monitoring.encode(value)) - len(monitoring.encode(value["members"][-1])) + slack
+                    try:
+                        self.assert_same_as_reference(json.loads(json.dumps(value)), budget)
+                    except ValueError:
+                        with self.assertRaises(ValueError):
+                            trim_one_batch_at_a_time(json.loads(json.dumps(value)), budget)
+
+    def test_metadata_alone_over_budget_is_refused(self):
+        value = self.observation(terminal=2, active=1, members_per_batch=3)
+        with self.assertRaises(ValueError):
+            monitoring.fit(value, 50)
+
+
 if __name__ == "__main__":
     unittest.main()
