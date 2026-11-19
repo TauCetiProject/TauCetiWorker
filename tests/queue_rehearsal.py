@@ -64,10 +64,10 @@ class DryRun(unittest.TestCase):
         self.assertEqual(evidence["clean"]["agent_invocations"], 0)
         self.assertEqual(evidence["source-failure"]["adoption"]["status"], "adopted")
         self.assertTrue(evidence["shrink"]["empty_commit"]["empty"])
-        self.assertEqual(evidence["shrink"]["pr_hopeless"]["state"], "closed")
+        self.assertEqual(evidence["shrink"]["pr_hopeless"]["state"], "open")
         self.assertFalse(evidence["shrink"]["pr_hopeless"]["title"].startswith(rehearsal.MERGED_TITLE_PREFIX))
-        self.assertIn("rejected during staging repair", evidence["shrink"]["pr_hopeless"]["comment_excerpt"])
-        self.assertGreaterEqual(evidence["shrink"]["counters"]["prs_rejected"], 1)
+        self.assertIn("withdrew this PR", evidence["shrink"]["pr_hopeless"]["comment_excerpt"])
+        self.assertGreaterEqual(evidence["shrink"]["counters"]["prs_withdrawn_empty"], 1)
         self.assertEqual(evidence["conflict"]["task"]["kind"], "rebase_conflict")
         self.assertGreaterEqual(evidence["conflict"]["xray_first_probe"]["probes"], 1)
         self.assertEqual(evidence["conflict"]["xray_inserted_event"]["kind"], "inserted")
@@ -90,6 +90,8 @@ class Scaffold(unittest.TestCase):
             workflow = (Path(tmp) / ".github/workflows/pr-build.yml").read_text()
             # What the service relies on: the dispatch event, the run title, the job names, the bound status.
             self.assertIn("types: [tauceti-bors-staging]", workflow)
+            self.assertNotIn("nscloud-", workflow)
+            self.assertNotIn("namespace-features:", workflow)
             self.assertIn("format('bors branch={0} batch={1} head={2} base={3}'", workflow)
             self.assertIn("  sandboxed-build:", workflow)
             self.assertIn("  finalize-merge-group-build:", workflow)
@@ -121,10 +123,10 @@ class Scaffold(unittest.TestCase):
         self.assertNotIn("__PUBLIC_URL__", config)
         default = rehearsal.scaffold_files()["tauceti.toml"]
         self.assertIn(f'url = "{rehearsal.DEFAULT_PUBLIC_URL}"', default)
-        # The pinned TauCetiTools revision is the same in the workflow's `uses:` lines and the configuration.
-        pins = set(re.findall(r"TauCetiTools/\.github/actions/[a-z-]+@([0-9a-f]{40})", rehearsal.PR_BUILD_YML))
-        self.assertEqual(len(pins), 1)
-        self.assertIn(f'ref = "{pins.pop()}"', config)
+        # The workflow's `uses:` lines and the configuration both follow TauCetiTools main.
+        refs = set(re.findall(r"TauCetiTools/\.github/actions/[a-z-]+@(\S+)", rehearsal.PR_BUILD_YML))
+        self.assertEqual(refs, {"main"})
+        self.assertIn('ref = "main"', config)
 
     def test_public_url_must_be_an_https_origin(self):
         self.assertEqual(rehearsal.public_url_argument("https://host.example/"), "https://host.example")

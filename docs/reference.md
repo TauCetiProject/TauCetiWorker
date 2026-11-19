@@ -373,9 +373,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
-| `TAUCETI_VERIFY_CHECKPOINT_MARGIN` | `600` | Seconds reserved before the round deadline for checkpointing; verification returns incomplete at this boundary. |
 | `TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS` | unset | JSON mapping of absolute resolved installation paths to publisher provenance tokens. Only validated read-only installations use compact cached identities; writable inputs retain full validation. See [verification](verification.md). |
-| `TAUCETI_VERIFY_CONTINUATION` | `1` | Set `0` to pause new mechanical verification continuations, preserving pending jobs and active helpers. |
 | `TAUCETI_VERIFY_HELPER` | `0` | V0 dispatch remains the default. Set `1` only for an opt-in natural canary; helper CLI and receipts are available independently. Dispatch changes preserve running helpers and recovery jobs. |
 | `TAUCETI_VERIFY_CACHE_DIR` | actual host identity under `/tmp` | Shared immutable-installation identity cache; no verification admission limit. Bubble mounts it automatically. |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude config/credential source (account switching; Bubble uses a private transient handoff on macOS). |
@@ -383,7 +381,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `MATHLIB_CACHE_DIR` | `<worker state>/.cache/mathlib` | Where this worker downloads Mathlib artifacts. Private, because `lake exe cache get` takes no lock; finished files are exchanged with the machine pool by hardlink before each round. |
 | `TAUCETI_MATHLIB_POOL` | `$XDG_CACHE_HOME/mathlib`, else login user's `~/.cache/mathlib` | The pool those hardlinks go to and come from. |
 | `LAKE_CACHE_DIR` | `<worker state>/.cache/lake` | Lake's own build-output cache. Per-worker: unlike a toolchain install it is written throughout a build. |
-| `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main. |
+| `LAKE_CACHE_MAX_REVS` | `100` | Maximum revision history searched for published TauCeti artifacts; `0` searches all history. Host coding rounds warm both their selected branch and current main, and wait rather than start when the revision found has different dependencies (see [workers](workers.md), "Waiting for a matching TauCeti cache"). |
 | `LAKE_ARTIFACT_CACHE` | `1` | Keep local build outputs in Lake's artifact store so later rounds can reuse them. |
 | `LAKE_RESTORE_ARTIFACTS` | `1` | Copy artifact-store hits into the build directory for TauCeti's post-build audits. |
 | `TAUCETI_CLAUDE_CMD` | `claude` | The `claude` executable for host rounds; split as a shell word list, the usual flags appended. |
@@ -407,13 +405,13 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_BUBBLE_TOOLCHAINS` | `0` | Set `1` to mount the complete Lean toolchains under `$ELAN_HOME/toolchains` read-only into Bubble code-writing rounds (Linux hosts). See [the sandbox notes](sandbox.md#lean-toolchains-from-the-host). |
 | `TAUCETI_REVIEW_ENGINE_DIR` | — | Use a local `tauceti-review` checkout instead of fetching the engine. |
 | `TAUCETI_POLL` | `300` | Seconds between quota checks while the loop waits. |
-| `TAUCETI_ROUND_TIMEOUT` | `5400` | Hard cap per round (seconds). |
+| `TAUCETI_ROUND_TIMEOUT` | `21600` | Hard safety cap per round (seconds), against a hung agent or tool: the loop kills the round's process group and abandons the round. Work, including verification, finishes inside the round; nothing is checkpointed or continued. |
 | `TAUCETI_INTERROUND` | `20` | Minimum gap after a productive round (seconds). |
+| `TAUCETI_ROUND_LOCK_WAIT` | `120` | How long a loop's round waits for its worker's `round.lock` (seconds), held briefly by another worker removing this worker's leftover worktree or by a round still finishing after a loop restart. A round that still finds it held exits as a claim collision, without failure backoff. |
 | `TAUCETI_BACKOFF_BASE` / `TAUCETI_BACKOFF_MAX` | `30` / `900` | The escalating no-progress back-off (seconds). |
 | `TAUCETI_PROGRESS_GAP` | `28800` | Minimum gap between progress prose attempts (seconds; eight hours by default). Mechanical documentation retries do not spend this window. |
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
 | `TAUCETI_OVERLAP_BATCH_COMMITS` | `160` | First-parent Mathlib commits examined per overlap-scan conversation; `--overlap-batch-commits` overrides it. Calibrated with Codex `gpt-6.1-sol` at high effort. |
-| `TAUCETI_GH_INROUND_WAIT` | `900` | Cap on how long a single `gh` call waits in place for a secondary rate limit to clear (seconds). Primary limits return immediately so the loop can wait for them before another round. |
 | `TAUCETI_GH_PROXY_WAIT` | `900` | Maximum host child `gh` quota wait, capped at 900 seconds to preserve the round deadline. |
 | `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |

@@ -166,6 +166,7 @@ class RoundResources:
             if reads is not None and self.baseline_reads is not None
             else None,
             read_bytes_scope="supervisor and reaped children; excludes live or unreaped descendants",
+            private_storage=storage.latest() if (storage := sys.modules.get("tauceti_worker.round_storage")) else None,
             worker_scope=scope_usage(self.directory) if self.directory else None,
         )
 

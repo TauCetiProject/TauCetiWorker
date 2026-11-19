@@ -36,6 +36,7 @@ import re
 import sys
 import time
 from collections.abc import Sequence
+from contextlib import contextmanager
 from typing import Protocol
 
 OBSERVATION_SCHEMA = "tauceti-bors.observation/v1"
@@ -572,11 +573,24 @@ def reduce_sample(observation: dict, candidates: dict) -> dict:
 
 
 def main(argv: Sequence[str]) -> int:
-    if len(argv) != 4 or argv[1] != "derive":
-        print("usage: python -m tauceti_queue.feeds derive <active-batches.json> <candidates.json>", file=sys.stderr)
+    if len(argv) != 4 or argv[1] not in {"derive", "validate"}:
+        print(
+            "usage: python -m tauceti_queue.feeds {derive|validate} <active-batches.json> <candidates.json>",
+            file=sys.stderr,
+        )
         return 2
     observation = json.loads(pathlib.Path(argv[2]).read_text())
     candidates = json.loads(pathlib.Path(argv[3]).read_text())
+    if argv[1] == "validate":
+        errors = [
+            *(f"{argv[2]}: {error}" for error in validate_observation(observation)),
+            *(f"{argv[3]}: {error}" for error in validate_candidates(candidates)),
+        ]
+        if errors:
+            print("\n".join(errors), file=sys.stderr)
+            return 1
+        print("both captures match the committed feed schema")
+        return 0
     schema = {
         "derived_from": {"observation": pathlib.Path(argv[2]).name, "candidates": pathlib.Path(argv[3]).name},
         "observation": derive_schema(observation),
@@ -613,6 +627,15 @@ def _micro(seconds) -> int:
     return int(round(float(seconds or 0) * 1_000_000))
 
 
+@contextmanager
+def read_snapshot(source):
+    if not isinstance(source, ControllerFeedSource):
+        yield source
+        return
+    with source.store.read_snapshot() as store:
+        yield ControllerFeedSource(source.controller, store=store)
+
+
 class ControllerFeedSource:
     """`FeedSource` over `tauceti_queue.controller.Controller`'s store (inputs, batches, members,
     ci_attempts, journal), mapping its states to Bors's: the open batch is `waiting`, the head is
@@ -620,12 +643,14 @@ class ControllerFeedSource:
     one `canceled`; a candidate is one CI attempt (generation = batch version); an admission is one
     member row with its input's approval evidence."""
 
-    def __init__(self, controller) -> None:
+    def __init__(self, controller, *, store=None) -> None:
         self.controller = controller
+        self._store = store
+        self._inputs_cache = None
 
     @property
     def store(self):
-        return self.controller.store
+        return self._store if self._store is not None else self.controller.store
 
     def repository(self, repo_id: int) -> str | None:
         return self.controller.repository if repo_id == 1 else None
@@ -642,17 +667,27 @@ class ControllerFeedSource:
     # -- members and inputs
 
     def _inputs_by_id(self) -> dict[int, dict]:
-        return {row["id"]: row for row in self.store.rows("inputs", {"repository": self.controller.repository})}
+        if self._store is None:
+            return {row["id"]: row for row in self.store.rows("inputs", {"repository": self.controller.repository})}
+        if self._inputs_cache is None:
+            self._inputs_cache = {
+                row["id"]: row for row in self.store.rows("inputs", {"repository": self.controller.repository})
+            }
+        return self._inputs_cache
+
+    def _batches(self):
+        return self.store.rows("batches", {"repository": self.controller.repository}, order="id")
 
     def _member_view(self, member: dict, inputs: dict[int, dict]) -> MemberView:
         source = inputs.get(member["input_id"]) or {}
         evidence = _loads(source.get("evidence"), {})
         scope = None
-        if evidence.get("admin") and evidence.get("merge_base_sha") and evidence.get("actor_id"):
+        admin = _admin_scope(evidence, member["accepted_head"])
+        if admin is not None:
             scope = {
-                "actor_id": evidence["actor_id"],
+                "actor_id": admin["actor_id"],
                 "head_sha": member["accepted_head"],
-                "merge_base_sha": evidence["merge_base_sha"],
+                "merge_base_sha": admin["merge_base_sha"],
             }
         return MemberView(
             pr=int(member["number"]),
@@ -716,7 +751,7 @@ class ControllerFeedSource:
         if not self._serves(repo, base):
             return []
         inputs = self._inputs_by_id()
-        rows = [r for r in self.controller.batches() if r["state"] in ("open", "head")]
+        rows = [r for r in self._batches() if r["state"] in ("open", "head")]
         rows.sort(key=lambda r: r["id"], reverse=True)
         return [self._batch_view(r, inputs) for r in rows]
 
@@ -729,10 +764,11 @@ class ControllerFeedSource:
     def outcomes(self, repo: str, base: str) -> Sequence[OutcomeView]:
         if not self._serves(repo, base):
             return []
-        batches = {b["id"]: b for b in self.controller.batches()}
+        batches = {b["id"]: b for b in self._batches()}
         rows = self.store.rows("members", None, order="id DESC", limit=5000)
         inputs = self._inputs_by_id()
         out = []
+        attempts_by_batch = {}
         from .mixed_identity import SourceNumber
 
         for member in rows:
@@ -745,9 +781,13 @@ class ControllerFeedSource:
             if member["removed"]:
                 state = "canceled"
             elif batch["state"] == "head":
-                attempts = self._attempts(batch["id"])
+                if batch["id"] not in attempts_by_batch:
+                    attempts_by_batch[batch["id"]] = self._attempts(batch["id"])
+                attempts = attempts_by_batch[batch["id"]]
                 state = "running" if attempts and attempts[-1].get("outcome") == "pending" else "waiting"
             source = inputs.get(member["input_id"]) or {}
+            if source.get("state") == "inserted" and source.get("batch_id") not in (None, batch["id"]):
+                continue  # a slot displaced by the emergency lane: the owning batch reports the PR
             if batch["state"] == "landed" and (
                 member["withdrawn"] or (source.get("state") == "cancelled" and not source.get("landed_sha"))
             ):
@@ -769,14 +809,14 @@ class ControllerFeedSource:
                 continue
             if row["state"] not in ("waiting", "reserved", "inserted"):
                 continue
-            evidence = _loads(row.get("evidence"), {})
-            if evidence.get("admin") and evidence.get("merge_base_sha") and evidence.get("actor_id"):
+            admin = _admin_scope(_loads(row.get("evidence"), {}), row["head_sha"])
+            if admin is not None:
                 approvals.append(
                     {
                         "pr": int(row["number"]),
-                        "actor_id": int(evidence["actor_id"]),
+                        "actor_id": int(admin["actor_id"]),
                         "head_sha": str(row["head_sha"]),
-                        "merge_base_sha": str(evidence["merge_base_sha"]),
+                        "merge_base_sha": str(admin["merge_base_sha"]),
                     }
                 )
         return approvals
@@ -830,7 +870,7 @@ class ControllerFeedSource:
         if not self._serves(repo, base):
             return []
         inputs = self._inputs_by_id()
-        batches = {b["id"]: b for b in self.controller.batches()}
+        batches = {b["id"]: b for b in self._batches()}
         where = {"batch_id": batch_id} if batch_id is not None else None
         if promoted:
             clause = " AND b.id=?" if batch_id is not None else ""
@@ -901,3 +941,15 @@ def _loads(text, default):
     except ValueError:
         return default
     return value if isinstance(value, type(default)) else default
+
+
+def _admin_scope(evidence: dict, head_sha: str) -> dict | None:
+    """The admin approval Bors's scope check accepts for `head_sha`: the original evidence when an admin
+    gave it, else a later admin re-approval of the same head (`evidence.admin_reapproval`)."""
+    if evidence.get("admin") and evidence.get("merge_base_sha") and evidence.get("actor_id"):
+        return evidence
+    again = evidence.get("admin_reapproval")
+    if isinstance(again, dict) and again.get("merge_base_sha") and again.get("actor_id"):
+        if again.get("head_sha") == head_sha:
+            return again
+    return None

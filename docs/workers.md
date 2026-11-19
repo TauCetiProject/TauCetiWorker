@@ -1,12 +1,29 @@
 # Persistent workers
 
-For the legacy TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects an absolute
-directory containing `state/`, `checkouts/`, and `logs/`. Set it before starting
-a worker to reuse its existing credentials, recovery records, and checkouts
-with a different installed code revision. Round, verification, and cleanup
-subprocesses inherit the same location; bundled scripts and prompts remain with
-the code. Without this setting, the existing installation-relative layout is
-preserved. Changing the setting does not move data or merge worker histories.
+Worker data (`state/`, `checkouts/`, `logs/` and `host-repositories/`) lives in
+one data root. An installed package (`uv tool install`, pip) uses
+`$XDG_DATA_HOME/tauceti`, else `~/Library/Application Support/tauceti/data` on
+macOS, else `~/.local/share/tauceti`, so upgrading or reinstalling the code keeps
+it. A Fleet runtime uses `<fleet data>/worker-data/root` (normally
+`~/.local/share/tauceti-fleet/worker-data/root`), shared by every runtime
+revision; it keeps `~/.local/share/tauceti` only while that holds worker state
+and the fixed root does not. A source checkout keeps it beside the code,
+gitignored. For the legacy TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects
+another absolute directory; round, verification and cleanup subprocesses inherit
+it, and bundled scripts and prompts remain with the code. Changing the location
+does not move data: the cleanup collector deletes data an earlier installation
+left in its package directory, and on Fleet hosts other runtimes' roots, once no
+worker or round holds their locks.
+
+A data root inside a virtualenv looks disposable, so `tauceti doctor` fails and
+a worker loop refuses to start when it would create data there. Data already
+inside one only draws a warning; move it out by renaming each part into the new
+root and leaving a symbolic link at the old name. While workers run, swap the
+part with a link created beside it in one step (`mv --exchange`, coreutils 9.5),
+then rename the swapped-out directory into the new root: a separate rename and
+`ln -s` leave a moment where a worker can recreate an empty part at the old name. The collector treats a root
+whose parts are symbolic links into another as an alias: it collects the target
+once, through the selected root, and never stages or deletes it through the link.
 
 ## Fleet admission and reporting
 
@@ -45,7 +62,9 @@ available maintenance, the slot falls back to the ordinary global cascade.
 
 Fleet installers can query `_fleet-protocol` to verify this integration before
 starting workers. The response is local, contains no credentials, and launches
-no agents.
+no agents. `"graceful_restart": 1` there (and in the manager's `ping` reply)
+means a manager `restart` request waits for the worker's current round; see
+[Restarts and rolling deploys](#restarts-and-rolling-deploys).
 
 On Linux, Fleet sets `TAUCETI_WORKER_SLICE` to keep each worker's entire process
 tree in an independent systemd scope, sharing the existing pool's memory and CPU
@@ -61,6 +80,52 @@ Persistent workers are declarative. You describe the workers you want in
 `workers.toml`, and a manager process reconciles reality against that file:
 starting missing workers, stopping removed ones, restarting changed ones, and
 backing off repeated failures. They do not belong to a terminal session.
+
+## Source selection
+
+Worker definitions select the same sources as `tauceti work`. Existing definitions
+keep their GitHub-only defaults. For a Forgejo worker, set:
+
+```toml
+github = false
+forgejo = true
+new_pr_forge = "forgejo"
+```
+
+Set both source booleans to `true` to maintain PRs from both sources. New PRs use
+`new_pr_forge`, independently of maintenance selection. Configure all three fields
+for native authoring; without an explicit destination, new PRs still default to GitHub.
+These fields are available in `workers.toml`. Credentials use the existing
+private Forgejo token-file configuration. Source changes wait for the worker's
+current round to finish; other workers retain their running processes and settings.
+
+## Locally verified publications
+
+With `self_tested = true` and `TAUCETI_VERIFY_HELPER=1`, the worker applies
+`self-tested` after an authoring or repair round publishes ordinary mathematics
+entirely under `TauCeti/`. Every verification phase must succeed in that round,
+and the receipt's source inventory must exactly match the published commit.
+Pin changes, infrastructure changes and full-lint/lint-repair requests do not
+qualify. This is the same eligibility check for GitHub and Forgejo.
+
+Both forges use the same add-label flow through their source adapters; no picker
+or separate status publication is required. Provision the `self-tested`
+repository label on Forgejo before enabling this route. This rollout does not
+change publisher grants.
+
+The label is a persistent author declaration. Keep it through fix/rebase pushes
+after successful verification; remove it when verification fails or is
+incomplete. Authors can apply it themselves after verification, and the worker
+also applies it when it finds the complete matching receipt after a round.
+An unavailable or invalid receipt never produces an automatic label. Ordinary
+PR-CI eligibility is checked independently at admission.
+
+Forgejo does not currently run an individual Actions build for each PR. Reviews
+still run, and every mixed merge-queue candidate requires its full CI build and
+audits before landing, including self-tested members. Source statuses cannot
+replace that candidate CI. For live deployments, preserve every per-worker
+`env` entry, including any `TAUCETI_ROUND_WORKTREES=0` opt-out; the verification
+helper can also be enabled in the worker manager's service environment.
 
 ## Dependency bumps
 
@@ -82,14 +147,14 @@ for bumps: one branch claim serializes edits anyway, and every worker whose
 After a host round pushes a new bump head, the worker runs the full local
 verifier (`tauceti verify`, bump policy) on that exact commit with the same
 build-cache view the agent used. If it succeeds and GitHub still reports that
-commit as the PR head, the worker applies `self-tested`. The TauCeti picker
-then checks eligibility itself (the labeler's team membership, bump-only paths
-and the real `bump-guard` validation) and posts the PR-bound assertion, so
-review and queue admission need not wait for the ordinary PR build. The agent's
+commit as the PR head, the worker applies `self-tested`. Review and queue admission
+validate eligibility directly (the labeler's team membership, bump-only paths
+and the real `bump-guard` validation), without waiting for an Actions receipt or
+the ordinary PR build. The agent's
 own claims are never consulted. Bubble rounds, a dirty checkout, a moved head,
 or a failed or incomplete verification (capped at 45 minutes) leave the PR on
-ordinary CI, which the push has already started. If the push's own picker run
-removes the label, the worker applies it once more. Set
+ordinary CI, which the push has already started. The label persists through pushes and fix rounds; withdraw it if local
+verification fails or is incomplete. Set
 `TAUCETI_BUMP_SELF_TESTED=0` in a worker's `env` to turn this off.
 
 ## Rebase retry budget
@@ -134,7 +199,7 @@ Day-to-day controls:
 ```bash
 tauceti workers disable reviewer   # persist desired stopped state
 tauceti workers enable reviewer    # and start it again
-tauceti workers restart reviewer   # without changing desired state
+tauceti workers restart reviewer   # after its current round, without changing desired state
 tauceti workers remove reviewer    # drop the definition and stop it
 ```
 
@@ -239,7 +304,9 @@ other top-level key is an error, as is any unrecognized field inside a
 
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
-without disturbing unchanged workers.
+without disturbing unchanged workers. Like `workers restart`, a changed
+definition takes effect after the worker's current round finishes, never by
+killing it; disabling or removing a worker stops it at once.
 
 `env` exists for running one worker differently from its peers when the
 difference has no flag: an A/B of a build setting, for instance. It is part of
@@ -287,20 +354,11 @@ real run once headroom recovers; candidate counts do not estimate reclaimed byte
 `tauceti cleanup` performs reclamation. Both discover retired
 workers from local storage, without GitHub requests. A live loop recycles its own private cache generation under its round lock;
 the hourly collector skips that loop's workspace whenever its instance-lock file
-is open and never takes that lock itself. Independent verification job leases and pending
-references protect their caches and source too. An inactive checkout can be removed in full only after source recovery
-succeeds and its remaining Git state can be safely discarded. Failed source
-preservation retains source while recognized build caches can still be reclaimed.
-The existing cleanup service also processes retained checkout roots, using
-resumable deletion batches. Safety checks finish before scheduling yields;
-activity reporting only inventories and requests that background work when the
-timer is installed. Uncertain candidates are skipped while unrelated work continues. It
-archives extra commit/reflog tips in existing v1 bundles. Stashes, notes, native
-Git operations and credential-like files keep their original checkout when the
-recovery format cannot capture them. This is generated
-data retention; it does not discard uncaptured Git history to meet an age target.
-Credentials, review outboxes, source recovery, usage journals and budget accounting
-are preserved. Existing installations get one 72-hour grace
+is open and never takes that lock itself. Rounds are all-or-nothing: whatever an agent pushed is
+on the remote, and anything unpushed is discarded with the round's checkout, so an inactive
+checkout is removed in full once it is idle. Uncertain candidates (a live process using the tree,
+a mount inside it) are skipped while unrelated work continues.
+Credentials, review outboxes, usage journals and budget accounting are preserved. Existing installations get one 72-hour grace
 period when their generation marker is first recorded, including checkout removal.
 Without local process-file observations, diagnostic candidates are skipped; private
 cache recycling can still run at the worker's own safe boundary.
@@ -326,15 +384,12 @@ from worker configuration files. There is no macOS cleanup schedule in this chan
 private cache generations still recycle at round boundaries there. Installing the Linux
 worker service installs this timer too; existing services can install it separately
 without restarting workers. Cleanup uses one collector lock and resumes interrupted
-directory deletions. The same background collector drains already-retired recovery trash
-with a separate 30-second, 32-GiB deletion slice and the existing recovery lock/cursors.
-It never archives or deletes unpublished recovery records in that pass. Retained caches
-can be reclaimed while source preservation waits. Directed pressure requests prefer private
-artifact archives and prefer workers without active rounds or verification continuations.
+directory deletions. Directed pressure requests prefer private
+artifact archives and prefer workers without active rounds.
 If every worker is busy, one is still selected for reclamation at its next safe boundary.
 Ordinary pressure preserves young build trees. At critical headroom, workers retain their
 independent emergency reclamation at safe round boundaries, including throughout the existing
-recovery hysteresis band; a missing collector or damaged request cannot suppress that path.
+headroom hysteresis band; a missing collector or damaged request cannot suppress that path.
 A concrete out-of-space error during cache preparation also
 unlinks closed diagnostics before the existing single retry, without synchronously
 archiving source or recursively collecting other workers' workspaces. Further failures follow normal
@@ -364,6 +419,59 @@ Archive seeding skips duplicates, and an archive removed concurrently by pool co
 is an individual cache miss for Lake to fetch. Native fetch arguments and Mathlib snapshot
 keys/inventory checks are unchanged.
 
+A worker's build tree outlives its rounds, so it can hold modules an earlier round compiled
+locally. When CI has published outputs for the same input hash and they differ from the
+local ones, Lake would still trust the local trace. Locally built bytes need not match CI's,
+and every module downstream would then miss the cache and compile locally. After hydration,
+preparation therefore removes each such module's trace (and its `.hash` sidecars), and Lake
+restores CI's outputs by hard link. Modules CI has not published are the agent's own work and
+are left alone. The receipt counts `ci_disagreeing_traces`, `ci_disagreeing_removed` and
+`ci_disagreeing_skipped` (deferred because a file was busy).
+
+#### Waiting for a matching TauCeti cache
+
+`lake cache get --max-revs=N` installs the newest published revision in the last N commits.
+When CI has not yet published a commit that changed dependencies (a Mathlib bump, say), that
+revision predates the change, none of its outputs apply, and the round would compile all of
+TauCeti, which cannot finish within the round limit. Host agent rounds (roadmap, overlap-fix,
+and the PR rounds fix, fix-ci, rebase, bump and lint-repair) therefore check the cache before
+the agent starts. The revision Lake installed is the first commit in `git rev-list HEAD -n N`
+whose revision map is in the round's download directory, which is the same rule Lake follows
+(maps seeded from the pool included). Its `lake-manifest.json` package revisions and
+`lean-toolchain` are compared with the checkout's dependency files as prepared. A rebase round
+prepares with main's files, so main's cache is the one it needs. For a PR round, the main
+revision fetched alongside also counts. If either matches, the round proceeds. A fallback with
+the same dependencies is logged as a same-dependency fallback and only the commits in between
+rebuild.
+
+Otherwise the round ends as `waiting-build-cache` (exit 79): no failure, no attempt charged,
+downloaded and hydrated outputs kept, and the worker selects other work after 5 seconds.
+`tauceti workers status` shows the state, the commit and the recheck time. The round writes
+`<pool>/cache-waits/<commit>-<dependencies>.json`, keyed by the head and the dependency files it
+prepared, with a retry time five minutes ahead. It records the stage and the revision whose map
+would serve those dependencies: the head for its own, main for main's (a rebase round). Until the
+retry time, other workers on the host skip the same stage on that head, and skip roadmap and
+overlap-fix while a wait on main is recorded (roadmap reports `waiting-build-cache` itself, since
+it is the last candidate). A fix of a head whose rebase is waiting is not held. At most every
+30 seconds per host, a selecting worker sends an anonymous `HEAD` request for that revision's
+map, `<TAUCETI_CACHE_REVISION_URL>/TauCetiProject/TauCeti/tc/<toolchain>/<revision>.jsonl`, with
+the prepared toolchain mangled as Lake does (`leanprover--lean4---v4.36.0`); a 200 removes the
+wait. When the retry time passes, the next round to select that work claims the check for two
+minutes, together with its own later candidates, and goes through. Only cache preparation
+re-arms the retry time, so a round that claims and then declines lets the claim lapse for the
+next one. A successful check on main clears every wait on main. Any error reading or writing
+markers, or probing, lets work proceed, including the round that could not record its wait. A marker
+that exists but cannot be read is left alone rather than restarted. At most once an hour per
+host, selection deletes every marker whose first wait is more than seven days old, whatever its
+head or stage; released PR waits are kept until then, so a spent grace is not granted again.
+
+A wait older than an hour logs one warning per host and commit, naming the URL CI should have
+published. Rounds on main wait without limit: main always gets a cache, and building anyway
+only occupies the host. A PR whose own head changes dependencies relative to main only gets a
+cache once CI builds that PR, which may never succeed, so after two hours of waiting its rounds
+proceed on the fallback cache as before, letting the repair agent work on the PR. Bubble rounds,
+bump attestation and the queue's repair service do not wait.
+
 The existing pool status receipt also records mapping/seed/install counts and per-phase
 elapsed and CPU seconds for seeding, fetching, transfer, expansion/hydration, and Mathlib
 view preparation. CPU includes the preparator and reaped children. Phases can be nested,
@@ -374,6 +482,18 @@ The pool defaults to `~/.cache/tauceti/builds` under the login user's home. Conf
 `TAUCETI_SHARED_ARTIFACTS=0` disables expanded-artifact sharing. Explicit Mathlib/Lake
 cache overrides are preserved. Only directories carrying a valid TauCeti ownership record
 are collected; an arbitrary nonempty directory is never adopted or deleted.
+
+Every round works in its own linked worktree (a host opts out with `TAUCETI_ROUND_WORKTREES=0` in
+its `workers.toml` `env` table) of one bare host clone,
+`<state>/host-repositories/TauCeti.git` (override with `TAUCETI_HOST_REPOSITORIES`). The worktree
+sits at the worker's usual checkout path, detached at `origin/main`; the host clone is fetched at
+most once a minute under `host-repositories/TauCeti.lock`. At round end the worktree is removed
+with anything unpushed in it; its `.lake` waits beside it as `checkout.lake-between-rounds`. A
+crashed round's worktree is removed by the next round on the host once its worker's round lock is
+free. On its first round each worker deletes its old permanent checkout. Shared Git config that could run code for every
+round (hooks, fsmonitor, filters, aliases, credential and URL rewrites, includes) is cleared at each
+round. Turning the flag off again is safe: the next round finds a worktree of a clone it does not
+manage, removes it, and clones an ordinary checkout as before.
 
 The collector measures allocated bytes across shared and worker-private caches, counting
 hard-linked inodes once. Its eviction target defaults to 25% of filesystem capacity;
@@ -397,9 +517,59 @@ whole-fleet drain, or human-resume action is needed.
 Cleanup and expanded-artifact metrics are prepared in activity data: managed and live-worker-held
 bytes, remaining free space, observed net space recovered, cleanup errors, and latest per-worker
 expanded/reused artifact counts and preparation time. `status` reads prepared data without
-walking cache trees. Space held by active work, preserved source or unrelated programs cannot
-be reclaimed to enforce an eviction target; this is not a filesystem quota. Retained source,
-usage/accounting records and credentials are never disposable cache data.
+walking cache trees. Space held by active work or unrelated programs cannot
+be reclaimed to enforce an eviction target; this is not a filesystem quota. Usage/accounting
+records and credentials are never disposable cache data.
+
+The collector also reports storage three ways, because hard-linked files still count in `du`:
+named bytes (every link counted, as `du --count-links` would), bytes allocated in unique inodes,
+and filesystem free space. `status` prints all three; checkout size alone proves nothing.
+
+### Per-round private-bytes cap
+
+A host round's private bytes are the bytes of files whose links all lie inside the round's own
+writable roots: its checkout (including `.lake` and the shared-Mathlib overlay upper), the
+worker's `LAKE_CACHE_DIR` and `MATHLIB_CACHE_DIR`, and a private `TMPDIR`. A file hard-linked to a
+shared store is not private; a file written, unpacked or copied there is. A walk before the agent
+starts records the baseline the round inherits. While the agent runs, a monitor thread measures
+again every 30 seconds, and sooner when the worker scope's cgroup `io.stat` write bytes jump. Each
+pass lstats every directory but rereads only directories whose mtime changed, a rotating eighth of
+the rest, and files changed during the round; the pass after the agent exits is a full walk.
+Rounds get no private `TMPDIR` yet, so writes under `/tmp` are not measured. Filesystem quotas are
+not used: hard links fail
+across XFS project IDs and bind mounts, which would make Lake copy instead of link.
+
+| Setting | Values | Default |
+| --- | --- | --- |
+| `TAUCETI_ROUND_PRIVATE_BYTES`, or `mode` | `off`, `report` (measure only), `enforce` | `off` |
+| `TAUCETI_ROUND_PRIVATE_CAP_GIB`, or `cap_gib` | new private GiB allowed per round | `6` |
+| `TAUCETI_ROUND_PRIVATE_SCAN_SECONDS`, or `scan_seconds` | seconds between passes | `30` |
+
+The environment overrides the per-host file `round-storage.json` in the workers state directory
+(`~/.local/state/tauceti/workers/` on Linux), for example `{"mode": "enforce", "cap_gib": 6}`.
+Each round reads it again, so enabling a host needs no restart. An invalid value fails the round.
+
+In `enforce`, a round whose new private bytes exceed the cap has its agent's process group killed.
+Once the group is reaped, its checkout is deleted without saving anything, through the ordinary
+retention removal, which never follows links or crosses filesystems. A checkout with a mount
+inside, or one that cannot be deleted, is renamed to a hidden `.<name>.abandoned-<id>` sibling for
+an operator to remove. The round ends as no progress, and the PR attempt stays charged; a queue
+repair task fails. While enabled, round start also checks the leased shared Mathlib entry against its
+`ready.json` inventory. A mismatch stops the round before the agent starts and records a shared
+Mathlib safety stop; it never deletes through the shared path. `report` logs the same findings and
+keeps the round.
+
+Each measurement is published as `round_storage` in the runtime status and as `private_storage`
+in the round's `resources.jsonl` record. A finished invocation also writes
+`state/<worker-id>/round-storage.json` and a `round_storage` activity event. Bubble rounds,
+verification jobs and review rounds are not measured.
+
+The plan is to enable `enforce` on a host once authoring, verification and review rounds
+keep completing, deletion keeps progressing, and private copies do not regrow. Until shared
+Mathlib is required and TauCeti outputs are relinked to one canonical copy, rounds that rebuild or
+fetch Mathlib privately exceed the cap by design. Run `report` first to see which rounds would be
+killed. The baseline walk costs a few seconds per round for a fully built checkout, and memory of
+about 8 bytes per file plus a dictionary entry per hard-linked file.
 
 ## `workers add` flags
 
@@ -439,7 +609,7 @@ always writes `enabled = true`. Use `workers edit` for those.
 | `apply [--check]` | Validate the TOML schema and manager-level rules, then reconcile. `--check` validates only |
 | `add [ID] [flags]` | Append an enabled definition and reconcile |
 | `enable ID` / `disable ID` | Persist desired running or stopped state |
-| `restart ID` | Request a restart without changing desired state; a disabled worker stays stopped |
+| `restart ID [--timeout SECONDS] [--no-wait]` | Restart on the current runtime once the round in flight finishes (at once between rounds), without changing desired state; a disabled worker stays stopped. Waits for the new instance unless `--no-wait`. See [Restarts and rolling deploys](#restarts-and-rolling-deploys) |
 | `remove ID` | Drop the definition and stop the worker |
 | `logs ID [--follow] [--lines N]` | The durable console log. `--follow` continues across worker restarts |
 | `tmux [--no-attach]` | Build the optional tmux viewing workspace |
@@ -452,6 +622,63 @@ always writes `enabled = true`. Use `workers edit` for those.
 `apply` without `--check`, `add`, `enable`, `disable`, `remove`, and `restart`
 start a manager if none is running and return only after it accepts control
 requests. `edit`, `import`, and `apply --check` do not start one.
+
+## Restarts and rolling deploys
+
+A round is all-or-nothing: anything it has not pushed when it is killed is
+discarded. Restarts therefore happen only between rounds. `tauceti workers
+restart ID` asks the worker to finish the round it is running and then exit;
+the manager starts it again on whatever code is installed now. The request
+reaches the loop as `SIGUSR1` from its managed wrapper. A worker that is
+between rounds (sleeping after a round, backing off, or waiting for quota,
+budget, GitHub or fleet capacity) exits at once instead of starting another
+round. A changed definition in `workers.toml` restarts the same way.
+
+By default the command waits as long as the round takes, then until the new
+instance is running; `TAUCETI_ROUND_TIMEOUT` (6 hours) still bounds any round.
+`workers status` shows `restart: after the current round` meanwhile. Two
+options change this:
+
+- `--timeout SECONDS` stops the worker if its round is still running after
+  that long, discarding the round, exactly as restarts did before.
+  `--timeout 0` stops it immediately.
+- `--no-wait` returns once the manager has accepted the request. The restart
+  still happens at the round boundary, and so does the deadline: the manager
+  enforces it, not the command. Interrupting a waiting command likewise leaves
+  the restart pending.
+
+`disable`, `remove` and `manager-stop` still stop workers at once.
+
+To deploy new worker code without losing work:
+
+1. Update the code the manager runs: `git pull` in a source checkout, or
+   install the new package or runtime.
+2. Restart the manager so that it, and the runners it launches, use the new
+   code. The workers keep running and are adopted:
+   `tauceti workers manager-stop --leave-workers`. The native service starts
+   the new manager within seconds; without it, `tauceti workers apply` starts
+   one. A manager that predates graceful restarts would kill the round, so
+   `workers restart` refuses to use one unless you pass `--timeout 0`.
+3. Restart the workers. One at a time, each finishing its round first, keeps
+   the rest of the fleet working throughout:
+
+   ```bash
+   for id in $(tauceti workers status --json | jq -r '.workers[] | select(.enabled) | .id'); do
+     tauceti workers restart "$id"
+   done
+   ```
+
+   Or restart them all at once, each still finishing its own round:
+
+   ```bash
+   for id in $(tauceti workers status --json | jq -r '.workers[] | select(.enabled) | .id'); do
+     tauceti workers restart --no-wait "$id"
+   done
+   ```
+
+A runner still executing the previous release does not understand the
+graceful request; the manager then waits until that worker reports that it is
+sleeping between rounds, and stops it then.
 
 ## The manager, and running past logout
 
@@ -582,6 +809,35 @@ the previous behaviour of sharing your own `CLAUDE.md`, settings, and skills,
 including on a worker already seeded the clean way; a `settings.json` you have
 edited is kept rather than replaced.
 
+## Cleanup and uninstalling
+
+Every round starts the cleanup collector (`tauceti cleanup --all-data-roots`) in
+the background, at most once an hour per data root, at low CPU and I/O priority
+and for at most 15 minutes, unless the systemd timer installed by `workers
+service install` already collects that data root. The collector expires logs
+and verification runs older than three days, idle checkouts, and shared build
+pools, and deletes the data roots of earlier installations once no worker or
+round holds their locks. It also deletes, for every worker and at every round
+start, the recovery records, retained checkouts, cleanup queues, verification
+checkpoints and continuation state that older releases kept: rounds are
+all-or-nothing, so this legacy data is deleted, never migrated.
+Its output goes to `cleanup-fallback.log` in the activity directory. Set
+`TAUCETI_BACKGROUND_CLEANUP=off` to stop rounds from starting it.
+
+To remove everything TauCetiWorker stored for your account, stop the workers and
+run `tauceti purge` before uninstalling the code:
+
+```bash
+tauceti workers manager-stop
+tauceti purge          # prints what would be removed
+tauceti purge --yes    # removes it, and the worker service and timers
+uv tool uninstall tauceti
+```
+
+`--config` also removes `workers.toml` and other settings. `~/.elan` is kept
+because other Lean projects share it; `elan toolchain gc` reclaims toolchains
+nothing uses.
+
 ## State on disk
 
 | Path | Contents |
@@ -679,6 +935,5 @@ and merges current main, diagnoses the actual integration failure, preserves
 the dependency target and verifies its changes before pushing. Healthy surveys
 make no additional API calls.
 
-Claim collisions skip to other candidates without consuming a repair attempt. An idle mechanical
-recovery probe returns immediately to normal work selection. Only consecutive all-busy passes
+Claim collisions skip to other candidates without consuming a repair attempt. Only consecutive all-busy passes
 use a small capped retry pause; they never enter the general failed-round backoff.

@@ -41,11 +41,6 @@ class CostTests(unittest.TestCase):
                 "TAUCETI_FLEET_EVENTS": str(self.root / "worker-events.jsonl"),
             },
         )
-        from tauceti_worker import work_recovery
-
-        recovery_home = patch.object(work_recovery, "HERE", self.root / "worker")
-        recovery_home.start()
-        self.addCleanup(recovery_home.stop)
         env.start()
         self.addCleanup(env.stop)
         with patch.object(a.time, "time", return_value=self.now - 10 * DAY):
@@ -844,7 +839,10 @@ class CostTests(unittest.TestCase):
         self.summary()
         with contextlib.closing(a._connect()) as db, db:
             db.execute("DELETE FROM pr_contributions")
-        fleet_events.emit("pr_activity", repository="org/repo", pr=100, activity="review")
+        # At the fixture's time: a receipt later than `summary()`'s clock is deferred, and on a slow
+        # runner the wall clock passes it before this line.
+        with patch.object(fleet_events.time, "time", return_value=self.now):
+            fleet_events.emit("pr_activity", repository="org/repo", pr=100, activity="review")
         s = self.summary()
         self.assertEqual(s["pr_windows"]["total"]["reviews"], 1)
         self.assertEqual(s["pr_windows"]["total"]["assisted"], 1)

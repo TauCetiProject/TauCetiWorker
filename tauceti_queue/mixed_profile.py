@@ -6,11 +6,10 @@ writer credentials have independent roles; no ambient gh token enrolls Forgejo.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from tauceti_tools.ci_candidate import RepositoryIdentity, digest, read_json
+from tauceti_tools.ci_candidate import RepositoryIdentity, read_json
 from tauceti_tools.forge import GITHUB, Forgejo, PrincipalRef
 from tauceti_tools.system import ensure_ssl_cert_file
 
@@ -36,7 +35,6 @@ def credential(path):
 class MixedProfile:
     github: RepositoryIdentity
     forgejo: RepositoryIdentity
-    reviewers: frozenset[int]
     publisher: int
     token_file: Path = field(repr=False)
     raw: dict = field(repr=False)
@@ -45,39 +43,17 @@ class MixedProfile:
     def load(cls, path, config):
         try:
             raw = private_json(path)
-            required = {
-                "schema",
-                "github",
-                "forgejo",
-                "reviewer_ids",
-                "publisher_id",
-                "source_token_file",
-                "authority_generation",
-            }
-            optional = {"execution", "mirror"}
-            if not isinstance(raw, dict) or set(raw) - optional != required or raw["schema"] != SCHEMA:
+            required = {"schema", "github", "forgejo", "publisher_id", "source_token_file"}
+            # Scoreboards count from any author, as on GitHub; older profiles' review keys are ignored.
+            optional = {"execution", "mirror", "reviewer_ids", "authority_generation"}
+            if not isinstance(raw, dict) or not required <= set(raw) <= required | optional or raw["schema"] != SCHEMA:
                 raise ValueError
-            generation = raw["authority_generation"]
-            if (
-                not isinstance(generation, str)
-                or not re.fullmatch(r"[0-9a-f]{32}", generation)
-                or int(generation, 16) == 0
-            ):
-                raise ValueError("native review authority requires an explicit fresh generation")
             github = RepositoryIdentity.parse(raw["github"])
             native = RepositoryIdentity.parse(raw["forgejo"])
             if (
                 github.repository.forge != GITHUB
                 or github.repository.name != config.repository
                 or native.repository.forge.kind != "forgejo"
-            ):
-                raise ValueError
-            reviewers = raw["reviewer_ids"]
-            if (
-                not isinstance(reviewers, list)
-                or not 0 < len(reviewers) <= 256
-                or any(type(i) is not int or not 0 < i < 2**63 for i in reviewers)
-                or len(set(reviewers)) != len(reviewers)
             ):
                 raise ValueError
             publisher = raw["publisher_id"]
@@ -88,30 +64,13 @@ class MixedProfile:
                 raise ValueError
             if config.forgejo_mode == "admit" and ("execution" not in raw or "mirror" not in raw):
                 raise ValueError("mixed admission requires explicit execution and mirror roles")
-            return cls(github, native, frozenset(reviewers), publisher, token_file, raw)
+            return cls(github, native, publisher, token_file, raw)
         except (ValueError, KeyError, TypeError, OSError, UnicodeError):
             raise ConfigError("invalid or unavailable private Forgejo queue profile") from None
 
-    @property
-    def digest(self):
-        return digest(
-            {
-                "source": self.forgejo.record(),
-                "reviewer_ids": sorted(self.reviewers),
-                "publisher_id": self.publisher,
-                "authority_generation": self.raw["authority_generation"],
-            }
-        )
-
     def publishers(self):
         forge = self.forgejo.repository.forge
-        return NativePublishers(
-            self.forgejo,
-            frozenset(PrincipalRef(forge, str(i)) for i in self.reviewers | {self.publisher}),
-            frozenset({PrincipalRef(forge, str(self.publisher))}),
-            recoveries=frozenset({PrincipalRef(forge, str(self.publisher))}),
-            generation=self.digest[:32],
-        )
+        return NativePublishers(self.forgejo, frozenset({PrincipalRef(forge, str(self.publisher))}))
 
     def client(self):
         ensure_ssl_cert_file()

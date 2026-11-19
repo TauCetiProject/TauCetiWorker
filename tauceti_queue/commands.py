@@ -2,8 +2,9 @@
 
 The queue is a drop-in replacement for Bors's approval intake: the same comment lines from the
 same people do the same thing. The grammar follows bors-ng's COMMAND_PARSING.md for the commands
-the queue runs (`r+`, `merge`, `r=`, `merge=`, `p=`, `single`, `r-`, `merge-`, `cancel`, `ping`)
-and keeps its principles: a line that is an attempt at a command either runs exactly as written or
+the queue runs (`r+`, `merge`, `r=`, `merge=`, `p=`, `single`, `r-`, `merge-`, `cancel`, `ping`),
+plus the queue's own `emergency` and `emergency-` (a repository admin's request that an approved PR
+land next through the emergency lane, and its withdrawal), and keeps its principles: a line that is an attempt at a command either runs exactly as written or
 gets a reply saying what did not run and why; a line that is prose gets nothing; a line that could
 mean two things is refused, never guessed. Bors commands the queue has no equivalent for (`try`,
 `retry`, delegation, `link`, `stack`) are recognised so they are refused with a reply rather than
@@ -37,7 +38,7 @@ TRIGGER_LINE = re.compile(rf"^(?P<trigger>{TRIGGER}|bros):?\s(?P<command>.+)", r
 UNSPACED_LINE = re.compile(rf"^{TRIGGER}:(?P<command>\S.*)", re.IGNORECASE)
 # A command word running on into a longer word is prose (`bors merged this`); see COMMAND_PARSING.md.
 RUN_ON = re.compile(
-    r"^(?:(?:merge|link)-?[^\W_]|try(?:[^\W_]|-\S)|(?:single|ping|retry|cancel|unlink|stack)[\w-]|(?:delegate|d(?!elegate))[^\s+=-])",
+    r"^(?:(?:merge|link|emergency)-?[^\W_]|try(?:[^\W_]|-\S)|(?:single|ping|retry|cancel|unlink|stack)[\w-]|(?:delegate|d(?!elegate))[^\s+=-])",
     re.UNICODE,
 )
 UNSUPPORTED = ("try-", "try", "retry", "delegate", "d", "link-", "link", "unlink", "stack")
@@ -48,7 +49,9 @@ ACCEPTED = "`bors r+`, `bors merge`, `bors r=<login>`, `bors p=<n>`, `bors r-` a
 class Command:
     """One parsed command line, or the reply it earns instead."""
 
-    kind: str  # approve | unapprove | cancel | priority | single | ping | refusal | autocorrect | unsupported | bros
+    # approve | unapprove | cancel | priority | single | ping | emergency | emergency_cancel | refusal |
+    # autocorrect | unsupported | bros
+    kind: str
     typed: str = ""
     reviewer: str | None = None  # the login named by `r=`; None means the commenter
     priority: int | None = None
@@ -59,12 +62,21 @@ class Command:
 
     @property
     def runs(self) -> bool:
-        return self.kind in ("approve", "unapprove", "cancel", "priority", "single", "ping")
+        return self.kind in (
+            "approve",
+            "unapprove",
+            "cancel",
+            "priority",
+            "single",
+            "ping",
+            "emergency",
+            "emergency_cancel",
+        )
 
     @property
     def merge_bound(self) -> bool:
         """Commands a draft refuses: everything that can lead to a merge."""
-        return self.kind in ("approve", "priority", "single", "unsupported") or (
+        return self.kind in ("approve", "priority", "single", "unsupported", "emergency") or (
             self.kind in ("refusal", "autocorrect") and self.level == "reviewer"
         )
 
@@ -159,6 +171,8 @@ def parse_cmd(cmd: str, *, review_app: bool = False) -> list[Command]:
         ("r-", "unapprove", "member"),
         ("merge-", "unapprove", "member"),
         ("cancel", "cancel", "member"),
+        ("emergency-", "emergency_cancel", "reviewer"),
+        ("emergency", "emergency", "reviewer"),
     ):
         if cmd.startswith(word):
             rest = cmd[len(word) :]
@@ -376,6 +390,41 @@ PERMISSION_DENIED = (
 )
 
 
+EMERGENCY_DENIED = ":lock: Permission denied\n\nOnly repository admins can run `bors emergency` and `bors emergency-`."
+
+EMERGENCY_REFUSALS = {
+    "disabled": "the emergency lane is disabled (`emergency_enabled`)",
+    "not-approved": "this pull request has no approved revision in the queue; approve it first",
+    "head-moved": "the approved revision is not the pull request's live head; approve the live head first",
+    "forgejo-inert": "this pull request's source is not enabled for staging",
+    "already-requested": "an emergency request for this pull request is already queued",
+}
+
+
+def emergency_reply(result: dict) -> str:
+    """The reply to `bors emergency`: accepted (and behind whom), or refused with the reason."""
+    if result.get("accepted"):
+        behind = result.get("behind")
+        where = f"It is queued behind #{behind}." if behind else "It is the next emergency batch."
+        return (
+            ":rotating_light: Emergency request accepted: this pull request becomes the next head, in a batch of "
+            f"its own, once the running head lands. {where} Its own CI run must pass before it lands."
+        )
+    reason = str(result.get("reason") or "")
+    if reason == "already-requested" and result.get("behind"):
+        return f":-1: {TRIGGER} did not run `{TRIGGER} emergency`: it is already queued behind #{result['behind']}."
+    shown = EMERGENCY_REFUSALS.get(reason, reason)
+    return f":-1: {TRIGGER} did not run `{TRIGGER} emergency`: {shown}."
+
+
+def emergency_cancel_reply(result: dict) -> str:
+    if result.get("cancelled"):
+        return ":ok_hand: Emergency request withdrawn; the approval stands."
+    if result.get("reason") == "promotion-pending":
+        return f":-1: {TRIGGER} did not run `{TRIGGER} emergency-`: the emergency batch is already landing."
+    return f":-1: {TRIGGER} did not run `{TRIGGER} emergency-`: there is no emergency request for this pull request."
+
+
 def draft_reply(commands: Sequence[Command]) -> str:
     blocked = ", ".join(f"`{TRIGGER} {c.typed}`" for c in commands if c.merge_bound)
     return (
@@ -388,8 +437,9 @@ def run_comment(controller, adapter, context: CommentContext, *, is_admin=None) 
     """Apply one comment's commands; returns the replies posted (for logs and tests).
 
     `controller` provides `approve(repo, pr, head_sha, reviewer, priority, evidence)` (evidence as
-    a dict), `unapprove(repo, pr, actor)`, `cancel(repo, pr, actor)` and `set_priority(repo, pr,
-    priority)`; `adapter` is the GitHub port, used for the live PR, the reviewer check and replies.
+    a dict), `unapprove(repo, pr, actor)`, `cancel(repo, pr, actor)`, `set_priority(repo, pr,
+    priority)`, `request_emergency(repo, pr, actor, surface=, reason=, live_head=)` and
+    `cancel_emergency(repo, pr, actor, surface=)`; `adapter` is the GitHub port, used for the live PR, the reviewer check and replies.
     """
     commands = parse(context.body, review_app=context.review_app)
     if not commands:
@@ -420,6 +470,16 @@ def run_comment(controller, adapter, context: CommentContext, *, is_admin=None) 
         pr = None
 
     admin = None
+
+    def is_repository_admin() -> bool:
+        nonlocal admin
+        if admin is None:
+            if context.review_app:
+                admin = False
+            else:
+                admin = bool(is_admin) if is_admin is not None else adapter.repository_admin(context.actor_login, repo)
+        return admin
+
     for index, command in enumerate(commands):
         key = f"{reply_key}:{index}"
         if command.kind in ("refusal", "autocorrect", "unsupported"):
@@ -434,14 +494,7 @@ def run_comment(controller, adapter, context: CommentContext, *, is_admin=None) 
             continue
         if command.kind == "approve":
             head = command.sha or (context.review_head if context.review_head else pr.head_sha)
-            if admin is None:
-                if context.review_app:
-                    admin = False
-                else:
-                    admin = (
-                        bool(is_admin) if is_admin is not None else adapter.repository_admin(context.actor_login, repo)
-                    )
-            merge_base = adapter.pr_merge_base(repo, number, head) if admin else None
+            merge_base = adapter.pr_merge_base(repo, number, head) if is_repository_admin() else None
             evidence = Evidence(
                 kind="review_app" if context.review_app else context.kind,
                 actor_login=context.actor_login,
@@ -471,6 +524,22 @@ def run_comment(controller, adapter, context: CommentContext, *, is_admin=None) 
                 context.actor_login,
                 **({"head_sha": pr.head_sha} if getattr(controller, "admission", None) is not None else {}),
             )
+        elif command.kind in ("emergency", "emergency_cancel"):
+            if not is_repository_admin():
+                reply(EMERGENCY_DENIED, key)
+            elif command.kind == "emergency":
+                result = controller.request_emergency(
+                    repo,
+                    number,
+                    context.actor_login,
+                    surface="comment",
+                    reason=context.comment_url,
+                    live_head=pr.head_sha,
+                )
+                reply(emergency_reply(result), key)
+            else:
+                result = controller.cancel_emergency(repo, number, context.actor_login, surface="comment")
+                reply(emergency_cancel_reply(result), key)
         elif command.kind == "priority":
             controller.set_priority(repo, number, command.priority)
         elif command.kind == "single":

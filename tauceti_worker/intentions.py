@@ -15,9 +15,9 @@ import json
 import re
 from dataclasses import dataclass
 
-from .config import log, roadmap_extra_identities, roadmap_subareas
+from .config import Die, log, one_line, roadmap_extra_identities, roadmap_subareas
 from .constants import ROADMAP
-from .github import GitHub, me
+from .github import GitHub, GitHubError, me
 
 # A claim's scope is untrusted text from an arbitrary issue body, injected into the worker prompt;
 # bound its length and (in claimed_block) quote it so it reads as data, not instructions.
@@ -168,11 +168,15 @@ def avoid_list(gh: GitHub, area: str | None, respect: bool) -> str:
     unpinned round gets every hold and no claims, and its agent checks the board itself.
 
     One read serves both lists: every open intention when claims are wanted, else only the holds.
-    It deliberately does not catch GitHub errors: authoring must stop if it cannot establish whether
-    a maintainer hold is active. Picking the claims out of a successful read still fails open."""
+    A failed read stops authoring with a Die naming the cause: the round must not author if it cannot
+    establish whether a maintainer hold is active. Picking the claims out of a successful read still
+    fails open."""
     want_claims = bool(area) and respect
     labels = ["intention"] if want_claims else ["intention", ADMINISTRATIVE_HOLD_LABEL]
-    issues = gh.issue_list(ROADMAP, labels=labels, fields=_FIELDS, limit=INTENTION_LIMIT)
+    try:
+        issues = gh.issue_list(ROADMAP, labels=labels, fields=_FIELDS, limit=INTENTION_LIMIT)
+    except GitHubError as e:
+        raise Die(f"roadmap: cannot read administrative holds on {ROADMAP} ({one_line(str(e))}); not authoring") from e
     if area:
         names = area_names(gh, area)
         issues = [it for it in issues if in_area(it, names)]

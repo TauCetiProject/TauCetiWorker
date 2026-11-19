@@ -168,6 +168,33 @@ class CacheTests(unittest.TestCase):
             sleep.assert_not_called()
 
 
+class SourceTreeTests(unittest.TestCase):
+    def test_idle_pinned_trees_are_collected_but_never_the_current_or_a_locked_one(self):
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as temporary:
+            parent = Path(temporary)
+            now = 10_000_000.0
+            current, idle, recent, held = ("a" * 40, "b" * 40, "c" * 40, "d" * 40)
+            stale_temporary = parent / ("e" * 40 + "-123")
+            for name in (current, idle, recent, held):
+                (parent / name / "Mathlib").mkdir(parents=True)
+            (stale_temporary / "Mathlib").mkdir(parents=True)
+            (parent / "unrelated").mkdir()
+            old = now - overlaps.SOURCES_IDLE - 1
+            for path in (parent / current, parent / idle, parent / held, stale_temporary, parent / "unrelated"):
+                os.utime(path, (old, old))
+            os.utime(parent / recent, (now, now))
+            with open(parent / (held + ".lock"), "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                removed = overlaps.collect_sources(parent, parent / current, now=now)
+            self.assertEqual(sorted(p.name for p in removed), sorted([idle, stale_temporary.name]))
+            self.assertEqual(
+                sorted(p.name for p in parent.iterdir() if p.suffix != ".lock"),
+                sorted([current, recent, held, "unrelated"]),
+            )
+
+
 class StateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

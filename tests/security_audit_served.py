@@ -706,6 +706,228 @@ class ServedJudgments(unittest.TestCase):
             advance.assert_called_once()
         self.assertFalse((self.work / "blocked.json").exists())
 
+    def test_fresh_launch_carries_and_records_trusted_baseline_names(self):
+        prompt = sa.inspection_prompt(self.batch, True, protocol=4, trusted_names=True)
+        self.assertIn(sa.TRUSTED_ORIGIN_POLICY, prompt)
+        self.assertIn("stacks", prompt.split("Trusted baseline names: ", 1)[1])
+        self.assertIn("never makes safe", prompt)
+        with self.assertRaises(Die):
+            sa.inspection_prompt(self.batch, True, protocol=3, trusted_names=True)
+        key_file = self.work / "anthropic-key"
+        key_file.write_text("sk-ant-fixture\n")
+        key_file.chmod(0o600)
+        attempt = self.work / "attempt-names"
+        attempt.mkdir()
+        value = {"verdict": "pass", "findings": []}
+        prompts = []
+
+        def model(argv, **kwargs):
+            prompts.append(kwargs["input"])
+            config = json.loads(argv[argv.index("--mcp-config") + 1])
+            args = config["mcpServers"]["audit"]["args"]
+            r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
+            for page in range(len(r.pages)):
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            events = read_events("claude", range(len(r.pages))) + [
+                {"type": "result", "subtype": "success", "structured_output": value}
+            ]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
+            patch.object(sa, "run_process", side_effect=model),
+        ):
+            sa.inspect(self.batch, "claude", attempt)
+        self.assertIn(sa.TRUSTED_ORIGIN_POLICY, prompts[0])
+        execution = json.loads((attempt / "execution.json").read_text())
+        self.assertEqual(execution["trusted_names_digest"], sa.trusted_names_digest())
+        self.assertIn("claude-haiku-5-5", execution["argv"])
+
+    def test_retained_attempts_keep_their_recorded_trusted_name_list(self):
+        self.evidence()
+        execution = json.loads((self.original / "execution.json").read_text())
+        self.assertNotIn("trusted_names_digest", execution)
+        recovery.retained(self.work, self.block)  # Older attempts validate against their original prompt.
+        execution["trusted_names_digest"] = "0" * 64
+        (self.original / "execution.json").write_text(sa.serialize(execution))
+        with self.assertRaisesRegex(Die, "trusted baseline name list"):
+            recovery.retained(self.work, self.block)
+
+    def test_haiku_api_key_file_replaces_subscription_credentials_and_is_not_retained(self):
+        key_file = self.work / "anthropic-key"
+        key_file.write_text("sk-ant-fixture-secret\n")
+        key_file.chmod(0o600)
+        value = {"verdict": "pass", "findings": []}
+        attempt = self.work / "attempt-api-key"
+        attempt.mkdir()
+        seen = {}
+
+        def model(argv, **kwargs):
+            seen.update(kwargs["env"])
+            self.assertFalse((kwargs["cwd"] / ".claude/.credentials.json").exists())
+            config = json.loads(argv[argv.index("--mcp-config") + 1])
+            args = config["mcpServers"]["audit"]["args"]
+            r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
+            for page in range(len(r.pages)):
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            events = read_events("claude", range(len(r.pages))) + [
+                {"type": "result", "subtype": "success", "structured_output": value}
+            ]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
+            patch.object(sa, "claude_dir", return_value=self.work / "no-subscription"),
+            patch.object(sa, "run_process", side_effect=model),
+        ):
+            self.assertEqual(sa.inspect(self.batch, "claude", attempt), sa.bind_verdict(value, self.batch))
+            key_file.chmod(0o644)
+            with self.assertRaises(Die):
+                sa.anthropic_api_key()
+        self.assertEqual(seen["ANTHROPIC_API_KEY"], "sk-ant-fixture-secret")
+        for path in attempt.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(b"sk-ant-fixture-secret", path.read_bytes(), str(path))
+
+    def test_pinned_claude_credential_selects_subscription_or_api_key(self):
+        key_file = self.work / "anthropic-key"
+        key_file.write_text("sk-ant-fixture-secret\n")
+        key_file.chmod(0o600)
+        (self.work / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"subscription-fixture"}}')
+        value = {"verdict": "pass", "findings": []}
+        seen = []
+
+        def model(argv, **kwargs):
+            seen.append(
+                (
+                    kwargs["env"].get("ANTHROPIC_API_KEY"),
+                    (kwargs["cwd"] / ".claude/.credentials.json").exists(),
+                )
+            )
+            config = json.loads(argv[argv.index("--mcp-config") + 1])
+            args = config["mcpServers"]["audit"]["args"]
+            r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
+            for page in range(len(r.pages)):
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            events = read_events("claude", range(len(r.pages))) + [
+                {"type": "result", "subtype": "success", "structured_output": value}
+            ]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
+            patch.object(sa, "claude_dir", return_value=self.work),
+            patch.object(sa, "run_process", side_effect=model),
+        ):
+            for kind in ("subscription", "api-key"):
+                attempt = self.work / f"attempt-{kind}"
+                attempt.mkdir()
+                verdict = sa.inspect(self.batch, "claude", attempt, claude_credential=kind)
+                self.assertEqual(verdict, sa.bind_verdict(value, self.batch))
+        self.assertEqual(seen, [(None, True), ("sk-ant-fixture-secret", False)])
+        with (
+            patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: ""}),
+            patch.object(sa, "run_process", side_effect=model),
+            self.assertRaises(Die),
+        ):
+            attempt = self.work / "attempt-missing-key"
+            attempt.mkdir()
+            sa.inspect(self.batch, "claude", attempt, claude_credential="api-key")
+        self.assertEqual(len(seen), 2)
+
+    def test_coverage_turns_serving_new_pages_continue_in_one_invocation(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
+        calls = 0
+        pages = len(ar.Reader(self.batch, self.original / "read-receipt.json").pages)
+        # Two turns that only reread page 0 use two of the three charged launches;
+        # the remaining pages are then read one per turn in the same invocation.
+
+        def model(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
+            r = ar.Reader(self.batch, Path(args[3]))
+            start = len(r.coverage()["served"])
+            read = ([start] if start < len(r.pages) else []) if calls > 2 else [0]
+            for page in read:
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            done = len(r.coverage()["served"]) == len(r.pages)
+            value = {"verdict": "pass" if done else "unfinished", "findings": []}
+            append_native_reads(kwargs["cwd"], read, self.thread, self.batch)
+            historical.append_native(kwargs["cwd"], value, self.thread)
+            events = [
+                {"type": "thread.started", "thread_id": self.thread},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+                {"type": "turn.completed"},
+            ]
+            events = read_events("codex", read) + events
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa, "run_process", side_effect=model),
+            patch.object(sa.time, "sleep"),
+            patch.object(sa, "advance", return_value="b" * 40) as advance,
+            patch.object(recovery.time, "time", return_value=1000),
+        ):
+            self.assertTrue(recovery.recover(self.cfg, self.opts, self.block))
+        self.assertEqual(calls, 2 + pages - 1)
+        advance.assert_called_once()
+        self.assertFalse((self.work / "blocked.json").exists())
+
+    def test_worker_killed_between_coverage_turns_resumes_the_retained_attempt(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
+        calls = 0
+
+        class Killed(BaseException):
+            pass
+
+        def model(argv, **kwargs):
+            nonlocal calls
+            calls += 1
+            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
+            r = ar.Reader(self.batch, Path(args[3]))
+            pages = list(range(len(r.pages))) if calls == 3 else [len(r.coverage()["served"])]
+            for page in pages:
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            value = {"verdict": "pass" if calls == 3 else "unfinished", "findings": []}
+            append_native_reads(kwargs["cwd"], pages, self.thread, self.batch)
+            historical.append_native(kwargs["cwd"], value, self.thread)
+            events = [
+                {"type": "thread.started", "thread_id": self.thread},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+                {"type": "turn.completed"},
+            ]
+            events = read_events("codex", pages) + events
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        sleeps = 0
+
+        def sleep(_):
+            # The Worker is killed while waiting to launch the next coverage turn,
+            # after the continuation for that unlaunched turn has been prepared.
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 2:
+                raise Killed
+
+        with (
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa, "run_process", side_effect=model),
+            patch.object(sa.time, "sleep", side_effect=sleep),
+            patch.object(sa, "advance", return_value="b" * 40) as advance,
+        ):
+            with patch.object(recovery.time, "time", return_value=1000), self.assertRaises(Killed):
+                recovery.recover(self.cfg, self.opts, self.block)
+            self.assertEqual(calls, 2)
+            previous = json.loads((self.work / "blocked.json").read_text())
+            self.assertEqual(previous["reason"], "security-audit: operational recovery interrupted")
+            with patch.object(recovery.time, "time", return_value=1301):
+                self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
+            self.assertEqual(calls, 3)
+            advance.assert_called_once()
+        self.assertFalse((self.work / "blocked.json").exists())
+
 
 class FreshRun(unittest.TestCase):
     setUp = historical.Run.setUp

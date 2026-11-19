@@ -24,6 +24,7 @@ from tauceti_worker import state_repair
 from tauceti_worker import work_units as work
 from tauceti_worker.config import ClaimCollision
 from tauceti_worker.constants import REVIEW_HEAD_CHANGED_EXIT, TAUCETI
+from tauceti_worker.github import GitHub
 from tauceti_worker.survey import Candidate, Counters, Survey
 
 HEAD, NEW = "a" * 40, "b" * 40
@@ -39,7 +40,7 @@ class StateRepair(unittest.TestCase):
         self.w = SimpleNamespace(
             cfg=self.cfg,
             counters=self.counters,
-            gh=SimpleNamespace(repo=TAUCETI),
+            gh=GitHub(TAUCETI),
             claims=None,
             rs=SimpleNamespace(bust=Mock(), review_rounds=lambda *_: 1),
         )
@@ -123,13 +124,22 @@ class StateRepair(unittest.TestCase):
             self.assertTrue(transport.direct_reads())
             return dict(headRefOid=NEW, state="OPEN", isDraft=False)
 
-        self.w.gh = SimpleNamespace(pr_view=read)
+        self.w.gh.pr_view = read
         self.w.rs.gh_meta = lambda *_, **__: SimpleNamespace(provenance="missing")
         self.w.rs.ledger_clean_head = lambda *_: ""
         with patch.object(state, "refresh_pr", return_value=dict(status="ok")) as refresh:
             self.assertFalse(work._still_actionable("review", self.w, None, Candidate(7, HEAD)))
         refresh.assert_called_once_with(TAUCETI, 7, HEAD, NEW)
         self.assertEqual(self.counters.read("review-err-7"), 0)
+
+    def test_source_without_refresh_capability_never_falls_back_to_github(self):
+        self.w.gh = SimpleNamespace()
+        with patch.object(state, "refresh_pr", side_effect=AssertionError("wrong-source refresh")):
+            state_repair.repair_selected(self.w, Candidate(7, HEAD), NEW)
+        retry = self.counters.read(state_repair.retry_key(7, HEAD))
+        self.assertGreater(retry, time.time() + 25)
+        self.assertLess(retry, time.time() + 35)
+        self.w.rs.bust.assert_called_once_with(7)
 
     def test_review_command_race_never_counts_as_a_review_or_error(self):
         self.counters.write("review-err-7", 2)

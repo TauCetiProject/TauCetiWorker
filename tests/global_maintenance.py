@@ -1,5 +1,6 @@
 """Global maintenance precedes roadmap choice without expanding GitHub reads."""
 
+import contextlib
 import importlib
 import os
 import sys
@@ -245,7 +246,6 @@ class GlobalMaintenance(unittest.TestCase):
         sv.open_prs[0] = SimpleNamespace(number=10, author="bot", automatic_bump=True)
         with (
             patch("tauceti_worker.github_outbox.pending_for", return_value=False),
-            patch("tauceti_worker.repair_recovery.pending_for", return_value=False),
             patch.object(work, "_check_stage_read_quota"),
             patch.object(work, "_close_spent_pr") as close,
             patch.object(work, "_effective_authoring_profile", side_effect=RuntimeError("normal model path")),
@@ -638,6 +638,56 @@ class GlobalMaintenance(unittest.TestCase):
         ):
             work._do_fixlike(self.w, sv, work.Candidate(10, HEAD), self.opts, False, prompt_file="fix.md", label="fix")
 
+    def test_fix_policy_uses_live_labels_and_retains_survey_on_incomplete_read(self):
+        sv = work.Survey(worker_id="test", me_login="science")
+        p = PRInfo.from_json(row(10, "Other")["pr"])
+        p = work.replace(p, labels=["full-lint"])
+        sv.open_prs = [p]
+        self.w.claims.begin_branch_work = lambda *args: True
+        for label in ("fix", "rebase"):
+            for live, expected in (
+                (dict(head=HEAD, state="OPEN", isDraft=False, labels=[dict(name="full-lint")]), ["full-lint"]),
+                (dict(head=HEAD, state="OPEN", isDraft=False, labels=[]), []),
+                (None, ["full-lint"]),
+            ):
+                with (
+                    patch.object(work, "_progress_snapshot", return_value=live),
+                    patch.object(self.w.gh, "pr_view", return_value=None, create=True),
+                    patch.object(work, "scope_policy", side_effect=RuntimeError("policy observed")) as policy,
+                    self.assertRaisesRegex(RuntimeError, "policy observed"),
+                ):
+                    work._do_fixlike(
+                        self.w, sv, work.Candidate(10, HEAD), self.opts, False, prompt_file="fix.md", label=label
+                    )
+                self.assertEqual(policy.call_args.args[0], expected)
+
+    def test_dispatch_host_rebase_reads_progress_once_after_claim(self):
+        self.opts.work_model = "claude"
+        sv = work.Survey(worker_id="test", me_login="science")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        self.w.cfg.checkout = Path(self.tmp.name) / "checkout"
+        self.w.counters.incr = lambda key: self.counter_values.update({key: 1})
+        claimed = []
+        self.w.claims.begin_branch_work = lambda *args: claimed.append(True) or True
+
+        def snapshot(*args):
+            self.assertTrue(claimed, "dispatch must leave the baseline read to the claimed stage")
+            return dict(head=HEAD, state="OPEN", isDraft=False, labels=[])
+
+        with (
+            patch.object(work, "_still_actionable", return_value=True),
+            patch.object(work, "_host_agent_binary", return_value=None),
+            patch.object(work, "_check_stage_read_quota"),
+            patch.object(work, "_checkout_head", return_value=HEAD),
+            patch.object(work, "_progress_snapshot", side_effect=snapshot) as progress,
+            patch("tauceti_worker.claude_api.api_mode", return_value=False),
+            patch("tauceti_worker.claude_api.api_context", side_effect=lambda *a, **kw: contextlib.nullcontext()),
+            patch.object(work, "scope_policy", side_effect=RuntimeError("preparation reached")),
+            self.assertRaisesRegex(RuntimeError, "preparation reached"),
+        ):
+            work.dispatch("rebase", self.w, sv, work.Candidate(10, HEAD, rebase_budget_key="rebase-test"), self.opts)
+        progress.assert_called_once()
+
     def test_stale_fix_never_reaches_paid_provider_probes(self):
         self.opts.work_model = "claude"
         self.w.gh.pr_view = lambda *_: dict(headRefOid="b" * 40, isDraft=False, state="OPEN", labels=[])
@@ -645,7 +695,6 @@ class GlobalMaintenance(unittest.TestCase):
         sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
         with (
             patch("tauceti_worker.github_outbox.pending_for", return_value=False),
-            patch("tauceti_worker.repair_recovery.pending_for", return_value=False),
             patch.object(work, "_host_agent_binary", return_value=None),
             patch.object(work, "resolve_codex_model_access") as entitlement,
             patch("tauceti_worker.fleet_capacity.admission_reason") as admission,
