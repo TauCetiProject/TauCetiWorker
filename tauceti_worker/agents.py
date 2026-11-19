@@ -2563,36 +2563,6 @@ def resolved_mount(spec: str) -> str:
     return f"{Path(src).resolve()}:/{rest}"
 
 
-def pooled_toolchain_mounts() -> list[str]:
-    """`--mount` specs offering each complete Lean toolchain in the host's elan pool to the
-    container, read-only at elan's own path. Empty unless `TAUCETI_BUBBLE_TOOLCHAINS=1`.
-
-    Bubble's image holds the toolchain the target pins and the container cannot download another,
-    so a round that merges a main with a newer `lean-toolchain` otherwise has nothing to build with.
-    Linux only: a macOS host's pool holds macOS binaries. A toolchain registered with
-    `elan toolchain link` is left out: elan reads a custom name only from a symlink, and a bind
-    mount presents a directory, which elan would take for a release to download. Elan unpacks an
-    install into a `<name>.tmp` sibling and renames it on completion, so that name can vanish
-    between listing and mounting; `scripts/share-build-caches` stages in a hidden sibling the same
-    way. A final name is assumed complete, since both producers only ever rename a whole one in."""
-    if os.environ.get("TAUCETI_BUBBLE_TOOLCHAINS", "0") != "1" or not sys.platform.startswith("linux"):
-        return []
-    pool = build_caches.elan_pool(_host_home(), os.environ) / "toolchains"
-    try:
-        names = sorted(
-            d.name
-            for d in pool.iterdir()
-            if ":" not in d.name
-            and not d.name.startswith(".")
-            and d.suffix != ".tmp"
-            and not d.is_symlink()
-            and (d / "bin" / "lean").is_file()
-        )
-    except OSError:
-        return []
-    return [f"{pool / name}:/home/user/.elan/toolchains/{name}:ro" for name in names]
-
-
 def run_in_bubble(
     w: Worker,
     target: str,
@@ -2753,9 +2723,6 @@ def run_in_bubble(
     snapshot = os.environ.get("TAUCETI_CONF_SNAPSHOT")
     if snapshot:
         mount_flags += ["--mount", f"{snapshot}:/opt/project.toml:ro"]
-    if inner_cmd is None:  # only the work agent builds
-        for m in pooled_toolchain_mounts():
-            mount_flags += ["--mount", m]
     mount_flags = [arg if arg == "--mount" else resolved_mount(arg) for arg in mount_flags]
 
     # Fork-PR write support (kim-em/bubble#320): grant the in-container agent git fetch/push to the
