@@ -268,7 +268,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     tail.append("--ignore-quota")  # only the operator grants outage permission
             # Audit-capable workers use a fixed Luna/Haiku inspection profile and reject
             # authoring overrides. Their maintenance fallback resolves its normal defaults.
-            if model and "security-audit" not in only:
+            if model and "security-audit" not in only and not model_free:
                 profile = resolve_authoring_profile(
                     model,
                     cli_model=getattr(args, "author_model", None),

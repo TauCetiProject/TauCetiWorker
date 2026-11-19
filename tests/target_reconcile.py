@@ -835,15 +835,17 @@ class ModelFree(Tmp):
             raise KeyboardInterrupt
 
         with (
-            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid", "HOME": str(self.tmp)}),
             patch.object(loop, "choose_model", side_effect=AssertionError("no provider is chosen")),
             patch.object(loop, "github_budget", return_value={}),
             patch.object(loop, "run_round_subprocess", return_value=0) as launched,
             patch.object(loop, "report_runtime"),
             patch.object(loop.time, "sleep", side_effect=sleep),
         ):
-            loop.cmd_loop(args, SimpleNamespace(wid="fixture"), only=["reconcile"], agent="claude")
-        launched.assert_called()
+            for agent in ("claude", "auto"):
+                launched.reset_mock()
+                loop.cmd_loop(args, SimpleNamespace(wid="fixture"), only=["reconcile"], agent=agent)
+                launched.assert_called()
 
 
 if __name__ == "__main__":
