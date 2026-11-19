@@ -592,166 +592,104 @@ class Look(Tmp):
 
 
 class Publication(Tmp):
-    """An inferred tick is published in the look that made it or not at all."""
+    """An inferred tick is published from a worktree of the remote branch, onto the goal and item
+    line it was given, or not at all."""
 
-    def ticked(self, text=LIST):
+    def inference(self, path, text=LIST):
         listed = t.parse_targets(text)
         item = listed.find("zero-one")
-        return (
-            item,
-            reconcile._unchanged(self.tmp / "x", listed, [item]),
-            t.rewrite_item(text, item, "done", add=(f"inferred: {TAIL}#a on 2026-01-02",)),
+        clause = f"inferred: {TAIL}#a on 2026-01-02"
+        plan, check = reconcile._inference_plan(
+            path, listed, [reconcile.Change(item, "done", "n", ("in flight",), (clause,))]
         )
 
-    def test_a_tick_is_not_pushed_once_a_rebase_changes_what_it_was_given(self):
+        def compute(text):
+            changes = plan(t.parse_targets(text))
+            return reconcile.apply(text, changes), [c.note for c in changes]
+
+        return compute, check
+
+    def remote(self):
+        return git(self.tmp / "remote.git", "show", "main:targets.md") + "\n"
+
+    def hook(self, clone, name, body):
+        hook = clone.parent / ".git" / "hooks" / name
+        hook.write_text("#!/bin/sh\n" + body)
+        hook.chmod(0o755)
+
+    def test_a_tick_on_an_unchanged_basis_is_published_and_the_clone_follows(self):
+        first = self.clone("first")
+        compute, check = self.inference(first)
+        self.assertEqual(reconcile.publish(first, compute, check=check), ["n"])
+        self.assertEqual(t.parse_targets(self.remote()).find("zero-one").status, "done")
+        self.assertEqual(first.read_text(), self.remote())
+
+    def test_a_tick_is_not_published_once_the_remote_changed_what_it_was_given(self):
         first, second = self.clone("first"), self.clone("second")
-        _, still, ticked = self.ticked()
+        compute, check = self.inference(first)
         broadened = LIST.replace("a synthetic goal", "a broader synthetic goal")
         second.write_text(broadened)
         git(second.parent, "commit", "-q", "-m", "goal", "targets.md")
-        hook = first.parent / ".git" / "hooks" / "post-commit"
-        hook.write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
-        hook.chmod(0o755)
-        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", broadened)
+        git(second.parent, "push", "-q", "origin", "HEAD:main")
+        self.assertEqual(reconcile.publish(first, compute, check=check), [])
+        self.assertEqual((self.remote(), first.read_text()), (broadened, broadened))
+
+    def test_a_tick_is_not_published_once_a_commit_hook_changes_what_it_was_given(self):
+        first = self.clone("first")
+        compute, check = self.inference(first)
+        self.hook(
+            first,
+            "pre-commit",
+            "sed 's/a synthetic goal/a rewritten goal/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
+        )
+        self.assertIsNone(reconcile.publish(first, compute, check=check))
         self.assertEqual(
-            (first.read_text(), git(first.parent, "show", "HEAD:targets.md") + "\n"), (broadened, broadened)
+            (self.remote(), first.read_text(), git(first.parent, "status", "--porcelain")), (LIST, LIST, "")
         )
 
-    def test_a_tick_that_cannot_be_pushed_is_withdrawn_keeping_the_operators_edits(self):
+    def test_a_refused_push_leaves_nothing_even_after_a_hook_committed_on_top(self):
         first = self.clone("first")
-        by_hand = LIST.replace("a synthetic goal", "a hand-edited goal") + "- [ ] `more` — Layer 5, x (needs: none)\n"
+        compute, check = self.inference(first)
+        by_hand = LIST.replace("- [ ] `aside`", "- [~] `aside`")
         first.write_text(by_hand)
-        _, still, ticked = self.ticked(by_hand)
-        hook = first.parent / ".git" / "hooks" / "post-commit"
-        hook.write_text("#!/bin/sh\ngit remote set-url --push origin /nonexistent/remote.git\n")
-        hook.chmod(0o755)
-        self.assertIsNone(reconcile.publish(first, by_hand, ticked, ["n"], still=still))
+        self.hook(
+            first,
+            "post-commit",
+            "grep -q 'operator note' targets.md && exit 0\n"
+            "echo '> operator note' >> targets.md && git commit -q -m note -- targets.md\n"
+            "git remote set-url --push origin /nonexistent/remote.git\n",
+        )
+        self.assertIsNone(reconcile.publish(first, compute, check=check))
+        self.assertEqual(self.remote(), LIST)
+        self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
         self.assertEqual(first.read_text(), by_hand)
-        self.assertEqual(git(first.parent, "show", "HEAD:targets.md") + "\n", by_hand)
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+        self.assertEqual(git(first.parent, "worktree", "list").count("\n"), 0)
 
-    def test_a_tick_line_a_formatting_hook_changed_is_still_taken_back(self):
-        first, second = self.clone("first"), self.clone("second")
-        _, still, ticked = self.ticked()
-        broadened = LIST.replace("a synthetic goal", "a broader synthetic goal")
-        second.write_text(broadened)
-        git(second.parent, "commit", "-q", "-m", "goal", "targets.md")
-        hooks = first.parent / ".git" / "hooks"
-        (hooks / "pre-commit").write_text(
-            "#!/bin/sh\nsed 's/^- \\[x\\] \\(.*inferred: TauCeti\\/Probability\\/Tail.lean#a \\)/- [X] \\1/'"
-            " targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n"
-        )
-        (hooks / "post-commit").write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
-        for name in ("pre-commit", "post-commit"):
-            (hooks / name).chmod(0o755)
-        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
-        self.assertEqual(t.parse_targets(first.read_text()).find("zero-one").status, "open")
-        reconcile._sync(first)
-        self.assertEqual(first.read_text(), broadened)
-
-    def test_a_tick_is_not_pushed_once_a_commit_hook_changes_what_it_was_given(self):
+    def test_a_second_list_in_the_clone_never_carries_a_refused_tick(self):
         first = self.clone("first")
-        _, still, ticked = self.ticked()
-        hook = first.parent / ".git" / "hooks" / "pre-commit"
-        hook.write_text(
-            "#!/bin/sh\nsed 's/a synthetic goal/a rewritten goal/' targets.md > t.tmp && mv t.tmp targets.md"
-            " && git add targets.md\n"
-        )
-        hook.chmod(0o755)
-        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", LIST)
-        self.assertEqual(t.parse_targets(git(first.parent, "show", "HEAD:targets.md")).find("zero-one").status, "open")
-        self.assertEqual(t.parse_targets(first.read_text()).find("zero-one").status, "open")
-        self.assertIn("a rewritten goal", first.read_text())
+        other = first.with_name("other.md")
+        other.write_text(LIST)
+        git(first.parent, "add", "other.md")
+        git(first.parent, "commit", "-q", "-m", "other")
+        git(first.parent, "push", "-q", "origin", "HEAD:main")
+        compute, check = self.inference(first)
+        self.hook(first, "pre-push", "exit 1\n")
+        self.assertIsNone(reconcile.publish(first, compute, check=check))
+        (first.parent / ".git" / "hooks" / "pre-push").unlink()
+        other_compute, other_check = self.inference(other)
+        self.assertEqual(reconcile.publish(other, other_compute, check=other_check), ["n"])
+        self.assertEqual(self.remote(), LIST)
 
-    def test_a_tick_taken_back_after_another_commit_keeps_that_commit(self):
-        first = self.clone("first")
-        _, still, ticked = self.ticked()
-        hook = first.parent / ".git" / "hooks" / "post-commit"
-        hook.write_text(
-            "#!/bin/sh\n[ -f other-list.md ] && exit 0\n"
-            "echo other > other-list.md && git add other-list.md && git commit -q -m 'other list'\n"
-            "git remote set-url --push origin /nonexistent/remote.git\n"
-        )
-        hook.chmod(0o755)
-        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
-        log = git(first.parent, "log", "--format=%s", "@{upstream}..HEAD").splitlines()
-        self.assertIn("other list", log)
-        self.assertEqual(t.parse_targets(first.read_text()).find("zero-one").status, "open")
-        committed = git(first.parent, "show", "HEAD:targets.md") + "\n"
-        self.assertEqual(t.parse_targets(committed).find("zero-one").status, "open")
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
-
-    def test_a_later_commit_to_the_same_list_survives_the_withdrawal(self):
-        first = self.clone("first")
-        _, still, ticked = self.ticked()
-        hook = first.parent / ".git" / "hooks" / "post-commit"
-        hook.write_text(
-            "#!/bin/sh\ngrep -q 'operator note' targets.md && exit 0\n"
-            "echo '> operator note' >> targets.md && git commit -q -m 'note' -- targets.md\n"
-            "git remote set-url --push origin /nonexistent/remote.git\n"
-        )
-        hook.chmod(0o755)
-        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
-        self.assertIn("note", git(first.parent, "log", "--format=%s", "@{upstream}..HEAD").splitlines())
-        committed = git(first.parent, "show", "HEAD:targets.md")
-        self.assertIn("operator note", committed)
-        self.assertEqual(t.parse_targets(committed).find("zero-one").status, "open")
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
-
-    def test_a_list_named_with_a_space_is_withdrawn(self):
+    def test_a_list_named_with_a_space_is_published(self):
         first = self.clone("first")
         named = first.with_name("target list.md")
         git(first.parent, "mv", "targets.md", named.name)
         git(first.parent, "commit", "-q", "-m", "rename")
         git(first.parent, "push", "-q", "origin", "HEAD:main")
-        listed = t.parse_targets(LIST)
-        item = listed.find("zero-one")
-        still = reconcile._unchanged(named, listed, [item])
-        ticked = t.rewrite_item(LIST, item, "done", add=(f"inferred: {TAIL}#a on 2026-01-02",))
-        hook = first.parent / ".git" / "hooks" / "post-commit"
-        hook.write_text(
-            "#!/bin/sh\n[ -f other-list.md ] && exit 0\n"
-            "echo other > other-list.md && git add other-list.md && git commit -q -m 'other list'\n"
-            "git remote set-url --push origin /nonexistent/remote.git\n"
-        )
-        hook.chmod(0o755)
-        self.assertIsNone(reconcile.publish(named, LIST, ticked, ["n"], still=still))
-        committed = git(first.parent, "show", "HEAD:target list.md")
-        self.assertEqual(t.parse_targets(committed).find("zero-one").status, "open")
-        self.assertFalse(reconcile._owed(named).exists())
-
-    def test_an_owed_withdrawal_blocks_every_push_until_it_is_made(self):
-        first = self.clone("first")
-        _, still, ticked = self.ticked()
-        hook = first.parent / ".git" / "hooks" / "post-commit"
-        hook.write_text("#!/bin/sh\ngit remote set-url --push origin /nonexistent/remote.git\n")
-        hook.chmod(0o755)
-        with patch.object(reconcile, "_withdraw", return_value=False):
-            self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
-            git(first.parent, "remote", "set-url", "--push", "origin", str(self.tmp / "remote.git"))
-            self.assertFalse(reconcile._push(first))
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", LIST)
-        self.assertTrue(reconcile._push(first))
-        remote = git(self.tmp / "remote.git", "show", "main:targets.md")
-        self.assertEqual(t.parse_targets(remote).find("zero-one").status, "open")
-        self.assertFalse(reconcile._owed(first).exists())
-
-    def test_a_tick_another_host_already_published_leaves_the_rebased_clone_alone(self):
-        first, second = self.clone("first"), self.clone("second")
-        _, still, ticked = self.ticked()
-        second.write_text(ticked)
-        git(second.parent, "commit", "-q", "-m", "same tick", "targets.md")
-        second.write_text(ticked.replace("a synthetic goal", "a broader synthetic goal"))
-        git(second.parent, "commit", "-q", "-m", "goal", "targets.md")
-        hook = first.parent / ".git" / "hooks" / "post-commit"
-        hook.write_text(f"#!/bin/sh\ngit -C {second.parent} push -q origin HEAD:main\n")
-        hook.chmod(0o755)
-        self.assertIsNotNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
-        self.assertEqual(git(first.parent, "rev-parse", "HEAD"), git(self.tmp / "remote.git", "rev-parse", "main"))
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
+        compute, check = self.inference(named)
+        self.assertEqual(reconcile.publish(named, compute, check=check), ["n"])
+        committed = git(self.tmp / "remote.git", "show", "main:target list.md")
+        self.assertEqual(t.parse_targets(committed).find("zero-one").status, "done")
 
 
 if __name__ == "__main__":

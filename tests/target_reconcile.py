@@ -205,91 +205,129 @@ class NativeReferences(unittest.TestCase):
         self.assertIn(f"(needs: none; closed: {canonical})", out)
 
 
+def tick(slug, clause="landed: #7"):
+    """A `publish` computation that ticks `slug` wherever it is still open."""
+
+    def compute(text):
+        item = t.parse_targets(text).find(slug)
+        if item is None or item.status == "done":
+            return text, []
+        return t.rewrite_item(text, item, "done", add=(clause,)), [f"`{slug}`: n"]
+
+    return compute
+
+
 class Publish(Tmp):
-    def test_an_untracked_list_is_edited_in_place_and_keeps_a_hand_edit(self):
+    def remote(self):
+        return git(self.tmp / "remote.git", "show", "main:targets.md") + "\n"
+
+    def hook(self, clone, name, body):
+        hook = clone.parent / ".git" / "hooks" / name
+        hook.write_text("#!/bin/sh\n" + body)
+        hook.chmod(0o755)
+        return hook
+
+    def test_an_untracked_list_is_edited_in_place_and_recomputed_on_a_hand_edit(self):
         path = self.tmp / "targets.md"
         path.write_text(EXAMPLE)
         path.chmod(0o640)
-        ours = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        self.assertEqual(reconcile.publish(path, EXAMPLE, ours, ["n"]), ours)
-        self.assertEqual((path.read_text(), path.stat().st_mode & 0o777), (ours, 0o640))
-        by_hand = ours.replace("Goal: the strong law", "Goal: the weak law")
-        path.write_text(by_hand)
-        mine = ours.replace("- [ ] `kolmogorov-zero-one`", "- [x] `kolmogorov-zero-one`")
-        merged = reconcile.publish(path, ours, mine, ["n"])
-        self.assertIn("Goal: the weak law", merged)
-        self.assertIn("- [x] `kolmogorov-zero-one`", merged)
-        self.assertEqual(path.read_text(), merged)
-        path.write_text(merged.replace("- [x] `kolmogorov-zero-one`", "- [~] `kolmogorov-zero-one`"))
-        clash = merged.replace("- [x] `kolmogorov-zero-one`", "- [ ] `kolmogorov-zero-one`")
-        self.assertIsNone(reconcile.publish(path, merged, clash, ["n"]))
-        self.assertIn("- [~] `kolmogorov-zero-one`", path.read_text())
-        with patch.object(reconcile.os, "replace", side_effect=PermissionError(13, "Permission denied")):
-            self.assertIsNone(reconcile.publish(path, path.read_text(), merged, ["n"]))
+        self.assertEqual(reconcile.publish(path, tick("strong-law")), ["`strong-law`: n"])
+        self.assertIn("- [x] `strong-law`", path.read_text())
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(reconcile.publish(path, tick("strong-law")), [])
+        by_hand = EXAMPLE.replace("Goal: the strong law", "Goal: the weak law")
+        seen = []
+
+        def edited_meanwhile(text):
+            if not seen:
+                path.write_text(by_hand)
+            seen.append(text)
+            return tick("kolmogorov-zero-one")(text)
+
+        path.write_text(EXAMPLE)
+        self.assertEqual(len(reconcile.publish(path, edited_meanwhile)), 1)
+        self.assertIn("Goal: the weak law", path.read_text())
+        self.assertIn("- [x] `kolmogorov-zero-one`", path.read_text())
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["targets.md"])
 
-    def test_two_hosts_share_a_tracked_list_through_its_remote(self):
+    def test_a_tracked_list_is_published_from_a_worktree_and_the_clean_clone_follows(self):
         first, second = self.clone("first"), self.clone("second")
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        self.assertEqual(reconcile.publish(first, EXAMPLE, a, ["`strong-law`: #7 merged"]), a)
+        self.assertEqual(reconcile.publish(first, tick("strong-law")), ["`strong-law`: n"])
         self.assertEqual(
-            git(first.parent, "log", "-1", "--format=%s%n%n%b"),
-            "Reconcile targets.md: 1 item(s)\n\n- `strong-law`: #7 merged",
+            git(self.tmp / "remote.git", "log", "-1", "--format=%s%n%n%b", "main"),
+            "Reconcile targets.md: 1 item(s)\n\n- `strong-law`: n",
         )
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
-        b = EXAMPLE.replace("- [ ] `kolmogorov-zero-one`", "- [x] `kolmogorov-zero-one`")
-        both = reconcile.publish(second, EXAMPLE, b, ["`kolmogorov-zero-one`: #8 merged"])
+        self.assertEqual(first.read_text(), self.remote())
+        self.assertEqual(
+            (git(first.parent, "status", "--porcelain"), git(first.parent, "worktree", "list").count("\n")), ("", 0)
+        )
+        self.assertEqual(reconcile.publish(second, tick("kolmogorov-zero-one")), ["`kolmogorov-zero-one`: n"])
+        both = self.remote()
         self.assertIn("- [x] `strong-law`", both)
         self.assertIn("- [x] `kolmogorov-zero-one`", both)
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
-        self.assertEqual(git(self.tmp / "remote.git", "rev-list", "--count", "main"), "3")
+        self.assertEqual(second.read_text(), both)
+        self.assertEqual(reconcile.publish(first, tick("strong-law")), [])
 
-    def test_a_commit_that_fails_leaves_the_edit_to_a_later_look(self):
-        first = self.clone("first")
-        by_hand = EXAMPLE.replace("Goal: the strong law", "Goal: the weak law")
-        first.write_text(by_hand)
-        hook = first.parent / ".git" / "hooks" / "pre-commit"
-        hook.write_text("#!/bin/sh\nexit 1\n")
-        hook.chmod(0o755)
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
-        self.assertEqual((first.read_text(), git(first.parent, "rev-list", "--count", "HEAD")), (by_hand, "1"))
-        hook.unlink()
-        both = reconcile.publish(first, EXAMPLE, a, ["n"])
-        self.assertIn("- [x] `strong-law`", both)
-        self.assertIn("Goal: the weak law", both)
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
+    def test_edits_are_computed_on_the_published_list_not_merged_into_it(self):
+        first, second = self.clone("first"), self.clone("second")
+        second.write_text(EXAMPLE.replace("## Probability", "## Statistics"))
+        git(second.parent, "commit", "-q", "-am", "rename the area")
+        git(second.parent, "push", "-q", "origin", "HEAD:main")
 
-    def test_a_commit_that_fails_after_a_hook_edits_the_list_keeps_that_edit_alone(self):
-        first = self.clone("first")
-        hook = first.parent / ".git" / "hooks" / "pre-commit"
-        hook.write_text("#!/bin/sh\necho '<!-- formatted -->' >> targets.md\nexit 1\n")
-        hook.chmod(0o755)
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
-        self.assertEqual(first.read_text(), EXAMPLE + "<!-- formatted -->\n")
-        hook.unlink()
-        both = reconcile.publish(first, EXAMPLE + "<!-- formatted -->\n", a + "<!-- formatted -->\n", ["n"])
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
-        self.assertIn("- [x] `strong-law`", both)
+        def settle_probability(text):
+            item = next(
+                (it for it in t.parse_targets(text).areas.get("Probability", []) if it.slug == "strong-law"), None
+            )
+            if item is None:
+                return text, []
+            return t.rewrite_item(text, item, "done", add=("landed: #42",)), ["n"]
 
-    def test_a_failed_commit_whose_hook_edited_the_same_line_is_retried(self):
+        self.assertEqual(reconcile.publish(first, settle_probability), [])
+        self.assertNotIn("landed: #42", self.remote())
+        self.assertEqual(first.read_text(), self.remote())
+
+    def test_a_rejected_commit_leaves_nothing_and_a_later_look_publishes(self):
         first = self.clone("first")
-        hook = first.parent / ".git" / "hooks" / "pre-commit"
-        hook.write_text(
-            "#!/bin/sh\nsed 's/the strong law (/the strong law. (/' targets.md > t.tmp && mv t.tmp targets.md\nexit 1\n"
+        hook = self.hook(
+            first,
+            "pre-commit",
+            "sed 's/the strong law (/the strong law. (/' targets.md > t.tmp && mv t.tmp targets.md\nexit 1\n",
         )
-        hook.chmod(0o755)
-        listed = t.parse_targets(EXAMPLE)
-        a = t.rewrite_item(EXAMPLE, listed.find("strong-law"), "done", add=("landed: #7",))
-        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
-        left = first.read_text()
-        self.assertIn("- [ ] `strong-law` — the strong law. (serves: G1; needs:", left)
-        self.assertNotIn("landed: #7", left)
+        self.assertIsNone(reconcile.publish(first, tick("strong-law")))
+        self.assertEqual((first.read_text(), self.remote()), (EXAMPLE, EXAMPLE))
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
         hook.unlink()
-        again = t.rewrite_item(left, t.parse_targets(left).find("strong-law"), "done", add=("landed: #7",))
-        self.assertEqual(reconcile.publish(first, left, again, ["n"]), again)
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", again)
+        self.assertEqual(len(reconcile.publish(first, tick("strong-law"))), 1)
+        self.assertIn("- [x] `strong-law`", self.remote())
+
+    def test_a_partial_history_survives_a_rejected_commit_and_its_retry(self):
+        listed = EXAMPLE.replace("in flight: #1234", "partial: #7; in flight: #1234")
+        first = self.clone("first")
+        first.write_text(listed)
+        git(first.parent, "commit", "-q", "-am", "partial")
+        git(first.parent, "push", "-q", "origin", "HEAD:main")
+        observed = seen(
+            pulls={1234: {"state": "MERGED", "body": marker("Probability", "truncation-bounds", partial=True)}}
+        )
+
+        def compute(text):
+            changes = reconcile.settle(t.parse_targets(text), observed)
+            return reconcile.apply(text, changes), [c.note for c in changes]
+
+        hook = self.hook(first, "pre-commit", "exit 1\n")
+        self.assertIsNone(reconcile.publish(first, compute))
+        hook.unlink()
+        self.assertEqual(len(reconcile.publish(first, compute)), 1)
+        self.assertIn("(needs: none; partial: #7, #1234)", self.remote())
+
+    def test_an_operators_uncommitted_edit_is_left_alone(self):
+        first = self.clone("first")
+        by_hand = EXAMPLE.replace("- [ ] `strong-law`", "- [~] `strong-law`")
+        first.write_text(by_hand)
+        self.assertEqual(len(reconcile.publish(first, tick("kolmogorov-zero-one"))), 1)
+        self.assertEqual(first.read_text(), by_hand)
+        self.assertIn("- [x] `kolmogorov-zero-one`", self.remote())
+        self.assertNotIn("- [~] `strong-law`", self.remote())
 
     def test_a_list_named_like_a_glob_is_committed_alone(self):
         first = self.clone("first")
@@ -300,44 +338,33 @@ class Publish(Tmp):
         git(first.parent, "commit", "-q", "-m", "rename")
         git(first.parent, "push", "-q", "origin", "HEAD:main")
         (first.parent / "targets1.md").write_text("unfinished notes\n")
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        self.assertEqual(reconcile.publish(named, EXAMPLE, a, ["n"]), a)
-        self.assertEqual(git(first.parent, "show", "--name-only", "--format=", "HEAD"), "targets[1].md")
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets1.md")
+        self.assertEqual(len(reconcile.publish(named, tick("strong-law"))), 1)
+        self.assertEqual(git(self.tmp / "remote.git", "show", "--name-only", "--format=", "main"), "targets[1].md")
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets1.md"), "notes")
+        self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets1.md")
 
     def test_a_commit_hook_keeps_its_own_glob_matching(self):
         first = self.clone("first")
-        hook = first.parent / ".git" / "hooks" / "pre-commit"
-        hook.write_text("#!/bin/sh\n[ -z \"$(git diff --cached --name-only -- '*.md')\" ] || exit 1\n")
-        hook.chmod(0o755)
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", EXAMPLE)
+        self.hook(first, "pre-commit", "[ -z \"$(git diff --cached --name-only -- '*.md')\" ] || exit 1\n")
+        self.assertIsNone(reconcile.publish(first, tick("strong-law")))
+        self.assertEqual(self.remote(), EXAMPLE)
 
-    def test_a_failed_commit_keeps_an_operators_change_to_the_same_item(self):
+    def test_a_check_on_the_committed_list_refuses_what_a_hook_changed(self):
         first = self.clone("first")
-        listed = t.parse_targets(EXAMPLE)
-        a = t.rewrite_item(EXAMPLE, listed.find("strong-law"), "done", add=("landed: #7",))
-        by_hand = EXAMPLE.replace(
-            "- [ ] `strong-law` — the strong law (serves: G1; needs: `borel-cantelli`, `truncation-bounds`)",
-            "- [~] `strong-law` — the strong law (serves: G1; needs: `borel-cantelli`, `truncation-bounds`; "
-            "partial: #7; in flight: #8)",
+        self.hook(
+            first,
+            "pre-commit",
+            "sed 's/the strong law for/the weak law for/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
         )
-        hook = first.parent / ".git" / "hooks" / "pre-commit"
-        hook.write_text(f"#!/bin/sh\ncat > targets.md <<'LIST'\n{by_hand}LIST\nexit 1\n")
-        hook.chmod(0o755)
-        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
-        self.assertEqual(first.read_text(), by_hand)
+        self.assertIsNone(reconcile.publish(first, tick("strong-law"), check=lambda text: "the strong law for" in text))
+        self.assertEqual(self.remote(), EXAMPLE)
 
     def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
         from tauceti_worker.source_identity import SourceActor
         from tauceti_worker.worker_sources import activate
 
         first = self.clone("first")
-        hook = first.parent / ".git" / "hooks" / "pre-commit"
-        hook.write_text("#!/bin/sh\nexit 1\n")
-        hook.chmod(0o755)
+        hook = self.hook(first, "pre-commit", "exit 1\n")
         token = self.tmp / "native-token"
         token.write_text("synthetic\n")
         token.chmod(0o600)
@@ -348,23 +375,21 @@ class Publish(Tmp):
         )
         source.api.request.return_value = {"id": 3, "email": "bot@example.invalid"}
         source.identity.record.return_value = {}
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
         with activate(source, SimpleNamespace(state=self.tmp / "native-state")):
-            self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
+            self.assertIsNone(reconcile.publish(first, tick("strong-law")))
             hook.unlink()
-            self.assertEqual(reconcile.publish(first, EXAMPLE, a, ["n"]), a)
-        self.assertEqual(git(first.parent, "log", "-1", "--format=%an"), "curator")
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", a)
+            self.assertEqual(len(reconcile.publish(first, tick("strong-law"))), 1)
+        self.assertEqual(git(self.tmp / "remote.git", "log", "-1", "--format=%an", "main"), "curator")
 
-    def test_a_commit_that_cannot_be_pushed_goes_with_the_next_look(self):
+    def test_a_refused_push_leaves_nothing_and_a_later_look_publishes(self):
         first = self.clone("first")
         git(first.parent, "remote", "set-url", "--push", "origin", str(self.tmp / "nonexistent.git"))
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        self.assertEqual(reconcile.publish(first, EXAMPLE, a, ["n"]), a)
-        self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "1")
+        self.assertIsNone(reconcile.publish(first, tick("strong-law")))
+        self.assertEqual(
+            (first.read_text(), git(first.parent, "rev-list", "--count", "@{upstream}..HEAD")), (EXAMPLE, "0")
+        )
         git(first.parent, "remote", "set-url", "--push", "origin", str(self.tmp / "remote.git"))
-        self.assertTrue(reconcile._push(first))
-        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", a)
+        self.assertEqual(len(reconcile.publish(first, tick("strong-law"))), 1)
 
     def test_the_first_publication_creates_the_branch_an_empty_remote_lacks(self):
         remote = self.tmp / "empty.git"
@@ -374,31 +399,22 @@ class Publish(Tmp):
         path.write_text(EXAMPLE)
         git(path.parent, "add", "targets.md")
         git(path.parent, "commit", "-q", "-m", "list")
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        self.assertEqual(reconcile.publish(path, EXAMPLE, a, ["n"]), a)
-        self.assertEqual(git(remote, "show", "main:targets.md") + "\n", a)
+        self.assertEqual(len(reconcile.publish(path, tick("strong-law"))), 1)
+        self.assertIn("- [x] `strong-law`", git(remote, "show", "main:targets.md"))
 
-    def test_a_push_that_loses_the_race_is_retried_after_a_rebase(self):
+    def test_a_clone_with_uncommitted_edits_or_its_own_commits_is_not_moved(self):
         first, second = self.clone("first"), self.clone("second")
-        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
-        b = EXAMPLE.replace("- [ ] `kolmogorov-zero-one`", "- [x] `kolmogorov-zero-one`")
-        second.write_text(b)
-        git(second.parent, "commit", "-q", "-m", "local", "targets.md")
-        reconcile.publish(first, EXAMPLE, a, ["n"])
-        reconcile._push(second)
-        merged = git(self.tmp / "remote.git", "show", "main:targets.md")
-        self.assertIn("- [x] `strong-law`", merged)
-        self.assertIn("- [x] `kolmogorov-zero-one`", merged)
-        self.assertEqual(git(second.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
-
-    def test_a_clone_being_edited_by_hand_is_not_rebased(self):
-        first, second = self.clone("first"), self.clone("second")
-        reconcile.publish(first, EXAMPLE, EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`"), ["n"])
         by_hand = EXAMPLE.replace("Goal: the strong law", "Goal: the weak law")
         second.write_text(by_hand)
         head = git(second.parent, "rev-parse", "HEAD")
+        reconcile.publish(first, tick("strong-law"))
+        git(second.parent, "fetch", "-q")
         reconcile._sync(second)
         self.assertEqual((git(second.parent, "rev-parse", "HEAD"), second.read_text()), (head, by_hand))
+        git(second.parent, "commit", "-q", "-am", "own")
+        own = git(second.parent, "rev-parse", "HEAD")
+        reconcile._sync(second)
+        self.assertEqual(git(second.parent, "rev-parse", "HEAD"), own)
 
 
 class Round(Tmp):
