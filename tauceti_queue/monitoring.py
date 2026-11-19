@@ -28,16 +28,23 @@ from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import task_progress
+from . import stuck_heads, task_progress
 from .monitoring_protocol import PublicationRejected, PublisherIdentity, ResyncRequired, SnapshotPublisher, encode
-from .task_identity import TaskBinding
 
 SCHEMA = "tauceti.operations.queue/v1"
 LIMIT = 20_000
+# Terminal inputs kept beside every live one; older inputs remain only as their members' detail.
+TERMINAL_INPUTS = 5000
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 MAX_BYTES = 2_000_000
 BUILD_TAIL_BYTES = 64_000
+# The public observation's conditions are bounded (100); stuck heads take at most this many.
+STUCK_LISTED = 30
+MAX_CONDITIONS = 100
+# The live projection's encoded size target, inside the receiver's 15 MB snapshot budget.
+PROJECTION_BUDGET = 12_000_000
+DETAIL = ("members", "attempts", "tasks", "events")
 
 
 def iso(value):
@@ -337,7 +344,7 @@ def task_binding_fields(task):
     """Project SQL identity metadata independently of optional worker progress."""
     try:
         row = json.loads(task.get("task_binding", "{}"))
-        return {} if row == {} else {"task_binding": TaskBinding.parse(row).record()}
+        return {} if row == {} else {"task_binding": task_progress.binding_record(row)}
     except (ValueError, TypeError):
         return {"task_binding": None, "identity_coverage": "invalid"}
 
@@ -355,7 +362,7 @@ class TaskObservations:
         for task in sorted(tasks, key=lambda t: (t["state"] != "open", -t["id"]))[:100]:
             try:
                 raw_binding = json.loads(task.get("task_binding", "{}"))
-                expected_binding = None if raw_binding == {} else TaskBinding.parse(raw_binding).record()
+                expected_binding = None if raw_binding == {} else task_progress.binding_record(raw_binding)
             except (ValueError, TypeError):
                 continue
             candidates = []
@@ -431,7 +438,9 @@ class TaskObservations:
                     if task["state"] == "open"
                     else None
                 )
-                result[task["id"]] = observation | ({"build": build} if build else {})
+                # The binding only matches a checkpoint to its task; the task record publishes it.
+                public = {key: value for key, value in observation.items() if key != "task_binding"}
+                result[task["id"]] = public | ({"build": build} if build else {})
                 if task["state"] == "open" and token in live_tokens:
                     from . import task_activity
 
@@ -471,22 +480,72 @@ def project(
             # native records under an unrelated github.com owner/name.
             raise ValueError("source-bound queue requires a qualified public monitoring policy")
 
+        captured = clock()
+        public = sorted(public_repositories)
+        in_public = "repository IN (" + ",".join("?" * len(public)) + ")" if public else "0"
         batches = rows(
             "SELECT id,repository,version,base,tip,state,sealed,created_at,sealed_at,landed_at,"
             "first_dispatch_at,pre_rebase_state,pre_rebase_tip,pre_rebase_onto,pre_rebase_prepared "
             "FROM batches ORDER BY CASE state WHEN 'head' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,id DESC LIMIT ?",
             (LIMIT + 1,),
         )
-        members = rows(
-            "SELECT id,batch_id,input_id,number,accepted_head,position,commit_sha,provenance,"
-            "task_id,explanation,added_at,removed,removed_reason,no_repair,withdrawn FROM members "
-            "ORDER BY id DESC LIMIT ?",
-            (LIMIT + 1,),
+        # Keep active work and a bounded 90-day terminal window. Historic totals
+        # belong to the journal report, rather than an ever-growing live projection.
+        terminal = [
+            r
+            for r in batches[:LIMIT]
+            if r["state"] not in ("head", "open") and (r["landed_at"] or r["created_at"]) >= captured - 90 * 86400
+        ][:500]
+        active = [
+            r for r in batches[:LIMIT] if r["state"] in ("head", "open") and r["repository"] in public_repositories
+        ]
+        terminal = [r for r in terminal if r["repository"] in public_repositories]
+        # Only active members count toward the row limit; terminal batches then join newest first
+        # while all of their members fit, so shortened history drops whole batches, never a
+        # retained batch's members (docs/queue/monitoring.md).
+        sizes = {r["batch_id"]: r["n"] for r in rows("SELECT batch_id,COUNT(*) n FROM members GROUP BY batch_id")}
+        room = LIMIT - sum(sizes.get(r["id"], 0) for r in active)
+        kept = []
+        for row in terminal:
+            if sizes.get(row["id"], 0) > room:
+                break
+            kept.append(row)
+            room -= sizes.get(row["id"], 0)
+        member_params = tuple(public)
+        member_columns = (
+            "SELECT m.id,m.batch_id,m.input_id,m.number,m.accepted_head,m.position,m.commit_sha,m.provenance,"
+            "m.task_id,m.explanation,m.added_at,m.removed,m.removed_reason,m.no_repair,m.withdrawn,"
+            # Each member's own input, however old, rather than only the inputs published below.
+            "i.title,i.author,i.state input_state,i.approved_at,i.landed_at,i.landed_sha,i.reason "
+            # Only a public input's detail, as for the published inputs.
+            "FROM members m LEFT JOIN inputs i ON i.id=m.input_id AND "
+            + ("i." + in_public if public else "0")
+            + " WHERE m.batch_id IN "
         )
-        inputs = rows(
-            "SELECT id,repository,number,head_sha,title,author,state,approved_at,batch_id,"
-            "landed_at,landed_sha,no_repair FROM inputs ORDER BY CASE WHEN state IN ('waiting','reserved') THEN 0 ELSE 1 END,id DESC LIMIT ?",
-            (LIMIT + 1,),
+
+        def members_of(group, limit):
+            if not group:
+                return []
+            ids = [r["id"] for r in group]
+            sql = member_columns + "(" + ",".join("?" * len(ids)) + ") ORDER BY m.id DESC LIMIT ?"
+            return rows(sql, (*member_params, *ids, limit))
+
+        members = members_of(active, LIMIT + 1)
+        members += members_of(kept, max(0, LIMIT + 1 - len(members)))
+        # Rows past the limit are the oldest terminal batches unless active work alone exceeds it.
+        batches_complete = len(batches) <= LIMIT or batches[LIMIT]["state"] not in ("head", "open")
+        batches = active + kept
+        live_inputs = rows(
+            "SELECT id,repository,number,head_sha,title,author,state,approved_at,batch_id,landed_at,landed_sha,"
+            f"no_repair,reason FROM inputs WHERE state IN ('waiting','reserved') AND {in_public} ORDER BY id DESC LIMIT ?",
+            (*public, LIMIT + 1),
+        )
+        inputs = live_inputs + rows(
+            "SELECT id,repository,number,head_sha,title,author,state,approved_at,batch_id,landed_at,landed_sha,"
+            f"no_repair,reason FROM inputs WHERE state NOT IN ('waiting','reserved') AND {in_public} "
+            "ORDER BY id DESC LIMIT ?",
+            # The receiver accepts at most LIMIT records per collection; live inputs come first.
+            (*public, max(0, min(TERMINAL_INPUTS, LIMIT - len(live_inputs)))),
         )
         # The exporter can start before the queue migrates an older ledger.
         columns = {r["name"] for r in rows("PRAGMA table_info(ci_attempts)")}
@@ -539,37 +598,25 @@ def project(
         reductions = rows(
             "SELECT detail FROM journal WHERE kind='member-reduced-to-empty' ORDER BY id DESC LIMIT ?", (LIMIT,)
         )
-        captured = clock()
-    tables = (batches, members, inputs, attempts, tasks)
-    truncated = any(len(t) > LIMIT for t in tables)
+    # Only active detail beyond the limit is missing: terminal history is shortened whole above.
     complete = {
-        k: len(v) <= LIMIT for k, v in zip(("batches", "members", "inputs", "attempts", "tasks"), tables, strict=True)
+        "batches": batches_complete,
+        "members": len(members) <= LIMIT,
+        "inputs": len(live_inputs) <= LIMIT,
+        "attempts": len(attempts) <= LIMIT,
+        "tasks": len(tasks) <= LIMIT,
     }
+    truncated = not all(complete.values())
     complete["events"] = len(events) <= 3000
-    for table in tables:
-        del table[LIMIT:]
-    # Keep active work and a bounded 90-day terminal window. Historic totals
-    # belong to the journal report, rather than an ever-growing live projection.
-    terminal = [
-        r
-        for r in batches
-        if r["state"] not in ("head", "open") and (r["landed_at"] or r["created_at"]) >= captured - 90 * 86400
-    ][:500]
-    batches = [
-        r
-        for r in batches
-        if (r["state"] in ("head", "open") or r in terminal) and r["repository"] in public_repositories
-    ]
-    inputs = [r for r in inputs if r["repository"] in public_repositories]
-    live_inputs = [r for r in inputs if r["state"] in ("waiting", "reserved")]
-    inputs = live_inputs + [r for r in inputs if r["state"] not in ("waiting", "reserved")][:5000]
+    del members[LIMIT:], attempts[LIMIT:], tasks[LIMIT:]
+    if len(live_inputs) > LIMIT:
+        inputs = live_inputs[:LIMIT] + inputs[len(live_inputs) :]
     known = facts.observe(members) if facts else {}
     reduced = set()
     for event in reductions:
         detail = json.loads(event["detail"])
         if isinstance(detail.get("commit"), str):
             reduced.add(detail["commit"])
-    input_map = {r["id"]: r for r in inputs}
     batch_map = {r["id"]: r for r in batches}
     task_progress = (
         task_observations.observe(
@@ -580,7 +627,8 @@ def project(
     )
     member_records = []
     for row in members:
-        item = input_map.get(row["input_id"], {})
+        item = {key: row[key] for key in ("title", "author", "approved_at", "landed_at", "landed_sha", "reason")}
+        item["state"] = row["input_state"]
         batch = batch_map.get(row["batch_id"], {})
         repo = batch.get("repository")
         if not repo or not REPO.fullmatch(repo):
@@ -603,6 +651,9 @@ def project(
             and not row["removed"]
         ):
             disposition = "rejected_empty"
+        elif row["withdrawn"] and item.get("state") == "cancelled" and item.get("reason") == "empty-commit":
+            # Emptied by an adopted repair and sent back to its author at once (`_withdraw_member`).
+            disposition = "withdrawn_empty"
         member_records.append(
             {
                 "id": str(row["id"]),
@@ -723,9 +774,23 @@ def project(
             else "source_condition"
         )
         if kind != "source_condition" or not any(
-            x in str(alert) for x in ("build stalled", "inference hold", " unclaimed for ")
+            x in str(alert) for x in ("build stalled", "inference hold", " unclaimed for ", stuck_heads.ALERT_TEXT)
         ):
             conditions.append({"kind": kind})
+    # The CI recovery pass's stuck heads: one condition per listed head (since its last push), so the
+    # public observation carries the count and the oldest age without naming private detail.
+    stuck = status.get("stuck_heads") or {}
+    if stuck.get("state") == "fresh" and numeric(stuck.get("observed_at")) is not None:
+        markers = [{"kind": "stuck_heads_observed", "since": iso(stuck["observed_at"])}]
+        if not stuck.get("complete"):
+            markers.append({"kind": "stuck_heads_partial"})
+        # The ingest accepts at most MAX_CONDITIONS: keep the markers and a truncation marker.
+        del conditions[MAX_CONDITIONS - len(markers) - 1 :]
+        room = max(0, min(STUCK_LISTED, MAX_CONDITIONS - len(conditions) - len(markers) - 1))
+        listed = [h for h in (stuck.get("heads") or []) if numeric(h.get("last_push_at")) is not None][:room]
+        conditions += markers + [{"kind": "stuck_head", "since": iso(h["last_push_at"])} for h in listed]
+        if type(stuck.get("count")) is int and stuck["count"] > len(listed):
+            conditions.append({"kind": "stuck_heads_truncated"})
     observation = {
         "schema": SCHEMA,
         "observed_at": iso(captured),
@@ -833,28 +898,73 @@ def project(
         "workers": workers(worker_roots, claims=claims, task_states=task_progress, captured=captured),
     }
 
-    # Full live projection stays comfortably inside the receiver's 16MB budget.
-    # Extraordinary active-only overflow is explicitly partial, never an admission change.
-    while len(encode(observation)) > 12_000_000:
-        terminal = [b for b in observation["batches"] if b["state"] not in ("head", "open")]
-        if terminal:
-            drop = min(terminal, key=lambda b: int(b["id"]))["id"]
-            observation["batches"] = [b for b in observation["batches"] if b["id"] != drop]
-            for name in ("members", "attempts", "tasks", "events"):
-                observation[name] = [r for r in observation[name] if r["batch_id"] != drop]
-        else:
-            name = max(
-                (k for k in ("members", "inputs", "attempts", "tasks", "events") if observation[k]),
-                key=lambda k: len(encode(observation[k])),
-                default=None,
-            )
-            if name is None:
-                raise ValueError("metadata exceeds public projection budget")
-            observation[name] = observation[name][: max(0, len(observation[name]) - 100)]
-            observation["collection_complete"][name] = False
-        observation["truncated"] = True
-        observation["coverage"] = "partial"
+    fit(observation)
     return observation
+
+
+def fit(observation, budget=None):
+    """Shrink an oversized projection to its byte budget: oldest terminal batches go first.
+
+    Shortening terminal history is not partial coverage: the retained batch identities say which
+    history the snapshot covers, and every record of a retained batch stays. Only extraordinary
+    active-only overflow, which removes records of retained batches, is explicitly partial and
+    marks those collections incomplete; it is never an admission change. Each record is encoded once: in
+    compact JSON a list element costs its own encoding plus one separator, so the sum over removed
+    records bounds the saving from above (by one byte per emptied list) and a removal never
+    overshoots. Coverage flags change before the excess is measured, so their bytes count too.
+    The whole observation is encoded again only to confirm each step.
+    """
+    budget = PROJECTION_BUDGET if budget is None else budget
+    size = len(encode(observation))
+    if size <= budget:
+        return
+    cost = {name: [len(encode(r)) + 1 for r in observation[name]] for name in ("batches", "inputs", *DETAIL)}
+    while size > budget:
+        # The step below removes at least one batch or 100 records, as the one-at-a-time loop did.
+        excess = size - budget
+        terminal = sorted(
+            (i for i, b in enumerate(observation["batches"]) if b["state"] not in ("head", "open")),
+            key=lambda i: int(observation["batches"][i]["id"]),
+        )
+        if terminal:
+            weight = {observation["batches"][i]["id"]: cost["batches"][i] for i in terminal}
+            for name in DETAIL:
+                for record, length in zip(observation[name], cost[name], strict=True):
+                    if record["batch_id"] in weight:
+                        weight[record["batch_id"]] += length
+            drop, freed = set(), 0
+            for i in terminal:
+                drop.add(observation["batches"][i]["id"])
+                freed += weight[observation["batches"][i]["id"]]
+                if freed >= excess:
+                    break
+            for name in ("batches", *DETAIL):
+                key = "id" if name == "batches" else "batch_id"
+                kept = [(r, c) for r, c in zip(observation[name], cost[name], strict=True) if r[key] not in drop]
+                observation[name], cost[name] = [r for r, _ in kept], [c for _, c in kept]
+        else:
+            before = len(encode(observation["truncated"])) + len(encode(observation["coverage"]))
+            observation["truncated"] = True
+            observation["coverage"] = "partial"
+            excess += len(encode(True)) + len(encode("partial")) - before
+            # Trim 100 records at a time from whichever collection currently encodes largest.
+            total = {k: (sum(cost[k]) + 1 if cost[k] else 2) for k in ("members", "inputs", *DETAIL[1:])}
+            freed = 0
+            while True:
+                name = max((k for k in total if cost[k]), key=lambda k: total[k], default=None)
+                if name is None:
+                    raise ValueError("metadata exceeds public projection budget")
+                keep = max(0, len(cost[name]) - 100)
+                removed = sum(cost[name][keep:]) - (1 if keep == 0 else 0)
+                observation[name], cost[name] = observation[name][:keep], cost[name][:keep]
+                total[name] -= removed
+                freed += removed
+                if observation["collection_complete"][name]:
+                    observation["collection_complete"][name] = False
+                    freed -= 1  # `false` is one byte longer than `true`.
+                if freed >= excess:
+                    break
+        size = len(encode(observation))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -868,7 +978,7 @@ def main(argv=None):
     parser.add_argument("--clone", type=Path)
     parser.add_argument("--worker-root", type=Path, action="append", default=[])
     parser.add_argument("--public-repository", action="append", default=[])
-    parser.add_argument("--status-url", default="http://127.0.0.1:8780/status")
+    parser.add_argument("--status-url", default="http://127.0.0.1:8780/status/summary")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--publish-url")
     parser.add_argument("--token-file", type=Path)
@@ -885,6 +995,10 @@ def main(argv=None):
         parser.error("interval must be between 5 and 300 seconds")
     if args.publish_url and (not args.token_file or not args.state_file or not args.publish_url.startswith("https://")):
         parser.error("publication requires an HTTPS endpoint, --token-file and --state-file")
+    from .runtime import running_revision
+
+    revision = running_revision()
+    print(f"queue monitoring: running revision {revision.sha} ({revision.source})", file=sys.stderr)
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
@@ -921,6 +1035,25 @@ def main(argv=None):
         return run(args, stop, facts, opener, publisher)
 
 
+def read_status(url, *, timeout=3):
+    """The controller's status sections this projection reads; empty when the controller is unavailable.
+
+    `/status/summary` omits the megabytes of task diagnostics and waiting inputs and never waits long
+    for a reconciliation pass. A controller older than that route answers 404; read the full document.
+    """
+    try:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return json.loads(response.read(MAX_BYTES))
+        except urllib.error.HTTPError as error:
+            if error.code != 404 or not url.endswith("/status/summary"):
+                raise
+        with urllib.request.urlopen(url.removesuffix("/summary"), timeout=timeout) as response:
+            return json.loads(response.read(MAX_BYTES))
+    except (OSError, ValueError, http.client.HTTPException):
+        return {}
+
+
 def run(args, stop, facts, opener, publisher):
     task_observations = TaskObservations()
     retry_seconds = args.interval
@@ -928,11 +1061,7 @@ def run(args, stop, facts, opener, publisher):
         iteration_started = time.monotonic()
         succeeded = False
         try:
-            try:
-                with urllib.request.urlopen(args.status_url, timeout=3) as response:
-                    status = json.loads(response.read(MAX_BYTES))
-            except (OSError, ValueError, http.client.HTTPException):
-                status = {}
+            status = read_status(args.status_url)
             observation = project(
                 args.database,
                 status=status,

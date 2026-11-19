@@ -2,11 +2,13 @@
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -137,6 +139,123 @@ class Resources(unittest.TestCase):
                     self.assertTrue(stop.is_set())
                     self.assertEqual(read.call_count, 1)
                     self.assertEqual(read.call_args.args, ("o/r", "pr"))
+
+    def journal(self, *events):
+        path = self.root / "worker-events.jsonl"
+        path.write_text("")
+        stat = path.stat()
+        with path.open("a") as stream:
+            for event in events:
+                stream.write(json.dumps(event) + "\n")
+        return dict(round_id="round", mutation_cursor=(str(path), stat.st_ino, 0))
+
+    def closure(self, **fields):
+        event = dict(
+            kind="pr_activity",
+            round_id="round",
+            repository="TauCetiProject/TauCeti",
+            pr=10,
+            activity="github_mutation",
+            publication="closure",
+        )
+        return {**event, **fields}
+
+    def test_own_closure_stops_the_agent_as_a_completed_round(self):
+        candidate = SimpleNamespace(pr=10, progress=self.journal(self.closure()))
+        with b.MaintenanceStop(self.worker, candidate) as stop, contextlib.redirect_stdout(io.StringIO()):
+            with patch("tauceti_worker.github_state.read", return_value=(True, {"state": "CLOSED"})):
+                self.assertTrue(stop.is_set())
+        self.assertEqual(stop.outcome, b.CLOSED_BY_AGENT)
+
+    def test_a_closure_by_anyone_else_still_stops_retained_work_as_before(self):
+        for live, events in [
+            ({"state": "CLOSED"}, ()),
+            ({"state": "CLOSED"}, (self.closure(round_id="other round"),)),
+            ({"state": "CLOSED"}, (self.closure(pr=11),)),
+            ({"state": "CLOSED"}, (self.closure(publication="reply"),)),
+            ({"state": "MERGED"}, (self.closure(),)),
+        ]:
+            candidate = SimpleNamespace(pr=10, progress=self.journal(*events))
+            with self.assertRaises(b.QueueOwned), b.MaintenanceStop(self.worker, candidate) as stop:
+                with patch("tauceti_worker.github_state.read", return_value=(True, live)):
+                    self.assertTrue(stop.is_set())
+            self.assertIsNone(stop.outcome)
+        # No progress snapshot (no journal) keeps today's behaviour.
+        with self.assertRaises(b.QueueOwned), b.MaintenanceStop(self.worker, self.candidate) as stop:
+            with patch("tauceti_worker.github_state.read", return_value=(True, {"state": "CLOSED"})):
+                self.assertTrue(stop.is_set())
+
+    def test_round_whose_agent_closed_its_pr_completes_with_its_own_outcome(self):
+        from tauceti_worker import agents
+        from tauceti_worker import work_units as wu
+
+        co = self.root / "checkout"
+        co.mkdir()
+        self.worker.cfg = SimpleNamespace(checkout=co, logdir=self.root / "logs", state=self.root / "state")
+        self.worker.claims = SimpleNamespace(begin_branch_work=lambda *a: True)
+        self.worker.rs = SimpleNamespace(bust=lambda *a: None)
+        self.worker.counters = wu.Counters(self.worker.cfg)
+        survey = SimpleNamespace(
+            open_prs=[SimpleNamespace(number=10, head_owner="o", head_repo="r", head_ref="b", labels=[])],
+            me="o",
+        )
+        real_run = subprocess.run
+
+        def checkout(command, **kwargs):
+            if command[:3] == ["gh", "pr", "checkout"]:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if command[-2:] == ["rev-parse", "HEAD"]:
+                return SimpleNamespace(returncode=0, stdout="a" * 40 + "\n", stderr="")
+            return real_run(command, **kwargs)
+
+        def stopped(code):
+            def agent(*args, cancel_event, **kwargs):
+                self.assertTrue(cancel_event.is_set())
+                return code
+
+            return agent
+
+        for events, live, code, expected in [
+            ((self.closure(),), {"state": "CLOSED"}, -15, 0),
+            ((self.closure(),), {"state": "CLOSED"}, -9, 0),
+            # Only a stop-induced exit becomes a completion; a crash after closing stays a failure.
+            ((self.closure(),), {"state": "CLOSED"}, 70, 70),
+            ((), {"state": "CLOSED"}, -15, b.QueueOwned),
+            # An agent that closed its PR and exited by itself gets the same outcome.
+            ((self.closure(),), {"state": "OPEN", "labels": []}, None, 0),
+        ]:
+            agent = stopped(code) if code is not None else lambda *a, **k: 0
+            candidate = SimpleNamespace(pr=10, head="a" * 40, progress=self.journal(*events))
+            with (
+                patch.object(wu, "prepare_checkout", return_value=True),
+                patch.object(wu, "run_agent_host", agent),
+                patch.object(wu, "_refund_infra_failure"),
+                patch.object(agents.subprocess, "run", checkout),
+                patch("tauceti_worker.github_state.read", return_value=(True, live)),
+                patch("tauceti_worker.activity.observation") as observation,
+                patch.dict(os.environ, TAUCETI_ROUND_WORKTREES="0"),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                run = partial(
+                    wu._do_fixlike,
+                    self.worker,
+                    survey,
+                    candidate,
+                    SimpleNamespace(agent_name="Claude", work_model="claude", prs=()),
+                    False,
+                    prompt_file="fix-ci.md",
+                    label="fix-ci",
+                )
+                if expected is b.QueueOwned:
+                    with self.assertRaises(b.QueueOwned):
+                        run()
+                    observation.assert_not_called()
+                    continue
+                self.assertEqual(run(), expected)
+            if expected:
+                observation.assert_not_called()
+            else:
+                observation.assert_called_once_with(b.CLOSED_BY_AGENT)
 
     def test_unavailable_shared_state_does_not_cancel_and_explicit_queue_work_is_allowed(self):
         for available, live, explicit in [

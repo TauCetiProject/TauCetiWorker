@@ -102,7 +102,7 @@ try:
     wu.shutil.which = lambda name: None
     # The pre-launch re-read of the candidate is a separate concern (see dispatch_revalidation); these
     # cases pass no Worker at all because the PATH check is what they are about.
-    wu._still_actionable = lambda *a: True
+    wu._still_actionable = lambda *a, **kw: True
     reset()
     raised, msg = False, ""
     try:

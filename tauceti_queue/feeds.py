@@ -682,11 +682,12 @@ class ControllerFeedSource:
         source = inputs.get(member["input_id"]) or {}
         evidence = _loads(source.get("evidence"), {})
         scope = None
-        if evidence.get("admin") and evidence.get("merge_base_sha") and evidence.get("actor_id"):
+        admin = _admin_scope(evidence, member["accepted_head"])
+        if admin is not None:
             scope = {
-                "actor_id": evidence["actor_id"],
+                "actor_id": admin["actor_id"],
                 "head_sha": member["accepted_head"],
-                "merge_base_sha": evidence["merge_base_sha"],
+                "merge_base_sha": admin["merge_base_sha"],
             }
         return MemberView(
             pr=int(member["number"]),
@@ -785,6 +786,8 @@ class ControllerFeedSource:
                 attempts = attempts_by_batch[batch["id"]]
                 state = "running" if attempts and attempts[-1].get("outcome") == "pending" else "waiting"
             source = inputs.get(member["input_id"]) or {}
+            if source.get("state") == "inserted" and source.get("batch_id") not in (None, batch["id"]):
+                continue  # a slot displaced by the emergency lane: the owning batch reports the PR
             if batch["state"] == "landed" and (
                 member["withdrawn"] or (source.get("state") == "cancelled" and not source.get("landed_sha"))
             ):
@@ -806,14 +809,14 @@ class ControllerFeedSource:
                 continue
             if row["state"] not in ("waiting", "reserved", "inserted"):
                 continue
-            evidence = _loads(row.get("evidence"), {})
-            if evidence.get("admin") and evidence.get("merge_base_sha") and evidence.get("actor_id"):
+            admin = _admin_scope(_loads(row.get("evidence"), {}), row["head_sha"])
+            if admin is not None:
                 approvals.append(
                     {
                         "pr": int(row["number"]),
-                        "actor_id": int(evidence["actor_id"]),
+                        "actor_id": int(admin["actor_id"]),
                         "head_sha": str(row["head_sha"]),
-                        "merge_base_sha": str(evidence["merge_base_sha"]),
+                        "merge_base_sha": str(admin["merge_base_sha"]),
                     }
                 )
         return approvals
@@ -938,3 +941,15 @@ def _loads(text, default):
     except ValueError:
         return default
     return value if isinstance(value, type(default)) else default
+
+
+def _admin_scope(evidence: dict, head_sha: str) -> dict | None:
+    """The admin approval Bors's scope check accepts for `head_sha`: the original evidence when an admin
+    gave it, else a later admin re-approval of the same head (`evidence.admin_reapproval`)."""
+    if evidence.get("admin") and evidence.get("merge_base_sha") and evidence.get("actor_id"):
+        return evidence
+    again = evidence.get("admin_reapproval")
+    if isinstance(again, dict) and again.get("merge_base_sha") and again.get("actor_id"):
+        if again.get("head_sha") == head_sha:
+            return again
+    return None

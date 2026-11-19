@@ -7,6 +7,7 @@ import hashlib
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,7 +36,13 @@ class Decision:
 
 class NativeFake(FakeGitHub):
     def list_open_pull_requests(self, repo, *, review_app_id=0, **kwargs):
-        return super().list_open_pull_requests(repo, review_app_id=review_app_id, **kwargs)
+        # Like the Forgejo adapter, the listing carries each PR's listed-facts version.
+        return [
+            dataclasses.replace(
+                pull, admission={"discovery_version": self._discovery_version(self.fetch_pr(repo, pull.number))}
+            )
+            for pull in super().list_open_pull_requests(repo, review_app_id=review_app_id, **kwargs)
+        ]
 
     def _discovery_version(self, pull):
         return pull.head_sha + ":" + pull.state
@@ -56,14 +63,7 @@ class MixedFixture:
         )
         self.github_id = cc.RepositoryIdentity(RepositoryRef(GITHUB, self.controller.repository), 42)
         self.github.repository_identity = self.github_id
-        self.profile = MixedProfile(
-            self.github_id,
-            self.native_id,
-            frozenset({3}),
-            4,
-            self.root / "unused-token",
-            {"authority_generation": "1" * 32},
-        )
+        self.profile = MixedProfile(self.github_id, self.native_id, 4, self.root / "unused-token", {})
         self.native = NativeFake(self.repo, self.clock, self.native_id.repository.name)
         self.native.repository_identity = self.native_id
         self.native.admission_policy = Decision()
@@ -344,7 +344,7 @@ class Mixed(MixedFixture, unittest.TestCase):
         promotion = self.controller.store.rows("outbox", {"kind": "promote"})[0]
         self.assertEqual(loads(promotion["payload"])["primary_generation"], 2)
 
-    def test_native_discovery_skips_unchanged_snapshots_and_withdraws_recovery_holds(self):
+    def test_native_discovery_skips_unchanged_snapshots_and_withdraws_unsafe_reviews(self):
         registry = self.registry()
         head = self.native.create_pr(1, {"Native.lean": "native\n"})
         poller = NativePoller(registry, self.controller)
@@ -360,7 +360,7 @@ class Mixed(MixedFixture, unittest.TestCase):
 
         def revoked(snapshot):
             result, *rest = original(snapshot)
-            return ({**result, "merge": False, "recovery_authority_hold": True}, *rest)
+            return ({**result, "merge": False, "review_safe": False}, *rest)
 
         self.native.admission_policy.evaluate = revoked
         poller.invalidate(1, head=head, urgent=True)
@@ -369,6 +369,295 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.assertFalse(poller.is_current(1, head))
         poller.withdraw(99, None)
         self.assertEqual(poller.state.get(99)["cancelled_head_sha"], "*")
+
+    def test_native_listing_runs_once_per_approval_poll_interval_and_evaluations_continue(self):
+        registry = self.registry()
+        poller = NativePoller(registry, self.controller)
+        self.native.create_pr(1, {"One.lean": "one\n"})
+
+        def listings():
+            return sum(name == "list_open_pull_requests" for name, _ in self.native.calls)
+
+        poller.run_once()
+        self.assertEqual(listings(), 1)
+        interval = self.controller.setting("approval_poll_interval_seconds")
+        self.assertGreater(interval, registry.poll_seconds)
+        # Work dirtied between listings is evaluated without listing again.
+        self.native.create_pr(2, {"Two.lean": "two\n"})
+        poller.invalidate(2, head=self.native.prs[2]["head_sha"])
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["evaluated"], 1)
+        self.assertEqual(listings(), 1)
+        self.assertLessEqual(poller.interval(), interval)
+        self.clock.advance(interval - registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(listings(), 2)
+        # A requested discovery (a canonical push, a setting change) still lists at once.
+        poller.request_discovery()
+        poller.run_once()
+        self.assertEqual(listings(), 3)
+
+    def native_approved(self):
+        from tauceti_queue.mixed_sources import AdmissionInputs
+
+        registry = self.registry()
+        poller = registry.poller = NativePoller(registry, self.controller)
+        self.controller.admission = AdmissionInputs(None, poller)
+        head = self.native.create_pr(1, {"Native.lean": "native\n"})
+        self.assertEqual(poller.run_once()["approved"], 1)
+        return poller, head
+
+    def native_input(self):
+        return self.controller.input_for(self.native_id.repository.key, 1)
+
+    def test_native_insertion_reads_the_pr_once_more_and_inserts_it_unchanged(self):
+        poller, head = self.native_approved()
+        reads = sum(name == "fetch_pr" for name, _ in self.native.calls)
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "inserted")
+        self.assertGreater(sum(name == "fetch_pr" for name, _ in self.native.calls), reads)
+
+    def test_native_insertion_is_held_for_a_change_no_listing_has_seen(self):
+        poller, head = self.native_approved()
+        self.native.prs[1]["state"] = "closed"  # closed after evaluation, before the next listing
+        self.controller.tick()
+        row = self.native_input()
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "admission-recheck"))
+        self.assertFalse(poller.is_current(1, head))
+        poller.run_once()
+        self.assertEqual(self.native_input()["state"], "cancelled")
+
+    def test_native_insertion_is_held_while_a_blocking_label_is_on_the_pr(self):
+        poller, head = self.native_approved()
+        self.native.labels[1] = {"hold"}  # added after approval; the fixture's listed facts omit labels
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "waiting")
+        self.native.labels[1] = set()
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "inserted")
+
+    def test_native_insertion_is_held_while_the_source_cannot_be_read(self):
+        poller, head = self.native_approved()
+
+        def unavailable(repo, number):
+            raise OSError("forge unreachable")
+
+        self.native.fetch_pr_or_none = unavailable
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "waiting")
+        del self.native.fetch_pr_or_none
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "inserted")
+
+    def recent_fixture(self):
+        """A native fake that reports update times and serves a recent listing."""
+        registry = self.registry()
+        poller = NativePoller(registry, self.controller)
+        self.updated = {}
+        recent_calls = []
+        plain = self.native.list_open_pull_requests
+
+        def stamped(pulls):
+            return [
+                dataclasses.replace(p, admission={**(p.admission or {}), "updated_at": self.updated.get(p.number, "")})
+                for p in pulls
+            ]
+
+        def full(repo, **kwargs):
+            return stamped(plain(repo, **kwargs))
+
+        def recent(repo, *, since):
+            recent_calls.append(since)
+            from tauceti_queue.forgejo_source import _forge_time
+
+            listed = [p for p in full(repo) if _forge_time(p.admission["updated_at"]) >= since]
+            newest = max([_forge_time(t) for t in self.updated.values()] or [0.0])
+            return listed, newest, True
+
+        self.native.list_open_pull_requests = full
+        self.native.list_recent_pull_requests = recent
+        return registry, poller, recent_calls
+
+    def test_recent_listing_finds_a_change_between_full_listings(self):
+        registry, poller, recent_calls = self.recent_fixture()
+
+        def listings():
+            return sum(name == "list_open_pull_requests" for name, _ in self.native.calls)
+
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()  # full listing; evaluates #1
+        full = listings()
+        self.assertEqual(recent_calls, [])
+        # A new PR opens after the full listing: the next pass's recent listing finds it.
+        self.native.create_pr(2, {"Two.lean": "two\n"})
+        self.updated[2] = "2026-11-19T04:05:00Z"
+        self.clock.advance(registry.poll_seconds)
+        summary = poller.run_once()
+        self.assertEqual(len(recent_calls), 1)
+        self.assertEqual(summary.get("recent"), 2)  # #1 too: it is within the margin of the newest update
+        self.assertEqual(poller.state.get(2)["evaluated_generation"], poller.state.get(2)["generation"])
+        self.assertLessEqual(listings() - full, 1)  # only the fixture's own use, no full re-listing
+        # Turned off, passes between full listings list nothing.
+        self.controller.set_setting("forgejo_recent_listing", False, "operator")
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(len(recent_calls), 1)
+
+    def test_a_scoreboard_edit_from_the_comment_feed_dirties_its_settled_pr_once(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        feed = []
+        self.native.list_recent_comments = lambda repo, *, since, **kw: (list(feed), 0.0, True)
+        head = self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        work = poller.state.get(1)
+        self.assertEqual(work["generation"], work["evaluated_generation"])
+        board = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 {}-->"
+        feed[:] = [
+            (1, {"id": 50, "body": board, "updated_at": "2026-11-19T04:30:00Z"}),
+            (1, {"id": 51, "body": "thanks!", "updated_at": "2026-11-19T04:30:00Z"}),
+        ]
+        self.clock.advance(registry.poll_seconds)
+        poller.stopping.set()  # read the feed, evaluate nothing yet
+        summary = poller.run_once()
+        poller.stopping.clear()
+        self.assertEqual(summary["comment_feed"], {"read": 2, "dirtied": 1})
+        self.assertNotEqual(poller.state.get(1)["generation"], poller.state.get(1)["evaluated_generation"])
+        poller.run_once()  # evaluated; the same edit, listed again, is not dirtied again
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["comment_feed"]["dirtied"], 0)
+        self.assertTrue(poller.is_current(1, head))
+
+    def test_feed_edits_that_drop_a_marker_count_and_an_incomplete_read_keeps_its_place(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        feed, complete = [], [True]
+        newest = datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp()
+        self.native.list_recent_comments = lambda repo, *, since, **kw: (list(feed), newest, complete[0])
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        listed = poller.state.get(1)["observed_version"]
+        position = poller._comments_since
+        feed[:] = [
+            (
+                1,
+                {
+                    "id": 50,
+                    "body": "no longer a scoreboard",
+                    "created_at": "2026-11-19T03:00:00Z",
+                    "updated_at": "2026-11-19T04:30:00Z",
+                },
+            )
+        ]
+        complete[0] = False
+        self.clock.advance(registry.poll_seconds)
+        poller.stopping.set()
+        summary = poller.run_once()
+        poller.stopping.clear()
+        self.assertEqual(summary["comment_feed"]["dirtied"], 1)  # an edit, whatever it says now
+        self.assertEqual(poller.state.get(1)["observed_version"], listed)  # listed facts kept
+        self.assertEqual(poller._comments_since, position)  # unread pages may hold older edits
+        complete[0] = True
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(poller._comments_since, newest - 120)
+
+    def test_native_insertion_rejudges_a_review_no_listing_or_feed_reported(self):
+        poller, head = self.native_approved()
+        original = self.native.admission_policy.evaluate
+
+        def revoked(snapshot):  # the scoreboard was edited to red; nothing else changed
+            result, *rest = original(snapshot)
+            return ({**result, "merge": False, "review_safe": False}, *rest)
+
+        self.native.admission_policy.evaluate = revoked
+        self.controller.tick()
+        row = self.native_input()
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "admission-recheck"))
+        self.assertFalse(poller.is_current(1, head))
+        poller.run_once()
+        self.assertEqual(self.native_input()["state"], "cancelled")
+
+    def test_native_insertion_is_held_when_the_merge_base_moved(self):
+        poller, head = self.native_approved()
+        work = poller.state.get(1)
+        decision = loads(work["decision"], {})
+        decision.setdefault("evidence", {})["merge_base_sha"] = "e" * 40
+        self.controller.store.update("admission_work", {"id": work["id"]}, decision=dumps(decision))
+        self.native._merge_base = lambda repo, pull: "f" * 40
+        self.controller.tick()
+        row = self.native_input()
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "admission-recheck"))
+        self.assertFalse(poller.is_current(1, head))
+
+    def test_the_comment_feed_position_survives_a_restart(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        positions = []
+
+        def feed(repo, *, since, **kw):
+            positions.append(since)
+            return [], datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp(), True
+
+        self.native.list_recent_comments = feed
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        # The first read starts a recheck interval before the newest listed update.
+        listed = datetime(2026, 11, 19, 4, tzinfo=UTC).timestamp()
+        self.assertLess(positions[0], listed - self.controller.setting("forgejo_recheck_seconds") + 1)
+        restarted = NativePoller(registry, self.controller)
+        self.assertEqual(restarted._comments_since, datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp() - 120)
+
+    def test_rechecks_follow_their_own_interval(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        self.native.list_open_pull_requests = lambda repo, **kw: [
+            dataclasses.replace(p, admission={**(p.admission or {}), "recheck_seconds": 900, "updated_at": ""})
+            for p in NativeFake.list_open_pull_requests(self.native, repo, **kw)
+        ]
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        poller.run_once()
+        self.controller.set_setting("forgejo_recheck_seconds", 3600, "operator")
+        self.clock.advance(1800)
+        poller.request_discovery()
+        poller.stopping.set()
+        poller.run_once()
+        poller.stopping.clear()
+        work = poller.state.get(1)
+        self.assertEqual(work["generation"], work["evaluated_generation"])  # 30 min: no recheck yet
+        self.clock.advance(1801)
+        poller.request_discovery()
+        poller.stopping.set()
+        poller.run_once()
+        poller.stopping.clear()
+        self.assertEqual(poller.state.get(1)["recheck"], 1)
+
+    def test_an_incomplete_recent_listing_asks_for_a_full_one(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        self.native.list_recent_pull_requests = lambda repo, *, since: ([], 0.0, False)
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(poller.interval(), 0)  # the full listing is due at once
+
+    def test_native_readmit_rereads_admission_and_refuses_another_head_or_a_closed_pr(self):
+        registry = self.registry()
+        head = self.native.create_pr(1, {"Native.lean": "native\n"})
+        poller = NativePoller(registry, self.controller)
+        self.controller.admission = __import__(
+            "tauceti_queue.mixed_sources", fromlist=["AdmissionInputs"]
+        ).AdmissionInputs(None, poller)
+        self.assertEqual(poller.run_once()["approved"], 1)
+        number = registry.number(1)
+        self.assertTrue(poller.is_current(1, head))
+        self.assertFalse(self.controller.admission.readmit(number, "f" * 40))
+        self.assertTrue(self.controller.admission.readmit(number, head))
+        self.assertFalse(poller.is_current(1, head), "re-read before the input can be restored")
+        work = poller.state.get(1)
+        self.controller.store.update("admission_work", {"id": work["id"]}, disposition="closed")
+        self.assertFalse(self.controller.admission.readmit(number, head))
 
     def test_native_landed_head_is_not_readmitted_and_missing_head_is_retried(self):
         registry = self.registry()
@@ -408,50 +697,36 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.assertEqual(self.native.calls, [])
         self.assertTrue(any(row["source_identity"] for row in self.controller.store.rows("members")))
 
-    def test_operational_profile_revert_does_not_reuse_retired_review_authority(self):
-        from types import SimpleNamespace
+    def test_profiles_load_with_or_without_retired_review_keys(self):
+        import json
+        import os
 
-        from tauceti_queue.mixed_native import MixedNativeSource
+        from tauceti_queue.config import ConfigError
 
+        raw = {
+            "schema": "tauceti-queue.mixed-sources/v1",
+            "github": self.github_id.record(),
+            "forgejo": self.native_id.record(),
+            "publisher_id": 4,
+            "source_token_file": str(self.root / "unused-token"),
+        }
         cfg = Config(repository=self.controller.repository, canonical_branch="main", forgejo_mode="observe")
+        path = self.root / "profile.json"
 
-        def configured(profile):
-            source = MixedNativeSource(
-                profile,
-                cfg,
-                self.repo.clone,
-                client=SimpleNamespace(forge=self.native_id.repository.forge),
-                token="fixture",
-                clock=self.clock,
-            )
-            source.configure_publisher_policy(self.controller.store)
+        def load(value):
+            path.unlink(missing_ok=True)
+            path.write_text(json.dumps(value))
+            os.chmod(path, 0o600)
+            return MixedProfile.load(path, cfg)
 
-        configured(self.profile)
-        old = dict(self.profile.raw)
-        self.profile.raw["execution"] = {"workflow_revision": "a" * 40}
-        configured(self.profile)
-        self.profile.raw.clear()
-        self.profile.raw.update(old)
-        configured(self.profile)
-        self.profile.raw["authority_generation"] = "2" * 32
-        configured(self.profile)
-        self.profile.raw.clear()
-        self.profile.raw.update(old)
-        with self.assertRaisesRegex(ValueError, "generation"):
-            configured(self.profile)
-
-    def test_operational_profile_edits_preserve_review_generation(self):
-        original = self.profile.publishers().generation
-        self.profile.raw.update(
-            execution={"workflow_revision": "a" * 40},
-            mirror={"approved_caller": "b" * 40},
-            source_token_file="/another/credential",
-        )
-        self.assertEqual(self.profile.publishers().generation, original)
-        self.profile.raw.pop("execution")
-        self.profile.raw.pop("mirror")
-        self.profile.raw.pop("source_token_file")
-        self.assertEqual(self.profile.publishers().generation, original)
+        # Production profiles still name the reviewer IDs and authority generation scoreboards no longer need.
+        for value in (raw, {**raw, "reviewer_ids": [3], "authority_generation": "1" * 32}):
+            profile = load(value)
+            self.assertEqual(profile.publisher, 4)
+            self.assertEqual(profile.publishers().record(), {"source": self.native_id.record(), "recoveries": [4]})
+        for value in ({**raw, "unknown": 1}, {k: v for k, v in raw.items() if k != "publisher_id"}):
+            with self.assertRaises(ConfigError):
+                load(value)
 
 
 class MixedExecution(MixedFixture, unittest.TestCase):
@@ -598,6 +873,118 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertEqual(len(self.execution.dispatches), 1)
         self.assertTrue(any(comment["number"] == 17 for comment in self.github.comments))
         self.assertTrue(any(comment["number"] == 17 for comment in self.native.comments))
+
+    def test_evict_native_returns_members_and_github_only_batch_dispatches_without_forgejo(self):
+        frozen = self.start_mixed()
+        head = self.controller._head()
+        other = self.github.create_pr(18, {"Other.lean": "other\n"})
+        self.controller.approve(self.controller.repository, 18, other, "fixture")
+        self.controller.tick()
+        self.assertEqual(
+            self.controller.evict_native(self.controller.repository, "operator")["reason"], "placement-enabled"
+        )
+        self.controller.set_setting("forgejo_placement_enabled", False, "operator")
+        result = self.controller.evict_native(self.controller.repository, "operator", withdraw=[18])
+        self.assertTrue(result["evicted"])
+        self.assertIn(head["id"], result["batches"])
+        self.assertEqual(result["withdrawn"], {18: True})
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "removed")
+        native = self.controller.input_for(self.native_id.repository.key, 17)
+        self.assertEqual(native["state"], "waiting")
+        self.assertEqual(self.controller.input_for(self.controller.repository, 18)["state"], "cancelled")
+        dispatches = len(self.execution.dispatches)
+        self.native.calls.clear()
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertIsNotNone(head, self.controller._reasons)
+        self.assertEqual([m["number"] for m in self.controller._members(head["id"])], [17])
+        self.assertFalse(isinstance(self.controller._members(head["id"])[0]["number"], SourceNumber))
+        attempt = self.controller._current_attempt(head)
+        self.assertIsNotNone(attempt, self.controller._reasons)
+        self.assertIsNone(self.controller.store.row("ci_requests", {"attempt_id": attempt["id"]}))
+        self.assertEqual(attempt["dispatch_state"], "accepted")
+        self.assertEqual(len(self.execution.dispatches), dispatches)
+        self.assertFalse(any(name == "update_ref" for name, _ in self.native.calls))
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 17)["state"], "waiting")
+        self.assertNotEqual(frozen.attempt_id, attempt["id"])
+        self.controller.set_setting("forgejo_placement_enabled", True, "operator")
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(self.native_id.repository.key, 17)["state"], "inserted")
+
+    def test_placement_pause_during_a_native_probe_keeps_the_input_waiting(self):
+        import threading
+
+        from tauceti_queue import chain
+
+        native = self.native.create_pr(17, {"Native.lean": "native\n"})
+        self.controller.approve(self.native_id.repository.key, 17, native, "fixture")
+        entered, release = threading.Event(), threading.Event()
+        build = chain.build
+        errors = []
+
+        def slow(*args, **kwargs):
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test release missing")
+            return build(*args, **kwargs)
+
+        def tick():
+            try:
+                self.controller.tick()
+            except Exception as error:
+                errors.append(error)
+
+        with patch.object(chain, "build", side_effect=slow):
+            thread = threading.Thread(target=tick)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(self.controller.input_for(self.native_id.repository.key, 17)["state"], "reserved")
+                self.controller.set_setting("forgejo_placement_enabled", False, "operator")
+                self.assertTrue(self.controller.evict_native(self.controller.repository, "operator")["evicted"])
+            finally:
+                release.set()
+                thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        row = self.controller.input_for(self.native_id.repository.key, 17)
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "placement-paused"))
+        self.assertFalse(
+            any(isinstance(m["number"], SourceNumber) for m in self.controller.store.rows("members", {"removed": 0}))
+        )
+
+    def test_named_withdrawal_is_not_undone_by_insertion_while_runs_are_cancelled(self):
+        self.start_mixed()
+        self.controller.set_setting("forgejo_placement_enabled", False, "operator")
+        cancel = self.controller._cancel_superseded_runs
+
+        def cancel_then_insert(*args, **kwargs):
+            # Run cancellation may let the lock go; the loop's insertion can run meanwhile.
+            cancel(*args, **kwargs)
+            self.controller.tick()
+
+        with patch.object(self.controller, "_cancel_superseded_runs", side_effect=cancel_then_insert):
+            result = self.controller.evict_native(self.controller.repository, "operator", withdraw=[17])
+        self.assertEqual(result["withdrawn"], {17: True})
+        self.assertEqual(self.controller.input_for(self.controller.repository, 17)["state"], "cancelled")
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(self.controller.repository, 17)["state"], "cancelled")
+
+    def test_placement_pause_holds_a_native_emergency_request(self):
+        self.controller.set_setting("emergency_enabled", True, "operator")
+        native = self.native.create_pr(17, {"Native.lean": "native\n"})
+        self.controller.approve(self.native_id.repository.key, 17, native, "fixture")
+        self.controller.set_setting("forgejo_placement_enabled", False, "operator")
+        request = self.controller.request_emergency(
+            self.native_id.repository.key, 17, "admin", surface="test", live_head=native
+        )
+        self.assertTrue(request["accepted"], request)
+        self.controller.tick()
+        self.assertIsNone(self.controller._emergency_batch())
+        self.assertIsNone(self.controller._head())
+        row = self.controller.input_for(self.native_id.repository.key, 17)
+        self.assertEqual(row["state"], "waiting")
+        self.assertTrue(self.controller._emergency_requested(row))
 
     def test_admission_pause_keeps_accepted_waiting_inputs_and_lands_running_mixed_work(self):
         # Accept an input before pausing, including its pre-batch waiting state.
@@ -842,6 +1229,428 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.controller.tick()
         self.assertEqual(self.controller.input_for(self.controller.repository, 17)["state"], "inserted")
 
+    # --- the control-file lane (`control_lane_enabled`) ---------------------------------------------
+
+    def enable_lane(self):
+        self.native.admission_policy.prefix = "Math/"
+        self.native.admission_policy.allow_files = ("Shared.lean",)
+        self.controller.set_setting("control_lane_enabled", True, "fixture")
+
+    def lane(self):
+        return self.controller.store.row("batches", {"lane": "control", "state": ["open", "head"]}, order="id DESC")
+
+    def sources(self, batch):
+        return [
+            ("forgejo" if isinstance(m["number"], SourceNumber) else "github", int(m["number"]))
+            for m in self.controller._members(batch["id"])
+        ]
+
+    def pass_native_head(self):
+        head = self.controller._head()
+        frozen = self.ledger.load(self.controller._current_attempt(head)["id"])
+        self.execution.add(frozen, classification="passed")
+        self.clock.advance(60)
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        return head
+
+    def pass_github_head(self):
+        from tauceti_queue.fakes import run_git
+
+        head = self.controller._head()
+        # The fixture's Forgejo mirror has only the objects pushed to it: give it the landing tip.
+        run_git(self.repo.clone, "push", "-q", str(self.native_repo.origin), f"{head['tip']}:refs/fixture/{head['id']}")
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.clock.advance(60)
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(
+            self.controller.store.row("batches", {"id": head["id"]})["state"], "landed", self.controller._reasons
+        )
+        return head
+
+    def native_head(self, number=17, path="Math/Head.lean"):
+        native = self.native.create_pr(number, {path: "head\n"})
+        self.controller.approve(self.native_id.repository.key, number, native, "fixture")
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual(self.sources(head), [("forgejo", number)])
+        return head
+
+    def approve_github(self, number, files):
+        head = self.github.create_pr(number, files)
+        self.assertTrue(self.controller.approve(self.controller.repository, number, head, "fixture")["accepted"])
+        return head
+
+    def approve_native(self, number, files):
+        head = self.native.create_pr(number, files)
+        self.assertTrue(self.controller.approve(self.native_id.repository.key, number, head, "fixture")["accepted"])
+        return head
+
+    def test_control_lane_takes_the_control_pr_alone_and_native_prs_share_an_ordinary_batch(self):
+        self.enable_lane()
+        self.approve_github(17, {"scripts/control.py": "control\n"})
+        self.approve_native(17, {"Math/Native.lean": "native\n"})
+        self.approve_native(18, {"Math/Other.lean": "other\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual((lane["state"], self.sources(lane)), ("head", [("github", 17)]), self.controller._reasons)
+        [ordinary] = self.controller.store.rows("batches", {"state": "open"})
+        self.assertEqual(ordinary["lane"], "")
+        self.assertEqual(sorted(self.sources(ordinary)), [("forgejo", 17), ("forgejo", 18)])
+        row = self.controller.input_for(self.controller.repository, 17)
+        self.assertEqual((row["no_repair"], loads(row["evidence"])["control_files"]), (1, True))
+        self.assertEqual([m["no_repair"] for m in self.controller._members(lane["id"])], [1])
+        # The lane head runs GitHub-native CI; nothing went to source-candidate CI.
+        self.assertIsNone(self.controller._candidate_coordinator(batch_id=lane["id"]))
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(self.execution.dispatches, [])
+        from tauceti_queue.controller import ControllerError
+
+        with self.assertRaisesRegex(ControllerError, "human control-file"):
+            self.controller.change_primary("forgejo", "fixture")
+        status = self.controller.status()
+        self.assertEqual(status["head"]["id"], lane["id"])
+        self.assertEqual([b["lane"] for b in status["open_batches"]], [""])
+        self.pass_github_head()
+        head = self.controller._head()
+        self.assertEqual(head["id"], ordinary["id"])
+        self.assertTrue(self.execution.dispatches)
+        for request in self.execution.dispatches:
+            self.assertTrue(self.registry_value.supports_candidate(request.request.base, request.request.head))
+            self.assertTrue(all(member.source == self.native_id for member in request.request.accepted_members))
+
+    def test_control_lane_goes_ahead_of_an_older_open_batch_but_never_preempts_the_head(self):
+        self.enable_lane()
+        first = self.native_head()
+        self.approve_native(18, {"Math/Next.lean": "next\n"})
+        self.controller.tick()
+        [older] = self.controller.store.rows("batches", {"state": "open"})
+        self.approve_github(19, {".github/workflows/x.yml": "on: push\n"})
+        reasons = self.controller.tick()
+        lane = self.lane()
+        self.assertGreater(lane["id"], older["id"])
+        self.assertEqual((lane["state"], self.sources(lane)), ("open", [("github", 19)]))
+        self.assertEqual(self.controller._head()["id"], first["id"], "the lane never evicts the running head")
+        self.assertIn(f"control-file lane batch {lane['id']} waits for head {first['id']} to land", reasons)
+        status = self.controller.status()
+        self.assertEqual(sorted(b["lane"] for b in status["open_batches"]), ["", "control"])
+        self.assertEqual(self.controller.status()["waiting"]["control"], 0)
+        self.pass_native_head()
+        head = self.controller._head()
+        self.assertEqual(head["id"], lane["id"], "the lane batch seals ahead of the older open batch")
+        self.assertEqual(self.controller.store.row("batches", {"id": older["id"]})["state"], "open")
+        self.assertEqual(len(self.github.dispatches), 1)
+        self.assertEqual(len(self.execution.dispatches), 1)
+        self.assertEqual(len(self.controller.store.journal_entries("control-lane-head")), 1)
+
+    def test_control_lane_opens_outside_the_open_batch_limit(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_native(18, {"Math/Same.lean": "eighteen\n"})
+        self.approve_native(19, {"Math/Same.lean": "nineteen\n"})
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(len(self.controller._unsealed_batches()), 2)
+        self.assertEqual(int(self.controller.setting("open_batch_limit")), 2)
+        self.approve_github(20, {"scripts/control.sh": "echo\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual(self.sources(lane), [("github", 20)])
+        self.assertEqual(len(self.controller._unsealed_batches()), 2)
+        self.assertNotIn(lane["id"], [b["id"] for b in self.controller._staging_batches()])
+
+    def test_a_control_pr_left_waiting_is_never_probed_into_an_ordinary_batch(self):
+        self.enable_lane()
+        first = self.native_head()
+        self.approve_github(18, {"scripts/control.py": "eighteen\n"})
+        self.controller.tick()
+        # #19 conflicts with #18 in the lane: it waits for the lane's base to move, never for an ordinary batch.
+        self.approve_github(19, {"scripts/control.py": "nineteen\n"})
+        before = self.controller.store.count("batches")
+        for _ in range(3):
+            self.clock.advance(60)
+            self.controller.tick()
+        self.assertEqual(self.controller.store.count("batches"), before)
+        row = self.controller.input_for(self.controller.repository, 19)
+        self.assertEqual((row["state"], row["probes"]), ("waiting", 1))
+        self.assertEqual(self.sources(self.lane()), [("github", 18)])
+        self.assertEqual(self.controller.store.journal_entries("probe-source-ci-scope"), [])
+        self.assertEqual(self.controller._head()["id"], first["id"])
+        self.assertEqual(self.controller.status()["waiting"]["control"], 1)
+
+    def test_an_unclassified_github_pr_waits_out_of_ordinary_batches(self):
+        self.enable_lane()
+        self.native_head()
+        head = self.approve_github(18, {"Math/Github.lean": "github\n"})
+        fetch = self.controller._fetch_head
+        with patch.object(self.controller, "_fetch_head", side_effect=lambda n, sha: sha != head and fetch(n, sha)):
+            self.controller.tick()
+        row = self.controller.input_for(self.controller.repository, 18)
+        self.assertEqual((row["state"], row["probes"]), ("waiting", 0))
+        self.assertEqual(row["last_probe"], "control-lane: waits for its head to be classified")
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(self.controller.repository, 18)["state"], "inserted")
+        self.assertIsNone(self.lane())
+
+    def test_a_pr_with_native_and_control_changes_goes_to_the_lane_whole(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_github(18, {"Math/Both.lean": "both\n", "scripts/both.py": "both\n"})
+        self.approve_native(19, {"Math/Native.lean": "native\n"})
+        self.controller.tick()
+        self.assertEqual(self.sources(self.lane()), [("github", 18)])
+        ordinary = [b for b in self.controller.store.rows("batches", {"state": "open"}) if not b["lane"]]
+        self.assertEqual([self.sources(b) for b in ordinary], [[("forgejo", 19)]])
+
+    def test_an_ordinary_github_pr_and_allow_listed_files_stay_out_of_the_lane(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_github(18, {"Math/Github.lean": "github\n", "Shared.lean": "allowed\n"})
+        self.controller.tick()
+        self.assertIsNone(self.lane())
+        row = self.controller.input_for(self.controller.repository, 18)
+        self.assertEqual(
+            (row["state"], row["no_repair"], loads(row["evidence"])["control_files"]), ("inserted", 0, False)
+        )
+
+    def test_native_control_changes_are_refused_and_never_enter_the_lane(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_native(18, {"scripts/native.py": "native\n"})
+        self.controller.tick()
+        row = self.controller.input_for(self.native_id.repository.key, 18)
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("native candidate needs a compatible batch", row["last_probe"])
+        self.assertNotIn("control_files", loads(row["evidence"]))
+        self.assertIsNone(self.lane())
+        self.assertEqual(self.controller.store.count("batches", {"lane": "control"}), 0)
+
+    def test_control_lane_is_off_under_native_primary(self):
+        self.enable_lane()
+        self.registry_value.primary = "forgejo"
+        self.approve_github(17, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        row = self.controller.input_for(self.controller.repository, 17)
+        self.assertEqual(row["state"], "waiting")
+        self.assertIn("require GitHub primary", row["last_probe"])
+        self.assertNotIn("control_files", loads(row["evidence"]))
+        self.assertEqual(self.controller.store.count("batches", {"lane": "control"}), 0)
+        self.assertEqual(self.execution.dispatches, [])
+        self.assertTrue(self.controller.change_primary("github", "fixture")["changed"])
+        self.controller.tick()
+        self.assertEqual(self.sources(self.lane()), [("github", 17)])
+
+    def test_a_control_pr_refused_on_the_canonical_tip_is_still_probed_into_a_lane_on_that_tip(self):
+        self.native.admission_policy.prefix = "Math/"
+        self.native.admission_policy.allow_files = ()
+        self.approve_github(17, {"scripts/control.py": "control\n"})
+        canonical = self.repo.main_sha()
+        # A source-candidate scope refusal recorded against an empty batch on the canonical commit.
+        row = self.controller.input_for(self.controller.repository, 17)
+        self.controller.store.update(
+            "inputs",
+            {"id": row["id"]},
+            last_probe="source-ci-scope: human control-file changes require GitHub primary and a GitHub-only batch",
+            last_probe_tip=canonical,
+            last_probe_base=canonical,
+        )
+        self.controller.set_setting("control_lane_enabled", True, "fixture")
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual((lane["base"], self.sources(lane)), (canonical, [("github", 17)]), self.controller._reasons)
+
+    def test_an_emergency_request_for_a_control_pr_takes_it_out_of_the_lane(self):
+        self.enable_lane()
+        self.controller.set_setting("emergency_enabled", True, "fixture")
+        first = self.native_head()
+        self.approve_github(18, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual(self.sources(lane), [("github", 18)])
+        request = self.controller.request_emergency(self.controller.repository, 18, "admin", surface="test")
+        self.assertTrue(request["accepted"], request)
+        self.controller.tick()
+        emergency = self.controller._emergency_batch()
+        self.assertEqual(self.sources(emergency), [("github", 18)])
+        self.assertEqual([m["no_repair"] for m in self.controller._members(emergency["id"])], [1])
+        self.assertEqual(self.controller.store.journal_entries("emergency-refused"), [])
+        self.assertEqual(self.controller._head()["id"], first["id"])
+        self.pass_native_head()
+        self.assertEqual(self.controller._head()["id"], emergency["id"], "the emergency batch goes before the lane")
+        self.pass_github_head()
+        self.controller.tick()
+        # The lane batch keeps only the displaced slot, which never makes it a head of its own.
+        self.assertIsNone(self.controller._head())
+        self.assertIsNone(self.controller._lane_ready())
+
+    def test_a_label_added_and_removed_never_clears_the_control_opt_out(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_github(18, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        for action, labels in (("labeled", ["dont-repair-in-queue"]), ("unlabeled", [])):
+            self.controller.handle_event(
+                "pull_request",
+                {
+                    "action": action,
+                    "number": 18,
+                    "label": {"name": "dont-repair-in-queue"},
+                    "pull_request": {"number": 18, "labels": [{"name": label} for label in labels]},
+                },
+            )
+        row = self.controller.input_for(self.controller.repository, 18)
+        self.assertEqual((row["state"], row["no_repair"]), ("inserted", 1))
+        self.assertEqual([m["no_repair"] for m in self.controller._members(self.lane()["id"])], [1])
+
+    def test_a_failing_lane_head_withdraws_the_culprit_without_editing_it(self):
+        from tauceti_queue.fakes import Resolution, ScriptedAgent
+
+        self.enable_lane()
+        self.github.ci_policy = lambda head, base, members: (
+            ("fail", [{"kind": "compiler", "module": "scripts/bad.py", "message": "boom"}])
+            if self.repo.file_at(head, "scripts/bad.py") is not None
+            else ("pass", [])
+        )
+        self.approve_github(17, {"scripts/good.py": "good\n"})
+        self.approve_github(18, {"scripts/bad.py": "bad\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.assertEqual((lane["state"], sorted(self.sources(lane))), ("head", [("github", 17), ("github", 18)]))
+        self.github.start_runs()
+        self.github.complete_runs()
+        self.clock.advance(60)
+        self.controller.tick()
+        self.github.admins.add("reviewer")
+        [bad] = [m for m in self.controller._members(lane["id"]) if int(m["number"]) == 18]
+        edit = ScriptedAgent(
+            "editor",
+            "reviewer",
+            self.repo,
+            self.root / "editor",
+            lambda task: {bad["source_pr"]: Resolution({"scripts/bad.py": "edited\n"}, explanation="Edited.")},
+        )
+        result = edit.run(self.controller)
+        self.assertIsNotNone(result, self.controller._reasons)
+        self.assertFalse(result.accepted, "a control member is never edited")
+        self.assertEqual(result.reason, "no-repair-edited")
+        self.assertTrue(all(m.no_repair for m in edit.tasks[0].members))
+        # The same worker empties the member instead, which is all a repair may do to it.
+        edit.script = lambda task: {bad["source_pr"]: Resolution(empty=True, explanation="It does not build.")}
+        task = edit.tasks[0]
+        result = self.controller.submit_task(task.task_id, task.claim_token, edit.produce(task))
+        self.assertTrue(result.accepted, result)
+        row = self.controller.input_for(self.controller.repository, 18)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "problem-anticipated"))
+        self.controller.tick()
+        body = self.github.comments_for(18)[0]["body"]
+        self.assertIn("changes control files outside the native path policy", body)
+        self.assertNotIn("dont-repair-in-queue", body)
+        self.pass_github_head()
+        self.assertEqual(self.repo.file_at("main", "scripts/good.py"), "good\n")
+        self.assertIsNone(self.repo.file_at("main", "scripts/bad.py"))
+        self.assertEqual(
+            {m["number"]: m["provenance"] for m in self.controller._members(lane["id"])}, {17: "clean", 18: "edited"}
+        )
+
+    def test_turning_the_lane_off_stages_a_live_lane_batch_as_an_ordinary_one(self):
+        self.enable_lane()
+        self.native_head()
+        self.approve_native(18, {"Math/Next.lean": "next\n"})
+        self.controller.tick()
+        [older] = self.controller.store.rows("batches", {"state": "open"})
+        self.approve_github(19, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        lane = self.lane()
+        self.controller.set_setting("control_lane_enabled", False, "operator")
+        reasons = self.controller.tick()
+        self.assertFalse(any("control-file lane" in reason for reason in reasons), reasons)
+        self.assertEqual([b["id"] for b in self.controller._staging_batches()], [older["id"], lane["id"]])
+        self.pass_native_head()
+        self.assertEqual(self.controller._head()["id"], older["id"], "with the lane off, oldest first")
+        self.assertEqual(self.controller.store.journal_entries("control-lane-head"), [])
+        self.assertEqual(self.controller.store.row("batches", {"id": lane["id"]})["state"], "open")
+
+    def lane_with_claimed_successor_pre_rebase(self):
+        """Head H (#101) runs, ordinary open batch B (#102) conflicts with it on `Shared.lean` and a
+        worker holds B's `pre_rebase` task onto H's tip; then a control PR (#103) opens the lane."""
+        from tauceti_queue.fakes import Resolution, ScriptedAgent
+
+        self.enable_lane()
+        self.controller.set_setting("repair_concurrency", 2, "fixture")
+        self.github.admins.add("reviewer")
+        self.approve_github(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.controller.tick()
+        head = self.controller._head()
+        self.approve_github(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
+        self.controller.tick()
+        successor = next(b for b in self.controller.store.rows("batches", {"state": "open"}) if not b["lane"])
+        source_pr = self.controller._members(successor["id"])[0]["source_pr"]
+        agent = ScriptedAgent(
+            "agent",
+            "reviewer",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                source_pr: Resolution(
+                    {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"}, explanation="Merged."
+                )
+            },
+        )
+        task = agent.claim(self.controller)
+        self.assertIsNotNone(task, self.controller._reasons)
+        self.assertEqual((task.kind, task.onto), ("pre_rebase", head["tip"]))
+        self.approve_github(103, {"scripts/control.py": "control\n"})
+        self.controller.tick()
+        self.assertEqual(self.lane()["state"], "open")
+        self.pass_github_head()
+        lane = self.controller._head()
+        self.assertEqual(lane["lane"], "control")
+        self.assertEqual(
+            [e["detail"] for e in self.controller.store.journal_entries("emergency-preserved")],
+            [{"tasks": [task.task_id]}],
+        )
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        return successor, agent, task, source_pr
+
+    def test_claimed_successor_pre_rebase_survives_the_lane_head_and_is_carried_onto_it(self):
+        successor, agent, task, source_pr = self.lane_with_claimed_successor_pre_rebase()
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task))
+        self.assertTrue(adoption.accepted, adoption)
+        self.controller.tick()
+        carried = self.controller.store.row("batches", {"id": successor["id"]})
+        self.assertEqual(
+            (carried["pre_rebase_state"], carried["pre_rebase_onto"]), ("adopted", self.controller._head()["tip"])
+        )
+        self.assertIn(source_pr, loads(carried["pre_rebase_edits"]))
+        self.pass_github_head()
+        sealed = self.controller._head()
+        self.assertEqual(sealed["id"], successor["id"])
+        self.assertTrue(self.controller.store.journal_entries("rebased")[-1]["detail"]["pre_rebased"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        self.assertEqual([m["provenance"] for m in self.controller._members(sealed["id"])], ["edited"])
+
+    def test_a_preserved_pre_rebase_submitted_after_the_lane_lands_is_carried_onto_main(self):
+        successor, agent, task, source_pr = self.lane_with_claimed_successor_pre_rebase()
+        self.pass_github_head()  # the lane lands while the worker still holds the task
+        self.assertIsNone(self.controller._head(), "the claimed successor waits for its worker")
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task))
+        self.assertTrue(adoption.accepted, adoption)
+        self.controller.tick()
+        sealed = self.controller._head()
+        self.assertEqual(sealed["id"], successor["id"])
+        self.assertEqual(sealed["base"], self.repo.main_sha())
+        self.assertTrue(self.controller.store.journal_entries("rebased")[-1]["detail"]["pre_rebased"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        self.assertEqual([m["provenance"] for m in self.controller._members(sealed["id"])], ["edited"])
+        self.pass_github_head()
+        self.assertEqual(
+            self.repo.file_at("main", "Shared.lean"), "line one\nline two changed by 101 and 102\nline three\n"
+        )
+        self.assertEqual(self.repo.file_at("main", "scripts/control.py"), "control\n")
+
     def test_old_uncertain_lease_is_settled_when_main_has_moved_off_its_expected_parent(self):
         from tauceti_queue.controller import ControllerError
         from tauceti_queue.fakes import run_git
@@ -1053,11 +1862,9 @@ class MixedExecution(MixedFixture, unittest.TestCase):
             with self.assertRaises(ValueError):
                 WorkerTask.from_json(damaged)
         original_binding = loads(self.controller.store.row("tasks", {"id": task_id})["task_binding"])
-        self.ledger.policy = dataclasses.replace(self.ledger.policy, harness_revision="e" * 40)
+        self.ledger.policy = dataclasses.replace(self.ledger.policy, require_publication=False)
         self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
         self.profile.raw["authority_generation"] = "2" * 32
-        self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
-        self.registry_value.profile = dataclasses.replace(self.profile, reviewers=frozenset({3, 5}))
         self.assertGreater(self.controller.renew_task(task_id, task.claim_token), self.clock())
         self.ledger.policy = dataclasses.replace(self.ledger.policy, base_branch="other")
         with self.assertRaises(TaskError):
@@ -1083,7 +1890,7 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         frozen = self.start_mixed()
         configuration = self.ledger.configuration + b"\n# reviewed control update\n"
         policy = dataclasses.replace(
-            self.ledger.policy, harness_revision="e" * 40, config_digest=hashlib.sha256(configuration).hexdigest()
+            self.ledger.policy, require_publication=False, config_digest=hashlib.sha256(configuration).hexdigest()
         )
         self.execution.caller_snapshot = ("f" * 40, policy, configuration)
         head = self.controller._head()

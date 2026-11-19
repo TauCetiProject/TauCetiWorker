@@ -26,12 +26,14 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from .agents import (
     BUBBLE_MIN_VERSION,
     BUBBLE_REPO,
     KIRO_BUBBLE_MIN_VERSION,
+    BuildCacheWait,
     bubble_cmd_is_disposable,
     bubble_supports_allow_push,
     bubble_supports_github_account,
@@ -60,7 +62,9 @@ from .config import (
     auto_assign_wid,
     extra_roadmap_prompt,
     is_git_url,
+    legacy_project,
     log,
+    one_line,
     roadmap_only,
     sanitize_wid,
     security_audit_problem,
@@ -1044,6 +1048,7 @@ def main(argv: list[str] | None = None) -> int:
                     "activity": 1,
                     "roadmap_focus": 1,
                     "self_tested": 1,
+                    "source_selection": 1,
                     "graceful_restart": 1,
                 }
             )
@@ -1458,6 +1463,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             os.kill(os.getpid(), signal.SIGTERM)
 
         threading.Thread(target=stop_with_parent, name="tauceti-parent-watch", daemon=True).start()
+    if legacy_project():
+        from .paths import refuse_virtualenv_data_root
+
+        refuse_virtualenv_data_root(warn=is_loop_driver)  # rounds of a loop: warned once already
     if explicit:
         wid = sanitize_wid(explicit)
         # A top-level loop driver also reserves its slot, so an auto-assigned peer in another terminal
@@ -1633,6 +1642,8 @@ def cmd_doctor(args) -> int:
     if os.environ.get("TAUCETI_CONF") or any(
         (root / file).is_file() for file in ("lean-toolchain", "lakefile.toml", "lakefile.lean")
     ):
+        if problem := _virtualenv_data_problem():
+            print(f"tauceti doctor: data root: {problem}", file=sys.stderr)
         from tauceti_tools.cli import main as project_doctor
 
         flags = ["doctor"]
@@ -1648,9 +1659,20 @@ def cmd_doctor(args) -> int:
                 flags.extend(["--" + flag, getattr(args, flag)])
         for field in args.field:
             flags.extend(["--field", field])
-        return project_doctor(flags)
+        status = project_doctor(flags)
+        return status or (1 if problem else 0)
     print("For project setup, run tauceti-tools doctor from the content checkout.")
     return cmd_host_doctor(args)
+
+
+def _virtualenv_data_problem() -> str | None:
+    """Why the selected data root is unsafe, or None. Doctor fails for established data too."""
+    if not legacy_project():
+        return None
+    from .paths import virtualenv_data
+
+    inside = virtualenv_data(legacy_data_root())
+    return f"{inside[0][0]} is inside the virtualenv {inside[0][1]}; move it out" if inside else None
 
 
 def cmd_host_doctor(args) -> int:
@@ -1727,11 +1749,14 @@ def cmd_host_doctor(args) -> int:
             "$KIRO_API_KEY" if (os.environ.get("KIRO_API_KEY") or "").strip() else str(kiro_db),
         )
     )
+    if legacy_project():
+        problem = _virtualenv_data_problem()
+        rows.append(("data root", not problem, problem or str(legacy_data_root())))
     bad = 0
     print(f"tauceti doctor — worker '{cfg.wid}'")
     for name, ok, note in rows:
         mark = "ok " if ok else "MISSING"
-        if not ok and name in ("gh", "git", "uv/uvx", "gh auth"):
+        if not ok and name in ("gh", "git", "uv/uvx", "gh auth", "data root"):
             bad += 1
         print(f"  [{mark:7}] {name:14} {note}")
     return 1 if bad else 0
@@ -1894,7 +1919,8 @@ def cli_main() -> int:
         log(str(e))
         report_failure(str(e), code=1)
         return 1
-    except ProgressPreparationUnavailable as e:
+    except (ProgressPreparationUnavailable, BuildCacheWait) as e:
+        # A deferral before any paid work: no failure, and the loop selects other work.
         log(str(e))
         report_runtime(
             e.state,
@@ -1934,6 +1960,15 @@ def cli_main() -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except Exception as e:  # noqa: BLE001 - an unexpected crash still leaves a one-line reason
+        # The traceback is for debugging; the log line and the published failure are what the loop
+        # and status views show, so a crashed round never reads as a bare "exited with status 1".
+        traceback.print_exc()
+        what = "round" if sys.argv[1:2] == ["_round"] else "tauceti"
+        reason = f"{what} crashed: {type(e).__name__}: {one_line(str(e))}"
+        log(reason)
+        report_failure(reason, code=1)
+        return 1
 
 
 def _ensure_scripts_executable() -> None:

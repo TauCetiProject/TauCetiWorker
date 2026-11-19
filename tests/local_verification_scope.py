@@ -316,12 +316,14 @@ def main():
                 f"self-tested helper={helper}: label the PR after verification",
                 "Apply the `self-tested` label to the PR" in text
                 and "gh-safe-pr-create" in text
-                and "--add-label self-tested" in text
+                and "matching verification receipt" in text
                 and "failed, incomplete, or outdated" in text,
             )
             check(
                 f"self-tested helper={helper}: author-only comment fallback for missing label permissions",
-                "lack of label permissions" in text
+                "lack label permissions" in text
+                and ".permissions.triage" in text
+                and "do not run `gh pr edit`" in text
                 and "you are the PR author" in text
                 and "gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested" in text
                 and "do not post duplicate requests" in text,
@@ -331,6 +333,13 @@ def main():
                 "Keep the label in place through fix/rebase pushes" in text
                 and "--remove-label self-tested" in text
                 and "A push clears" not in text,
+            )
+            check(
+                f"self-tested helper={helper}: remove only on failed local verification, never for PR CI",
+                "Remove it only when local verification of the current head actually fails" in text
+                and "verification fails or is incomplete" not in text
+                and "Never remove `self-tested` (or post `-self-tested`) to request or re-trigger PR CI" in text
+                and "`awaiting-CI` or `ci-failed` labels" in text,
             )
             for policy in ("bump", "full-lint", "lint-repair"):
                 check(

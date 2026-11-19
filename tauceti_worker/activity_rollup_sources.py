@@ -147,6 +147,7 @@ def round_events(db, key, now):
         for field, outcomes in (
             ("failed", {"failed", "timeout", "interrupted"}),
             ("unknown", {"unknown", "unconfirmed"}),
+            ("closed", {"closed-by-agent"}),
         ):
             if row["outcome"] in outcomes:
                 metrics["round:" + json.dumps([kind, field])] = 1
