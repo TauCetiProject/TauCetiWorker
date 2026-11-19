@@ -1808,7 +1808,7 @@ class ToolchainBumpWithoutArtifacts(Fixture):
         converted = {"kind": "admission_predictions", "proactive": False, "was_proactive": True}
         self.assertTrue(repair_task.background_task(task("prepare")))
         self.assertTrue(repair_task.background_task(task("pre_rebase")))
-        self.assertTrue(repair_task.background_task(task("repair", [prediction])))
+        self.assertFalse(repair_task.background_task(task("repair", [prediction])))
         self.assertFalse(repair_task.background_task(task("repair", [converted])))
         self.assertFalse(repair_task.background_task(task("repair")))
         self.assertFalse(repair_task.background_task(task("rebase_conflict")))

@@ -502,7 +502,7 @@ host between sibling slices by weight, so a reniced process in `app.slice` compe
 does. The weights are work-conserving, so repairs slow down under a staging build and never stop.
 Inside the slice the head batch's work comes first: the repair units set no CPU weight of their own, so
 the slice enables no CPU controller for them and all repair processes share its CPU by niceness, and
-during a background task (`prepare`, `pre_rebase`, a proactive prediction repair) every sandboxed build,
+during a background task (`prepare` or `pre_rebase`, work for a later batch) every sandboxed build,
 the agent's included, runs at niceness 19 (`repair_sandbox.prioritized`). Giving a repair unit a CPU
 weight would make each unit a separate CPU group and end this ordering.
 Disk traffic is ordered only where the block layer honours cgroup weights or IO priorities (BFQ,
