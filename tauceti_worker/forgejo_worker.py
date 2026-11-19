@@ -192,8 +192,15 @@ class ForgejoWorkerSource(ForgejoReadSource):
                         return json.loads(output)
                     return self.api.request("GET", path)
                 except ForgeError as error:
-                    if error.status in (404, 422) and ("/compare/" in path or "/git/commits/" in path):
-                        return None  # An untrusted candidate names no usable landed commit.
+                    suffix = path.split("/", 3)[-1]
+                    candidate_read = suffix.startswith(("compare/", "git/commits/"))
+                    oversized_compare = (
+                        suffix.startswith("compare/")
+                        and isinstance(error, Incomplete)
+                        and str(error) == "Forgejo response exceeded the configured byte limit"
+                    )
+                    if (error.status in (404, 422) and candidate_read) or oversized_compare:
+                        return None  # Invalid or unprovably large candidates cannot complete an item.
                     failures.append(error)
                     raise
                 except (OSError, ValueError) as error:

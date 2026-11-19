@@ -172,8 +172,8 @@ def queue_landed(
 
         for expected in subjects:
             for sha in landing_candidates(comments, expected, branch, native=native):
-                if commit_on_base(read, repository, branch, sha, native=native) and (
-                    not native or native_commit_binds(read, repository, sha, expected)
+                if (not native or native_commit_binds(read, repository, sha, expected)) and commit_on_base(
+                    read, repository, branch, sha, native=native
                 ):
                     return True
     except Exception:

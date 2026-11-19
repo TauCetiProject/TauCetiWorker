@@ -79,7 +79,7 @@ class Proof(unittest.TestCase):
     def test_github_queue_comment_and_configured_branch_ancestry(self):
         check = self.github()
         self.assertTrue(check())
-        self.assertEqual(self.calls, list(self.responses))
+        self.assertCountEqual(self.calls, list(self.responses))
 
     def test_github_tip_is_itself_a_landing_without_compare(self):
         check = self.github()
@@ -155,7 +155,7 @@ class Proof(unittest.TestCase):
     def test_native_canonical_commit_proves_untrusted_comment_candidate(self):
         check = self.native()
         self.assertTrue(check())
-        self.assertEqual(self.calls, list(self.responses))
+        self.assertCountEqual(self.calls, list(self.responses))
 
     def test_subjects_match_both_real_queue_modes(self):
         from tauceti_tools.ci_candidate import RepositoryIdentity
@@ -173,6 +173,12 @@ class Proof(unittest.TestCase):
         for subject in (standalone, mixed):
             self.native(subject=subject)
             self.assertTrue(self.check(native=True, subject=mixed, alternate_subjects=(standalone,)))
+
+    def test_unbound_native_candidate_is_rejected_before_any_compare(self):
+        check = self.native()
+        self.responses[f"repos/team/Math/git/commits/{SHA}"]["message"] = "Initial commit"
+        self.assertFalse(check())
+        self.assertFalse(any("/compare/" in path or "/branches/" in path for path in self.calls))
 
     def test_native_subject_includes_forge_and_repository_id(self):
         check = self.native()
@@ -237,7 +243,7 @@ class Proof(unittest.TestCase):
 
 
 class NativeAdapter(unittest.TestCase):
-    def source(self, comments, *, branch_error=None):
+    def source(self, comments, *, branch_error=None, compare_error=None):
         from tauceti_tools.ci_candidate import RepositoryIdentity
         from tauceti_tools.forge import Forge, ForgeError, RepositoryRef
 
@@ -256,6 +262,8 @@ class NativeAdapter(unittest.TestCase):
                 return {"name": "release/next", "commit": {"id": TIP}}
             if "/compare/" in path and "f" * 40 in path:
                 raise ForgeError("nominated object does not exist", status=404)
+            if "/compare/" in path and compare_error is not None:
+                raise compare_error
             if f"{TIP}...{SHA}" in path:
                 return {"total_commits": 0, "commits": []}
             if f"{SHA}...{TIP}" in path:
@@ -273,6 +281,16 @@ class NativeAdapter(unittest.TestCase):
             self.assertFalse(self.source([invalid]).target_queue_landed(7, "release/next"))
             self.assertTrue(self.source([invalid, valid]).target_queue_landed(7, "release/next"))
 
+    def test_oversized_compare_fails_candidate_without_stalling_source(self):
+        from tauceti_tools.forge import Incomplete
+
+        subject = f"forgejo:https://forge.example/{REPO}@91#7"
+        source = self.source(
+            [comment(subject)], compare_error=Incomplete("Forgejo response exceeded the configured byte limit")
+        )
+        with patch.object(proof, "native_commit_binds", return_value=True):
+            self.assertFalse(source.target_queue_landed(7, "release/next"))
+
     def test_missing_branch_or_comments_report_source_unavailable(self):
         from tauceti_tools.forge import ForgeError
 
@@ -280,7 +298,7 @@ class NativeAdapter(unittest.TestCase):
 
         subject = f"forgejo:https://forge.example/{REPO}@91#7"
         source = self.source([comment(subject)], branch_error=ForgeError("base unavailable", status=404))
-        with self.assertRaises(SourceUnavailable):
+        with patch.object(proof, "native_commit_binds", return_value=True), self.assertRaises(SourceUnavailable):
             source.target_queue_landed(7, "release/next")
         with self.assertRaises(SourceUnavailable):
             self.source(None).target_queue_landed(7, "release/next")

@@ -83,6 +83,10 @@ The marks in the file go stale between edits, so each round overlays them:
   repository ID and PR in its queue trailers and contain a nonempty change.
   Missing or forged proof never unlocks dependent work. For older queue
   landings without verifiable records, an operator can explicitly mark `[x]`.
+  Native comparisons exceeding the client’s response bound also establish no
+  completion; they do not stall the whole source. Per-item searches remain bounded
+  (30 matching PRs), so exceptionally long partial-PR histories may likewise need
+  an explicit operator completion. Source response bounds remain enforced.
 
 The overlay only moves an item forward: `[x]` in the file stays done and `[~]`
 stays in flight until the file changes. The merged side reads, on each forge,
