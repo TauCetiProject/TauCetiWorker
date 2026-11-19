@@ -4115,6 +4115,7 @@ class Controller:
                 check = getattr(self.admission, "insertion_check", None)
                 if result.status == chain.CLEAN and callable(check):
                     held = check(row["number"], row["head_sha"])
+                    held = held if isinstance(held, str) else None  # a reason, or nothing to hold
         except chain.ChainError as error:
             failure = error
         finally:
