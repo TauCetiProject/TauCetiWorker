@@ -737,13 +737,14 @@ def project(
     # public observation carries the count and the oldest age without naming private detail.
     stuck = status.get("stuck_heads") or {}
     if stuck.get("state") == "fresh" and numeric(stuck.get("observed_at")) is not None:
-        conditions.append({"kind": "stuck_heads_observed", "since": iso(stuck["observed_at"])})
+        markers = [{"kind": "stuck_heads_observed", "since": iso(stuck["observed_at"])}]
         if not stuck.get("complete"):
-            conditions.append({"kind": "stuck_heads_partial"})
-        # Leave room for the truncation marker within the ingest's bound on conditions.
-        room = max(0, min(STUCK_LISTED, MAX_CONDITIONS - len(conditions) - 1))
+            markers.append({"kind": "stuck_heads_partial"})
+        # The ingest accepts at most MAX_CONDITIONS: keep the markers and a truncation marker.
+        del conditions[MAX_CONDITIONS - len(markers) - 1 :]
+        room = max(0, min(STUCK_LISTED, MAX_CONDITIONS - len(conditions) - len(markers) - 1))
         listed = [h for h in (stuck.get("heads") or []) if numeric(h.get("last_push_at")) is not None][:room]
-        conditions += [{"kind": "stuck_head", "since": iso(h["last_push_at"])} for h in listed]
+        conditions += markers + [{"kind": "stuck_head", "since": iso(h["last_push_at"])} for h in listed]
         if type(stuck.get("count")) is int and stuck["count"] > len(listed):
             conditions.append({"kind": "stuck_heads_truncated"})
     observation = {

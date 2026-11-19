@@ -602,6 +602,14 @@ class StuckHeads(QueueFixture):
         self.tick()
         self.assertEqual(len(self.notifier.messages), 2)
 
+    def test_a_partial_pass_counts_as_a_lower_bound(self):
+        self.write(since_hours=7)
+        report = json.loads(self.report.read_text())
+        self.report.write_text(json.dumps(dict(report, complete=False)))
+        self.tick()
+        self.assertIn("at least 2 (partial pass) PR heads stuck", self.notifier.messages[0])
+        self.assertIn("(partial pass)", rt.summarize(self.controller.status()))
+
     def test_malformed_reports_are_invalid_not_fatal_or_silent(self):
         now = self.clock()
         good = {

@@ -110,6 +110,11 @@ def read(path: str | Path | None, now: float, repository: str | None = None) -> 
     }
 
 
+def _count(section: Mapping[str, Any]) -> str:
+    """The count, as a lower bound when the pass stopped before classifying every head."""
+    return f"{section['count']}" if section.get("complete") else f"at least {section['count']} (partial pass)"
+
+
 def _hours(seconds: float | None) -> str:
     return f"{int((seconds or 0) // 3600)}h"
 
@@ -137,7 +142,7 @@ def alert(section: Mapping[str, Any], now: float) -> str | None:
     if section.get("state") != "fresh" or not section.get("count") or since is None or now - since < PERSIST_SECONDS:
         return None
     return (
-        f"{section['count']} PR heads {ALERT_TEXT} for {_hours(now - since)} "
+        f"{_count(section)} PR heads {ALERT_TEXT} for {_hours(now - since)} "
         f"(oldest {_hours(section.get('oldest_seconds'))})"
     )
 
@@ -150,7 +155,7 @@ def notice(section: Mapping[str, Any], now: float, public_url: str = "") -> tupl
     since = int(section["stuck_since"])
     started = datetime.fromtimestamp(since, TIMEZONE).strftime("%a %d %b %H:%M %Z")
     lines = [
-        f"**Tau Ceti CI: {section['count']} PR heads {ALERT_TEXT} since {started}**",
+        f"**Tau Ceti CI: {_count(section)} PR heads {ALERT_TEXT} since {started}**",
         "",
         "Each has had no `build` status and no live pr-build three hours after its last push, or its build "
         "and its one automatic retry were both interrupted. ci-recovery found them; nothing will re-run them.",
