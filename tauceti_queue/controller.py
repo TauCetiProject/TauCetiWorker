@@ -123,6 +123,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # many requests left (GraphQL: points), until the window resets; the rest is kept for landing,
     # dispatch and commands.
     "github_background_floor": 1000,
+    # Decision 38 step 4: "off" keeps no admission evidence cache; "shadow" fills it from webhook
+    # deliveries and full reads and compares its verdict with each real evaluation (status
+    # `admission.evidence`), never changing a decision.
+    "admission_evidence_mode": "off",
     "membership_label": "bors-staging",
     # Added to a landed member whose commit the queue modified (one with an edit summary in its landing
     # comment); created in the repository on first use. Empty disables it.
@@ -726,6 +730,11 @@ class Controller:
                     raise ControllerError("bad-setting-value", f"{key} must be a list of strings")
             elif not isinstance(value, type(expected)):
                 raise ControllerError("bad-setting-value", f"{key} must be a {type(expected).__name__}")
+            if key == "admission_evidence_mode":
+                from .admission_evidence import MODES
+
+                if value not in MODES:
+                    raise ControllerError("bad-setting-value", f"{key} must be one of {', '.join(MODES)}")
             now = self.clock()
             previous = self.setting(key)
             if value == previous:
@@ -10551,6 +10560,11 @@ class Controller:
                     "source": "policy",
                     "policy_digest": self.admission.policy.revision,
                     **self.admission.state.summary(),
+                    **(
+                        {"evidence": self.admission.evidence_status()}
+                        if callable(getattr(self.admission, "evidence_status", None))
+                        else {}
+                    ),
                 },
                 "anticipated": [
                     {

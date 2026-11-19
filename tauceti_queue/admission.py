@@ -251,6 +251,25 @@ class AdmissionPoller:
         self.last_summary = None
         self.stopping = threading.Event()
         self._prefer_urgent = True
+        from .admission_evidence import ADMISSION_LABELS, EvidenceCache, Shadow
+
+        fake_repo = getattr(adapter, "repo", None)
+        clone = getattr(adapter, "clone_dir", None) or getattr(fake_repo, "clone", None)
+        self.evidence = EvidenceCache(
+            controller.store,
+            repo,
+            clock=clock,
+            clone=str(clone) if clone else None,
+            relevant_comment=relevant_comment,
+            relevant_labels=lambda: KEEP | controller._no_repair_labels() | ADMISSION_LABELS,
+            base_branch=controller.canonical_branch,
+        )
+        self.shadow = Shadow(
+            self.evidence,
+            self.policy,
+            journal=controller.store.journal,
+            blocking_labels=controller._blocking_labels,
+        )
         # Restore retry deadlines as-is. Discovery is due at startup independently of pending work.
         saved = controller.store.get_setting("state:admission_discovery", {})
         self._discovery_at = float(saved.get("retry_at", 0))
@@ -321,6 +340,22 @@ class AdmissionPoller:
             cancelled_at=0,
         )
         self.wake()
+
+    def evidence_mode(self):
+        return self.controller.setting("admission_evidence_mode")
+
+    def evidence_event(self, kind, payload):
+        """Record a verified delivery in the evidence cache (shadow only); never fails the delivery."""
+        if kind not in ("pull_request", "issue_comment", "status", "push") or self.evidence_mode() == "off":
+            return
+        try:
+            self.evidence.apply_event(kind, payload)
+        except Exception as error:  # noqa: BLE001 - the cache is advisory until a later slice acts on it
+            log.warning("admission evidence: %s delivery not recorded: %s", kind, error)
+
+    def evidence_status(self):
+        mode = self.evidence_mode()
+        return {"mode": mode} if mode == "off" else {"mode": mode, "shadow": self.shadow.summary()}
 
     def handle_event(self, kind, payload):
         """Persist before webhook acknowledgement. No GitHub call or policy evaluation here."""
@@ -606,8 +641,14 @@ class AdmissionPoller:
 
     def _evaluate(self, work, summary):
         epoch = self._source_epoch()
+        started = self.clock()
         snapshot = self.adapter.admission_snapshot(self.repo, work["number"], generation=work["generation"])
         result, authorization, evidence, comment, meta = self.policy.evaluate(snapshot)
+        if self.evidence_mode() == "shadow":
+            try:
+                self.shadow.compare(snapshot, result, started, authorization)
+            except Exception as error:  # noqa: BLE001 - the shadow never changes or blocks a decision
+                log.warning("admission shadow #%s: %s", work["number"], error)
         current_input = self.controller.input_for(self.repo, work["number"])
         human_review = self._human_owned_approval(snapshot, current_input, comment)
         if human_review:

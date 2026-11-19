@@ -12,6 +12,9 @@ Tables:
 - `inputs`: approved inputs, one row per accepted PR revision, with the waiting/reserved/inserted/
   landed/cancelled state, priority, urgency, the retained ref of the accepted head, the `no_repair`
   opt-out and, for a `problem-anticipated` withdrawal, what it waits for (`anticipated`).
+- `admission_evidence`, `admission_evidence_comments`, `admission_evidence_statuses`: the PR
+  evidence admission's shadow keeps from webhook deliveries and full reads
+  (`tauceti_queue/admission_evidence.py`); empty unless `admission_evidence_mode` is `shadow`.
 - `batches`: identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`),
   `state=open, sealed=1` denotes the fixed-membership successor, separate from the sole head;
   the expected parent recorded for promotion and, for a non-head batch, the version a `prepare` task
@@ -123,6 +126,60 @@ CREATE TABLE IF NOT EXISTS admission_work (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS admission_pr ON admission_work (repository, number);
 CREATE INDEX IF NOT EXISTS admission_due ON admission_work (repository, next_attempt_at, attempted_at);
+CREATE TABLE IF NOT EXISTS admission_evidence (
+    id INTEGER PRIMARY KEY,
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL DEFAULT '',
+    base_sha TEXT NOT NULL DEFAULT '',
+    base_ref TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    draft INTEGER NOT NULL DEFAULT 0,
+    body TEXT NOT NULL DEFAULT '',
+    labels TEXT NOT NULL DEFAULT '[]',
+    author TEXT NOT NULL DEFAULT '',
+    head_ref TEXT NOT NULL DEFAULT '',
+    head_repo TEXT NOT NULL DEFAULT '',
+    pr_updated_at REAL NOT NULL DEFAULT 0,
+    comments_count INTEGER NOT NULL DEFAULT -1,
+    count_updated_at REAL NOT NULL DEFAULT 0,
+    seeded_at REAL NOT NULL DEFAULT 0,
+    seeded_until REAL NOT NULL DEFAULT 0,
+    received_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_evidence_pr ON admission_evidence (repository, number);
+CREATE TABLE IF NOT EXISTS admission_evidence_comments (
+    id INTEGER PRIMARY KEY,
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    comment_id INTEGER NOT NULL,
+    author TEXT NOT NULL DEFAULT '',
+    author_id INTEGER NOT NULL DEFAULT 0,
+    app_id INTEGER NOT NULL DEFAULT 0,
+    relevant INTEGER NOT NULL DEFAULT 0,
+    body TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_text TEXT NOT NULL DEFAULT '',
+    html_url TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    received_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_evidence_comment ON admission_evidence_comments (repository, number, comment_id);
+CREATE TABLE IF NOT EXISTS admission_evidence_statuses (
+    id INTEGER PRIMARY KEY,
+    repository TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    context TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT '',
+    status_id INTEGER NOT NULL DEFAULT 0,
+    sender TEXT NOT NULL DEFAULT '',
+    seeded_at REAL NOT NULL DEFAULT 0,
+    seeded_until REAL NOT NULL DEFAULT 0,
+    ambiguous INTEGER NOT NULL DEFAULT 0,
+    received_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_evidence_status ON admission_evidence_statuses (repository, sha, context);
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY,
     repository TEXT NOT NULL,
