@@ -251,6 +251,7 @@ class AdmissionPoller:
         self.last_summary = None
         self.stopping = threading.Event()
         self._prefer_urgent = True
+        self._insertion_held = {}  # number -> (head, evaluated version, no re-read before)
         from .admission_evidence import ADMISSION_LABELS, EvidenceCache, Shadow
 
         fake_repo = getattr(adapter, "repo", None)
@@ -293,6 +294,47 @@ class AdmissionPoller:
     def is_current(self, number, head):
         work = self.state.get(number)
         return bool(work and work["head_sha"] == head and work["generation"] == work["evaluated_generation"])
+
+    def insertion_check(self, number, head):
+        """None when the PR's admission inputs still match those admission evaluated for `head`, else
+        why not. Runs without the controller lock, before an approved head joins a batch.
+
+        `is_current` only consults local records, so a missed webhook would let a revoked review or
+        a failed status reach a batch until the next discovery. Behind `admission_insertion_check`,
+        this re-reads the inputs and compares their digest with the evaluated one. Any difference,
+        or a read that fails, holds the insertion (fail closed); a difference also has the PR
+        evaluated again. If the next read differs from that same evaluation again, reads wait an
+        approval-poll interval, so a digest that can never match costs no quota on every pass.
+        """
+        if not self.controller.setting("admission_insertion_check"):
+            return None
+        read = getattr(self.adapter, "admission_insertion_source", None)
+        if read is None:
+            return None  # an adapter without the read keeps today's local check
+        work = self.state.get(number)
+        if not work or work["head_sha"] != head or work["generation"] != work["evaluated_generation"]:
+            return "not evaluated at this head"
+        held = self._insertion_held.get(number)
+        if held and held[:2] == (head, work["evaluated_version"]) and self.clock() < held[2]:
+            # The last read disagreed with this very evaluation: wait before reading again, so a
+            # digest that never matches holds the head without spending quota on every pass.
+            return "inputs differed from this evaluation at the last check; waiting before reading again"
+        try:
+            source = read(self.repo, number, head)
+        except Exception as error:  # noqa: BLE001 - an unreadable source never admits
+            return f"unavailable: {error}"
+        if source.get("head") != head:
+            self.invalidate(number, urgent=True)
+            return "head moved"
+        if self._version(source) != work["evaluated_version"]:
+            if held and held[:2] == (head, work["evaluated_version"]):
+                log.warning("admission #%s: insertion check differs again from an unchanged evaluation", number)
+            retry = self.clock() + self.controller.setting("approval_poll_interval_seconds")
+            self._insertion_held[number] = (head, work["evaluated_version"], retry)
+            self.invalidate(number, head=head, urgent=True)
+            return "inputs changed since evaluation"
+        self._insertion_held.pop(number, None)
+        return None
 
     def interval(self):
         pending = self.state.summary()["next_attempt_at"]

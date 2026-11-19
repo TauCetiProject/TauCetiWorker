@@ -734,6 +734,10 @@ class FakeGitHub:
             },
         }
 
+    def admission_insertion_source(self, repo, number, head):
+        self._call("admission_insertion_source", number)
+        return self._admission_source(number)
+
     def admission_snapshot(self, repo, number, *, generation=0):
         self._call("admission_snapshot", number)
         pull = self.fetch_pr(repo, number)

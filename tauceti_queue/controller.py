@@ -131,6 +131,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # clone is complete and the merge base is unique there, instead of the compare API (one REST
     # call per evaluation). Otherwise, and while false, compare answers as before.
     "admission_local_merge_base": False,
+    # Decision 38 step 4, slice 3: before an approved GitHub head joins a batch, re-read its
+    # admission inputs (one GraphQL call) and hold the insertion unless they still match what
+    # admission evaluated. False keeps today's local check only.
+    "admission_insertion_check": False,
     "membership_label": "bors-staging",
     # Added to a landed member whose commit the queue modified (one with an edit summary in its landing
     # comment); created in the repository on first use. Empty disables it.
@@ -4106,12 +4110,17 @@ class Controller:
         gaps: list[tuple[str, str]] = []
         scan_unavailable: str | None = None
         scope_supported = True
+        held: str | None = None
         try:
             with self._lock.unlocked():
                 if not self._fetch_head(row["number"], row["head_sha"]):
                     raise chain.ChainError(f"accepted head {row['head_sha']} is not available")
                 result = chain.build(self.clone, batch["tip"], [member], chain_id=chain_id)
                 gaps, scan_unavailable, scope_supported = self._replay_preflight(batch["base"], batch["tip"], result)
+                check = getattr(self.admission, "insertion_check", None)
+                if result.status == chain.CLEAN and callable(check):
+                    held = check(row["number"], row["head_sha"])
+                    held = held if isinstance(held, str) else None  # a reason, or nothing to hold
         except chain.ChainError as error:
             failure = error
         finally:
@@ -4327,6 +4336,17 @@ class Controller:
             return False
         version = batch["version"] + 1
         with self.store.transaction():
+            if held is not None:
+                # The inputs admission evaluated have changed or could not be read: evaluate again.
+                self.store.update(
+                    "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="admission-recheck"
+                )
+                self._release_claim(claim, "admission-recheck", now)  # the check re-dirtied the PR if needed
+                self._count("insertion_checks_held")
+                self.store.journal(
+                    now, "insertion-check-held", batch["id"], number=row["number"], head=row["head_sha"], reason=held
+                )
+                return False
             if self.admission is not None and not self.admission.is_current(row["number"], row["head_sha"]):
                 self.store.update(
                     "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="admission-pending"
@@ -4365,6 +4385,8 @@ class Controller:
                     f"member-label:{batch['id']}:{row['number']}",
                     {"number": row["number"], "add": [self.setting("membership_label")], "remove": []},
                 )
+            if self.setting("admission_insertion_check") and not isinstance(row["number"], SourceNumber):
+                self._count("insertion_checks_passed")
             self.store.journal(
                 now,
                 "inserted",

@@ -210,6 +210,7 @@ RUN_STDLIB=(
   queue_admission_state.py
   queue_admission.py
   queue_admission_evidence.py
+  queue_insertion_check.py
   queue_admission_adapter.py
   queue_config.py
   queue_cli.py

@@ -594,6 +594,79 @@ class SourceTests(unittest.TestCase):
             pulls = adapter.list_open_pull_requests(TAUCETI, review_app_id=0, admission=True)
             self.assertEqual(source_version(snapshot.source(), "policy"), source_version(pulls[0].admission, "policy"))
 
+    def test_insertion_check_source_matches_the_evaluated_version(self):
+        """The check before insertion digests what evaluation digested, comments and bots included."""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- a\n"}, "head", push_to="refs/pull/42/head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            ts = "2026-11-19T01:00:00Z"
+            board = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 {}-->"
+            recovery = f"Merge-queue recovery for head `{head}`"
+            rest = [
+                {"id": 1, "body": board, "created_at": ts, "updated_at": ts, "user": {"login": "reviewer"}},
+                {
+                    "id": 2,
+                    "body": recovery,
+                    "created_at": ts,
+                    "updated_at": ts,
+                    "user": {"login": "tau-ceti-bors[bot]"},
+                },
+            ]
+            graph = [
+                {"databaseId": 1, "body": board, "createdAt": ts, "updatedAt": ts, "author": {"login": "reviewer"}},
+                {
+                    "databaseId": 2,
+                    "body": recovery,
+                    "createdAt": ts,
+                    "updatedAt": ts,
+                    "author": {"login": "tau-ceti-bors", "__typename": "Bot"},
+                },
+            ]
+            transport = FakeTransport()
+            raw = pr_json(head={"sha": head}, base={"ref": "main", "sha": base}, comments=2)
+            url = f"https://api.github.com/repos/{TAUCETI}"
+            transport.add("GET", url + "/pulls/42", 200, raw)
+            transport.add(
+                "GET", url + f"/compare/{base}...{head}?per_page=1", 200, {"merge_base_commit": {"sha": base}}
+            )
+            transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, rest)
+            transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw))
+            document = fence_document(raw)
+            document["data"]["repository"]["pullRequest"]["comments"] = connection(graph)
+            transport.add("POST", "https://api.github.com/graphql", 200, document)
+            c, _ = client(transport)
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)
+            snapshot = adapter.admission_snapshot(TAUCETI, 42)
+            source = adapter.admission_insertion_source(TAUCETI, 42, head)
+            self.assertEqual(source_version(snapshot.source(), "p"), source_version(source, "p"))
+            # A scoreboard edited since evaluation changes the digest.
+            graph[0]["body"] += "\nedited"
+            graph[0]["updatedAt"] = "2026-11-19T02:00:00Z"
+            document = fence_document(raw)
+            document["data"]["repository"]["pullRequest"]["comments"] = connection(graph)
+            transport.add("POST", "https://api.github.com/graphql", 200, document)
+            changed = adapter.admission_insertion_source(TAUCETI, 42, head)
+            self.assertNotEqual(source_version(snapshot.source(), "p"), source_version(changed, "p"))
+
+    def test_deleted_authors_read_alike_in_both_apis(self):
+        node = {"databaseId": 7, "body": "b", "createdAt": "t", "updatedAt": "t", "url": "", "author": None}
+        self.assertEqual(ga._graphql_comment(node)["author"], "ghost")  # REST names a deleted user `ghost`
+
+    def test_a_paged_insertion_read_is_repeated_and_must_agree(self):
+        transport = FakeTransport()
+        c, _ = client(transport)
+        adapter = ga.GitHubAdapter(c, repo=TAUCETI)
+        reads = iter([({"body": "first"}, 2), ({"body": "edited meanwhile"}, 2), ({"body": "same"}, 2)])
+        adapter._insertion_source = lambda repo, number, head: next(reads)
+        with self.assertRaises(ga.GitHubError):
+            adapter.admission_insertion_source(TAUCETI, 42, HEAD)
+        reads = iter([({"body": "same"}, 2), ({"body": "same"}, 2)])
+        self.assertEqual(adapter.admission_insertion_source(TAUCETI, 42, HEAD), {"body": "same"})
+        reads = iter([({"body": "one page"}, 1)])
+        self.assertEqual(adapter.admission_insertion_source(TAUCETI, 42, HEAD), {"body": "one page"})
+
 
 class BumpGuardFloorTests(unittest.TestCase):
     """PR #43422: a self-tested Mathlib bump's guard needs 19 reads, and restarts from its first."""
