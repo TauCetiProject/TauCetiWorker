@@ -1170,6 +1170,24 @@ class LostRuns(ControllerCase):
             time.sleep(0.01)
         self.assertFalse(self.controller._live_reading)
 
+    def test_failing_reads_are_logged_once_and_their_recovery_too(self):
+        advanced, _reads, inline = self.live_reports()
+        self.github.start_runs()
+        with inline:
+            self.observe()
+            failing = mock.Mock(side_effect=RuntimeError("HTTP 403: blocked"))
+            working = self.controller.live_progress
+            self.controller.live_progress = failing
+            with self.assertLogs(self.controller.log, "WARNING") as logged:
+                for _ in range(3):
+                    self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertEqual(len([m for m in logged.output if "unavailable" in m and "HTTP 403" in m]), 1)
+            self.controller.live_progress = working
+            advanced["at"] = self.clock()
+            with self.assertLogs(self.controller.log, "INFO") as logged:
+                self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertTrue(any("readable again" in m for m in logged.output))
+
     def test_a_failed_watermark_write_does_not_stop_polling(self):
         advanced, reads, inline = self.live_reports()
         self.github.start_runs()

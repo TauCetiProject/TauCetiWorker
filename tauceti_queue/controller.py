@@ -654,6 +654,7 @@ class Controller:
         # (run id, run attempt) -> {"checked_at", "raw", "progress_at"} for the head's run only.
         self._live: dict[tuple[str, int], dict[str, Any]] = {}
         self._live_reading = False
+        self._live_failure: str | None = None
         self._live_lock = threading.Lock()
         # (attempt id, run id, run attempt) -> (time, run status) of the last phase read of a source run.
         self._source_phases_read: dict[tuple[Any, str, int], tuple[float, str]] = {}
@@ -3787,8 +3788,19 @@ class Controller:
         def read() -> None:
             try:
                 report = self.live_progress(*key)
-            except Exception:  # noqa: BLE001 - observational; a failed read leaves the step phases alone
+            except Exception as error:  # noqa: BLE001 - observational; a failed read leaves the step phases alone
                 report = None
+                failure = f"{type(error).__name__}: {str(error)[:200]}"
+            else:
+                failure = None if report is not None else "no live report for the run"
+            # One journal line when reads start failing or recover, not one a minute.
+            if failure != self._live_failure:
+                log = self.log
+                if failure is None:
+                    log.info("live build progress for run %s attempt %s readable again", *key)
+                else:
+                    log.warning("live build progress for run %s attempt %s unavailable: %s", key[0], key[1], failure)
+                self._live_failure = failure
             with self._live_lock:
                 try:
                     current = self._live.get(key, {})
