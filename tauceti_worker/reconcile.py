@@ -337,6 +337,41 @@ def _push(path: Path) -> bool:
     return False
 
 
+def _taken_back(base: str, ours: str, parent: str, current: str) -> str | None:
+    """`current` with each item `ours` changed from `base` set back to its `base` status and
+    clauses, found by area and slug so a line a hook reformatted is still found; an item `parent`
+    already holds as `ours` has it stays. None when an item cannot be put back."""
+
+    def listed(text: str) -> Targets | None:
+        try:
+            return parse_targets(text)
+        except Die:
+            return None
+
+    before, after, held = listed(base), listed(ours), listed(parent)
+    if before is None or after is None:
+        return None
+    text = current
+    for item in after.items():
+        old = before.find(item.slug)
+        if old is None or (old.status, old.meta) == (item.status, item.meta):
+            continue
+        kept = held.find(item.slug) if held else None
+        if kept is not None and (kept.status, kept.meta) == (item.status, item.meta):
+            continue
+        now = listed(text)
+        found = now.find(item.slug) if now else None
+        if found is None:
+            return None
+        added = [m.partition(":")[0] for m in item.meta if m not in old.meta]
+        restored = [m for m in old.meta if m not in item.meta]
+        text = rewrite_item(text, found, old.status, drop=added, add=restored)
+        again = listed(text)
+        if again is None or again.find(item.slug) is None or again.find(item.slug).status != old.status:
+            return None
+    return text
+
+
 def merge3(base: str, ours: str, theirs: str) -> str | None:
     """Two edits of `base` merged (`git merge-file`), or None when they touch the same lines."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -388,8 +423,11 @@ def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
             log(
                 f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); the edit waits for a later look"
             )
-            # Take back this look's edit alone, keeping one a hook or a hand made meanwhile.
-            undone = merge3(merged, path.read_text(), theirs)
+            # Take back this look's edit alone, keeping one a hook or a hand made meanwhile. When the
+            # hook touched the same lines, put each edited item back by its slug instead: a status
+            # left behind uncommitted would read as settled and never be published.
+            now = path.read_text()
+            undone = merge3(merged, now, theirs) or _taken_back(theirs, merged, "", now)
             if undone is None:
                 log(f"reconcile: {path.name} changed on the reconciled lines during the commit; left as it is")
             else:

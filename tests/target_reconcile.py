@@ -273,6 +273,24 @@ class Publish(Tmp):
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", both)
         self.assertIn("- [x] `strong-law`", both)
 
+    def test_a_failed_commit_whose_hook_edited_the_same_line_is_retried(self):
+        first = self.clone("first")
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text(
+            "#!/bin/sh\nsed 's/the strong law (/the strong law. (/' targets.md > t.tmp && mv t.tmp targets.md\nexit 1\n"
+        )
+        hook.chmod(0o755)
+        listed = t.parse_targets(EXAMPLE)
+        a = t.rewrite_item(EXAMPLE, listed.find("strong-law"), "done", add=("landed: #7",))
+        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
+        left = first.read_text()
+        self.assertIn("- [ ] `strong-law` — the strong law. (serves: G1; needs:", left)
+        self.assertNotIn("landed: #7", left)
+        hook.unlink()
+        again = t.rewrite_item(left, t.parse_targets(left).find("strong-law"), "done", add=("landed: #7",))
+        self.assertEqual(reconcile.publish(first, left, again, ["n"]), again)
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", again)
+
     def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
         from tauceti_worker.source_identity import SourceActor
         from tauceti_worker.worker_sources import activate
