@@ -495,6 +495,18 @@ class Repair(QueueFixture):
         self.assertEqual((refused.accepted, refused.reason), (False, "invalid-chain"))
         self.assertEqual(refused.violations[0]["code"], "wrong-base")
         self.controller.release_task(task.task_id, task.claim_token, "agent_failed", "")
+        # A resolution that takes in the next member's change (a replay by hand) is refused: that member
+        # would be left an empty commit.
+        absorber = self.agent(
+            "absorber",
+            script=lambda task: {f"{PROJECT}#102": Resolution({**merged, "C.lean": "c\n"}, explanation="Merged.")},
+        )
+        absorbed = absorber.run(self.controller)
+        self.assertEqual((absorbed.accepted, absorbed.reason), (False, "invalid-chain"))
+        self.assertEqual(
+            [(v["code"], v["source_pr"]) for v in absorbed.violations], [("absorbed-later-member", f"{PROJECT}#103")]
+        )
+        self.controller.release_task(absorbed.task_id, absorber.tasks[-1].claim_token, "agent_failed", "")
         # An explanation smuggling in a second member's identity is refused at once: a later task
         # could not undo it.
         smuggler = self.agent(

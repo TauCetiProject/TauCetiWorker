@@ -4833,6 +4833,16 @@ class Records(unittest.TestCase):
         records = [json.loads(line) for line in listings.read_text().splitlines()]
         self.assertEqual([(r["pr"], r["state"]) for r in records], [(1, "replayed"), (2, "conflicting")])
         self.assertEqual(sh(seed, "status", "--porcelain"), "", "the listings are excluded from Git")
+        # A verification round's findings replace the task's, but the task still resolves its one commit.
+        verified = repair.findings_from_diagnostics(
+            [{"kind": "compiler", "module": "TauCeti/Two.lean", "message": "TauCeti/Two.lean:1:1: boom"}]
+        )
+        retry = repair.compose_prompt(
+            repair_task.prompt_context(task, "verification failed", verified), verified, chain, seed
+        )
+        self.assertTrue(retry.startswith(repair.RESOLUTION_INSTRUCTION))
+        self.assertIn("## Resolving the commit", retry)
+        self.assertNotIn("--fixup", retry)
         with self.assertRaises(ValueError):
             repair_task.Task.from_json({**raw, "kind": "mystery", "claim_token": "x", "expires_at": 1})
 

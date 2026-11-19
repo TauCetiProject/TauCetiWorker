@@ -6394,15 +6394,60 @@ class Controller:
                     source_pr=original.source_pr,
                 )
             )
+        member = next((m for m in self._members(task["batch_id"]) if m["source_pr"] == original.source_pr), None)
+        if member is not None and (member["no_repair"] or member["withdrawn"]) and not self._commit_empty(resolved):
+            # Checked here too: a later task could not undo an edit that the final validation refuses.
+            problems.append(
+                chain.Violation(
+                    "no-repair-edited",
+                    f"{original.source_pr} is never edited: leave its content alone, or reduce it to an empty "
+                    "commit naming the interacting PR, file and finding",
+                    commit=resolved,
+                    source_pr=original.source_pr,
+                )
+            )
         if problems:
             return None, problems
         chain_id = f"resolved-{task['id']}-{secrets.token_hex(4)}"
         try:
-            return chain.replay(self.clone, step["commit"], task["tip"], resolved, chain_id=chain_id), []
+            result = chain.replay(self.clone, step["commit"], task["tip"], resolved, chain_id=chain_id)
+            absorbed = self._absorbed_members(task, step, result, resolved)
         except chain.ChainError as error:
             return None, [chain.Violation("replay-failed", str(error), commit=resolved)]
         finally:
             chain.delete_chain_ref(self.clone, chain_id)
+        return (None, absorbed) if absorbed else (result, [])
+
+    def _absorbed_members(
+        self, task: dict[str, Any], step: dict[str, Any], result: chain.ChainResult, resolved: str
+    ) -> list[chain.Violation]:
+        """Later members a resolution took into itself: empty when replayed onto it, though their change
+        applies onto the clean prefix and they did not land on the base. Taking a later member's content
+        is replaying it by hand, which would leave that member an empty commit."""
+        emptied = {
+            r.source_pr
+            for r in result.commits
+            if r.status == chain.CLEAN and r.empty and not r.landed_on_base and r.sha is not None
+        }
+        if not emptied:
+            return []
+        prefix_tree = chain.tree_of(self.clone, step["clean_prefix_tip"])
+        found = []
+        for later in chain.chain_commits(self.clone, step["commit"], task["tip"]):
+            if later.source_pr not in emptied or later.tree == chain.tree_of(self.clone, later.parents[0]):
+                continue
+            outcome = chain.merge_trees(self.clone, step["clean_prefix_tip"], later.sha, merge_base=later.parents[0])
+            if outcome.clean and outcome.tree != prefix_tree:
+                found.append(
+                    chain.Violation(
+                        "absorbed-later-member",
+                        f"the resolution already contains {later.source_pr}'s change, which the queue replays "
+                        "after it: keep only the conflicting commit's change",
+                        commit=resolved,
+                        source_pr=later.source_pr,
+                    )
+                )
+        return found
 
     def _next_conflict(
         self,
@@ -6420,6 +6465,7 @@ class Controller:
         already holds this resolution. Nothing is adopted into the batch until the replay finishes."""
         step = self._conflict_diagnostic(batch["id"], result, task["onto"], "continuing the replay onto")
         diagnostics = [step, *(d for d in loads(task["diagnostics"], []) if d.get("kind") != "conflict")]
+        # One transaction with the successor's creation: an accepted resolution always has its next task.
         with self.store.transaction():
             self.store.update(
                 "tasks",
@@ -6451,9 +6497,15 @@ class Controller:
                 next_conflict=step["source_pr"],
                 clean_prefix_tip=result.tip,
             )
-        # The next task describes the same input chain as this one, whatever the batch did since.
-        chain_of = dict(batch, base=task["base"], tip=task["tip"], version=task["batch_version"])
-        self._create_task(chain_of, task["kind"], task["onto"], diagnostics, now)
+            # The next task describes the same input chain as this one, whatever the batch did since.
+            chain_of = dict(batch, base=task["base"], tip=task["tip"], version=task["batch_version"])
+            successor = self._create_task(chain_of, task["kind"], task["onto"], diagnostics, now)
+            marker = self._eviction(batch)
+            if marker is not None and task["id"] in marker["task_ids"]:
+                # Like the task it continues, the successor is retained work of an evicted batch.
+                self._set_state(
+                    f"emergency_evicted:{batch['id']}", dict(marker, task_ids=[*marker["task_ids"], successor])
+                )
         self.report_inference(claim["worker"], True)
         self._wake.set()
         return Adoption(True, "resolved-commit", task["id"], batch["id"], None, resolved, retained, [])

@@ -1572,7 +1572,8 @@ def prompt_context(
     knowledge = task_findings(task).get("admission_predictions")
     if knowledge:
         findings.setdefault("admission_predictions", knowledge)
-    conflict = dict(findings.get("conflict") or {}) or None
+    # A verification round replaces the findings; a conflict task still resolves its one commit.
+    conflict = dict(findings.get("conflict") or task_findings(task).get("conflict") or {}) or None
     if conflict is not None:
         conflict.setdefault("onto", task.onto)
         conflict.setdefault("previous_base", task.base)
@@ -2810,7 +2811,11 @@ def _run_task(
                         )
                         log(f"attempt {attempt}: verification failed; running the agent on its findings")
                         continue
-                    if not (
+                    if step is not None:
+                        # The tree is a prefix of the chain: a later member may fix what fails here. The
+                        # queue replays the rest and its CI judges the whole chain.
+                        log(f"task {task.task_id}: the resolved commit still fails verification; submitting it")
+                    elif not (
                         task.extra.get("can_checkpoint_repair")
                         and verification.get("build", {}).get("rc") == 0
                         and checks.get("status") == "failed"
@@ -2818,13 +2823,14 @@ def _run_task(
                         and all(d.get("kind") in ("audit", "lint") for d in verification["diagnostics"])
                     ):
                         return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-                    outcome["repair_checkpoint"] = {
-                        "tip": tip,
-                        "diagnostics": [
-                            {**finding, "message": finding["message"][:2000]}
-                            for finding in verification["diagnostics"][:20]
-                        ],
-                    }
+                    else:
+                        outcome["repair_checkpoint"] = {
+                            "tip": tip,
+                            "diagnostics": [
+                                {**finding, "message": finding["message"][:2000]}
+                                for finding in verification["diagnostics"][:20]
+                            ],
+                        }
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
             if (
