@@ -301,6 +301,13 @@ uv run tauceti-queue status --json | jq .service
 uv run tauceti-queue status --url https://queue.taucetiproject.org   # through the tunnel
 ```
 
+While the head's CI run is in progress, `status` also reads that run's live build report from the
+public CI operations snapshot (`https://ci-data.taucetiproject.org`, no GitHub calls) and prints a
+line such as `build: phase build, 103,917/113,955 Lake jobs (91.2%), 850/min, ETA 05 Nov 11:10 AEDT`.
+TauCetiTools' build reporter, outside the bwrap sandbox, posts these counters every fifteen seconds;
+they come from candidate output, so they are observations only. When the report is unavailable the
+head shows its running step alone (`tauceti_queue/build_progress.py`).
+
 ## Current deployment
 
 The controller, SQLite store, content clone, public tunnel, monitoring publisher,
