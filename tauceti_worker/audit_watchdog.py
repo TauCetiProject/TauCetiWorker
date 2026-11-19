@@ -16,7 +16,7 @@ import os
 import time
 from pathlib import Path
 
-from .audit_alerts import ALERT_ERRORS, deliver, delivery_pending, save
+from .audit_alerts import deliver, delivery_pending, save
 from .config import log
 from .constants import TAUCETI
 
@@ -25,16 +25,20 @@ REMIND_SECONDS = 86400
 
 
 def admitted(work: Path, cursor: str) -> bool:
-    """An inspection was started from this cursor: admitted work stays due below the threshold."""
-    ledger = work / "ledger.jsonl"
-    if not ledger.exists():
-        return False
-    for line in ledger.read_text().splitlines():
-        try:
-            if json.loads(line).get("from_sha") == cursor:
-                return True
-        except (ValueError, AttributeError):
+    """Work already started at this cursor stays due below the admission threshold.
+
+    That is a held block there, or a pool range starting there that has not passed (its persisted
+    status is written at launch). A remainder nobody has started waits for the threshold.
+    """
+    blocked = load(work / "blocked.json")
+    if blocked.get("from_sha") == cursor:
+        return True
+    for meta in (work / "pool").glob("*.json") if (work / "pool").is_dir() else ():
+        if meta.name.endswith(".input.json"):
             continue
+        value = load(meta)
+        if value.get("from_sha") == cursor and value.get("status") != "pass":
+            return True
     return False
 
 
@@ -55,11 +59,12 @@ def check(work: Path, observe, *, min_commits: int) -> None:
         return
     try:
         _check(work, observe, min_commits=min_commits)
-    except ALERT_ERRORS as exc:
+    except Exception as exc:  # noqa: BLE001 - the watchdog must never stop audit or maintenance work.
         delivery_pending(exc)
 
 
 def _check(work: Path, observe, *, min_commits: int) -> None:
+    work.mkdir(parents=True, exist_ok=True)
     path = work / "stall.json"
     state = load(path)
     now = time.time()
@@ -74,11 +79,13 @@ def _check(work: Path, observe, *, min_commits: int) -> None:
         cursor, pending = state.get("cursor"), state.get("pending")
         error = f"{type(exc).__name__}: {str(exc)[:300]}"
         due = True
-    if cursor != state.get("cursor") or not due or since is None:
+    if not due or cursor != state.get("cursor"):
+        since = None  # The clock runs only while due work holds one cursor.
+    if due and since is None:
         since = now
-    held = now - since
-    save(path, {"cursor": cursor, "since": since, "pending": pending, "error": error, "checked": now})
-    if not due or held < STALL_SECONDS:
+    save(path, {"cursor": cursor, "since": since, "due": due, "pending": pending, "error": error, "checked": now})
+    held = now - since if due else 0.0
+    if held < STALL_SECONDS:
         return
     occurrence = int((held - STALL_SECONDS) // REMIND_SECONDS)
     identity = {"kind": "Cursor stall", "cursor": cursor, "since": since, "occurrence": occurrence}

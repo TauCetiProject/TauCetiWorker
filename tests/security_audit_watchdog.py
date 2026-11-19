@@ -72,20 +72,64 @@ class Watchdog(unittest.TestCase):
         self.assertEqual(len(self.posts()), 1)
         self.assertIn(B, self.posts()[0])
 
-    def test_below_threshold_is_not_due_unless_work_was_admitted(self):
+    def test_below_threshold_is_not_due_unless_work_was_started_there(self):
         self.seen = (A, 5)
         self.check(10000)
         self.check(10**6)
         self.assertEqual(self.posts(), [])
-        # An inspection already started at this cursor stays due below the admission threshold.
-        (self.work / "ledger.jsonl").write_text(json.dumps({"from_sha": A, "reason": "unfinished"}) + "\n")
+        # A pool range launched at this cursor (status persisted at launch) stays due.
+        (self.work / "pool").mkdir()
+        (self.work / "pool" / "d.json").write_text(json.dumps({"from_sha": A, "status": "running"}))
+        (self.work / "pool" / "d.input.json").write_text(json.dumps({"from_sha": A}))
         self.check(10**6 + 1)
         self.check(10**6 + 3601)
         self.assertEqual(len(self.posts()), 1)
 
+    def test_held_block_at_the_cursor_is_due_below_the_threshold(self):
+        self.seen = (A, 3)
+        (self.work / "blocked.json").write_text(json.dumps({"from_sha": A, "reason": "malformed"}))
+        self.check(10000)
+        self.check(13600)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_passed_pool_range_is_not_admitted_work(self):
+        self.seen = (A, 3)
+        (self.work / "pool").mkdir()
+        (self.work / "pool" / "d.json").write_text(json.dumps({"from_sha": A, "status": "pass"}))
+        self.check(10000)
+        self.check(10**6)
+        self.assertEqual(self.posts(), [])
+
+    def test_newly_due_work_does_not_inherit_idle_time(self):
+        self.seen = (A, 0)
+        self.check(10000)
+        self.seen = (A, 25)
+        self.check(10**6)
+        self.assertEqual(self.posts(), [])
+        self.check(10**6 + 3599)
+        self.assertEqual(self.posts(), [])
+        self.check(10**6 + 3600)
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_unexpected_delivery_errors_never_escape(self):
+        import http.client
+
+        self.check(10000)
+        self.http.side_effect = http.client.IncompleteRead(b"")
+        self.check(13600)  # Must not raise.
+        self.assertTrue((self.work / "stall.json").exists())
+
+    def test_missing_state_directory_and_failing_observation_still_alerts(self):
+        self.work = self.work / "fresh" / "security-audit"
+        self.seen = NoProgress("ls-remote failed")
+        self.check(10000)
+        self.check(13600)
+        self.assertEqual(len(self.posts()), 1)
+        self.assertIn("ls-remote failed", self.posts()[0])
+
     def test_caught_up_cursor_is_never_a_stall(self):
         self.seen = (A, 0)
-        (self.work / "ledger.jsonl").write_text(json.dumps({"from_sha": A}) + "\n")
+        (self.work / "blocked.json").write_text(json.dumps({"from_sha": A}))
         self.check(10000)
         self.check(10**6)
         self.assertEqual(self.posts(), [])

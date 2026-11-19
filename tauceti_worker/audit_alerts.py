@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import math
 import os
 import ssl
 import tempfile
@@ -17,8 +16,6 @@ from pathlib import Path
 from .config import log
 from .constants import TAUCETI
 from .paths import ensure_ssl_cert_file
-
-OPERATIONAL_STALL_SECONDS = 3600
 
 
 def request(config: dict, method: str, params: dict) -> dict:
@@ -101,37 +98,6 @@ def report(work: Path, block: dict) -> dict:
     }
 
 
-def actionable(work: Path, value: dict) -> bool:
-    """Source concerns notify now; operational pauses notify after an hour held.
-
-    The held range's start (the cursor it holds), rather than an attempt ID or failure text,
-    identifies the stall. Each start keeps its own timer, so a pool holding blocks at several
-    starts never resets one with another. Retries and Worker restarts cannot reset a delay;
-    unreadable timer state restarts the delay rather than suppressing the alert for good.
-    This timer controls notifications only; audit blocks/recovery are untouched.
-    """
-    if value["kind"] != "Operational stall":
-        return True
-    path = work / "operational-alert.json"
-    now = time.time()
-    try:
-        state = json.loads(path.read_text()) if path.exists() else {}
-    except ValueError:
-        state = {}
-    if not isinstance(state, dict):
-        state = {}
-    if "from_sha" in state:  # The single-timer format written before per-start timers.
-        state = {"starts": {state["from_sha"]: state.get("first_seen")}}
-    starts = state.get("starts")
-    if not isinstance(starts, dict):
-        starts = {}
-    started = starts.get(value["from_sha"])
-    if type(started) not in (int, float) or not math.isfinite(started) or started > now:
-        started = starts[value["from_sha"]] = now
-        save(path, {"starts": starts})
-    return now - started >= OPERATIONAL_STALL_SECONDS
-
-
 def content(value: dict, work: Path, marker: str) -> str:
     # Model-generated diagnostics are quoted as data, never mentions or Markdown commands.
     detail = "\n".join(value["details"])[:6000].replace("`", "ˋ").replace("@", "＠")
@@ -142,11 +108,7 @@ def content(value: dict, work: Path, marker: str) -> str:
         else f"https://github.com/{TAUCETI}/commits/main"
     )
     attention = (
-        "**Attention: the audit cursor has remained held for at least one hour.** "
-        "This is an operational stall, with no recorded source-safety finding for this range. "
-        "Automatic recovery continues where eligible; investigate if the stall persists."
-        if value["kind"] == "Operational stall"
-        else "**Human review required:** the inspection recorded a source concern or unresolved "
+        "**Human review required:** the inspection recorded a source concern or unresolved "
         "code-safety uncertainty. Automatic recovery will not discard this judgment."
     )
     return (
@@ -225,13 +187,17 @@ def delivery_pending(exc: BaseException) -> None:
 
 
 def notify_block(work: Path, block: dict) -> None:
-    """Notification failure never clears a block or stops maintenance; retry after 15 minutes."""
+    """Source concerns notify now. Notification failure never clears a block or stops maintenance.
+
+    Operational pauses send nothing here: the cursor watchdog (audit_watchdog) alone reports a
+    cursor held for an hour, whatever the cause, so one pause never produces two DMs.
+    """
     if not os.environ.get("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG"):
         return
     try:
         value = report(work, block)
-        if not actionable(work, value):
-            return  # A transient operational pause: no private alert before one hour.
+        if value["kind"] == "Operational stall":
+            return
         identity = {key: value[key] for key in ("kind", "from_sha", "to_sha")}
         deliver(work, identity, lambda marker: content(value, work, marker))
     except ALERT_ERRORS as exc:

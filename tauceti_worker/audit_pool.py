@@ -723,6 +723,7 @@ class Pool:
         else:
             self.holding = None
         cursor = self.advance(cursor)
+        self.observation = (cursor, len(sa.validate_history(self.repo, cursor, main)))
         self.refill(cursor, main)
         if self.slots:
             pending = len(sa.validate_history(self.repo, cursor, main))
@@ -755,7 +756,9 @@ class Pool:
                             return
                     except NoProgress as exc:
                         log(f"security-audit pool: {exc}; retrying")
-                    audit_watchdog.check(self.work, self.observed, min_commits=self.min_commits)
+                    finally:
+                        # Every pass, including one that fails with any exception.
+                        audit_watchdog.check(self.work, self.observed, min_commits=self.min_commits)
                     if stop is not None and stop(self):
                         return
                     timeout = 30 if self.slots else POLL_SECONDS
