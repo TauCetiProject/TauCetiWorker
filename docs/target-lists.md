@@ -262,8 +262,12 @@ prompt names (in the worker's state, `target-report/prerequisites.txt`). After
 the round the worker reads at most 4 KiB of it, keeps only slugs that are
 inferred `needs:` of the item that round was handed, and opens each again: `[ ]`,
 its `inferred:` clause dropped and
-`reopened: <its evidence> by <item> round <round id>` added. It waits up to two
-minutes for the list's lock to do so, and does not move the look gap. A tick
+`reopened: <its evidence> by <item> round <round id>` added, but only while its
+`inferred:` clause still names the evidence that round was shown. It waits up to
+two minutes for the list's lock, and does not move the look gap; a report it
+cannot apply then is kept in the worker's state and tried again before each of
+that worker's later roadmap rounds. Each prerequisite is shown to the round
+with its area and whole line, whichever area it is in. A tick
 earned by a merged pull request (`landed:`, or an `[x]` without `inferred:`) is
 never opened this way.
 
@@ -274,7 +278,7 @@ layer with exactly that id in a state other than `done`, each inferred tick in
 the layer that is dated before the status header's date is opened again, with
 `reopened: <its evidence> by coverage <layer> <state> on <status date>`. A
 missing or unparseable header, a second header for the area, no layer with that
-exact id, a status no later than the tick, or an inferred tick with no date
+exact id, a status no later than the tick (both dates in UTC), or an inferred tick with no date
 changes nothing. Earned ticks are never opened this way.
 
 **Not again on the same evidence.** A `reopened:` clause stays on the item. A
