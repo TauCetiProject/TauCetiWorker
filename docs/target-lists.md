@@ -192,24 +192,27 @@ created).
 end, so two workers on a host never reconcile one file at once; the lock file's
 modification time is what shares the gap between them, and it is read again
 once the lock is held, so a worker that was due when its round began does not
-look again just after another one did. Each write merges the edit three ways
-with the file as it then is, so a change made by hand while the look ran is
-kept; if both changed the same or adjacent lines nothing is written and the
-next look starts from the new file. The file is replaced by a rename.
+look again just after another one did. Every edit is computed on the very text
+it replaces, never merged into it: the look's observations are applied again to
+the list as it is where it is published, so an item whose line, area or status
+changed meanwhile gets the edit that list calls for, or none.
 
-When the list is tracked in a git repository, the worker also runs git in that
-clone with the clone's own identity and credentials: before reading and before
-writing it fetches the branch the current branch tracks and rebases onto it,
-then commits the list alone as `Reconcile <file name>: N item(s)` with one line
-per item, and pushes to that branch, once more after a rebase if the remote
-moved first. That is how workers on several hosts share one list: each keeps a
-clone, and their edits meet through the remote. Give the list a clone of its
-own, since the rebase moves the whole checkout. A clone with uncommitted
-changes to tracked files is not rebased, a rebase that conflicts is aborted
-and logged, a commit that fails takes the look's edit back out of the file,
-keeping any other change made meanwhile, so the next look makes it again, and
-a commit that cannot be pushed goes with the next look. A branch that tracks
-nothing is committed and not pushed. Add the lock file to `.gitignore`.
+When the list is tracked in a git repository on a branch that tracks a remote
+branch, the worker publishes it from a throwaway worktree, running git with the
+clone's own identity, credentials and hooks: it fetches that remote branch,
+checks it out in a temporary worktree, computes the edits on the list there,
+commits the list alone as `Reconcile <file name>: N item(s)` with one line per
+item, and pushes the commit to the remote branch. A commit a hook rejects, a
+push the remote refuses, or a fetch that fails publishes nothing and leaves
+nothing behind, and the next look computes again. The worktree is then removed
+and the clone is fast-forwarded to the remote branch when it has no
+uncommitted changes and no commits of its own; otherwise it is left for the
+operator. That is how workers on several hosts share one list: their edits meet
+on the remote. Neither the operator's working file nor their branch is ever
+written by a look, and their own commits are never pushed by it. Any other
+list, untracked or on a branch that tracks nothing, is edited in place and
+replaced by a rename, computed again if it changed while the look ran. Add the
+lock file to `.gitignore`.
 
 A look costs, on each forge it reads, one search for merged markers, plus one
 read per `in flight:` clause. It starts no model.

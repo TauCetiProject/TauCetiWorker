@@ -8,7 +8,7 @@ names. The pieces:
 
     due(counters)                  whether a look is due, and the reason either way
     settle(targets, seen)          pure: the edits that pull request states imply
-    publish(path, base, ours, ..)  merge an edit into the file; commit and push a tracked one
+    publish(path, compute)         compute the edits on the published list and publish them
     run(w, c)                      one reconciliation, under the list's lock
 """
 
@@ -270,12 +270,12 @@ def observe(targets: Targets, read: list[Source]) -> Seen:
     return Seen(merged, pulls)
 
 
-def _git(path: Path, *args: str, timeout: int = 120) -> subprocess.CompletedProcess:
-    """Git in the list's clone, with the operator's identity, credentials and hooks even inside a
-    source's activation."""
+def _git(path: Path, *args: str, timeout: int = 120, cwd: Path | None = None) -> subprocess.CompletedProcess:
+    """Git in the list's clone (or in `cwd`, a worktree of it), with the operator's identity,
+    credentials and hooks even inside a source's activation."""
     from .worker_sources import operator_environment
 
-    argv = ["git", "-C", str(path.parent), *args]
+    argv = ["git", "-C", str(cwd or path.parent), *args]
     try:
         return subprocess.run(
             argv,
@@ -297,110 +297,27 @@ def _tracked(path: Path) -> bool:
     return _git(path, "ls-files", "--error-unmatch", "--", _spec(path)).returncode == 0
 
 
-def _upstream(path: Path) -> tuple[str, str] | None:
-    """(remote, ref) that the branch checked out around the list tracks on a remote."""
+def _upstream(path: Path) -> tuple[str, str, str] | None:
+    """(remote, its ref, the local ref tracking it) for the branch checked out around the list."""
     head = _git(path, "symbolic-ref", "-q", "HEAD").stdout.strip()
     if not head:
         return None
-    found = _git(path, "for-each-ref", "--format=%(upstream:remotename) %(upstream:remoteref)", head).stdout.split()
-    return (found[0], found[1]) if len(found) == 2 and found[0] != "." else None
+    found = _git(
+        path, "for-each-ref", "--format=%(upstream:remotename) %(upstream:remoteref) %(upstream)", head
+    ).stdout.split()
+    return (found[0], found[1], found[2]) if len(found) == 3 and found[0] != "." else None
 
 
 def _sync(path: Path) -> None:
-    """Fetch the branch the list's branch tracks and rebase local commits onto it. A clone with
-    uncommitted changes to tracked files is left where it is; so is one whose rebase stops on a
-    conflict, after aborting it."""
-    upstream = _upstream(path)
-    if upstream is None:
+    """Fast-forward the clone around the list to the branch it tracks, as far as the last fetch saw.
+    A clone with uncommitted changes to tracked files, or with commits of its own, is left as it
+    is."""
+    if _upstream(path) is None:
         return
-    fetched = _git(path, "fetch", "-q", upstream[0], timeout=300)
-    if fetched.returncode != 0:
-        log(f"reconcile: fetch from {upstream[0]} failed ({one_line(fetched.stderr)}); working from the local list")
-    elif _git(path, "status", "--porcelain", "--untracked-files=no").stdout.strip():
-        log(f"reconcile: {path.parent} has uncommitted changes; not rebasing it onto {upstream[0]}")
-    elif _git(path, "rebase", "-q", "@{upstream}").returncode != 0:
-        _git(path, "rebase", "--abort")
-        log(f"reconcile: local commits in {path.parent} conflict with {upstream[0]}; rebase there by hand")
-
-
-def _push(path: Path) -> bool:
-    """Push the list's branch to the branch it tracks when it is ahead, once more after a sync if
-    the remote has moved; whether nothing is left unpushed. A commit that cannot be pushed stays
-    local and goes with a later call."""
-    upstream = _upstream(path)
-    if upstream is None:
-        return True
-    for attempt in (1, 2):
-        # A failed comparison (the tracked branch not on the remote yet, say) is left to the push.
-        ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
-        if ahead.returncode == 0 and ahead.stdout.strip() in ("", "0"):
-            return True
-        pushed = _git(path, "push", "-q", upstream[0], f"HEAD:{upstream[1]}", timeout=300)
-        if pushed.returncode == 0:
-            log(f"reconcile: pushed the target list to {upstream[0]}")
-            return True
-        if attempt == 1:
-            _sync(path)
-    log(f"reconcile: push to {upstream[0]} failed ({one_line(pushed.stderr)}); the commit stays local")
-    return False
-
-
-def _taken_back(base: str, ours: str, parent: str, current: str) -> str | None:
-    """`current` with this look's edit of each item (`ours` against `base`) undone where it still
-    stands, found by area and slug so a line a hook reformatted is still found: the status goes back
-    only while it is the one `ours` wrote, a clause `ours` added goes only while it is there as
-    written, and a clause `ours` removed returns only with the status. Whatever else changed the line
-    meanwhile stays. An item `parent` already holds as `ours` has it stays. None when an item cannot
-    be found or put back."""
-
-    def listed(text: str) -> Targets | None:
-        try:
-            return parse_targets(text)
-        except Die:
-            return None
-
-    def key(clause: str) -> str:
-        return clause.partition(":")[0].strip().lower()
-
-    before, after, held = listed(base), listed(ours), listed(parent)
-    if before is None or after is None:
-        return None
-    text = current
-    for item in after.items():
-        old = before.find(item.slug)
-        if old is None or (old.status, old.meta) == (item.status, item.meta):
-            continue
-        kept = held.find(item.slug) if held else None
-        if kept is not None and (kept.status, kept.meta) == (item.status, item.meta):
-            continue
-        now = listed(text)
-        found = now.find(item.slug) if now else None
-        if found is None:
-            return None
-        reverted = found.status == item.status
-        status = old.status if reverted else found.status
-        added = [m for m in item.meta if m not in old.meta and m in found.meta]
-        keys = {key(m) for m in added}
-        restored = [m for m in old.meta if m not in item.meta and key(m) not in {key(c) for c in found.meta}]
-        others = [m for m in found.meta if key(m) in keys and m not in added]
-        if not reverted and not added:
-            continue
-        text = rewrite_item(text, found, status, drop=keys, add=[*others, *(restored if reverted else ())])
-        again = listed(text)
-        if again is None or again.find(item.slug) is None or again.find(item.slug).status != status:
-            return None
-    return text
-
-
-def merge3(base: str, ours: str, theirs: str) -> str | None:
-    """Two edits of `base` merged (`git merge-file`), or None when they touch the same lines."""
-    with tempfile.TemporaryDirectory() as tmp:
-        files = []
-        for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
-            (Path(tmp) / name).write_text(text)
-            files.append(str(Path(tmp) / name))
-        merged = subprocess.run(["git", "merge-file", "-p", "-q", *files], capture_output=True, text=True)
-    return merged.stdout if merged.returncode == 0 else None
+    if _git(path, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+        log(f"reconcile: {path.parent} has uncommitted changes; not bringing it up to its upstream")
+    elif _git(path, "merge", "-q", "--ff-only", "@{upstream}").returncode != 0:
+        log(f"reconcile: {path.parent} has commits its upstream lacks; bring it up to date by hand")
 
 
 def _write(path: Path, text: str) -> bool:
@@ -417,45 +334,84 @@ def _write(path: Path, text: str) -> bool:
     return True
 
 
-def publish(path: Path, base: str, ours: str, notes: list[str]) -> str | None:
-    """Put `ours`, the list as this look edited it from `base`, into the file and return what the
-    file then holds, or None when it could not be merged or written. Call with the lock held.
-
-    A tracked list is first brought up to the branch it tracks. The edit is then merged three ways
-    with the file as it is now, so an edit made meanwhile by hand or on another host is kept; when
-    both touch the same lines nothing is written and a later look starts from the new file. A
-    tracked list is committed, that path only, and pushed; when the commit fails this look's edit
-    is taken back out of the file, so a later look makes it again."""
-    tracked = _tracked(path)
-    if tracked:
-        _sync(path)
-    theirs = path.read_text()
-    merged = ours if theirs == base else merge3(base, ours, theirs)
-    if merged is None:
-        log(f"reconcile: {path.name} changed on the same lines during this look; nothing written")
-        return None
-    if merged != theirs and not _write(path, merged):
-        return None
-    if tracked and merged != theirs:
-        message = f"Reconcile {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
-        committed = _git(path, "commit", "-q", "-m", message, "--", _spec(path))
-        if committed.returncode != 0:
-            log(
-                f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); the edit waits for a later look"
-            )
-            # Take back this look's edit alone, keeping one a hook or a hand made meanwhile. When the
-            # hook touched the same lines, put each edited item back by its slug instead: a status
-            # left behind uncommitted would read as settled and never be published.
-            now = path.read_text()
-            undone = merge3(merged, now, theirs) or _taken_back(theirs, merged, "", now)
-            if undone is None:
-                log(f"reconcile: {path.name} changed on the reconciled lines during the commit; left as it is")
-            else:
-                _write(path, undone)
+def _in_place(path: Path, compute) -> list[str] | None:
+    """`publish` for a list that is not tracked on a remote: computed on the file as it is and
+    written by a rename, computed again if the file changed meanwhile."""
+    for _ in (1, 2):
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError):
             return None
-    if tracked:
-        _push(path)
-    return merged
+        ours, notes = compute(text)
+        if ours == text:
+            return []
+        if path.read_text() == text:
+            return notes if _write(path, ours) else None
+    log(f"reconcile: {path.name} kept changing during this look; nothing written")
+    return None
+
+
+def publish(path: Path, compute, *, check=None) -> list[str] | None:
+    """Apply `compute` to the list where it is published and return its notes, `[]` when it changes
+    nothing, or None when nothing could be published. Call with the lock held.
+
+    `compute(text)` gives the list's new text and one note per edit; it is run on the text it will
+    replace, so every edit is checked against the list as it is there, never merged into it. A list
+    tracked on a remote is published from a throwaway worktree of the branch it tracks, as fetched
+    now: the commit (the list alone, through the clone's hooks) is pushed only if `check`, when
+    given, holds for the list as committed, and the worktree is then removed. A rejected commit,
+    check or push leaves nothing behind, and a later look computes again. The clone around the
+    list is then fast-forwarded when it is clean (`_sync`). Any other list is edited in place."""
+    upstream = _upstream(path) if _tracked(path) else None
+    if upstream is None:
+        return _in_place(path, compute)
+    remote, ref, tracking = upstream
+    fetched = _git(path, "fetch", "-q", remote, timeout=300)
+    if fetched.returncode != 0:
+        log(f"reconcile: fetch from {remote} failed ({one_line(fetched.stderr)}); nothing published")
+        return None
+    name = _git(path, "ls-files", "--full-name", "--", _spec(path)).stdout.strip()
+    # A tracked branch the remote does not have yet starts from the clone's own commit.
+    base = tracking if _git(path, "rev-parse", "-q", "--verify", tracking).returncode == 0 else "HEAD"
+    with tempfile.TemporaryDirectory(prefix="reconcile-") as tmp:
+        tree = Path(tmp) / "tree"
+        if _git(path, "worktree", "add", "-q", "--detach", str(tree), base).returncode != 0:
+            log(f"reconcile: no worktree of {base} could be made; nothing published")
+            return None
+        try:
+            return _publish_from(path, tree, name, compute, check, remote, ref)
+        finally:
+            _git(path, "worktree", "remove", "--force", str(tree))
+            _git(path, "worktree", "prune")
+            _sync(path)
+
+
+def _publish_from(path: Path, tree: Path, name: str, compute, check, remote: str, ref: str) -> list[str] | None:
+    try:
+        text = (tree / name).read_text()
+    except (OSError, UnicodeDecodeError):
+        log(f"reconcile: {remote} has no readable {name}; nothing published")
+        return None
+    ours, notes = compute(text)
+    if ours == text:
+        return []
+    (tree / name).write_text(ours)
+    message = f"Reconcile {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
+    committed = _git(path, "commit", "-q", "-m", message, "--", f":(literal){name}", cwd=tree)
+    if committed.returncode != 0:
+        log(f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); a later look tries again")
+        return None
+    shown = _git(path, "show", f"HEAD:{name}", cwd=tree)
+    if check is not None and (shown.returncode != 0 or not check(shown.stdout)):
+        log("reconcile: the list as committed is not what this look's edits were made for; not pushed")
+        return None
+    pushed = _git(path, "push", "-q", remote, f"HEAD:{ref}", timeout=300, cwd=tree)
+    if pushed.returncode != 0:
+        log(f"reconcile: push to {remote} failed ({one_line(pushed.stderr)}); a later look tries again")
+        return None
+    log(f"reconcile: pushed the target list to {remote}")
+    _git(path, "fetch", "-q", remote, timeout=300)
+    return notes
 
 
 def _parsed(path: Path, text: str) -> Targets:
@@ -467,8 +423,9 @@ def _parsed(path: Path, text: str) -> Targets:
 
 def _reconcile(w, c, path: Path) -> int | None:
     if _tracked(path):
+        if _upstream(path) is not None:
+            _git(path, "fetch", "-q", _upstream(path)[0], timeout=300)
         _sync(path)
-        _push(path)
     try:
         text = path.read_text()
     except (OSError, UnicodeDecodeError) as error:
@@ -480,14 +437,21 @@ def _reconcile(w, c, path: Path) -> int | None:
         c.reason = f"pull requests could not be read ({one_line(str(error))})"
         log(f"reconcile: {c.reason}; the target list is left as it is")
         return None
-    changes = settle(targets, seen)
-    if not changes:
+    if not settle(targets, seen):
         c.reason = "the target list is current"
         log(f"reconcile: {c.reason}")
         return None
-    notes = [f"`{change.item.slug}`: {change.note}" for change in changes]
-    if publish(path, text, apply(text, changes), notes) is None:
-        c.reason = f"{len(changes)} edit(s) to the target list could not be written"
+
+    def compute(text: str) -> tuple[str, list[str]]:
+        changes = settle(_parsed(path, text), seen)
+        return apply(text, changes), [f"`{change.item.slug}`: {change.note}" for change in changes]
+
+    notes = publish(path, compute)
+    if not notes:
+        c.reason = (
+            "the edits to the target list could not be published" if notes is None else "the target list is current"
+        )
+        log(f"reconcile: {c.reason}")
         return None
     for note in notes:
         log(f"reconcile: {note}")
