@@ -1,0 +1,21 @@
+[Unit]
+Description=Mirror every ref of the Forgejo TauCeti repository and its forks
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/services/forgejo-mirror/README.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+# install.sh copies the script from origin/main to this fixed path.
+ExecStart=/usr/bin/env python3 -I %h/.local/share/tauceti-forgejo-mirror/bin/forgejo_mirror.py fetch
+Environment=PATH=/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+SyslogIdentifier=tauceti-forgejo-mirror
+UMask=0077
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+KillMode=control-group
+# The first run clones about 1 GB; later runs take seconds.
+TimeoutStartSec=2h
+
+# Exit 1 (a source refused or failed) and 2 (setup) leave the unit failed until a later run
+# succeeds; exit 75 means another run held the lock.
