@@ -1041,8 +1041,12 @@ comment or explicit operator approval is required. Missing withdrawal history is
 `status.admission` reports the active source, policy digest, pending count, oldest pending time,
 and pending PRs with attempt time, retry deadline, resource and last error. The existing
 `approvals.last_poll` field carries the intake summary. Successful decisions are journaled as
-`admission-evaluated`, including their reason; `admission_evaluations` and `admission_approvals`
-count completed work. `tauceti-queue reconcile-approvals` wakes this same intake path for diagnosis;
+`admission-evaluated`, including their reason and where the evaluation's time went: `seconds` in
+all, `read_seconds` reading the source, `fetch_seconds` of that fetching into the clone, and
+`lock_seconds` waiting for the controller lock. Each completed discovery pass is journaled as
+`admission-discovered` with the open PRs it listed, its pages, its `seconds`, and the
+`evaluation_seconds` it spent on the urgent evaluations made between pages.
+`admission_evaluations` and `admission_approvals` count completed work. `tauceti-queue reconcile-approvals` wakes this same intake path for diagnosis;
 routine progress does not require that command.
 
 To switch an existing eligibility deployment, back up the database, verify its process supervisor,
