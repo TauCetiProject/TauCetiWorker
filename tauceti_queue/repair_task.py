@@ -1439,6 +1439,20 @@ def artifact_revisions(task: Task) -> list[str]:
     return revisions
 
 
+def toolchain_changed(worktree: Path, base: str, tip: str) -> bool:
+    """Whether the chain from ``base`` to ``tip`` changes ``lean-toolchain``.
+
+    Lake scopes a published cache mapping by the toolchain of the checkout that asks for it
+    (``.../tc/<toolchain>/<revision>.jsonl``), and the chain's checkout pins the new toolchain, so no
+    revision on main can answer, and outputs built by the old toolchain would not be reused anyway.
+    A repair of such a chain (a Lean or Mathlib bump) builds cold instead of being released as
+    ``artifacts_unavailable`` on every claim until the controller escalates it.
+    """
+    if not base or not tip or base == tip:
+        return False
+    return bool(git(worktree, "diff", "--name-only", base, tip, "--", "lean-toolchain", check=False).strip())
+
+
 @contextlib.contextmanager
 def artifact_checkout(worktree: Path, task: Task, start_tip: str):
     """Prepare changed rebase dependencies on the target, then restore the agent's input chain.
@@ -1524,7 +1538,8 @@ def describe_cache_revision(task: Task, artifacts: dict) -> str:
 
 def artifacts_cold(task: Task, artifacts: dict | None) -> bool:
     """Whether the agent builds without warm artifacts: a rebase conflict whose preparation found no
-    cache (a repair without artifacts is released instead, so it never gets this far)."""
+    cache, or a repair of a chain that changes the toolchain (``toolchain_changed``); any other repair
+    without artifacts is released instead, so it never gets this far."""
     if not artifacts:
         return False
     return bool(artifacts.get("cold")) or (task.kind in repair.REBASE_KINDS and not artifacts.get("available", True))
@@ -2393,6 +2408,14 @@ def _run_task(
                     f"task {task.task_id}: warm artifacts from {describe_cache_revision(task, artifacts)}"
                     + (f"; skipped: {skipped}" if skipped else "")
                 )
+            if not artifacts["available"] and (
+                task.kind in repair.REBASE_KINDS
+                # A build-failure repair only: a preparation discovers its failures with the warm build
+                # (a repair works from the task's diagnostics, without the stream), and audit/lint
+                # findings are verified by the worker, which a cold tree cannot do.
+                or (task.kind == "repair" and not known_checks and toolchain_changed(worktree, revisions[0], start_tip))
+            ):
+                artifacts["cold"] = True
             outcome["artifacts"] = {k: v for k, v in artifacts.items() if k != "incremental_build"} | {
                 "incremental_build": {
                     k: v for k, v in (artifacts.get("incremental_build") or {}).items() if "load" not in k
@@ -2404,7 +2427,7 @@ def _run_task(
             if stopping() and not lease.lost.is_set():
                 return cancelled("the worker stopped while the artifacts were prepared")
             if not artifacts["available"]:
-                if task.kind not in repair.REBASE_KINDS:
+                if not artifacts.get("cold"):
                     return release_task(
                         cfg,
                         client,
@@ -2416,11 +2439,11 @@ def _run_task(
                         lease,
                     )
                 # The rebase itself needs no build; its validation build runs cold here or in the
-                # service's CI, so the agent is run rather than the task released.
-                outcome["artifacts"]["cold"] = True
+                # service's CI. A chain that changes `lean-toolchain` can never be warmed from main
+                # (`toolchain_changed`). Either way the agent is run rather than the task released.
                 log(
                     f"task {task.task_id}: no warm artifacts ({artifacts['unavailable_reason']}); "
-                    "running the rebase without them"
+                    f"running the {'rebase' if task.kind in repair.REBASE_KINDS else 'repair'} without them"
                 )
         elif not worktree.is_dir():
             return release_task(
@@ -2556,6 +2579,7 @@ def _run_task(
                 and not continuation
                 and task.kind in ("repair", "prepare")
                 and cfg.parallel_agents > 1
+                and not (outcome.get("artifacts") or {}).get("cold")
             ):
                 # Independent failing groups are repaired by concurrent agents first; what they leave
                 # (nothing, a group that failed, a build that still fails) goes to the usual agent below.
