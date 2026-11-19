@@ -28,7 +28,7 @@ from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import task_progress
+from . import stuck_heads, task_progress
 from .monitoring_protocol import PublicationRejected, PublisherIdentity, ResyncRequired, SnapshotPublisher, encode
 
 SCHEMA = "tauceti.operations.queue/v1"
@@ -37,6 +37,9 @@ REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 MAX_BYTES = 2_000_000
 BUILD_TAIL_BYTES = 64_000
+# The public observation's conditions are bounded (100); stuck heads take at most this many.
+STUCK_LISTED = 30
+MAX_CONDITIONS = 100
 
 
 def iso(value):
@@ -727,9 +730,23 @@ def project(
             else "source_condition"
         )
         if kind != "source_condition" or not any(
-            x in str(alert) for x in ("build stalled", "inference hold", " unclaimed for ")
+            x in str(alert) for x in ("build stalled", "inference hold", " unclaimed for ", stuck_heads.ALERT_TEXT)
         ):
             conditions.append({"kind": kind})
+    # The CI recovery pass's stuck heads: one condition per listed head (since its last push), so the
+    # public observation carries the count and the oldest age without naming private detail.
+    stuck = status.get("stuck_heads") or {}
+    if stuck.get("state") == "fresh" and numeric(stuck.get("observed_at")) is not None:
+        markers = [{"kind": "stuck_heads_observed", "since": iso(stuck["observed_at"])}]
+        if not stuck.get("complete"):
+            markers.append({"kind": "stuck_heads_partial"})
+        # The ingest accepts at most MAX_CONDITIONS: keep the markers and a truncation marker.
+        del conditions[MAX_CONDITIONS - len(markers) - 1 :]
+        room = max(0, min(STUCK_LISTED, MAX_CONDITIONS - len(conditions) - len(markers) - 1))
+        listed = [h for h in (stuck.get("heads") or []) if numeric(h.get("last_push_at")) is not None][:room]
+        conditions += markers + [{"kind": "stuck_head", "since": iso(h["last_push_at"])} for h in listed]
+        if type(stuck.get("count")) is int and stuck["count"] > len(listed):
+            conditions.append({"kind": "stuck_heads_truncated"})
     observation = {
         "schema": SCHEMA,
         "observed_at": iso(captured),

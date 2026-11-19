@@ -66,6 +66,7 @@ for key in ("TAUCETI_RUNTIME_STATUS", "TAUCETI_FLEET_ADMISSION_FILE", "CLAUDE_CO
 from tauceti_queue import chain as chain_tool  # noqa: E402
 from tauceti_queue import diagnostics as queue_diagnostics  # noqa: E402
 from tauceti_queue import (  # noqa: E402
+    diff_guard,
     repair,
     repair_audit,
     repair_context,
@@ -3836,8 +3837,11 @@ class WorkerAsTheQueueApp(Fixture):
         self.addCleanup(environment.stop)
         repair_task.pin_app_credentials()
 
+        # Outside any repository: a CI checkout's own config carries actions/checkout's extraHeader.
         def config(*args):
-            result = subprocess.run(["git", "config", *args], capture_output=True, text=True, check=False)
+            result = subprocess.run(
+                ["git", "config", *args], cwd=self.root, capture_output=True, text=True, check=False
+            )
             return result.stdout.splitlines()
 
         self.assertEqual(config("--get-all", "user.name"), ["Kept"], "the user's own config still applies")
@@ -3847,6 +3851,7 @@ class WorkerAsTheQueueApp(Fixture):
         filled = subprocess.run(
             ["git", "credential", "fill"],
             input="protocol=https\nhost=github.com\n\n",
+            cwd=self.root,
             capture_output=True,
             text=True,
             env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"},
@@ -4960,7 +4965,7 @@ class Records(unittest.TestCase):
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
         chain = repair.read_chain(seed, content.base, content.tip)
-        long_file = "".join(f"theorem t{i} : True := trivial\n" for i in range(1001))
+        long_file = "".join(f"theorem t{i} : True := trivial\n" for i in range(1251))
         for commit_ in chain:
             sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
             if commit_.pr == 2:
@@ -4974,7 +4979,8 @@ class Records(unittest.TestCase):
         [entry] = report["review_size"]
         self.assertEqual(entry["pr"], 2)
         self.assertIn(
-            "TauCeti/Long.lean: new Lean files must be at most 1000 lines (found 1001)", entry["violations"][0]
+            f"TauCeti/Long.lean: new Lean files must be at most {diff_guard.ci_git.NEW_FILE_LINE_CAP} lines (found 1251)",
+            entry["violations"][0],
         )
         self.assertTrue(any(p.startswith("review-size: #2 (commit ") for p in report["problems"]))
 
@@ -5010,7 +5016,7 @@ class Records(unittest.TestCase):
         self.assertIn("(#2): the staging review-size policy measures this commit against its parent", problem)
         second = sh(seed, "rev-list", "--reverse", f"{content.base}..HEAD").split()[1]
         rc, measured = run("--size", second)
-        self.assertEqual((rc, json.loads(measured)["new_files_too_long"]), (1, [["TauCeti/Long.lean", 1001]]))
+        self.assertEqual((rc, json.loads(measured)["new_files_too_long"]), (1, [["TauCeti/Long.lean", 1251]]))
 
         # Splitting the long file inside member 2's own commit satisfies the policy.
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -5018,8 +5024,8 @@ class Records(unittest.TestCase):
             sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
             if commit_.pr == 2:
                 lines = long_file.splitlines(keepends=True)
-                (seed / "TauCeti" / "Long.lean").write_text("".join(lines[:600]))
-                (seed / "TauCeti" / "Long2.lean").write_text("".join(lines[600:]))
+                (seed / "TauCeti" / "Long.lean").write_text("".join(lines[:650]))
+                (seed / "TauCeti" / "Long2.lean").write_text("".join(lines[650:]))
                 sh(seed, "add", "-A")
                 sh(seed, "commit", "--quiet", "--amend", "--no-edit")
         split = sh(seed, "rev-parse", "HEAD")

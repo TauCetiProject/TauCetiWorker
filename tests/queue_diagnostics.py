@@ -142,8 +142,8 @@ class ParseLog(unittest.TestCase):
             "source": {"forge": {"kind": "forgejo", "url": "https://forge.invalid"}, "name": "o/r", "id": 9},
             "source_forge": "forgejo:https://forge.invalid",
             "head": head,
-            "reasons": ["+2400 added lines (cap 2000)"],
-            "additions": 2400,
+            "reasons": ["+3400 added lines (cap 3000)"],
+            "additions": 3400,
             "deletions": 3,
             "files": 12,
         }
@@ -159,9 +159,9 @@ class ParseLog(unittest.TestCase):
         self.assertEqual((finding["kind"], finding["module"]), ("policy", ""))
         self.assertEqual((finding["source_pr"], finding["member_head"]), (812, head))
         self.assertEqual(finding["source"]["forge"]["kind"], "forgejo")
-        self.assertEqual((finding["additions"], finding["files"]), (2400, 12))
+        self.assertEqual((finding["additions"], finding["files"]), (3400, 12))
         self.assertIn("#812", finding["message"])
-        self.assertIn("+2400 added lines", finding["message"])
+        self.assertIn("+3400 added lines", finding["message"])
         # Without the record (older TauCetiTools) nothing is invented.
         self.assertEqual(d.parse_log(lines[-1:]), [])
 

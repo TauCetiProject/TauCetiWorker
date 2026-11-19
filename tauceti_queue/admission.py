@@ -462,6 +462,8 @@ class AdmissionPoller:
             if self.controller.store.get_setting("state:admission_discovery", {}).get("retry_at"):
                 with self._discovery_lock:
                     self._discovery_at = min(self._discovery_at, self.clock())
+        if hasattr(self.adapter, "local_merge_base"):
+            self.adapter.local_merge_base = bool(self.controller.setting("admission_local_merge_base"))
         configure_polling = getattr(self.adapter, "configure_admission_polling", None)
         if configure_polling is not None:
             configure_polling(

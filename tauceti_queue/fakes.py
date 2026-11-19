@@ -383,7 +383,7 @@ class FakeGitHub:
                     post("build", "failure", "infrastructure: runner lost its cache volume", "")
                 elif run.verdict == "scope-fail":
                     # A green build whose merge-policy verdict is red (restricted paths without a current
-                    # admin approval, an oversized diff, a new file over 1000 lines).
+                    # admin approval, an oversized diff, a new file over 1250 lines).
                     run.conclusion = "success"
                     post("build", "success", "Build succeeded")
                     policy["scope"] = ("failure", "restricted paths changed with no valid current bors scope approval")

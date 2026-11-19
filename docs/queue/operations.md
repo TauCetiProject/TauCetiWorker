@@ -155,6 +155,7 @@ its source (`default`, `file`, `env:VARIABLE`, `hostname`) and the problems that
 | `database` | `~/.local/state/tauceti-queue/queue.sqlite3` | the SQLite file |
 | `credentials_dir` | `~/.config/tauceti-queue` | where the three App credential files live |
 | `log_dir` | `~/.local/state/tauceti-queue/logs` | the service's own log files |
+| `ci_recovery_report` | `~/.local/state/tauceti-ci-recovery/stuck-heads.json` | the CI recovery pass's stuck-head report, read for status and its alert ([escalation.md](escalation.md), "Stuck PR heads") |
 | `listen_host`, `listen_port` | `127.0.0.1`, `8780` | the local listen address the tunnel forwards to |
 | `public_url` | `https://queue.taucetiproject.org` | the public base; the webhook address is `<public_url>/webhook/github` |
 | `reconcile_interval_seconds` | `30` | the loop's cadence between event-driven wakeups |
@@ -874,6 +875,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `approval_poll_interval_seconds` | `900` | integer, at least 1 |
 | `github_background_floor` | `1000` | integer, at least 0; queue App requests left at which admission reads wait for the reset |
 | `admission_evidence_mode` | `off` | `off` or `shadow`; see "Admission evidence shadow" below |
+| `admission_local_merge_base` | `false` | true takes a GitHub PR's merge base from the local clone when it is complete and the merge base is unique there, instead of the compare API; `status.admission.merge_base_sources` counts both |
 | `membership_label` | `bors-staging` | text |
 | `repaired_label` | `repaired-in-queue` | text; empty disables |
 | `insertion_probe_budget_seconds` | `20` | integer, at least 0 |

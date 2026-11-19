@@ -33,7 +33,7 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
-from . import admission_planning, attribution, chain, declaration_names, escalation
+from . import admission_planning, attribution, chain, declaration_names, escalation, stuck_heads
 from .eligibility import KEEP as BLOCKING_LABELS
 from .mixed_identity import SourceNumber
 from .ports import (
@@ -127,6 +127,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # deliveries and full reads and compares its verdict with each real evaluation (status
     # `admission.evidence`), never changing a decision.
     "admission_evidence_mode": "off",
+    # Decision 38 step 4, slice 2: take a GitHub PR's merge base from the local clone, when the
+    # clone is complete and the merge base is unique there, instead of the compare API (one REST
+    # call per evaluation). Otherwise, and while false, compare answers as before.
+    "admission_local_merge_base": False,
     "membership_label": "bors-staging",
     # Added to a landed member whose commit the queue modified (one with an edit summary in its landing
     # comment); created in the repository on first use. Empty disables it.
@@ -693,6 +697,9 @@ class Controller:
         self.notifier = notifier
         # The service's public URL (configuration `public_url`), linked from notifications when set.
         self.public_url = ""
+        # The CI recovery pass's stuck-head report (configuration `ci_recovery_report`), read for the
+        # status and its one direct message per stuck period (`stuck_heads`). None: not reported.
+        self.stuck_heads_report: str | None = None
         # Reads a Lake revision-map URL for the published-base requirement (`_base_cache_ready`). None
         # (the fixtures, native sources) leaves the requirement off; the service passes
         # `revision_map_published`. Per base: (covering revision or None, checked at, detail).
@@ -3570,6 +3577,8 @@ class Controller:
         now = self.clock()
         self._supersede_stale_source_tasks(now)
         self._expire_claims(now)
+        # Before anything that can end the pass early: the message depends only on the report.
+        self._notify_stuck_heads(now)
         if self.mixed is not None and self.mixed.mode == "admit" and self.setting("publication_enabled"):
             sync_key = f"mixed-sync:startup:{self.mixed.generation}:{self.revision}"
             self._enqueue("mixed-sync", sync_key, {})
@@ -9116,6 +9125,29 @@ class Controller:
             )
             self._notify(key or f"escalation:{head['id']}:{head['version']}:{action}:{fingerprint}", record)
 
+    def _notify_stuck_heads(self, now: float) -> None:
+        """Queue the one direct message of the current stuck period of the CI recovery report, once due."""
+        if not self.stuck_heads_report:
+            return
+        section = stuck_heads.read(self.stuck_heads_report, now, self.repository)
+        found = stuck_heads.notice(section, now, self.public_url)
+        if found is None:
+            return
+        key, content = found
+        marker = "tauceti-queue-" + hashlib.sha256(key.encode()).hexdigest()[:24]
+        with self.store.transaction():
+            if self.store.row("outbox", {"key": f"notify:{key}"}) is not None:
+                return
+            self.store.journal(
+                now,
+                "stuck-heads-notified",
+                None,
+                count=section["count"],
+                since=section["stuck_since"],
+                prs=[head["pr"] for head in section["heads"]],
+            )
+            self._enqueue("notify", f"notify:{key}", {"marker": marker, "content": f"{content}\n\nAlert ID: {marker}"})
+
     def _notify(self, key: str, record: dict[str, Any]) -> None:
         """Queue a direct message to the operator about `record` (outbox kind `notify`, sent once)."""
         marker = "tauceti-queue-" + hashlib.sha256(key.encode()).hexdigest()[:24]
@@ -10499,6 +10531,9 @@ class Controller:
                 alerts.append(f"escalation notifier unavailable: {self.notifier_error}")
             if any(e["attempts"] and e["kind"] == "notify" for e in pending):
                 alerts.append("escalation notification delivery is failing; see outbox history")
+            stuck = stuck_heads.read(self.stuck_heads_report, now, self.repository)
+            if (stuck_alert := stuck_heads.alert(stuck, now)) is not None:
+                alerts.append(stuck_alert)
             tasks = self.store.rows("tasks", {"state": TASK_OPEN}, order="id")
             return {
                 "schema": STATUS_SCHEMA,
@@ -10565,6 +10600,9 @@ class Controller:
                         if callable(getattr(self.admission, "evidence_status", None))
                         else {}
                     ),
+                    "merge_base_sources": dict(
+                        getattr(getattr(self.admission, "adapter", None), "merge_base_sources", None) or {}
+                    ),
                 },
                 "anticipated": [
                     {
@@ -10580,6 +10618,7 @@ class Controller:
                 "outbox": {"pending": len(pending), "entries": [self._outbox_status(e) for e in pending]},
                 "reasons": list(self._reasons),
                 "alerts": alerts,
+                "stuck_heads": stuck,
                 "escalations": escalations[-10:],
                 "loop_termination": loop_termination,
                 "counters": counters,
