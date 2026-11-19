@@ -127,6 +127,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # deliveries and full reads and compares its verdict with each real evaluation (status
     # `admission.evidence`), never changing a decision.
     "admission_evidence_mode": "off",
+    # Decision 38 step 4, slice 2: take a GitHub PR's merge base from the local clone, when the
+    # clone is complete and the merge base is unique there, instead of the compare API (one REST
+    # call per evaluation). Otherwise, and while false, compare answers as before.
+    "admission_local_merge_base": False,
     "membership_label": "bors-staging",
     # Added to a landed member whose commit the queue modified (one with an edit summary in its landing
     # comment); created in the repository on first use. Empty disables it.
@@ -10564,6 +10568,9 @@ class Controller:
                         {"evidence": self.admission.evidence_status()}
                         if callable(getattr(self.admission, "evidence_status", None))
                         else {}
+                    ),
+                    "merge_base_sources": dict(
+                        getattr(getattr(self.admission, "adapter", None), "merge_base_sources", None) or {}
                     ),
                 },
                 "anticipated": [

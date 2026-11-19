@@ -705,5 +705,77 @@ class BumpGuardFloorTests(unittest.TestCase):
         self.assertEqual(clock.slept, [])
 
 
+class LocalMergeBaseTests(unittest.TestCase):
+    """`admission_local_merge_base`: the clone answers when it can vouch for the answer."""
+
+    def snapshot(self, *, local, shallow=False):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- source\n"}, "head", push_to="refs/pull/42/head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            if shallow:
+                (Path(repo.clone) / ".git" / "shallow").write_text(base + "\n")
+            transport = FakeTransport()
+            raw = pr_json(head={"sha": head}, base={"ref": "main", "sha": base})
+            url = f"https://api.github.com/repos/{TAUCETI}"
+            transport.add("GET", url + "/pulls/42", 200, raw)
+            transport.add(
+                "GET", url + f"/compare/{base}...{head}?per_page=1", 200, {"merge_base_commit": {"sha": base}}
+            )
+            transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, [])
+            transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw))
+            c, _clock = client(transport)
+            c.background_floor = 0
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)
+            adapter.local_merge_base = local
+            with c.deferred_requests():
+                snapshot = adapter.admission_snapshot(TAUCETI, 42, generation=1)
+            compared = [call for call in transport.calls if "/compare/" in str(call)]
+            return snapshot, base, compared, adapter.merge_base_sources
+
+    def test_off_asks_compare(self):
+        snapshot, base, compared, sources = self.snapshot(local=False)
+        self.assertEqual(snapshot.merge_base_sha, base)
+        self.assertEqual(len(compared), 1)
+        self.assertEqual(sources, {"local": 0, "compare": 1})
+
+    def test_on_answers_from_the_clone_without_compare(self):
+        snapshot, base, compared, sources = self.snapshot(local=True)
+        self.assertEqual(snapshot.merge_base_sha, base)
+        self.assertEqual(snapshot.paths, ("TauCeti/A.lean",))
+        self.assertEqual(compared, [])
+        self.assertEqual(sources, {"local": 1, "compare": 0})
+
+    def test_a_shallow_clone_falls_back_to_compare(self):
+        snapshot, base, compared, sources = self.snapshot(local=True, shallow=True)
+        self.assertEqual(snapshot.merge_base_sha, base)
+        self.assertEqual(len(compared), 1)
+        self.assertEqual(sources, {"local": 0, "compare": 1})
+
+    def test_ambiguous_or_missing_merge_base_is_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_git(directory, "init", "-q")
+            run_git(directory, "config", "user.name", "t")
+            run_git(directory, "config", "user.email", "t@example.invalid")
+
+            def commit(message, *parents):
+                tree = run_git(directory, "write-tree")
+                args = [arg for parent in parents for arg in ("-p", parent)]
+                return run_git(directory, "commit-tree", tree, *args, "-m", message)
+
+            root = commit("root")
+            a, b = commit("a", root), commit("b", root)
+            # A criss-cross: two merges of a and b, so the merge base is not unique.
+            left, right = commit("left", a, b), commit("right", b, a)
+            transport = FakeTransport()
+            c, _clock = client(transport)
+            adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=directory)
+            self.assertEqual(adapter._local_merge_base(a, b), root)
+            self.assertIsNone(adapter._local_merge_base(left, right))
+            self.assertIsNone(adapter._local_merge_base(a, "f" * 40))
+            self.assertEqual(transport.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
