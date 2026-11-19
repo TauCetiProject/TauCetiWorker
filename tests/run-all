@@ -110,6 +110,7 @@ RUN_STDLIB=(
   fleet_capacity.py
   forge_inventory.py
   forgejo_mirror.py
+  forgejo_restore.py
   forge_contracts.py
   forgejo_reads.py
   github_accounts.py
