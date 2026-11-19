@@ -30,6 +30,7 @@ import secrets
 import subprocess
 import threading
 import time
+import types
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
@@ -241,6 +242,9 @@ MISSING_SOURCE_WATCH = "missing_source_watch"
 # The cancellation reason of a `missing-source` refusal whose dependencies changed: admission reads
 # the PR again and, if it would still admit the head, restores the input (`restore_missing_source`).
 MISSING_SOURCE_RECHECK = "missing-source-recheck"
+# The cancellation reason of a waiting input whose PR gained a blocking label (`BLOCKING_LABELS`) after
+# approval: it stays out of batches, and returns to waiting at its original age once the labels go.
+BLOCKED_LABEL = "blocked-label"
 # The cancellation reason of a `no_repair` member the agent emptied: withdrawn until the PR it
 # interacts with lands on `main` (then `needs-rebase`) or leaves the queue (then re-admitted).
 PROBLEM_ANTICIPATED = "problem-anticipated"
@@ -1354,15 +1358,16 @@ class Controller:
             return {"withdrawn": True, "reason": reason}
 
     def _drop_missing_source(self, current: dict[str, Any] | None, reason: str, now: float) -> None:
-        """A withdrawal of a PR its `missing-source` refusal left cancelled: the refusal is no longer the
-        last word, so `_recheck_missing_sources` must not re-admit it."""
+        """A withdrawal of a PR its `missing-source` refusal or a blocking label left cancelled: that is
+        no longer the last word, so neither `_recheck_missing_sources` nor a label removal re-admits it."""
         if (
             current is not None
             and current["state"] == INPUT_CANCELLED
-            and current["reason"] in ("missing-source", MISSING_SOURCE_RECHECK)
+            and current["reason"] in ("missing-source", MISSING_SOURCE_RECHECK, BLOCKED_LABEL)
         ):
+            kind = "blocked-label-dropped" if current["reason"] == BLOCKED_LABEL else "missing-source-dropped"
             self.store.update("inputs", {"id": current["id"]}, reason=reason)
-            self.store.journal(now, "missing-source-dropped", number=current["number"], reason=reason)
+            self.store.journal(now, kind, number=current["number"], reason=reason)
 
     def set_priority(self, repo: str, pr: int, priority: int) -> dict[str, Any]:
         with self._lock:
@@ -1596,15 +1601,28 @@ class Controller:
             # Scenario 21: closing, relabelling, re-reviewing a member changes nothing; the content lands.
             self.store.journal(now, "member-event-ignored", number=number, action=action, batch_id=current["batch_id"])
             return
-        if current["state"] == INPUT_CANCELLED and current["reason"] in ("missing-source", MISSING_SOURCE_RECHECK):
-            # A refusal `_recheck_missing_sources` would re-admit no longer stands for the PR as it is.
+        if current["state"] == INPUT_CANCELLED and current["reason"] in (
+            "missing-source",
+            MISSING_SOURCE_RECHECK,
+            BLOCKED_LABEL,
+        ):
+            # A refusal `_recheck_missing_sources` would re-admit, or a blocking-label hold, no longer
+            # stands for the PR as it is.
             moved = action == "synchronize" and (pull.get("head") or {}).get("sha") not in (None, current["head_sha"])
             reason = {"closed": "closed", "converted_to_draft": "draft"}.get(action, "head-changed" if moved else "")
             if reason:
                 self.store.update("inputs", {"id": current["id"]}, reason=reason)
-                self.store.journal(now, "missing-source-dropped", number=number, reason=reason)
+                kind = "blocked-label-dropped" if current["reason"] == BLOCKED_LABEL else "missing-source-dropped"
+                self.store.journal(now, kind, number=number, reason=reason)
+            elif action == "unlabeled" and current["reason"] == BLOCKED_LABEL:
+                self._unblock_from_event(current, pull, now)
             return
         if current["state"] not in (INPUT_WAITING, INPUT_RESERVED):
+            return
+        if action == "labeled":
+            name = str((payload.get("label") or {}).get("name") or "").lower()
+            if name in BLOCKING_LABELS:
+                self.block_for_labels(current, [name], now)
             return
         if action == "closed":
             reason = "merged-externally" if pull.get("merged") else "closed"
@@ -1618,6 +1636,29 @@ class Controller:
         elif action == "converted_to_draft":
             self.store.update("inputs", {"id": current["id"]}, state=INPUT_CANCELLED, reason="draft")
             self.store.journal(now, "withdrawn", number=number, reason="draft")
+
+    def block_for_labels(self, current: dict[str, Any], labels: list[str], now: float) -> None:
+        """Take a waiting or reserved input out of placement while its PR carries a blocking label:
+        `approve` refuses these labels, and one added after approval keeps the head out of batches too.
+        A reserved input's running probe sees the change and inserts nothing. An inserted member is
+        not touched (membership is fixed). The input returns at its original age once the labels go
+        (`_unblock_from_event`, or admission's `restore_missing_source`)."""
+        with self.store.transaction():
+            self.store.update("inputs", {"id": current["id"]}, state=INPUT_CANCELLED, reason=BLOCKED_LABEL)
+            self.store.journal(now, "withdrawn", number=current["number"], reason=BLOCKED_LABEL, labels=sorted(labels))
+        self._refresh_snapshot()
+
+    def _unblock_from_event(self, current: dict[str, Any], pull: dict[str, Any], now: float) -> None:
+        """An `unlabeled` delivery for a PR held by `block_for_labels`: once the delivery's own label list
+        shows no blocking label, the PR open and not a draft at the accepted head, the input waits again.
+        Without a label list nothing changes; admission's next read restores it."""
+        if not isinstance(pull.get("labels"), list):
+            return
+        head = (pull.get("head") or {}).get("sha")
+        if (head is not None and head != current["head_sha"]) or pull.get("draft") or pull.get("state") == "closed":
+            return
+        labels = [label.get("name") if isinstance(label, dict) else label for label in pull["labels"]]
+        self._restore_missing_source(current["number"], current["head_sha"], types.SimpleNamespace(labels=labels), now)
 
     def _no_repair_event(self, current: dict[str, Any], payload: dict[str, Any], now: float) -> bool:
         """A `labeled`/`unlabeled` event that changes the PR's `no_repair` opt-out, applied to a waiting
@@ -4695,8 +4736,9 @@ class Controller:
 
     def restore_missing_source(self, number: Any, head: str, pull: Any) -> str | None:
         """Called by admission, under the controller lock, when its fresh read of `pull` would admit
-        `head`: a refusal `_recheck_missing_sources` handed back waits again at its original age.
-        Returns the disposition, or None when the PR has no such refusal at `head`."""
+        `head`: a refusal `_recheck_missing_sources` handed back, or an input a blocking label held
+        (`block_for_labels`), waits again at its original age. Returns the disposition, or None when
+        the PR has no such refusal at `head`."""
         return self._restore_missing_source(number, head, pull, self.clock())
 
     def _restore_missing_source(self, number: Any, head: str, pull: Any, now: float) -> str | None:
@@ -4704,7 +4746,7 @@ class Controller:
         if (
             current is None
             or current["state"] != INPUT_CANCELLED
-            or current["reason"] != MISSING_SOURCE_RECHECK
+            or current["reason"] not in (MISSING_SOURCE_RECHECK, BLOCKED_LABEL)
             or current["head_sha"] != head
         ):
             return None
@@ -4713,6 +4755,14 @@ class Controller:
             # The refusal stays pending: admission restores it once the labels go.
             self.store.journal(now, "approval-refused", number=number, head=head, labels=blocked)
             return f"blocked-label: {', '.join(blocked)}"
+        if current["reason"] == BLOCKED_LABEL:
+            # Only the label held it: its probe records still describe the same head.
+            with self.store.transaction():
+                self.store.update("inputs", {"id": current["id"]}, state=INPUT_WAITING, reason="", batch_id=None)
+                self.store.journal(now, "blocked-label-cleared", number=number, head=head)
+            self._wake.set()
+            self._refresh_snapshot()
+            return "readmitted"
         with self.store.transaction():
             self.store.update(
                 "inputs",

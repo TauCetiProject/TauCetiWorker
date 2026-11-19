@@ -2735,6 +2735,63 @@ class NoRepair(ControllerCase):
         self.assertEqual(self.controller.status()["anticipated"], [], "nothing to follow")
 
 
+class BlockingLabelAfterApproval(ControllerCase):
+    """A blocking label (`hold`, `wip`, ...) added to an approved PR keeps it out of batches until it goes."""
+
+    def label_event(self, number, action, name, labels, **pull):
+        self.github.labels[number] = set(labels)
+        self.controller.handle_event(
+            "pull_request",
+            {
+                "action": action,
+                "number": number,
+                "label": {"name": name},
+                "pull_request": {"number": number, "labels": [{"name": label} for label in labels], **pull},
+            },
+        )
+
+    def test_a_waiting_input_is_held_while_labelled_and_returns_at_its_age(self):
+        head, result = self.approve(101, {"A.lean": "a\n"})
+        approved_at = result["input"]["approved_at"]
+        self.label_event(101, "labeled", "Hold", ["Hold"])
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "blocked-label"))
+        self.controller.tick()
+        self.assertEqual(self.controller.store.count("members"), 0, "a held input joins no batch")
+        self.assertEqual(self.controller.approve(PROJECT, 101, head, "r")["reason"], "blocked-label: hold")
+        self.label_event(101, "labeled", "wip", ["Hold", "wip"])
+        self.label_event(101, "unlabeled", "Hold", ["wip"])
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "cancelled", "wip still blocks")
+        self.label_event(101, "unlabeled", "wip", [], head={"sha": head})
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual((row["id"], row["state"], row["approved_at"]), (result["input"]["id"], "waiting", approved_at))
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+
+    def test_a_withdrawal_or_new_head_while_held_needs_a_new_approval(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        for number in (101, 102):
+            self.label_event(number, "labeled", "hold", ["hold"])
+        self.controller.unapprove(PROJECT, 101, "kim")
+        self.controller.handle_event(
+            "pull_request", {"action": "synchronize", "number": 102, "pull_request": {"head": {"sha": "f" * 40}}}
+        )
+        self.assertEqual(
+            [self.controller.input_for(PROJECT, n)["reason"] for n in (101, 102)], ["unapproved", "head-changed"]
+        )
+        for number in (101, 102):
+            self.label_event(number, "unlabeled", "hold", [])
+        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["cancelled"] * 2)
+
+    def test_a_member_is_not_withdrawn_by_a_blocking_label(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+        self.label_event(101, "labeled", "hold", ["hold"])
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+
+
 class EditSummary(ControllerCase):
     def test_a_long_diff_is_capped_with_a_note_and_the_commit_link(self):
         self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "Long.lean", "message": "boom"}])

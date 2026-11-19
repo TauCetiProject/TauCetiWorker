@@ -591,6 +591,50 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.controller.input_for(REPO, 1)["state"], "inserted")
         self.assertEqual(self.controller.status()["counters"].get("missing_source_rechecks"), 1)
 
+    def test_a_blocking_label_whose_webhook_was_missed_holds_until_it_goes(self):
+        self.ready()
+        self.intake.run_once()
+        approved = self.controller.input_for(REPO, 1)
+        self.assertEqual(approved["state"], "waiting")
+        self.github.labels[1] = {"wip"}  # no delivery: only admission's next read sees it
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.get(1)["disposition"], "blocked-label: wip")
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual((row["state"], row["reason"]), ("cancelled", "blocked-label"))
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+        self.github.labels[1] = set()
+        self.intake.invalidate(1)
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.get(1)["disposition"], "readmitted")
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual(
+            (row["id"], row["state"], row["approved_at"]), (approved["id"], "waiting", approved["approved_at"])
+        )
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "inserted")
+
+    def test_a_blocking_label_delivery_holds_a_waiting_input(self):
+        head = self.ready()
+        self.intake.run_once()
+        self.github.labels[1] = {"hold"}
+        labels = [{"name": "hold"}]
+        pull = {"number": 1, "labels": labels, "head": {"sha": head}}
+        self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "hold"}, "pull_request": pull})
+        self.assertEqual(self.controller.input_for(REPO, 1)["reason"], "blocked-label")
+        self.intake.run_once()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+        self.github.labels[1] = set()
+        pull = {**pull, "labels": []}
+        self.event(
+            "pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "hold"}, "pull_request": pull}
+        )
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.intake.run_once()
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "inserted")
+
     def test_manual_reapproval_clears_withdrawal_intent(self):
         head = self.ready()
         self.intake.run_once()

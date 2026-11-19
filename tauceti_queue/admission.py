@@ -806,6 +806,11 @@ class AdmissionPoller:
                     disposition = (
                         "already-approved" if current["state"] in ("waiting", "reserved") else current["state"]
                     )
+                    blocked = self.controller._blocking_labels(pull)
+                    if blocked and current["state"] in ("waiting", "reserved"):
+                        # A blocking label added after approval, its webhook missed: held until it goes.
+                        self.controller.block_for_labels(current, blocked, self.clock())
+                        disposition = f"blocked-label: {', '.join(blocked)}"
                 elif (restored := self.controller.restore_missing_source(pull.number, pull.head_sha, pull)) is not None:
                     disposition = restored
                 elif self._cancelled(current_work, snapshot, authorization, comment, meta):
