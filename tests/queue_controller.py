@@ -1412,6 +1412,82 @@ class PreRebase(ControllerCase):
         self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "held"})
         self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
 
+    def batch_conflicting_in_the_middle(self):
+        """A head waiting on CI and an open batch [103, 102, 104] whose member 102 conflicts with it."""
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        for number, files in (
+            (103, {"B.lean": "b\n"}),
+            (102, {"Shared.lean": "line one\nline two by 102\nline three\n"}),
+            (104, {"C.lean": "c\n"}),
+        ):
+            self.approve(number, files)
+            self.controller.tick()
+        batch = self.open_batch()
+        self.assertEqual([m["number"] for m in self.controller.members(batch["id"])], [103, 102, 104])
+        self.assertEqual(batch["pre_rebase_state"], "conflict")
+        return batch
+
+    def land_head(self):
+        self.github.complete_runs()
+        for context in VERDICT_CONTEXTS:
+            self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+        self.controller.tick()  # promotes the head
+        self.controller.tick()  # observes the landing and seals
+
+    def assert_clean_prefix_sealed(self, batch):
+        head = self.controller._head()
+        self.assertGreater(head["id"], batch["id"])
+        self.assertEqual([m["number"] for m in self.controller.members(head["id"])], [103])
+        self.assertEqual(head["base"], self.repo.main_sha())
+        self.assertEqual(self.repo.file_at(head["tip"], "B.lean"), "b\n")
+        self.assertEqual(len(self.github.runs), 2, "the clean prefix is dispatched in the same pass")
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["batch_id"], head["id"])
+        # The rest stays in the batch, still first in line, on the moved member's own commit.
+        left = self.controller._open_batch()
+        self.assertEqual(left["id"], batch["id"])
+        self.assertEqual((left["tip"], left["version"]), (batch["tip"], batch["version"] + 1))
+        self.assertEqual(
+            [(m["number"], m["position"]) for m in self.controller.members(left["id"])], [(102, 0), (104, 1)]
+        )
+        self.assertEqual(len(chain.chain_commits(self.repo.clone, left["base"], left["tip"])), 2)
+        for number in (102, 104):
+            row = self.controller.input_for(PROJECT, number)
+            self.assertEqual((row["state"], row["batch_id"]), ("inserted", batch["id"]))
+            self.assertEqual(self.github.comments_for(number), [])
+        [entry] = self.controller.store.journal_entries("clean-prefix-sealed")
+        self.assertEqual(
+            (entry["detail"]["kept"], entry["detail"]["left"], entry["detail"]["conflict"]),
+            ([103], [102, 104], f"{PROJECT}#102"),
+        )
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        # Once the new head is dispatched the batch is replayed onto it and conflicts again.
+        self.controller.tick()
+        task = self.controller.store.row("tasks", {"batch_id": batch["id"], "state": "open", "kind": "pre_rebase"})
+        self.assertEqual((task["onto"], task["base"]), (head["tip"], left["base"]))
+        return head
+
+    def test_a_claimed_pre_rebase_conflict_seals_the_clean_prefix_when_the_head_lands(self):
+        batch = self.batch_conflicting_in_the_middle()
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual(task.kind, "pre_rebase")
+        self.land_head()
+        self.assert_clean_prefix_sealed(batch)
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        self.assertEqual((row["state"], row["resolution"]), ("superseded", "clean-prefix"))
+        self.assertFalse(self.controller.submit_task(task.task_id, task.claim_token, task.tip).accepted)
+
+    def test_an_unclaimed_pre_rebase_conflict_seals_the_clean_prefix_too(self):
+        batch = self.batch_conflicting_in_the_middle()
+        self.land_head()
+        head = self.assert_clean_prefix_sealed(batch)
+        # The prefix lands; the batch then seals and its conflict is a `rebase_conflict` task.
+        self.land_head()
+        self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertEqual(self.controller._head()["id"], batch["id"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 1)
+
     def test_verified_pre_rebase_needs_no_second_preparation(self):
         ref = "a" * 40
         pin = f'[tools.tools]\nrepo = "org/Tools"\nref = "{ref}"\n'

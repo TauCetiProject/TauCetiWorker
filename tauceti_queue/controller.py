@@ -5452,6 +5452,9 @@ class Controller:
         if batch is None or not self._members(batch["id"]):
             return
         blocked = self._seal_blocked(batch)
+        if (blocked is None or blocked[1]) and self._seal_clean_prefix(batch, now):
+            self._seal_successor(now)
+            return
         if blocked is not None:
             reason, claimed = blocked
             if claimed:
@@ -5473,6 +5476,95 @@ class Controller:
             # ordinary open-batch validation, and the next head keeps the completed work.
             return f"open batch {batch['id']} is claimed; sealing waits for the release", True
         return None
+
+    def _seal_clean_prefix(self, batch: dict[str, Any], now: float) -> bool:
+        """Seal the members of `batch` that replay cleanly onto `main`, when its pre-rebase is a conflict.
+
+        The slot is free, but resolving the conflict (a `pre_rebase` task, claimed or not) takes hours:
+        rather than wait for it, or seal everything and hand the head a `rebase_conflict` task, the
+        members before the conflict move to a new batch that becomes the head. The conflicting member
+        and those after it stay in `batch`, now based on the last moved member's commit, so it keeps its
+        place as the next batch and its members their approvals and age; a return to waiting would
+        instead cancel a member that conflicts with `main`. The batch's `pre_rebase` tasks are
+        superseded (resolution `clean-prefix`) and their claims released; the next pre-rebase onto the
+        new head creates a fresh task. False (nothing changed) for the emergency or control-file lane
+        batch, a claim that is not a `pre_rebase` task's, a conflict at the first member, or a replay error.
+        """
+        if (
+            batch["pre_rebase_state"] != PRE_REBASE_CONFLICT
+            or batch["urgent"] == URGENT_EMERGENCY
+            or batch["lane"] == LANE_CONTROL
+            or self._canonical is None
+        ):
+            return False
+        for claim in self._active_claims(batch["id"]):
+            task = self.store.row("tasks", {"id": claim["task_id"]}) if claim["task_id"] is not None else None
+            if task is None or task["kind"] != TASK_PRE_REBASE:
+                return False
+        chain_id = f"clean-prefix-{batch['id']}-{secrets.token_hex(4)}"
+        try:
+            result = chain.replay(self.clone, batch["base"], batch["tip"], self._canonical, chain_id=chain_id)
+        except chain.ChainError as error:
+            self.store.journal(now, "pre-rebase-error", batch["id"], onto=self._canonical, error=str(error))
+            return False
+        finally:
+            chain.delete_chain_ref(self.clone, chain_id)
+        # The chain's own order decides the prefix (an adopted preparation may reorder commits).
+        commits = chain.chain_commits(self.clone, batch["base"], batch["tip"])
+        by_pr = {member["source_pr"]: member for member in self._members(batch["id"])}
+        order = [commit.source_pr or commit.sha for commit in commits]
+        if sorted(order) != sorted(by_pr) or [record.source_pr for record in result.commits] != order:
+            return False
+        cut = next((i for i, record in enumerate(result.commits) if record.sha is None), len(order))
+        kept, left = [by_pr[pr] for pr in order[:cut]], [by_pr[pr] for pr in order[cut:]]
+        if not kept:
+            return False
+        tip = commits[cut - 1].sha
+        conflict = result.conflict
+        with self.store.transaction():
+            superseded = self._supersede_pre_rebase_tasks(batch["id"], "clean-prefix", now)
+            self._set_pre_rebase(batch, "", now)
+            if not left:
+                head = batch  # the conflict is gone: the whole batch seals
+            else:
+                head_id = self.store.insert(
+                    "batches",
+                    repository=batch["repository"],
+                    version=0,
+                    base=batch["base"],
+                    tip=tip,
+                    sealed=0,
+                    state=BATCH_OPEN,
+                    created_at=now,
+                    sealed_at=batch["sealed_at"],
+                )
+                self._record_tip(head_id, 0, tip, now)
+                self._retain(self.batch_ref(head_id, 0), tip)
+                for position, member in enumerate(kept):
+                    self.store.update("members", {"id": member["id"]}, batch_id=head_id, position=position)
+                    self.store.update("inputs", {"id": member["input_id"], "batch_id": batch["id"]}, batch_id=head_id)
+                for position, member in enumerate(left):
+                    # Insertion appends at `len(members)`: keep the positions dense, in chain order.
+                    self.store.update("members", {"id": member["id"]}, position=position)
+                version = batch["version"] + 1
+                self.store.update("batches", {"id": batch["id"]}, version=version, base=tip, expected_parent=None)
+                self._record_tip(batch["id"], version, batch["tip"], now)
+                self._retain(self.batch_ref(batch["id"], version), batch["tip"])
+                head = self.store.row("batches", {"id": head_id}) or {}
+            self._count("clean_prefix_seals")
+            self.store.journal(
+                now,
+                "clean-prefix-sealed",
+                batch["id"],
+                head_id=head["id"],
+                onto=self._canonical,
+                kept=[m["number"] for m in kept],
+                left=[m["number"] for m in left],
+                conflict=conflict.source_pr if conflict else None,
+                tasks_superseded=superseded,
+            )
+            self._make_head(head, now)
+        return True
 
     def _make_head(self, batch: dict[str, Any], now: float) -> None:
         """Seal `batch` as the head, which `_seal_blocked` allowed."""
