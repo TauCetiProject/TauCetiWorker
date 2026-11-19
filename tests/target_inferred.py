@@ -393,6 +393,24 @@ class AuthoringRound(Tmp):
         self.assertEqual((listed.find("tail-sigma").status, listed.find("borel").status), ("open", "done"))
         self.assertIn("by zero-one round", self.path.read_text())
 
+    def test_a_report_the_busy_lock_turned_away_is_applied_by_a_later_round(self):
+        import fcntl
+
+        lock = os.open(self.path.with_name(".targets.md.lock"), os.O_RDWR | os.O_CREAT)
+        self.addCleanup(os.close, lock)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.write = "tail-sigma\n"
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS_INFER": "1"}), patch.object(reconcile, "REOPEN_WAIT", 0):
+            self.author()
+            self.assertEqual(t.parse_targets(self.path.read_text()).find("tail-sigma").status, "done")
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            self.write = None
+            self.author()
+        text = self.path.read_text()
+        self.assertEqual(t.parse_targets(text).find("tail-sigma").status, "open")
+        self.assertIn("by zero-one round", text)
+        self.assertFalse((self.w.cfg.state / "target-report-pending.json").exists())
+
     def test_off_the_round_is_not_told_and_nothing_is_reopened(self):
         self.write = None
         prompt = self.author()

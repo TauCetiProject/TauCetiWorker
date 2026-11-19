@@ -959,12 +959,13 @@ def reported(file: Path, allowed: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(slug for slug in slugs if slug in allowed))
 
 
-def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str) -> int:
+def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str) -> int | None:
     """Open again each of `slugs` that is in `seen` and is still ticked by inference on exactly the
     evidence `seen` gives for it (what the reporting round was shown), dropping its `inferred:`
     clause and recording that evidence and `by` in a `reopened:` clause, so the same evidence does
     not tick it again. Waits up to REOPEN_WAIT seconds for the list's lock and does not move the
-    look gap. Returns how many items were opened."""
+    look gap. Returns how many items were opened, or None when the list could not be locked, read
+    or written, so that the report can be tried again (`keep_pending`)."""
     listed = roadmap_targets()
     slugs = [slug for slug in dict.fromkeys(slugs) if slug in seen]
     if listed is None or not slugs:
@@ -975,7 +976,7 @@ def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str) -> in
         fd = _open_lock(_lock_path(path))
     except OSError as error:
         log(f"reconcile: the lock of {path.name} cannot be opened ({error.strerror}); nothing reopened")
-        return 0
+        return None
     try:
         deadline = time.time() + REOPEN_WAIT
         while True:
@@ -984,15 +985,15 @@ def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str) -> in
                 break
             except OSError:
                 if time.time() > deadline:
-                    log(f"reconcile: {path.name} stayed locked; {', '.join(slugs)} not reopened")
-                    return 0
+                    log(f"reconcile: {path.name} stayed locked; {', '.join(slugs)} not reopened yet")
+                    return None
                 time.sleep(2)
         try:
             text = path.read_text()
             targets = _parsed(path, text)
         except (OSError, UnicodeDecodeError, Die) as error:
-            log(f"reconcile: {path.name} cannot be read ({one_line(str(error))}); nothing reopened")
-            return 0
+            log(f"reconcile: {path.name} cannot be read ({one_line(str(error))}); nothing reopened yet")
+            return None
         changes = []
         for slug in slugs:
             item = targets.find(slug)
@@ -1003,13 +1004,54 @@ def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str) -> in
             clause = f"reopened: {_evidence(tick[0])} by {by}"
             changes.append(Change(item, "open", f"reopened by {by}", ("inferred",), (clause,)))
         notes = [f"`{change.item.slug}`: {change.note}" for change in changes]
-        if not changes or publish(path, text, apply(text, changes), notes) is None:
+        if not changes:
             return 0
+        if publish(path, text, apply(text, changes), notes) is None:
+            return None
         for note in notes:
             log(f"reconcile: {note}")
         return len(changes)
     finally:
         os.close(fd)
+
+
+def keep_pending(file: Path, slugs: list[str], seen: dict[str, frozenset[str]], by: str) -> None:
+    """Record a report `reopen` could not apply, for `retry_pending`."""
+    try:
+        rows = json.loads(file.read_text())
+    except (OSError, ValueError):
+        rows = []
+    rows = rows if isinstance(rows, list) else []
+    rows.append({"slugs": slugs, "seen": {slug: sorted(found) for slug, found in seen.items()}, "by": by})
+    with contextlib.suppress(OSError):
+        file.parent.mkdir(parents=True, exist_ok=True)
+        _replace_json(file, rows)
+
+
+def retry_pending(file: Path) -> None:
+    """Apply again each report `keep_pending` recorded, keeping those that still cannot be."""
+    try:
+        rows = json.loads(file.read_text())
+    except (OSError, ValueError):
+        return
+    left = []
+    for row in rows if isinstance(rows, list) else ():
+        if not isinstance(row, dict) or not isinstance(row.get("seen"), dict):
+            continue
+        seen = {slug: frozenset(found) for slug, found in row["seen"].items() if isinstance(found, list)}
+        if reopen([s for s in row.get("slugs") or () if isinstance(s, str)], seen, str(row.get("by") or "")) is None:
+            left.append(row)
+    with contextlib.suppress(OSError):
+        if left:
+            _replace_json(file, left)
+        else:
+            file.unlink(missing_ok=True)
+
+
+def _replace_json(file: Path, value) -> None:
+    temporary = file.with_name(f".{file.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, indent=1, sort_keys=True))
+    os.replace(temporary, file)
 
 
 def run(w, c, profile=None) -> int | None:

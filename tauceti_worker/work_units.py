@@ -3283,6 +3283,10 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     report = None
     targets_path = roadmap_targets()
     if targets_path is not None:
+        if inference_enabled():
+            from .reconcile import retry_pending
+
+            retry_pending(w.cfg.state / "target-report-pending.json")
         live, item = assign_target(w, targets_path, only, skip)
         only = item.area
         assignment = render_assignment(live, item)
@@ -3459,7 +3463,7 @@ def _reopen_reported(report) -> None:
     if report is None:
         return
     from .activity import current_round_id
-    from .reconcile import reopen, reported
+    from .reconcile import keep_pending, reopen, reported
     from .targets import inferred
 
     directory, item, needs = report
@@ -3467,7 +3471,11 @@ def _reopen_reported(report) -> None:
     slugs = reported(directory / "prerequisites.txt", seen)
     if not slugs:
         return
+    by = f"{item.slug} round {(current_round_id() or str(int(time.time())))[:12]}"
     try:
-        reopen(slugs, seen, f"{item.slug} round {(current_round_id() or str(int(time.time())))[:12]}")
+        done = reopen(slugs, seen, by)
     except OSError as error:
         log(f"target list: {', '.join(slugs)} not reopened ({error})")
+        done = None
+    if done is None:
+        keep_pending(directory.parent / "target-report-pending.json", slugs, seen, by)
