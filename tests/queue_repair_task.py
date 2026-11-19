@@ -601,7 +601,13 @@ def commit(repo: Path, message: str, files: dict[str, str]) -> str:
 class Content:
     """A bare content repository, a seed clone that built the chain, and the worker's clone."""
 
-    def __init__(self, root: Path, broken: tuple[int, ...] = (2,), base_files: dict[str, str] | None = None):
+    def __init__(
+        self,
+        root: Path,
+        broken: tuple[int, ...] = (2,),
+        base_files: dict[str, str] | None = None,
+        member_files: dict[int, dict[str, str]] | None = None,
+    ):
         self.broken = broken
         self.bare = root / "content.git"
         subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", str(self.bare)], check=True)
@@ -616,6 +622,7 @@ class Content:
         for number, name in ((1, "One"), (2, "Two"), (3, "Three")):
             body = "BROKEN" if number in broken else "trivial"
             files = {f"TauCeti/{name}.lean": f"theorem {name.lower()} : True := {body}\n"}
+            files.update((member_files or {}).get(number, {}))
             sh(seed, "checkout", "--quiet", "--detach", self.base)
             heads[number] = commit(seed, f"pr {number}", files)
         members = [
@@ -1018,10 +1025,13 @@ class FakeService:
 class Fixture(unittest.TestCase):
     BROKEN = (2,)  # the members whose module fails to build
     BASE_FILES: dict[str, str] | None = None  # more files in the base commit (``tauceti.toml``)
+    MEMBER_FILES: dict[int, dict[str, str]] | None = None  # more files in a member's commit, by number
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="case-", dir=TMP))
-        self.content = Content(self.root, broken=self.BROKEN, base_files=self.BASE_FILES)
+        self.content = Content(
+            self.root, broken=self.BROKEN, base_files=self.BASE_FILES, member_files=self.MEMBER_FILES
+        )
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
         os.environ["STUB_DIR"] = str(self.stub_dir)
@@ -1745,6 +1755,33 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(outcome["status"], "released", outcome)
         self.assertEqual(outcome["reason"], "artifacts_unavailable")
         self.assertEqual(self.agent_calls(), [])
+
+
+class ToolchainBumpWithoutArtifacts(Fixture):
+    """A chain that changes `lean-toolchain` (a Lean or Mathlib bump): Lake scopes the published
+    mappings by the checkout's toolchain, so main's revisions never answer for it. Production repair
+    task 1273 (2026-11-19) was released as ``artifacts_unavailable`` on every claim until escalation."""
+
+    BASE_FILES = {"lean-toolchain": "leanprover/lean4:v4.36.0-rc2\n"}
+    MEMBER_FILES = {1: {"lean-toolchain": "leanprover/lean4:v4.36.0\n"}}
+
+    def test_the_repair_runs_cold_instead_of_being_released(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.service.releases, [], "a toolchain bump without artifacts is not released")
+        self.assertFalse(outcome["artifacts"]["available"])
+        self.assertTrue(outcome["artifacts"]["cold"])
+        self.assertTrue(self.state()["artifacts"]["cold"], "a resumed claim still knows the build is cold")
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertIn("The build is cold", self.agent_calls()[0]["prompt"])
+
+    def test_the_toolchain_change_is_read_from_the_chain(self):
+        clone = self.content.bare.parent / "seed"
+        self.assertTrue(repair_task.toolchain_changed(clone, self.content.base, self.content.tip))
+        self.assertFalse(repair_task.toolchain_changed(clone, self.content.base, self.content.base))
+        self.assertFalse(repair_task.toolchain_changed(clone, self.content.members[1]["commit"], self.content.tip))
 
 
 class InferenceUnavailable(Fixture):
