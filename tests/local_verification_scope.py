@@ -321,7 +321,9 @@ def main():
             )
             check(
                 f"self-tested helper={helper}: author-only comment fallback for missing label permissions",
-                "lack of label permissions" in text
+                "lack label permissions" in text
+                and ".permissions.triage" in text
+                and "do not run `gh pr edit`" in text
                 and "you are the PR author" in text
                 and "gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested" in text
                 and "do not post duplicate requests" in text,

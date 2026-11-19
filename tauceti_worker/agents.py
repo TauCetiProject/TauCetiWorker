@@ -554,9 +554,17 @@ def self_tested_guidance(policy: str) -> str:
     if policy != "ordinary" or enabled():
         return ""
     comment_requests = getattr(current(), "supports_label_requests", True)
+    # Most authors lack triage permission on TauCeti; send them straight to the comment request
+    # rather than through a label edit GitHub will deny.
+    permission = (
+        "First check whether you can edit labels: `gh api repos/TauCetiProject/TauCeti --jq .permissions.triage`. "
+        if comment_requests
+        else ""
+    )
     fallback = (
         (
-            " If that command fails for lack of label permissions, confirm you are the PR author and its head still "
+            " If that check did not print `true`, you lack label permissions: do not run `gh pr edit` with "
+            "`--add-label` or `--remove-label`. Instead confirm you are the PR author and its head still "
             "matches the verified commit, then post a new standalone `self-tested` comment with "
             "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
             "The comment handler is asynchronous; do not post duplicate requests while it runs. "
@@ -565,7 +573,7 @@ def self_tested_guidance(policy: str) -> str:
         else " "
     )
     remove_fallback = (
-        " (or post `-self-tested` as the PR author if label permissions are missing)" if comment_requests else ""
+        " (or post `-self-tested` as the PR author if you lack label permissions)" if comment_requests else ""
     )
     return (
         "### Apply the self-tested label after verification\n"
@@ -576,7 +584,7 @@ def self_tested_guidance(policy: str) -> str:
         "have not changed; this adds no verification pass.\n"
         "Apply the `self-tested` label to the PR. Create new PRs through the existing "
         "`gh-safe-pr-create` wrapper; do not bypass it. After creation or pushing an update, "
-        "confirm the live PR commit matches your verified commit, then use "
+        "confirm the live PR commit matches your verified commit. " + permission + "If you can, use "
         "`gh pr edit <number> --repo TauCetiProject/TauCeti "
         "--add-label self-tested`."
         + fallback
