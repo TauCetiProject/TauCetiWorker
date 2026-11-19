@@ -14,7 +14,9 @@ same process. Routes:
     POST /webhook/github                              HMAC-verified GitHub deliveries (webhook.py)
     POST /tasks/claim                                 worker endpoints: JSON bodies, authenticated by
     POST /tasks/<id>/renew                            a GitHub token in `Authorization: Bearer`,
-    POST /tasks/<id>/result                           resolved to a login through `GET /user`
+    POST /tasks/<id>/result                           resolved to a login through `GET /user` (or a
+                                                      co-located worker's `local_worker_bearer`,
+                                                      signed with the App key, for these alone)
     POST /admin/settings                              same bearer scheme; the controller checks the
     POST /admin/urgent                                caller's repository-admin permission
     POST /admin/emergency                             `{"repo", "pr", "reason"}`: an emergency request
@@ -49,7 +51,7 @@ import urllib.parse
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import feeds, webhook
+from . import feeds, github_app, webhook
 from .ports import GitHubUnavailable
 from .source_authority import (
     NativeQueueAuthority,
@@ -138,6 +140,11 @@ class BearerAuth:
     out of their claims. With a `store` the digests and logins (never the tokens) are persisted, so
     a restart during such an outage keeps them too. A 401 from GitHub still evicts the entry and
     refuses the token.
+
+    A bearer of the form `github_app.local_worker_bearer` (a co-located repair worker holding the
+    App's private key) is checked against the adapter's App credentials with no GitHub request and no
+    cache entry, and resolves to the App's bot login (`local_worker_login`), which the controller
+    trusts for claims and submissions and `_admin` refuses.
     """
 
     def __init__(
@@ -149,6 +156,13 @@ class BearerAuth:
         store=None,
         max_age: float = MAX_AGE_SECONDS,
     ) -> None:
+        app_credentials = getattr(adapter, "app_credentials", None)
+        credentials = app_credentials() if callable(app_credentials) else None
+        self.local_credentials = credentials if isinstance(credentials, github_app.AppCredentials) else None
+        self.local_login = (
+            github_app.local_worker_login(self.local_credentials) if self.local_credentials is not None else None
+        )
+        self.clock = clock
         self.cache = StaleCache(
             adapter.user_for_token,
             ttl=ttl,
@@ -172,12 +186,22 @@ class BearerAuth:
         token = header[len("Bearer ") :].strip()
         if not token:
             return None
+        if token.startswith(github_app.LOCAL_WORKER_PREFIX):
+            if self.local_credentials is None or not github_app.verify_local_worker_bearer(
+                self.local_credentials, token, self.clock()
+            ):
+                log.warning("refused a local-worker bearer that is stale or not signed by the App's key")
+                return None
+            return self.local_login, 0
         digest = hashlib.sha256(token.encode()).hexdigest()
         try:
-            return self.cache.get(digest, token)
+            identity = self.cache.get(digest, token)
         except GitHubUnavailable as error:
             log.warning("bearer identity lookup failed with nothing cached for %s: %s", digest[:12], error)
             return None
+        if identity is not None and self.local_login is not None and identity[0] == self.local_login:
+            return None  # Only the App's key, never a GitHub token, speaks for the local worker login.
+        return identity
 
 
 HEALTHZ_LOCK_WAIT_SECONDS = 0.5
@@ -690,6 +714,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(403, str(error))
                 return False
             return True
+        if login == getattr(self.server.auth, "local_login", None):
+            self._error(403, "the local repair worker's credential is for the worker endpoints only")
+            return False
         repo = next(iter(self.server.config.repositories.values()), None)
         if not repo:
             self._error(403, f"{login} is not a repository admin")

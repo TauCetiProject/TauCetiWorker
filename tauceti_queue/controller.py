@@ -640,6 +640,11 @@ class Controller:
             namespace="admin",
             decode=bool,
         )
+        # A co-located repair worker's login (`github_app.local_worker_login`): the server resolves it
+        # only from a bearer signed with the App's private key, so it is a worker for claims and
+        # submissions; the server's admin endpoints refuse it.
+        local_login = getattr(github, "local_worker_login", None)
+        self.local_worker_login = local_login() if callable(local_login) else None
         self._lock = ControllerLock()
         # Serializes ticks: the tick lets go of `_lock` around its GitHub I/O, so the lock alone no
         # longer keeps a second tick (or drain) from interleaving with the first.
@@ -1683,6 +1688,8 @@ class Controller:
         """`repository_admin(login)` through the cache; None when GitHub cannot answer and never has."""
         if self.candidate_ci is not None:
             return None  # Native authority never uses a cached GitHub login.
+        if login and login == self.local_worker_login:
+            return True  # The server resolves this login only from a bearer signed with the App's key.
         try:
             return bool(self.admins.get(login, login))
         except GitHubUnavailable as error:
