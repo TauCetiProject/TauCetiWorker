@@ -66,10 +66,14 @@ from .config import (
 from .constants import (
     AGENT_NAMES,
     AUTO_STAGES,
+    BUMP_HEAD_PREFIX,
     CLAIM_TTL_S,
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    LINT_REPAIR_HEAD_PREFIX,
+    MAX_CI_ATTEMPTS,
+    MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
     MAX_REBASE_ATTEMPTS,
@@ -1426,8 +1430,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
         return _close_spent_pr(w, sv, c, explicit=explicit)
-    if stage == "rebase" and getattr(c, "final_resolution", False):
-        return _close_spent_pr(w, sv, c, stage="rebase", explicit=explicit)
+    if stage in ("rebase", "fix-ci") and getattr(c, "final_resolution", False):
+        return _close_spent_pr(w, sv, c, stage=stage, explicit=explicit)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -2279,6 +2283,11 @@ FINAL_ATTEMPT_INSTRUCTION = (
 def _budget_spent(stage, w, c) -> bool:
     if stage == "fix":
         return w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS
+    if stage == "fix-ci":
+        return (
+            w.counters.read(f"ci-{c.pr}-{c.head[:12]}") >= MAX_CI_ATTEMPTS
+            or w.counters.read(f"ci-pr-{c.pr}") >= MAX_CI_PR_ATTEMPTS
+        )
     key_for = getattr(w.counters, "rebase_budget_key", None)
     try:
         # A verified progress checkpoint since the survey starts a new budget under a new key.
@@ -2289,7 +2298,7 @@ def _budget_spent(stage, w, c) -> bool:
 
 
 def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
-    """Retire an owned, still-blocked head after its existing repair or rebase attempts; no model call."""
+    """Retire an owned, still-blocked head after its existing repair, rebase or CI attempts; no model call."""
     from .github_transport import read_context
 
     p = next((p for p in sv.open_prs if p.number == c.pr), None)
@@ -2302,7 +2311,8 @@ def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
             if not _still_actionable(stage, w, sv, replace(c, partial_history=False), explicit=explicit):
                 return None
             fields = ["state", "headRefOid", "author", "labels", "isDraft"]
-            live = w.gh.pr_view(c.pr, [*fields, "mergeable"] if stage == "rebase" else fields)
+            extra = {"rebase": ["mergeable"], "fix-ci": ["statusCheckRollup", "headRefName", "baseRefName"]}
+            live = w.gh.pr_view(c.pr, [*fields, *extra.get(stage, [])])
             if (
                 not live
                 or live.get("state") != "OPEN"
@@ -2327,6 +2337,21 @@ def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
                     f"Closing because {MAX_REBASE_ATTEMPTS} attempts could not bring this branch up to date "
                     f"with `{base}` at head `{c.head}`. The branch is retained; a fresh attempt can start "
                     f"from current `{base}`."
+                )
+            elif stage == "fix-ci":
+                info = PRInfo.from_json({**live, "number": c.pr})
+                # Pending or re-running CI, an ERROR status or a self-tested head is not evidence.
+                if (
+                    not info.needs_ci_repair
+                    or not info.build_failure_only
+                    or info.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX))
+                ):
+                    return None
+                base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+                spent = "CI repair"
+                comment = (
+                    f"Closing because repeated attempts could not make CI pass at head `{c.head}`. "
+                    f"The branch is retained; a fresh attempt can start from current `{base}`."
                 )
             else:
                 spent = "repair"

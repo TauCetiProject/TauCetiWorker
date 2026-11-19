@@ -399,6 +399,101 @@ class GlobalMaintenance(unittest.TestCase):
             self.assertEqual(work.dispatch("rebase", self.w, sv, c, self.opts), 0)
         self.assertEqual(close.call_args.kwargs["stage"], "rebase")
 
+    def test_spent_owned_fix_ci_is_selected_for_closure_only_on_failure(self):
+        from tauceti_worker.survey import MAX_CI_PR_ATTEMPTS
+
+        self.opts.only = ["fix-ci", "roadmap"]
+        self.counter_values["ci-pr-10"] = MAX_CI_PR_ATTEMPTS
+        flags = []
+        for state, expected in (("FAILURE", [("fix-ci", 10)]), ("ERROR", [("roadmap", 0)])):
+            with self.subTest(state=state):
+                pr = row(10, "Other")
+                pr["pr"]["statusCheckRollup"] = [{"context": "build", "state": state}]
+                self.run_round([pr], lambda stage, c: flags.append(c.final_resolution) or 0)
+                self.assertEqual([(s, n) for s, n, *_ in self.calls][:1], expected)
+        self.assertEqual(flags[:1], [True])
+
+    def ci_fixture(self, **changes):
+        rollup = [{"context": "build", "state": "FAILURE"}]
+        changes = {"statusCheckRollup": rollup, "headRefName": "roadmap/work", "baseRefName": "main", **changes}
+        sv, _, live = self.spent_fixture(**changes)
+        self.counter_values[f"ci-10-{HEAD[:12]}"] = 3
+        return sv, work.Candidate(10, HEAD, final_resolution=True), live
+
+    def test_spent_fix_ci_budget_closes_without_another_model_call(self):
+        for counters in ({f"ci-10-{HEAD[:12]}": 3}, {f"ci-10-{HEAD[:12]}": 0, "ci-pr-10": 5}):
+            with self.subTest(counters=counters):
+                sv, c, live = self.ci_fixture()
+                self.counter_values.update(counters)
+
+                def closed(*args, live=live, **kwargs):
+                    live["state"] = "CLOSED"
+
+                with patch.object(work, "gh_run", side_effect=closed) as mutation:
+                    self.assertEqual(work._close_spent_pr(self.w, sv, c, stage="fix-ci"), 0)
+                comment = mutation.call_args.args[0][-1]
+                self.assertIn(f"could not make CI pass at head `{HEAD}`", comment)
+                self.assertIn("The branch is retained", comment)
+                self.w.claims.release.assert_called_once()
+
+    def test_spent_fix_ci_closure_not_confirmed_raises(self):
+        sv, c, _ = self.ci_fixture()
+        with patch.object(work, "gh_run") as mutation:
+            with self.assertRaisesRegex(NoProgress, "closure not confirmed"):
+                work._close_spent_pr(self.w, sv, c, stage="fix-ci")
+        mutation.assert_called_once()
+        self.w.claims.release.assert_called_once()
+
+    def test_spent_fix_ci_closure_guards_leave_the_pr_open(self):
+        def build(*states):
+            return {"statusCheckRollup": [{"context": "build", "state": state} for state in states]}
+
+        def spend_less(sv, c):
+            self.counter_values.update({f"ci-10-{HEAD[:12]}": 2, "ci-pr-10": 4})
+
+        cases = {
+            "label": ({"labels": [{"name": "keep"}]}, None),
+            "draft": ({"isDraft": True}, None),
+            "moved head": ({"headRefOid": "b" * 40}, None),
+            "live author": ({"author": {"login": "peer"}}, None),
+            "pending": (build("PENDING"), None),
+            "re-running": (build("FAILURE", "PENDING"), None),
+            "green": (build("SUCCESS"), None),
+            "error status": (build("ERROR"), None),
+            "no build status": (build(), None),
+            "lint-repair branch": ({"headRefName": "lint-repair/main"}, None),
+            "surveyed author": (
+                {},
+                lambda sv, c: setattr(sv, "open_prs", [PRInfo.from_json(row(10, "Other", author="peer")["pr"])]),
+            ),
+            "bump": (
+                {},
+                lambda sv, c: setattr(
+                    sv, "open_prs", [SimpleNamespace(number=10, author="science", automatic_bump=True)]
+                ),
+            ),
+            "not spent": ({}, spend_less),
+        }
+        for name, (changes, adjust) in cases.items():
+            with self.subTest(name):
+                self.counter_values.clear()
+                sv, c, _ = self.ci_fixture(**changes)
+                if adjust:
+                    adjust(sv, c)
+                with patch.object(work, "gh_run") as mutation:
+                    self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="fix-ci"))
+                mutation.assert_not_called()
+
+    def test_spent_fix_ci_dispatch_goes_to_closure(self):
+        sv, c, _ = self.ci_fixture()
+        with (
+            patch("tauceti_worker.github_outbox.pending_for", return_value=False),
+            patch.object(work, "_check_stage_read_quota"),
+            patch.object(work, "_close_spent_pr", return_value=0) as close,
+        ):
+            self.assertEqual(work.dispatch("fix-ci", self.w, sv, c, self.opts), 0)
+        self.assertEqual(close.call_args.kwargs["stage"], "fix-ci")
+
     def test_other_roadmap_maintenance_and_claim_fallthrough(self):
         # Model an independent worker's shuffled order. Claimed and contested
         # heads must not hide the remaining maintenance in a different area.
