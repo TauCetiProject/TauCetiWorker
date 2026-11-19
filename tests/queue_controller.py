@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -376,6 +377,63 @@ class Verdicts(ControllerCase):
         self.assertEqual(task["kind"], "repair")
         self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
         self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
+
+    def test_bound_failure_with_failed_finalizer_and_no_parsed_finding_creates_repair(self):
+        # The finalizer exits 1 after posting build=failure; a bound failed status is a source verdict
+        # even when no log line parses into a finding.
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "pr-build / finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "repair")
+        [finding] = json.loads(task["diagnostics"])
+        self.assertEqual(finding["kind"], "status")
+        self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
+
+    def test_dependency_audit_collision_with_failed_finalizer_creates_repair(self):
+        findings = diagnostics.parse_log(
+            [
+                "audit-driver: import TauCeti.Topology.Algebra.Algebra.Unitization failed, environment already "
+                "contains 'Unitization.continuous_iff' from Mathlib.Analysis.Normed.Algebra.Unitization"
+            ]
+        )
+        findings += diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_bound_failure_with_another_infrastructure_finding_stays_infrastructure(self):
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"},
+            [
+                {"name": "sandboxed-build", "conclusion": "timed_out"},
+                {"name": "finalize-merge-group-build", "conclusion": "failure"},
+            ],
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
 
     def test_an_unrelated_cancelled_job_does_not_skip_publication_grace(self):
         self.github.ci_policy = lambda *_: (
@@ -1189,27 +1247,48 @@ class SupersededRuns(ControllerCase):
         self.assertEqual(self.controller._active_claims(self.head["id"])[0]["task_id"], task.task_id)
         self.assertEqual(self.attempts()[0]["cancel_reason"], "canonical advanced; rebase waits for worker")
 
-    def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_once(self):
-        self.github.fail_next["cancel_run"] = 5
+    def test_a_failed_cancel_never_blocks_the_dispatch_and_is_retried_until_settled(self):
+        self.github.fail_next["cancel_run"] = 3
         first, second = self.replay()
         self.assertEqual(len(self.github.dispatches), 2, "the new attempt was dispatched")
         self.assertEqual(second["dispatch_id"], "dispatch-2")
         self.assertEqual(first["outcome"], "superseded")
         self.assertTrue(first["cancel_result"].startswith("failed:"), first["cancel_result"])
+        intent = self.controller._cancel_intents()[first["id"]]
+        self.assertEqual(intent["tries"], 1)
+        self.assertGreater(intent["retry_at"], self.clock())
         for _ in range(4):
             self.observe(self.controller.setting("outbox_retry_max_seconds") + 1)
-        self.assertEqual(len(self.cancel_calls()), 2, "one inline call and one retry from the outbox")
-        entry = self.controller.store.row("outbox", {"kind": "cancel_run"})
-        self.assertEqual(entry["state"], "done")
-        self.assertTrue(entry["result"].startswith("gave-up:"), entry["result"])
+        self.assertEqual(len(self.cancel_calls()), 4, "one inline call, two failed retries and the one that settles")
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["cancel_result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
+        self.assertIsNone(self.controller.store.row("outbox", {"kind": "cancel_run"}))
         self.assertEqual(self.attempts()[1]["outcome"], "pending")
 
-    def test_a_failed_cancel_succeeds_on_its_outbox_retry(self):
+    def test_a_failed_cancel_backs_off_before_its_retry(self):
         self.github.fail_next["cancel_run"] = 1
         self.replay()
+        self.controller._settle_cancel_intents(self.clock())
+        self.assertEqual(len(self.cancel_calls()), 1, "the retry waits out its backoff")
+        self.observe()
+        self.assertEqual(len(self.cancel_calls()), 2)
+        self.assertEqual(self.github.runs[0].conclusion, "cancelled")
+        self.assertEqual(self.attempts()[0]["cancel_result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
+
+    def test_a_queued_outbox_cancel_that_fails_hands_over_to_a_cancel_intent(self):
+        # An entry enqueued by an earlier controller, which retried a failed cancel once through the outbox.
+        self.github.cancel_run = None
+        first, _second = self.replay()
+        del self.github.cancel_run
+        self.github.fail_next["cancel_run"] = 1
+        payload = {"run_id": first["run_id"], "attempt_id": first["id"]}
+        self.assertTrue(self.controller._perform("cancel_run", payload, self.clock()).startswith("cancel-intent:"))
+        self.assertIn(first["id"], self.controller._cancel_intents())
         self.observe()
         self.assertEqual(self.github.runs[0].conclusion, "cancelled")
-        self.assertEqual(self.controller.store.row("outbox", {"kind": "cancel_run"})["result"], "cancelled")
+        self.assertEqual(self.controller._cancel_intents(), {})
 
     def test_a_landed_batch_cancels_a_straggler(self):
         # A controller unable to cancel at dispatch (as before this was added) leaves the old run going.
@@ -1390,6 +1469,82 @@ class PreRebase(ControllerCase):
         self.assertIsNone(self.controller._head())
         self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "held"})
         self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
+
+    def batch_conflicting_in_the_middle(self):
+        """A head waiting on CI and an open batch [103, 102, 104] whose member 102 conflicts with it."""
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        for number, files in (
+            (103, {"B.lean": "b\n"}),
+            (102, {"Shared.lean": "line one\nline two by 102\nline three\n"}),
+            (104, {"C.lean": "c\n"}),
+        ):
+            self.approve(number, files)
+            self.controller.tick()
+        batch = self.open_batch()
+        self.assertEqual([m["number"] for m in self.controller.members(batch["id"])], [103, 102, 104])
+        self.assertEqual(batch["pre_rebase_state"], "conflict")
+        return batch
+
+    def land_head(self):
+        self.github.complete_runs()
+        for context in VERDICT_CONTEXTS:
+            self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+        self.controller.tick()  # promotes the head
+        self.controller.tick()  # observes the landing and seals
+
+    def assert_clean_prefix_sealed(self, batch):
+        head = self.controller._head()
+        self.assertGreater(head["id"], batch["id"])
+        self.assertEqual([m["number"] for m in self.controller.members(head["id"])], [103])
+        self.assertEqual(head["base"], self.repo.main_sha())
+        self.assertEqual(self.repo.file_at(head["tip"], "B.lean"), "b\n")
+        self.assertEqual(len(self.github.runs), 2, "the clean prefix is dispatched in the same pass")
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["batch_id"], head["id"])
+        # The rest stays in the batch, still first in line, on the moved member's own commit.
+        left = self.controller._open_batch()
+        self.assertEqual(left["id"], batch["id"])
+        self.assertEqual((left["tip"], left["version"]), (batch["tip"], batch["version"] + 1))
+        self.assertEqual(
+            [(m["number"], m["position"]) for m in self.controller.members(left["id"])], [(102, 0), (104, 1)]
+        )
+        self.assertEqual(len(chain.chain_commits(self.repo.clone, left["base"], left["tip"])), 2)
+        for number in (102, 104):
+            row = self.controller.input_for(PROJECT, number)
+            self.assertEqual((row["state"], row["batch_id"]), ("inserted", batch["id"]))
+            self.assertEqual(self.github.comments_for(number), [])
+        [entry] = self.controller.store.journal_entries("clean-prefix-sealed")
+        self.assertEqual(
+            (entry["detail"]["kept"], entry["detail"]["left"], entry["detail"]["conflict"]),
+            ([103], [102, 104], f"{PROJECT}#102"),
+        )
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+        # Once the new head is dispatched the batch is replayed onto it and conflicts again.
+        self.controller.tick()
+        task = self.controller.store.row("tasks", {"batch_id": batch["id"], "state": "open", "kind": "pre_rebase"})
+        self.assertEqual((task["onto"], task["base"]), (head["tip"], left["base"]))
+        return head
+
+    def test_a_claimed_pre_rebase_conflict_seals_the_clean_prefix_when_the_head_lands(self):
+        batch = self.batch_conflicting_in_the_middle()
+        task = self.controller.claim_task("w", "admin-worker")
+        self.assertEqual(task.kind, "pre_rebase")
+        self.land_head()
+        self.assert_clean_prefix_sealed(batch)
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        self.assertEqual((row["state"], row["resolution"]), ("superseded", "clean-prefix"))
+        self.assertFalse(self.controller.submit_task(task.task_id, task.claim_token, task.tip).accepted)
+
+    def test_an_unclaimed_pre_rebase_conflict_seals_the_clean_prefix_too(self):
+        batch = self.batch_conflicting_in_the_middle()
+        self.land_head()
+        head = self.assert_clean_prefix_sealed(batch)
+        # The prefix lands; the batch then seals and its conflict is a `rebase_conflict` task.
+        self.land_head()
+        self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertEqual(self.controller._head()["id"], batch["id"])
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 1)
 
     def test_verified_pre_rebase_needs_no_second_preparation(self):
         ref = "a" * 40
@@ -1684,6 +1839,15 @@ class Tasks(ControllerCase):
         self.assertEqual(refusals[-1]["detail"]["reason"], "github-unavailable")
         result = self.controller.submit_task(task.task_id, task.claim_token, head["tip"])
         self.assertTrue(result.accepted, "the submission's admin check serves the same stale answer")
+
+    def test_the_local_worker_login_claims_and_submits_without_a_github_admin_read(self):
+        head = self.failing_head()
+        self.controller.local_worker_login = "tauceti-queue[bot]"
+        self.github.unavailable = "rate limited for 2400s"
+        task = self.controller.claim_task("worker-1", "tauceti-queue[bot]")
+        self.assertIsNotNone(task, "the server resolves this login only from a bearer signed with the App's key")
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, head["tip"]).accepted)
+        self.assertEqual([c for c in self.github.calls if c[0] == "repository_admin"], [])
 
     def test_admin_answers_survive_a_restart_during_an_outage(self):
         self.failing_head()
@@ -2629,6 +2793,75 @@ class NoRepair(ControllerCase):
         self.assertEqual(self.controller.status()["anticipated"], [], "nothing to follow")
 
 
+class BlockingLabelAfterApproval(ControllerCase):
+    """A blocking label (`hold`, `wip`, ...) added to an approved PR keeps it out of batches until it goes."""
+
+    def label_event(self, number, action, name, labels, **pull):
+        self.github.labels[number] = set(labels)
+        self.controller.handle_event(
+            "pull_request",
+            {
+                "action": action,
+                "number": number,
+                "label": {"name": name},
+                "pull_request": {"number": number, "labels": [{"name": label} for label in labels], **pull},
+            },
+        )
+
+    def held(self, number):
+        row = self.controller.input_for(PROJECT, number)
+        return row["state"], json.loads(row["blocked_labels"])
+
+    def test_a_waiting_input_is_held_while_labelled_and_placed_once_it_goes(self):
+        head, result = self.approve(101, {"A.lean": "a\n"})
+        self.label_event(101, "labeled", "Hold", ["Hold"])
+        self.assertEqual(self.held(101), ("waiting", ["hold"]))
+        self.controller.tick()
+        self.assertEqual(self.controller.store.count("members"), 0, "a held input joins no batch")
+        self.assertEqual(self.controller.status()["waiting"]["inputs"][0]["blocked_labels"], ["hold"])
+        self.label_event(101, "labeled", "wip", ["Hold", "wip"])
+        self.label_event(101, "unlabeled", "Hold", ["wip"])
+        self.controller.tick()
+        self.assertEqual(self.held(101), ("waiting", ["wip"]), "wip still blocks")
+        self.label_event(101, "unlabeled", "wip", [])
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual((row["id"], row["approved_at"]), (result["input"]["id"], result["input"]["approved_at"]))
+        self.controller.tick()
+        self.assertEqual(self.held(101), ("inserted", []))
+
+    def test_a_delivery_without_a_label_list_applies_its_one_label(self):
+        self.approve(101, {"A.lean": "a\n"})
+        for action in ("labeled", "unlabeled"):
+            self.controller.handle_event(
+                "pull_request", {"action": action, "number": 101, "label": {"name": "wip"}, "pull_request": {}}
+            )
+            self.assertEqual(self.held(101), ("waiting", ["wip"] if action == "labeled" else []))
+
+    def test_a_label_arriving_during_the_probe_keeps_the_input_out(self):
+        self.approve(101, {"A.lean": "a\n"})
+        build = chain.build
+
+        def label_then_build(*args, **kwargs):
+            self.label_event(101, "labeled", "hold", ["hold"])
+            return build(*args, **kwargs)
+
+        with mock.patch.object(chain, "build", label_then_build):
+            self.controller.tick()
+        self.assertEqual(self.held(101), ("waiting", ["hold"]))
+        self.assertEqual(self.controller.store.count("members"), 0)
+
+    def test_a_member_is_not_withdrawn_by_a_blocking_label(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.label_event(101, "labeled", "hold", ["hold"])
+        self.assertEqual(self.held(101), ("inserted", ["hold"]), "kept in its batch, recorded should it return")
+
+    def test_a_delivery_for_another_head_is_ignored(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.label_event(101, "labeled", "hold", ["hold"], head={"sha": "f" * 40})
+        self.assertEqual(self.held(101), ("waiting", []))
+
+
 class EditSummary(ControllerCase):
     def test_a_long_diff_is_capped_with_a_note_and_the_commit_link(self):
         self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "Long.lean", "message": "boom"}])
@@ -2754,6 +2987,7 @@ class StatusShape(ControllerCase):
                 "open_batches",
                 "sealed_successor",
                 "head",
+                "emergency",
                 "external_head",
                 "approvals",
                 "admission",
@@ -2762,6 +2996,9 @@ class StatusShape(ControllerCase):
                 "outbox",
                 "reasons",
                 "alerts",
+                "stuck_heads",
+                "escalations",
+                "loop_termination",
                 "counters",
                 "head_cycle_seconds",
                 "insertion_passes",
@@ -2770,6 +3007,9 @@ class StatusShape(ControllerCase):
         )
         self.assertIsNone(status["head"])
         self.assertIsNone(status["external_head"])
+        self.assertEqual(
+            status["emergency"], {"enabled": False, "evict": False, "batch": None, "queued": [], "cancel_intents": []}
+        )
         self.assertEqual(status["approvals"], {"webhook": 0, "polled": 0, "revoked_by_poll": 0, "last_poll": None})
         self.assertEqual(status["waiting"]["count"], 0)
         self.approve(101, {"A.lean": "a\n"})

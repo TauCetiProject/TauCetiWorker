@@ -21,7 +21,23 @@ python3 -m tauceti_queue.monitoring \
   --follow --interval 10
 ```
 
-Run it from an installed release or source checkout. The module is stdlib-only.
+On the queue host these commands run as systemd user units from their own release directory,
+`~/TauCetiQueue-releases/<sha>-<time>/`, with its uv environment (the modules import
+`tauceti_tools`, so the system `python3` is not enough; operations.md, "Install and update"):
+
+```sh
+~/TauCetiQueue/services/queue/install-monitoring.sh
+```
+
+installs `tauceti-queue-monitoring.service` (the live publisher above),
+`tauceti-queue-task-activity.service` (the repair-phase observer below), and
+`tauceti-queue-monitoring-history.service` with its hourly timer (the history report below), then
+restarts the two long-running units. Host-specific extra arguments, such as retired workers' task
+roots, go in `~/.config/tauceti-queue/monitoring-environment` as `TAUCETI_QUEUE_MONITORING_ARGS`
+(`services/queue/monitoring-environment.example`). Never use systemd drop-ins for these units, and
+never point them at a hand-made directory: the installer creates their release, refuses to run
+while a drop-in exists, and any revision other than origin/main HEAD needs a human operator's
+permission (operations.md, "Install and update").
 The controller/repair services do not need to restart to start the sidecar. Live
 source updates that add the reduction journal event use the normal live deployment
 path without draining. Do not run the controller installer solely to add telemetry.
@@ -38,8 +54,13 @@ an unrelated queue/store. Restart epochs also advance from current milliseconds,
 so an ordinary restored old state file does not replay old process epochs.
 
 The live detail window retains active batches plus up to 500 terminal batches in
-ninety days, and up to 5,000 terminal inputs. Byte caps can shorten old detail;
-extraordinary active-only overflow is marked partial. Authoritative batch counts
+ninety days, and up to 5,000 terminal inputs. Only active batches' members and live inputs
+count toward the 20,000-row read limit; terminal batches join newest first while all their
+members fit, and each member carries its own input's title, author and times even when that
+input is older than the published terminal inputs. Byte caps can shorten old detail by
+dropping the oldest terminal batches whole; `retained_batch_ids` says which remain, and
+this alone does not make the snapshot partial. Extraordinary active-only overflow is
+marked partial, with the trimmed collections' `collection_complete` false. Authoritative batch counts
 remain distinct from retained member detail. The public report records its source
 scope and observation times. Worker checkpoint/outcome summaries contain only
 phase/observation/duration, approved provider/model labels and recorded cost
@@ -109,6 +130,8 @@ scripted already-landed notes remain separate. Historical ambiguous empties stay
 `empty_unknown`.
 
 Members rejected at batch landing are shown as `rejected_empty`, with no `landed_at` timestamp.
+Members an adopted repair emptied, which the queue withdrew at once and sent back to their authors,
+are shown as `withdrawn_empty`.
 The input's landing timestamp, rather than the batch's, is used for each member.
 
 The module's local JSON output is prepared public data; keep its parent directory

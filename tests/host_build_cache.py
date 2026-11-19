@@ -82,6 +82,8 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         "PATH": f"{root}:{os.environ['PATH']}",
         "CACHE_TEST_CALLS": str(calls),
         "TAUCETI_SHARED_ARTIFACTS": "0",
+        # These fixtures exercise the build cache in an ordinary checkout, not per-round worktrees.
+        "TAUCETI_ROUND_WORKTREES": "0",
         "TAUCETI_SHARED_MATHLIB_ROOT": str(root / "shared-pool"),
         # Pinned so no run can reach the host's real build pool, home or activity store.
         "TAUCETI_BUILD_CACHE_ROOT": str(root / "base-pool"),

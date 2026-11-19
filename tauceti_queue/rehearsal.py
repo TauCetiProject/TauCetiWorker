@@ -124,8 +124,8 @@ end Scratch
 
 PR_BUILD_YML = r"""name: pr-build
 # Adapted from TauCetiProject/TauCeti's .github/workflows/pr-build.yml for the queue cutover
-# rehearsal; the staging path is TauCeti's (read against it on 2026-11-04, TauCetiTools pinned at
-# 8bad7a00af97c00c90a9777c195618c857dbf91c in `uses:` lines and tauceti.toml, as in TauCeti):
+# rehearsal; the staging path is TauCeti's (read against it on 2026-11-04). TauCetiTools runs from
+# `main` in `uses:` lines and tauceti.toml, as in TauCeti:
 #
 # - the `repository_dispatch` event `tauceti-bors-staging` with the same `client_payload`
 #   (head_sha, base_sha, batch_id, members, base_ref), the same `run-name` the service finds the
@@ -195,14 +195,13 @@ jobs:
           fetch-depth: 1
 
       - name: Prepare pinned shared tools
-        uses: TauCetiProject/TauCetiTools/.github/actions/setup@8bad7a00af97c00c90a9777c195618c857dbf91c
+        uses: TauCetiProject/TauCetiTools/.github/actions/setup@main
         with:
           tools-repository: TauCetiProject/TauCetiTools
-          tools-ref: 8bad7a00af97c00c90a9777c195618c857dbf91c
           project-directory: gate
       - name: Select CI API credentials
         id: ci-api
-        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@8bad7a00af97c00c90a9777c195618c857dbf91c
+        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@main
         with:
           owner: ${{ github.repository_owner }}
           repository: ${{ github.event.repository.name }}
@@ -396,14 +395,13 @@ jobs:
           persist-credentials: false
 
       - name: Prepare pinned shared tools
-        uses: TauCetiProject/TauCetiTools/.github/actions/setup@8bad7a00af97c00c90a9777c195618c857dbf91c
+        uses: TauCetiProject/TauCetiTools/.github/actions/setup@main
         with:
           tools-repository: TauCetiProject/TauCetiTools
-          tools-ref: 8bad7a00af97c00c90a9777c195618c857dbf91c
           project-directory: .
       - name: Select CI API credentials
         id: ci-api
-        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@8bad7a00af97c00c90a9777c195618c857dbf91c
+        uses: TauCetiProject/TauCetiTools/.github/actions/ci-credentials@main
         with:
           owner: ${{ github.repository_owner }}
           repository: ${{ github.event.repository.name }}
@@ -494,7 +492,7 @@ deployment = "cloudflare"
 
 [tools.tools]
 repo = "TauCetiProject/TauCetiTools"
-ref = "8bad7a00af97c00c90a9777c195618c857dbf91c"
+ref = "main"
 """
 
 # TauCeti's scripts/*.py are these eleven lines; the finalizer sparse-checks-out three of them.
@@ -992,7 +990,7 @@ class Rig:
     def pr_record(self, number: int) -> dict:
         raise NotImplementedError
 
-    def landing_comment(self, number: int, *, rejected: bool = False) -> dict | None:
+    def landing_comment(self, number: int, *, rejected: bool = False, withdrawn: bool = False) -> dict | None:
         raise NotImplementedError
 
     def runner_config(self, inference_attempts: int):
@@ -1351,9 +1349,9 @@ class LocalRig(Rig):
             pr = self.github.prs[number]
             return {"state": pr["state"], "title": pr["title"]}
 
-    def landing_comment(self, number: int, *, rejected: bool = False) -> dict | None:
+    def landing_comment(self, number: int, *, rejected: bool = False, withdrawn: bool = False) -> dict | None:
         for comment in self.github.comments_for(number):
-            if ("rejected:" if rejected else "landed:") in comment["marker"]:
+            if _comment_kind(rejected, withdrawn) in comment["marker"]:
                 return {"id": comment["id"], "body": comment["body"]}
         return None
 
@@ -1980,10 +1978,10 @@ class LiveRig(Rig):
         pr = self.adapter.fetch_pr(self.repository, number)
         return {"state": pr.state, "title": pr.title}
 
-    def landing_comment(self, number: int, *, rejected: bool = False) -> dict | None:
+    def landing_comment(self, number: int, *, rejected: bool = False, withdrawn: bool = False) -> dict | None:
         for comment in self.client.paginate(f"repos/{self.repository}/issues/{number}/comments"):
             body = str(comment.get("body") or "")
-            if ("rejected:" if rejected else "landed:") in body and "tauceti-queue" in body:
+            if _comment_kind(rejected, withdrawn) in body and "tauceti-queue" in body:
                 return {"id": comment.get("id"), "body": body, "html_url": comment.get("html_url")}
         return None
 
@@ -2131,6 +2129,11 @@ class Report:
 def expect(condition: Any, message: str) -> None:
     if not condition:
         raise Failure(message)
+
+
+def _comment_kind(rejected: bool, withdrawn: bool) -> str:
+    """The marker kind of the queue comment a rehearsal check looks for."""
+    return "withdrawn:" if withdrawn else ("rejected:" if rejected else "landed:")
 
 
 def _members(batch: dict | None) -> list[int]:
@@ -2344,13 +2347,24 @@ class Rehearsal:
         return found
 
     def pr_evidence(
-        self, pr: PR, *, edited: bool | None = None, mentions: str | None = None, rejected: bool = False
+        self,
+        pr: PR,
+        *,
+        edited: bool | None = None,
+        mentions: str | None = None,
+        rejected: bool = False,
+        withdrawn: bool = False,
     ) -> dict:
         record = self.rig.pr_record(pr.number)
-        comment = self.rig.landing_comment(pr.number, rejected=rejected)
+        comment = self.rig.landing_comment(pr.number, rejected=rejected, withdrawn=withdrawn)
         expect(comment is not None, f"#{pr.number} has no landing comment")
         body = comment["body"]
-        if rejected:
+        if withdrawn:
+            expect("withdrew this PR" in body, f"#{pr.number}: no withdrawal notice")
+            expect("What to do next" in body, f"#{pr.number}: the withdrawal notice says nothing about what to do next")
+            expect("successfully merged" not in body, f"#{pr.number}: withdrawn PR has a merge notice")
+            expect(record["state"] == "open", f"#{pr.number}: withdrawn PR was closed")
+        elif rejected:
             expect("rejected during staging repair" in body, f"#{pr.number}: no rejection notice")
             expect("successfully merged" not in body, f"#{pr.number}: rejected PR has a merge notice")
             expect(record["state"] == "closed", f"#{pr.number}: rejected PR is not closed")
@@ -2508,7 +2522,7 @@ class Rehearsal:
     def scenario_shrink(self) -> None:
         with self.report.scenario(
             "shrink",
-            "A contribution reduced to an empty commit is rejected; the comment names what was dropped",
+            "A contribution reduced to an empty commit is withdrawn at adoption; the comment names what was dropped",
             [3, 14],
         ) as rec:
             hopeless = self.rig.create_pr("hopeless", self.content.module("Hopeless", "1 = 2", failing=True))
@@ -2532,13 +2546,13 @@ class Rehearsal:
             expect(empty and empty[0].get("empty"), f"the landed commit of #{hopeless.number} is not empty: {empty}")
             rec.evidence["empty_commit"] = empty[0]
             expect(self.rig.base_content(path) is None, f"{path} landed although it was dropped")
-            rec.evidence["pr_hopeless"] = self.pr_evidence(hopeless, rejected=True, mentions="Dropped")
+            rec.evidence["pr_hopeless"] = self.pr_evidence(hopeless, withdrawn=True, mentions="Dropped")
             rec.evidence["pr_sound"] = self.pr_evidence(sound, edited=False)
             counters = self.status().get("counters") or {}
             expect(counters.get("shrink_to_empty", 0) >= 1, f"no shrink counted: {counters}")
-            expect(counters.get("prs_rejected", 0) >= 1, f"no rejection counted: {counters}")
+            expect(counters.get("prs_withdrawn_empty", 0) >= 1, f"no withdrawal counted: {counters}")
             rec.evidence["counters"] = {
-                k: counters.get(k) for k in ("shrink_to_empty", "repair_rounds", "prs_rejected")
+                k: counters.get(k) for k in ("shrink_to_empty", "repair_rounds", "prs_withdrawn_empty")
             }
 
     def scenario_conflict(self) -> None:

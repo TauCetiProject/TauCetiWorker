@@ -28,14 +28,15 @@ Tables:
 | --- | --- |
 | `settings` | runtime settings and controller state (`state:*` keys: canonical SHA, inference hold, counters, Bors's external head, the last approval poll) as JSON, with actor and time |
 | `inputs` | approved inputs: repository, PR, accepted head, title, description, author, evidence, reviewer, priority, urgent flag, state, age (`approved_at`), retained ref, probe history (`probes`, `last_probe`, `last_probe_tip`, `passes_waited`), the `no_repair` opt-out and, for a `problem-anticipated` withdrawal, `anticipated` (JSON: batch, member, commit, `interacting`, `file`, `finding`, the agent's `explanation`, `stage`, times) |
-| `batches` | identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`), expected parent for promotion, urgent flag, first dispatch time |
-| `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA, the `no_repair` opt-out, `withdrawn` (an emptied `no_repair` member: its empty commit stays in the chain, the PR does not land) |
+| `batches` | identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`), expected parent for promotion, urgent flag, first dispatch time, `lane` (`control` for the control-file lane batch, else empty) |
+| `members` | per batch and position: input, `Source-PR`, accepted head, current commit, provenance (`clean` or `edited`), the task that edited it, the accumulated explanation, every edited commit SHA, the `no_repair` opt-out, `withdrawn` (a member the queue sent back: an emptied `no_repair` member, or one an adopted repair emptied; its empty commit stays in the chain, the PR does not land) |
 | `claims` | batch identity and version, operation (`insert`, `rebase`, `task:repair`, `task:rebase_conflict`), worker identity and GitHub login, token, starting tip, expiry, renewal, release and its reason |
 | `tasks` | repair and rebase-conflict tasks: batch and version, base, tip, `onto`, diagnostics, state (`open`, `submitted`, `superseded`), counts of claims and submissions |
 | `batch_tips` | every tip a batch has had: batch, version, tip SHA and the time it was recorded (written wherever the tip changes: insertion, adoption, rebase, rebuild, and at dispatch for a version not yet recorded) |
 | `submissions` | every submitted chain with its retained ref, accepted flag and reason |
 | `ci_attempts` | every dispatch: head and base SHA, dispatch id, bound run id and attempt, status, conclusion, runner, labels, host, phases, progress timestamps, outcome (`pending`, `pass`, `source-failure`, `infrastructure`, `superseded`), diagnostics and the `repair_outputs_revs` the dispatch sent |
-| `outbox` | pending side effects (`promote`, `comment`, `close_pr`, `labels`, `retain_ref`) with an idempotency key, attempt count, history and next attempt time |
+| `outbox` | pending side effects (`promote`, `comment`, `close_pr`, `labels`, `retain_ref`, `notify`) with an idempotency key, attempt count, history and next attempt time |
+| `failures` | one row per failed head CI attempt: its fingerprint, the members it names, its finding lines and what the controller did (`repair`, `withdraw`, `bisect`, `dissolve`, `hold`); see [escalation.md](escalation.md) |
 | `journal` | append-only log of what the controller did (`approved`, `inserted`, `sealed`, `rebased`, `dispatched`, `ci-pass`, `task`, `claimed`, `adopted`, `landed`, ...) for status and tests |
 
 Retained refs in the clone and, when publication is enabled, on GitHub through the outbox:
@@ -57,7 +58,11 @@ dispatch pushes the head's batch ref itself only when the outbox has not already
 Inputs: `waiting` -> `reserved` (during a probe) -> `inserted` (a member) -> `landed`; or
 `cancelled` with a reason (`unapproved`, `cancelled`, `closed`, `head-changed`, `draft`,
 `merged-externally`, `landed-externally`, `conflicts-with-main`, `superseded-by-new-approval`,
-`problem-anticipated`, `empty-commit`).
+`problem-anticipated`, `empty-commit`, `queue-withdrawn`). A head failure that repair does not
+resolve is escalated, each time with an alert and a Zulip direct message: withdrawal of the members
+it names or that attribution finds, else bisection as the last resort; see [`escalation.md`](escalation.md). An ordinary member an adopted repair reduces to an empty commit
+is withdrawn at adoption with reason `empty-commit` (`_withdraw_member`; see
+[`reject-empty-commits.md`](reject-empty-commits.md)).
 A member is never withdrawn by its author or reviewers: `unapprove`, `cancel`, a closing or
 relabelling event on a member PR are journaled (`member-event-ignored`, `withdrawal-refused`) and
 change nothing, except that a `labeled`/`unlabeled` event for one of the `no_repair_labels` updates
@@ -124,6 +129,15 @@ I/O, below):
    `pre_rebase` owner keeps the batch open until adoption, release or claim expiry, so completed
    repairs enter the new head through ordinary validation. Unclaimed background offers are
    superseded (resolution `sealed`); the new head keeps what its preparations adopted.
+   The exception is a batch whose pre-rebase is a conflict (`_seal_clean_prefix`), with no claim
+   on it other than its `pre_rebase` task's: resolving the conflict takes hours, so the batch is
+   replayed onto the canonical commit and the members before the conflicting one move to a new
+   batch that becomes the head at once (`clean-prefix-sealed` in the journal). The conflicting
+   member and those after it stay in the batch, now based on the last moved member's own commit,
+   so they keep their approvals, their age and the batch's place as the next head; the batch's
+   `pre_rebase` tasks are superseded (resolution `clean-prefix`), their claims released, and the
+   next pre-rebase onto the new head creates a fresh task. A conflict at the first member leaves
+   the batch as before; a replay that is now clean seals the whole batch.
    While fewer than two active batches are sealed (counting the head), seal the oldest unsealed batch once it has
    `sealed_successor_min_members` members (default 100; 0 disables new successor sealing). A larger
    later batch never overtakes a smaller first one. Successor sealing preserves active background
@@ -176,6 +190,29 @@ not a dependency if the proposed
 PR removes that module, or imports it after a batch-mate removed it, landing the inherited copy
 cannot repair the prospective tree. Those cases receive the ordinary missing-source request.
 A genuinely new module in another batch still waits for that batch to land before re-probing.
+
+A missing-source refusal is not final for its head. The refusal records a dependency fingerprint
+(`evidence.missing_source_watch`): for each gap, the blobs at its importer and at its missing source
+on the canonical commit, and the distinct such pairs at active batch tips that differ from it.
+Whenever the canonical commit or an active batch's tip moves, `_recheck_missing_sources` recomputes
+it for each PR's newest refusal. When it differs (the source landed, entered or left a batch, or an
+importer changed), the refusal becomes `missing-source-recheck` (journal `missing-source-recheck`)
+and admission (`readmit`) reads the PR again. If that read would admit the head (open, not a draft,
+review-safe, scoreboard green, no blocking label), `restore_missing_source` returns the same input
+to waiting at its original age (journal `missing-source-readmitted`, counter
+`missing_source_rechecks`), and it is probed like any waiting input, which refuses it again if a
+gap remains. The refusal comment is keyed by head, so a repeated refusal posts nothing new.
+Closing, drafting, pushing to or withdrawing a refused PR drops its refusal from the recheck.
+
+A blocking label (`hold`, `wip` and the others `approve` refuses) added to a PR whose input is
+waiting or reserved is recorded in the input's `blocked_labels` (journal `blocked-label`), from the
+`labeled` delivery or, when that was missed, from admission's or eligibility's next read of the PR.
+While it is set the input stays waiting but no batch takes it: ordinary insertion, the control lane
+and the emergency lane skip it, and a probe that was already running returns it to waiting
+(`last_probe` `blocked-label`). It keeps its approval and age, so once the labels go (journal
+`blocked-label-cleared`) it is placed like any waiting input. A batch member is not touched.
+Refusals recorded before the fingerprint existed compare against the base of the batch that
+refused them, without batches.
 
 Background preparation (item 8 of "Pipeline acceleration behind the head" in the plan): while the
 head waits on CI or is being repaired, an open batch is built as assembled on its own base (never on
@@ -249,9 +286,15 @@ told that the target is the next head's expected base rather than `main`. `claim
 after the unheld head tasks and before `prepare`, one claim per batch; insertion goes on during the claim, and the submission
 is validated against the members the task covers and adopted as the batch's pre-rebase (`adopted`)
 with base, tip, version and members unchanged. A task whose `onto` is no longer the head's tip, or
-whose batch's chain was rewritten (a preparation adopted), is superseded and its claims released. A
+whose batch's chain was rewritten (a preparation adopted), is superseded and its claims released,
+except a claimed task whose `onto` is an earlier tip of the current head (a repair round or a rebase
+moved it, `_preserve_across_head_round`): resolving a conflict outlasts a head round, so the task is
+recorded in `state:emergency_preserved` (`pre-rebase-preserved` in the journal) like the claimed
+successor work of an emergency head (below), its owner submits onto that tip, and the next
+`_pre_rebase` carries the adopted result onto the head's tip by replay. A
 rebuild of the head or a repair that empties a head member discards every pre-rebase. When the head
-lands and the canonical commit equals `pre_rebase_onto`, the sealed head takes the pre-rebased chain
+lands and the canonical commit equals `pre_rebase_onto`, or the pre-rebase carries onto it by a clean
+replay (a preserved task that resolved onto an earlier tip of the landed head), the sealed head takes the pre-rebased chain
 directly (the `rebased` journal entry carries `pre_rebased`), recording the members edited in the
 task as edited; otherwise it is replayed as before. The stacked pair is never built by the
 controller and nothing about the pre-rebase is a verdict.
@@ -324,12 +367,35 @@ batch's tips newest first, at most four per batch (`Controller._landed_tips`), w
 Every task's `warm_revs` (`Controller._warm_revs`) names the same tips after the batch tips it lists
 and before the base.
 
+Staging never builds on a `main` revision whose Lake cache is not published. Before any dispatch
+(after a live run is re-adopted, which needs none) the controller asks the public revision endpoint
+(`base_cache_endpoint`) for the map `pr-build.yml`'s cache lookup reads: the URL is TauCetiTools'
+`lake_cache_probe.exact_map_url` for the toolchain in `lean-toolchain` at the base. The base is
+covered by its own map, or by that of a first-parent ancestor at most `BASE_CACHE_ANCESTORS` (20)
+commits back whose tree differs from the base's only outside the Lake build inputs (every `.lean`
+file, `lakefile.toml`, `lakefile.lean`, `lake-manifest.json`, `lean-toolchain`; `lake_build_input`),
+since the walk of staging's lookup finds that map and every input hash matches. The probe runs
+without the controller lock, and the head is re-read after it. A covering revision is remembered
+for the process; a miss is remembered for `base_cache_recheck_seconds`. While no map covers the
+base the head is not dispatched: the reason line says `head N waiting for base SHA cache to be
+published`, the head's status carries `base_cache_wait` (`batch_id`, `base`, `since`, `detail`,
+`alerted_at`), `base-cache-wait` is journaled once per base, and after `base_cache_alert_seconds`
+the status raises an alert and one direct message is sent (`base-cache-alert`). The dispatch that
+follows journals `base-cache-published`. An emergency batch (`batches.urgent == 2`) is exempt, being
+how `main` is published again after an out-of-queue push, and journals `dispatch-unpublished-base`.
+Source-candidate CI, which reads its own cache scope, and a controller built without
+`revision_map_probe` (the fixtures, native sources) skip the requirement.
+
 A run GitHub reports `queued` or `in_progress` is never re-dispatched over. It is lost only when it
 can no longer be found (neither in the listing nor by a direct read of the run), or when it is
 `in_progress`, nothing in its jobs moved for `lost_run_seconds` (progress is any phase or step
 appearing, starting or completing, or the run's `updated_at` moving), and a direct read
 (`GET /repos/{repo}/actions/runs/{id}`) still says `in_progress` with an `updated_at` at least that
-old; a silence short of that is a `stall:` reason line, never a verdict. A second dispatch for a tip
+old; a silence short of that is a `stall:` reason line, never a verdict. A run publishing its final
+oleans (`publishing`: the `sandboxed-build` step `Build exact candidate under bwrap` concluded
+`success`, and the handoff step or the `publish-merge-group-cache` job has started with no phase of
+them concluded unsuccessfully) is never lost, however long it is silent: a publisher that really died
+ends when GitHub fails or times out its job, and the completed run is classified as usual. A second dispatch for a tip
 whose run is live is never issued, because pr-build.yml's concurrency group would cancel the live run:
 before any re-dispatch of a tip dispatched before, the controller asks `find_candidate_run` for the
 newest run for it since its first attempt, and when that run is still `queued` or `in_progress` it
@@ -347,9 +413,16 @@ its head rebuilt, every other attempt of the batch whose run is known and not la
 `cancel_result` (`cancelled`, `already-completed` for a 409, or the failure), a pending attempt
 becomes `superseded` with detail `ci-cancelled: <reason>` (an attempt already classified keeps its
 outcome, so infrastructure retries still count), and `ci-cancelled` is journaled with the attempt,
-run, `superseded_by` and reason. A failed request (403, 404, 5xx) is logged and retried once through
-the outbox (`cancel_run`, key `cancel-run:<run id>`); the second failure is recorded as `gave-up:`
-and dropped, and neither holds back the dispatch or the landing. A cancelled run is never treated as
+run, `superseded_by` and reason. A failed request (403, 404, 5xx), or a failed lookup of a
+superseded attempt's run, is logged and leaves a durable `cancel_intent:<attempt>`, which
+`_settle_cancel_intents` retries with the outbox's backoff (`outbox_retry_seconds` doubling up to
+`outbox_retry_max_seconds`) until the run is settled; neither holds back the dispatch or the landing.
+A `cancel_run` outbox entry left by an earlier controller gets one more try and then hands a failure
+to the same intent. A source-CI cancellation (`SourceCandidateCI.cancel_run`) is authorised by the
+stored `ci_request_runs` row and its receipt alone, checked against the bound execution repository
+and the live run; it never reparses the frozen request or its execution policy, so an attempt frozen
+under an older policy schema stays cancellable, and a run with no stored ownership is never
+cancelled. A cancelled run is never treated as
 lost or as an infrastructure failure: its attempt is no longer observed, the re-adoption of live
 runs skips it, and observation of a newer attempt never binds to it.
 
@@ -411,7 +484,111 @@ hour.
 
 Urgent lane: `mark_urgent` flags the input (drawn next, ahead of the random draw) or, if it is
 already a member of the open batch, the batch. The open batch seals as soon as the head lands and
-its active claims finish; the running head is never cancelled.
+its active claims finish; the running head is never cancelled. It never lowers an emergency
+(`urgent = 2`) input or batch.
+
+Emergency lane (`emergency_enabled`, off by default): a repository admin's request
+(`request_emergency(repo, pr, actor, surface=, reason=, live_head=)`, from `bors emergency`,
+`POST /admin/emergency` or `tauceti-queue emergency`) makes an approved PR the next head as a batch
+of its own. The flag is never an approval: the PR needs a live input (`waiting`, `reserved` or
+`inserted`) whose head is the live PR head, else the request is refused `not-approved` or
+`head-moved` (also `disabled`, `forgejo-inert`, `already-requested`); every request and refusal is
+journaled (`emergency-requested`, `emergency-refused`). The input gets `urgent = 2` and
+`evidence.emergency` (`actor`, `requested_at`, `surface`, `reason`, then the `batch_id` and, for a
+displaced PR, `displaced`), and leaves the ordinary draw (`_waiting`). An ordinary insertion never
+makes an emergency batch: it copies at most urgency 1 into its batch.
+
+The tick's `_emergency` step (after `_supersede_stale_pre_rebase`, before `_seal`) settles cancel
+intents, ends a dead emergency batch E (`empty-allocation`: no member after a crash or a transient
+probe failure, retried; `emptied`: no active member; `inert`: a member from a disabled source), and,
+when no E is live, builds one for the oldest request: a waiting input is probed (`_probe`) into a
+new open batch on `main` with `batches.urgent = 2` (`conflicts-with-main`, `missing-source`,
+`missing-source-in-flight` and `source-ci-scope` refuse the request; `probe-error`, `batch-moved` and
+`admission-pending` keep it for the next pass); an input inserted in an open batch B is replayed onto
+`main` without the lock with the same checks and then, in one transaction, inserted into a new E
+whose ownership of the input (`inputs.batch_id`) replaces B's (the prospective singleton; a refusal
+leaves it in B). A request whose PR is in the running head waits for that head to land, unless
+eviction (below) displaces it. One E is live at a time; later requests queue behind it, first in
+first out. E is never evicted. With `emergency_evict` off E waits for the running head to land
+(`emergency-waits`).
+
+Eviction (`emergency_evict`, off by default; `_evict`): E takes the head from a running ordinary head
+H unless H is protected, decided on H's current attempt in this order (`_protection`): a
+promotion-refusal hold is never protection; a pending `promote:<H>:...` outbox entry (P1) or a pass
+(P2) is; then, on a fresh strict observation of a pending attempt that may have a run
+(`_eviction_observation`: `needs_observation` set, `_observe_attempt(strict=True)`, reloaded; a
+source-candidate run in progress also has its phases read afresh, and a failed read means no
+eviction this pass), P2 again, a completed run with conclusion `success` whose verdicts are being
+bound (P3), and a run publishing its final oleans (P4, `publishing`). Everything else is evicted: a
+building or queued run, a publisher still waiting for a runner, a pending or uncertain dispatch, an
+infrastructure backoff, a source failure waiting for or under repair, a rebase conflict, an
+escalation hold. An observation that fails means no eviction this pass; a head found protected by an
+observation within `polling_interval_seconds` is not read again until that interval passes. After
+the observation everything read is revalidated (same head, version, tip and attempt, no controller
+claim on H, still not protected, E still sealable or the prospective singleton still current), then
+one transaction: for a PR in H with other active members, E is allocated from the prospective
+singleton built beforehand (ownership moves only here); H becomes `open` again, sealed, with its
+version and tip, `expected_parent` cleared and `prepared_version = version`; a durable
+`cancel_intent` is written for every unsettled attempt of H (a pending one superseded), except an
+attempt under a promotion-refusal hold, which H returns to; `state:emergency_evicted:<H>` records
+H's version, tip and open tasks; `_make_head(E)`; journal `evicted` (the last observed phases and why
+H was not protected). What no transaction prevents: the run can start publishing between the
+observation and the cancel.
+
+While H waits, its retained tasks (open at the evicted version) stay submittable and claimable
+(`_evicted_task_current`), and nothing else is created for H (`_pre_rebase`, `_prepare_open_batches`,
+`_prepare_pre_rebased`); an adoption on H, like a preparation's, records `prepared_version`. Tasks
+are offered by the role of their batch, not their kind (`claim_task`, `_choose_task`): the head's
+task first, then open batches' work, H's retained repair ahead of pre-rebases and preparations, with
+claims on open batches bounded by `repair_concurrency - 1`; while no claim on the head is live, the
+head's task is offered even when the claims already number `repair_concurrency`, so live claims can
+exceed it by one while H keeps a retained claim. In normal operation role and kind coincide. Once E
+is dispatched, H (now the first open batch) is pre-rebased onto E's tip as usual and seals from that
+pre-rebase when E lands; the batch behind H keeps its pre-rebase onto H's tip and gets no own-base
+preparation while that pre-rebase is usable. If E ends without landing, H is sealed again at once on
+its unchanged base. A run with an open cancel intent is never re-adopted (`_readopt_live_run`), so a
+returning H dispatches a new attempt. The marker goes when H is head again, lands or is removed.
+
+E is left out of the scheduling selectors only (`_staging_batches`: insertion, `open_batch_limit`,
+idle removal, the first open batch for pre-rebase and preparation, successor sealing); retained-ref
+republication, sources in flight and status still see it. `_seal` selects `_emergency_ready()` (an
+open E with an active member, not inert) before the first open batch and makes it head through the
+same checks (`_seal_blocked`: inference hold, external head, claims) and transition (`_make_head`).
+As E becomes head, the claimed `pre_rebase` tasks and claimed pre-rebased `prepare` tasks of ordinary
+open batches are recorded (`state:emergency_preserved`): while claimed they stay current on their
+recorded `onto` and their batch's pre-rebase is not rewritten, so they submit as usual and the next
+`_pre_rebase` carries the result onto E's tip. E dispatches on an unpublished base (published base
+cache, above) and lands only on a pass of its own run through the normal promotion.
+
+A displaced slot in B never acts for the input (`_displaced`): its withdrawal, anticipation or
+return only marks the slot, and B's landing skips it. Every way E's member leaves E goes through
+`_emergency_exit` (escalation, adoption emptying or anticipation, return, cancellation, and a
+rejection when E lands with `withdraw_emptied_at_adoption` off): when B's slot is still live the
+input is `inserted` in B again with one comment to the author; otherwise the caller's own behaviour
+applies (withdrawal cancels, return waits at the original age). Every way E ends without landing goes
+through `_end_emergency`, one transaction that returns its member (or a reservation its own probe
+holds), clears the request (except a transient `empty-allocation`), supersedes its tasks, releases
+its claims, discards pre-rebases onto its tips, removes it (`emergency-ended` with the cause:
+`cancelled`, `dissolved`, `emptied`, `inert`, `empty-allocation`) and writes `cancel_intent:<attempt>`
+for every unsettled attempt of E at any version. `_reconcile_head` ends an E emptied between tick
+steps before anything can dispatch it. `cancel_emergency(repo, pr, actor, surface=)` refuses
+`promotion-pending` once a `promote` entry is pending or the current attempt passed; a promotion
+entry for a batch no longer `head` returns `not-head`. `_settle_cancel_intents` (after each such
+transaction and first in every `_emergency` pass) looks up the run of an attempt without one whose
+dispatch may have been sent, cancels a live run and deletes the intent only once the cancel is
+accepted, the run is observed completed, or the attempt provably has no run (`prepared`, `rejected`,
+or an `accepted` dispatch with no run found once older than `dispatch_timeout_seconds`; a `sending`
+or `uncertain` dispatch is never retired by age). A source-CI lookup that ends in `NoOwner` (a
+complete listing with no live, unreadable or owned run) is such an empty lookup, not a failure. A
+failure backs the intent off (`tries`, `retry_at`, as for the outbox), measured from the clock after
+the failure and never earlier than a rate-limit deadline GitHub gave it; there is no cap, and
+intents block nothing. Source-CI cancellations share one GitHub client in deferred mode: they never
+sleep or retry in a pass, and the cancel POST's rate-limit headers feed the same counters.
+
+`approve` of a live input's own accepted head by a repository admin (admin evidence with `actor_id`
+and `merge_base_sha`) records `evidence.admin_reapproval` beside the original evidence and journals
+`admin-reapproved`; the original evidence, `approved_at`, state and batch are untouched. The feeds'
+scope approvals read it when the original evidence has no admin scope.
 
 Bors's state at the cutover (`import_bors_state(observation, candidates, now=, dry_run=,
 release_head=)`, implemented in `tauceti_queue/bors_import.py`): every member of a non-running batch
@@ -474,6 +651,10 @@ and reported in status:
 | `outbox_retry_seconds`, `outbox_retry_max_seconds` | 30, 900 | outbox retry backoff |
 | `polling_interval_seconds` | 60 | polling fallback interval |
 | `approval_poll_interval_seconds` | 900 | interval of the approval reconciliation poll behind the webhooks |
+| `github_background_floor` | 1000 | queue App requests left at which admission's background reads wait for the window's reset |
+| `admission_evidence_mode` | `off` | `shadow` keeps admission evidence from webhooks and compares its verdict with each full read (`admission_evidence.py`); `events` also evaluates from one GraphQL read and ignores status deliveries that change nothing |
+| `admission_local_merge_base` | false | merge base from the local clone (complete, unique merge base) instead of the compare API; compare answers otherwise |
+| `admission_insertion_check` | false | re-read a GitHub PR's admission inputs before its head joins a batch; hold the insertion and evaluate again unless they match the evaluated digest |
 | `membership_label` | `bors-staging` | label added to member PRs at insertion |
 | `repaired_label` | `repaired-in-queue` | label added to a landed member whose commit the queue modified (one with an edit summary), created in the repository on first use; empty disables it |
 | `insertion_probe_budget_seconds` | 20 | wall-clock budget of one tick's insertion probes; the rest wait for the next tick, which follows at once |
@@ -483,6 +664,12 @@ and reported in status:
 | `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
 | `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
 | `prepare_pre_rebased` | true | create a `prepare` task for the oldest open batch's usable pre-rebase on the head's tip (with `prepare_open_batches`, for the batches it applies to) |
+| `base_cache_endpoint` | `https://cache.taucetiproject.org/revisions` | public Lake revision endpoint a head's base must be published at before staging is dispatched (CI section above); empty disables the requirement |
+| `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
+| `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |
+| `emergency_enabled` | false | accept emergency requests (`bors emergency`, `POST /admin/emergency`); off refuses them `disabled`, and a request already accepted keeps running |
+| `emergency_evict` | false | the emergency batch takes the head from a running ordinary head unless it is about to land or publishing its final oleans (`_evict`); off, it waits for the running head to land |
+| `control_lane_enabled` | false | with mixed sources admitted under GitHub primary, stage GitHub PRs whose own diff leaves the native path policy in the control-file lane batch, sealed next after the emergency batch and never repaired ([mixed-sources.md](mixed-sources.md), "The control-file lane"); off stages a live lane batch as an ordinary one |
 | `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
 
 ## Ports
@@ -500,7 +687,8 @@ squash-landed member with a title change, which no other method expresses. `Cand
 only `kind == "infrastructure"` for classification.
 
 Commands arrive from the adapter as `approve(repo, pr, head_sha, reviewer, priority, evidence,
-approved_at=None, pull=None)`, `unapprove`, `cancel`, `set_priority`, `mark_urgent(repo, pr, actor)`;
+approved_at=None, pull=None)`, `unapprove`, `cancel`, `set_priority`, `mark_urgent(repo, pr, actor)`,
+`request_emergency` and `cancel_emergency`;
 `approved_at` lets the cutover import keep an input's original age and `pull` a PR already read.
 `validate_pull(repo, pr, head_sha)` and `input_for(repo, pr)` serve the import and the poll. Events arrive as
 `handle_event(kind, payload)` with the raw webhook payload; they refresh what they describe
@@ -587,7 +775,8 @@ prepares, `own_base` or `pre_rebased`) and `waiting` (null, or the other `kind` 
 and `sealed_at`, and retain the successor for compatibility); `sealed_successor` (null or the first sealed
 non-head batch summary; `open_batches` includes every sealed non-head batch); `head` (the same plus `sealed_at`,
 `expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
-`repair`, `infrastructure`, `promote`, the open `task`, and `ci` with dispatch id, run id and
+`repair`, `infrastructure`, `promote`, the open `task`, `base_cache_wait` (null, or the wait for a
+published base described in the CI section), and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,
 outcome and detail, plus `stall` with `since`, `silence_seconds` and the phase when the build has
 been silent for `stall_interval_seconds`, and `cancelled_runs`, the batch's attempts whose runs the
@@ -605,7 +794,14 @@ claim collisions, chain validation failures, inference holds, promotion refusals
 repair-or-reject decision: `no_repair_opt_outs`, `edit_summaries` and `prs_edited_landed` (the
 repairs), `no_repair_withdrawals`, `problem_anticipated_needs_rebase`,
 `problem_anticipated_readmitted`); the recent
-`head_cycle_seconds` (first dispatch to landing); `insertion_passes`; `max_passes_waited`.
+`head_cycle_seconds` (first dispatch to landing); `insertion_passes`; `max_passes_waited`;
+`emergency` (`enabled`; `batch`, null or the live emergency batch: `batch_id`, `stage` (`waiting` or
+`head`), `waiting_for`, and the request's `number`, `state`, `actor`, `requested_at`, `surface`,
+`reason`; `queued`, the requests behind it; `cancel_intents`, the open intents with `attempt_id`,
+`batch_id`, `reason`, `at`, and after a failure `tries` and `retry_at`). Every batch summary
+carries `emergency` (`urgent == 2`) and `lane` (`control` for the control-file lane batch, else
+empty); `waiting.control` counts the waiting control-file inputs, and each waiting input carries
+`control`.
 
 `status()` waits at most two seconds for the controller lock (`wait=` overrides; `/healthz` passes
 half a second). When a pass holds it longer, the snapshot taken at the end of the last pass or
@@ -638,6 +834,7 @@ Tests are `tests/queue_fixture.py` (F), `tests/queue_controller.py` (C) and `tes
 | 18 no PR waits more than the window in passes | F `test_s18_no_pr_waits_more_than_the_window_in_passes`; C `Draw` |
 | 19 PR events and pushes neither cancel nor verdict; cancelled runs change nothing | F `test_s19_pr_events_and_branch_pushes_never_cancel_a_candidate_or_post_its_verdict`, `test_s10_s19_stale_status_...` |
 | 20 urgent lane | F `test_s20_urgent_pr_is_in_the_next_head_without_cancelling_the_running_one` |
+| 20b emergency lane | F `EmergencyLane` (every test of the class) |
 | 21 closing or relabelling a member changes nothing | F `test_s16_s21_...`; C `test_waiting_inputs_react_to_events_and_members_do_not` |
 | 22 status names runner, host, phases, stall, revision | F `test_s22_status_names_runner_host_phase_progress_stall_and_revision`; C `StatusShape` |
 | 25 a removal that strands an importer is refused at insertion | F `MissingSource` (`test_s25_removal_that_strands_an_importer_is_refused_at_insertion`, `test_s25_bad_import_is_refused_and_a_batch_mates_module_is_a_source`, `test_s25_gap_already_on_main_and_unavailable_scan_do_not_refuse`); `tests/queue_admission_planning.py` `ImportGaps` |

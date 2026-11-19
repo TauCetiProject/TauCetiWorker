@@ -145,6 +145,9 @@ def display(value, default_kinds=()):
         ]
         rounds.append(("  " + kind, counts))
     rounds.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in report_windows]))
+    closed = [sum(r.get("closed", 0) for r in s["rounds"][w].values()) for w in report_windows]
+    if any(closed):
+        rounds.append(("    closed own PR", closed))
     unconfirmed = [sum(r.get("unknown", 0) for r in s["rounds"][w].values()) for w in report_windows]
     if any(unconfirmed):
         rounds.append(("    outcome unconfirmed", unconfirmed))
@@ -505,8 +508,10 @@ def combine(values):
                 continue
             for kind, counts in types.items():
                 row = s["rounds"][w].setdefault(kind, dict(finished=0, failed=0, unknown=0))
-                for key in row:
+                for key in ("finished", "failed", "unknown"):
                     row[key] += counts.get(key, 0)
+                if counts.get("closed"):
+                    row["closed"] = row.get("closed", 0) + counts["closed"]
     cleanup = [v["storage_cleanup"] for v in known if v.get("storage_cleanup")]
     if cleanup:
         s["storage_cleanup"] = dict(

@@ -104,8 +104,10 @@ def survey_with(pr=1, build_success=True):
     return sv
 
 
-def still(stage, rs, c=None, sv=None, gh=None):
-    return wu._still_actionable(stage, worker(rs, gh), sv or survey_with(), c or tc.Candidate(1, HEAD, ""))
+def still(stage, rs, c=None, sv=None, gh=None, *, explicit=False):
+    return wu._still_actionable(
+        stage, worker(rs, gh), sv or survey_with(), c or tc.Candidate(1, HEAD, ""), explicit=explicit
+    )
 
 
 # --- review ---------------------------------------------------------------------------------------
@@ -131,6 +133,13 @@ for pause in ("hold", "on-hold", "human"):
     gh = FakeGH()
     gh.view["labels"] = [{"name": pause}]
     check("live pause declines review: " + pause, still("review", FakeRS(), gh=gh), False)
+
+# Shared discovery may predate queue intake. The selected live header owns this decision.
+for stage in ("review", "fix"):
+    gh = FakeGH()
+    gh.view["labels"] = [{"name": "bors-staging"}]
+    check(f"new queue ownership declines {stage}", still(stage, FakeRS(), gh=gh), False)
+    check(f"explicit target overrides queue ownership for {stage}", still(stage, FakeRS(), gh=gh, explicit=True), True)
 
 check("a head reviewed since the survey is declined", still("review", FakeRS(clean_head=HEAD)), False)
 carried = FakeRS(meta=tc.Meta({"head_sha": HEAD, "states": {"reuse": "green"}, "runs": []}, "fresh"))
@@ -276,6 +285,7 @@ for changes, expected, probe in (
     ({"baseRefName": "other"}, False, False),
     ({"isDraft": True}, False, False),
     ({"labels": [{"name": "hold"}]}, False, False),
+    ({"labels": [{"name": "bors-staging"}]}, False, False),
     ({"mergeable": "MERGEABLE"}, False, False),
     ({"mergeable": "CONFLICTING"}, True, False),
 ):
@@ -287,6 +297,15 @@ for changes, expected, probe in (
     check(f"native prelaunch checks {changes}", actual, expected)
     calls = [("authorize", True)] + ([("proof", w.cfg.state, 1, HEAD)] if probe else [])
     check(f"native proof follows authorization {changes}", gh.calls, calls)
+
+gh = ProofGH(labels=[{"name": "bors-staging"}])
+w = worker(FakeRS(), gh)
+w.cfg.state = Path("/unused-probe-state")
+check(
+    "explicit rebase overrides live queue ownership",
+    wu._still_actionable("rebase", w, survey_with(), tc.Candidate(1, HEAD), explicit=True),
+    True,
+)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

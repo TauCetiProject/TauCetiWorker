@@ -1,6 +1,6 @@
-"""Run each round in its own worktree of one host clone (opt-in per host).
+"""Run each round in its own worktree of one host clone (on unless a host opts out).
 
-With `TAUCETI_ROUND_WORKTREES=1`, a host keeps one bare clone of TauCeti (one object store and one
+Unless `TAUCETI_ROUND_WORKTREES=0`, a host keeps one bare clone of TauCeti (one object store and one
 set of refs) and every round works in a linked worktree of it at the worker's ordinary checkout
 path, `cfg.checkout`:
 
@@ -31,6 +31,9 @@ from .config import log
 
 # Every checkout this process prepared (worker and source checkouts), released at round end.
 PREPARED = []
+# The host clone each prepared checkout is a worktree of. A source checkout is prepared while its
+# source is active, so `host_clone()` names another repository's clone by the time the round ends.
+CLONES: dict[Path, Path] = {}
 FETCH_INTERVAL = 60
 FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
 # Shared-config keys that could run code or redirect traffic for every round on the host. An agent
@@ -54,8 +57,9 @@ UNSAFE_CONFIG = (
 
 
 def enabled(env=None) -> bool:
+    """Per-round worktrees are the default; `TAUCETI_ROUND_WORKTREES=0` (or false/no/off) opts a host out."""
     env = os.environ if env is None else env
-    return env.get("TAUCETI_ROUND_WORKTREES", "").strip().lower() in {"1", "true", "yes", "on"}
+    return env.get("TAUCETI_ROUND_WORKTREES", "").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def root() -> Path:
@@ -103,14 +107,14 @@ def _git(*args, check=True, timeout=600):
     return result
 
 
-def owns(path: Path) -> bool:
-    """Whether `path` is a linked worktree of this host's clone."""
+def owns(path: Path, clone: Path | None = None) -> bool:
+    """Whether `path` is a linked worktree of this host's clone (or of `clone`)."""
     from .live_use import checkout_kind, common_dir
 
     if checkout_kind(path) != "worktree":
         return False
     try:
-        return common_dir(path).resolve() == host_clone().resolve()
+        return common_dir(path).resolve() == (clone or host_clone()).resolve()
     except Exception:  # noqa: BLE001 - an unreadable worktree is not ours to manage
         return False
 
@@ -317,6 +321,7 @@ def prepare(cfg, url) -> bool:
         return False
     _unpark(cfg, co)
     PREPARED.append(cfg)
+    CLONES[Path(co).resolve()] = host_clone()
     return True
 
 
@@ -336,13 +341,16 @@ def release(cfg) -> None:
         if co is None or co in seen:
             continue
         seen.add(co)
+        # The clone it was prepared from: a source checkout is not a worktree of the default clone,
+        # and one left behind is swept by another worker's round while holding this worker's lock.
+        clone = CLONES.pop(Path(co).resolve(), None)
         try:
-            if not enabled() or not co.exists() or not owns(co):
+            if not enabled() or not co.exists() or not owns(co, clone):
                 continue
             _check_unused(co)
             _park(current, co)
             with host_lock():
-                _remove(co)
+                _remove(co, clone)
         except Exception as error:  # noqa: BLE001 - round cleanup must not fail the round
             log(f"worktrees: release deferred ({type(error).__name__}: {error}); the next round removes it")
 

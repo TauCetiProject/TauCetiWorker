@@ -14,7 +14,7 @@ import time
 from .agents import resolve_authoring_profile
 from .budget import ACCOUNTING_ERRORS, Budget, BudgetError, admission_pause
 from .claude_api import api_mode
-from .config import Config, NoProgress, log
+from .config import Config, NoProgress, log, one_line
 from .constants import (
     BACKOFF_BASE,
     BACKOFF_MAX,
@@ -402,7 +402,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     if published
                     else ("round timed out" if rc in (124, 137) else f"round exited with status {rc}")
                 )
-                log(f"round {tag}; no-progress streak={streak} — backing off {nap}s")
+                why = f": {one_line(str(published))}" if published else ""
+                if failed.get("failure_log"):
+                    why += f" (log: {failed['failure_log']})"
+                log(f"round {tag}{why}; no-progress streak={streak} — backing off {nap}s")
                 report_runtime(
                     "backoff",
                     detail=reason,

@@ -156,7 +156,7 @@ check("deciding there is nothing to do costs no quota", CALLS["bootstrap"], 0)
 # Ordinary dispatch uses the existing work/preflight path, without another quota request.
 ran = []
 tc.work_units._host_agent_binary = lambda stage, model: None
-tc.work_units._still_actionable = lambda *a: True
+tc.work_units._still_actionable = lambda *a, **kw: True
 tc.work_units.do_review = lambda *a, **k: ran.append("review") or 0
 rc = tc.work_units.dispatch("review", w, tc.Survey(worker_id=cfg.wid), tc.Candidate(1, "head", ""), opts)
 check("eligible idle Claude work dispatches normally", (ran, rc), (["review"], 0))

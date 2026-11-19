@@ -114,18 +114,7 @@ CASES = [
         1,
         0,
     ),
-    ("picker refusal is reported", {}, lambda h: [pull(h)], ["failure"], "picker refused", 1, 1),
-    # The push's own picker run can remove a label applied while it is in flight: label again once.
-    (
-        "removed label is applied again",
-        {},
-        lambda h: [pull(h), pull(h), pull(h), pull(h, labels=LABELLED)],
-        ["", "", "success"],
-        "attested",
-        1,
-        2,
-    ),
-    ("no assertion after two labels falls back", {}, lambda h: [pull(h)], [], "assertion not observed", 1, 2),
+    ("no receipt is needed", {}, lambda h: [pull(h)], [], "attested", 1, 1),
 ]
 
 for name, options, pulls, statuses, prefix, verify_calls, labels in CASES:

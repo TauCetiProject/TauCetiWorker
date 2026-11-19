@@ -6,7 +6,8 @@ Covered: the command corpus from bors-ng's COMMAND_PARSING.md for the commands t
 (well formed, with leftover text, miscased, run into a longer word, prose), the review App's
 exact-head forms, unsupported Bors commands, permission levels, and `run_comment`: permission
 denied, drafts, approval evidence (head, reviewer, priority, admin merge base), stale exact-head
-approvals, unapprove and cancel, and reply idempotency markers.
+approvals, unapprove and cancel, the emergency lane's `emergency` and `emergency-` (admins only), and
+reply idempotency markers.
 """
 
 import sys
@@ -40,6 +41,8 @@ class Parsing(unittest.TestCase):
             ("bors p=5", "priority"),
             ("bors single on", "single"),
             ("bors ping", "ping"),
+            ("bors emergency", "emergency"),
+            ("bors emergency-", "emergency_cancel"),
         ]:
             with self.subTest(body=body):
                 parsed = c.parse(body)
@@ -79,6 +82,7 @@ class Parsing(unittest.TestCase):
             "bors merge!",
             "bors p=5 please",
             "bors ping!",
+            "bors emergency now",
         ]:
             with self.subTest(body=body):
                 parsed = c.parse(body)
@@ -105,6 +109,8 @@ class Parsing(unittest.TestCase):
             "bors does this work",
             "bors merge-conflicts",
             "bors pinged",
+            "bors emergencyish",
+            "bors emergency-room visit",
             "thanks bors",
             "",
             None,
@@ -194,6 +200,16 @@ class FakeController:
 
     def set_priority(self, repo, pr, priority):
         self.calls.append(("set_priority", repo, pr, priority))
+
+    def request_emergency(self, repo, pr, actor, *, surface, reason="", live_head=None):
+        self.calls.append(("request_emergency", repo, pr, actor, surface, reason, live_head))
+        return self.emergency_result
+
+    def cancel_emergency(self, repo, pr, actor, *, surface):
+        self.calls.append(("cancel_emergency", repo, pr, actor, surface))
+        return {"cancelled": True, "reason": "cancelled"}
+
+    emergency_result = {"accepted": True, "reason": "accepted", "behind": None}
 
 
 class FakeAdapter:
@@ -348,6 +364,36 @@ class Running(unittest.TestCase):
         self.assertEqual(len(set(markers)), 3)
         self.assertTrue(all(m.startswith("reply issue_comment:1001:") for m in markers))
         self.assertEqual(controller.calls, [])
+
+    def test_emergency_is_for_repository_admins_and_binds_the_live_head(self):
+        controller, adapter = FakeController(), FakeAdapter(pr(), permissions={"alice": "write", "kim": "admin"})
+        [reply] = c.run_comment(controller, adapter, context("bors emergency"))
+        self.assertEqual((reply, controller.calls), (c.EMERGENCY_DENIED, []))
+        [reply] = c.run_comment(controller, adapter, context("bors emergency", login="kim"))
+        url = context("").comment_url
+        self.assertEqual(
+            controller.calls, [("request_emergency", "TauCetiProject/TauCeti", 42, "kim", "comment", url, HEAD)]
+        )
+        self.assertIn("Emergency request accepted", reply)
+        controller.emergency_result = {"accepted": True, "reason": "accepted", "behind": 7}
+        [reply] = c.run_comment(controller, adapter, context("bors emergency", login="kim"))
+        self.assertIn("queued behind #7", reply)
+        controller.emergency_result = {"accepted": False, "reason": "not-approved", "behind": None}
+        [reply] = c.run_comment(controller, adapter, context("bors emergency", login="kim"))
+        self.assertIn("did not run `bors emergency`: this pull request has no approved revision", reply)
+        [reply] = c.run_comment(controller, adapter, context("bors emergency-", login="kim"))
+        self.assertEqual(controller.calls[-1], ("cancel_emergency", "TauCetiProject/TauCeti", 42, "kim", "comment"))
+        self.assertIn("withdrawn", reply)
+
+    def test_emergency_on_a_draft_is_refused_and_the_review_app_cannot_run_it(self):
+        controller, adapter = FakeController(), FakeAdapter(pr(draft=True), permissions={"kim": "admin"})
+        [reply] = c.run_comment(controller, adapter, context("bors emergency", login="kim"))
+        self.assertIn("draft", reply)
+        controller, adapter = FakeController(), FakeAdapter(pr())
+        [reply] = c.run_comment(
+            controller, adapter, context("bors emergency", login="tauceti-review-bot[bot]", review_app=True)
+        )
+        self.assertEqual((reply, controller.calls), (c.EMERGENCY_DENIED, []))
 
     def test_missing_pull_request_runs_nothing(self):
         controller, adapter = FakeController(), FakeAdapter(None, permissions={"alice": "write"})

@@ -47,21 +47,13 @@ class Integration(unittest.TestCase):
             admin.request("PUT", f"repos/{repository.name}/collaborators/queue", {"permission": "admin"})
             admin.request("PUT", f"repos/{repository.name}/collaborators/worker", {"permission": "admin"})
             api = Forgejo(repository.forge, token=tokens["queue"])
-            reviewer = Forgejo(repository.forge, token=tokens["reviewer"])
             queue_actor = SourceActor.from_native(repository.forge, api.current_user())
-            review_actor = SourceActor.from_native(repository.forge, reviewer.current_user())
             identity = RepositoryIdentity(repository, row["id"])
             configuration = CONFIG.replace(b"https://source.example", repository.forge.url.encode()).replace(
                 b"team/Math", repository.name.encode()
             )
             approved = replace(policy(configuration), source=identity, credential_origin=repository.forge)
-            publishers = NativePublishers(
-                identity,
-                frozenset({review_actor.principal}),
-                frozenset({queue_actor.principal}),
-                frozenset({queue_actor.principal}),
-                generation=secrets.token_hex(16),
-            )
+            publishers = NativePublishers(identity, frozenset({queue_actor.principal}))
             clone = root / "controller"
             subprocess.run(["git", "init", "-q", str(clone)], check=True, capture_output=True)
             config = Config(

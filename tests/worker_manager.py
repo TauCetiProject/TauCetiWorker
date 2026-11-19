@@ -83,6 +83,41 @@ specs = [
     wm.WorkerSpec(id="worker2", agent="codex", only=("review",)),
     wm.WorkerSpec(id="worker3", only=("roadmap",), roadmap_only="RepresentationTheory"),
 ]
+
+# Source selection survives declarative storage and reaches the ordinary work parser.
+from tauceti_worker.worker_sources import resolve_selection
+
+assert specs[0].as_dict() == {"id": "worker1", "enabled": True}
+for github, forgejo, destination in ((True, False, None), (False, True, "forgejo"), (True, True, "forgejo")):
+    spec = wm.WorkerSpec.from_dict(
+        dict(id="source-worker", github=github, forgejo=forgejo, new_pr_forge=destination), 0
+    )
+    assert wm.WorkerSpec.from_dict(spec.as_dict(), 0) == spec
+    argv = spec.work_argv()
+    args = build_parser().parse_args(argv[argv.index("work") :])
+    assert resolve_selection(
+        getattr(args, "github", True), getattr(args, "forgejo", False), getattr(args, "new_pr_forge", None)
+    ) == resolve_selection(github, forgejo, destination)
+for changes in (
+    dict(github=False, forgejo=False),
+    dict(forgejo="true"),
+    dict(github=1),
+    dict(new_pr_forge="other"),
+    dict(new_pr_forge="forgejo"),
+):
+    try:
+        wm.WorkerSpec.from_dict(dict(id="invalid-source", **changes), 0)
+    except wm.WorkersError:
+        pass
+    else:
+        raise AssertionError(f"accepted invalid source selection: {changes}")
+old_source = wm.WorkerSpec("source-worker")
+new_source = dataclasses.replace(old_source, github=False, forgejo=True, new_pr_forge="forgejo")
+live_source = dict(applied_spec=old_source.as_dict(), state="running")
+assert wm._defer_read_policy_reload(new_source, live_source), "source changes must preserve a paid round"
+with patch.object(wm, "_between_rounds", return_value=True):
+    assert not wm._defer_read_policy_reload(new_source, live_source)
+
 manager = None
 try:
     if sys.platform == "linux":
@@ -148,12 +183,15 @@ try:
     legacy = root / "workers.conf"
     legacy.write_text(
         "./tauceti work --loop --worker-id worker2 --agent codex --only rebase,review --ignore-quota --auto-refresh\n"
+        "./tauceti work --loop --worker-id worker3 --full-quality\n"
     )
     imported = wm.parse_legacy_config(legacy)
     assert imported[0].id == "worker2"
     assert imported[0].only == ("rebase", "review")
     assert imported[0].ignore_quota is True
     assert imported[0].auto_refresh is True
+    assert imported[0].full_quality is False
+    assert imported[1].full_quality is True
 
     # The full semantic model must remain parseable by the real work CLI.
     maximal = wm.WorkerSpec(
@@ -169,6 +207,7 @@ try:
         respect_claims=False,
         extra_roadmap_prompt="Work on the material relevant to Higher Topos Theory",
         self_tested=True,
+        full_quality=True,
         source="https://example.invalid/source",
         author_model="gpt-5",
         author_effort="high",
@@ -194,6 +233,17 @@ try:
     )
     assert "--self-tested" not in wm.WorkerSpec(id="plain").work_argv()
     assert build_parser().parse_args(["work", "--no-self-tested"]).self_tested is False
+    # --full-quality: all five quality-pass checks instead of Q1, Q2 and Q5. Like --self-tested it
+    # only changes prompts, so turning it on waits for a round boundary.
+    assert parsed.full_quality is True
+    assert wm.WorkerSpec.from_dict({"id": "full", "full_quality": True}, 0).as_dict()["full_quality"] is True
+    assert "full_quality" not in wm.WorkerSpec(id="plain").as_dict()
+    assert wm._defer_read_policy_reload(
+        wm.WorkerSpec(id="attest", full_quality=True), {"applied_spec": before, "state": "running"}
+    )
+    assert "--full-quality" not in wm.WorkerSpec(id="plain").work_argv()
+    assert build_parser().parse_args(["work"]).full_quality is None
+    assert build_parser().parse_args(["work", "--no-full-quality"]).full_quality is False
     # A worker that has NOT opted in must not emit the flag: the default is to leave the operator's
     # single-use refresh token alone.
     assert "--auto-refresh" not in wm.WorkerSpec(id="plain").work_argv()

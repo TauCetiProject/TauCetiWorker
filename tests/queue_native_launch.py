@@ -67,7 +67,6 @@ class LaunchFiles(unittest.TestCase):
             forge,
             ".github/workflows/pr-build.yml",
             harness,
-            "c" * 40,
             "main",
             "main",
             True,
@@ -113,7 +112,7 @@ class LaunchFiles(unittest.TestCase):
             project_configuration_sha256=hashlib.sha256(CONFIG).hexdigest(),
             execution_policy=self.policy.record(with_config=False),
             workflow_revision="b" * 40,
-            publishers=dict(generation="1" * 32, reviews=[8], statuses=[7], recoveries=[7]),
+            publishers=dict(recoveries=[7]),
             control_policy_file=str(self.control),
             source_credentials=dict(
                 origin=dict(kind="forgejo", url=forge.url),
@@ -185,6 +184,17 @@ class LaunchFiles(unittest.TestCase):
                 NativeLaunch.load(self.path)
             read.assert_not_called()
 
+    def test_retired_publisher_fields_are_ignored(self):
+        row = copy.deepcopy(self.row)
+        row["publishers"].update(generation="1" * 32, reviews=[7], statuses=[8])
+        self.save(row)
+        publishers = NativeLaunch.load(self.path).bootstrap.publishers
+        self.assertEqual({int(p.native_id) for p in publishers.recoveries}, {7})
+        row["publishers"]["unexpected"] = []
+        self.save(row)
+        with self.assertRaises(NativeLaunchError):
+            NativeLaunch.load(self.path)
+
     def test_symlinks_public_files_and_duplicate_publishers_are_rejected(self):
         self.path.chmod(0o644)
         with self.assertRaises(NativeLaunchError):
@@ -195,7 +205,7 @@ class LaunchFiles(unittest.TestCase):
         with self.assertRaises(NativeLaunchError):
             NativeLaunch.load(link)
         row = copy.deepcopy(self.row)
-        row["publishers"]["reviews"] = [8, 8]
+        row["publishers"]["recoveries"] = [7, 7]
         self.save(row)
         with self.assertRaises(NativeLaunchError):
             NativeLaunch.load(self.path)

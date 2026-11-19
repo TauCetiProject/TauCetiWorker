@@ -29,6 +29,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 from tauceti_queue import __main__ as cli  # noqa: E402
+from tauceti_queue import build_progress  # noqa: E402
 from tauceti_queue import config as cfg  # noqa: E402
 from tauceti_queue import runtime as rt  # noqa: E402
 
@@ -259,12 +260,95 @@ class StatusCommand(Base):
         args = cli.build_parser().parse_args(["status", "--url", "http://queue.local:1/"])
         with captured() as (out, _err):
             self.assertEqual(cli.cmd_status(args, fetch=fetch), 0)
-        self.assertEqual(calls, ["http://queue.local:1/status"])
+        # The in-progress head's public build report is looked up too; this one is not a manifest.
+        self.assertEqual(calls, ["http://queue.local:1/status", build_progress.MANIFEST])
         self.assertIn("head: batch 1 v6", out.getvalue())
+        self.assertNotIn("build: ", out.getvalue())
         args = cli.build_parser().parse_args(["status", "--url", "http://queue.local:1", "--json"])
         with captured() as (out, _err):
             self.assertEqual(cli.cmd_status(args, fetch=fetch), 0)
         self.assertEqual(json.loads(out.getvalue())["head"]["id"], 1)
+
+    def test_head_build_progress_from_the_public_job_report(self):
+        scope = "a" * 64
+        path = f"/v1/operations/objects/{scope}/{'b' * 64}.json"
+        manifest = {"schema": "tauceti.operations.manifest/v1", "scope": scope, "domains": {"jobs": {"url": path}}}
+        report = {
+            "coverage": "untrusted_counters_trusted_reporter",
+            "observed_at": "2026-11-04T23:59:00Z",
+            "phase": "build",
+            "completed_modules": 25433,
+            "last_module": "TauCeti.Private",
+            "completed_tasks": 103917,
+            "total_tasks": 113955,
+            "tasks_per_minute": 850.4,
+        }
+        run = {"run_id": "41934607574", "run_attempt": 1, "active": True}
+        pages = {
+            "root": {"job_pages": [{"url": path}, {"url": path}]},
+            "page": {
+                "records": [
+                    {**run, "name": "pick", "progress": {"coverage": "steps_only"}},
+                    {**run, "run_attempt": 2, "progress": dict(report, completed_tasks=1)},
+                    {**run, "name": "sandboxed-build", "progress": report},
+                ]
+            },
+        }
+        calls = []
+
+        def fetch(url, **_kwargs):
+            calls.append(url)
+            if url.endswith("/status"):
+                return json.loads(json.dumps(FIXTURE))
+            if url == build_progress.MANIFEST:
+                return manifest
+            return pages["root" if len(calls) == 3 else "page"]
+
+        args = cli.build_parser().parse_args(["status", "--url", "http://q"])
+        with captured() as (out, _err), mock.patch.object(rt, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = NOW
+            self.assertEqual(cli.cmd_status(args, fetch=fetch), 0)
+        self.assertEqual(len(calls), 4, "the first page held the run, so later pages are not read")
+        self.assertIn(
+            "  build: phase build, 103,917/113,955 Lake jobs (91.2%), 850/min, ETA 05 Nov 11:10 AEDT\n",
+            out.getvalue(),
+        )
+        self.assertNotIn("Private", out.getvalue())
+        text = build_progress.text(
+            dict(report, phase="lint-env", completed_tasks=113955, tasks_per_minute=None), NOW.timestamp() + 600
+        )
+        self.assertEqual(text, "build: phase environment lint, 113,955/113,955 Lake jobs (100.0%), reported 11m ago")
+        self.assertEqual(
+            build_progress.text(dict(report, completed_tasks=None), NOW.timestamp()),
+            "build: phase build, 25,433 TauCeti modules built",
+        )
+        self.assertIsNone(build_progress.text({"observed_at": "2026-11-04T23:59:00Z"}, NOW.timestamp()))
+        self.assertEqual(
+            build_progress.text(dict(report, completed_tasks=100, tasks_per_minute=1e-300), NOW.timestamp()),
+            "build: phase build, 100/113,955 Lake jobs (0.1%), 0/min",
+        )
+        # A build job already finished while its run continues can sit behind terminal-only pages.
+        terminal = {"records": [{"run_id": "1", "active": False}]}
+        documents = iter([manifest, pages["root"], terminal, pages["page"]])
+        self.assertEqual(
+            build_progress.lookup("41934607574", 1, lambda *_a, **_k: next(documents))["completed_tasks"], 103917
+        )
+
+    def test_unavailable_build_progress_leaves_the_running_step(self):
+        for failure in (ConnectionRefusedError("down"), RuntimeError("HTTP 500"), {"schema": "other"}):
+
+            def fetch(url, failure=failure, **_kwargs):
+                if url.endswith("/status"):
+                    return json.loads(json.dumps(FIXTURE))
+                if isinstance(failure, Exception):
+                    raise failure
+                return failure
+
+            args = cli.build_parser().parse_args(["status", "--url", "http://q"])
+            with self.subTest(failure=failure), captured() as (out, _err):
+                self.assertEqual(cli.cmd_status(args, fetch=fetch), 0)
+                self.assertIn("ci run 41934607574", out.getvalue())
+                self.assertNotIn("build: ", out.getvalue())
 
     def test_default_url_comes_from_the_configuration(self):
         path = self.config_file()
@@ -273,7 +357,7 @@ class StatusCommand(Base):
         args = cli.build_parser().parse_args(["status", "--config", str(path)])
         with captured():
             cli.cmd_status(args, fetch=lambda url, **_: seen.append(url) or FIXTURE)
-        self.assertEqual(seen, [f"http://127.0.0.1:{port}/status"])
+        self.assertEqual(seen[0], f"http://127.0.0.1:{port}/status")
 
     def test_expected_revision(self):
         parser = cli.build_parser()
@@ -302,11 +386,58 @@ class StatusCommand(Base):
             args = cli.build_parser().parse_args(["status", "--url", "http://q", "--wait", "30"])
             with captured():
                 self.assertEqual(cli.cmd_status(args, fetch=fetch), 0)
-        self.assertEqual(len(attempts), 3)
+        self.assertEqual(len([url for url in attempts if url.startswith("http://q")]), 3)
         args = cli.build_parser().parse_args(["status", "--url", "http://q"])
         with captured() as (_out, err):
             self.assertEqual(cli.cmd_status(args, fetch=mock.Mock(side_effect=ConnectionRefusedError("down"))), 1)
         self.assertIn("no status from http://q/status", err.getvalue())
+
+
+class EmergencyCommand(Base):
+    def test_request_and_cancel_post_to_the_admin_endpoints(self):
+        requests = []
+
+        def fetch(url, method="GET", body=None, token=None, **_kwargs):
+            requests.append((url, method, body, token))
+            return {"accepted": True} if url.endswith("/admin/emergency") else {"cancelled": False}
+
+        parser = cli.build_parser()
+        with captured():
+            args = parser.parse_args(
+                [
+                    "emergency",
+                    "TauCetiProject/TauCeti",
+                    "42",
+                    "--reason",
+                    "harness",
+                    "--url",
+                    "http://q",
+                    "--token",
+                    "t",
+                ]
+            )
+            self.assertEqual(cli.cmd_emergency(args, fetch=fetch), 0)
+        self.assertEqual(
+            requests[-1],
+            (
+                "http://q/admin/emergency",
+                "POST",
+                {"repo": "TauCetiProject/TauCeti", "pr": 42, "reason": "harness"},
+                "t",
+            ),
+        )
+        with captured():
+            args = parser.parse_args(
+                ["emergency", "cancel", "TauCetiProject/TauCeti", "42", "--url", "http://q", "--token", "t"]
+            )
+            self.assertEqual(cli.cmd_emergency(args, fetch=fetch), 1, "a refusal exits 1")
+        self.assertEqual(
+            requests[-1], ("http://q/admin/emergency-cancel", "POST", {"repo": "TauCetiProject/TauCeti", "pr": 42}, "t")
+        )
+        with captured() as (_out, err):
+            args = parser.parse_args(["emergency", "TauCetiProject/TauCeti", "x", "--url", "http://q", "--token", "t"])
+            self.assertEqual(cli.cmd_emergency(args, fetch=fetch), 2)
+        self.assertIn("positive integer", err.getvalue())
 
 
 class SettingsCommand(Base):
