@@ -2297,6 +2297,12 @@ def _budget_spent(stage, w, c) -> bool:
         return False
 
 
+def _claim_held(w, pr) -> bool:
+    held = getattr(w.claims, "held", None)
+    lost = getattr(w.claims, "lost", None)
+    return bool(held) and held[0] == f"branch/{pr}" and not (lost is not None and lost.is_set())
+
+
 def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
     """Retire an owned, still-blocked head after its existing repair, rebase or CI attempts; no model call."""
     from .github_transport import read_context
@@ -2307,6 +2313,10 @@ def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
     try:
+        # A claim error lets ordinary branch work proceed unclaimed behind its push CAS; a close has none.
+        if not _claim_held(w, c.pr):
+            log(f"{stage} #{c.pr}: no confirmed branch claim; leaving the PR open")
+            return None
         with read_context(fresh=True, direct=True):
             if not _still_actionable(stage, w, sv, replace(c, partial_history=False), explicit=explicit):
                 return None
@@ -2360,6 +2370,9 @@ def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
                     f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
                     "remaining findings using the current review rubric."
                 )
+            # A progress checkpoint published during the claim or the reads renews the budget.
+            if not _budget_spent(stage, w, c) or not _claim_held(w, c.pr):
+                return None
             from .activity import select
 
             select(stage)
