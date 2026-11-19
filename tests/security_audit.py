@@ -1391,15 +1391,22 @@ class PrivateAlerts(unittest.TestCase):
             seen["handlers"] = handlers
             return Opener()
 
+        context = unittest.mock.MagicMock()
         with (
             patch.dict(os.environ, {"SSL_CERT_FILE": ""}),
-            patch.object(alerts, "ensure_ssl_cert_file", return_value=None) as bundle,
+            patch.object(alerts, "ensure_ssl_cert_file", return_value="/host/ca-bundle.crt") as bundle,
+            patch.object(alerts.ssl, "create_default_context", return_value=context) as default,
+            patch.object(alerts.urllib.request, "HTTPSHandler") as https,
             patch.object(alerts.urllib.request, "build_opener", side_effect=build_opener),
         ):
             with self.assertRaisesRegex(OSError, "stop before network"):
                 alerts.request(json.loads(self.config.read_text()), "POST", {"type": "direct"})
         bundle.assert_called_once()
-        self.assertTrue(any(isinstance(h, alerts.urllib.request.HTTPSHandler) for h in seen["handlers"]))
+        # The default stores (including SSL_CERT_DIR) stay loaded; the host bundle is added to them.
+        default.assert_called_once_with()
+        context.load_verify_locations.assert_called_once_with(cafile="/host/ca-bundle.crt")
+        https.assert_called_once_with(context=context)
+        self.assertIn(https.return_value, seen["handlers"])
 
     def test_alert_filter_never_clears_a_block_or_modifies_recovery_budget(self):
         blocked = self.work / "blocked.json"

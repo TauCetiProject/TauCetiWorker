@@ -54,7 +54,10 @@ def request(config: dict, method: str, params: dict) -> dict:
     # Entry points other than the Worker CLI (the pool, attest) never repaired SSL_CERT_FILE, and uv's
     # standalone CPython cannot find the NixOS bundle by default: every DM then failed verification.
     # Trust the host bundle explicitly, so delivery does not depend on how this process was started.
-    context = ssl.create_default_context(cafile=ensure_ssl_cert_file(dict(os.environ)))
+    context = ssl.create_default_context()  # Keeps SSL_CERT_DIR and other operator trust stores.
+    bundle = ensure_ssl_cert_file(dict(os.environ))
+    if bundle:
+        context.load_verify_locations(cafile=bundle)
     opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=context))
     with opener.open(req, timeout=20) as response:
         result = json.load(response)
