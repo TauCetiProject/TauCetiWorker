@@ -839,7 +839,10 @@ class CostTests(unittest.TestCase):
         self.summary()
         with contextlib.closing(a._connect()) as db, db:
             db.execute("DELETE FROM pr_contributions")
-        fleet_events.emit("pr_activity", repository="org/repo", pr=100, activity="review")
+        # At the fixture's time: a receipt later than `summary()`'s clock is deferred, and on a slow
+        # runner the wall clock passes it before this line.
+        with patch.object(fleet_events.time, "time", return_value=self.now):
+            fleet_events.emit("pr_activity", repository="org/repo", pr=100, activity="review")
         s = self.summary()
         self.assertEqual(s["pr_windows"]["total"]["reviews"], 1)
         self.assertEqual(s["pr_windows"]["total"]["assisted"], 1)
