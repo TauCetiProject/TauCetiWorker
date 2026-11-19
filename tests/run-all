@@ -266,6 +266,7 @@ RUN_STDLIB=(
   status_labels.py
   target_list.py
   target_landings.py
+  target_maintenance.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
