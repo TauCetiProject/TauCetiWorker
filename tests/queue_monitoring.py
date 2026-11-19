@@ -216,6 +216,48 @@ url = "https://private.invalid"
         self.assertEqual(progress["state"], "agent_running")
         self.assertNotIn(sentinel, json.dumps(value))
 
+    def test_mixed_task_binding_is_published_and_its_checkpoint_progress_matched(self):
+        github = {"forge": {"kind": "github", "url": "https://github.com"}, "id": 7, "name": PROJECT}
+        forgejo = {"forge": {"kind": "forgejo", "url": "https://git.example"}, "id": 1, "name": PROJECT}
+        binding = {
+            "schema": "tauceti-queue.mixed-task/v1",
+            "github": github,
+            "forgejo": forgejo,
+            "policy_digest": "8" * 64,
+            "epoch": "d" * 32,
+        }
+        head = self.controller._head()
+        self.controller._create_task(head, "repair", head["base"], [], self.clock())
+        task_id = self.controller.store.rows("tasks")[-1]["id"]
+        self.controller.store.execute("UPDATE tasks SET task_binding=? WHERE id=?", (json.dumps(binding), task_id))
+        directory = self.root / "worker" / "tasks" / str(task_id)
+        directory.mkdir(parents=True)
+        task = {
+            "task_id": str(task_id),
+            "claim_token": "c" * 32,
+            "schema": "tauceti-queue.mixed-task/v1",
+            "mixed_binding": binding,
+            "repository": PROJECT,
+        }
+        (directory / "task.json").write_text(
+            json.dumps({"task": task, "state": "agent_running", "updated_at": self.clock()})
+        )
+        value = self.export(worker_roots=[self.root / "worker"], task_observations=monitoring.TaskObservations())
+        record = next(t for t in value["tasks"] if t["id"] == str(task_id))
+        self.assertEqual(record["task_binding"], binding)
+        self.assertNotIn("identity_coverage", record)
+        self.assertEqual(record["progress"]["coverage"], "observed")
+        self.assertEqual(record["progress"]["state"], "agent_running")
+        self.assertNotIn("task_binding", record["progress"])
+        # A checkpoint bound to another queue generation is never attributed to this task.
+        task["mixed_binding"] = dict(binding, epoch="e" * 32)
+        (directory / "task.json").write_text(
+            json.dumps({"task": task, "state": "agent_running", "updated_at": self.clock() + 1})
+        )
+        value = self.export(worker_roots=[self.root / "worker"], task_observations=monitoring.TaskObservations())
+        record = next(t for t in value["tasks"] if t["id"] == str(task_id))
+        self.assertEqual(record["progress"]["coverage"], "unavailable")
+
     def test_export_does_not_write_the_database(self):
         before = {
             table: self.controller.store.rows(table) for table in ("inputs", "members", "batches", "claims", "settings")
@@ -240,6 +282,65 @@ url = "https://private.invalid"
         self.assertEqual(value["coverage"], "partial")
         self.assertEqual(len(value["members"]), 1)
         self.assertEqual(value["batches"][0]["size"], 2)
+
+    def landed_batches(self, *sizes):
+        """Terminal batches, oldest first, each with members whose inputs have landed."""
+        store = self.controller.store
+        template = {k: v for k, v in self.controller._head().items() if k != "id"}
+        member = {k: v for k, v in store.rows("members")[0].items() if k != "id"}
+        source = {k: v for k, v in store.rows("inputs")[0].items() if k != "id"}
+        made = []
+        for index, size in enumerate(sizes):
+            batch = store.insert("batches", **(template | {"state": "landed", "landed_at": self.clock()}))
+            for position in range(size):
+                title = f"Landed {index}.{position}"
+                number = 1000 + 10 * index + position
+                item = store.insert("inputs", **(source | {"number": number, "state": "landed", "title": title}))
+                store.insert("members", **(member | {"batch_id": batch, "input_id": item, "number": number}))
+            made.append(str(batch))
+        return made
+
+    def test_the_row_limit_shortens_terminal_history_by_whole_batches(self):
+        oldest, middle, newest = self.landed_batches(3, 1, 2)
+        # Two active members leave room for three terminal ones: the newest two batches fit whole.
+        with patch.object(monitoring, "LIMIT", 5):
+            value = self.export()
+        retained = {b["id"] for b in value["batches"]}
+        self.assertTrue({middle, newest} <= retained)
+        self.assertNotIn(oldest, retained)
+        self.assertEqual(len(value["members"]), 5)
+        self.assertEqual(value["coverage"], "observed")
+        self.assertFalse(value["truncated"])
+        self.assertTrue(value["collection_complete"]["members"])
+
+    def test_members_keep_their_input_detail_outside_the_published_inputs(self):
+        [batch] = self.landed_batches(2)
+        with patch.object(monitoring, "TERMINAL_INPUTS", 0):
+            value = self.export()
+        self.assertNotIn("landed", {i["state"] for i in value["inputs"]})
+        landed = [m for m in value["members"] if m["batch_id"] == batch]
+        self.assertEqual(sorted(m["title"] for m in landed), ["Landed 0.0", "Landed 0.1"])
+        self.assertTrue(all(m["approved_at"] for m in landed))
+
+    def test_a_member_never_carries_a_private_input_detail(self):
+        [batch] = self.landed_batches(1)
+        self.controller.store.execute(
+            "UPDATE inputs SET repository='OtherOrg/Private', title='PRIVATE_TITLE', author='PRIVATE_AUTHOR' "
+            "WHERE id=(SELECT input_id FROM members WHERE batch_id=?)",
+            (int(batch),),
+        )
+        value = self.export()
+        [member] = [m for m in value["members"] if m["batch_id"] == batch]
+        self.assertEqual((member["title"], member["author"]), ("", ""))
+        self.assertNotIn("PRIVATE", json.dumps(value))
+
+    def test_live_inputs_leave_terminal_inputs_only_the_remaining_records(self):
+        self.landed_batches(1, 1)
+        live = sum(1 for r in self.controller.store.rows("inputs") if r["state"] in ("waiting", "reserved"))
+        with patch.object(monitoring, "LIMIT", live + 1):
+            value = self.export()
+        self.assertEqual(len(value["inputs"]), live + 1)
+        self.assertTrue(value["collection_complete"]["inputs"])
 
     def test_git_failures_are_retried_without_discarding_previous_evidence(self):
         facts = monitoring.CommitFacts(self.repo.clone)
@@ -274,6 +375,31 @@ url = "https://private.invalid"
         )
         self.assertEqual([c["kind"] for c in value["conditions"]], ["inference_hold", "promotion_failed"])
         self.assertNotIn("secret provider token", json.dumps(value))
+
+    def test_stuck_heads_are_published_as_bounded_conditions_without_pr_detail(self):
+        now = self.clock()
+        stuck = {
+            "state": "fresh",
+            "observed_at": now - 60,
+            "count": 31,
+            "complete": True,
+            "heads": [{"pr": 40000 + n, "last_push_at": now - 4 * 3600 - n} for n in range(30)],
+        }
+        alert = "31 PR heads stuck without CI or a final state for 7h (oldest 4h)"
+        value = self.export(status={"stuck_heads": stuck, "alerts": [alert]})
+        kinds = [c["kind"] for c in value["conditions"]]
+        self.assertEqual(kinds, ["stuck_heads_observed"] + ["stuck_head"] * 30 + ["stuck_heads_truncated"])
+        self.assertEqual(value["conditions"][1]["since"], monitoring.iso(now - 4 * 3600))
+        self.assertNotIn("40000", json.dumps(value["conditions"]))
+        crowded = ["promotion is failing; see outbox history"] * 98
+        value = self.export(status={"stuck_heads": dict(stuck, complete=False), "alerts": crowded})
+        self.assertLessEqual(len(value["conditions"]), 100)
+        kinds = [c["kind"] for c in value["conditions"]]
+        self.assertEqual(kinds[-3:], ["stuck_heads_observed", "stuck_heads_partial", "stuck_heads_truncated"])
+        self.assertEqual(value["conditions"][-1]["kind"], "stuck_heads_truncated")
+        for state in ("stale", "missing", "unconfigured"):
+            value = self.export(status={"stuck_heads": dict(stuck, state=state)})
+            self.assertEqual(value["conditions"], [])
 
     def test_unclaimed_head_task_is_distinct_from_build_silence_without_duplicate_alert(self):
         head = self.controller.status()["head"]
@@ -636,6 +762,174 @@ class PublisherCadence(unittest.TestCase):
                     self.assertEqual(monitoring.run(args, stop, None, None, publisher), 0)
                 publisher.publish.assert_called_once()
                 stop.wait.assert_called_once_with(expected_wait)
+
+
+def trim_one_batch_at_a_time(observation, budget):
+    """The previous trimming loop, one full encoding per removed batch, as the reference result."""
+    encode = monitoring.encode
+    while len(encode(observation)) > budget:
+        terminal = [b for b in observation["batches"] if b["state"] not in ("head", "open")]
+        if terminal:
+            drop = min(terminal, key=lambda b: int(b["id"]))["id"]
+            observation["batches"] = [b for b in observation["batches"] if b["id"] != drop]
+            for name in ("members", "attempts", "tasks", "events"):
+                observation[name] = [r for r in observation[name] if r["batch_id"] != drop]
+        else:
+            name = max(
+                (k for k in ("members", "inputs", "attempts", "tasks", "events") if observation[k]),
+                key=lambda k: len(encode(observation[k])),
+                default=None,
+            )
+            if name is None:
+                raise ValueError("metadata exceeds public projection budget")
+            observation[name] = observation[name][: max(0, len(observation[name]) - 100)]
+            observation["collection_complete"][name] = False
+            observation["truncated"] = True
+            observation["coverage"] = "partial"
+
+
+class ProjectionBudget(unittest.TestCase):
+    """The byte budget removes the same records as trimming one batch at a time, in a few encodings."""
+
+    @staticmethod
+    def observation(terminal, active, members_per_batch):
+        import random
+
+        rng = random.Random(terminal * 1000 + active)
+        names = ("batches", "inputs", "members", "attempts", "tasks", "events")
+        value = {
+            "schema": monitoring.SCHEMA,
+            "coverage": "observed",
+            "truncated": False,
+            "collection_complete": dict.fromkeys(names, True),
+            **{name: [] for name in names},
+        }
+        for number in range(1, terminal + active + 1):
+            batch = str(number)
+            state = "landed" if number <= terminal else ("head" if number == terminal + 1 else "open")
+            value["batches"].append({"id": batch, "state": state})
+            for _ in range(rng.randint(0, members_per_batch)):
+                ident = str(len(value["members"]) + 1)
+                value["members"].append({"id": ident, "batch_id": batch, "title": "x" * rng.randint(0, 400)})
+                value["inputs"].append({"id": ident, "title": "y" * rng.randint(0, 200)})
+            for name in ("attempts", "tasks", "events"):
+                for _ in range(rng.randint(0, 3)):
+                    value[name].append(
+                        {"id": str(len(value[name]) + 1), "batch_id": batch, "x": "z" * rng.randint(0, 99)}
+                    )
+        rng.shuffle(value["batches"])
+        return value
+
+    def assert_same_as_reference(self, value, budget):
+        expected = json.loads(json.dumps(value))
+        trim_one_batch_at_a_time(expected, budget)
+        full = []
+        real = monitoring.encode
+
+        def counted(item):
+            if isinstance(item, dict) and "schema" in item:
+                full.append(item)
+            return real(item)
+
+        with patch.object(monitoring, "encode", counted):
+            monitoring.fit(value, budget)
+        self.assertEqual(value, expected)
+        self.assertLessEqual(len(monitoring.encode(value)), budget)
+        return len(full)
+
+    def test_shortened_terminal_history_is_not_partial(self):
+        value = self.observation(terminal=50, active=2, members_per_batch=10)
+        active = {b["id"] for b in value["batches"] if b["state"] in ("head", "open")}
+        monitoring.fit(value, len(monitoring.encode(value)) // 2)
+        self.assertEqual(value["coverage"], "observed")
+        self.assertFalse(value["truncated"])
+        self.assertTrue(all(value["collection_complete"].values()))
+        self.assertTrue(active < {b["id"] for b in value["batches"]})
+        self.assertLess(len(value["batches"]), 52)
+
+    def test_active_only_overflow_is_partial(self):
+        value = self.observation(terminal=2, active=3, members_per_batch=300)
+        monitoring.fit(value, len(monitoring.encode(value)) // 2)
+        self.assertEqual(value["coverage"], "partial")
+        self.assertTrue(value["truncated"])
+        self.assertFalse(value["collection_complete"]["members"])
+
+    def test_terminal_history_is_shortened_oldest_first(self):
+        value = self.observation(terminal=200, active=3, members_per_batch=20)
+        size = len(monitoring.encode(value))
+        for fraction in (0.95, 0.6, 0.3, 0.1):
+            with self.subTest(fraction=fraction):
+                encodings = self.assert_same_as_reference(json.loads(json.dumps(value)), int(size * fraction))
+                self.assertLessEqual(encodings, 3)
+
+    def test_active_only_overflow_trims_the_largest_collection(self):
+        value = self.observation(terminal=5, active=4, members_per_batch=400)
+        size = len(monitoring.encode(value))
+        for fraction in (0.9, 0.5, 0.2):
+            with self.subTest(fraction=fraction):
+                self.assert_same_as_reference(json.loads(json.dumps(value)), int(size * fraction))
+
+    def test_a_fitting_projection_is_encoded_once_and_left_alone(self):
+        value = self.observation(terminal=3, active=2, members_per_batch=5)
+        expected = json.loads(json.dumps(value))
+        self.assertEqual(self.assert_same_as_reference(value, 10**9), 1)
+        self.assertEqual(value, expected)
+
+    def test_flag_bytes_count_toward_an_exact_fit(self):
+        # Clearing the flags saves bytes of their own; a budget met only with them still fits.
+        for terminal, active in ((0, 1), (1, 1), (6, 1)):
+            value = self.observation(terminal=terminal, active=active, members_per_batch=3)
+            value["members"] = value["members"][:1] or [{"id": "1", "batch_id": "1"}]
+            for slack in range(-3, 4):
+                with self.subTest(terminal=terminal, slack=slack):
+                    budget = len(monitoring.encode(value)) - len(monitoring.encode(value["members"][-1])) + slack
+                    try:
+                        self.assert_same_as_reference(json.loads(json.dumps(value)), budget)
+                    except ValueError:
+                        with self.assertRaises(ValueError):
+                            trim_one_batch_at_a_time(json.loads(json.dumps(value)), budget)
+
+    def test_metadata_alone_over_budget_is_refused(self):
+        value = self.observation(terminal=2, active=1, members_per_batch=3)
+        with self.assertRaises(ValueError):
+            monitoring.fit(value, 50)
+
+
+class StatusRead(unittest.TestCase):
+    """The publisher reads the status summary, and the full document from a controller without it."""
+
+    def serve(self, routes):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib naming
+                body = routes.get(self.path)
+                self.send_response(404 if body is None else 200)
+                self.end_headers()
+                self.wfile.write(json.dumps(body or {"error": "no such route"}).encode())
+
+            def log_message(self, *_):
+                pass
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def test_summary_is_read_when_served(self):
+        base = self.serve({"/status/summary": {"head": {"id": 1}}, "/status": {"head": {"id": 2}}})
+        self.assertEqual(monitoring.read_status(base + "/status/summary"), {"head": {"id": 1}})
+
+    def test_older_controller_falls_back_to_the_full_document(self):
+        base = self.serve({"/status": {"head": {"id": 2}}})
+        self.assertEqual(monitoring.read_status(base + "/status/summary"), {"head": {"id": 2}})
+
+    def test_other_failures_leave_status_unavailable(self):
+        base = self.serve({})
+        self.assertEqual(monitoring.read_status(base + "/status"), {})
+        self.assertEqual(monitoring.read_status("http://127.0.0.1:1/status/summary", timeout=1), {})
 
 
 if __name__ == "__main__":
