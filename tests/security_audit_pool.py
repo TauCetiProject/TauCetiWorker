@@ -191,6 +191,27 @@ class Ordering(PoolFixture):
         self.assertTrue(blocked["pool_retries_exhausted"])
         self.assertEqual(blocked["from_sha"], self.shas[0])
 
+    def test_held_block_alert_is_offered_again_on_later_passes(self):
+        # A failed DM is retried from its receipts; the pool must keep offering the block.
+        def inspect(batch, attempt):
+            if self.index(batch) == 1:
+                return self.verdict(batch, "finding", ["unsafe IO in A.lean"])
+            return self.verdict(batch)
+
+        passes = {"n": 0}
+
+        def stop(p):
+            if not self.settled(p):
+                return False
+            passes["n"] += 1
+            return passes["n"] >= 3
+
+        self.serve(inspect, stop=stop)
+        offered = [c.args[1] for c in pool.notify_block.call_args_list]
+        blocked = [b for b in offered if b.get("from_sha") == self.shas[2]]
+        self.assertGreaterEqual(len(blocked), 3)
+        self.assertTrue(all("unsafe IO" in b["reason"] for b in blocked))
+
     def test_non_operational_failure_blocks_without_retry(self):
         def inspect(batch, attempt):
             if self.index(batch) == 0:

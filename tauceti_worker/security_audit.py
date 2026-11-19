@@ -2639,6 +2639,11 @@ def setup(state: Path) -> None:
 
 
 if __name__ == "__main__":
+    from .paths import ensure_ssl_cert_file
+
+    # Like the Worker CLI: a service has no login shell to supply the CA bundle, and Zulip alerts,
+    # GitHub and reviewer clients launched from here need the host's trust store.
+    ensure_ssl_cert_file()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output", "pool"])
     parser.add_argument("--state", type=Path, required=True)
