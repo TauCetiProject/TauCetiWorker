@@ -378,6 +378,63 @@ class Verdicts(ControllerCase):
         self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
         self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
 
+    def test_bound_failure_with_failed_finalizer_and_no_parsed_finding_creates_repair(self):
+        # The finalizer exits 1 after posting build=failure; a bound failed status is a source verdict
+        # even when no log line parses into a finding.
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "pr-build / finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "repair")
+        [finding] = json.loads(task["diagnostics"])
+        self.assertEqual(finding["kind"], "status")
+        self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
+
+    def test_dependency_audit_collision_with_failed_finalizer_creates_repair(self):
+        findings = diagnostics.parse_log(
+            [
+                "audit-driver: import TauCeti.Topology.Algebra.Algebra.Unitization failed, environment already "
+                "contains 'Unitization.continuous_iff' from Mathlib.Analysis.Normed.Algebra.Unitization"
+            ]
+        )
+        findings += diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
+        self.assertEqual(len(self.github.dispatches), 1)
+
+    def test_bound_failure_with_another_infrastructure_finding_stays_infrastructure(self):
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"},
+            [
+                {"name": "sandboxed-build", "conclusion": "timed_out"},
+                {"name": "finalize-merge-group-build", "conclusion": "failure"},
+            ],
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+
     def test_an_unrelated_cancelled_job_does_not_skip_publication_grace(self):
         self.github.ci_policy = lambda *_: (
             "no-status",
