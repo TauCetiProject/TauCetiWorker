@@ -19,6 +19,14 @@ from pathlib import Path
 from . import github_transport as tr
 from .github_forks import ForkUnknown, discover
 
+# Agents read this on stderr. It must not suggest that the publication happened, or an agent may
+# take a step that depends on it, such as closing a PR whose explanation comment was never posted.
+NOT_POSTED = (
+    "TauCeti: this publication is NOT confirmed as posted to GitHub. It is retained for "
+    "retry/reconciliation, which may never post it. Do not repeat it, and do not act as if it were visible "
+    "(for example, do not close a PR whose explanation it carries). No paid work needs to be repeated."
+)
+
 
 def directory(env=None):
     env = os.environ if env is None else env
@@ -447,9 +455,7 @@ def _finish_locked(path, value, result, records=None, *, before_request=False):
     tr.atomic(path, value)
     tr.event({"kind": "publication_deferred", "status": value["status"], "intent": path.stem})
     result.github_deferred = True
-    result.stderr = (
-        result.stderr or ""
-    ) + "\nTauCeti: publication retained for retry/reconciliation; no paid work needs to be repeated.\n"
+    result.stderr = (result.stderr or "") + "\n" + NOT_POSTED + "\n"
 
 
 def archive(path, value, reason, **evidence):
