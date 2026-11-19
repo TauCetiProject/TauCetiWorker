@@ -58,8 +58,9 @@ first `## ` heading is shown to the agent with the items of its area.
   with no parentheses inside. `needs:` is a comma list of slugs from any area,
   or `none`. `partial: #N, #M` names merged GitHub pull requests that did not
   complete the item; a Forgejo pull request is named by its URL, in any case. Every other clause is passed to the agent as written.
-- An item line that does not parse is logged and skipped. A `needs:` slug the
-  file never defines is logged and blocks nothing.
+- Malformed item lines, empty/invalid or duplicate slugs, undefined `needs:`
+  references and dependency cycles reject the list before any model starts.
+  Prerequisites may appear later in the file or in another area.
 
 The file is read at the start of each roadmap round, so an edit takes effect on
 the next round. The worker never writes to it.
@@ -82,9 +83,11 @@ the 200 most recent pull requests merged into the base branch that carry a targe
 the most recently updated, on Forgejo the most recently created among the closed
 pull requests its client's page bound reaches). A marker counts whatever the
 spacing of its JSON. An older
-landing is still found before its item is assigned again (see below), but it
-no longer unlocks the items that need it, so tick an item `[x]` in the file to
-make its landing permanent.
+landing is searched by item before eligibility is computed for any unresolved
+prerequisite, so it continues to unlock dependent items after leaving this recent
+window. Candidate items are also checked before assignment. These reads preserve
+partial-marker, explicit `partial:` and base-branch checks. Ticking `[x]` in the
+file records an operator completion and avoids repeated historical lookups.
 
 ## Selection
 
@@ -113,7 +116,8 @@ review are unaffected by the list.
 
 A roadmap round under a list costs, on each forge it reads, one listing of
 open pull requests, one search for recent landings, and one search per candidate
-tried, plus one claim push per candidate. The GitHub searches are shared
+tried, plus one item search per unresolved prerequisite missing from the recent
+landings, and one claim push per candidate. The GitHub searches are shared
 between workers of one account on a host for two minutes.
 
 ## What the agent sees
@@ -132,3 +136,14 @@ marker; in a Forgejo round its `gh pr create` goes through the source-bound
 While an authoring round runs, the worker's runtime status file carries
 `roadmap_target`, the item as `<Area>/<slug>`. The loop clears it between
 rounds.
+
+## Fleet inspection contract
+
+`tauceti _targets-inspect --file /absolute/path/targets.md` reads and validates
+the file offline and emits `tauceti-target-list/v1` JSON with canonical items,
+areas and saved-file summary counts. It performs no forge, credential or model
+reads. Invalid files exit nonzero with a diagnostic rather than a success object.
+Fleet uses this interface from a compatible Worker runtime instead of duplicating
+the grammar. Its counts describe the file; the worker round additionally overlays
+forge evidence. `_fleet-protocol` and the running manager advertise
+`targets_inspect: 1` and `roadmap_targets: 1`.

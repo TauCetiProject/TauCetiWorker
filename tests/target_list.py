@@ -9,7 +9,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -72,21 +71,81 @@ class Format(unittest.TestCase):
         self.assertTrue(parsed.preamble.startswith("Goal: the strong law"))
         self.assertIsNone(parsed.find("second-moment-route"))
 
-    def test_unmarked_file_is_refused_and_bad_lines_are_skipped(self):
+    def test_unmarked_file_and_malformed_lines_are_refused(self):
         with self.assertRaisesRegex(tc.Die, "tauceti-targets:v1"):
             t.parse_targets("## Algebra\n- [ ] `a` — text\n")
-        with patch.object(t, "log") as log:
-            parsed = t.parse_targets(
-                "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] no slug\n- [ ] `a` - b (needs: c, `d`)\n"
-            )
-        self.assertEqual([(it.slug, it.needs) for it in parsed.items()], [("a", ("c", "d"))])
-        self.assertIn("1 malformed item line(s), first at line 3", log.call_args_list[0].args[0])
-        self.assertIn("undefined slug(s), which block nothing: c, d", log.call_args_list[1].args[0])
+        with self.assertRaisesRegex(tc.Die, "malformed item line.*line 3"):
+            t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] no slug\n- [ ] `a` - b (needs: c, `d`)\n")
         with tempfile.TemporaryDirectory() as tmp, self.assertRaisesRegex(tc.Die, "roadmap targets: .*absent.md"):
             t.load_targets(Path(tmp) / "absent.md")
 
+    def test_dependency_graph_is_validated_before_selection(self):
+        prefix = "<!-- tauceti-targets:v1 -->\n## Algebra\n"
+        for body, error in (
+            ("- [ ] `a` — x (needs: missing)\n", "undefined slug.*missing"),
+            ("- [ ] `a` — x\n## Topology\n- [ ] `a` — y\n", "duplicate slug.*a"),
+            ("- [ ] `a` — x (needs: a)\n", "dependency cycle"),
+            ("- [ ] `a` — x (needs: b)\n- [ ] `b` — y (needs: a)\n", "dependency cycle"),
+            ("- [ ] `` — x\n", "malformed item|invalid slug"),
+        ):
+            with self.subTest(body=body), self.assertRaisesRegex(tc.Die, error):
+                t.parse_targets(prefix + body)
+
+    def test_large_valid_graph_does_not_recurse(self):
+        text = "<!-- tauceti-targets:v1 -->\n## Algebra\n- [x] `a0` — root\n"
+        text += "".join(f"- [ ] `a{i}` — item (needs: a{i - 1})\n" for i in range(1, 1200))
+        parsed = t.parse_targets(text)
+        self.assertEqual([it.slug for it in t.eligible_items(parsed, "Algebra")], ["a1"])
+
+    def test_offline_inspection_uses_canonical_parser_and_summary(self):
+        parsed = t.parse_targets(EXAMPLE)
+        info = t.describe_targets(parsed)
+        self.assertEqual(info["schema"], "tauceti-target-list/v1")
+        self.assertEqual(info["areas"], ["MeasureTheory", "Probability"])
+        self.assertEqual(info["summary"], {"total": 4, "done": 1, "inflight": 1, "eligible": 1, "blocked": 1})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "targets.md"
+            path.write_text(EXAMPLE)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), patch.object(tc, "pin_github_account", side_effect=AssertionError):
+                self.assertEqual(tc.main(["_targets-inspect", "--file", str(path)]), 0)
+            self.assertEqual(json.loads(output.getvalue()), info)
+
 
 class LiveView(unittest.TestCase):
+    def test_old_prerequisite_unlocks_children_on_every_read(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        source = github(
+            merged=[(500 + i, marker("Algebra", f"unrelated{i}")) for i in range(200)],
+            older=[(7, marker("Algebra", "old"))],
+        )
+        for _ in range(2):
+            live = t.live_targets(listed, source)
+            self.assertEqual(status(live), {"old": "done", "next": "open"})
+            self.assertEqual([it.slug for it in t.candidates(live, "auto", ())], ["next"])
+
+    def test_old_partial_or_other_base_does_not_unlock_children(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        for row in (
+            {"number": 7, "body": marker("Algebra", "old", partial=True), "baseRefName": "main"},
+            {"number": 7, "body": marker("Algebra", "old"), "baseRefName": "other"},
+        ):
+            source = SimpleNamespace(open_prs=lambda: [], merged_prs=lambda *a, row=row, **kw: [row])
+            live = t.live_targets(listed, source)
+            self.assertEqual(status(live)["old"], "open")
+            self.assertNotIn("next", [it.slug for it in t.eligible_items(live, "Algebra")])
+
+    def test_old_completion_from_another_source_unlocks_children(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        live = t.live_targets(listed, github(), [github(older=[(7, marker("Algebra", "old"))])])
+        self.assertEqual(status(live)["old"], "done")
+
     def test_markers(self):
         body = (
             marker("A", "x")
@@ -145,8 +204,8 @@ class Selection(unittest.TestCase):
         self.assertEqual(self.slugs(landed), ["kolmogorov-zero-one", "strong-law"])
         self.assertEqual(self.slugs(landed, only="Probability", skip=["Probability"]), ["strong-law"])
         self.assertEqual(self.slugs(landed, only="any", skip=["MeasureTheory"]), ["strong-law"])
-        undefined = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — b (needs: `nowhere`)\n")
-        self.assertEqual(self.slugs(undefined), ["a"])
+        with self.assertRaisesRegex(tc.Die, "undefined slug.*nowhere"):
+            t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — b (needs: `nowhere`)\n")
         mixed = t.parse_targets(
             "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — open\n- [x] `b` — done\n- [ ] `c` — x (needs: a, `b`)\n"
         )
@@ -246,7 +305,8 @@ class Round(unittest.TestCase):
         """gh-safe-pr-create's verdict on a pull request body, with `true` standing in for gh."""
         if not (self.tmp / "bin").exists():
             (self.tmp / "bin").mkdir()
-            (self.tmp / "bin" / "gh").symlink_to(shutil.which("true"))
+            (self.tmp / "bin" / "gh").write_text("#!/bin/sh\nexit 0\n")
+            (self.tmp / "bin" / "gh").chmod(0o755)
         env = {"PATH": f"{self.tmp / 'bin'}:{os.environ['PATH']}", "TAUCETI_TARGET_MARKER": required}
         script = REPO / "scripts" / "gh-safe-pr-create"
         return subprocess.run([script, "--body", body], env=env, capture_output=True).returncode
@@ -257,7 +317,8 @@ class Round(unittest.TestCase):
         self.author()
         complete, partial = os.environ["TAUCETI_TARGET_MARKER"].splitlines()
         (self.tmp / "bin").mkdir()
-        (self.tmp / "bin" / "gh").symlink_to(shutil.which("true"))
+        (self.tmp / "bin" / "gh").write_text("#!/bin/sh\nexit 0\n")
+        (self.tmp / "bin" / "gh").chmod(0o755)
         script = REPO / "scripts" / "gh-safe-pr-create"
         inner = f'env PATH={self.tmp / "bin"}:"$PATH" {shlex.quote(str(script))} --body "$TCW_BODY"'
         cfg = SimpleNamespace(state=self.tmp / "state", home=self.tmp / "home", wid="w", logdir=self.tmp / "logs")

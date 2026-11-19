@@ -96,8 +96,11 @@ def _parse_item(line: str, area: str) -> TargetItem | None:
 
 
 def parse_targets(text: str) -> Targets:
-    """Parse a target list. Die when the `tauceti-targets:v1` marker is missing; an item line that
-    does not parse, or a `needs:` slug the file never defines, is logged and otherwise ignored."""
+    """Parse and validate a target list before any task can be selected.
+
+    IDs are unique across areas; unknown prerequisites and dependency cycles are errors rather
+    than permission to author work whose prerequisites cannot be established.
+    """
     if not MARKER_RE.search(text):
         raise Die("the file lacks the `<!-- tauceti-targets:v1 -->` marker, so it is not a target list")
     preamble: list[str] = []
@@ -123,10 +126,32 @@ def parse_targets(text: str) -> Targets:
                 areas[area].append(item)
     targets = Targets("\n".join(preamble).strip(), areas)
     if bad:
-        log(f"target list: ignoring {len(bad)} malformed item line(s), first at line {bad[0]}")
-    undefined = {s for it in targets.items() for s in it.needs} - {it.slug for it in targets.items()}
+        raise Die(f"target list: {len(bad)} malformed item line(s), first at line {bad[0]}")
+    by_slug = {}
+    for item in targets.items():
+        if not item.slug or any(c.isspace() or c in '/\\`"' or ord(c) < 32 for c in item.slug):
+            raise Die(f"target list: invalid slug {item.slug!r}")
+        if item.slug in by_slug:
+            raise Die(f"target list: duplicate slug {item.slug!r}; slugs must be unique across areas")
+        by_slug[item.slug] = item
+    undefined = {s for it in targets.items() for s in it.needs} - by_slug.keys()
     if undefined:
-        log(f"target list: `needs:` names undefined slug(s), which block nothing: {', '.join(sorted(undefined))}")
+        raise Die(f"target list: `needs:` names undefined slug(s): {', '.join(sorted(undefined))}")
+    # An iterative traversal also accepts large, valid lists without Python recursion limits.
+    remaining = {slug: len(set(it.needs)) for slug, it in by_slug.items()}
+    dependents: dict[str, list[str]] = {slug: [] for slug in by_slug}
+    for slug, item in by_slug.items():
+        for dep in set(item.needs):
+            dependents[dep].append(slug)
+    ready = [slug for slug, count in remaining.items() if count == 0]
+    for slug in ready:
+        for child in dependents[slug]:
+            remaining[child] -= 1
+            if remaining[child] == 0:
+                ready.append(child)
+    cyclic = [slug for slug, count in remaining.items() if count]
+    if cyclic:
+        raise Die(f"target list: dependency cycle blocks: {', '.join(cyclic)}")
     return targets
 
 
@@ -241,11 +266,13 @@ def landed(items: Iterable[TargetItem], merged: Iterable[dict]) -> dict[Key, int
 def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
     """`overlay_live` from the pull requests of `gh` and of each source in `others` (GitHub or
     Forgejo): an open one whose marker names an item puts it in flight, a merged one that completes
-    it (`landed`) makes it done. The merged side sees each source's MERGED_LIMIT most recent closed
-    pull requests that carry a marker. Raises GitHubError or SourceUnavailable when a listing fails."""
+    it (`landed`) makes it done. Missing prerequisite completions are also searched by item, so an
+    old landing still unlocks its children after it leaves the recent listing. Raises GitHubError
+    or SourceUnavailable when a required source read fails."""
     inflight: set[Key] = set()
     done: set[Key] = set()
-    for source in (gh, *others):
+    sources = (gh, *others)
+    for source in sources:
         rows = source.open_prs()
         if rows is None:
             raise SourceUnavailable("open pull requests are unavailable for the target list")
@@ -253,6 +280,14 @@ def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
             inflight |= marker_keys(d.get("body"))[0]
         recent = source.merged_prs(f"{MERGED_SEARCH} base:{content_base()} sort:updated-desc", limit=MERGED_LIMIT)
         done |= set(landed(targets.items(), recent))
+    # Resolve dependencies BEFORE eligibility, rather than only searching already eligible
+    # candidates. Otherwise an old completed parent stays open and its children remain blocked.
+    needed = {slug for item in targets.items() if item.status != "done" for slug in item.needs}
+    for item in targets.items():
+        key = (item.area, item.slug)
+        if item.slug in needed and item.status != "done" and key not in done:
+            if any(landed_pr(item, source) is not None for source in sources):
+                done.add(key)
     return overlay_live(targets, inflight, done)
 
 
@@ -365,18 +400,46 @@ def open_pr(item: TargetItem, gh) -> int | None:
 
 
 def eligible_items(targets: Targets, area: str) -> list[TargetItem]:
-    """The area's open items whose every `needs` slug is done, in file order. A slug the file does
-    not define blocks nothing."""
+    """The area's open items whose every prerequisite is known and done, in file order."""
 
     def met(slug: str) -> bool:
         dep = targets.find(slug)
-        return dep is None or dep.status == "done"
+        return dep is not None and dep.status == "done"
 
     return [it for it in targets.areas.get(area, []) if it.status == "open" and all(map(met, it.needs))]
 
 
 def eligible_areas(targets: Targets) -> list[str]:
     return [a for a in targets.areas if eligible_items(targets, a)]
+
+
+def describe_targets(targets: Targets) -> dict:
+    """Offline, versioned parse/summary contract shared with Fleet; no forge or credential reads."""
+    items = list(targets.items())
+    eligible = {it.slug for area in targets.areas for it in eligible_items(targets, area)}
+    return {
+        "schema": "tauceti-target-list/v1",
+        "preamble": targets.preamble,
+        "areas": list(targets.areas),
+        "items": [
+            {
+                "area": it.area,
+                "slug": it.slug,
+                "status": it.status,
+                "text": it.text,
+                "needs": list(it.needs),
+                "meta": list(it.meta),
+            }
+            for it in items
+        ],
+        "summary": {
+            "total": len(items),
+            "done": sum(it.status == "done" for it in items),
+            "inflight": sum(it.status == "inflight" for it in items),
+            "eligible": len(eligible),
+            "blocked": sum(it.status == "open" and it.slug not in eligible for it in items),
+        },
+    }
 
 
 def candidates(targets: Targets, only: str, skip: Iterable[str]) -> list[TargetItem]:
