@@ -694,6 +694,13 @@ class Pool:
             mine.update(a for slot in self.slots for a in slot.attempts)
             ours = previous.get("attempt") in mine
             hold = previous.get("from_sha") == cursor and not ours and not self.supersede(previous)
+        # Delivery is idempotent and backs off on its own receipts. Re-offer every held block on
+        # each pass, so a failed DM is retried rather than only attempted when the block is created.
+        if hold:
+            notify_block(self.work, previous)
+        for slot in self.slots:
+            if slot.status == "blocked" and slot.failure:
+                notify_block(self.work, slot.failure)
         if hold and not (self.slots and self.slots[0].status in ("pass", "blocked")):
             # The batch at the cursor holds a binding judgment this pool cannot
             # identify in its window; never plan or inspect it again. Wait for review.

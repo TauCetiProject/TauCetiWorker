@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import ssl
 import tempfile
 import time
 import urllib.parse
@@ -15,6 +16,7 @@ from pathlib import Path
 
 from .config import log
 from .constants import TAUCETI
+from .paths import ensure_ssl_cert_file
 
 OPERATIONAL_STALL_SECONDS = 3600
 
@@ -49,7 +51,12 @@ def request(config: dict, method: str, params: dict) -> dict:
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             return None
 
-    with urllib.request.build_opener(NoRedirect).open(req, timeout=20) as response:
+    # Entry points other than the Worker CLI (the pool, attest) never repaired SSL_CERT_FILE, and uv's
+    # standalone CPython cannot find the NixOS bundle by default: every DM then failed verification.
+    # Trust the host bundle explicitly, so delivery does not depend on how this process was started.
+    context = ssl.create_default_context(cafile=ensure_ssl_cert_file(dict(os.environ)))
+    opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=context))
+    with opener.open(req, timeout=20) as response:
         result = json.load(response)
     if result.get("result") != "success":
         raise ValueError("Zulip request was not successful")
@@ -94,23 +101,31 @@ def report(work: Path, block: dict) -> dict:
 def actionable(work: Path, value: dict) -> bool:
     """Source concerns notify now; operational pauses notify after an hour held.
 
-    The cursor, rather than an attempt ID or failure text, identifies the stall.
-    Retries and Worker restarts cannot reset the delay. A new cursor resets it.
+    The held range's start (the cursor it holds), rather than an attempt ID or failure text,
+    identifies the stall. Each start keeps its own timer, so a pool holding blocks at several
+    starts never resets one with another. Retries and Worker restarts cannot reset a delay;
+    unreadable timer state restarts the delay rather than suppressing the alert for good.
     This timer controls notifications only; audit blocks/recovery are untouched.
     """
     if value["kind"] != "Operational stall":
         return True
     path = work / "operational-alert.json"
     now = time.time()
-    state = json.loads(path.read_text()) if path.exists() else {}
+    try:
+        state = json.loads(path.read_text()) if path.exists() else {}
+    except ValueError:
+        state = {}
     if not isinstance(state, dict):
-        raise ValueError("invalid operational alert state")
-    if state.get("from_sha") != value["from_sha"]:
-        state = {"from_sha": value["from_sha"], "first_seen": now}
-        save(path, state)
-    started = state.get("first_seen")
-    if type(started) not in (int, float) or not math.isfinite(started):
-        raise ValueError("invalid operational alert timestamp")
+        state = {}
+    if "from_sha" in state:  # The single-timer format written before per-start timers.
+        state = {"starts": {state["from_sha"]: state.get("first_seen")}}
+    starts = state.get("starts")
+    if not isinstance(starts, dict):
+        starts = {}
+    started = starts.get(value["from_sha"])
+    if type(started) not in (int, float) or not math.isfinite(started) or started > now:
+        started = starts[value["from_sha"]] = now
+        save(path, {"starts": starts})
     return now - started >= OPERATIONAL_STALL_SECONDS
 
 
@@ -149,8 +164,7 @@ def notify_block(work: Path, block: dict) -> None:
     try:
         value = report(work, block)
         if not actionable(work, value):
-            log("security-audit: transient operational pause retained in logs; no private alert before one hour")
-            return
+            return  # A transient operational pause: no private alert before one hour.
         config = json.loads(Path(configured).read_text())
         identity = {key: value[key] for key in ("kind", "from_sha", "to_sha")}
         key = hashlib.sha256(
@@ -195,5 +209,10 @@ def notify_block(work: Path, block: dict) -> None:
         state[key] = {"message_id": result["id"]}
         save(path, state)
         log(f"security-audit: sent private Zulip alert {result['id']}")
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        log("security-audit: private Zulip alert delivery pending; retained block remains in force")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        # The cause, never the request (which carries the bot credential), so a persistent delivery
+        # failure such as TLS verification is visible in the log rather than retried blindly.
+        log(
+            f"security-audit: private Zulip alert delivery pending ({type(exc).__name__}: {str(exc)[:200]}); "
+            "retained block remains in force"
+        )

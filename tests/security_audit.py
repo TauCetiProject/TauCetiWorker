@@ -1296,7 +1296,7 @@ class PrivateAlerts(unittest.TestCase):
         self.http.assert_not_called()
         self.assertFalse((self.work / "zulip-alerts.json").exists())
         state = self.work / "operational-alert.json"
-        self.assertEqual(json.loads(state.read_text())["first_seen"], 10000)
+        self.assertEqual(json.loads(state.read_text())["starts"][self.block["from_sha"]], 10000)
         self.assertEqual(state.stat().st_mode & 0o777, 0o600)
 
     def test_persistent_stall_timer_survives_restart_retry_and_target_changes(self):
@@ -1310,7 +1310,9 @@ class PrivateAlerts(unittest.TestCase):
         alerts.notify_block(self.work, retry)
         alerts.notify_block(self.work, retry)
         self.http.assert_called_once()
-        self.assertEqual(json.loads((self.work / "operational-alert.json").read_text())["first_seen"], 10000)
+        self.assertEqual(
+            json.loads((self.work / "operational-alert.json").read_text())["starts"][self.block["from_sha"]], 10000
+        )
 
     def test_advancing_cursor_starts_a_new_operational_delay(self):
         alerts.notify_block(self.work, self.block)
@@ -1344,18 +1346,60 @@ class PrivateAlerts(unittest.TestCase):
         self.assertIn("Human review required", message)
         self.assertNotIn("operational stall", message)
 
-    def test_bad_operational_timer_does_not_mutate_audit_evidence_or_send_misleading_dm(self):
+    def test_bad_operational_timer_restarts_the_delay_without_mutating_audit_evidence(self):
         blocked = self.work / "blocked.json"
         blocked.write_text(json.dumps(self.block))
         for state in (
             [],
+            "not json",
             {"from_sha": self.block["from_sha"], "first_seen": True},
             {"from_sha": self.block["from_sha"], "first_seen": float("nan")},
+            {"starts": {self.block["from_sha"]: 10**12}},
         ):
-            (self.work / "operational-alert.json").write_text(json.dumps(state))
-            alerts.notify_block(self.work, self.block)
-            self.assertEqual(json.loads(blocked.read_text()), self.block)
+            with self.subTest(state=state):
+                self.clock.return_value = 10000
+                path = self.work / "operational-alert.json"
+                path.write_text(state if isinstance(state, str) else json.dumps(state))
+                alerts.notify_block(self.work, self.block)
+                self.assertEqual(json.loads(blocked.read_text()), self.block)
+                self.http.assert_not_called()
+                # Unreadable state never suppresses the alert for good: the delay restarts.
+                self.assertEqual(json.loads(path.read_text())["starts"][self.block["from_sha"]], 10000)
+
+    def test_blocks_at_different_starts_keep_independent_timers(self):
+        (self.work / "operational-alert.json").unlink()
+        ahead = {**self.block, "from_sha": "c" * 40, "to_sha": "d" * 40}
+        alerts.notify_block(self.work, self.block)
+        self.clock.return_value = 12000
+        alerts.notify_block(self.work, ahead)
+        self.clock.return_value = 13600
+        alerts.notify_block(self.work, ahead)
         self.http.assert_not_called()
+        alerts.notify_block(self.work, self.block)
+        self.http.assert_called_once()
+
+    def test_request_trusts_the_host_ca_bundle_without_ssl_cert_file(self):
+        self.request.stop()
+        self.addCleanup(self.request.start)
+        seen = {}
+
+        class Opener:
+            def open(self, req, timeout):
+                raise OSError("stop before network")
+
+        def build_opener(*handlers):
+            seen["handlers"] = handlers
+            return Opener()
+
+        with (
+            patch.dict(os.environ, {"SSL_CERT_FILE": ""}),
+            patch.object(alerts, "ensure_ssl_cert_file", return_value=None) as bundle,
+            patch.object(alerts.urllib.request, "build_opener", side_effect=build_opener),
+        ):
+            with self.assertRaisesRegex(OSError, "stop before network"):
+                alerts.request(json.loads(self.config.read_text()), "POST", {"type": "direct"})
+        bundle.assert_called_once()
+        self.assertTrue(any(isinstance(h, alerts.urllib.request.HTTPSHandler) for h in seen["handlers"]))
 
     def test_alert_filter_never_clears_a_block_or_modifies_recovery_budget(self):
         blocked = self.work / "blocked.json"
