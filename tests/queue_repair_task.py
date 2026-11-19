@@ -4405,6 +4405,47 @@ exit 1
         self.assertEqual(last["event"], "build_finished")
         self.assertEqual(last["errors"], 0)
 
+    def test_a_module_edited_during_the_build_is_a_rerun_not_an_error(self):
+        worktree = self.root / "wt"
+        repair.create_worktree(self.content.clone, self.content.tip, worktree)
+        chain = repair.read_chain(self.content.clone, self.content.base, self.content.tip)
+        # Lake v4.37.0-rc1's output when the agent edits TauCeti/Two.lean while Lean compiles it.
+        self.script(
+            "✖ [2/3] Building TauCeti.Two (6.1s)\n"
+            "error: module source file:\n"
+            f"   {worktree.resolve()}/TauCeti/Two.lean\n"
+            "changed since build began; rerun the build\n"
+            "✖ [3/3] Building TauCeti.Three\n"
+            "error: TauCeti/Three.lean:1:1: unsolved goals\n"
+            "Some required targets logged failures:\n"
+            "- TauCeti.Two\n"
+            "- TauCeti.Three\n"
+            "exit 1\n"
+        )
+        directory = worktree / ".tauceti-repair"
+        stream = repair_stream.start_build(
+            worktree, directory, dict(os.environ), chain=chain, repository=PROJECT, timeout=60
+        )
+        self.assertTrue(stream.finished.wait(30))
+        self.assertEqual(stream.failed_modules, ["TauCeti.Three"])
+        self.assertEqual(stream.summary()["reruns"], ["TauCeti.Two"])
+        entries = [json.loads(line) for line in (directory / "errors.jsonl").read_text().splitlines()]
+        self.assertEqual(
+            entries[0],
+            {
+                "kind": "rerun",
+                "module": "TauCeti.Two",
+                "file": "TauCeti/Two.lean",
+                "message": "module source file TauCeti/Two.lean changed since build began; rerun the build",
+            },
+        )
+        self.assertEqual(entries[-1]["reruns"], 1)
+        self.assertIn("1 error total, 1 module to rerun", entries[-1]["message"])
+        self.assertEqual(
+            [e["file"] for e in repair_parallel.read_errors(directory)], ["TauCeti/Three.lean"], "not a compiler error"
+        )
+        self.assertIn("`kind` `rerun` is not a compile error", "\n".join(stream.prompt_section()))
+
 
 class PreRebasedPrepare(Fixture):
     """A ``prepare`` task of the next batch's pre-rebased chain is run like an own-base preparation, on
@@ -4537,6 +4578,35 @@ class ErrorParsing(unittest.TestCase):
                 ("TauCeti.B", 11, 2, "type mismatch\n  expected Nat"),
             ],
         )
+
+    def test_lake_changed_since_build_began(self):
+        # Lake v4.37.0-rc1 (lean4 #16457) for a source edited while Lean compiled it, as captured
+        # from a real run; the message has no location and must not become a compiler error.
+        lines = [
+            "✖ [3/7] Building TauCeti.Slow (6.1s)",
+            "trace: .> LEAN_PATH=/w/.lake/build/lib/lean lean /w/TauCeti/Slow.lean -o /w/x.olean --json",
+            "error: TauCeti/A.lean:3:4: unknown identifier 'x'",
+            "error: module source file:",
+            "   /w/TauCeti/Slow.lean",
+            "changed since build began; rerun the build",
+            "error: module source file:",
+            "   /elsewhere/Other.lean",
+            "changed since build began; rerun the build",
+            "Some required targets logged failures:",
+            "- TauCeti.Slow",
+            "error: build failed",
+        ]
+        parser = repair_stream.ErrorParser(root=Path("/w"))
+        found = [entry for line in lines for entry in parser.feed(line)] + parser.finish()
+        self.assertEqual(
+            [(e["module"], e["message"]) for e in parser.errors], [("TauCeti.A", "unknown identifier 'x'")]
+        )
+        self.assertEqual(
+            [(e["kind"], e["module"], e["file"]) for e in parser.reruns],
+            [("rerun", "TauCeti.Slow", "TauCeti/Slow.lean"), ("rerun", None, "/elsewhere/Other.lean")],
+        )
+        self.assertEqual(len(found), 3)
+        self.assertEqual(repair_stream.parse_errors(lines), parser.errors)
 
 
 class Records(unittest.TestCase):
