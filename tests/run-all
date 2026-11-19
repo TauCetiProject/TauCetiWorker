@@ -92,6 +92,7 @@ RUN_STDLIB=(
   native_self_tested.py
   authoring_profiles.py
   bubble_cache.py
+  bubble_mounts.py
   cache_probe_user_agent.py
   bubble_version.py
   branch_claim_repo.py
