@@ -3389,7 +3389,21 @@ other contributors' claims, or the hard rules of the repo.
     # Scope git-safe-push's publication records to this round so its pushes can be labelled.
     push_scope = current_round_id() or os.urandom(16).hex()
     try:
-        with environment(TAUCETI_PUSH_SCOPE=push_scope):
+        claim_env = {}
+        # List assignments already hold a host-side claim; native agents use their source
+        # claim wrapper, whose GitHub namespace must be resolved outside native activation.
+        from .worker_sources import current
+
+        if targets_path is None and current() is None:
+            try:
+                namespace = claims_repo()
+            except (Die, GitHubError, ForgeError, NoProgress, OSError) as error:
+                # This fork is already needed for publication. A failed optional namespace
+                # lookup must not prevent authoring, and canonical is never the fallback.
+                log(f"roadmap: claim namespace lookup failed ({type(error).__name__}); using the authoring fork")
+                namespace = fork
+            claim_env["CLAIM_REPO"] = namespace
+        with environment(TAUCETI_PUSH_SCOPE=push_scope, **claim_env):
             return run_agent_host(
                 w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg
             )
