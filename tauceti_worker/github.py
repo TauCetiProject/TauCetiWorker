@@ -690,10 +690,9 @@ _OPEN_PRS_QUERY = """query($owner:String!,$repo:String!,$n:Int!,$cursor:String){
 BORS_MERGED_PREFIX = "[Merged by Bors] - "
 
 
-def normalize_merged(d: dict) -> dict:
-    """`d` with a Bors landing reported as any other merge. Bors lands a squash on main and closes
-    the pull request under a `[Merged by Bors] - ` title, which GitHub reports as CLOSED."""
-    if d.get("state") == "CLOSED" and str(d.get("title") or "").startswith(BORS_MERGED_PREFIX):
+def normalize_merged(d: dict, *, verified_queue_landing: bool = False) -> dict:
+    """Normalize a queue closure only after source-bound landing proof, never from its title."""
+    if verified_queue_landing and d.get("state") == "CLOSED":
         d["state"] = "MERGED"
     return d
 
@@ -878,9 +877,17 @@ class GitHub:
             p = self._gh([*args, "--json", "number,title,body,state,baseRefName"])
             if p.returncode != 0:
                 raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
-            return [d for d in map(normalize_merged, json.loads(p.stdout or "[]")) if d.get("state") == "MERGED"]
+            rows = json.loads(p.stdout or "[]")
+            normalized = [self._target_merge(d) for d in rows]
+            return {
+                "rows": [d for d in normalized if d.get("state") == "MERGED"],
+                "complete": len(rows) < limit,
+            }
 
-        return transport.shared_read(["merged_prs", self.repo, search, limit], fetch, ttl=120)
+        from .targets import MergedPRs
+
+        result = transport.shared_read(["merged_prs", "verified-v2", self.repo, search, limit], fetch, ttl=120)
+        return MergedPRs(result["rows"], complete=result["complete"])
 
     def target_marker_prs(self, *, limit: int = 200, search: str = "") -> list[dict]:
         """Number, title, body, head (`headRefOid`), base branch (`baseRefName`) and state (OPEN, CLOSED or
@@ -894,9 +901,50 @@ class GitHub:
             p = self._gh([*args, "--json", "number,title,body,state,headRefOid,baseRefName"])
             if p.returncode != 0:
                 raise GitHubError(f"gh pr list failed: {p.stderr.strip()}")
-            return [normalize_merged(d) for d in json.loads(p.stdout or "[]")]
+            return [self._target_merge(d) for d in json.loads(p.stdout or "[]")]
 
-        return transport.shared_read(["target_marker_prs", self.repo, limit, search], fetch, ttl=120)
+        return transport.shared_read(["target_marker_prs", "verified-v2", self.repo, limit, search], fetch, ttl=120)
+
+    def _target_merge(self, row: dict) -> dict:
+        """Native merges are authoritative; Bors-looking closures need a verified landing."""
+        if row.get("state") == "CLOSED" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX):
+            return normalize_merged(
+                row, verified_queue_landing=self.target_queue_landed(row.get("number"), row.get("baseRefName"))
+            )
+        return row
+
+    def target_queue_landed(self, number: int, branch: str) -> bool:
+        from .target_landings import queue_landed
+
+        def fetch():
+            failures = []
+
+            def read_json(path):
+                result = self._gh(["api", path])
+                if result.returncode:
+                    error = GitHubError("target landing evidence is unavailable")
+                    failures.append(error)
+                    raise error
+                try:
+                    return json.loads(result.stdout)
+                except (ValueError, TypeError) as error:
+                    failures.append(error)
+                    raise
+
+            def comments():
+                rows = self.issue_comments(number)
+                if rows is None:
+                    error = GitHubError("target landing comments are unavailable")
+                    failures.append(error)
+                    raise error
+                return rows
+
+            verified = queue_landed(self.repo, number, branch, read_json=read_json, read_comments=comments)
+            if failures:
+                raise failures[0]
+            return verified
+
+        return transport.shared_read(["target_queue_landed", self.repo, number, branch], fetch, ttl=120)
 
     def issue_list(
         self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200

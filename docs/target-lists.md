@@ -53,7 +53,9 @@ first `## ` heading is shown to the agent with the items of its area.
   slug as the first backtick token, then ` — ` and a description. Slugs are
   unique across the file. A slug becomes the claim key `author/<Area>/<slug>`
   and the `id` of the pull request's target marker, so it should not change
-  once work has started.
+  once work has started. Slugs use letters, digits, `_`, `-` and `.`, start
+  with a letter or digit, and contain neither `..` nor a trailing `.lock` or `.`.
+  This keeps them valid both in Git claim refs and in target markers.
 - A trailing parenthesised group holds `key: value` clauses separated by `;`,
   with no parentheses inside. `needs:` is a comma list of slugs from any area,
   or `none`. `partial: #N, #M` names merged GitHub pull requests that did not
@@ -74,8 +76,13 @@ The marks in the file go stale between edits, so each round overlays them:
   flight.
 - A merged one, into the branch the worker authors against
   (`TAUCETI_BASE_BRANCH`, default `main`), marks it done, unless its marker also says `"partial":true` or
-  the item's `partial:` clause names the pull request. A pull request Bors
-  landed, closed under a `[Merged by Bors] - ` title, counts as merged.
+  the item's `partial:` clause names the pull request. A pull request closed by the queue counts only with verified landing evidence
+  on the configured base branch. A `[Merged by Bors] - ` title is only a hint:
+  on GitHub the queue App’s canonical landing record must name an ancestor of
+  the base; on Forgejo that landed commit must also bind the exact forge,
+  repository ID and PR in its queue trailers and contain a nonempty change.
+  Missing or forged proof never unlocks dependent work. For older queue
+  landings without verifiable records, an operator can explicitly mark `[x]`.
 
 The overlay only moves an item forward: `[x]` in the file stays done and `[~]`
 stays in flight until the file changes. The merged side reads, on each forge,
@@ -86,7 +93,9 @@ spacing of its JSON. An older
 landing is searched by item before eligibility is computed for any unresolved
 prerequisite, so it continues to unlock dependent items after leaving this recent
 window. Candidate items are also checked before assignment. These reads preserve
-partial-marker, explicit `partial:` and base-branch checks. Ticking `[x]` in the
+partial-marker, explicit `partial:` and base-branch checks. Complete recent
+listings avoid these per-item reads, and completed/in-flight items do not trigger
+searches for their own prerequisites. Ticking `[x]` in the
 file records an operator completion and avoids repeated historical lookups.
 
 ## Selection

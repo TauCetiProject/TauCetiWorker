@@ -87,6 +87,12 @@ class Format(unittest.TestCase):
             ("- [ ] `a` — x (needs: a)\n", "dependency cycle"),
             ("- [ ] `a` — x (needs: b)\n- [ ] `b` — y (needs: a)\n", "dependency cycle"),
             ("- [ ] `` — x\n", "malformed item|invalid slug"),
+            ("- [ ] `a` — x (needs:)\n", "malformed item"),
+            ("- [ ] `a` — x (needs: none; needs: none)\n", "malformed item"),
+            *[
+                (f"- [ ] `{slug}` — x\n", "invalid slug")
+                for slug in ("a..b", "x:y", "lemma[1]", "foo.lock", "a~1", "a}", "a.")
+            ],
         ):
             with self.subTest(body=body), self.assertRaisesRegex(tc.Die, error):
                 t.parse_targets(prefix + body)
@@ -111,8 +117,44 @@ class Format(unittest.TestCase):
                 self.assertEqual(tc.main(["_targets-inspect", "--file", str(path)]), 0)
             self.assertEqual(json.loads(output.getvalue()), info)
 
+    def test_console_inspection_failure_does_not_mutate_runtime_or_scripts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "targets.md"
+            path.write_text("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x (needs: missing)\n")
+            output, errors = io.StringIO(), io.StringIO()
+            with (
+                patch.object(sys, "argv", ["tauceti", "_targets-inspect", "--file", str(path)]),
+                contextlib.redirect_stdout(output),
+                contextlib.redirect_stderr(errors),
+                patch.object(tc, "_ensure_scripts_executable", side_effect=AssertionError("script mutation")),
+                patch.object(tc, "report_failure", side_effect=AssertionError("runtime mutation")),
+            ):
+                self.assertEqual(tc.cli_main(), 2)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("undefined slug", errors.getvalue())
+
 
 class LiveView(unittest.TestCase):
+    def test_complete_recent_history_does_not_trigger_dependency_searches(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        source = SimpleNamespace(open_prs=lambda: [], merged_prs=Mock(return_value=t.MergedPRs([], complete=True)))
+        t.live_targets(listed, source)
+        source.merged_prs.assert_called_once()
+
+    def test_done_and_inflight_items_do_not_search_their_prerequisites(self):
+        listed = t.parse_targets(
+            "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
+        )
+        for source in (
+            github(open_bodies=[marker("Algebra", "next")]),
+            github(merged=[(7, marker("Algebra", "next"))]),
+        ):
+            source.merged_prs = Mock(wraps=source.merged_prs)
+            t.live_targets(listed, source)
+            source.merged_prs.assert_called_once()
+
     def test_old_prerequisite_unlocks_children_on_every_read(self):
         listed = t.parse_targets(
             "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"
@@ -181,7 +223,13 @@ class LiveView(unittest.TestCase):
         ]
         gh = tc.GitHub("org/repo")
         gh._gh = Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr=""))
-        with patch.dict(os.environ, {"TAUCETI_GITHUB_CACHE_BYPASS": "1"}):
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_CACHE_BYPASS": "1"}),
+            patch.object(gh, "target_queue_landed", return_value=False) as proof,
+        ):
+            self.assertEqual([d["number"] for d in gh.merged_prs(t.MERGED_SEARCH, limit=50)], [1])
+            proof.assert_called_once_with(2, None)
+            proof.return_value = True
             self.assertEqual([d["number"] for d in gh.merged_prs(t.MERGED_SEARCH, limit=50)], [1, 2])
             argv = gh._gh.call_args.args[0]
             self.assertEqual(argv[argv.index("--state") + 1], "closed")
@@ -507,9 +555,14 @@ class Forgejo(unittest.TestCase):
         unmerged = dict(self.pull(7, marker("Algebra", "b"), merged=False), title="Prove b")
         self.closed = [[landed, unmerged]]
         listed = t.parse_targets("<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `a` — x\n- [ ] `b` — y\n")
-        self.assertEqual(status(t.live_targets(listed, self.source)), {"a": "done", "b": "open"})
-        self.found = [[{"number": 6, "title": title, "body": landed["body"], "state": "closed"}]]
-        self.assertEqual(t.landed_pr(listed.find("a"), self.source), 6)
+        with patch.object(self.source, "target_queue_landed", return_value=False) as proof:
+            self.assertEqual(status(t.live_targets(listed, self.source)), {"a": "open", "b": "open"})
+            proof.assert_called_once_with(6, "main")
+            proof.return_value = True
+            self.source.cache.invalidate()
+            self.assertEqual(status(t.live_targets(listed, self.source)), {"a": "done", "b": "open"})
+            self.found = [[{"number": 6, "title": title, "body": landed["body"], "state": "closed"}]]
+            self.assertEqual(t.landed_pr(listed.find("a"), self.source), 6)
 
     def test_partial_clause_names_a_forgejo_pull_request_by_url(self):
         url = self.repo.pull_url(5)

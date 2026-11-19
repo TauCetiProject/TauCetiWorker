@@ -1873,6 +1873,17 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
 
 def cli_main() -> int:
     """Console-script entry point (also used by ./tauceti). Maps the worker's exceptions to exit codes."""
+    from tauceti_tools.project import conf_argument
+
+    _, arguments = conf_argument(sys.argv[1:])
+    if arguments[:1] == ["_targets-inspect"]:
+        # Fleet's offline parser must not repair installed scripts or write failure/runtime
+        # records merely because an operator is validating a proposed list.
+        try:
+            return main() or 0
+        except Die as error:
+            print(f"tauceti: {error}", file=sys.stderr)
+            return 2
     # A service has no login shell to provide NIX_SSL_CERT_FILE, and uv's standalone CPython may not
     # know the host's CA-bundle path. Repair the process environment before quota telemetry and child
     # launches; this also gives other TLS-using subprocesses the same host trust store.

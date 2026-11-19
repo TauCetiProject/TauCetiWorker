@@ -44,11 +44,20 @@ _AREA_RE = re.compile(r"[A-Za-z0-9_-]+")
 _HEADING_RE = re.compile(r"^##\s+(.*?)\s*$")
 _ITEM_RE = re.compile(r"^\s*-\s*\[([ xX~])\]\s*(.*?)\s*$")
 _SLUG_RE = re.compile(r"`([^`]+)`")
+_VALID_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _META_RE = re.compile(r"\(([^()]*)\)\s*$")
 _STATUS = {" ": "open", "~": "inflight", "x": "done", "X": "done"}
 _BOX = {"open": "[ ]", "inflight": "[~]", "done": "[x]"}
 
 Key = tuple[str, str]  # (area, slug): what a pull request's target marker names
+
+
+class MergedPRs(list):
+    """A merged-PR listing with explicit coverage before merged-state filtering."""
+
+    def __init__(self, rows=(), *, complete=False):
+        super().__init__(rows)
+        self.complete = complete
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,7 @@ def _parse_item(line: str, area: str) -> TargetItem | None:
     sep = re.match(r"\s*[—–-]\s+", text)
     text = text[sep.end() :] if sep else text.strip()
     needs: tuple[str, ...] = ()
+    saw_needs = False
     meta = []
     clauses = _META_RE.search(text)
     if clauses:
@@ -90,8 +100,14 @@ def _parse_item(line: str, area: str) -> TargetItem | None:
             key, _, value = clause.partition(":")
             if key.strip().lower() != "needs":
                 meta.append(clause)
-            elif value.strip().lower() != "none":
-                needs = tuple(s.strip().strip("`").strip() for s in value.split(",") if s.strip("` \t"))
+            else:
+                if saw_needs or not value.strip():
+                    return None
+                saw_needs = True
+                if value.strip().lower() != "none":
+                    needs = tuple(s.strip().strip("`").strip() for s in value.split(",") if s.strip("` \t"))
+                    if not needs:
+                        return None
     return TargetItem(area, slug.group(1).strip(), _STATUS[m.group(1)], text, needs, tuple(meta))
 
 
@@ -129,7 +145,7 @@ def parse_targets(text: str) -> Targets:
         raise Die(f"target list: {len(bad)} malformed item line(s), first at line {bad[0]}")
     by_slug = {}
     for item in targets.items():
-        if not item.slug or any(c.isspace() or c in '/\\`"' or ord(c) < 32 for c in item.slug):
+        if not _VALID_SLUG_RE.fullmatch(item.slug) or ".." in item.slug or item.slug.endswith((".", ".lock")):
             raise Die(f"target list: invalid slug {item.slug!r}")
         if item.slug in by_slug:
             raise Die(f"target list: duplicate slug {item.slug!r}; slugs must be unique across areas")
@@ -272,6 +288,7 @@ def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
     inflight: set[Key] = set()
     done: set[Key] = set()
     sources = (gh, *others)
+    incomplete = []
     for source in sources:
         rows = source.open_prs()
         if rows is None:
@@ -280,13 +297,16 @@ def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
             inflight |= marker_keys(d.get("body"))[0]
         recent = source.merged_prs(f"{MERGED_SEARCH} base:{content_base()} sort:updated-desc", limit=MERGED_LIMIT)
         done |= set(landed(targets.items(), recent))
+        if not getattr(recent, "complete", False):
+            incomplete.append(source)
     # Resolve dependencies BEFORE eligibility, rather than only searching already eligible
     # candidates. Otherwise an old completed parent stays open and its children remain blocked.
-    needed = {slug for item in targets.items() if item.status != "done" for slug in item.needs}
+    live = overlay_live(targets, inflight, done)
+    needed = {slug for item in live.items() if item.status == "open" for slug in item.needs}
     for item in targets.items():
         key = (item.area, item.slug)
         if item.slug in needed and item.status != "done" and key not in done:
-            if any(landed_pr(item, source) is not None for source in sources):
+            if any(landed_pr(item, source) is not None for source in incomplete):
                 done.add(key)
     return overlay_live(targets, inflight, done)
 
@@ -365,7 +385,10 @@ class GitHubMarkerReads:
     def merged_prs(self, search: str, *, limit: int = MERGED_LIMIT) -> list[dict]:
         phrases = search_phrases(search)
         rows = [d for d in self._listing() if d.get("state") == "MERGED"]
-        return [d for d in rows if body_matches(d.get("body") or "", phrases)][:limit]
+        return MergedPRs(
+            [d for d in rows if body_matches(d.get("body") or "", phrases)][:limit],
+            complete=len(self._listing()) < MERGED_LIMIT,
+        )
 
     def merged_beyond_listing(self, search: str, *, limit: int) -> list[dict]:
         return self._beyond(search, "MERGED")[:limit]

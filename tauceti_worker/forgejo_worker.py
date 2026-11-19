@@ -118,7 +118,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
 
         from .config import SourceUnavailable
         from .github import BORS_MERGED_PREFIX
-        from .targets import MARKER_TAG, body_matches, content_base, search_id, search_phrases
+        from .targets import MARKER_TAG, MergedPRs, body_matches, content_base, search_id, search_phrases
 
         phrases = search_phrases(search)
         keyword = search_id(phrases) or next((p for p in phrases if p != MARKER_TAG), None)
@@ -133,7 +133,11 @@ class ForgejoWorkerSource(ForgejoReadSource):
             # queue lands a pull request by squash and closes it, unmerged, under BORS_MERGED_PREFIX.
             if (row if keyword is None else row.get("pull_request") or {}).get("merged") is True:
                 return True
-            return row.get("state") == "closed" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
+            return (
+                row.get("state") == "closed"
+                and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
+                and self.target_queue_landed(row["number"], content_base())
+            )
 
         def base(row):
             if keyword is not None:  # an issue search row names no base branch
@@ -146,13 +150,15 @@ class ForgejoWorkerSource(ForgejoReadSource):
 
         def fetch():
             rows = []
+            complete = True
             # Stop at the client's page bound, where `pages` would raise, rather than fail the read.
             for n, batch in enumerate(self.api.pages(path), 1):
                 # The base is checked before counting, so landings on other branches never fill `limit`.
                 rows += [r for r in batch if merged(r) and body_matches(r.get("body") or "", phrases) and on_base(r)]
                 if len(rows) >= limit or n >= self.api.max_pages:
+                    complete = False
                     break
-            return [
+            found = [
                 {
                     "number": r["number"],
                     "title": r.get("title") or "",
@@ -162,11 +168,60 @@ class ForgejoWorkerSource(ForgejoReadSource):
                 }
                 for r in rows[:limit]
             ]
+            return {"rows": found, "complete": complete}
 
-        rows = self._read("merged_prs", [search, limit], fetch)
-        if rows is None:
+        result = self._read("merged_prs", ["verified-v2", search, limit], fetch)
+        if result is None:
             raise SourceUnavailable("Forgejo merged pull request listing is unavailable")
-        return rows
+        return MergedPRs(result["rows"], complete=result["complete"])
+
+    def target_queue_landed(self, number, branch):
+        from .target_landings import queue_landed
+
+        def fetch():
+            failures = []
+
+            def read_json(path):
+                try:
+                    if "/git/commits/" in path:
+                        from tauceti_tools.forge_api import execute, plan
+                        from tauceti_tools.forge_command import parse_command
+
+                        # Forgejo's raw commit JSON nests the message and tree; the Tools
+                        # adapter normalizes it and verifies the actual Git tree object.
+                        output, _, _ = execute(plan(parse_command(["api", path])), self.api)
+                        return json.loads(output)
+                    return self.api.request("GET", path)
+                except (ForgeError, OSError, ValueError) as error:
+                    failures.append(error)
+                    raise
+
+            def comments():
+                rows = self.issue_comments(number)
+                if rows is None:
+                    error = Incomplete("native target landing comments are unavailable")
+                    failures.append(error)
+                    raise error
+                return rows
+
+            subject = f"{self.repository.forge.key}/{self.repository.name}@{self.identity.native_id}#{number}"
+            verified = queue_landed(
+                self.repository.name,
+                number,
+                branch,
+                read_json=read_json,
+                read_comments=comments,
+                native=True,
+                subject=subject,
+            )
+            if failures:
+                raise failures[0]
+            return verified
+
+        result = self._read("target_queue_landed", [number, branch], fetch)
+        if result is None:
+            raise Incomplete("native target landing evidence is unavailable")
+        return result
 
     def issue_list(self, repository, **options):
         from .github import GitHub

@@ -265,6 +265,7 @@ RUN_STDLIB=(
   staging_journal_report.py
   status_labels.py
   target_list.py
+  target_landings.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
