@@ -1497,6 +1497,10 @@ class Controller:
             with self.store.transaction():
                 # Only the input is flagged: an ordinary batch never becomes an emergency batch.
                 self.store.update("inputs", {"id": current["id"]}, urgent=URGENT_EMERGENCY, evidence=dumps(evidence))
+                if self.admission is not None:
+                    # Its batch needs admission current at this head: evaluate it again now, ahead of
+                    # all other pending admission work (`AdmissionState.next_due`).
+                    self.admission.invalidate(number, head=current["head_sha"], urgent=True)
                 self.store.journal(
                     now,
                     "emergency-requested",
