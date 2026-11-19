@@ -1216,6 +1216,7 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     "source_selection": 1,
                     "graceful_restart": 1,
                     "roadmap_targets": 1,
+                    "roadmap_targets_fallback": 1,
                     "targets_inspect": 1,
                 }
             if action == "restart":

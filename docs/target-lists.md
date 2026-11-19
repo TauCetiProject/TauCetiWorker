@@ -175,7 +175,7 @@ reads. Invalid files exit nonzero with a diagnostic rather than a success object
 Fleet uses this interface from a compatible Worker runtime instead of duplicating
 the grammar. Its counts describe the file; the worker round additionally overlays
 forge evidence. `_fleet-protocol` and the running manager advertise
-`targets_inspect: 1` and `roadmap_targets: 1`.
+`targets_inspect: 1`, `roadmap_targets: 1` and `roadmap_targets_fallback: 1`.
 
 ## Maintenance priority
 
