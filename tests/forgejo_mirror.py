@@ -193,6 +193,37 @@ class MirrorTests(unittest.TestCase):
             self.assertEqual(refs["refs/forks/alice/heads/feature"], self.fork_sha)
             self.assertNotIn("refs/tauceti-mirror/archive", git(self.mirror, "for-each-ref", "--format=%(refname)"))
 
+    def test_reserved_namespace_roots_are_dropped(self):
+        sha = self.base_refs["refs/heads/main"]
+        git(self.forge.repo("Org/TauCeti"), "update-ref", "refs/forks", sha)
+        git(self.forge.repo("Org/TauCeti"), "update-ref", "refs/tauceti-mirror", sha)
+        self.assertEqual(self.run_mirror()[0], 0)
+        self.assertEqual(self.run_mirror("--fork", "alice")[0], 0)
+        self.assertEqual(self.mirrored()["refs/forks/alice/heads/feature"], self.fork_sha)
+        self.assertNotIn("refs/forks", self.mirrored())
+
+    def test_an_interrupted_apply_is_replayed_before_the_next_assessment(self):
+        for i in range(30):
+            self.forge.set_ref("Org/TauCeti", f"refs/heads/roadmap/b{i}", self.base_refs["refs/heads/main"])
+        self.assertEqual(self.run_mirror()[0], 0)
+        accepted = self.mirrored()
+        # Upstream deleted 8 refs; a run deleted them in its first step and died. Upstream then
+        # lost 8 more.
+        doomed = [f"refs/heads/roadmap/b{i}" for i in range(8)]
+        backup = self.mirror.parent / "apply-backup-base.txt"
+        backup.write_text("".join(f"{accepted[name]} {name}\n" for name in doomed))
+        for name in doomed:
+            git(self.mirror, "update-ref", "-d", name)
+        for i in range(16):
+            self.forge.delete_ref("Org/TauCeti", f"refs/heads/roadmap/b{i}")
+        self.assertEqual(self.run_mirror(command="check")[0], 1)
+        code, events = self.run_mirror()
+        # Against the full baseline 16 refs disappear, more than the allowance of 10.
+        self.assertEqual(code, 1, events)
+        self.assertIn("recovered-interrupted-apply", [event["event"] for event in events])
+        self.assertEqual(self.mirrored(), accepted)
+        self.assertFalse(backup.exists())
+
     def test_fork_with_its_own_name(self):
         self.forge.set_ref("bob/Other", "refs/heads/work", self.fork_sha)
         self.forge.set_ref("bob/TauCeti", "refs/heads/unrelated", self.base_refs["refs/heads/main"])

@@ -39,6 +39,13 @@ STAGING = "refs/tauceti-mirror/staging/"
 FORKS = "refs/forks/"
 # Namespaces in the mirror that never belong to the base repository's own refs.
 PRIVATE = (STAGING, FORKS, "refs/tauceti-mirror/")
+
+
+def reserved(name: str) -> bool:
+    """A ref in, or at the root of, one of the mirror's own namespaces."""
+    return any(name == prefix.rstrip("/") or name.startswith(prefix) for prefix in PRIVATE)
+
+
 EXIT_OK, EXIT_REFUSED, EXIT_SETUP, EXIT_BUSY = 0, 1, 2, 75
 
 
@@ -113,7 +120,7 @@ def list_refs(repo: Path, prefix: str) -> dict[str, str]:
 def live_refs(repo: Path, source: Source) -> dict[str, str]:
     refs = list_refs(repo, source.live_prefix)
     if source.live_prefix == "refs/":
-        refs = {name: sha for name, sha in refs.items() if not name.startswith(PRIVATE)}
+        refs = {name: sha for name, sha in refs.items() if not reserved(name)}
     return refs
 
 
@@ -123,7 +130,7 @@ def staged_refs(repo: Path, source: Source) -> dict[str, str]:
     staged = {source.live_prefix + name[len(source.staging_prefix) :]: sha for name, sha in raw.items()}
     if source.live_prefix == "refs/":
         # The base repository may not write into the mirror's own namespaces.
-        staged = {name: sha for name, sha in staged.items() if not name.startswith(PRIVATE)}
+        staged = {name: sha for name, sha in staged.items() if not reserved(name)}
     return staged
 
 
@@ -189,8 +196,9 @@ def assess(source: Source, live: dict[str, str], staged: dict[str, str], max_los
 def apply(repo: Path, live: dict[str, str], staged: dict[str, str], backup: Path) -> None:
     """Move the accepted copy to the staged one in a single all-or-nothing ref transaction.
 
-    If a second transaction is unavoidable, the accepted refs are first written to `backup`,
-    which is removed again once both transactions succeed or the first is undone.
+    If a second transaction is unavoidable, the refs the first one deletes are written to
+    `backup` beforehand, and the file is removed once both succeed or the first is undone. A file
+    left by an interrupted run is replayed by recover() before the next fetch is assessed.
     """
     deletes = [f"delete {name} {sha}" for name, sha in sorted(live.items()) if name not in staged]
     updates = [
@@ -216,15 +224,44 @@ def apply(repo: Path, live: dict[str, str], staged: dict[str, str], backup: Path
         if not conflicts:
             raise
     backup.parent.mkdir(parents=True, exist_ok=True)
-    backup.write_text("".join(f"{sha} {name}\n" for name, sha in sorted(live.items())))
+    write_atomic(backup, "".join(f"{sha} {name}\n" for name, sha in sorted(conflicts.items())))
     transaction(repo, [f"delete {name} {sha}" for name, sha in sorted(conflicts.items())])
     try:
         transaction(repo, [line for line in deletes if line.split(" ")[1] not in conflicts] + updates)
-    except MirrorError:
-        transaction(repo, [f"create {name} {sha}" for name, sha in sorted(conflicts.items())])
-        backup.unlink()
+    except BaseException:
+        recover(repo, backup)
         raise
     backup.unlink()
+
+
+def recover(repo: Path, backup: Path) -> int:
+    """Recreate the refs an interrupted two-step apply deleted, so the loss baseline stays intact.
+
+    A ref is skipped when it, or a ref it conflicts with, exists: then the second transaction had
+    committed and the deletion was accepted. Returns the number of refs recreated.
+    """
+    if not backup.exists():
+        return 0
+    existing = set(list_refs(repo, "refs/"))
+    restored = 0
+    for line in backup.read_text().splitlines():
+        sha, name = line.split(" ", 1)
+        if any(other == name or other.startswith(name + "/") or name.startswith(other + "/") for other in existing):
+            continue
+        transaction(repo, [f"create {name} {sha}"])
+        restored += 1
+    backup.unlink()
+    return restored
+
+
+def write_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    partial = path.with_name(path.name + ".partial")
+    with open(partial, "w") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(partial, path)
 
 
 def transaction(repo: Path, lines: list[str]) -> None:
@@ -340,6 +377,10 @@ def run(args) -> int:
         record = dict(results.get(source.name, {}))
         record["last_attempt"] = now.isoformat()
         try:
+            backup = state_dir / f"apply-backup-{source.name}.txt"
+            recovered = recover(repo, backup)
+            if recovered:
+                log("warning", "recovered-interrupted-apply", source=source.name, refs=recovered)
             fetch(repo, source, env, args.fetch_timeout)
             live = live_refs(repo, source)
             staged = staged_refs(repo, source)
@@ -349,7 +390,7 @@ def run(args) -> int:
                 ok = True
             details["seconds"] = round(time.monotonic() - started, 1)
             if ok:
-                apply(repo, live, staged, state_dir / f"apply-backup-{source.name}.txt")
+                apply(repo, live, staged, backup)
                 record.update(last_success=now.isoformat(), refs=details["staged"], last_error=None)
                 log("info", "mirrored", **details)
             else:
