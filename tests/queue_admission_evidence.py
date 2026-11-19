@@ -339,6 +339,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(cache.store.get_setting(cache.tip_key)["sha"], "b" * 40)
         self.deliver("push", {"ref": ref, "after": "c" * 40, "repository": {"full_name": REPO, "pushed_at": 200}})
         self.assertEqual(cache.store.get_setting(cache.tip_key)["sha"], "")  # a tie: no push tip
+        self.assertIsNone(cache.view(1)["tip"])  # and a tie after the last read leaves the base unknown
         # Two comment counts with one timestamp: order unknown, so the PR needs a full read.
         at = self.rows("admission_evidence")[0]["count_updated_at"]
         self.deliver(
@@ -358,6 +359,16 @@ class EvidenceTests(unittest.TestCase):
         board = self.github.review_comments[1][0]
         self.comment_event(1, {**board, "body": "plain words now"}, "edited")
         self.assertEqual(self.intake.evidence.view(1)["status"], "unseeded")
+
+    def test_push_tip_against_the_last_read(self):
+        from tauceti_queue.admission_evidence import EvidenceCache
+
+        row = {"base_sha": "r" * 40, "seeded_at": 100, "seeded_until": 110}
+        self.assertEqual(EvidenceCache._tip({}, row), "r" * 40)
+        self.assertEqual(EvidenceCache._tip({"sha": "p" * 40, "at": 90}, row), "r" * 40)  # before the read
+        self.assertIsNone(EvidenceCache._tip({"sha": "p" * 40, "at": 105}, row))  # during the read
+        self.assertEqual(EvidenceCache._tip({"sha": "p" * 40, "at": 120}, row), "p" * 40)  # after it
+        self.assertIsNone(EvidenceCache._tip({"sha": "", "ambiguous": True, "at": 120}, row))
 
 
 if __name__ == "__main__":

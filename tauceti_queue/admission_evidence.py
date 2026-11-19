@@ -102,7 +102,7 @@ class EvidenceCache:
                 if len(after) == 40 and pushed and pushed >= current.get("pushed_at", 0):
                     # Two pushes with one `pushed_at`: order unknown, so no push tip until the next.
                     tie = pushed == current.get("pushed_at") and after != current.get("sha")
-                    value = {"sha": "" if tie else after, "pushed_at": pushed, "at": now}
+                    value = {"sha": "" if tie else after, "ambiguous": tie, "pushed_at": pushed, "at": now}
                     self.store.set_setting(self.tip_key, value, "admission evidence", now)
 
     def _row(self, number):
@@ -158,7 +158,7 @@ class EvidenceCache:
             "received_at": now if seeded_at is None else seeded_at,
         }
         if seeded_at is not None:
-            values["seeded_at"] = seeded_at
+            values["seeded_at"], values["seeded_until"] = seeded_at, now
         elif updated == row["pr_updated_at"] and any(
             row[k] != values[k]
             for k in ("head_sha", "base_sha", "base_ref", "state", "draft", "body", "labels", "head_ref", "head_repo")
@@ -339,9 +339,7 @@ class EvidenceCache:
         return {
             "status": "seeded",
             "row": row,
-            # A push delivered after the PR's last full read is newer than that read's base;
-            # otherwise the read's base is the authoritative one.
-            "tip": tip["sha"] if tip.get("sha") and tip.get("at", 0) > row["seeded_at"] else row["base_sha"],
+            "tip": self._tip(tip, row),
             "labels": tuple(loads(row["labels"], [])),
             "comment_ids": tuple(c["comment_id"] for c in live),
             "comments": tuple(
@@ -359,6 +357,18 @@ class EvidenceCache:
             "statuses": {s["context"]: s["state"] for s in statuses},
             "received_at": received,
         }
+
+    @staticmethod
+    def _tip(tip, row):
+        """The canonical tip to measure against: a push delivered after the PR's last full read
+        ended is newer than that read's base; one delivered during the read, or two pushes with
+        one timestamp, leave the order unknown (None); otherwise the read's base holds."""
+        at = tip.get("at", 0)
+        if not tip or at < row["seeded_at"]:
+            return row["base_sha"]
+        if at <= max(row["seeded_until"], row["seeded_at"]) or tip.get("ambiguous") or not tip.get("sha"):
+            return None
+        return tip["sha"]
 
     def merge_base(self, tip, head):
         """The unique local merge base of `head` with `tip`, or None."""

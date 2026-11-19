@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS admission_evidence (
     comments_count INTEGER NOT NULL DEFAULT -1,
     count_updated_at REAL NOT NULL DEFAULT 0,
     seeded_at REAL NOT NULL DEFAULT 0,
+    seeded_until REAL NOT NULL DEFAULT 0,
     received_at REAL NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS admission_evidence_pr ON admission_evidence (repository, number);
