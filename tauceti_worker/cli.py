@@ -1382,6 +1382,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         from .targets import load_targets
 
         load_targets(roadmap_targets())
+    if "reconcile" in only and roadmap_targets() is None:
+        raise Die("--only reconcile needs a target list: pass --roadmap-targets FILE")
     # Persist the operator's choice into loop children and recovery rounds.
     if getattr(args, "self_tested", None) is not None:
         os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
@@ -1770,7 +1772,9 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
     needs_host_build = any(
-        (not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan")
+        (not _bubble(s, opts))
+        for s in WORK_TASKS
+        if want(opts.only, s) and s not in ("review", "overlap-scan", "reconcile")
     )
     if needs_host_build:
         from .agents import lake_cache_max_revs

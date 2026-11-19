@@ -157,6 +157,19 @@ def deduplicate(observations):
             kind.actionable = [candidate for candidate in kind.actionable if candidate.pr not in duplicates]
 
 
+def _keeping(pause, call, *args, **kwargs):
+    """`call(*args, **kwargs)`, except that when it finds no work an earlier typed `pause` is the
+    round's result."""
+    from .work_units import NoEligibleWork
+
+    try:
+        return call(*args, **kwargs)
+    except NoProgress as error:
+        if pause is not None and (type(error) is NoProgress or isinstance(error, NoEligibleWork)):
+            raise pause from error
+        raise
+
+
 def run_round(w, opts, *, use_fleet_focus=True):
     import os
 
@@ -197,6 +210,29 @@ def run_round(w, opts, *, use_fleet_focus=True):
         if waits:
             raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
+    pause = None
+    if want(opts.only, "reconcile") and not getattr(opts, "prs", ()):
+        # Once a round and ahead of any source's work, reconciliation reads every healthy source. It
+        # runs in GitHub's round when GitHub was surveyed, otherwise in the new-PR forge's.
+        destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
+        name, worker, result = min(healthy, key=lambda row: (row[0] != "github", row[0] != destination))
+        worker.target_sources = [other.gh for _, other, _ in healthy if other is not worker]
+        selected = dataclasses.replace(opts, only=["reconcile"])
+        rest = [task for task in opts.only if task != "reconcile"]
+        try:
+            if name == "github":
+                return ordinary_round(worker, selected, prepared_survey=result)
+            with activate(worker.gh, worker.cfg):
+                return ordinary_round(worker, selected, prepared_survey=result)
+        except NoProgress as error:
+            if not rest:  # an empty `only` would mean every task
+                raise
+            # A typed pause (admission, an unavailable forge) is raised if nothing else runs.
+            if type(error) is not NoProgress and not isinstance(error, NoEligibleWork):
+                pause = error
+                waits.append(error)
+            log(f"{error}; going on to the other selected work")
+        opts = dataclasses.replace(opts, only=rest)
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")
@@ -259,16 +295,16 @@ def run_round(w, opts, *, use_fleet_focus=True):
             worker.target_sources = [other.gh for _, other, _ in healthy if other is not worker]
             selected = dataclasses.replace(opts, only=["roadmap"])
             if name == "github":
-                return ordinary_round(worker, selected, prepared_survey=result)
+                return _keeping(pause, ordinary_round, worker, selected, prepared_survey=result)
             with activate(worker.gh, worker.cfg):
-                return ordinary_round(worker, selected, prepared_survey=result)
+                return _keeping(pause, ordinary_round, worker, selected, prepared_survey=result)
     if (
         use_fleet_focus
         and want(opts.only, "roadmap")
         and any(getattr(result, "_round_scope", (False, False))[1] for _, _, result in healthy)
     ):
         log("Fleet roadmap focus: no available focused work; selecting global maintenance")
-        return run_round(w, opts, use_fleet_focus=False)
+        return _keeping(pause, run_round, w, opts, use_fleet_focus=False)
     if waits:
         raise waits[0]
     error = ClaimCollision if collisions else NoEligibleWork
