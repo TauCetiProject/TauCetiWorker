@@ -500,6 +500,11 @@ included, and the background publisher's transient unit is started in the same s
 settings. The slice weight is what counts against the VMs: the cgroup CPU controller shares a busy
 host between sibling slices by weight, so a reniced process in `app.slice` competes as `app.slice`
 does. The weights are work-conserving, so repairs slow down under a staging build and never stop.
+Inside the slice the head batch's work comes first: the repair units set no CPU weight of their own, so
+the slice enables no CPU controller for them and all repair processes share its CPU by niceness, and
+during a background task (`prepare`, `pre_rebase`, a proactive prediction repair) every sandboxed build,
+the agent's included, runs at niceness 19 (`repair_sandbox.prioritized`). Giving a repair unit a CPU
+weight would make each unit a separate CPU group and end this ordering.
 Disk traffic is ordered only where the block layer honours cgroup weights or IO priorities (BFQ,
 mq-deadline, or io.cost configured for the device); tauchonki2's devices use `none`, so there
 nothing orders it. The slice's `MemoryHigh=48G` (with no `MemoryMax`) is a reclaim threshold that

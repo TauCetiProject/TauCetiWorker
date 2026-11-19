@@ -1051,6 +1051,7 @@ class Fixture(unittest.TestCase):
         status.start()
         self.addCleanup(status.stop)
         os.environ.pop("STUB_LAKE_CACHE_FAIL", None)
+        os.environ.pop(repair_sandbox.BACKGROUND_VARIABLE, None)
         os.environ.pop("STUB_LAKE_CACHE_FAIL_REVS", None)
         os.environ.pop("STUB_LAKE_REPAIR_REVS", None)
         os.environ.pop("STUB_LAKE_PUT_FAIL", None)
@@ -1795,6 +1796,22 @@ class ToolchainBumpWithoutArtifacts(Fixture):
         self.assertEqual(outcome["status"], "released", outcome)
         self.assertEqual(outcome["reason"], "artifacts_unavailable")
         self.assertEqual(self.agent_calls(), [])
+        self.assertEqual(os.environ.get(repair_sandbox.BACKGROUND_VARIABLE), "1", "its builds run in the background")
+
+    def test_background_tasks(self):
+        def task(kind, diagnostics=()):
+            raw = {**self.content.task(kind=kind), "claim_token": "t", "expires_at": time.time() + 60}
+            raw["diagnostics"] = list(diagnostics)
+            return repair_task.Task.from_json(raw)
+
+        prediction = {"kind": "admission_predictions", "proactive": True}
+        converted = {"kind": "admission_predictions", "proactive": False, "was_proactive": True}
+        self.assertTrue(repair_task.background_task(task("prepare")))
+        self.assertTrue(repair_task.background_task(task("pre_rebase")))
+        self.assertTrue(repair_task.background_task(task("repair", [prediction])))
+        self.assertFalse(repair_task.background_task(task("repair", [converted])))
+        self.assertFalse(repair_task.background_task(task("repair")))
+        self.assertFalse(repair_task.background_task(task("rebase_conflict")))
 
     def test_the_toolchain_change_is_read_from_the_chain(self):
         clone = self.content.bare.parent / "seed"
@@ -4149,6 +4166,19 @@ class SandboxedBuilds(Fixture):
         self.assertIn("--unshare-net", call)
         self.assertIn((str(worktree), str(worktree)), pairs(call, "--ro-bind"))
         self.assertEqual(self.lake_calls(), ["build --iofail TauCeti.A"])
+
+    def test_background_builds_run_at_the_lowest_cpu_priority(self):
+        worktree, _, env = self.worktree()
+        command = ["sh", "-c", "nice"]
+        self.assertEqual(repair_sandbox.sandboxed_lake(command, worktree, env)[1:3], ["-i", str(BIN / "bwrap")])
+        os.environ[repair_sandbox.BACKGROUND_VARIABLE] = "1"
+        argv = repair_sandbox.sandboxed_lake(command, worktree, env)
+        self.assertEqual(argv[:3], [shutil.which("nice"), "-n", "19"])
+        run = subprocess.run(argv, capture_output=True, text=True, env=env)
+        self.assertEqual(run.stdout.split(), ["19"], run.stderr)
+        os.environ[repair_sandbox.DISABLE_VARIABLE] = "0"
+        with self.assertLogs(repair_sandbox.LOGGER, "WARNING"):
+            self.assertEqual(repair_sandbox.sandboxed_lake(command, worktree, env)[:3], argv[:3])
 
     def test_disabled_falls_back_with_a_logged_warning(self):
         worktree, _, env = self.worktree()
