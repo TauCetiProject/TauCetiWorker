@@ -74,7 +74,12 @@ which no worker ever needs.
 If you run several workers on one host or in several containers, they get the
 same answer and coordinate with no configuration. Set `CLAIM_REPO` when you want
 to pin a namespace of your own anyway, for instance to keep two fleets under
-different `gh` accounts from contending with each other.
+different `gh` accounts from contending with each other. Free-choice roadmap
+agents on the GitHub host path receive that resolved namespace for their own
+`author/<area>/<slug>` claims; a failed namespace lookup falls back to the
+already selected authoring fork. With a target list, the worker takes its claim
+before launching the agent instead. Native sources retain their own claim
+wrapper and source identity.
 
 Claims are cooperative and fail-open. Honouring one only avoids duplicate work;
 the guarantee that two workers cannot clobber each other's branch is the
