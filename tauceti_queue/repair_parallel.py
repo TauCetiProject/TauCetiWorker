@@ -378,7 +378,7 @@ def group_prompt(context: PromptContext, group: Group, chain: list[ChainCommit],
             )
         lines.append("")
     if findings["lint"]["findings"]:
-        lines += ["Environment lint findings (new violations against the grandfathered baseline):", ""]
+        lines += ["Lint findings (new violations against the grandfathered baselines):", ""]
         for finding in findings["lint"]["findings"]:
             where = f" in `{finding['path']}`" if finding.get("path") else ""
             lines.append(f"- linter `{finding.get('linter')}`: `{finding.get('declaration')}`{where}")
@@ -762,8 +762,6 @@ def repair_groups(
             base=base,
             tools_root=cfg.root / repair_audit.TOOLS_DIR,
             lake=tuple(cfg.lake),
-            checks_owner="staging" if repair_audit.staging_checks(task) else "worker",
-            policy_file=worktree / repair_tools.TOOLS_DIR / repair_audit.SETTINGS_FILE,
         )
         group.worktree = str(path)
         return path
@@ -890,13 +888,8 @@ def repair_groups(
                     env_lake,
                     cfg.build_timeout,
                 )
-                if (
-                    build["rc"] == 0
-                    and getattr(cfg, "worker_audits", False)
-                    and task.kind == "repair"
-                    and not repair_audit.staging_checks(task)
-                ):
-                    # CI's audits and changed-module lint over the green build, still under the lock.
+                if build["rc"] == 0 and getattr(cfg, "worker_audits", False) and task.kind == "repair":
+                    # Staging's audits and lints over the green build, still under the lock.
                     checks = repair_audit.check(
                         worktree,
                         env_lake,
@@ -905,7 +898,6 @@ def repair_groups(
                         logdir=logdir,
                         lake=tuple(cfg.lake),
                         timeout=cfg.build_timeout,
-                        defer_when=lambda: repair_audit.staging_checks(task),
                     )
                     record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
                     check_findings = checks["diagnostics"]
@@ -926,7 +918,7 @@ def repair_groups(
     ):
         record["status"] = "ok"
         record["tip"] = folded_tip
-        if "checks" in record or repair_audit.staging_checks(task):
+        if "checks" in record:
             record["verified_tip"] = folded_tip  # the task's assigned worker verification completed
     else:
         record["status"] = "partial"

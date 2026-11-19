@@ -2139,53 +2139,6 @@ class Controller:
                     del self._renewal_waiters[claim_token]
                     self._renewing.pop(claim_token, None)
 
-    def _task_checks_owner(self, task: dict[str, Any]) -> str:
-        if task["kind"] == TASK_REPAIR and any(
-            diagnostic.get("kind")
-            in {"audit", "duplicate_declaration", "import_collision", "lint", "environment_linter"}
-            for diagnostic in loads(task["diagnostics"], [])
-        ):
-            # A diagnosed check failure is required repair verification, not optional
-            # background work to hand off for another serial staging round.
-            return "worker"
-        if task["kind"] not in BACKGROUND_TASKS:
-            return "staging"
-        head = self._head()
-        if head is not None:
-            if head["id"] == task["batch_id"]:
-                return "staging"
-            if task["kind"] == TASK_PREPARE and not self._pre_rebased_prepare(task):
-                first = self._open_batch()
-                if (
-                    first is not None
-                    and first["id"] == task["batch_id"]
-                    and not self._state("inference_hold")
-                    and self._pre_rebase_blocked(head) is None
-                ):
-                    # Finish useful source work, then release the old-base owner so
-                    # the successor can rebase. Its rebased worker may run full checks.
-                    return "staging"
-            return "worker"
-        first = self._open_batch()
-        ready = (
-            first is not None
-            and first["id"] == task["batch_id"]
-            and not self._state("inference_hold")
-            and not self._external_head_blocks_sealing()
-        )
-        return "staging" if ready else "worker"
-
-    def task_check_policy(self, task_id: int) -> dict:
-        """Refresh optional check priority over the existing authenticated claim renewal."""
-        with self._lock.priority():
-            task = self.store.row("tasks", {"id": task_id})
-            if task is None:
-                return {}
-            policy = {"checks_owner": self._task_checks_owner(task)}
-            if task["kind"] in BACKGROUND_TASKS:
-                policy["renew_after"] = HANDOFF_RENEW_SECONDS
-            return policy
-
     def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
 
@@ -2952,7 +2905,6 @@ class Controller:
         extra: dict[str, Any] = {
             "canonical_branch": self.canonical_branch,
             "claim_id": claim_id,
-            "checks_owner": self._task_checks_owner(task),
         }
         if loads(task.get("task_binding"), {}).get("schema") == "tauceti-queue.mixed-task/v1":
             if self.mixed is None:

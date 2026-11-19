@@ -1084,7 +1084,6 @@ class PromptContext:
     artifacts_cold: bool = False  # no warm artifacts: the agent's first build starts from nothing
     artifacts_reason: str | None = None  # ``prepare_artifacts``'s ``unavailable_reason`` when cold
     worker_verifies: bool = False  # worker owns the final full suite; agent checks are scoped
-    staging_checks: bool = False  # staging owns full audits and lint
     check_findings_known: bool = False  # cached artifacts fetched; CI already supplied the failures
     listings_path: Path | None = None  # where the member listings and the check script are written
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
@@ -1540,13 +1539,9 @@ def _verification_section(
             "that closure check in its final whole-library verification.",
             "",
             "After the focused checks and the chain check, return your summary. "
-            + (
-                "The worker compiles the final chain and submits it; staging runs full audits and environment lint. "
-                if context.staging_checks
-                else "The worker runs the whole-library build, full audits and environment lint before submission "
-                "and sends remaining failures back as diagnostics. "
-            )
-            + "If a targeted checker is unavailable, report that and return after scoped compilation; "
+            "The worker runs the whole-library build and all of staging's audits and lints before submission "
+            "and sends every remaining finding back as diagnostics. "
+            "If a targeted checker is unavailable, report that and return after scoped compilation; "
             "do not replace it with the full suite.",
             "",
             CACHE_SENTENCE,
@@ -2047,9 +2042,7 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
             )
         lines.append("")
     if findings["lint"]["findings"] or findings["lint"]["report"]:
-        lines.append(
-            "Environment lint findings (new violations against the grandfathered baseline; CI runs this lint):"
-        )
+        lines.append("Lint findings (new violations against the grandfathered baselines; CI runs these lints):")
         lines.append("")
         for finding in findings["lint"]["findings"]:
             path = finding.get("path") or (
