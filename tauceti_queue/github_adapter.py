@@ -701,6 +701,8 @@ class GitHubAdapter:
         # API when it is unambiguous there (set from `admission_local_merge_base` each pass).
         self.local_merge_base = False
         self.merge_base_sources = {"local": 0, "compare": 0}
+        # Slice 5: which admission evaluations took the single GraphQL read, and which fell back.
+        self.snapshot_sources = {"single": 0, "full": 0}
 
     # -- pull requests
 
@@ -1235,6 +1237,156 @@ class GitHubAdapter:
             return None
         return bases[0] if len(bases) == 1 and SHA.fullmatch(bases[0]) else None
 
+    def _admission_paths(self, merge_base: str, head: str) -> tuple[str, ...]:
+        return tuple(
+            p
+            for p in chain.git(
+                self.clone_dir,
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--ignore-submodules=none",
+                merge_base,
+                head,
+                "--",
+            ).split("\0")
+            if p
+        )
+
+    def _self_tested(self, repo, number, pull, paths, merge_base):
+        """Inline self-tested eligibility (live membership and bump reads) and, for an eligible head,
+        the PR-level diff guards PR CI would have run."""
+        from tauceti_tools.self_tested import eligible, requested
+
+        local = False
+        if requested(pull.labels):
+            raw = {
+                "number": number,
+                "state": pull.state,
+                "labels": pull.labels,
+                "base": {"ref": pull.base_ref},
+                "head": {"sha": pull.head_sha, "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
+                "user": {"login": pull.author_login},
+            }
+            local = eligible(
+                raw,
+                repo,
+                paths=paths,
+                read=lambda path: self.client.get_json(path)[1],
+                member_read=self.team_member_read,
+            )
+        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
+        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()
+        return local, guard
+
+    def admission_snapshot_single(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
+        """The same snapshot as `admission_snapshot`, from one GraphQL read (decision 38 step 4, slice 5).
+
+        One response carries the PR, its labels, every comment and the head's statuses, so no
+        separate fence is needed for them; the merge base and paths come from the clone. A PR whose
+        read cannot be complete in one response (over 100 comments or labels), whose head commit
+        does not match, or whose merge base the clone cannot vouch for, takes the full read. Live
+        self-tested reads (membership, bump guard) happen after the response, so a self-tested
+        request is fenced again exactly as the full read fences.
+        """
+        owner, name = repo.split("/", 1)
+        data = self.client.graphql(SINGLE_READ_QUERY, {"owner": owner, "name": name, "number": number})
+        node = (data.get("repository") or {}).get("pullRequest")
+        if not isinstance(node, dict):
+            raise GitHubError("incomplete single admission read")
+        labels, connection = node.get("labels") or {}, node.get("comments") or {}
+        commits = (node.get("commits") or {}).get("nodes") or []
+        commit = (commits[-1].get("commit") or {}) if commits else {}
+        head, base = node.get("headRefOid", ""), node.get("baseRefOid", "")
+        if (
+            not isinstance(labels.get("pageInfo"), dict)
+            or labels["pageInfo"].get("hasNextPage")
+            or not isinstance(connection.get("pageInfo"), dict)
+            or connection["pageInfo"].get("hasNextPage")
+            or not isinstance(connection.get("nodes"), list)
+            or commit.get("oid") != head
+        ):
+            return self._full_snapshot(repo, number, generation)
+        author = node.get("author") or {}
+        login = author.get("login", "") if node.get("author") is not None else "ghost"
+        if author.get("__typename") == "Bot" and login and not login.endswith("[bot]"):
+            login += "[bot]"  # REST's login for an App, which self-tested bump checks compare
+        pull = PullRequest(
+            number=number,
+            head_sha=head,
+            base_ref=node.get("baseRefName", ""),
+            title=node.get("title") or "",
+            body=node.get("body") or "",
+            author_login=login,
+            state="open" if node.get("state") == "OPEN" else "closed",
+            draft=bool(node.get("isDraft")),
+            labels=tuple(s["name"] for s in labels.get("nodes", ())),
+            base_sha=base,
+            author_id=int(author.get("databaseId") or 0),
+            head_repo=((node.get("headRepository") or {}).get("nameWithOwner")) or "",
+            head_ref=node.get("headRefName") or "",
+            merged=bool(node.get("merged")),
+            updated_at=node.get("updatedAt") or "",
+            comments_count=connection.get("totalCount", 0),
+        )
+        if pull.state != "open" or pull.draft:
+            self.snapshot_sources["single"] += 1
+            return ports.AdmissionSnapshot(pull, "", (), (), {})
+        if not self.clone_dir or not SHA.fullmatch(head) or not SHA.fullmatch(base):
+            raise GitHubError("admission needs a clone and complete head/target identities")
+        missing = [sha for sha in (base, head) if not chain.object_exists(self.clone_dir, sha)]
+        if missing:
+            self.fetch_refs(repo, missing)
+        chain.git(self.clone_dir, "update-ref", f"{chain.REF_NAMESPACE}/admission/{number}", head)
+        merge_base = self._local_merge_base(base, head)
+        if merge_base is None:
+            return self._full_snapshot(repo, number, generation)
+        comments = tuple(_graphql_comment(comment) for comment in connection["nodes"])
+        paths = self._admission_paths(merge_base, head)
+        local, guard = self._self_tested(repo, number, pull, paths, merge_base)
+        statuses = {
+            s["context"]: str(s.get("state") or "").lower()
+            for s in (commit.get("status") or {}).get("contexts", ())
+            if s.get("context") in ("build", "scope", "bump-guard", f"self-tested/{number}")
+        }
+        from tauceti_tools.self_tested import requested
+
+        if requested(pull.labels):
+            # Membership and bump reads came after the response: fence them as the full read does.
+            fresh, statuses = self._admission_fence(repo, number, pull)
+            if (fresh.head_sha, fresh.base_sha, fresh.base_ref, fresh.state, fresh.draft, sorted(fresh.labels)) != (
+                pull.head_sha,
+                pull.base_sha,
+                pull.base_ref,
+                pull.state,
+                pull.draft,
+                sorted(pull.labels),
+            ) or (fresh.body, fresh.comments_count, _timestamp(fresh.updated_at)) != (
+                pull.body,
+                pull.comments_count,
+                _timestamp(pull.updated_at),
+            ):
+                raise GitHubError("PR inputs changed while admission was reading source evidence")
+        self.snapshot_sources["single"] += 1
+        self.merge_base_sources["local"] = self.merge_base_sources.get("local", 0) + 1
+        return ports.AdmissionSnapshot(
+            pull,
+            merge_base,
+            paths,
+            comments,
+            statuses,
+            self._diff_version(base, head),
+            self_tested=local,
+            diff_guard=guard,
+        )
+
+    def _full_snapshot(self, repo, number, generation):
+        self.snapshot_sources["full"] += 1
+        return self.admission_snapshot(repo, number, generation=generation)
+
     def admission_snapshot(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """Read complete current inputs and the exact reviewed diff; never run a PR's code."""
         progress = self._admission_reads.get((repo, number))
@@ -1273,47 +1425,11 @@ class GitHubAdapter:
             raise GitHubError("compare did not return a complete merge base")
         if not chain.object_exists(self.clone_dir, merge_base):
             self.fetch_refs(repo, [merge_base])
-        paths = tuple(
-            p
-            for p in chain.git(
-                self.clone_dir,
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--ignore-submodules=none",
-                merge_base,
-                pull.head_sha,
-                "--",
-            ).split("\0")
-            if p
-        )
+        paths = self._admission_paths(merge_base, pull.head_sha)
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
-        from tauceti_tools.self_tested import eligible, requested
-
-        local = False
-        if requested(pull.labels):
-            raw = {
-                "number": number,
-                "state": pull.state,
-                "labels": pull.labels,
-                "base": {"ref": pull.base_ref},
-                "head": {"sha": pull.head_sha, "ref": pull.head_ref, "repo": {"full_name": pull.head_repo}},
-                "user": {"login": pull.author_login},
-            }
-            local = eligible(
-                raw,
-                repo,
-                paths=paths,
-                read=lambda path: self.client.get_json(path)[1],
-                member_read=self.team_member_read,
-            )
-        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
-        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()
+        local, guard = self._self_tested(repo, number, pull, paths, merge_base)
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
@@ -1849,6 +1965,26 @@ query($owner: String!, $name: String!, $number: Int!, $after: String) {
 """
 )
 
+
+SINGLE_READ_QUERY = (
+    """
+query($owner: String!, $name: String!, $number: Int!) {
+  rateLimit { cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      headRefOid headRefName baseRefOid baseRefName state isDraft merged body title updatedAt
+      headRepository { nameWithOwner }
+      author { __typename login ... on User { databaseId } ... on Bot { databaseId } }
+      labels(first: 100) { pageInfo { hasNextPage } nodes { name } }
+      comments(first: 100) { totalCount """
+    + ADMISSION_COMMENT_FIELDS
+    + """ }
+      commits(last: 1) { nodes { commit { oid status { contexts { context state } } } } }
+    }
+  }
+}
+"""
+)
 
 INSERTION_CHECK_QUERY = (
     """

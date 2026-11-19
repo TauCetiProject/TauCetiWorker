@@ -10625,6 +10625,9 @@ class Controller:
                     "merge_base_sources": dict(
                         getattr(getattr(self.admission, "adapter", None), "merge_base_sources", None) or {}
                     ),
+                    "snapshot_sources": dict(
+                        getattr(getattr(self.admission, "adapter", None), "snapshot_sources", None) or {}
+                    ),
                 },
                 "anticipated": [
                     {

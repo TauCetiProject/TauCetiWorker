@@ -252,6 +252,7 @@ class AdmissionPoller:
         self.stopping = threading.Event()
         self._prefer_urgent = True
         self._insertion_held = {}  # number -> (head, evaluated version, no re-read before)
+        self._delivery = threading.local()  # per webhook thread: a delivery that changed nothing
         from .admission_evidence import ADMISSION_LABELS, EvidenceCache, Shadow
 
         fake_repo = getattr(adapter, "repo", None)
@@ -390,10 +391,14 @@ class AdmissionPoller:
         """Record a verified delivery in the evidence cache (shadow only); never fails the delivery."""
         if kind not in ("pull_request", "issue_comment", "status", "push") or self.evidence_mode() == "off":
             return
+        self._delivery.unchanged = None
         try:
-            self.evidence.apply_event(kind, payload)
-        except Exception as error:  # noqa: BLE001 - the cache is advisory until a later slice acts on it
+            changed = self.evidence.apply_event(kind, payload)
+        except Exception as error:  # noqa: BLE001 - a failed write only means the PR is dirtied as before
             log.warning("admission evidence: %s delivery not recorded: %s", kind, error)
+            return
+        if changed is False:
+            self._delivery.unchanged = payload  # this thread's delivery; see `handle_event`
 
     def evidence_status(self):
         mode = self.evidence_mode()
@@ -440,6 +445,23 @@ class AdmissionPoller:
             if kind == "check_run" and detail.get("name") == "merge eligibility":
                 return
             sha = detail.get("head_sha") or detail.get("sha")
+            if self.evidence_mode() == "events" and getattr(self._delivery, "unchanged", None) is payload:
+                rows = self.controller.store.rows("admission_work", {"repository": self.repo, "head_sha": sha})
+                cached = self.controller.store.row(
+                    "admission_evidence_statuses",
+                    {"repository": self.repo, "sha": sha, "context": detail.get("context")},
+                )
+                if (
+                    len(rows) == 1  # a head shared by PRs: one PR's seed proves nothing about another's evaluation
+                    and cached is not None
+                    and all(
+                        r["generation"] == r["evaluated_generation"] and cached["seeded_at"] >= r["attempted_at"]
+                        for r in rows
+                    )
+                ):
+                    # The last completed evaluation of the only PR at this head installed exactly
+                    # this state from its own read, and no delivery has changed it since.
+                    return
             if sha and self.controller.store.row("ci_attempts", {"head_sha": sha}):
                 return  # the service's candidate CI is output, not PR review evidence
             numbers = {p["number"] for p in detail.get("pull_requests", ()) if p.get("number")}
@@ -686,9 +708,11 @@ class AdmissionPoller:
     def _evaluate(self, work, summary):
         epoch = self._source_epoch()
         started = self.clock()
-        snapshot = self.adapter.admission_snapshot(self.repo, work["number"], generation=work["generation"])
+        single = getattr(self.adapter, "admission_snapshot_single", None)
+        read = single if self.evidence_mode() == "events" and single is not None else self.adapter.admission_snapshot
+        snapshot = read(self.repo, work["number"], generation=work["generation"])
         result, authorization, evidence, comment, meta = self.policy.evaluate(snapshot)
-        if self.evidence_mode() == "shadow":
+        if self.evidence_mode() in ("shadow", "events"):
             try:
                 self.shadow.compare(snapshot, result, started, authorization)
             except Exception as error:  # noqa: BLE001 - the shadow never changes or blocks a decision

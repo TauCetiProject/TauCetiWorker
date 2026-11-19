@@ -668,6 +668,184 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(adapter.admission_insertion_source(TAUCETI, 42, HEAD), {"body": "one page"})
 
 
+class SingleReadTests(unittest.TestCase):
+    """`admission_evidence_mode = events`: one GraphQL read gives the full read's snapshot."""
+
+    TS = "2026-11-19T01:00:00Z"
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = FakeRepo(self.directory.name)
+        self.base = self.repo.main_sha()
+        self.head = self.repo.commit_branch({"TauCeti/A.lean": "-- a\n"}, "head", push_to="refs/pull/42/head")
+        run_git(self.repo.clone, "fetch", "-q", str(self.repo.origin), self.head)
+        self.board = "<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 {}-->"
+
+    def single(self, *, more_comments=False, labels=("ready-to-merge",)):
+        return {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "headRefOid": self.head,
+                        "headRefName": "feature",
+                        "baseRefOid": self.base,
+                        "baseRefName": "main",
+                        "state": "OPEN",
+                        "isDraft": False,
+                        "merged": False,
+                        "body": "body",
+                        "title": "feat: add",
+                        "updatedAt": self.TS,
+                        "headRepository": {"nameWithOwner": TAUCETI},
+                        "author": {"login": "alice", "databaseId": 7},
+                        "labels": connection([{"name": name} for name in labels]),
+                        "comments": {
+                            "totalCount": 1,
+                            **connection(
+                                [
+                                    {
+                                        "databaseId": 1,
+                                        "body": self.board,
+                                        "createdAt": self.TS,
+                                        "updatedAt": self.TS,
+                                        "author": {"login": "reviewer"},
+                                    }
+                                ],
+                                "next" if more_comments else None,
+                            ),
+                        },
+                        "commits": {
+                            "nodes": [
+                                {
+                                    "commit": {
+                                        "oid": self.head,
+                                        "status": {
+                                            "contexts": [
+                                                {"context": "build", "state": "SUCCESS"},
+                                                {"context": "scope", "state": "SUCCESS"},
+                                                {"context": "deploy", "state": "FAILURE"},
+                                            ]
+                                        },
+                                    }
+                                }
+                            ]
+                        },
+                    }
+                }
+            }
+        }
+
+    def full_read(self, transport):
+        raw = pr_json(
+            head={"sha": self.head, "ref": "feature", "repo": {"full_name": TAUCETI}},
+            base={"ref": "main", "sha": self.base},
+            comments=1,
+            updated_at=self.TS,
+        )
+        url = f"https://api.github.com/repos/{TAUCETI}"
+        rest = [
+            {"id": 1, "body": self.board, "created_at": self.TS, "updated_at": self.TS, "user": {"login": "reviewer"}}
+        ]
+        transport.add("GET", url + "/pulls/42", 200, raw)
+        transport.add(
+            "GET",
+            url + f"/compare/{self.base}...{self.head}?per_page=1",
+            200,
+            {"merge_base_commit": {"sha": self.base}},
+        )
+        transport.add("GET", url + "/issues/42/comments?per_page=100&page=1", 200, rest)
+        transport.add("POST", "https://api.github.com/graphql", 200, fence_document(raw))
+
+    def adapter(self, transport):
+        c, _ = client(transport)
+        c.background_floor = 0
+        return ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=self.repo.clone)
+
+    def test_one_read_gives_what_the_full_read_gives(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single())
+        single = self.adapter(transport).admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(len(transport.calls), 1)
+        transport = FakeTransport()
+        self.full_read(transport)
+        full = self.adapter(transport).admission_snapshot(TAUCETI, 42)
+        self.assertEqual(source_version(single.source(), "p"), source_version(full.source(), "p"))
+        for field in ("head_sha", "base_sha", "base_ref", "state", "draft", "labels", "author_login", "head_ref"):
+            self.assertEqual(getattr(single.pull, field), getattr(full.pull, field), field)
+        self.assertEqual(
+            (single.merge_base_sha, single.paths, single.statuses), (full.merge_base_sha, full.paths, full.statuses)
+        )
+
+    def test_a_read_that_one_response_cannot_complete_takes_the_full_read(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(more_comments=True))
+        self.full_read(transport)
+        adapter = self.adapter(transport)
+        snapshot = adapter.admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(snapshot.merge_base_sha, self.base)
+        self.assertEqual(adapter.snapshot_sources, {"single": 0, "full": 1})
+
+    def test_a_clone_that_cannot_vouch_for_the_merge_base_takes_the_full_read(self):
+        (Path(self.repo.clone) / ".git" / "shallow").write_text(self.base + "\n")
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single())
+        self.full_read(transport)
+        adapter = self.adapter(transport)
+        adapter.admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(adapter.snapshot_sources, {"single": 0, "full": 1})
+        self.assertTrue(any("/compare/" in str(call) for call in transport.calls))
+
+    def test_an_app_author_reads_as_rest_names_it(self):
+        document = self.single()
+        document["data"]["repository"]["pullRequest"]["author"] = {"__typename": "Bot", "login": "tauceti-review-bot"}
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, document)
+        snapshot = self.adapter(transport).admission_snapshot_single(TAUCETI, 42)
+        self.assertEqual(snapshot.pull.author_login, "tauceti-review-bot[bot]")
+
+    def test_live_self_tested_reads_fence_the_update_time_too(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
+        raw = pr_json(
+            head={"sha": self.head},
+            base={"ref": "main", "sha": self.base},
+            labels=[{"name": "self-tested"}],
+            comments=1,
+            updated_at="2026-11-19T01:05:00Z",  # a scoreboard edited during the live reads
+        )
+
+        def fence(raw):
+            document = fence_document(raw)
+            document["data"]["repository"]["pullRequest"]["labels"] = connection([{"name": "self-tested"}])
+            return document
+
+        transport.add("POST", "https://api.github.com/graphql", 200, fence(raw))
+        adapter = self.adapter(transport)
+        adapter.team_member_read = lambda path: {"state": "active"}
+        with self.assertRaises(ga.GitHubError):
+            adapter.admission_snapshot_single(TAUCETI, 42)
+        # The same fence at the same update time passes.
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
+        transport.add("POST", "https://api.github.com/graphql", 200, fence({**raw, "updated_at": self.TS}))
+        adapter = self.adapter(transport)
+        adapter.team_member_read = lambda path: {"state": "active"}
+        self.assertEqual(adapter.admission_snapshot_single(TAUCETI, 42).pull.head_sha, self.head)
+
+    def test_live_self_tested_reads_are_fenced_again(self):
+        transport = FakeTransport()
+        transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
+        raw = pr_json(head={"sha": self.head}, base={"ref": "main", "sha": self.base}, labels=[{"name": "self-tested"}])
+        moved = fence_document(raw)
+        moved["data"]["repository"]["pullRequest"]["labels"] = connection([{"name": "self-tested"}, {"name": "wip"}])
+        transport.add("POST", "https://api.github.com/graphql", 200, moved)
+        adapter = self.adapter(transport)
+        adapter.team_member_read = lambda path: {"state": "active"}
+        with self.assertRaises(ga.GitHubError):
+            adapter.admission_snapshot_single(TAUCETI, 42)
+
+
 class BumpGuardFloorTests(unittest.TestCase):
     """PR #43422: a self-tested Mathlib bump's guard needs 19 reads, and restarts from its first."""
 
