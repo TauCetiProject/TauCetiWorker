@@ -54,8 +54,10 @@ an unrelated queue/store. Restart epochs also advance from current milliseconds,
 so an ordinary restored old state file does not replay old process epochs.
 
 The live detail window retains active batches plus up to 500 terminal batches in
-ninety days, and up to 5,000 terminal inputs. Byte caps can shorten old detail;
-extraordinary active-only overflow is marked partial. Authoritative batch counts
+ninety days, and up to 5,000 terminal inputs. Byte caps can shorten old detail by
+dropping the oldest terminal batches whole; `retained_batch_ids` says which remain, and
+this alone does not make the snapshot partial. Extraordinary active-only overflow is
+marked partial, with the trimmed collections' `collection_complete` false. Authoritative batch counts
 remain distinct from retained member detail. The public report records its source
 scope and observation times. Worker checkpoint/outcome summaries contain only
 phase/observation/duration, approved provider/model labels and recorded cost

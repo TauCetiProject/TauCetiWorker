@@ -864,8 +864,10 @@ def project(
 def fit(observation, budget=None):
     """Shrink an oversized projection to its byte budget: oldest terminal batches go first.
 
-    Full live projection stays comfortably inside the receiver's budget. Extraordinary active-only
-    overflow is explicitly partial, never an admission change. Each record is encoded once: in
+    Shortening terminal history is not partial coverage: the retained batch identities say which
+    history the snapshot covers, and every record of a retained batch stays. Only extraordinary
+    active-only overflow, which removes records of retained batches, is explicitly partial and
+    marks those collections incomplete; it is never an admission change. Each record is encoded once: in
     compact JSON a list element costs its own encoding plus one separator, so the sum over removed
     records bounds the saving from above (by one byte per emptied list) and a removal never
     overshoots. Coverage flags change before the excess is measured, so their bytes count too.
@@ -878,10 +880,7 @@ def fit(observation, budget=None):
     cost = {name: [len(encode(r)) + 1 for r in observation[name]] for name in ("batches", "inputs", *DETAIL)}
     while size > budget:
         # The step below removes at least one batch or 100 records, as the one-at-a-time loop did.
-        before = len(encode(observation["truncated"])) + len(encode(observation["coverage"]))
-        observation["truncated"] = True
-        observation["coverage"] = "partial"
-        excess = size - budget - before + len(encode(True)) + len(encode("partial"))
+        excess = size - budget
         terminal = sorted(
             (i for i, b in enumerate(observation["batches"]) if b["state"] not in ("head", "open")),
             key=lambda i: int(observation["batches"][i]["id"]),
@@ -903,6 +902,10 @@ def fit(observation, budget=None):
                 kept = [(r, c) for r, c in zip(observation[name], cost[name], strict=True) if r[key] not in drop]
                 observation[name], cost[name] = [r for r, _ in kept], [c for _, c in kept]
         else:
+            before = len(encode(observation["truncated"])) + len(encode(observation["coverage"]))
+            observation["truncated"] = True
+            observation["coverage"] = "partial"
+            excess += len(encode(True)) + len(encode("partial")) - before
             # Trim 100 records at a time from whichever collection currently encodes largest.
             total = {k: (sum(cost[k]) + 1 if cost[k] else 2) for k in ("members", "inputs", *DETAIL[1:])}
             freed = 0
