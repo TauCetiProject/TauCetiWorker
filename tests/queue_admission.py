@@ -142,8 +142,10 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.intake.run_once()["approved"], 0)
         self.assertEqual(self.controller.inputs(), [])
         decision = json.loads(self.intake.state.get(1)["decision"])
-        self.assertIn(f"TauCeti/Long.lean: new Lean files must be at most {diff_guard.ci_git.NEW_FILE_LINE_CAP} lines",
-                      decision["reason"])
+        self.assertIn(
+            f"TauCeti/Long.lean: new Lean files must be at most {diff_guard.ci_git.NEW_FILE_LINE_CAP} lines",
+            decision["reason"],
+        )
         comments = [json.loads(row["payload"]) for row in self.controller.store.rows("outbox", {"kind": "comment"})]
         self.assertEqual(len(comments), 1)
         self.assertIn("cannot join the merge queue", comments[0]["body"])

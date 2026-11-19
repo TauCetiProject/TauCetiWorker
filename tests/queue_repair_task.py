@@ -4976,7 +4976,7 @@ class Records(unittest.TestCase):
         self.assertEqual(entry["pr"], 2)
         self.assertIn(
             f"TauCeti/Long.lean: new Lean files must be at most {diff_guard.ci_git.NEW_FILE_LINE_CAP} lines (found 1251)",
-            entry["violations"][0]
+            entry["violations"][0],
         )
         self.assertTrue(any(p.startswith("review-size: #2 (commit ") for p in report["problems"]))
 
