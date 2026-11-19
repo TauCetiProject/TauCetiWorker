@@ -306,6 +306,30 @@ class Publish(Tmp):
         self.assertEqual(git(first.parent, "status", "--porcelain"), "M targets1.md")
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets1.md"), "notes")
 
+    def test_a_commit_hook_keeps_its_own_glob_matching(self):
+        first = self.clone("first")
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\n[ -z \"$(git diff --cached --name-only -- '*.md')\" ] || exit 1\n")
+        hook.chmod(0o755)
+        a = EXAMPLE.replace("- [ ] `strong-law`", "- [x] `strong-law`")
+        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", EXAMPLE)
+
+    def test_a_failed_commit_keeps_an_operators_change_to_the_same_item(self):
+        first = self.clone("first")
+        listed = t.parse_targets(EXAMPLE)
+        a = t.rewrite_item(EXAMPLE, listed.find("strong-law"), "done", add=("landed: #7",))
+        by_hand = EXAMPLE.replace(
+            "- [ ] `strong-law` — the strong law (serves: G1; needs: `borel-cantelli`, `truncation-bounds`)",
+            "- [~] `strong-law` — the strong law (serves: G1; needs: `borel-cantelli`, `truncation-bounds`; "
+            "partial: #7; in flight: #8)",
+        )
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ncat > targets.md <<'LIST'\n{by_hand}LIST\nexit 1\n")
+        hook.chmod(0o755)
+        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
+        self.assertEqual(first.read_text(), by_hand)
+
     def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
         from tauceti_worker.source_identity import SourceActor
         from tauceti_worker.worker_sources import activate
@@ -440,6 +464,13 @@ class Round(Tmp):
             self.assertIn(item, text)
             self.assertEqual("landed: #8" in text, proof)
         self.assertEqual(sorted(asked), [8, 8, 1234, 1234])
+
+    def test_a_queue_landing_on_another_base_leaves_the_item_alone(self):
+        queued = {"state": "CLOSED", "title": "[Merged by Bors] - Truncation bounds", "baseRefName": "staging"}
+        self.w.gh = self.github(states={1234: queued})
+        self.w.gh.target_queue_landed = lambda number, branch: branch == "staging"
+        self.assertEqual(self.reconcile(), (None, "the target list is current"))
+        self.assertEqual(self.path.read_text(), EXAMPLE)
 
     def test_one_look_at_a_time_and_none_without_reads(self):
         lock = os.open(self.path.with_name(".targets.md.lock"), os.O_RDWR | os.O_CREAT)
@@ -835,15 +866,17 @@ class ModelFree(Tmp):
             raise KeyboardInterrupt
 
         with (
-            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid", "HOME": str(self.tmp)}),
             patch.object(loop, "choose_model", side_effect=AssertionError("no provider is chosen")),
             patch.object(loop, "github_budget", return_value={}),
             patch.object(loop, "run_round_subprocess", return_value=0) as launched,
             patch.object(loop, "report_runtime"),
             patch.object(loop.time, "sleep", side_effect=sleep),
         ):
-            loop.cmd_loop(args, SimpleNamespace(wid="fixture"), only=["reconcile"], agent="claude")
-        launched.assert_called()
+            for agent in ("claude", "auto"):
+                launched.reset_mock()
+                loop.cmd_loop(args, SimpleNamespace(wid="fixture"), only=["reconcile"], agent=agent)
+                launched.assert_called()
 
 
 if __name__ == "__main__":

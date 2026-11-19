@@ -152,11 +152,14 @@ class Source:
 
     def view(self, number: int) -> dict:
         """The pull request's state, title, body and base. One closed under the queue's title is
-        MERGED only with the source's landing proof, CLOSED when the proof is refused, and unknown
-        (`{}`) when there is none."""
+        MERGED only with the source's landing proof for its base, CLOSED when the proof is refused,
+        and unknown (`{}`) when there is none."""
         row = self._read("pr_view", number, ["state", "title", "body", "baseRefName"]) or {}
         if row.get("state") == "CLOSED" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX):
-            proof = self.target_queue_landed(number, content_base())
+            # Proof against the pull request's own base: one landed elsewhere is merged, not closed,
+            # and `_merged_into_base` then leaves its item alone.
+            base = row.get("baseRefName")
+            proof = self.target_queue_landed(number, base) if base else None
             return {} if proof is None else {**row, "state": "MERGED"} if proof else row
         return row
 
@@ -655,10 +658,10 @@ def _infer(w, profile, live: Targets, roadmap: Path | None) -> list[Change]:
 
 def _git(path: Path, *args: str, timeout: int = 120, env: dict | None = None) -> subprocess.CompletedProcess:
     """Git in the list's clone, with the operator's identity, credentials and hooks even inside a
-    source's activation. Paths are literal, so a list named like a glob names only itself."""
+    source's activation."""
     from .worker_sources import operator_environment
 
-    argv = ["git", "--literal-pathspecs", "-C", str(path.parent), *args]
+    argv = ["git", "-C", str(path.parent), *args]
     try:
         return subprocess.run(
             argv,
@@ -669,6 +672,11 @@ def _git(path: Path, *args: str, timeout: int = 120, env: dict | None = None) ->
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         return subprocess.CompletedProcess(argv, 124, "", str(error))
+
+
+def _spec(path: Path) -> str:
+    """The list as a pathspec that matches its own name only, whatever glob characters it holds."""
+    return f":(literal){path.name}"
 
 
 def _change_id(path: Path, commit: str) -> str | None:
@@ -712,7 +720,7 @@ def _withdraw(path: Path, base: str, ours: str) -> bool:
 
 
 def _tracked(path: Path) -> bool:
-    return _git(path, "ls-files", "--error-unmatch", "--", path.name).returncode == 0
+    return _git(path, "ls-files", "--error-unmatch", "--", _spec(path)).returncode == 0
 
 
 def _upstream(path: Path) -> tuple[str, str] | None:
@@ -783,15 +791,21 @@ def _push(path: Path, still=None) -> bool | None:
 
 
 def _taken_back(base: str, ours: str, parent: str, current: str) -> str | None:
-    """`current` with each item `ours` changed from `base` set back to its `base` status and
-    clauses, found by area and slug so a line a hook reformatted is still found; an item `parent`
-    already holds as `ours` has it stays. None when an item cannot be put back."""
+    """`current` with this look's edit of each item (`ours` against `base`) undone where it still
+    stands, found by area and slug so a line a hook reformatted is still found: the status goes back
+    only while it is the one `ours` wrote, a clause `ours` added goes only while it is there as
+    written, and a clause `ours` removed returns only with the status. Whatever else changed the line
+    meanwhile stays. An item `parent` already holds as `ours` has it stays. None when an item cannot
+    be found or put back."""
 
     def listed(text: str) -> Targets | None:
         try:
             return parse_targets(text)
         except Die:
             return None
+
+    def key(clause: str) -> str:
+        return clause.partition(":")[0].strip().lower()
 
     before, after, held = listed(base), listed(ours), listed(parent)
     if before is None or after is None:
@@ -808,11 +822,17 @@ def _taken_back(base: str, ours: str, parent: str, current: str) -> str | None:
         found = now.find(item.slug) if now else None
         if found is None:
             return None
-        added = [m.partition(":")[0] for m in item.meta if m not in old.meta]
-        restored = [m for m in old.meta if m not in item.meta]
-        text = rewrite_item(text, found, old.status, drop=added, add=restored)
+        reverted = found.status == item.status
+        status = old.status if reverted else found.status
+        added = [m for m in item.meta if m not in old.meta and m in found.meta]
+        keys = {key(m) for m in added}
+        restored = [m for m in old.meta if m not in item.meta and key(m) not in {key(c) for c in found.meta}]
+        others = [m for m in found.meta if key(m) in keys and m not in added]
+        if not reverted and not added:
+            continue
+        text = rewrite_item(text, found, status, drop=keys, add=[*others, *(restored if reverted else ())])
         again = listed(text)
-        if again is None or again.find(item.slug) is None or again.find(item.slug).status != old.status:
+        if again is None or again.find(item.slug) is None or again.find(item.slug).status != status:
             return None
     return text
 
@@ -868,7 +888,7 @@ def publish(path: Path, base: str, ours: str, notes: list[str], *, still=None) -
         return None
     if tracked and merged != theirs:
         message = f"Reconcile {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
-        committed = _git(path, "commit", "-q", "-m", message, "--", path.name)
+        committed = _git(path, "commit", "-q", "-m", message, "--", _spec(path))
         made = _change_id(path, "HEAD") if committed.returncode == 0 else None
         if committed.returncode != 0:
             log(
