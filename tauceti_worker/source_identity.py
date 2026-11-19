@@ -31,6 +31,10 @@ class SourceActor:
     principal: PrincipalRef
     login: str = field(compare=False)
 
+    @property
+    def qualified_id(self) -> str:
+        return self.principal.forge.key + "/users/" + self.principal.native_id
+
     def __post_init__(self):
         if (
             not isinstance(self.principal, PrincipalRef)
@@ -148,3 +152,12 @@ class SourceRepositoryAccess:
             row["archived"],
             row["mirror"],
         )
+
+
+def discovery_scope(source):
+    """One qualified repository incarnation; credentials partition its cache separately."""
+    return ["source_inventory_v1", source.repository.key, source.identity.native_id]
+
+
+def advisory_scope(source, number):
+    return ["source_advisory_v1", source.repository.key, source.identity.native_id, number]

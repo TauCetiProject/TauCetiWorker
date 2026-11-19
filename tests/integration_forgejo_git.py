@@ -78,7 +78,6 @@ class Integration(unittest.TestCase):
                 identity,
                 configured.execution,
                 "b" * 40,
-                configured.harness_revision,
                 configured.config_digest,
                 1,
                 1,

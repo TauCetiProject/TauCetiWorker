@@ -1,10 +1,17 @@
 # Tau Ceti AI merge queue service (docs/queue/operations.md).
 #
 # A systemd user unit on the service host. `services/queue/install.sh` installs it into
-# ~/.config/systemd/user/ from the checkout at ~/TauCetiQueue and verifies the running revision
+# ~/.config/systemd/user/ from its release directory and verifies the running revision
 # through /status afterwards. The process reads ~/.config/tauceti-queue/config.toml and the
 # optional environment file below; secrets live in ~/.config/tauceti-queue/ (mode 0600), never in
 # this unit. Logs go to the journal: `journalctl --user -u tauceti-queue -f`.
+#
+# WARNING: never add a systemd drop-in (*.service.d/*.conf) for this unit: drop-ins silently
+# override what install.sh installs, and the installers refuse to run while one exists. The
+# installer renders this file with the code paths below pointing at the unit's own release
+# directory, ~/TauCetiQueue-releases/<sha>-<time> (services/queue/release.sh). It runs origin/main
+# HEAD; running any other revision requires explicit permission from a human operator and must be
+# undone as soon as the change lands on main.
 
 [Unit]
 Description=Tau Ceti AI merge queue service

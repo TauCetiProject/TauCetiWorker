@@ -35,7 +35,6 @@ class NativeCLI(unittest.TestCase):
             self.addCleanup(fixture.doCleanups)
             admin.request("PUT", f"repos/{repository.name}/collaborators/queue", {"permission": "admin"})
             api = Forgejo(repository.forge, token=tokens["queue"])
-            reviewer = Forgejo(repository.forge, token=tokens["reviewer"])
             operator_id = Forgejo(repository.forge, token=tokens["operator"]).current_user()["id"]
             source = RepositoryIdentity(repository, row["id"])
             project = (
@@ -75,12 +74,7 @@ class NativeCLI(unittest.TestCase):
                 queue_configuration_sha256=hashlib.sha256(runtime).hexdigest(),
                 project_configuration_sha256=hashlib.sha256(project).hexdigest(),
                 execution_policy=approved.record(with_config=False),
-                publishers=dict(
-                    generation="2" * 32,
-                    reviews=[reviewer.current_user()["id"]],
-                    statuses=[api.current_user()["id"]],
-                    recoveries=[api.current_user()["id"]],
-                ),
+                publishers=dict(recoveries=[api.current_user()["id"]]),
             )
             fixture.row["source_credentials"]["origin"]["url"] = repository.forge.url
             fixture.save()

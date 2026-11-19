@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -30,12 +31,13 @@ from .audit_progress import (
     INLINE_CONTINUE_PROMPT,
     INLINE_POLICY,
     READING_POLICY,
+    claude_continuable,
     continuable,
     continuation_prompt,
     snapshot,
 )
 from .audit_reader_v3 import pages
-from .audit_recovery import mechanical_output, recover, safe_history
+from .audit_recovery import claude_judgments, claude_safe_history, mechanical_output, recover, safe_history
 from .config import Die, NoProgress, log
 from .constants import TAUCETI
 from .github_transport import execute
@@ -47,6 +49,8 @@ BOOTSTRAP = "8eecb48e9b51da99ca119f190a64ca43c100795b"
 # Legacy token-failure recovery credits only this unchanged page-layout version.
 LEGACY_READER_DIGEST = "3b7c68055c792d0ea3243220cff9a73f282c1e1c1f71d9646f1739a2fd3757c4"
 MAX_COMMITS = 20
+# Upper bound on launches in one invocation when coverage turns keep serving new pages.
+MAX_INVOCATION_LAUNCHES = 60
 MAX_BYTES = 2 * 1024 * 1024  # Session workload target, not a context-window limit.
 MAX_BLOB_BYTES = 4 * 1024 * 1024
 INLINE_BYTES = 32 * 1024
@@ -172,7 +176,11 @@ SERVED_COMPACTION_POLICY = COMPACTION_POLICY.replace(
 SERVED_MODEL_PROMPT = MODEL_PROMPT.replace("next_unread_page", "next_unserved_page").replace(
     "The Worker independently verifies coverage", "The Worker tracks served coverage"
 )
-SERVED_CLAUDE_PROMPT = V2_MODEL_PROMPT
+# Haiku follows the same served-reading and same-session continuation policy as Luna.
+SERVED_READING_POLICY = READING_POLICY.replace("next_unread_page", "next_unserved_page").replace(
+    "The Worker independently verifies coverage", "The Worker tracks served coverage"
+)
+SERVED_CLAUDE_PROMPT = V2_MODEL_PROMPT + SERVED_READING_POLICY
 SERVED_CODEX_CATALOG = copy.deepcopy(CODEX_CATALOG)
 SERVED_CODEX_CATALOG["models"][0]["model_messages"]["instructions_template"] = (
     SERVED_MODEL_PROMPT + SERVED_COMPACTION_POLICY + SERVED_GOAL_REQUEST
@@ -222,21 +230,48 @@ def api(path: str, *, method: str = "GET", body=None):
         raise NoProgress("security-audit: invalid GitHub response") from exc
 
 
-def require_admin() -> None:
-    if api(f"repos/{TAUCETI}").get("permissions", {}).get("admin") is not True:
+# The audit reads refs and advances its cursor over Git, and checks authority with
+# GraphQL. Neither draws on the REST quota that other tools on the same account
+# exhaust; only the non-fatal readiness dispatch still uses REST.
+REMOTE = f"https://github.com/{TAUCETI}.git"
+
+
+def admin_login() -> str:
+    """Return the authenticated login after confirming repository-admin permission."""
+    owner, name = TAUCETI.split("/")
+    argv = [
+        "gh",
+        "api",
+        "graphql",
+        "--hostname",
+        "github.com",
+        "-f",
+        "query=query($owner:String!,$name:String!){viewer{login} repository(owner:$owner,name:$name){viewerPermission}}",
+        "-F",
+        f"owner={owner}",
+        "-F",
+        f"name={name}",
+    ]
+    p = execute(argv, env={**os.environ, "TAUCETI_OUTBOX_REPLAY": "1"})
+    if p.returncode:
+        raise NoProgress(f"security-audit: GitHub request failed: {p.stderr.strip()}")
+    try:
+        data = json.loads(p.stdout)["data"]
+        login, permission = data["viewer"]["login"], data["repository"]["viewerPermission"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise NoProgress("security-audit: invalid GitHub response") from exc
+    if permission != "ADMIN" or not isinstance(login, str) or not login:
         raise Die(f"security-audit requires repository-admin permission on {TAUCETI}")
+    return login
 
 
-def remote_sha(branch: str) -> str:
-    value = api(f"repos/{TAUCETI}/git/ref/heads/{branch}").get("object", {})
-    sha = value.get("sha", "")
-    if value.get("type") != "commit" or not SHA.fullmatch(sha):
-        raise NoProgress(f"security-audit: {branch} is not a commit reference")
-    return sha
+def require_admin() -> None:
+    admin_login()
 
 
-def git(repo: Path, *args: str) -> bytes:
-    # Bare, private object store. Never inherit Git config injection or replace refs.
+def git_env(*, credential: bool = False) -> dict:
+    # Never inherit Git config injection or replace refs. Pushes authenticate
+    # with the selected account's token from the environment, never argv.
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "SSL_CERT_FILE")}
     env.update(
         GIT_CONFIG_NOSYSTEM="1",
@@ -245,9 +280,66 @@ def git(repo: Path, *args: str) -> bytes:
         GIT_LITERAL_PATHSPECS="1",
         GIT_TERMINAL_PROMPT="0",
     )
+    if credential:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if not token:
+            # gh's stored credential for its active account; a local read, not an API call.
+            p = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True, timeout=30)
+            token = p.stdout.strip() if not p.returncode else ""
+        if not token:
+            # NoProgress, not Die: a passing verdict stays reusable and nothing is blocked.
+            raise NoProgress("security-audit: no GitHub token available to advance the cursor")
+        env["TAUCETI_AUDIT_PUSH_TOKEN"] = token
+    return env
+
+
+def remote_sha(branch: str) -> str:
+    ref = f"refs/heads/{branch}"
+    p = subprocess.run(
+        ["git", "ls-remote", "--", REMOTE, ref], env=git_env(), capture_output=True, text=True, timeout=120
+    )
+    if p.returncode:
+        raise NoProgress(f"security-audit: git ls-remote failed: {p.stderr.strip()}")
+    rows = [line.split("\t") for line in p.stdout.splitlines() if line.strip()]
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != ref or not SHA.fullmatch(rows[0][0]):
+        raise NoProgress(f"security-audit: {branch} is not a commit reference")
+    return rows[0][0]
+
+
+def push_cursor(repo: Path, old: str, target: str) -> None:
+    """Fast-forward the cursor only if it still equals old (server-side compare-and-swap)."""
+    ref = f"refs/heads/{CURSOR}"
+    helper = '!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$TAUCETI_AUDIT_PUSH_TOKEN"; }; f'
+    p = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(repo),
+            "-c",
+            "credential.helper=",
+            "-c",
+            f"credential.helper={helper}",
+            "push",
+            "--porcelain",
+            "--no-verify",
+            f"--force-with-lease={ref}:{old}",
+            REMOTE,
+            f"{target}:{ref}",
+        ],
+        env=git_env(credential=True),
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    if p.returncode:
+        raise NoProgress(f"security-audit: cursor push rejected: {(p.stderr or p.stdout).strip()}")
+
+
+def git(repo: Path, *args: str) -> bytes:
+    # Bare, private object store.
     p = subprocess.run(
         ["git", "--git-dir", str(repo), *args],
-        env=env,
+        env=git_env(),
         capture_output=True,
         timeout=180,
     )
@@ -372,13 +464,38 @@ def bind_verdict(value, batch: dict) -> dict:
     )
 
 
+API_KEY_FILE_ENV = "TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE"
+
+
+def anthropic_api_key() -> str | None:
+    """Return the configured Claude API key for Haiku reviews, if any.
+
+    The setting names an absolute path to a regular, owner-only file holding
+    only the key. Without it, Haiku reviews use the subscription credential.
+    """
+    value = os.environ.get(API_KEY_FILE_ENV)
+    if not value:
+        return None
+    path = Path(value)
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise Die(f"security-audit: cannot read {API_KEY_FILE_ENV}") from exc
+    if not path.is_absolute() or not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise Die(f"security-audit: {API_KEY_FILE_ENV} must name an absolute mode-0600 file owned by this user")
+    key = path.read_text().strip()
+    if not key or any(c.isspace() for c in key):
+        raise Die(f"security-audit: {API_KEY_FILE_ENV} must contain only the API key")
+    return key
+
+
 def reviewer_argv(provider: str, *, goals: bool = True, protocol: int = 3) -> list[str]:
     if provider == "claude":
         return [
             "claude",
             "-p",
             "--model",
-            "haiku",
+            "claude-haiku-5-5",
             "--output-format",
             "stream-json",
             "--verbose",
@@ -392,7 +509,9 @@ def reviewer_argv(provider: str, *, goals: bool = True, protocol: int = 3) -> li
             "--setting-sources",
             "",
             "--disable-slash-commands",
-            "--no-session-persistence",
+            # Protocol 4 keeps the isolated session so a stopped inspection can
+            # continue in it; the Worker retains it under the attempt directory.
+            *(["--no-session-persistence"] if protocol != 4 else []),
             "--permission-mode",
             "dontAsk",
             "--append-system-prompt",
@@ -860,6 +979,158 @@ def retained_thread(work: Path) -> str:
         raise Die(f"security-audit: invalid retained native conversation: {exc}") from exc
 
 
+CLAUDE_SESSIONS = "claude-projects"
+
+
+def claude_sessions(work: Path) -> list[Path]:
+    """The durable Claude session store: the client writes `<project>/<session>.jsonl` here."""
+    return sorted((work / CLAUDE_SESSIONS).rglob("*.jsonl"))
+
+
+def jsonl_rows(text: str) -> list[dict]:
+    """Strict JSONL, except an interrupted client's truncated last line.
+
+    A killed client can leave its final line incomplete, typically a large
+    served chunk. Only a truncated tool result that cannot carry a judgment is
+    ignored; any other unreadable line makes the whole history unreadable.
+    """
+    lines = [line for line in text.split("\n") if line.strip()]
+    rows = []
+    for i, line in enumerate(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            if (
+                i == len(lines) - 1
+                and not text.endswith("\n")
+                and '"type":"tool_result"' in line.replace(" ", "")
+                and not re.search(r"verd|StructuredOutput|structured_output", line)
+            ):
+                break
+            raise
+        if not isinstance(row, dict):
+            raise ValueError("history row is not an object")
+        rows.append(row)
+    return rows
+
+
+def claude_thread(work: Path) -> str:
+    """The single retained Claude session id, consistent with every recorded row."""
+    try:
+        sessions = claude_sessions(work)
+        if len(sessions) != 1:
+            raise ValueError("expected exactly one retained Claude session")
+        session = str(uuid.UUID(sessions[0].stem))
+        if session != sessions[0].stem:
+            raise ValueError("non-canonical session file name")
+        for row in jsonl_rows(sessions[0].read_text(encoding="utf-8")):
+            if row.get("sessionId", session) != session:
+                raise ValueError("session file holds another conversation")
+        return session
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        raise Die(f"security-audit: invalid retained Claude session: {exc}") from exc
+
+
+def claude_saved_read_pages(work: Path, expected_pages: list[list[dict]]) -> set[int]:
+    """Reads whose exact served chunk is stored in the Claude session a resume will load."""
+    sessions = claude_sessions(work)
+    if len(sessions) != 1:
+        return set()
+    calls, pages = {}, set()
+    try:
+        rows = jsonl_rows(sessions[0].read_text(encoding="utf-8", errors="replace"))
+    except ValueError:
+        return set()
+    for row in rows:
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for item in content if isinstance(content, list) else ():
+            if not isinstance(item, dict):
+                continue
+            if (
+                row.get("type") == "assistant"
+                and item.get("type") == "tool_use"
+                and item.get("name") == "mcp__audit__read_page"
+                and isinstance(item.get("id"), str)
+                and isinstance(item.get("input"), dict)
+                and type(item["input"].get("page")) is int
+            ):
+                calls[item["id"]] = item["input"]["page"]
+            if row.get("type") == "user" and item.get("type") == "tool_result" and not item.get("is_error"):
+                page = calls.get(item.get("tool_use_id"))
+                if type(page) is not int or not 0 <= page < len(expected_pages):
+                    continue
+                for text in tool_texts(item.get("content")):
+                    try:
+                        delivered = json.loads(text)
+                        if delivered.get("page") == page and delivered.get("sections") == expected_pages[page]:
+                            pages.add(page)
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+    return pages
+
+
+def verdict_schema(provider: str, paged: bool, protocol: int) -> dict:
+    if not paged:
+        return MODEL_SCHEMA
+    verdicts = MODEL_SCHEMA["properties"]["verdict"]["enum"]
+    return {
+        **MODEL_SCHEMA,
+        "required": [*MODEL_SCHEMA["required"], *(["read_token"] if protocol < 4 else [])],
+        "properties": {
+            **MODEL_SCHEMA["properties"],
+            **({"read_token": {"type": "string"}} if protocol < 4 else {}),
+            "verdict": {
+                **MODEL_SCHEMA["properties"]["verdict"],
+                # Paged Haiku may report unfinished only when its session is retained.
+                "enum": [*verdicts, "unfinished"] if provider == "codex" or protocol == 4 else verdicts,
+            },
+        },
+    }
+
+
+def claude_launch(
+    home: Path,
+    paged: bool,
+    receipt: Path,
+    token: str = "",
+    *,
+    protocol: int = 3,
+    session: str | None = None,
+    resume: bool = False,
+) -> list[str]:
+    """The complete isolated Haiku command; protocol 4 names its retained session."""
+    cmd = reviewer_argv("claude", protocol=protocol)
+    if paged:
+        reader = [
+            str(reader_path(protocol)),
+            str(home / "input.json"),
+            str(receipt),
+            *([token] if protocol < 4 else []),
+        ]
+        # Safe mode suppresses even this explicitly configured MCP
+        # server. The empty HOME, --restricted, empty settings sources,
+        # empty built-in tools and strict MCP config provide isolation.
+        cmd.remove("--safe-mode")
+        cmd[cmd.index("--mcp-config") + 1] = serialize(
+            {"mcpServers": {"audit": {"type": "stdio", "command": sys.executable, "args": ["-I", *reader]}}}
+        )
+        cmd += ["--allowedTools", "mcp__audit__read_page"]
+    cmd += ["--json-schema", serialize(verdict_schema("claude", paged, protocol))]
+    if protocol == 4:
+        if session is None or str(uuid.UUID(session)) != session:
+            raise Die("security-audit: a retained Haiku session needs a canonical session id")
+        cmd += ["--resume" if resume else "--session-id", session]
+    return cmd
+
+
+def claude_session_arg(argv: list[str]) -> tuple[str, bool] | None:
+    flags = [i for i, arg in enumerate(argv) if arg in ("--session-id", "--resume")]
+    if len(flags) != 1 or flags[0] != len(argv) - 2:
+        return None
+    return argv[-1], argv[-2] == "--resume"
+
+
 def inspection_profile(protocol: int = 3) -> dict:
     return {
         "launcher_code_digest": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -934,6 +1205,26 @@ def reconcile_coverage(work: Path, batch: dict) -> dict:
     return reconciled
 
 
+def retain_saved_coverage(work: Path, batch: dict, receipt: Path) -> dict:
+    """A resumed Haiku session keeps only the served prefix its stored history holds.
+
+    Client stdout can report a read whose result never reached the session file,
+    for example after a timeout. That chunk must be served again in the resumed
+    session rather than counted as inspected.
+    """
+    from .audit_reader import Reader
+
+    reader = Reader(batch, receipt)
+    proof = reader.coverage()
+    saved = claude_saved_read_pages(work, reader.pages)
+    count = 0
+    while count < len(proof["served"]) and count in saved:
+        count += 1
+    retained = {**proof, "served": list(range(count))}
+    save(receipt, retained)
+    return retained
+
+
 def strip_recovery_prefixes(prompt: str, work: Path, batch: dict, *, protocol=3) -> str:
     prefixes = [
         OUTPUT_REPAIR_PROMPT,
@@ -942,8 +1233,12 @@ def strip_recovery_prefixes(prompt: str, work: Path, batch: dict, *, protocol=3)
         SERVED_CONTINUE_PROMPT,
         INLINE_CONTINUE_PROMPT,
     ]
-    if (work / "coverage-before.json").exists():
-        prefixes.append(continuation_prompt(batch, work / "coverage-before.json", protocol=protocol))
+    # coverage-before.json is rewritten when the next coverage turn is prepared,
+    # before that turn's prompt.txt. If the Worker stops in between, the retained
+    # prompt was built from the launch checkpoint that reconcile_coverage saved.
+    for name in ("coverage-before.json", "coverage-before-launch.json"):
+        if (work / name).exists():
+            prefixes.append(continuation_prompt(batch, work / name, protocol=protocol))
     while any(prompt.startswith(p) for p in prefixes):
         prompt = prompt[len(next(p for p in prefixes if prompt.startswith(p))) :]
     return prompt
@@ -1005,6 +1300,7 @@ def run_client(
     legacy_history=False,
     allowed_history=(),
     protocol=3,
+    trusted_names=False,
 ):
     """At most three requests, resuming one conversation for service/output recovery."""
     continue_prompt = SERVED_CONTINUE_PROMPT if protocol == 4 else CONTINUE_PROMPT
@@ -1014,7 +1310,8 @@ def run_client(
         base_prompt = base_prompt[
             len(OUTPUT_REPAIR_PROMPT) if base_prompt.startswith(OUTPUT_REPAIR_PROMPT) else len(CONTINUE_PROMPT) :
         ]
-    for number in range(3):
+    spent = 0  # Launches charged to the shared three-launch budget.
+    for number in range(MAX_INVOCATION_LAUNCHES):
         if protocol == 4 and number:
             from .audit_clients import selected_protocol
 
@@ -1032,7 +1329,10 @@ def run_client(
             serialize(
                 {
                     "argv": cmd,
-                    "environment": env,
+                    # Never persist a provider API key in retained evidence.
+                    "environment": {
+                        k: ("<anthropic-api-key-file>" if k == "ANTHROPIC_API_KEY" else v) for k, v in env.items()
+                    },
                     "paged": paged,
                     "protocol_version": protocol,
                     "legacy_history": legacy_history,
@@ -1045,6 +1345,7 @@ def run_client(
                     else None,
                     "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
                     **inspection_profile(protocol),
+                    "trusted_names_digest": trusted_names_digest() if trusted_names else None,
                 }
             )
         )
@@ -1078,6 +1379,10 @@ def run_client(
             if protocol == 4:
                 reconcile_coverage(work, batch)
         if provider == "codex" and "resume" in cmd and retained_thread(work) != cmd[cmd.index("resume") + 1]:
+            raise Die("security-audit: resumed client changed the retained conversation identity")
+        named = claude_session_arg(cmd) if provider == "claude" and protocol == 4 else None
+        # A fresh launch may stop before persisting anything; a resumed one must keep its session.
+        if named is not None and (named[1] or claude_sessions(work)) and claude_thread(work) != named[0]:
             raise Die("security-audit: resumed client changed the retained conversation identity")
         error = (
             codex_service_error(
@@ -1122,10 +1427,25 @@ def run_client(
                 paged=paged,
                 protocol=protocol,
             )
+        ) or (
+            named is not None
+            and not result.returncode
+            and batch is not None
+            and claude_continuable(result.stdout, batch, receipt, work, paged=paged)
         )
-        if (error is None and not repair and not progress) or number == 2:
+        # A protocol-4 coverage turn that served new pages of the same immutable
+        # input is not charged: keep reading in this invocation instead of
+        # waiting a full Worker round. Failures and stalled turns stay limited.
+        grew = (
+            protocol == 4
+            and paged
+            and progress
+            and len(Reader(batch, receipt).coverage()["served"]) > len(checkpoint["before"]["served"])
+        )
+        spent += 0 if grew else 1
+        if (error is None and not repair and not progress) or spent == 3 or number == MAX_INVOCATION_LAUNCHES - 1:
             return result
-        thread = retained_thread(work)
+        thread = claude_thread(work) if provider == "claude" else retained_thread(work)
         # Retain every failed launch before replacing the top-level evidence
         # with the next launch. Source, policy, model and native UUID stay fixed.
         archive = (
@@ -1135,11 +1455,21 @@ def run_client(
         for path in work.iterdir():
             if path.is_file() and path.name not in ("service-retries.jsonl", "output-repairs.jsonl"):
                 (archive / path.name).write_bytes(path.read_bytes())
-        notes = [
-            event["item"]["text"]
-            for event in map(json.loads, result.stdout.splitlines())
-            if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"
-        ]
+        notes = (
+            [
+                item["text"]
+                for event in map(json.loads, filter(str.strip, result.stdout.splitlines()))
+                if event.get("type") == "assistant" and isinstance(event.get("message", {}).get("content"), list)
+                for item in event["message"]["content"]
+                if isinstance(item, dict) and item.get("type") == "text"
+            ]
+            if provider == "claude"
+            else [
+                event["item"]["text"]
+                for event in map(json.loads, result.stdout.splitlines())
+                if event.get("type") == "item.completed" and event.get("item", {}).get("type") == "agent_message"
+            ]
+        )
         record(
             work / ("output-repairs.jsonl" if repair else "service-retries.jsonl"),
             {
@@ -1151,8 +1481,12 @@ def run_client(
                 "preserved_progress_notes": notes,
             },
         )
-        prefix = cmd[: cmd.index("resume")] if "resume" in cmd else cmd[:-1]
-        cmd = [*prefix, "resume", thread, "-"]
+        if provider == "claude":
+            # The same isolated profile, now resuming the named session in place.
+            cmd = [*cmd[:-2], "--resume", thread]
+        else:
+            prefix = cmd[: cmd.index("resume")] if "resume" in cmd else cmd[:-1]
+            cmd = [*prefix, "resume", thread, "-"]
         repairing = repairing or repair
         prompt = (OUTPUT_REPAIR_PROMPT if repairing else "") + continue_prompt + base_prompt
         if progress:
@@ -1160,9 +1494,9 @@ def run_client(
             # instructions from the subsequently advanced live receipt.
             prompt = (snapshot(batch, receipt, work, protocol=protocol) if paged else INLINE_CONTINUE_PROMPT) + prompt
         log(
-            f"security-audit: {'unfinished inspection' if progress else 'output repair' if repair else 'service error'}; retry {number + 1}/2 in the same conversation after {5 * (number + 1)}s"
+            f"security-audit: {'unfinished inspection' if progress else 'output repair' if repair else 'service error'}; launch {number + 2} ({spent}/2 charged retries) in the same conversation after {5 * max(1, spent)}s"
         )
-        time.sleep(5 * (number + 1))
+        time.sleep(5 * max(1, spent))
     raise AssertionError("unreachable")
 
 
@@ -1258,7 +1592,18 @@ def validate_output_profile(
             and Path(json.loads(commands[0].split("=", 1)[1])).resolve() == Path(sys.executable).resolve()
         ):
             argv[argv.index(commands[0])] = "mcp_servers.audit.command=" + json.dumps(sys.executable)
-    if prompt != inspection_prompt(batch, paged, token, policy=policy_prompt, goals=goals, protocol=protocol):
+    recorded_names = execution.get("trusted_names_digest")
+    if recorded_names is not None and recorded_names != trusted_names_digest():
+        raise Die("security-audit: retained inspection used a different trusted baseline name list")
+    if prompt != inspection_prompt(
+        batch,
+        paged,
+        token,
+        policy=policy_prompt,
+        goals=goals,
+        protocol=protocol,
+        trusted_names=recorded_names is not None,
+    ):
         raise Die("security-audit: retained prompt differs from the immutable inspection")
     thread = retained_thread(original) if "resume" in argv else None
     if goals and execution.get("protocol_version") in (3, 4):
@@ -1268,6 +1613,59 @@ def validate_output_profile(
         home, paged, token, thread, original / "read-receipt.json" if durable else None, goals=goals, protocol=protocol
     ):
         raise Die("security-audit: retained launcher does not match the complete isolated Luna profile")
+
+
+def validate_claude_profile(execution: dict, original: Path, batch: dict) -> str:
+    """Check a stopped Haiku attempt's complete isolated launch; return its retained session id."""
+    paged = len(serialize(batch).encode()) > INLINE_BYTES
+    if execution.get("protocol_version") != 4 or execution.get("paged") is not paged:
+        raise Die("security-audit: retained Haiku launch is not a protocol-4 inspection of this input")
+    prompt = strip_recovery_prefixes((original / "prompt.txt").read_text(), original, batch, protocol=4)
+    recorded_names = execution.get("trusted_names_digest")
+    if recorded_names is not None and recorded_names != trusted_names_digest():
+        raise Die("security-audit: retained inspection used a different trusted baseline name list")
+    if prompt != inspection_prompt(
+        batch, paged, policy=SERVED_CLAUDE_PROMPT, goals=False, protocol=4, trusted_names=recorded_names is not None
+    ):
+        raise Die("security-audit: retained prompt differs from the immutable inspection")
+    argv = list(execution["argv"])
+    named = claude_session_arg(argv)
+    if named is None or named[0] != claude_thread(original):
+        raise Die("security-audit: retained Haiku launch does not name its retained session")
+    if paged:
+        index = argv.index("--mcp-config") + 1
+        config = json.loads(argv[index])
+        server = config["mcpServers"]["audit"]
+        args = server["args"]
+        if set(config) != {"mcpServers"} or set(config["mcpServers"]) != {"audit"} or len(args) != 4:
+            raise Die("security-audit: retained launcher must have one fixed input reader")
+        try:
+            recorded_digest = hashlib.sha256(Path(args[1]).read_bytes()).hexdigest()
+        except (OSError, TypeError):
+            recorded_digest = None
+        if recorded_digest != execution.get("reader_digest") and (
+            hashlib.sha256(reader_path(4).read_bytes()).hexdigest() != execution.get("reader_digest")
+        ):
+            raise Die("security-audit: retained reader script changed")
+        # As for Luna, an immutable release may relocate this same reader and interpreter.
+        args[1] = str(reader_path(4))
+        if (
+            isinstance(server.get("command"), str)
+            and Path(server["command"]).resolve() == Path(sys.executable).resolve()
+        ):
+            server["command"] = sys.executable
+        argv[index] = serialize(config)
+    expected = claude_launch(
+        Path(execution["environment"]["HOME"]),
+        paged,
+        (original / "read-receipt.json").resolve(),
+        protocol=4,
+        session=named[0],
+        resume=named[1],
+    )
+    if argv != expected:
+        raise Die("security-audit: retained launcher does not match the complete isolated Haiku profile")
+    return named[0]
 
 
 PAGE_PROMPT = """
@@ -1308,11 +1706,46 @@ Manifest:
 """
 
 
+TRUSTED_ORIGIN_POLICY = """
+Origin of constructs. The pinned Lean toolchain and pinned dependencies are the
+trusted baseline. Tau Ceti modules that this bundle does not change were inspected
+by earlier audits and are trusted as well. So a construct that this bundle uses
+but does not define or change has a trusted origin: do not return incomplete merely
+because its definition is absent from the bundle. To help identify the baseline,
+the trusted Worker (not the bundle) lists attribute and syntax names that the
+pinned baseline defines. The list establishes origin only. It never makes safe a
+use that this policy flags, such as #eval, run_cmd, run_tac, run_elab, extern,
+implemented_by or initialize, and any definition or redefinition inside this
+bundle is new code to inspect.
+Trusted baseline names: """
+
+
+def trusted_names_text() -> str:
+    from .audit_trusted_names import NAMES
+
+    return TRUSTED_ORIGIN_POLICY + ", ".join(NAMES) + "\n"
+
+
+def trusted_names_digest() -> str:
+    return hashlib.sha256(trusted_names_text().encode()).hexdigest()
+
+
 def inspection_prompt(
-    batch: dict, paged: bool, token: str = "", *, policy: str = MODEL_PROMPT, goals: bool = True, protocol: int = 3
+    batch: dict,
+    paged: bool,
+    token: str = "",
+    *,
+    policy: str = MODEL_PROMPT,
+    goals: bool = True,
+    protocol: int = 3,
+    trusted_names: bool = False,
 ) -> str:
     if protocol == 4 and policy == MODEL_PROMPT:
         policy = SERVED_MODEL_PROMPT
+    if trusted_names:
+        if protocol != 4:
+            raise Die("security-audit: trusted baseline names require protocol 4")
+        policy = policy + trusted_names_text()
     policy = policy + (SERVED_GOAL_REQUEST if protocol == 4 else GOAL_REQUEST) if goals else policy
     if not paged:
         if policy.startswith((MODEL_PROMPT, SERVED_MODEL_PROMPT)):
@@ -1340,8 +1773,16 @@ def inspect(
     allowed_history=(),
     continue_reading: bool = False,
     protocol: int | None = None,
+    claude_credential: str | None = None,
 ) -> dict:
+    """Run one isolated reviewer launch.
+
+    `claude_credential` selects Haiku's billing: "subscription" never uses a configured
+    API key, "api-key" requires one, and None prefers a configured key."""
     from .audit_clients import selected_protocol
+
+    if claude_credential not in (None, "subscription", "api-key"):
+        raise Die("security-audit: unknown Claude credential kind")
 
     if resume_from is not None:
         retained_protocol = attempt_protocol(resume_from)
@@ -1359,14 +1800,27 @@ def inspect(
         raise Die("security-audit: unknown inspection protocol")
     if protocol == 4 and repair_output:
         raise Die("security-audit: token output repair is unavailable in protocol 4")
+    # Fresh protocol-4 launches carry the trusted baseline names. A continuation
+    # keeps exactly the prompt its retained attempt recorded.
+    if resume_from is None:
+        names = protocol == 4
+    else:
+        recorded = json.loads((resume_from / "execution.json").read_text()).get("trusted_names_digest")
+        if recorded is not None and recorded != trusted_names_digest():
+            raise Die("security-audit: retained inspection used a different trusted baseline name list")
+        names = recorded is not None
     cmd = reviewer_argv(provider, protocol=protocol)
     continue_prompt = SERVED_CONTINUE_PROMPT if protocol == 4 else CONTINUE_PROMPT
     thread = None
     if resume_from is not None:
-        if provider != "codex":
-            raise Die("security-audit: retained-session continuation supports Codex only")
-        thread = retained_thread(resume_from)
-        rollouts = native_rollouts(resume_from)
+        if provider == "claude":
+            if protocol != 4:
+                raise Die("security-audit: retained Haiku continuation requires protocol 4")
+            thread = claude_thread(resume_from)
+            sessions = claude_sessions(resume_from)
+        else:
+            thread = retained_thread(resume_from)
+            rollouts = native_rollouts(resume_from)
     paged = len(serialize(batch).encode()) > INLINE_BYTES
     with tempfile.TemporaryDirectory(prefix="tauceti-security-review-") as tmp:
         home = Path(tmp)
@@ -1391,7 +1845,14 @@ def inspect(
         )
         dest = home / (".codex/auth.json" if provider == "codex" else ".claude/.credentials.json")
         dest.parent.mkdir(parents=True)
-        if source.is_file():
+        api_key = anthropic_api_key() if provider == "claude" and claude_credential != "subscription" else None
+        if provider == "claude" and claude_credential == "api-key" and not api_key:
+            raise Die(f"security-audit: API-key Haiku review requires {API_KEY_FILE_ENV}")
+        if api_key:
+            # API billing, independent of subscription pacing. The key reaches only
+            # the isolated client process; the reviewer has no tool to read it.
+            env["ANTHROPIC_API_KEY"] = api_key
+        elif source.is_file():
             _mirror_creds_file(
                 source,
                 dest,
@@ -1411,9 +1872,10 @@ def inspect(
             dest.chmod(0o600)
         else:
             raise Die("security-audit: no Codex subscription credential available")
-        if not dest.is_file():
-            raise Die("security-audit: no usable subscription access token available")
-        dest.chmod(0o600)
+        if not api_key:
+            if not dest.is_file():
+                raise Die("security-audit: no usable subscription access token available")
+            dest.chmod(0o600)
         policy = (
             (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
             if protocol == 4
@@ -1421,14 +1883,32 @@ def inspect(
             if provider == "codex"
             else V2_MODEL_PROMPT
         )
-        prompt = inspection_prompt(batch, False, policy=policy, goals=provider == "codex", protocol=protocol)
+        prompt = inspection_prompt(
+            batch, False, policy=policy, goals=provider == "codex", protocol=protocol, trusted_names=names
+        )
         schema_value = MODEL_SCHEMA
         receipt = (work / "read-receipt.json").resolve()
         if provider == "codex":
             durable = work / "native-sessions"
             durable.mkdir(exist_ok=True)
             (home / ".codex/sessions").symlink_to(durable.resolve(), target_is_directory=True)
-        if resume_from is not None:
+        session = None
+        if provider == "claude" and protocol == 4:
+            # The client writes the live session straight into the attempt, so a
+            # timeout or killed Worker still leaves the exact history to resume.
+            durable = work / CLAUDE_SESSIONS
+            durable.mkdir(exist_ok=True)
+            (home / ".claude/projects").symlink_to(durable.resolve(), target_is_directory=True)
+            session = thread or str(uuid.uuid4())
+            if resume_from is not None:
+                # `--resume <id>` finds the session in any project directory, so
+                # the retained file keeps its name; nothing else is carried over.
+                (durable / sessions[0].parent.name).mkdir(mode=0o700)
+                (durable / sessions[0].parent.name / sessions[0].name).write_bytes(sessions[0].read_bytes())
+                if paged and (resume_from / "read-receipt.json").exists():
+                    receipt.write_bytes((resume_from / "read-receipt.json").read_bytes())
+                    retain_saved_coverage(work, batch, receipt)
+        if provider == "codex" and resume_from is not None:
             sessions = home / ".codex/sessions"
             sessions.mkdir(parents=True, exist_ok=True)
             name = time.strftime("rollout-%Y-%m-%dT%H-%M-%S-", time.gmtime()) + thread + ".jsonl"
@@ -1437,36 +1917,15 @@ def inspect(
                 receipt.write_bytes((resume_from / "read-receipt.json").read_bytes())
             cmd[-1:] = ["resume", thread, "-"]
         if paged:
-            schema_value = {
-                **schema_value,
-                "required": [*MODEL_SCHEMA["required"], *(["read_token"] if protocol < 4 else [])],
-                "properties": {
-                    **schema_value["properties"],
-                    **({"read_token": {"type": "string"}} if protocol < 4 else {}),
-                    "verdict": {
-                        **MODEL_SCHEMA["properties"]["verdict"],
-                        "enum": [*MODEL_SCHEMA["properties"]["verdict"]["enum"], "unfinished"]
-                        if provider == "codex"
-                        else MODEL_SCHEMA["properties"]["verdict"]["enum"],
-                    },
-                },
-            }
+            schema_value = verdict_schema(provider, paged, protocol)
             source = home / "input.json"
             source.write_text(serialize(batch))
             token = secrets.token_hex(16) if protocol < 4 else ""
-            reader = [str(reader_path(protocol)), str(source), str(receipt), *([token] if protocol < 4 else [])]
-            prompt = inspection_prompt(batch, True, token, policy=policy, goals=provider == "codex", protocol=protocol)
+            prompt = inspection_prompt(
+                batch, True, token, policy=policy, goals=provider == "codex", protocol=protocol, trusted_names=names
+            )
             if resume_from is not None:
                 prompt = continue_prompt + prompt
-            if provider == "claude":
-                # Safe mode suppresses even this explicitly configured MCP
-                # server. The empty HOME, --restricted, empty settings sources,
-                # empty built-in tools and strict MCP config provide isolation.
-                cmd.remove("--safe-mode")
-                cmd[cmd.index("--mcp-config") + 1] = serialize(
-                    {"mcpServers": {"audit": {"type": "stdio", "command": sys.executable, "args": ["-I", *reader]}}}
-                )
-                cmd += ["--allowedTools", "mcp__audit__read_page"]
         if provider == "codex":
             schema = home / "verdict-schema.json"
             schema.write_text(serialize(schema_value))
@@ -1474,7 +1933,15 @@ def inspect(
             catalog.write_text(serialize(inspection_catalog(protocol)))
             cmd = codex_launch(home, paged, token if paged else "", thread, receipt, protocol=protocol)
         else:
-            cmd += ["--json-schema", serialize(schema_value)]
+            cmd = claude_launch(
+                home,
+                paged,
+                receipt,
+                token if paged else "",
+                protocol=protocol,
+                session=session,
+                resume=resume_from is not None,
+            )
         (work / "prompt.txt").write_text(prompt)
         if repair_output:
             prompt = OUTPUT_REPAIR_PROMPT + prompt
@@ -1493,6 +1960,7 @@ def inspect(
             legacy_history=legacy_history,
             allowed_history=allowed_history,
             protocol=protocol,
+            trusted_names=names,
         )
         if p.returncode:
             raise Die(f"security-audit: {provider} failed; see {work / 'model-stderr.txt'}")
@@ -1519,6 +1987,22 @@ def inspect(
             raise Die("security-audit: inspection unfinished; retained for same-session continuation")
         read_token = value.pop("read_token", None) if protocol < 4 and paged and isinstance(value, dict) else None
         verdict = bind_verdict(value, batch)
+        if (
+            provider == "claude"
+            and verdict["verdict"] == "pass"
+            and not claude_safe_history(work, batch, paged, protocol=protocol)
+        ):
+            # As for Luna: an earlier Haiku judgment in this session or its captured
+            # output is binding, and a later pass can never discard it.
+            for prior in claude_judgments(work):
+                if (
+                    isinstance(prior, dict)
+                    and prior.get("verdict") in ("finding", "incomplete")
+                    and prior.get("findings")
+                ):
+                    prior = {k: v for k, v in prior.items() if k != "read_token"}
+                    return bind_verdict(prior, batch)
+            raise Die("security-audit: retained native history is missing or contains an unresolved judgment")
         if (
             provider == "codex"
             and verdict["verdict"] == "pass"
@@ -1595,9 +2079,11 @@ def advance(repo: Path, batch: dict) -> str:
     refresh(repo, main)
     target = batch["commits"][-1]["sha"]
     validate_history(repo, old, main, target)
-    # No force. GitHub's separate no-bypass rule also rejects rewinds/deletions.
-    updated = api(f"repos/{TAUCETI}/git/refs/heads/{CURSOR}", method="PATCH", body={"sha": target, "force": False})
-    if updated.get("object", {}).get("sha") != target or remote_sha(CURSOR) != target:
+    # target descends from old on main's first-parent history, so this is a
+    # fast-forward; the lease makes it conditional on the cursor still being old.
+    # GitHub's separate no-bypass rule also rejects rewinds/deletions.
+    push_cursor(repo, old, target)
+    if remote_sha(CURSOR) != target:
         raise NoProgress("security-audit: cursor update could not be confirmed")
     return target
 
@@ -1619,11 +2105,70 @@ def dispatch_advanced(work: Path, landed: str) -> None:
         log("security-audit: advanced, but readiness-report dispatch failed; dispatch toolchain-tags manually")
 
 
+def reviewer_model(provider: str) -> str:
+    return "gpt-6-luna" if provider == "codex" else "claude-haiku-5-5"
+
+
+def credential_kind(provider: str) -> str:
+    """The billing credential an unpinned inspect() uses: a configured key wins for Haiku."""
+    return "api-key" if provider == "claude" and anthropic_api_key() else "subscription"
+
+
+def review_record(
+    actor: str, provider: str, protocol: int, batch: dict, attempt: Path, verdict: dict, credential: str
+) -> dict:
+    """The ledger entry for one isolated reviewer verdict on one exact batch. Never includes a key."""
+    return {
+        "actor": actor,
+        "provider": provider,
+        "model": reviewer_model(provider),
+        "credential": credential,
+        "batch": batch["input_digest"],
+        "prompt_digest": hashlib.sha256(
+            (
+                (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
+                if protocol == 4
+                else MODEL_PROMPT
+            ).encode()
+        ).hexdigest(),
+        "protocol_version": protocol,
+        "launcher_profile": reviewer_argv(provider, protocol=protocol),
+        "execution_record": str(attempt / "execution.json"),
+        "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest()
+        if provider == "codex"
+        else None,
+        "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
+        "input_policy": "compacting-session-v1",
+        "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
+        if (attempt / "output-repairs.jsonl").exists()
+        else 0,
+        "from_sha": batch["from_sha"],
+        "to_sha": batch["commits"][-1]["sha"],
+        "verdict": verdict,
+    }
+
+
+def pool_active(work: Path) -> bool:
+    """True while a parallel pool holds this audit state's exclusive cursor lock."""
+    path = work / "pool.lock"
+    if not path.exists():
+        return False
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    return False
+
+
 def run(cfg, opts, *, min_commits: int = 1) -> int:
     if type(min_commits) is not int or min_commits < 1:
         raise Die("security-audit: minimum pending commits must be a positive integer")
-    require_admin()
     work = cfg.state / CURSOR
+    if pool_active(work):
+        raise AuditNotDue("security-audit: a parallel audit pool owns this cursor")
+    require_admin()
     repo = work / "objects.git"
     cursor, main = remote_sha(CURSOR), remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
     refresh(repo, cursor, main)
@@ -1688,12 +2233,12 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
     (attempt / "input.json").write_text(serialize(batch))
-    actor = api("user")["login"]  # Resolve identity before a model verdict can exist.
+    actor = admin_login()  # Resolve identity before a model verdict can exist.
     provider = opts.work_model
     from .audit_clients import selected_protocol
 
     protocol = selected_protocol(provider, work)
-    model = "gpt-6-luna" if provider == "codex" else "haiku"
+    model = reviewer_model(provider)
     log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
     try:
         if any(c["files"] for c in batch["commits"]):
@@ -1707,33 +2252,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
             }
         record(
             work / "ledger.jsonl",
-            {
-                "actor": actor,
-                "provider": provider,
-                "model": model,
-                "batch": batch["input_digest"],
-                "prompt_digest": hashlib.sha256(
-                    (
-                        (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
-                        if protocol == 4
-                        else MODEL_PROMPT
-                    ).encode()
-                ).hexdigest(),
-                "protocol_version": protocol,
-                "launcher_profile": reviewer_argv(provider, protocol=protocol),
-                "execution_record": str(attempt / "execution.json"),
-                "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest()
-                if provider == "codex"
-                else None,
-                "reader_digest": hashlib.sha256(reader_path(protocol).read_bytes()).hexdigest(),
-                "input_policy": "compacting-session-v1",
-                "output_repairs": len((attempt / "output-repairs.jsonl").read_text().splitlines())
-                if (attempt / "output-repairs.jsonl").exists()
-                else 0,
-                "from_sha": cursor,
-                "to_sha": target,
-                "verdict": verdict,
-            },
+            review_record(actor, provider, protocol, batch, attempt, verdict, credential_kind(provider)),
         )
         if verdict["verdict"] != "pass":
             raise Die("security-audit: " + "; ".join(verdict["findings"]))
@@ -1932,7 +2451,7 @@ def resume_incomplete(
     from .loop import resolve_work_model
 
     resolve_work_model(cfg, "codex", dry=False, ignore_quota=ignore_quota, fresh=True)
-    actor = api("user")["login"]
+    actor = admin_login()
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
     (attempt / "input.json").write_text(serialize(batch), encoding="utf-8")
@@ -2025,7 +2544,7 @@ def attest(state: Path, through: str, reason: str) -> None:
     refresh(repo, cursor, main)
     remaining = validate_history(repo, cursor, main, through)
     commits = remaining[: remaining.index(through) + 1]
-    actor = api("user")["login"]
+    actor = admin_login()
     record(
         state / "ledger.jsonl",
         {
@@ -2121,14 +2640,32 @@ def setup(state: Path) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output"])
+    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output", "pool"])
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--through", help="full main commit SHA reviewed by the human administrator")
     parser.add_argument("--reason", help="human review evidence; never a model re-roll")
     parser.add_argument("--ignore-quota", action="store_true", help="ignore pacing, retaining hard quota limits")
+    parser.add_argument("--parallel", type=int, default=4, help="pool: concurrent isolated reviewers")
+    parser.add_argument(
+        "--agent", choices=["codex", "claude"], help="pool: pin one provider (default: codex, then haiku)"
+    )
     args = parser.parse_args()
     if args.command == "setup":
         setup(args.state)
+    elif args.command == "pool":
+        from .audit_pool import Chooser, Pool
+        from .config import Config
+
+        cfg = Config.resolve(args.state.parent.name)
+        if (cfg.state / CURSOR).resolve() != args.state.resolve():
+            parser.error("pool --state must identify this checkout's existing worker audit state")
+        min_commits = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS") or 1)
+        Pool(
+            args.state,
+            parallel=args.parallel,
+            chooser=Chooser(cfg, pin=args.agent, ignore_quota=args.ignore_quota),
+            min_commits=min_commits,
+        ).serve()
     elif args.command in ("resume", "retry-service", "repair-output"):
         from .config import Config
         from .round import RoundContext

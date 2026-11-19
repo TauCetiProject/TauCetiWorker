@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import stat
+import sys
 import time
 from pathlib import Path
 
@@ -192,6 +193,10 @@ def main():
     parser.add_argument("--follow", action="store_true")
     parser.add_argument("--until-complete", type=Path)
     args = parser.parse_args()
+    from .runtime import running_revision
+
+    revision = running_revision()
+    print(f"task activity: running revision {revision.sha} ({revision.source})", file=sys.stderr, flush=True)
     builds = BuildObservations()
     while True:
         if args.until_complete:

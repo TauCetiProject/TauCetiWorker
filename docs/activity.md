@@ -16,7 +16,8 @@ such as `roadmap`, `review`, `fix`, or `security-audit`; fallback candidates are
 not additional rounds. All supported round types appear even when their counts
 are zero; the prepared summary publishes the worker taxonomy for other consumers.
 No-work surveys have their own row. Admission/GitHub
-waiting attempts and dry runs are excluded. Failed/interrupted rounds are
+waiting attempts, rounds waiting for a matching TauCeti build cache (`waiting-build-cache`,
+recorded with dependency `build-cache` and the commit) and dry runs are excluded. Failed/interrupted rounds are
 included, with a failure subset (including timeouts). Running rounds and
 processes interrupted without a finish receipt are separate. The current
 "workers working" count is distinct workers with an active work round, excluding
@@ -206,11 +207,6 @@ review runner's existing cache; previously recorded worker cache paths are also 
 `TAUCETI_ACTIVITY_REVIEW_ARCHIVES` can select already-existing archive checkouts
 (separated by the platform path separator). No new process, clone, archive sync, GitHub
 request or shared-server request is introduced.
-
-Local [work recovery](work-recovery.md) counts come from each worker's
-`state/<worker>/recovery` directory: saved, checkouts moved aside, incomplete and
-corrupt records, with reasons. The background collector prepares them.
-Fleet summaries add host counts.
 
 Completed review counts include reviews of other authors' PRs. `PRs assisted`
 counts distinct PRs in the reported scope with completed review/fix/rebase work

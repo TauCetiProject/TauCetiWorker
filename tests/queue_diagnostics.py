@@ -6,7 +6,8 @@ build job's log with bors-ng's `priv/failure_diagnostics.py` patterns, mapped to
 Covered: compiler errors in both the Lean and Lake forms with timestamps and ANSI stripped,
 duplicate declarations from the audit driver and the axioms script, environment linter locations
 (ranged, module-only, unknown), the failed-targets fallback used only without located findings,
-deduplication, a lost runner, and cancellation, timeouts and a failed finalizer as infrastructure.
+deduplication, a lost runner, the member review-size policy's per-member rejection records, and
+cancellation, timeouts and a failed finalizer as infrastructure.
 """
 
 import json
@@ -51,6 +52,12 @@ class ParseLog(unittest.TestCase):
         self.assertTrue(all(f["module"] == "TauCeti" for f in findings[1:]))
         self.assertEqual(d.parse_log(["../TauCeti/A.lean: missing project import TauCeti.B"]), [])
 
+    def test_linter_timeout_preserves_the_actual_failure_message(self):
+        line = "LINT-ENV: FAIL — driver/linter failure: no lint report header found (lean exit 124)"
+        findings = d.parse_log([line])
+        self.assertEqual(kinds(findings), [("lint", "")])
+        self.assertEqual(findings[0]["message"], line)
+
     def test_compiler_errors(self):
         lines = [
             "2026-11-04T04:20:00.1234567Z \x1b[31merror: TauCeti/Algebra/Group/Basic.lean:12:3: error: unknown identifier\x1b[0m",
@@ -82,6 +89,18 @@ class ParseLog(unittest.TestCase):
         )
         self.assertEqual(findings[0]["declaration"], "Foo.bar")
         self.assertEqual(findings[2]["path"], "TauCeti/E/F.lean")
+
+    def test_audit_collision_with_a_dependency_names_the_project_module(self):
+        # A Mathlib bump added a declaration the project already defines (batch 459, run 44442676966).
+        line = (
+            "2026-11-19T05:05:47.8653067Z audit-driver: import TauCeti.Topology.Algebra.Algebra.Unitization failed, "
+            "environment already contains 'Unitization.continuous_iff' from Mathlib.Analysis.Normed.Algebra.Unitization"
+        )
+        [finding] = d.parse_log([line])
+        self.assertEqual(kinds([finding]), [("audit", "TauCeti.Topology.Algebra.Algebra.Unitization")])
+        self.assertEqual(finding["path"], "TauCeti/Topology/Algebra/Algebra/Unitization.lean")
+        self.assertEqual(finding["declaration"], "Unitization.continuous_iff")
+        self.assertIn("Mathlib.Analysis.Normed.Algebra.Unitization", finding["message"])
 
     def test_environment_linter(self):
         payload = {
@@ -128,6 +147,36 @@ class ParseLog(unittest.TestCase):
         self.assertEqual(d.parse_log([]), [])
         self.assertEqual(d.parse_log(["info: all good", "error: something else entirely"]), [])
 
+    def test_member_policy_rejections_name_the_member(self):
+        head = "a" * 40
+        record = {
+            "source_pr": 812,
+            "source": {"forge": {"kind": "forgejo", "url": "https://forge.invalid"}, "name": "o/r", "id": 9},
+            "source_forge": "forgejo:https://forge.invalid",
+            "head": head,
+            "reasons": ["+3400 added lines (cap 3000)"],
+            "additions": 3400,
+            "deletions": 3,
+            "files": 12,
+        }
+        lines = [
+            "2026-11-16T05:16:00.0000000Z MEMBER-POLICY-REJECTED " + json.dumps(record, sort_keys=True),
+            "MEMBER-POLICY-REJECTED " + json.dumps(record, sort_keys=True),
+            "MEMBER-POLICY-REJECTED {not json",
+            "MEMBER-POLICY-REJECTED " + json.dumps(dict(record, head="not-a-sha")),
+            "MEMBER-POLICY-REJECTED " + json.dumps(dict(record, source_pr="812")),
+            "::error::source member review-size policy rejected this candidate; inspect source-member-policy.json",
+        ]
+        [finding] = d.parse_log(lines)
+        self.assertEqual((finding["kind"], finding["module"]), ("policy", ""))
+        self.assertEqual((finding["source_pr"], finding["member_head"]), (812, head))
+        self.assertEqual(finding["source"]["forge"]["kind"], "forgejo")
+        self.assertEqual((finding["additions"], finding["files"]), (3400, 12))
+        self.assertIn("#812", finding["message"])
+        self.assertIn("+3400 added lines", finding["message"])
+        # Without the record (older TauCetiTools) nothing is invented.
+        self.assertEqual(d.parse_log(lines[-1:]), [])
+
     def test_message_bound(self):
         finding = d.parse_log(["TauCeti/A/B.lean:1:1: error: " + "x" * 5000])[0]
         self.assertLessEqual(len(finding["message"]), d.MAX_MESSAGE)
@@ -142,6 +191,12 @@ class Infrastructure(unittest.TestCase):
         ]
         findings = d.infrastructure_findings(run, jobs)
         self.assertEqual([f["reason"] for f in findings], ["cancelled", "cancelled", "finalizer_failed"])
+        # A stub caller of the reusable pr-build prefixes its job names.
+        prefixed = [{"name": "pr-build / finalize-merge-group-build", "conclusion": "failure"}]
+        self.assertEqual(
+            [f["reason"] for f in d.infrastructure_findings({"id": 7, "conclusion": "failure"}, prefixed)],
+            ["finalizer_failed"],
+        )
         self.assertTrue(all(f["kind"] == "infrastructure" for f in findings))
         self.assertEqual(
             d.infrastructure_findings(
