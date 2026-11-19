@@ -819,5 +819,42 @@ class ProjectionBudget(unittest.TestCase):
             monitoring.fit(value, 50)
 
 
+class StatusRead(unittest.TestCase):
+    """The publisher reads the status summary, and the full document from a controller without it."""
+
+    def serve(self, routes):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - stdlib naming
+                body = routes.get(self.path)
+                self.send_response(404 if body is None else 200)
+                self.end_headers()
+                self.wfile.write(json.dumps(body or {"error": "no such route"}).encode())
+
+            def log_message(self, *_):
+                pass
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return f"http://127.0.0.1:{httpd.server_address[1]}"
+
+    def test_summary_is_read_when_served(self):
+        base = self.serve({"/status/summary": {"head": {"id": 1}}, "/status": {"head": {"id": 2}}})
+        self.assertEqual(monitoring.read_status(base + "/status/summary"), {"head": {"id": 1}})
+
+    def test_older_controller_falls_back_to_the_full_document(self):
+        base = self.serve({"/status": {"head": {"id": 2}}})
+        self.assertEqual(monitoring.read_status(base + "/status/summary"), {"head": {"id": 2}})
+
+    def test_other_failures_leave_status_unavailable(self):
+        base = self.serve({})
+        self.assertEqual(monitoring.read_status(base + "/status"), {})
+        self.assertEqual(monitoring.read_status("http://127.0.0.1:1/status/summary", timeout=1), {})
+
+
 if __name__ == "__main__":
     unittest.main()

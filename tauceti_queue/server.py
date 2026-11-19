@@ -9,6 +9,9 @@ same process. Routes:
     GET  /status                                      the controller's status JSON plus the service's
                                                       revision, start time, GitHub client counters,
                                                       webhook counters and the identity cache
+    GET  /status/summary                              the sections the monitoring publisher reads,
+                                                      waiting at most HEALTHZ_LOCK_WAIT_SECONDS for
+                                                      the controller lock (else the last snapshot)
     GET  /repositories/<n>/active-batches?base=..     tauceti-bors.observation/v1 (feeds.py)
     GET  /repositories/<n>/candidates?base=..         tauceti-bors.candidates/v1 (feeds.py)
     POST /webhook/github                              HMAC-verified GitHub deliveries (webhook.py)
@@ -205,6 +208,25 @@ class BearerAuth:
 
 
 HEALTHZ_LOCK_WAIT_SECONDS = 0.5
+# `/status/summary`: the small sections `tauceti_queue.monitoring` reads every few seconds. The full
+# document carries every open task's diagnostics and every waiting input (megabytes); the summary
+# omits them and, like `/healthz`, never waits long for a reconciliation pass.
+STATUS_SUMMARY_KEYS = (
+    "schema",
+    "generated_at",
+    "repository",
+    "canonical_branch",
+    "canonical_sha",
+    "service",
+    "settings",
+    "publication_enabled",
+    "inference_hold",
+    "head",
+    "alerts",
+    "stuck_heads",
+    "snapshot",
+    "stale_seconds",
+)
 
 
 class NativeBearerAuth:
@@ -564,6 +586,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"ok\n", "text/plain")
         elif path in ("/status", "/status/"):
             self._call(self._status)
+        elif path == "/status/summary":
+            self._call(self._status_summary)
         elif path == "/statistics":
             self._call(self._statistics)
         elif path == "/healthz":
@@ -678,6 +702,10 @@ class Handler(BaseHTTPRequestHandler):
             status.update({"revision": self.server.revision, "started_at": feeds._iso(self.server.started_at)})
         status.update(self._counters())
         return status
+
+    def _status_summary(self) -> dict:
+        status = self._status(wait=HEALTHZ_LOCK_WAIT_SECONDS)
+        return {key: status[key] for key in STATUS_SUMMARY_KEYS if key in status}
 
     def _healthz(self) -> dict:
         # The liveness probe must answer within a second even while a tick holds the controller lock.
