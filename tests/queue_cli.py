@@ -323,6 +323,16 @@ class StatusCommand(Base):
             "build: phase build, 25,433 TauCeti modules built",
         )
         self.assertIsNone(build_progress.text({"observed_at": "2026-11-04T23:59:00Z"}, NOW.timestamp()))
+        self.assertEqual(
+            build_progress.text(dict(report, completed_tasks=100, tasks_per_minute=1e-300), NOW.timestamp()),
+            "build: phase build, 100/113,955 Lake jobs (0.1%), 0/min",
+        )
+        # A build job already finished while its run continues can sit behind terminal-only pages.
+        terminal = {"records": [{"run_id": "1", "active": False}]}
+        documents = iter([manifest, pages["root"], terminal, pages["page"]])
+        self.assertEqual(
+            build_progress.lookup("41934607574", 1, lambda *_a, **_k: next(documents))["completed_tasks"], 103917
+        )
 
     def test_unavailable_build_progress_leaves_the_running_step(self):
         for failure in (ConnectionRefusedError("down"), RuntimeError("HTTP 500"), {"schema": "other"}):

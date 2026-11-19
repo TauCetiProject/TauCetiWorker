@@ -82,7 +82,7 @@ def reported(value: Any) -> dict[str, Any] | None:
 
 
 def lookup(run_id: Any, run_attempt: Any, fetch: Callable[..., dict[str, Any]]) -> dict[str, Any] | None:
-    """The latest live report for a run attempt; active jobs lead the public jobs pages."""
+    """The latest live report for a run attempt, from the first public jobs pages that hold it."""
     manifest = fetch(MANIFEST, timeout=3)
     scope = manifest.get("scope") if isinstance(manifest, Mapping) else None
     if (
@@ -104,7 +104,7 @@ def lookup(run_id: Any, run_attempt: Any, fetch: Callable[..., dict[str, Any]]) 
                 progress = reported(job.get("progress"))
                 if progress:
                     found.append(progress)
-        if found or not any(isinstance(job, Mapping) and job.get("active") for job in records):
+        if found:
             break
     return max(found, key=lambda p: _instant(p["observed_at"])) if found else None
 
@@ -137,9 +137,11 @@ def text(progress: Mapping[str, Any], now: float, timezone: str = DISPLAY_TIMEZO
             rate = progress.get("tasks_per_minute")
             if type(rate) in (int, float) and rate >= 0 and phase == "build" and done < total:
                 parts.append(f"{rate:,.0f}/min")
-                if rate > 0:
+                try:
                     eta = _instant(progress["observed_at"]) + (total - done) * 60 / rate
                     parts.append("ETA " + datetime.fromtimestamp(eta, ZoneInfo(timezone)).strftime("%d %b %H:%M %Z"))
+                except (ZeroDivisionError, OverflowError, OSError, ValueError):
+                    pass  # No usable ETA from this rate; the counters stand alone.
         elif modules and phase == "build":
             # Reporters before Lake's job counter count only built TauCeti modules, with no total.
             parts.append(f"{modules:,} TauCeti modules built")
