@@ -5,6 +5,7 @@ import importlib
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -236,7 +237,11 @@ class GlobalMaintenance(unittest.TestCase):
             bust=Mock(),
         )
         self.w.claims = SimpleNamespace(
-            begin_branch_work=Mock(return_value=True), release=Mock(), stop_heartbeat=Mock()
+            begin_branch_work=Mock(return_value=True),
+            release=Mock(),
+            stop_heartbeat=Mock(),
+            held=("branch/10", "org/claims"),
+            lost=threading.Event(),
         )
         return sv, work.Candidate(10, HEAD, final_resolution=True), live
 
@@ -388,6 +393,50 @@ class GlobalMaintenance(unittest.TestCase):
                 ):
                     self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="rebase"))
                 mutation.assert_not_called()
+
+    def test_spent_rebase_closure_requires_a_held_claim(self):
+        from tauceti_worker.round import Claims
+
+        sv, c, _ = self.rebase_fixture()
+        self.w.claims = Claims(self.w.cfg, SimpleNamespace(add_cleanup=Mock()))
+        with (
+            patch.dict(os.environ),
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch("tauceti_worker.round.subprocess.run", return_value=SimpleNamespace(returncode=2)),
+            patch.object(work, "gh_run") as mutation,
+        ):
+            self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="rebase"))
+        self.assertIsNone(self.w.claims.held)
+        mutation.assert_not_called()
+        sv, c, _ = self.rebase_fixture()
+        self.w.claims.lost.set()
+        with patch.object(work, "gh_run") as mutation:
+            self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="rebase"))
+        mutation.assert_not_called()
+
+    def test_spent_rebase_closure_rechecks_the_budget_after_claim_and_reads(self):
+        from dataclasses import replace
+
+        for during in ("claim", "live read"):
+            with self.subTest(during=during):
+                (self.w.cfg.state / "rebase-progress-10.json").unlink(missing_ok=True)
+                sv, c, live = self.rebase_fixture()
+                healthy = replace(
+                    sv.open_prs[0], mergeable="MERGEABLE", build_success=True, build_failed=False, build_status_at=100
+                )
+
+                def renew(*args, healthy=healthy, **kwargs):
+                    self.w.counters.observe_rebase_progress(healthy, handoff=False)
+                    return True
+
+                if during == "claim":
+                    self.w.claims.begin_branch_work.side_effect = renew
+                else:
+                    self.w.gh.pr_view = lambda *a, live=live, renew=renew: renew() and dict(live)
+                with patch.object(work, "gh_run") as mutation:
+                    self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="rebase"))
+                mutation.assert_not_called()
+                self.assertNotEqual(self.w.counters.rebase_budget_key(10), c.rebase_budget_key)
 
     def test_spent_rebase_dispatch_goes_to_closure(self):
         sv, c, _ = self.rebase_fixture()
