@@ -74,7 +74,14 @@ def reported(value: Any) -> dict[str, Any] | None:
         "completed_modules": _count(value.get("completed_modules")),
         "estimated_total_tasks": None,
         "estimate_source": None,
+        "last_progress_at": None,
     }
+    # When the reporter's counters last changed; the controller's stall report reads it.
+    try:
+        _instant(value.get("last_progress_at"))
+        result["last_progress_at"] = value["last_progress_at"]
+    except (ValueError, TypeError):
+        pass
     done, total = _count(value.get("completed_tasks")), _count(value.get("total_tasks"))
     if done is not None and total and done <= total:
         result.update(completed_tasks=done, total_tasks=total)
