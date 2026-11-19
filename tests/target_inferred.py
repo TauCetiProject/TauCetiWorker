@@ -210,6 +210,7 @@ class Audit(Tmp):
             "the layer is done": status([{"id": "Layer 1", "state": "done"}]),
             "no matching layer id": status([{"id": "Layer 01", "state": "partial"}]),
             "a status no later than the tick": status(partial, ts="2026-01-01T23:59:59Z"),
+            "a status that is the tick's day in UTC": status(partial, ts="2026-01-02T00:30:00+11:00"),
             "no status date": status(partial, ts="soon"),
             "another roadmap's header": status(partial, roadmap="Probability/Child"),
             "two headers": status(partial) + status(partial).split("\n", 1)[1],
@@ -221,6 +222,7 @@ class Audit(Tmp):
         }
         for why, text in cases.items():
             self.assertEqual(reconcile.audit(listed, self.roadmap(text)), [], why)
+        self.assertEqual(len(reconcile.audit(listed, self.roadmap(status(partial, ts="2026-01-01T20:00:00-05:00")))), 1)
         self.assertEqual(reconcile.audit(listed, None), [])
         self.assertEqual(reconcile.audit(listed, self.tmp / "absent"), [])
         roadmap = self.roadmap(status(partial))

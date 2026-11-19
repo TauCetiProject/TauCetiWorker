@@ -318,10 +318,13 @@ def _evidence(found: Iterable[str]) -> str:
 
 
 def _date(ts: str) -> str | None:
+    """The UTC date of an ISO timestamp, the calendar inference dates are written in; a timestamp
+    without an offset is taken as UTC."""
     try:
-        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).date().isoformat()
+        when = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+    return (when.astimezone(datetime.UTC) if when.tzinfo else when).date().isoformat()
 
 
 def coverage(status: str, area: str) -> tuple[dict[str, str], str] | None:
