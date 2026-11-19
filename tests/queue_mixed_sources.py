@@ -35,7 +35,13 @@ class Decision:
 
 class NativeFake(FakeGitHub):
     def list_open_pull_requests(self, repo, *, review_app_id=0, **kwargs):
-        return super().list_open_pull_requests(repo, review_app_id=review_app_id, **kwargs)
+        # Like the Forgejo adapter, the listing carries each PR's listed-facts version.
+        return [
+            dataclasses.replace(
+                pull, admission={"discovery_version": self._discovery_version(self.fetch_pr(repo, pull.number))}
+            )
+            for pull in super().list_open_pull_requests(repo, review_app_id=review_app_id, **kwargs)
+        ]
 
     def _discovery_version(self, pull):
         return pull.head_sha + ":" + pull.state
@@ -362,6 +368,85 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.assertFalse(poller.is_current(1, head))
         poller.withdraw(99, None)
         self.assertEqual(poller.state.get(99)["cancelled_head_sha"], "*")
+
+    def test_native_listing_runs_once_per_approval_poll_interval_and_evaluations_continue(self):
+        registry = self.registry()
+        poller = NativePoller(registry, self.controller)
+        self.native.create_pr(1, {"One.lean": "one\n"})
+
+        def listings():
+            return sum(name == "list_open_pull_requests" for name, _ in self.native.calls)
+
+        poller.run_once()
+        self.assertEqual(listings(), 1)
+        interval = self.controller.setting("approval_poll_interval_seconds")
+        self.assertGreater(interval, registry.poll_seconds)
+        # Work dirtied between listings is evaluated without listing again.
+        self.native.create_pr(2, {"Two.lean": "two\n"})
+        poller.invalidate(2, head=self.native.prs[2]["head_sha"])
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["evaluated"], 1)
+        self.assertEqual(listings(), 1)
+        self.assertLessEqual(poller.interval(), interval)
+        self.clock.advance(interval - registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(listings(), 2)
+        # A requested discovery (a canonical push, a setting change) still lists at once.
+        poller.request_discovery()
+        poller.run_once()
+        self.assertEqual(listings(), 3)
+
+    def native_approved(self):
+        from tauceti_queue.mixed_sources import AdmissionInputs
+
+        registry = self.registry()
+        poller = registry.poller = NativePoller(registry, self.controller)
+        self.controller.admission = AdmissionInputs(None, poller)
+        head = self.native.create_pr(1, {"Native.lean": "native\n"})
+        self.assertEqual(poller.run_once()["approved"], 1)
+        return poller, head
+
+    def native_input(self):
+        return self.controller.input_for(self.native_id.repository.key, 1)
+
+    def test_native_insertion_reads_the_pr_once_more_and_inserts_it_unchanged(self):
+        poller, head = self.native_approved()
+        reads = sum(name == "fetch_pr" for name, _ in self.native.calls)
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "inserted")
+        self.assertGreater(sum(name == "fetch_pr" for name, _ in self.native.calls), reads)
+
+    def test_native_insertion_is_held_for_a_change_no_listing_has_seen(self):
+        poller, head = self.native_approved()
+        self.native.prs[1]["state"] = "closed"  # closed after evaluation, before the next listing
+        self.controller.tick()
+        row = self.native_input()
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "admission-recheck"))
+        self.assertFalse(poller.is_current(1, head))
+        poller.run_once()
+        self.assertEqual(self.native_input()["state"], "cancelled")
+
+    def test_native_insertion_is_held_while_a_blocking_label_is_on_the_pr(self):
+        poller, head = self.native_approved()
+        self.native.labels[1] = {"hold"}  # added after approval; the fixture's listed facts omit labels
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "waiting")
+        self.native.labels[1] = set()
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "inserted")
+
+    def test_native_insertion_is_held_while_the_source_cannot_be_read(self):
+        poller, head = self.native_approved()
+
+        def unavailable(repo, number):
+            raise OSError("forge unreachable")
+
+        self.native.fetch_pr_or_none = unavailable
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "waiting")
+        del self.native.fetch_pr_or_none
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "inserted")
 
     def test_native_readmit_rereads_admission_and_refuses_another_head_or_a_closed_pr(self):
         registry = self.registry()
