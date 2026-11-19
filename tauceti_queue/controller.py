@@ -6102,10 +6102,33 @@ class Controller:
             batch = self.store.row("batches", {"id": task["batch_id"]})
             if batch is None or batch["state"] != BATCH_OPEN or self._pre_rebase_task_current(task, batch):
                 continue
+            if self._preserve_across_head_round(task, batch, now):
+                continue
             with self.store.transaction():
                 self._supersede_pre_rebase_tasks(batch["id"], "head-moved", now)
                 self.store.journal(now, "pre-rebase-superseded", batch["id"], task_id=task["id"], onto=task["onto"])
         self._supersede_stale_pre_rebased_prepare(now)
+
+    def _preserve_across_head_round(self, task: dict[str, Any], batch: dict[str, Any], now: float) -> bool:
+        """Keep a claimed `pre_rebase` task whose `onto` is an earlier tip of the current head (a repair
+        round or a rebase moved it) instead of superseding it: the agent's resolution takes longer
+        than a head round, and restarting it on every round means it never finishes. It is recorded
+        in `state:emergency_preserved` like the claimed successor work of an emergency head, so its
+        owner may still submit onto that tip and the next `_pre_rebase` carries the adopted result
+        onto the head's tip by replay (`_carry_pre_rebase`). True when preserved."""
+        head = self._head()
+        if (
+            head is None
+            or not self._active_claims(batch["id"], task_id=task["id"])
+            or not chain.is_ancestor(self.clone, task["tip"], batch["tip"])
+            or self.store.row("batch_tips", {"batch_id": head["id"], "tip": task["onto"]}) is None
+        ):
+            return False
+        preserved = self._state("emergency_preserved") or {}
+        preserved[str(task["id"])] = task["onto"]
+        self._set_state("emergency_preserved", preserved)
+        self.store.journal(now, "pre-rebase-preserved", batch["id"], task_id=task["id"], onto=task["onto"])
+        return True
 
     def _pre_rebase(self, now: float) -> None:
         """Replay the oldest open batch onto the head's tip in the background, once the head allows it.
@@ -6509,11 +6532,11 @@ class Controller:
         """Base a newly sealed head on `canonical` from its pre-rebase, without replaying it again.
 
         Applies when the head ahead of it landed as the tip the pre-rebase was made on (`main` equals
-        `pre_rebase_onto`, or descends from it, and the pre-rebase is first carried onto `main` by a
-        clean replay); members inserted after the pre-rebase are replayed onto it first. The
-        members take their commits from the pre-rebased chain, and those an agent edited in a
-        `pre_rebase` task are recorded as edited with its explanation. False (nothing changed) when
-        there is no such pre-rebase, an extension conflicts or the chain's members do not match.
+        `pre_rebase_onto`), or otherwise when the pre-rebase carries onto `main` by a clean replay;
+        members inserted after the pre-rebase are replayed onto it first. The members take their
+        commits from the pre-rebased chain, and those an agent edited in a `pre_rebase` task are
+        recorded as edited with its explanation. False (nothing changed) when there is no such
+        pre-rebase, a carry or an extension conflicts, or the chain's members do not match.
         """
         onto = head["pre_rebase_onto"]
         if head["pre_rebase_state"] not in PRE_REBASE_USABLE or not onto:
@@ -6524,10 +6547,10 @@ class Controller:
             return False
         if onto != canonical:
             # A batch landed after the pre-rebase was made (a lane or emergency head went ahead of
-            # this one while its pre-rebase work was claimed): carry the pre-rebase, with its edits,
-            # onto `main` by replay, as `_carry_pre_rebase` does while a head runs.
-            if not chain.is_ancestor(self.clone, onto, canonical):
-                return False
+            # this one while its pre-rebase work was claimed), or the head landed at a later tip than
+            # the one a preserved task resolved onto (`_preserve_across_head_round`): carry the
+            # pre-rebase, with its edits, onto `main` by replay, as `_carry_pre_rebase` does while a
+            # head runs.
             chain_id = f"pre-rebase-carry-{head['id']}-{secrets.token_hex(4)}"
             try:
                 moved = chain.replay(self.clone, onto, tip, canonical, chain_id=chain_id)
