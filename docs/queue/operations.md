@@ -303,7 +303,10 @@ uv run tauceti-queue status --url https://queue.taucetiproject.org   # through t
 
 While the head's CI run is in progress, `status` also reads that run's live build report from the
 public CI operations snapshot (`https://ci-data.taucetiproject.org`, no GitHub calls) and prints a
-line such as `build: phase build, 103,917/113,955 Lake jobs (91.2%), 850/min, ETA 05 Nov 11:10 AEDT`.
+line such as `build: phase build, 44,180 jobs done, ~54% of ~81.8k jobs (from last PR build), 905/min,
+ETA ~19 Nov 20:10 AEDT`. Lake's own total grows as it discovers jobs, so the percentage and ETA use
+the receiver's estimate, the latest finished build's final job count; without one only the done count
+and rate are shown.
 TauCetiTools' build reporter, outside the bwrap sandbox, posts these counters every fifteen seconds;
 they come from candidate output, so they are observations only. When the report is unavailable the
 head shows its running step alone (`tauceti_queue/build_progress.py`).
@@ -487,6 +490,20 @@ and relies on the service's own admin enforcement; only the API saying the accou
 stops it, and `--check` reports the cached verification's age. The worker runs
 on the service host today; it only needs the service URL, so it can run on any host meeting the
 requirements below (the service's `repair_concurrency` setting bounds how many hold a task at once).
+
+Repairs run below the CI and staging VMs that share their host. Every repair unit runs in
+`tauceti-repair.slice` (installed by `install-repair.sh` beside TauCetiFleet's `tauceti-fleet.slice`
+under `tauceti.slice`, with `CPUWeight=10` and `IOWeight=10` against the fleet slice's 100), at
+`Nice=10` with the lowest best-effort IO priority (not the idle class, which could stall the claim
+lease's renewal); every thread and child inherits these, bwrap sandboxes and the agent's processes
+included, and the background publisher's transient unit is started in the same slice with the same
+settings. The slice weight is what counts against the VMs: the cgroup CPU controller shares a busy
+host between sibling slices by weight, so a reniced process in `app.slice` competes as `app.slice`
+does. The weights are work-conserving, so repairs slow down under a staging build and never stop.
+Disk traffic is ordered only where the block layer honours cgroup weights or IO priorities (BFQ,
+mq-deadline, or io.cost configured for the device); tauchonki2's devices use `none`, so there
+nothing orders it. A `renice` by hand affects only the thread it names, not the other threads of a
+multithreaded process such as `lake` or the worker, nor their later children.
 
 Queue repair sessions using Claude (subscription or API) give Bash EOF on its default stdin.
 The worker atomically writes `bash-env.sh` beside its persistent private Claude config and selects
@@ -1164,7 +1181,10 @@ persistent infrastructure failures; automatic retries continue with capped backo
 To land an approved PR ahead of the queue (a harness or staging fix, a broken `main`), a repository
 admin comments `bors emergency` on it (withdraw with `bors emergency-`), or runs
 `uv run tauceti-queue emergency TauCetiProject/TauCeti <pr> --reason "<why>"` (`emergency cancel ...`
-to withdraw; `POST /admin/emergency` and `/admin/emergency-cancel` underneath). Use this, not an admin
+to withdraw; `POST /admin/emergency` and `/admin/emergency-cancel` underneath). The command waits up
+to 15 minutes for the answer, since the controller answers only once it holds its lock, which
+recording a large batch's landing can keep for minutes; if the answer is lost anyway, the request
+may still have been applied, so check `status`. Use this, not an admin
 merge: an admin merge supersedes the running head's CI and leaves `main` on a revision only `ci.yml`
 publishes, while the emergency lane lands the PR through the queue, as the next head in a batch of
 its own, on a pass of its own staging run, with its Lake cache published. With `emergency_evict` off

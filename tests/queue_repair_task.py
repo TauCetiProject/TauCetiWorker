@@ -601,7 +601,13 @@ def commit(repo: Path, message: str, files: dict[str, str]) -> str:
 class Content:
     """A bare content repository, a seed clone that built the chain, and the worker's clone."""
 
-    def __init__(self, root: Path, broken: tuple[int, ...] = (2,), base_files: dict[str, str] | None = None):
+    def __init__(
+        self,
+        root: Path,
+        broken: tuple[int, ...] = (2,),
+        base_files: dict[str, str] | None = None,
+        member_files: dict[int, dict[str, str]] | None = None,
+    ):
         self.broken = broken
         self.bare = root / "content.git"
         subprocess.run(["git", "init", "--quiet", "--bare", "-b", "main", str(self.bare)], check=True)
@@ -616,6 +622,7 @@ class Content:
         for number, name in ((1, "One"), (2, "Two"), (3, "Three")):
             body = "BROKEN" if number in broken else "trivial"
             files = {f"TauCeti/{name}.lean": f"theorem {name.lower()} : True := {body}\n"}
+            files.update((member_files or {}).get(number, {}))
             sh(seed, "checkout", "--quiet", "--detach", self.base)
             heads[number] = commit(seed, f"pr {number}", files)
         members = [
@@ -1018,10 +1025,13 @@ class FakeService:
 class Fixture(unittest.TestCase):
     BROKEN = (2,)  # the members whose module fails to build
     BASE_FILES: dict[str, str] | None = None  # more files in the base commit (``tauceti.toml``)
+    MEMBER_FILES: dict[int, dict[str, str]] | None = None  # more files in a member's commit, by number
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix="case-", dir=TMP))
-        self.content = Content(self.root, broken=self.BROKEN, base_files=self.BASE_FILES)
+        self.content = Content(
+            self.root, broken=self.BROKEN, base_files=self.BASE_FILES, member_files=self.MEMBER_FILES
+        )
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
         os.environ["STUB_DIR"] = str(self.stub_dir)
@@ -1745,6 +1755,52 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(outcome["status"], "released", outcome)
         self.assertEqual(outcome["reason"], "artifacts_unavailable")
         self.assertEqual(self.agent_calls(), [])
+
+
+class ToolchainBumpWithoutArtifacts(Fixture):
+    """A chain that changes `lean-toolchain` (a Lean or Mathlib bump): Lake scopes the published
+    mappings by the checkout's toolchain, so main's revisions never answer for it. Production repair
+    task 1273 (2026-11-19) was released as ``artifacts_unavailable`` on every claim until escalation."""
+
+    BASE_FILES = {"lean-toolchain": "leanprover/lean4:v4.36.0-rc2\n"}
+    MEMBER_FILES = {1: {"lean-toolchain": "leanprover/lean4:v4.36.0\n"}}
+
+    def test_the_repair_runs_cold_instead_of_being_released(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.service.releases, [], "a toolchain bump without artifacts is not released")
+        self.assertFalse(outcome["artifacts"]["available"])
+        self.assertTrue(outcome["artifacts"]["cold"])
+        self.assertTrue(self.state()["artifacts"]["cold"], "a resumed claim still knows the build is cold")
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertIn("The build is cold", self.agent_calls()[0]["prompt"])
+        self.assertNotIn("stream_build", outcome, "nothing to stream from without artifacts")
+
+    def test_parallel_agents_are_not_dispatched_cold(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        cfg = self.config(parallel_agents=3)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertNotIn("parallel", outcome)
+
+    def test_a_preparation_is_still_released(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        raw = self.content.task(kind="prepare")
+        raw["diagnostics"] = []
+        self.service.tasks = {1: raw}
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(outcome["reason"], "artifacts_unavailable")
+        self.assertEqual(self.agent_calls(), [])
+
+    def test_the_toolchain_change_is_read_from_the_chain(self):
+        clone = self.content.bare.parent / "seed"
+        self.assertTrue(repair_task.toolchain_changed(clone, self.content.base, self.content.tip))
+        self.assertFalse(repair_task.toolchain_changed(clone, self.content.base, self.content.base))
+        self.assertFalse(repair_task.toolchain_changed(clone, self.content.members[1]["commit"], self.content.tip))
 
 
 class InferenceUnavailable(Fixture):
@@ -3178,11 +3234,36 @@ class PublishOutputs(Fixture):
         self.assertTrue(record["unit"].startswith(f"tauceti-repair-publish-7-{self.content.tip[:12]}-"))
         args = (self.stub_dir / "systemd-run-args").read_text().splitlines()
         self.assertEqual(args[:3], ["--user", "--quiet", "--collect"])
+        # the transient unit starts from the user manager, so it is given the worker's priority
+        self.assertIn("--slice=tauceti-repair.slice", args)
+        self.assertIn("--property=Nice=10", args)
+        self.assertIn("--property=IOSchedulingClass=best-effort", args)
+        self.assertIn("--property=IOSchedulingPriority=7", args)
         self.assertIn(f"--setenv=LAKE_CACHE_DIR={env['LAKE_CACHE_DIR']}", args)
         self.assertFalse([a for a in args if "gh-secret" in a or "INVOCATION_ID" in a], args)
         self.assertEqual(args[-2:], ["tauceti_queue.repair_publish", str(logdir / repair_publish.SPEC)])
         self.assertNotIn(self.KEY, "\n".join(args))
         self.assertEqual(json.loads((logdir / repair_publish.RECORD).read_text())["state"], "running")
+
+    def test_the_publisher_takes_the_repair_units_priority(self):
+        """The background publisher's transient unit matches what the repair units set, so publication
+        never runs above the worker that started it."""
+        for name in ("tauceti-queue-repair.service", "tauceti-queue-repair@.service"):
+            text = (Path(__file__).resolve().parents[1] / "services/queue" / name).read_text()
+            with self.subTest(unit=name):
+                self.assertEqual(re.findall(r"^Slice=(.*)$", text, re.M), [repair_publish.SLICE])
+                for prop in repair_publish.UNIT_PRIORITY:
+                    self.assertEqual(re.findall(rf"^{prop.split('=')[0]}=(.*)$", text, re.M), [prop.split("=", 1)[1]])
+
+    def test_niced_reaches_a_target_niceness_without_compounding(self):
+        env = {"PATH": os.environ.get("PATH", "")}
+        with patch.object(repair_publish.os, "getpriority", return_value=0):
+            self.assertEqual(repair_publish.niced(["x"], 10, env), ["nice", "-n", "10", "x"])
+        with patch.object(repair_publish.os, "getpriority", return_value=4):
+            self.assertEqual(repair_publish.niced(["x"], 10, env), ["nice", "-n", "6", "x"])
+        for current in (10, 15):
+            with patch.object(repair_publish.os, "getpriority", return_value=current):
+                self.assertEqual(repair_publish.niced(["x"], 10, env), ["x"], "already at least that nice")
 
     def test_without_a_key_or_when_switched_off_nothing_is_put(self):
         for settings, reason in (
