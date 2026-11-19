@@ -54,7 +54,10 @@ an unrelated queue/store. Restart epochs also advance from current milliseconds,
 so an ordinary restored old state file does not replay old process epochs.
 
 The live detail window retains active batches plus up to 500 terminal batches in
-ninety days, and up to 5,000 terminal inputs. Byte caps can shorten old detail by
+ninety days, and up to 5,000 terminal inputs. Only active batches' members and live inputs
+count toward the 20,000-row read limit; terminal batches join newest first while all their
+members fit, and each member carries its own input's title, author and times even when that
+input is older than the published terminal inputs. Byte caps can shorten old detail by
 dropping the oldest terminal batches whole; `retained_batch_ids` says which remain, and
 this alone does not make the snapshot partial. Extraordinary active-only overflow is
 marked partial, with the trimmed collections' `collection_complete` false. Authoritative batch counts

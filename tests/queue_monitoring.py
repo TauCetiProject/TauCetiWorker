@@ -283,6 +283,65 @@ url = "https://private.invalid"
         self.assertEqual(len(value["members"]), 1)
         self.assertEqual(value["batches"][0]["size"], 2)
 
+    def landed_batches(self, *sizes):
+        """Terminal batches, oldest first, each with members whose inputs have landed."""
+        store = self.controller.store
+        template = {k: v for k, v in self.controller._head().items() if k != "id"}
+        member = {k: v for k, v in store.rows("members")[0].items() if k != "id"}
+        source = {k: v for k, v in store.rows("inputs")[0].items() if k != "id"}
+        made = []
+        for index, size in enumerate(sizes):
+            batch = store.insert("batches", **(template | {"state": "landed", "landed_at": self.clock()}))
+            for position in range(size):
+                title = f"Landed {index}.{position}"
+                number = 1000 + 10 * index + position
+                item = store.insert("inputs", **(source | {"number": number, "state": "landed", "title": title}))
+                store.insert("members", **(member | {"batch_id": batch, "input_id": item, "number": number}))
+            made.append(str(batch))
+        return made
+
+    def test_the_row_limit_shortens_terminal_history_by_whole_batches(self):
+        oldest, middle, newest = self.landed_batches(3, 1, 2)
+        # Two active members leave room for three terminal ones: the newest two batches fit whole.
+        with patch.object(monitoring, "LIMIT", 5):
+            value = self.export()
+        retained = {b["id"] for b in value["batches"]}
+        self.assertTrue({middle, newest} <= retained)
+        self.assertNotIn(oldest, retained)
+        self.assertEqual(len(value["members"]), 5)
+        self.assertEqual(value["coverage"], "observed")
+        self.assertFalse(value["truncated"])
+        self.assertTrue(value["collection_complete"]["members"])
+
+    def test_members_keep_their_input_detail_outside_the_published_inputs(self):
+        [batch] = self.landed_batches(2)
+        with patch.object(monitoring, "TERMINAL_INPUTS", 0):
+            value = self.export()
+        self.assertNotIn("landed", {i["state"] for i in value["inputs"]})
+        landed = [m for m in value["members"] if m["batch_id"] == batch]
+        self.assertEqual(sorted(m["title"] for m in landed), ["Landed 0.0", "Landed 0.1"])
+        self.assertTrue(all(m["approved_at"] for m in landed))
+
+    def test_a_member_never_carries_a_private_input_detail(self):
+        [batch] = self.landed_batches(1)
+        self.controller.store.execute(
+            "UPDATE inputs SET repository='OtherOrg/Private', title='PRIVATE_TITLE', author='PRIVATE_AUTHOR' "
+            "WHERE id=(SELECT input_id FROM members WHERE batch_id=?)",
+            (int(batch),),
+        )
+        value = self.export()
+        [member] = [m for m in value["members"] if m["batch_id"] == batch]
+        self.assertEqual((member["title"], member["author"]), ("", ""))
+        self.assertNotIn("PRIVATE", json.dumps(value))
+
+    def test_live_inputs_leave_terminal_inputs_only_the_remaining_records(self):
+        self.landed_batches(1, 1)
+        live = sum(1 for r in self.controller.store.rows("inputs") if r["state"] in ("waiting", "reserved"))
+        with patch.object(monitoring, "LIMIT", live + 1):
+            value = self.export()
+        self.assertEqual(len(value["inputs"]), live + 1)
+        self.assertTrue(value["collection_complete"]["inputs"])
+
     def test_git_failures_are_retried_without_discarding_previous_evidence(self):
         facts = monitoring.CommitFacts(self.repo.clone)
         first = self.export(facts=facts)

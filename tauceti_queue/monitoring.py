@@ -33,6 +33,8 @@ from .monitoring_protocol import PublicationRejected, PublisherIdentity, ResyncR
 
 SCHEMA = "tauceti.operations.queue/v1"
 LIMIT = 20_000
+# Terminal inputs kept beside every live one; older inputs remain only as their members' detail.
+TERMINAL_INPUTS = 5000
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 MAX_BYTES = 2_000_000
@@ -478,22 +480,72 @@ def project(
             # native records under an unrelated github.com owner/name.
             raise ValueError("source-bound queue requires a qualified public monitoring policy")
 
+        captured = clock()
+        public = sorted(public_repositories)
+        in_public = "repository IN (" + ",".join("?" * len(public)) + ")" if public else "0"
         batches = rows(
             "SELECT id,repository,version,base,tip,state,sealed,created_at,sealed_at,landed_at,"
             "first_dispatch_at,pre_rebase_state,pre_rebase_tip,pre_rebase_onto,pre_rebase_prepared "
             "FROM batches ORDER BY CASE state WHEN 'head' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,id DESC LIMIT ?",
             (LIMIT + 1,),
         )
-        members = rows(
-            "SELECT id,batch_id,input_id,number,accepted_head,position,commit_sha,provenance,"
-            "task_id,explanation,added_at,removed,removed_reason,no_repair,withdrawn FROM members "
-            "ORDER BY id DESC LIMIT ?",
-            (LIMIT + 1,),
+        # Keep active work and a bounded 90-day terminal window. Historic totals
+        # belong to the journal report, rather than an ever-growing live projection.
+        terminal = [
+            r
+            for r in batches[:LIMIT]
+            if r["state"] not in ("head", "open") and (r["landed_at"] or r["created_at"]) >= captured - 90 * 86400
+        ][:500]
+        active = [
+            r for r in batches[:LIMIT] if r["state"] in ("head", "open") and r["repository"] in public_repositories
+        ]
+        terminal = [r for r in terminal if r["repository"] in public_repositories]
+        # Only active members count toward the row limit; terminal batches then join newest first
+        # while all of their members fit, so shortened history drops whole batches, never a
+        # retained batch's members (docs/queue/monitoring.md).
+        sizes = {r["batch_id"]: r["n"] for r in rows("SELECT batch_id,COUNT(*) n FROM members GROUP BY batch_id")}
+        room = LIMIT - sum(sizes.get(r["id"], 0) for r in active)
+        kept = []
+        for row in terminal:
+            if sizes.get(row["id"], 0) > room:
+                break
+            kept.append(row)
+            room -= sizes.get(row["id"], 0)
+        member_params = tuple(public)
+        member_columns = (
+            "SELECT m.id,m.batch_id,m.input_id,m.number,m.accepted_head,m.position,m.commit_sha,m.provenance,"
+            "m.task_id,m.explanation,m.added_at,m.removed,m.removed_reason,m.no_repair,m.withdrawn,"
+            # Each member's own input, however old, rather than only the inputs published below.
+            "i.title,i.author,i.state input_state,i.approved_at,i.landed_at,i.landed_sha,i.reason "
+            # Only a public input's detail, as for the published inputs.
+            "FROM members m LEFT JOIN inputs i ON i.id=m.input_id AND "
+            + ("i." + in_public if public else "0")
+            + " WHERE m.batch_id IN "
         )
-        inputs = rows(
-            "SELECT id,repository,number,head_sha,title,author,state,approved_at,batch_id,"
-            "landed_at,landed_sha,no_repair,reason FROM inputs ORDER BY CASE WHEN state IN ('waiting','reserved') THEN 0 ELSE 1 END,id DESC LIMIT ?",
-            (LIMIT + 1,),
+
+        def members_of(group, limit):
+            if not group:
+                return []
+            ids = [r["id"] for r in group]
+            sql = member_columns + "(" + ",".join("?" * len(ids)) + ") ORDER BY m.id DESC LIMIT ?"
+            return rows(sql, (*member_params, *ids, limit))
+
+        members = members_of(active, LIMIT + 1)
+        members += members_of(kept, max(0, LIMIT + 1 - len(members)))
+        # Rows past the limit are the oldest terminal batches unless active work alone exceeds it.
+        batches_complete = len(batches) <= LIMIT or batches[LIMIT]["state"] not in ("head", "open")
+        batches = active + kept
+        live_inputs = rows(
+            "SELECT id,repository,number,head_sha,title,author,state,approved_at,batch_id,landed_at,landed_sha,"
+            f"no_repair,reason FROM inputs WHERE state IN ('waiting','reserved') AND {in_public} ORDER BY id DESC LIMIT ?",
+            (*public, LIMIT + 1),
+        )
+        inputs = live_inputs + rows(
+            "SELECT id,repository,number,head_sha,title,author,state,approved_at,batch_id,landed_at,landed_sha,"
+            f"no_repair,reason FROM inputs WHERE state NOT IN ('waiting','reserved') AND {in_public} "
+            "ORDER BY id DESC LIMIT ?",
+            # The receiver accepts at most LIMIT records per collection; live inputs come first.
+            (*public, max(0, min(TERMINAL_INPUTS, LIMIT - len(live_inputs)))),
         )
         # The exporter can start before the queue migrates an older ledger.
         columns = {r["name"] for r in rows("PRAGMA table_info(ci_attempts)")}
@@ -546,37 +598,25 @@ def project(
         reductions = rows(
             "SELECT detail FROM journal WHERE kind='member-reduced-to-empty' ORDER BY id DESC LIMIT ?", (LIMIT,)
         )
-        captured = clock()
-    tables = (batches, members, inputs, attempts, tasks)
-    truncated = any(len(t) > LIMIT for t in tables)
+    # Only active detail beyond the limit is missing: terminal history is shortened whole above.
     complete = {
-        k: len(v) <= LIMIT for k, v in zip(("batches", "members", "inputs", "attempts", "tasks"), tables, strict=True)
+        "batches": batches_complete,
+        "members": len(members) <= LIMIT,
+        "inputs": len(live_inputs) <= LIMIT,
+        "attempts": len(attempts) <= LIMIT,
+        "tasks": len(tasks) <= LIMIT,
     }
+    truncated = not all(complete.values())
     complete["events"] = len(events) <= 3000
-    for table in tables:
-        del table[LIMIT:]
-    # Keep active work and a bounded 90-day terminal window. Historic totals
-    # belong to the journal report, rather than an ever-growing live projection.
-    terminal = [
-        r
-        for r in batches
-        if r["state"] not in ("head", "open") and (r["landed_at"] or r["created_at"]) >= captured - 90 * 86400
-    ][:500]
-    batches = [
-        r
-        for r in batches
-        if (r["state"] in ("head", "open") or r in terminal) and r["repository"] in public_repositories
-    ]
-    inputs = [r for r in inputs if r["repository"] in public_repositories]
-    live_inputs = [r for r in inputs if r["state"] in ("waiting", "reserved")]
-    inputs = live_inputs + [r for r in inputs if r["state"] not in ("waiting", "reserved")][:5000]
+    del members[LIMIT:], attempts[LIMIT:], tasks[LIMIT:]
+    if len(live_inputs) > LIMIT:
+        inputs = live_inputs[:LIMIT] + inputs[len(live_inputs) :]
     known = facts.observe(members) if facts else {}
     reduced = set()
     for event in reductions:
         detail = json.loads(event["detail"])
         if isinstance(detail.get("commit"), str):
             reduced.add(detail["commit"])
-    input_map = {r["id"]: r for r in inputs}
     batch_map = {r["id"]: r for r in batches}
     task_progress = (
         task_observations.observe(
@@ -587,7 +627,8 @@ def project(
     )
     member_records = []
     for row in members:
-        item = input_map.get(row["input_id"], {})
+        item = {key: row[key] for key in ("title", "author", "approved_at", "landed_at", "landed_sha", "reason")}
+        item["state"] = row["input_state"]
         batch = batch_map.get(row["batch_id"], {})
         repo = batch.get("repository")
         if not repo or not REPO.fullmatch(repo):
