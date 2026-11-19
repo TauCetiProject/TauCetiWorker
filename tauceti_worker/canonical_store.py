@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import secrets
+import socket
 import stat
 import subprocess
 import sys
@@ -290,13 +291,14 @@ def writers(checkout):
 def open_for_writing():
     """Every `(dev, ino)` some process of this user holds open for writing (Linux `/proc` only).
 
-    One scan per relink pass. An fd whose flags cannot be read counts as writable; a writable
-    inode whose fd changed under the scan is kept as `(None, ino)` (see `_descriptor`).
+    One scan per relink pass. An fd whose flags cannot be read counts as writable. Where `fdinfo`
+    names the inode, a writable file is `(None, ino)`, busy on any device (see `_descriptor`).
     """
     if not os.path.isdir("/proc/self/fd"):
         return set()
     found = set()
     uid = os.getuid()
+    scan = _Scan()
     for entry in os.scandir("/proc"):
         if not entry.name.isdigit():
             continue
@@ -307,8 +309,30 @@ def open_for_writing():
         except OSError:
             continue
         for descriptor in descriptors:
-            found |= _descriptor(entry.path, descriptor.name)
+            found |= _descriptor(entry.path, descriptor.name, scan)
     return found
+
+
+class _Scan:
+    """What one `/proc` scan learns once from descriptors of our own."""
+
+    def __init__(self):
+        # Pipes, sockets and anonymous inodes live on kernel-internal mounts that no path reaches,
+        # so no canonical object or checkout output is ever on one. Learn their ids from our own.
+        self.internal = set()
+        self.inodes = False  # Whether fdinfo names the inode and mount (Linux 5.14 and later).
+        opened = []
+        with contextlib.suppress(OSError, AttributeError):
+            opened.extend(os.pipe())
+            pair = socket.socketpair()
+            opened.extend(p.detach() for p in pair)
+            opened.append(os.eventfd(0))
+        for fd in opened:
+            fields = _fdinfo("/proc/self", str(fd)) or {}
+            if fields.get("mnt_id", "").isdigit():
+                self.internal.add(fields["mnt_id"])
+                self.inodes = self.inodes or fields.get("ino", "").isdigit()
+            os.close(fd)
 
 
 def _fdinfo(process, fd):
@@ -326,56 +350,91 @@ def _fdinfo(process, fd):
     return fields
 
 
-def _descriptor(process, fd):
-    """The `(dev, ino)` keys that `process`'s `fd` holds open for writing (usually none or one).
+def _legacy(path, fdinfo):
+    """Stat, then flags: what kernels whose fdinfo names no inode allow (and main always did).
 
-    The process keeps opening, closing and `dup2`ing descriptors while it is scanned, so `fd` may
-    name another file between two looks at it. Its flags are read first, and only a writable fd
-    is stat'ed, to tell a file from a pipe or socket. The stat is trusted only if `fdinfo` reads the same flags, mount and `ino` on both
-    sides of it and that `ino` is the stat's: a reused fd never charges one file's flags to
-    another (a read-only checkout output must not look busy because a lock file took over its
-    fd). A writable inode is kept as `(None, ino)`, which `Guard.busy` matches on any device:
-    `fdinfo` names no device, and a writable inode whose fd keeps changing or closes may still be
-    open through another fd. Flags that cannot be read count as writable. Like any snapshot, a
-    writer moved to an already-scanned fd before this fd is first read is not seen; the guard's
-    fingerprint re-check still catches a writer that writes.
+    An fd closed or reused between the two looks counts the file stat'ed as writable.
     """
-    found = set()
-    path = os.path.join(process, "fd", fd)
-    for _ in range(3):
-        before = _fdinfo(process, fd)
-        if before is None:
-            return found  # Closed: nothing more to learn from this fd.
+    try:
+        info = os.stat(path)
+    except OSError:
+        return set()
+    if not stat.S_ISREG(info.st_mode):
+        return set()
+    try:
+        flags = int(_fdinfo(*fdinfo)["flags"], 8)
+    except (TypeError, KeyError, ValueError):
+        return {(info.st_dev, info.st_ino)}
+    return {(info.st_dev, info.st_ino)} if flags & (os.O_WRONLY | os.O_RDWR) else set()
+
+
+def _pin(path):
+    """`(mnt_id, kernel ino, stat)` of the file `path` names now, through a descriptor of our own.
+
+    Nothing else can reuse our `O_PATH` descriptor, so its `fdinfo` and `fstat` describe one file.
+    If we cannot open one (out of descriptors, say), a plain stat with an unknown identity
+    `(None, None, stat)`, which proves nothing either way; None if `path` names nothing.
+    """
+    try:
+        ours = os.open(path, os.O_PATH | os.O_CLOEXEC)
+    except OSError:
+        ours = None
+    if ours is not None:
         try:
-            flags = int(before["flags"], 8)
-        except (KeyError, ValueError):
-            flags = None
-        if flags is not None and not flags & (os.O_WRONLY | os.O_RDWR):
-            return found
-        ino = before.get("ino", "")
-        wildcard = (None, int(ino)) if ino.isdigit() else None
-        fresh = wildcard is not None and wildcard not in found  # Not an earlier look's evidence.
-        if wildcard is not None:
-            found.add(wildcard)
-        try:
-            info = os.stat(path)
+            fields = _fdinfo("/proc/self", str(ours)) or {}
+            return fields.get("mnt_id"), fields.get("ino"), os.fstat(ours)
         except OSError:
-            return found
-        if not ino.isdigit():
-            # Flags unreadable or no `ino` line (older kernels): count the file stat'ed.
-            if stat.S_ISREG(info.st_mode):
-                found.add((info.st_dev, info.st_ino))
-            return found
-        after = _fdinfo(process, fd)
-        stable = after is not None and all(after.get(k) == before.get(k) for k in ("flags", "mnt_id", "ino"))
-        if stable and int(ino) == info.st_ino:
-            # A regular file keeps its any-device key: the fd could still have named a file on
-            # another device with this inode number at the stat (A, B, A between the reads).
-            # Pipes and sockets are dropped, so their inode numbers never make outputs busy; only
-            # an A, pipe, A swap with a pipe of A's inode number between the reads defeats this.
-            if fresh and not stat.S_ISREG(info.st_mode):
-                found.discard(wildcard)
-            return found
+            pass
+        finally:
+            os.close(ours)
+    try:
+        return None, None, os.stat(path)
+    except OSError:
+        return None
+
+
+def _descriptor(process, fd, scan):
+    """The `(dev, ino)` keys that `process`'s `fd` holds open for writing.
+
+    The process keeps opening, closing and `dup2`ing descriptors while it is scanned, so two
+    lookups of `fd` may describe different files: stat-then-flags once charged a lock file's
+    writable flags to the read-only output it replaced, deferring a relink that nothing blocked.
+    The verdict rests on one `fdinfo` read, which describes one open file: its flags, mount and
+    kernel inode. A read-only fd, or one on a kernel-internal mount (pipe, socket, eventfd), is
+    never a file a relink could share. A writable fd is pinned before and after that read (see
+    `_pin`); each pin is kept unless its known `(mnt_id, ino)` differs from the read's, which
+    proves it another file. A match is not proof of the same file (multi-layer overlayfs
+    without `xino` repeats kernel inodes in one mount), so every other pin counts. `(None, ino)`
+    counts too, which `Guard.busy` matches on any device, for a writer that left this fd
+    unpinned. Pins give the `(st_dev, st_ino)` the guard compares, which NFS and overlayfs may
+    report differently from the kernel inode. Every unproven outcome errs toward busy. An
+    unreadable `fdinfo` counts the file pinned before it, and kernels whose `fdinfo` names no
+    inode (before 5.14) get main's stat-first judgement. Like any snapshot, a writer moved to an
+    already-scanned fd before this fd's `fdinfo` is read is not seen.
+    """
+    path = os.path.join(process, "fd", fd)
+    if not scan.inodes:
+        return _legacy(path, (process, fd))
+    before = _pin(path)
+    fields = _fdinfo(process, fd)
+    if fields is None:
+        return set()  # Closed: nothing open here to judge.
+    ino, mount = fields.get("ino", ""), fields.get("mnt_id", "")
+    try:
+        flags = int(fields["flags"], 8)
+    except (KeyError, ValueError):
+        flags = None
+    if flags is None or not (ino.isdigit() and mount.isdigit()):
+        pins = [before]  # Unreadable: judged as main did, by the file seen just before.
+    elif not flags & (os.O_WRONLY | os.O_RDWR) or mount in scan.internal:
+        return set()
+    else:
+        # Only a pin whose identity is known and differs is proven to be another file.
+        pins = [pin for pin in (before, _pin(path)) if pin is not None and pin[:2] in ((mount, ino), (None, None))]
+    found = {(None, int(ino))} if ino.isdigit() and flags is not None else set()
+    for pin in pins:
+        if pin is not None and stat.S_ISREG(pin[2].st_mode):
+            found.add((pin[2].st_dev, pin[2].st_ino))
     return found
 
 
