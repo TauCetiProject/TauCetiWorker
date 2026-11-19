@@ -78,14 +78,20 @@ METADATA_MISS = "\n".join(
 RAW_FALSE_POSITIVE = SimpleNamespace(returncode=1, stdout="error: model not found\n", stderr="")
 
 
-def make_cfg(root, *, account=True):
+def make_cfg(root, *, account=True, user_config=None, project_config=None):
     home = root / "home"
     (home / ".codex").mkdir(parents=True)
     if account:
         (home / ".codex" / "auth.json").write_text(
             json.dumps({"tokens": {"account_id": "acct-test", "access_token": "secret"}})
         )
-    return SimpleNamespace(home=home, quota_cache=root / "cache", state=root / "state")
+    if user_config is not None:
+        (home / ".codex" / "config.toml").write_text(user_config)
+    cfg = SimpleNamespace(home=home, quota_cache=root / "cache", state=root / "state", checkout=root / "checkout")
+    if project_config is not None:
+        (cfg.checkout / ".codex").mkdir(parents=True)
+        (cfg.checkout / ".codex" / "config.toml").write_text(project_config)
+    return cfg
 
 
 def make_profile(explicit=False):
@@ -99,9 +105,10 @@ def make_profile(explicit=False):
     )
 
 
-def run(sequence, *, repeat=False, explicit=False):
+def run(sequence, *, repeat=False, explicit=False, user_config=None, project_config=None):
     with tempfile.TemporaryDirectory() as td:
-        cfg = make_cfg(Path(td))
+        cfg = make_cfg(Path(td), user_config=user_config, project_config=project_config)
+        saved_codex_home = os.environ.pop("CODEX_HOME", None)
         profile = make_profile(explicit)
         calls = []
         outcomes = list(sequence)
@@ -126,6 +133,8 @@ def run(sequence, *, repeat=False, explicit=False):
                 selected_again = None
         finally:
             tc.agents.run_process = saved_run
+            if saved_codex_home is not None:
+                os.environ["CODEX_HOME"] = saved_codex_home
             if saved_key is None:
                 os.environ.pop("OPENAI_API_KEY", None)
             else:
@@ -143,6 +152,48 @@ check("probe ignores user config and rules", all(x in argv for x in ("--ignore-u
 check("probe prompt is trivial, not an authoring prompt", argv[-1], "Reply with exactly OK. Do not use tools.")
 check("probe closes stdin", kwargs.get("stdin"), subprocess.DEVNULL)
 check("probe strips API-key billing", "OPENAI_API_KEY" in kwargs.get("env", {}), False)
+
+# --ignore-user-config drops the user's credential-store setting with the rest of that file, so a
+# system default would choose the probe's store. The probe carries an explicit `file` setting, and
+# nothing else: a project layer can override any other user choice for authoring, but a -c override
+# would outrank that project layer.
+STORE = 'cli_auth_credentials_store="file"'
+check("no user store setting adds no override", STORE in argv, False)
+_, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "file"\n')
+argv = calls[0][0]
+check(
+    "an explicit user file store reaches the probe",
+    (STORE in argv, argv[argv.index(STORE) - 1] if STORE in argv else None),
+    (True, "-c"),
+)
+_, _, _, calls, _ = run(
+    [OK],
+    user_config='cli_auth_credentials_store = "keyring"\n',
+    project_config='cli_auth_credentials_store = "file"\n',
+)
+check(
+    "a user keyring setting under a project file store adds no override",
+    any("cli_auth_credentials_store" in a for a in calls[0][0]),
+    False,
+)
+_, _, _, calls, _ = run(
+    [OK],
+    user_config='cli_auth_credentials_store = "file"\n',
+    project_config='cli_auth_credentials_store = "keyring"\n',
+)
+check(
+    "a user file setting under a project keyring store adds no override",
+    any("cli_auth_credentials_store" in a for a in calls[0][0]),
+    False,
+)
+_, _, _, calls, _ = run(
+    [OK],
+    user_config='cli_auth_credentials_store = "file"\n',
+    project_config='cli_auth_credentials_store = "file"\n',
+)
+check("a user file setting under a project file store keeps the override", STORE in calls[0][0], True)
+_, _, _, calls, _ = run([OK], user_config='cli_auth_credentials_store = "file; x"\n')
+check("an unknown value adds no override", any("cli_auth_credentials_store" in a for a in calls[0][0]), False)
 
 selected, again, error, calls, remaining = run([UNAVAILABLE, UNAVAILABLE], repeat=True)
 check("two confirmed entitlement misses select Luna", (selected.model, error), (LUNA, None))

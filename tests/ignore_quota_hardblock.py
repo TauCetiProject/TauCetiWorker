@@ -150,9 +150,9 @@ case(
     True,
 )
 case(
-    "...without offering --auto-refresh, which codex does not have",
+    "...and offers --auto-refresh on every platform, since codex keeps a file on macOS too",
     "--auto-refresh" in resolve(None, codex_expired, agent="codex")[0],
-    False,
+    True,
 )
 case(
     "a timed block says when instead",
