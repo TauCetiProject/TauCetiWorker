@@ -92,13 +92,13 @@ class Watchdog(unittest.TestCase):
         self.check(13600)
         self.assertEqual(len(self.posts()), 1)
 
-    def test_passed_pool_range_is_not_admitted_work(self):
+    def test_passed_range_whose_cursor_update_keeps_failing_is_still_due(self):
         self.seen = (A, 3)
         (self.work / "pool").mkdir()
         (self.work / "pool" / "d.json").write_text(json.dumps({"from_sha": A, "status": "pass"}))
         self.check(10000)
-        self.check(10**6)
-        self.assertEqual(self.posts(), [])
+        self.check(13600)
+        self.assertEqual(len(self.posts()), 1)
 
     def test_newly_due_work_does_not_inherit_idle_time(self):
         self.seen = (A, 0)

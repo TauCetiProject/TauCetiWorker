@@ -27,8 +27,9 @@ REMIND_SECONDS = 86400
 def admitted(work: Path, cursor: str) -> bool:
     """Work already started at this cursor stays due below the admission threshold.
 
-    That is a held block there, or a pool range starting there that has not passed (its persisted
-    status is written at launch). A remainder nobody has started waits for the threshold.
+    That is a held block there, or any pool range starting there: its metadata is written at
+    launch and removed only when the cursor advances past it, so a passed range whose cursor
+    update keeps failing is still due. A remainder nobody has started waits for the threshold.
     """
     blocked = load(work / "blocked.json")
     if blocked.get("from_sha") == cursor:
@@ -37,7 +38,7 @@ def admitted(work: Path, cursor: str) -> bool:
         if meta.name.endswith(".input.json"):
             continue
         value = load(meta)
-        if value.get("from_sha") == cursor and value.get("status") != "pass":
+        if value.get("from_sha") == cursor:
             return True
     return False
 

@@ -310,7 +310,7 @@ With alerts configured, one cursor watchdog guarantees that the cursor is advanc
 operator has a DM. Every audit round (including maintenance turns and failed audits), every
 pool pass and the standalone command below record the cursor in `security-audit/stall.json`.
 Once audit work is due at one cursor (at least the configured threshold pending, or work
-already started there: a held block or a pool range that has not passed) and that cursor has
+already started there: a held block or a pool range starting there) and that cursor has
 not moved for an hour, an **Operational stall** DM is sent, then again daily while it stays held. An unobservable cursor (GitHub or
 git failures) counts as held, and the DM names the error. While a pool holds the state, it
 alone runs the watchdog. Checks and deliveries are serialized by local locks, so concurrent
