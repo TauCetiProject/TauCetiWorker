@@ -868,7 +868,8 @@ def fit(observation, budget=None):
     overflow is explicitly partial, never an admission change. Each record is encoded once: in
     compact JSON a list element costs its own encoding plus one separator, so the sum over removed
     records bounds the saving from above (by one byte per emptied list) and a removal never
-    overshoots. The whole observation is encoded again only to confirm each step.
+    overshoots. Coverage flags change before the excess is measured, so their bytes count too.
+    The whole observation is encoded again only to confirm each step.
     """
     budget = PROJECTION_BUDGET if budget is None else budget
     size = len(encode(observation))
@@ -876,7 +877,11 @@ def fit(observation, budget=None):
         return
     cost = {name: [len(encode(r)) + 1 for r in observation[name]] for name in ("batches", "inputs", *DETAIL)}
     while size > budget:
-        excess = size - budget
+        # The step below removes at least one batch or 100 records, as the one-at-a-time loop did.
+        before = len(encode(observation["truncated"])) + len(encode(observation["coverage"]))
+        observation["truncated"] = True
+        observation["coverage"] = "partial"
+        excess = size - budget - before + len(encode(True)) + len(encode("partial"))
         terminal = sorted(
             (i for i, b in enumerate(observation["batches"]) if b["state"] not in ("head", "open")),
             key=lambda i: int(observation["batches"][i]["id"]),
@@ -901,7 +906,7 @@ def fit(observation, budget=None):
             # Trim 100 records at a time from whichever collection currently encodes largest.
             total = {k: (sum(cost[k]) + 1 if cost[k] else 2) for k in ("members", "inputs", *DETAIL[1:])}
             freed = 0
-            while freed < excess:
+            while True:
                 name = max((k for k in total if cost[k]), key=lambda k: total[k], default=None)
                 if name is None:
                     raise ValueError("metadata exceeds public projection budget")
@@ -910,9 +915,11 @@ def fit(observation, budget=None):
                 observation[name], cost[name] = observation[name][:keep], cost[name][:keep]
                 total[name] -= removed
                 freed += removed
-                observation["collection_complete"][name] = False
-        observation["truncated"] = True
-        observation["coverage"] = "partial"
+                if observation["collection_complete"][name]:
+                    observation["collection_complete"][name] = False
+                    freed -= 1  # `false` is one byte longer than `true`.
+                if freed >= excess:
+                    break
         size = len(encode(observation))
 
 

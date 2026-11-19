@@ -799,6 +799,20 @@ class ProjectionBudget(unittest.TestCase):
         self.assertEqual(self.assert_same_as_reference(value, 10**9), 1)
         self.assertEqual(value, expected)
 
+    def test_flag_bytes_count_toward_an_exact_fit(self):
+        # Clearing the flags saves bytes of their own; a budget met only with them still fits.
+        for terminal, active in ((0, 1), (1, 1), (6, 1)):
+            value = self.observation(terminal=terminal, active=active, members_per_batch=3)
+            value["members"] = value["members"][:1] or [{"id": "1", "batch_id": "1"}]
+            for slack in range(-3, 4):
+                with self.subTest(terminal=terminal, slack=slack):
+                    budget = len(monitoring.encode(value)) - len(monitoring.encode(value["members"][-1])) + slack
+                    try:
+                        self.assert_same_as_reference(json.loads(json.dumps(value)), budget)
+                    except ValueError:
+                        with self.assertRaises(ValueError):
+                            trim_one_batch_at_a_time(json.loads(json.dumps(value)), budget)
+
     def test_metadata_alone_over_budget_is_refused(self):
         value = self.observation(terminal=2, active=1, members_per_batch=3)
         with self.assertRaises(ValueError):
