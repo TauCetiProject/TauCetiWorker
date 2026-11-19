@@ -328,10 +328,12 @@ def _date(ts: str) -> str | None:
     return (when.astimezone(datetime.UTC) if when.tzinfo else when).date().isoformat()
 
 
-def coverage(status: str, area: str) -> tuple[dict[str, str], str] | None:
+def coverage(status: str, area: str, readme: str) -> tuple[dict[str, str], str] | None:
     """The layer states a STATUS.md's coverage header gives for roadmap `area` itself, and the date
     of the status header beside it. None unless there is exactly one such header, it and the status
-    header parse, and every layer is an object with a string id and a known state."""
+    header parse, every layer is an object with a string id and a known state, and its `readme_sha`
+    is the SHA-256 of `readme`, the area's README as it now is: an assessment of another version of
+    the README says nothing about the current requirements under the same layer id."""
     headers = []
     for raw in _COVERAGE_RE.findall(status):
         with contextlib.suppress(ValueError):
@@ -346,6 +348,8 @@ def coverage(status: str, area: str) -> tuple[dict[str, str], str] | None:
                 stamps.append(_date(data.get("ts")))
     if len(headers) != 1 or len(stamps) != 1 or stamps[0] is None or not isinstance(headers[0].get("layers"), list):
         return None
+    if headers[0].get("readme_sha") != hashlib.sha256(readme.encode("utf-8")).hexdigest():
+        return None
     states: dict[str, str] = {}
     for layer in headers[0]["layers"]:
         if not (isinstance(layer, dict) and isinstance(layer.get("id"), str) and layer.get("state") in _LAYER_STATES):
@@ -357,12 +361,16 @@ def coverage(status: str, area: str) -> tuple[dict[str, str], str] | None:
 def audit(targets: Targets, roadmap: Path | None) -> list[Change]:
     """The inferred ticks a roadmap's coverage header refutes: when every item of an area that begins
     `Layer N,` is done, and the area's STATUS.md (under `roadmap`) says layer `Layer N` is not done,
-    as of a status date later than the day an inferred tick in that layer was made, that tick is
-    opened again. Ticks earned by a merged pull request, and inferred ones without a date, stay."""
+    as of a status date later than the day an inferred tick in that layer was made and for the README
+    the area has now (`coverage`), that tick is opened again. Ticks earned by a merged pull request, and inferred ones without a date, stay."""
     changes: list[Change] = []
     for area, items in targets.areas.items() if roadmap is not None else ():
         try:
-            found = coverage((roadmap / area / "STATUS.md").read_text(), area)
+            found = coverage(
+                (roadmap / area / "STATUS.md").read_text(),
+                area,
+                (roadmap / area / "README.md").read_text(encoding="utf-8"),
+            )
         except (OSError, UnicodeDecodeError):
             continue
         if found is None:

@@ -3,6 +3,7 @@
 and its checks, the reopening by a dependent's round and by a coverage header, the publication of a
 tick only in the look that made it, and that all of it is off by default. No forge or model access."""
 
+import hashlib
 import importlib
 import json
 import os
@@ -56,9 +57,13 @@ def git(cwd, *args):
     return done.stdout.strip()
 
 
-def status(layers, *, ts="2026-02-01T00:00:00Z", roadmap="Probability"):
+README = "## Layer 1\nThe tail sigma-algebra and Borel–Cantelli.\n"
+
+
+def status(layers, *, ts="2026-02-01T00:00:00Z", roadmap="Probability", readme=README):
     head = {"roadmap": roadmap, "to_sha": "a" * 40, "ts": ts}
-    cover = {"layers": layers, "readme_sha": "b" * 64, "roadmap": roadmap, "to_sha": "a" * 40}
+    sha = hashlib.sha256(readme.encode("utf-8")).hexdigest()
+    cover = {"layers": layers, "readme_sha": sha, "roadmap": roadmap, "to_sha": "a" * 40}
     return f"<!--tauceti-status:v1 {json.dumps(head)}-->\n<!--tauceti-coverage:v1 {json.dumps(cover)}-->\n# Status\n"
 
 
@@ -203,9 +208,10 @@ class Confirmed(Tmp):
 
 
 class Audit(Tmp):
-    def roadmap(self, text):
+    def roadmap(self, text, readme=README):
         (self.tmp / "roadmaps" / "Probability").mkdir(parents=True, exist_ok=True)
         (self.tmp / "roadmaps" / "Probability" / "STATUS.md").write_text(text)
+        (self.tmp / "roadmaps" / "Probability" / "README.md").write_text(readme)
         return self.tmp / "roadmaps"
 
     def test_a_layer_the_header_calls_unfinished_reopens_its_inferred_ticks_only(self):
@@ -238,11 +244,14 @@ class Audit(Tmp):
             "an unparseable header": '<!--tauceti-status:v1 {"ts":"2026-02-01T00:00:00Z"}-->\n'
             "<!--tauceti-coverage:v1 {not json}-->\n",
             "no header": "# Status\n",
+            "a header for another README": status(partial, readme="## Layer 1\nAn older statement.\n"),
         }
         for why, text in cases.items():
             self.assertEqual(reconcile.audit(listed, self.roadmap(text)), [], why)
         self.assertEqual(len(reconcile.audit(listed, self.roadmap(status(partial, ts="2026-01-01T20:00:00-05:00")))), 1)
         self.assertEqual(reconcile.audit(listed, None), [])
+        (self.roadmap(status(partial)) / "Probability" / "README.md").unlink()
+        self.assertEqual(reconcile.audit(listed, self.tmp / "roadmaps"), [])
         self.assertEqual(reconcile.audit(listed, self.tmp / "absent"), [])
         roadmap = self.roadmap(status(partial))
         open_one = LIST.replace("- [x] `borel`", "- [ ] `borel`")
@@ -541,13 +550,19 @@ class Look(Tmp):
         self.assertIn("reopened:", self.asked[0][1]["candidates"][0]["line"])
 
     def test_the_layer_audit_runs_in_the_same_look(self):
-        (self.roadmaps / "Probability" / "STATUS.md").write_text(status([{"id": "Layer 1", "state": "partial"}]))
+        readme = (self.roadmaps / "Probability" / "README.md").read_text()
+        (self.roadmaps / "Probability" / "STATUS.md").write_text(
+            status([{"id": "Layer 1", "state": "partial"}], readme=readme)
+        )
         self.verdicts = {"zero-one": {"landed": False}, "strong-law": {"landed": False}}
         self.assertEqual(self.look(), (0, ""))
         self.assertEqual(t.parse_targets(self.path.read_text()).find("tail-sigma").status, "open")
 
     def test_off_the_look_is_branch_ones(self):
-        (self.roadmaps / "Probability" / "STATUS.md").write_text(status([{"id": "Layer 1", "state": "partial"}]))
+        readme = (self.roadmaps / "Probability" / "README.md").read_text()
+        (self.roadmaps / "Probability" / "STATUS.md").write_text(
+            status([{"id": "Layer 1", "state": "partial"}], readme=readme)
+        )
         with (
             patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS_INFER": "0"}),
             patch.object(reconcile, "_roadmap", side_effect=AssertionError("no roadmap read")),

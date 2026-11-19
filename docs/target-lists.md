@@ -283,7 +283,8 @@ area's own `tauceti-coverage:v1` header in the roadmap's `STATUS.md` names a
 layer with exactly that id in a state other than `done`, each inferred tick in
 the layer that is dated before the status header's date is opened again, with
 `reopened: <its evidence> by coverage <layer> <state> on <status date>`. A
-missing or unparseable header, a second header for the area, no layer with that
+missing or unparseable header, a header whose `readme_sha` is not the SHA-256
+of the area's README as attached now, a second header for the area, no layer with that
 exact id, a status no later than the tick (both dates in UTC), or an inferred tick with no date
 changes nothing. Earned ticks are never opened this way.
 
