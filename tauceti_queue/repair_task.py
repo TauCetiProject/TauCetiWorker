@@ -821,13 +821,20 @@ def pin_app_credentials() -> None:
     (private / "gh").mkdir()
     original = os.environ.get("GIT_CONFIG_GLOBAL") or str(Path.home() / ".gitconfig")
     include = f"[include]\n\tpath = {original}\n" if Path(original).is_file() else ""
-    (private / "gitconfig").write_text(include)
     gh = shutil.which("gh") or "gh"
     _app_git_config = (
         ("credential.https://github.com.helper", ""),
         ("credential.https://github.com.helper", f"!{shlex.quote(gh)} auth git-credential"),
         ("http.extraHeader", ""),
         ("http.https://github.com/.extraHeader", ""),
+    )
+    # The same resets in the global config too: agents' isolation replaces the command-scope config,
+    # and they must not get the host's own helpers and headers back through the include.
+    (private / "gitconfig").write_text(
+        include
+        + '[credential "https://github.com"]\n\thelper =\n'
+        + f"\thelper = !{shlex.quote(gh)} auth git-credential\n"
+        + '[http]\n\textraHeader =\n[http "https://github.com/"]\n\textraHeader =\n'
     )
     try:
         count = max(int(os.environ.get("GIT_CONFIG_COUNT", "0")), 0)
@@ -843,11 +850,16 @@ def pin_app_credentials() -> None:
     os.environ.pop("GITHUB_TOKEN", None)
 
 
-def app_git_environment() -> dict[str, str]:
+def app_git_environment(url: str | None = None) -> dict[str, str]:
     """The ``GIT_CONFIG_*`` variables of a git process that pushes as the App and inherits no other
-    command-scope config: only the pins of ``pin_app_credentials`` (none outside App mode)."""
-    env = {"GIT_CONFIG_COUNT": str(len(_app_git_config))}
-    for index, (key, value) in enumerate(_app_git_config):
+    command-scope config: only the pins of ``pin_app_credentials`` (none outside App mode). With
+    ``url``, also reset the extra headers for exactly that URL, which a repository's config for that
+    URL would otherwise win over (git prefers the longest matching URL)."""
+    pins = _app_git_config
+    if pins and url:
+        pins = (*pins, (f"http.{url}.extraHeader", ""))
+    env = {"GIT_CONFIG_COUNT": str(len(pins))}
+    for index, (key, value) in enumerate(pins):
         env[f"GIT_CONFIG_KEY_{index}"] = key
         env[f"GIT_CONFIG_VALUE_{index}"] = value
     return env
@@ -2093,7 +2105,7 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
         if k == "GIT_CONFIG_GLOBAL" or not k.startswith(("TAUCETI_PUSH_", "TAUCETI_CLAIM_", "GIT_CONFIG_"))
     }
     env.update(
-        app_git_environment(),
+        app_git_environment(remote),
         TAUCETI_PUSH_REF=task.submission_ref,
         TAUCETI_PUSH_EXPECT=expect or "",
         TAUCETI_PUSH_REMOTE=remote,
@@ -2102,7 +2114,7 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
     )
     record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
     if record["rc"] == 78 and not expect:
-        observed = git(worktree, "ls-remote", remote, task.submission_ref, check=False).split()
+        observed = git(worktree, "ls-remote", remote, task.submission_ref, check=False, env=env).split()
         if observed:
             env["TAUCETI_PUSH_EXPECT"] = observed[0]
             record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
