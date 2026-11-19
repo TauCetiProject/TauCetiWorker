@@ -40,6 +40,9 @@ BUILD_TAIL_BYTES = 64_000
 # The public observation's conditions are bounded (100); stuck heads take at most this many.
 STUCK_LISTED = 30
 MAX_CONDITIONS = 100
+# The live projection's encoded size target, inside the receiver's 15 MB snapshot budget.
+PROJECTION_BUDGET = 12_000_000
+DETAIL = ("members", "attempts", "tasks", "events")
 
 
 def iso(value):
@@ -854,28 +857,63 @@ def project(
         "workers": workers(worker_roots, claims=claims, task_states=task_progress, captured=captured),
     }
 
-    # Full live projection stays comfortably inside the receiver's 16MB budget.
-    # Extraordinary active-only overflow is explicitly partial, never an admission change.
-    while len(encode(observation)) > 12_000_000:
-        terminal = [b for b in observation["batches"] if b["state"] not in ("head", "open")]
+    fit(observation)
+    return observation
+
+
+def fit(observation, budget=None):
+    """Shrink an oversized projection to its byte budget: oldest terminal batches go first.
+
+    Full live projection stays comfortably inside the receiver's budget. Extraordinary active-only
+    overflow is explicitly partial, never an admission change. Each record is encoded once: in
+    compact JSON a list element costs its own encoding plus one separator, so the sum over removed
+    records bounds the saving from above (by one byte per emptied list) and a removal never
+    overshoots. The whole observation is encoded again only to confirm each step.
+    """
+    budget = PROJECTION_BUDGET if budget is None else budget
+    size = len(encode(observation))
+    if size <= budget:
+        return
+    cost = {name: [len(encode(r)) + 1 for r in observation[name]] for name in ("batches", "inputs", *DETAIL)}
+    while size > budget:
+        excess = size - budget
+        terminal = sorted(
+            (i for i, b in enumerate(observation["batches"]) if b["state"] not in ("head", "open")),
+            key=lambda i: int(observation["batches"][i]["id"]),
+        )
         if terminal:
-            drop = min(terminal, key=lambda b: int(b["id"]))["id"]
-            observation["batches"] = [b for b in observation["batches"] if b["id"] != drop]
-            for name in ("members", "attempts", "tasks", "events"):
-                observation[name] = [r for r in observation[name] if r["batch_id"] != drop]
+            weight = {observation["batches"][i]["id"]: cost["batches"][i] for i in terminal}
+            for name in DETAIL:
+                for record, length in zip(observation[name], cost[name], strict=True):
+                    if record["batch_id"] in weight:
+                        weight[record["batch_id"]] += length
+            drop, freed = set(), 0
+            for i in terminal:
+                drop.add(observation["batches"][i]["id"])
+                freed += weight[observation["batches"][i]["id"]]
+                if freed >= excess:
+                    break
+            for name in ("batches", *DETAIL):
+                key = "id" if name == "batches" else "batch_id"
+                kept = [(r, c) for r, c in zip(observation[name], cost[name], strict=True) if r[key] not in drop]
+                observation[name], cost[name] = [r for r, _ in kept], [c for _, c in kept]
         else:
-            name = max(
-                (k for k in ("members", "inputs", "attempts", "tasks", "events") if observation[k]),
-                key=lambda k: len(encode(observation[k])),
-                default=None,
-            )
-            if name is None:
-                raise ValueError("metadata exceeds public projection budget")
-            observation[name] = observation[name][: max(0, len(observation[name]) - 100)]
-            observation["collection_complete"][name] = False
+            # Trim 100 records at a time from whichever collection currently encodes largest.
+            total = {k: (sum(cost[k]) + 1 if cost[k] else 2) for k in ("members", "inputs", *DETAIL[1:])}
+            freed = 0
+            while freed < excess:
+                name = max((k for k in total if cost[k]), key=lambda k: total[k], default=None)
+                if name is None:
+                    raise ValueError("metadata exceeds public projection budget")
+                keep = max(0, len(cost[name]) - 100)
+                removed = sum(cost[name][keep:]) - (1 if keep == 0 else 0)
+                observation[name], cost[name] = observation[name][:keep], cost[name][:keep]
+                total[name] -= removed
+                freed += removed
+                observation["collection_complete"][name] = False
         observation["truncated"] = True
         observation["coverage"] = "partial"
-    return observation
+        size = len(encode(observation))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
