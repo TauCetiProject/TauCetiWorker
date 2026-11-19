@@ -59,15 +59,12 @@ selected native account. Unsupported commands report their missing contract.
 
 ## Managed workers
 
-A worker run by `tauceti workers` selects its sources in `workers.toml`, not
-through `env`: `forges` lists the sources it discovers and `new_pr_forge` names
-the destination for new PRs. The manager passes them to `tauceti work` as the
-switches above, so they are checked the same way, and `tauceti workers apply
---check` reports a bad combination before any worker starts. Unset, a worker
-uses GitHub alone with new PRs on GitHub, exactly as before. Setting
-`TAUCETI_WORKER_FORGES` or `TAUCETI_NEW_PR_FORGE` in `env` has no effect.
-The connection settings go in `env`; the worker derives the native account ID
-from the token on each round.
+A worker run by `tauceti workers` selects its sources with the `github`,
+`forgejo` and `new_pr_forge` keys of its definition (see
+[source selection](workers.md#source-selection)); setting
+`TAUCETI_WORKER_FORGES` or `TAUCETI_NEW_PR_FORGE` in `env` has no effect. The
+connection settings go in `env`; the worker derives the native account ID from
+the token on each round.
 
 A Forgejo-only worker. It still needs a GitHub login for the shared roadmap,
 claims and archive repositories; `new_pr_forge` is what lets it author:
@@ -75,7 +72,8 @@ claims and archive repositories; `new_pr_forge` is what lets it author:
 ```toml
 [[workers]]
 id = "forgejo-author"
-forges = ["forgejo"]
+github = false
+forgejo = true
 new_pr_forge = "forgejo"
 only = ["rebase", "fix", "review", "roadmap"]
 
@@ -92,18 +90,16 @@ Forgejo:
 ```toml
 [[workers]]
 id = "both-forges"
-forges = ["github", "forgejo"]
+forgejo = true
 
 [workers.env]
 TAUCETI_FORGEJO_TOKEN_FILE = "/home/worker/.config/tauceti-forgejo/worker-token"
 TAUCETI_FORGEJO_FORK = "worker/TauCeti"
 ```
 
-Native rounds run on the host, so `sandbox = "bubble"` is refused with
-`forges = ["forgejo"]` or `new_pr_forge = "forgejo"`. With both forges a Bubble
-worker discovers both, counts Forgejo PRs toward its open-PR limit and
-duplicate checks, and works on GitHub PRs only. `tauceti _fleet-protocol`
-reports `"forges": 1` when the manager accepts these keys.
+Native rounds run on the host, so a Forgejo-only definition with
+`sandbox = "bubble"` is refused. With both sources a Bubble worker discovers
+both and works on GitHub PRs only.
 
 ## Scheduling and recovery
 

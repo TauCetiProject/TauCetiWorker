@@ -1023,7 +1023,6 @@ def main(argv: list[str] | None = None) -> int:
                     "events": True,
                     "activity": 1,
                     "roadmap_focus": 1,
-                    "forges": 1,
                     "self_tested": 1,
                     "source_selection": 1,
                     "graceful_restart": 1,
