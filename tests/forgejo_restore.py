@@ -195,6 +195,11 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(plan["refs/heads/roadmap/b"]["status"], "exists-different")
         self.assertEqual(plan["refs/heads/roadmap/c"]["status"], "present")
         self.assertIn("exists-different", out)
+        self.assertEqual(self.run_restore(command="verify")[0], 0)
+        git(self.target, "update-ref", "-d", "refs/heads/roadmap/b")
+        code, out = self.run_restore(command="verify")
+        self.assertEqual(code, 1)
+        self.assertIn("left-as-found ref changed: refs/heads/roadmap/b", out)
 
     def test_a_ref_created_during_the_push_is_not_overwritten(self):
         other = self.commit()
@@ -312,6 +317,9 @@ class RestoreTests(unittest.TestCase):
         git(fork, "update-ref", "-d", "refs/heads/main")
         git(fork, "update-ref", "-d", "refs/heads/feature")
         self.tokens["main"].unlink()  # not needed for a fork
+        code, out = self.run_restore("--skip-main", fork="alice")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("refs/heads/main", self.results())
         code, out = self.run_restore("--execute", fork="alice")
         self.assertEqual(code, 0, out)
         self.assertEqual(refs(fork), {"refs/heads/main": self.main, "refs/heads/feature": self.alice_sha})
@@ -357,6 +365,20 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(set(self.results()), set(self.expected()))
         self.assertEqual(self.run_restore(command="verify")[0], 1)
         self.assertEqual(self.run_restore("--execute")[0], 0)
+
+    def test_main_accepted_by_the_server_despite_a_local_timeout(self):
+        real = restore.git
+
+        def slow(repo, *args, **kw):
+            proc = real(repo, *args, **kw)
+            if args and args[0] == "push" and args[-1].endswith(":refs/heads/main"):
+                raise subprocess.TimeoutExpired(["git", "push"], 1)  # after the server took it
+            return proc
+
+        with mock.patch.object(restore, "git", slow):
+            code, out = self.run_restore("--execute")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(refs(self.target), self.expected())
 
     def test_a_push_timeout_is_retried(self):
         real = restore.git

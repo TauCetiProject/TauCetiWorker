@@ -313,8 +313,8 @@ def plan_refs(args, target: Target, stage: Path, fleet: list[Path]) -> tuple[lis
                 continue
             if ref.startswith(("refs/pull/",)) or ref.startswith(excluded) or ref in items:
                 continue
-            if not target.owner and ref == "refs/heads/main":
-                continue  # main comes from GitHub, pushed by the main sync account
+            if ref == "refs/heads/main" and (not target.owner or args.skip_main):
+                continue  # base main comes from GitHub, pushed by the main sync account
             items[ref] = Item(ref, sha, "mirror")
     else:
         warnings.append(f"no mirror at {mirror}; using only the fleet's repositories")
@@ -504,7 +504,7 @@ def restore_from(args, target: Target, remote: dict[str, str], stage: Path, flee
         env = git_env(target.base_url, args.main_user, Path(args.main_token_file).expanduser())
         push_all(args, stage, target.url, env, main, items, results)
         write_results(results, items)
-        if main[0].status != "pushed":
+        if main[0].status not in ("pushed", "present"):
             say(f"main was not pushed: {main[0].detail}")
             return 1
         say(f"main pushed as {args.main_user}: {main[0].sha}")
@@ -529,9 +529,12 @@ def verify(args, target: Target, items: list[Item]) -> int:
     for item in unrecoverable[:30]:
         say(f"  not restored, object missing: {item.ref} {item.sha}")
     kept = [item for item in items if item.status == "exists-different"]
+    moved = [item for item in kept if remote.get(item.ref) != item.detail.get("remote")]
     if kept:
-        say(f"left as found (the target had another SHA): {len(kept)} refs")
-    problems = len(missing) + len(unrecoverable)
+        say(f"left as found (the target had another SHA): {len(kept)} refs, {len(moved)} of them changed since")
+    for item in moved[:30]:
+        say(f"  left-as-found ref changed: {item.ref} was {item.detail.get('remote')}, now {remote.get(item.ref)}")
+    problems = len(missing) + len(unrecoverable) + len(moved)
     if not target.owner:
         by_ref = {item.ref: item for item in items}
         try:
