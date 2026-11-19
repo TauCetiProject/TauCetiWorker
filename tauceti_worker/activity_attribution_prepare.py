@@ -200,7 +200,7 @@ def fact(db, key, now):
         )
         if kind == "review" and rid and value > 0:
             row["attempted"][rid] = [round_start, round_finish]
-        if outcome not in {"completed", "unconfirmed"}:
+        if outcome not in {"completed", "unconfirmed", "closed-by-agent"}:
             continue  # Failed attempts are charged as overhead, never output.
         row[kind] = str(Decimal(row[kind]) + value)
         if kind == "author":

@@ -1,9 +1,9 @@
 """Native queue source reads for the live two-forge phase.
 
-Review authority comes from explicitly enrolled native user IDs and the native
-PR resource. Native commit statuses never grant candidate CI authority. Existing
-review decisions run before admission; trusted candidate CI remains mandatory
-before landing, including per-member size/scope/dependency and full lint gates.
+Review decisions follow the shared scoreboard policy, as on GitHub. Native
+commit statuses never grant candidate CI authority. Existing review decisions
+run before admission; trusted candidate CI remains mandatory before landing,
+including per-member size/scope/dependency and full lint checks.
 """
 
 from __future__ import annotations
@@ -26,11 +26,7 @@ class MixedNativePolicy(NativeAdmissionPolicy):
             snapshot, statuses={**snapshot.statuses, "build": "success", "scope": "success", "bump-guard": "success"}
         )
         static, _, _, _, _ = AdmissionPolicy.evaluate(self, preliminary)
-        if (
-            result["review_safe"]
-            and not result.get("recovery_authority_hold")
-            and snapshot.pull.head_sha not in result.get("recovery_heads", ())
-        ):
+        if result["review_safe"] and snapshot.pull.head_sha not in result.get("recovery_heads", ()):
             result["merge"] = static["merge"]
             result["reason"] = (
                 "review and static policy ready; exact mixed candidate CI required"
@@ -50,8 +46,6 @@ class MixedNativeSource(ForgejoSourceAdapter):
         root = config.admission_lean_root
         admission = MixedNativePolicy(
             profile.publishers(),
-            clock=clock,
-            base_branch=config.canonical_branch or "main",
             rubrics=config.admission_rubrics.split(","),
             prefix=root.replace(".", "/") + "/",
             allow_files=policy.default_allow_files(root) + [s for s in config.admission_extra_files.split(",") if s],

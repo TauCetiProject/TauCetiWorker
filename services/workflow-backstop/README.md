@@ -17,8 +17,15 @@ tauceti-workflow-backstop --repo TauCetiProject/TauCeti --state /path/to/state.j
 
 The default command is a read-only preview. It writes no state or GitHub data.
 `--execute` permits dispatch and stores accepted requests in the state file.
-The helper uses the existing `gh` authentication; it neither changes accounts nor
-creates credentials. Each read/dispatch command has a 45-second bound.
+By default the helper uses the existing `gh` authentication; it neither changes
+accounts nor creates credentials. `--github-app-dir DIR` instead runs every `gh`
+command with an installation token minted from the App credentials in `DIR`
+(`github-app.json` and `github-private-key.pem`, the layout of
+`~/.config/tauceti-queue`). The App needs `actions: write` on the repository. Each
+token is limited to `actions: write` and `metadata: read`, and to the repository ID
+once state pins it, so the backstop spends the App's rate limit rather than a
+person's. If a token cannot be minted the cycle defers; it never falls back to the
+ambient account. Each read/dispatch command has a 45-second bound.
 
 A recent attempt or any queued, waiting or running attempt suppresses another
 dispatch. An overdue workflow gets explicit active-status probes, so an older
@@ -37,7 +44,8 @@ replaced repository cannot silently inherit dispatch authority.
 The example systemd user unit and timer are **not installed or enabled by this
 package**. Review the policy, install a reviewed revision into an isolated venv,
 and point `~/.local/share/tauceti/workflow-backstop/current` to that venv. Confirm
-that `gh` authenticates as the intended operator in the user-service environment.
+that `gh` authenticates as the intended operator in the user-service environment,
+or add `--github-app-dir` to `ExecStart`.
 Then copy the units into `~/.config/systemd/user/`, run `systemctl --user
 daemon-reload`, and enable the timer only when deployment is authorized.
 

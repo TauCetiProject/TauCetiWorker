@@ -10,9 +10,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
-import re
-import stat
 import threading
 import time
 from collections import OrderedDict
@@ -22,6 +19,8 @@ from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
 from . import github_transport as transport
+from .constants import SOURCE_FACTS_TTL
+from .read_cache import prune_read_cache as prune_state_cache  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -37,81 +36,6 @@ class ReadInvalidated(RuntimeError):
 
 class SourceBindingChanged(RuntimeError):
     """This client no longer holds the origin/credential it was constructed for."""
-
-
-def prune_state_cache(root, *, max_files=384, max_bytes=16 * 1024 * 1024):
-    """Bound disposable source sidecars across credential scopes under one root.
-
-    Only owned regular files with review-state cache names in digest directories
-    are eligible. Outboxes, unrelated files and symlinks are never followed or
-    removed. Concurrent readers tolerate disappearing cache files. This is
-    best-effort cache maintenance; it cannot affect a fresh observation's result.
-    """
-    if type(max_files) is not int or type(max_bytes) is not int or min(max_files, max_bytes) < 1:
-        raise ValueError("state cache bounds must be positive integers")
-    directories, files = [], []
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    try:
-        root_fd = os.open(root, flags)
-    except OSError:
-        return
-    try:
-        for directory in os.listdir(root_fd):
-            if not re.fullmatch(r"[0-9a-f]{64}", directory):
-                continue
-            try:
-                fd = os.open(directory, flags, dir_fd=root_fd)
-            except OSError:
-                continue
-            try:
-                if os.fstat(fd).st_uid != os.getuid():
-                    continue
-                directories.append(directory)
-                for name in os.listdir(fd):
-                    if not re.fullmatch(r"[1-9][0-9]*(?:\.(?:key|contest))?(?:\.json|\.[0-9a-f]{32}\.tmp)", name):
-                        continue
-                    try:
-                        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                    except FileNotFoundError:
-                        continue
-                    if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
-                        files.append((info.st_mtime_ns, directory, name, info.st_size, info.st_dev, info.st_ino))
-            finally:
-                os.close(fd)
-        files.sort()
-        count, size = len(files), sum(row[3] for row in files)
-        for _, directory, name, length, device, inode in files:
-            if count <= max_files and size <= max_bytes:
-                break
-            try:
-                fd = os.open(directory, flags, dir_fd=root_fd)
-            except OSError:
-                continue
-            try:
-                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                if (info.st_dev, info.st_ino) != (device, inode) or not stat.S_ISREG(info.st_mode):
-                    continue  # Another writer replaced it; leave the newer value.
-                os.unlink(name, dir_fd=fd)
-                count -= 1
-                size -= length
-            except FileNotFoundError:
-                count -= 1
-                size -= length
-            finally:
-                os.close(fd)
-        for directory in directories:
-            try:
-                # Another process may have just made an empty namespace and be
-                # about to open it for an atomic write. Leave recent ones alone.
-                if time.time() - os.stat(directory, dir_fd=root_fd, follow_symlinks=False).st_mtime < 30:
-                    continue
-                os.rmdir(directory, dir_fd=root_fd)
-            except OSError:
-                pass
-    except OSError:
-        return
-    finally:
-        os.close(root_fd)
 
 
 @dataclass
@@ -251,6 +175,21 @@ class BoundedReadCache:
                 if not slot.users:
                     del self._active[key]
 
+    def peek(self, key, *, ttl, scope=None):
+        """A current entry, or CacheOnlyMiss. Never fetches, coalesces or publishes."""
+        self._validate_scope(scope)
+        key = (
+            scope,
+            json.dumps(key, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(),
+        )
+        now = self.clock()
+        with self._lock:
+            item = self._entries.get(key)
+            if item is None or ttl <= 0 or not 0 <= now - item[1] < ttl or now >= item[2]:
+                raise transport.CacheOnlyMiss("no current local observation")
+            self._entries.move_to_end(key)
+            return json.loads(item[0])
+
     def _publish(self, key, encoded, ttl, started):
         # Caller owns _lock. A slow request cannot extend the observation's TTL
         # or overwrite the result of a later-started fetch.
@@ -347,6 +286,41 @@ class _ProjectionAPI:
         return rows
 
 
+LISTING_PAGE_ATTEMPTS = 3
+
+
+def _page_retrying(api, *, attempts=LISTING_PAGE_ATTEMPTS, sleep=time.sleep):
+    """A view of a native client whose GET requests retry transient failures, page by page.
+
+    A listing spans many pages; one 5xx or dropped connection should cost that page another
+    request, not the whole listing (and every survey waiting on it). Malformed responses, client
+    errors and every non-GET request keep their single attempt. Other clients are returned as is.
+    """
+    import copy
+
+    from tauceti_tools.forge import ForgeError, Forgejo, Incomplete
+
+    if not isinstance(api, Forgejo):
+        return api
+    view = copy.copy(api)
+    request = api.request
+
+    def retrying(method, path, *args, **kwargs):
+        for attempt in range(attempts):
+            try:
+                return request(method, path, *args, **kwargs)
+            except Incomplete:
+                raise
+            except ForgeError as error:
+                transient = error.status in (0, 408, 429) or error.status >= 500
+                if method.upper() != "GET" or not transient or attempt == attempts - 1:
+                    raise
+                sleep(2**attempt)
+
+    view.request = retrying
+    return view
+
+
 class ForgejoReadSource:
     """Worker-shaped PR metadata and discussion reads on one qualified source.
 
@@ -356,6 +330,20 @@ class ForgejoReadSource:
     """
 
     direct_source = True
+    inventory_fields = (
+        "number",
+        "title",
+        "body",
+        "headRefOid",
+        "headRefName",
+        "headRepository",
+        "headRepositoryOwner",
+        "isDraft",
+        "mergeable",
+        "author",
+        "labels",
+        "updatedAt",
+    )
 
     def __init__(self, repository, api, *, cache=None, ttl=15):
         from tauceti_tools.forge import RepositoryRef
@@ -406,6 +394,16 @@ class ForgejoReadSource:
         if number is not None:
             self.repository.pull_url(number)
         self.cache.invalidate(scope=(self.repository.key, number))
+        if getattr(self, "shared_inventory", False) is True:
+            from .source_identity import advisory_scope
+
+            transport.invalidate_shared(advisory_scope(self, number))
+
+    def invalidate_discovery(self):
+        if getattr(self, "shared_inventory", False) is True:
+            from .source_identity import discovery_scope
+
+            transport.invalidate_shared(discovery_scope(self))
 
     def _read(self, operation, args, fetch, *, fresh=False, number=None, cacheable=True):
         from tauceti_tools.forge import ForgeError, Incomplete
@@ -432,14 +430,52 @@ class ForgejoReadSource:
                 return value
 
             key = (self.cache_namespace, operation, json.dumps(args, sort_keys=True), revision)
-            if cacheable:
+            cache_only = transport.cache_only()
+            if cache_only and (fresh or force or not cacheable):
+                raise transport.CacheOnlyMiss("uncached source read")
+            shared = (
+                getattr(self, "shared_inventory", False) is True
+                and transport.advisory_reads()
+                and not (fresh or force)
+                and cacheable
+                and number is not None
+            )
+            if shared:
+                from .source_identity import advisory_scope
+
+                shared_scope = advisory_scope(self, number)
+                global_epoch = transport.shared_generation(advisory_scope(self, None))
+
+                def fresh_fetch():
+                    # Reusing nested cached observations would restart their
+                    # age in this outer cache. Only the outermost read shares.
+                    with transport.read_context(fresh=True, advisory=False):
+                        return bounded_fetch()
+
+                value = transport.shared_read(
+                    [*shared_scope, operation, args, global_epoch],
+                    fresh_fetch,
+                    # A survey read names the PR's (updatedAt, head) as its revision, and
+                    # shared_read serves only that revision, so the observation answers until
+                    # the PR changes, a write invalidates it, or the edit/deletion backstop ends.
+                    ttl=SOURCE_FACTS_TTL if revision else self.ttl,
+                    identity=self.cache_namespace,
+                    lock_timeout=300,
+                    generation_scope=shared_scope,
+                    coalesce_failures=True,
+                )
+                # A cached projection never survives a credential/origin change in this process.
+                self._bound()
+            elif cache_only:
+                value, hit = self.cache.peek(key, ttl=self.ttl, scope=(self.repository.key, number)), True
+            elif cacheable:
                 value, hit = self.cache.read(
                     key, bounded_fetch, ttl=self.ttl, fresh=fresh or force, scope=(self.repository.key, number)
                 )
             else:
                 value, hit = bounded_fetch(), False
             self._bound()
-            if hit:
+            if not shared and hit:
                 transport.note_cache_hit()
             return value
         except ForgeError as error:
@@ -471,12 +507,45 @@ class ForgejoReadSource:
         )
 
     def refresh_pr_state(self, number, expected, observed=""):
-        """Correct a selected observation using only this bound source."""
+        """Correct a selected observation using only this bound source.
+
+        The fresh row replaces this PR's row in the shared listing (or removes a closed PR) instead
+        of expiring the whole listing, which every surveying worker would then have to refetch.
+        A row that cannot be placed falls back to expiring the listing.
+        """
         self.invalidate(number)
-        data = self.pr_view(number, ["headRefOid"], fresh=True)
+        data = self.pr_view(number, [*self.inventory_fields, "state"], fresh=True)
+        if data is not None and self._correct_discovery(number, data):
+            return dict(status="ok", outcome="refreshed", data=data)
+        self.invalidate_discovery()
+        if data is None:
+            data = self.pr_view(number, ["headRefOid"], fresh=True)
         if data is None:
             return dict(status="unavailable", reason="refresh_unavailable")
         return dict(status="ok", outcome="refreshed", data=data)
+
+    def _correct_discovery(self, number, data):
+        if getattr(self, "shared_inventory", False) is not True:
+            return True  # No shared listing; this adapter's own entries were invalidated above.
+        row = {key: data[key] for key in self.inventory_fields if key in data}
+        if set(row) != set(self.inventory_fields) or data.get("state") not in {"OPEN", "CLOSED", "MERGED"}:
+            return False
+        from .source_identity import discovery_scope
+        from .source_survey import discovery_key
+
+        def mutate(rows):
+            if not isinstance(rows, list):
+                raise ValueError("cached listing is not a list")
+            kept = [item for item in rows if not (isinstance(item, dict) and item.get("number") == number)]
+            if data["state"] == "OPEN":
+                # Native listings are creation-descending, which PR numbers follow.
+                index = next((i for i, item in enumerate(kept) if item.get("number", 0) < number), len(kept))
+                kept.insert(index, row)
+            return kept
+
+        return transport.update_shared(
+            discovery_key(self), mutate, identity=self.cache_namespace, generation_scope=discovery_scope(self)
+        )
 
     def open_prs(self, *, fresh=False):
         """Complete bounded open inventory, excluding unverified CI observations.
@@ -485,21 +554,18 @@ class ForgejoReadSource:
         needed. Concurrent changes can still move rows between pages; this is a
         short-lived discovery observation, not a source snapshot or merge proof.
         """
-        fields = [
-            "number",
-            "title",
-            "body",
-            "headRefOid",
-            "headRefName",
-            "headRepository",
-            "headRepositoryOwner",
-            "isDraft",
-            "mergeable",
-            "author",
-            "labels",
-            "updatedAt",
-        ]
-        return self._read("open_prs", [], lambda: self.reader.pulls(self.repository, fields, state="open"), fresh=fresh)
+        fields = list(self.inventory_fields)
+
+        def fetch():
+            reader = self.reader
+            retrying = _page_retrying(self.api)
+            if retrying is not self.api:
+                from tauceti_tools.forge_read import ForgejoReader
+
+                reader = ForgejoReader(_ProjectionAPI(retrying))
+            return reader.pulls(self.repository, fields, state="open")
+
+        return self._read("open_prs", [], fetch, fresh=fresh)
 
     def authenticated_actor(self):
         """Fresh native actor identity; never infer it from a login or GitHub."""

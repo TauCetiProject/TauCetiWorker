@@ -19,6 +19,7 @@ through the admin endpoint (`tauceti-queue settings set`), never by editing this
     database = "~/.local/state/tauceti-queue/queue.sqlite3"
     credentials_dir = "~/.config/tauceti-queue"
     log_dir = "~/.local/state/tauceti-queue/logs"
+    ci_recovery_report = "~/.local/state/tauceti-ci-recovery/stuck-heads.json"
     listen_host = "127.0.0.1"
     listen_port = 8780
     public_url = "https://queue.taucetiproject.org"
@@ -95,6 +96,8 @@ class Config:
     database: Path = Path("~/.local/state/tauceti-queue/queue.sqlite3")
     credentials_dir: Path = Path("~/.config/tauceti-queue")
     log_dir: Path = Path("~/.local/state/tauceti-queue/logs")
+    # The stuck-head report the CI recovery pass on this host writes (`stuck_heads.py`).
+    ci_recovery_report: Path = Path("~/.local/state/tauceti-ci-recovery/stuck-heads.json")
     listen_host: str = "127.0.0.1"
     listen_port: int = 8780
     public_url: str = "https://queue.taucetiproject.org"

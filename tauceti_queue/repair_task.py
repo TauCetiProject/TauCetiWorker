@@ -55,10 +55,10 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -66,6 +66,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 
 from tauceti_queue import (
@@ -76,6 +77,7 @@ from tauceti_queue import (
     repair_publish,
     repair_sandbox,
     repair_stream,
+    runtime,
     task_transport,
 )
 from tauceti_queue.ports import REPAIR_CHECKPOINT
@@ -129,6 +131,7 @@ SUBSCRIPTION_PROVIDERS = ("claude", "codex")  # paced by the fleet's quota reade
 # Checkpoint states before the agent has run: an error there is released as ``artifacts_unavailable``.
 PRE_AGENT_PHASES = (None, "claimed", "sources_ready", "artifacts_ready", "artifacts_unavailable")
 HERE = Path(__file__).resolve().parent.parent
+STARTUP_REVISION = runtime.running_revision().sha
 GIT_SAFE_PUSH = HERE / "scripts" / "git-safe-push"
 DEFAULT_ROOT = Path(
     os.environ.get("TAUCETI_QUEUE_TASK_ROOT")
@@ -408,7 +411,13 @@ class TaskClient:
     """
 
     def __init__(
-        self, service: str, token: str, worker: str, timeout: float = 30.0, *, binding: TaskBinding | None = None
+        self,
+        service: str,
+        token: str | Callable[[], str],
+        worker: str,
+        timeout: float = 30.0,
+        *,
+        binding: TaskBinding | None = None,
     ):
         self.service = service.rstrip("/")
         self.token = token
@@ -452,7 +461,7 @@ class TaskClient:
             data=data,
             method="POST",
             headers={
-                "Authorization": f"Bearer {self.token}",
+                "Authorization": f"Bearer {self.token() if callable(self.token) else self.token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "User-Agent": f"tauceti-queue-repair-task/{self.worker}",
@@ -727,20 +736,175 @@ class ClaimLease(threading.Thread):
 # Authorization and identity
 
 
+# The installation-token permissions a worker acting as the queue App asks for: pushing the submission
+# ref (contents, and workflows for a chain whose members touch `.github/workflows`), and reading the
+# repository for its access check.
+WORKER_APP_PERMISSIONS = {"contents": "write", "workflows": "write", "metadata": "read"}
+
+
+class WorkerApp:
+    """The queue's GitHub App as a co-located repair worker uses it (``TAUCETI_QUEUE_GITHUB_APP``).
+
+    The worker mints its own installation tokens from the App's private key (narrowed to
+    ``WORKER_APP_PERMISSIONS``, held in memory only, refreshed before they expire) for its GitHub calls
+    and pushes, and authenticates to the queue service with ``github_app.local_worker_bearer``, which
+    the service accepts for the worker endpoints only."""
+
+    def __init__(self, credentials, transport=None, *, clock=time.time):
+        from tauceti_queue import github_app
+
+        if transport is None:
+            from tauceti_queue.github_adapter import UrllibTransport
+
+            transport = UrllibTransport()
+        self.credentials = credentials
+        self.login = github_app.local_worker_login(credentials)
+        self.tokens = github_app.InstallationTokenSource(
+            credentials, transport, clock=clock, permissions=WORKER_APP_PERMISSIONS
+        )
+        self._clock = clock
+
+    @classmethod
+    def load(cls, directory) -> WorkerApp:
+        from tauceti_queue import github_app
+
+        return cls(github_app.AppCredentials.load(directory, webhook=False))
+
+    def bearer(self) -> str:
+        from tauceti_queue import github_app
+
+        return github_app.local_worker_bearer(self.credentials, self._clock())
+
+    def github_token(self) -> str:
+        return self.tokens.token()
+
+
+_worker_app: WorkerApp | None = None
+
+
+def worker_app() -> WorkerApp | None:
+    """The queue App when ``TAUCETI_QUEUE_GITHUB_APP`` names its credential directory, else None."""
+    global _worker_app
+    directory = os.environ.get("TAUCETI_QUEUE_GITHUB_APP")
+    if not directory:
+        return None
+    if _worker_app is None:
+        from tauceti_queue import github_app
+        from tauceti_worker.config import Die
+
+        if os.environ.get("TAUCETI_QUEUE_TOKEN_FILE") or os.environ.get("TAUCETI_QUEUE_TOKEN"):
+            raise Die("set either TAUCETI_QUEUE_GITHUB_APP or a worker token (TAUCETI_QUEUE_TOKEN_FILE), not both")
+        try:
+            _worker_app = WorkerApp.load(directory)
+        except (github_app.CredentialsError, OSError) as error:
+            raise Die(f"cannot load the queue App credentials from {directory}: {error}") from error
+        pin_app_credentials()
+    return _worker_app
+
+
+_app_git_config: tuple[tuple[str, str], ...] = ()
+# Every git process holding a GitHub credential runs without hooks: a hook in an agent's worktree (its
+# own ``.git/hooks``, a ``core.hooksPath`` or a ``core.fsmonitor`` in its config) would otherwise run
+# with the token in reach. Command scope wins over the repository's config, and git finds no hook
+# under /dev/null.
+_NO_GIT_HOOKS = (("core.hooksPath", os.devnull), ("core.fsmonitor", "false"))
+
+
+def pin_app_credentials() -> None:
+    """Make the worker's gh and git use only the App installation token in ``GH_TOKEN``.
+
+    gh reads an empty private config, so it never falls back to the host's gh login. git reads a
+    private global config that includes the user's own, and every GitHub credential helper and extra
+    header is reset in command scope (``GIT_CONFIG_COUNT``), which git reads after the system, global
+    and repository configs, leaving ``gh auth git-credential`` alone: no personal helper answers a
+    fetch or push first, no storing helper keeps an installation token, and no Authorization header
+    left in a repository's own config (as actions/checkout leaves one) travels with the request."""
+    import tempfile
+
+    global _app_git_config
+    private = Path(tempfile.mkdtemp(prefix="tauceti-queue-gh-"))
+    (private / "gh").mkdir()
+    original = os.environ.get("GIT_CONFIG_GLOBAL") or str(Path.home() / ".gitconfig")
+    include = f"[include]\n\tpath = {original}\n" if Path(original).is_file() else ""
+    gh = shutil.which("gh") or "gh"
+    _app_git_config = (
+        ("credential.https://github.com.helper", ""),
+        ("credential.https://github.com.helper", f"!{shlex.quote(gh)} auth git-credential"),
+        ("http.extraHeader", ""),
+        ("http.https://github.com/.extraHeader", ""),
+    )
+    # The same resets in the global config too: agents' isolation replaces the command-scope config,
+    # and they must not get the host's own helpers and headers back through the include.
+    (private / "gitconfig").write_text(
+        include
+        + '[credential "https://github.com"]\n\thelper =\n'
+        + f"\thelper = !{shlex.quote(gh)} auth git-credential\n"
+        + '[http]\n\textraHeader =\n[http "https://github.com/"]\n\textraHeader =\n'
+    )
+    try:
+        count = max(int(os.environ.get("GIT_CONFIG_COUNT", "0")), 0)
+    except ValueError:
+        count = 0
+    for index, (key, value) in enumerate(_app_git_config, count):
+        os.environ[f"GIT_CONFIG_KEY_{index}"] = key
+        os.environ[f"GIT_CONFIG_VALUE_{index}"] = value
+    os.environ["GIT_CONFIG_COUNT"] = str(count + len(_app_git_config))
+    os.environ["GH_CONFIG_DIR"] = str(private / "gh")
+    os.environ["GIT_CONFIG_GLOBAL"] = str(private / "gitconfig")
+    os.environ.pop("GH_TOKEN", None)
+    os.environ.pop("GITHUB_TOKEN", None)
+
+
+def app_git_environment(url: str | None = None) -> dict[str, str]:
+    """The ``GIT_CONFIG_*`` variables of a git process that pushes as the App and inherits no other
+    command-scope config: the hook reset, and the pins of ``pin_app_credentials`` (none outside App
+    mode). With ``url``, also reset the extra headers for exactly that URL, which a repository's
+    config for that URL would otherwise win over (git prefers the longest matching URL)."""
+    pins = _app_git_config
+    if pins and url:
+        pins = (*pins, (f"http.{url}.extraHeader", ""))
+    pins = (*_NO_GIT_HOOKS, *pins)
+    env = {"GIT_CONFIG_COUNT": str(len(pins))}
+    for index, (key, value) in enumerate(pins):
+        env[f"GIT_CONFIG_KEY_{index}"] = key
+        env[f"GIT_CONFIG_VALUE_{index}"] = value
+    return env
+
+
+def refresh_github_token() -> str | None:
+    """Point the worker's own ``gh`` and git calls at a current App installation token (App mode
+    only); the reason when one cannot be minted now, else None."""
+    app = worker_app()
+    if app is None:
+        return None
+    from tauceti_queue import github_app
+
+    try:
+        use_worker_token(app.github_token())
+    except (github_app.CredentialsError, OSError, ValueError) as error:
+        return f"cannot mint a queue App installation token: {error}"
+    return None
+
+
 def token_source() -> str:
     """Where ``worker_token`` reads the token from (named, never the value): ``TAUCETI_QUEUE_TOKEN_FILE``
-    (a mode 0600 file, the service unit's choice), the environment, else gh's store."""
+    (a mode 0600 file, the service unit's choice), else ``TAUCETI_QUEUE_TOKEN``."""
+    if os.environ.get("TAUCETI_QUEUE_GITHUB_APP"):
+        return f"the queue App in {os.environ['TAUCETI_QUEUE_GITHUB_APP']}"
     path = os.environ.get("TAUCETI_QUEUE_TOKEN_FILE")
     if path:
         return f"file {path}"
-    for key in ("TAUCETI_QUEUE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
-        if os.environ.get(key):
-            return f"${key}"
-    return "gh auth token"
+    if os.environ.get("TAUCETI_QUEUE_TOKEN"):
+        return "$TAUCETI_QUEUE_TOKEN"
+    return "none configured"
 
 
 def worker_token() -> str:
-    """The GitHub token of the worker's account: a token file, the usual environment, else gh's store."""
+    """The GitHub token of the worker's dedicated account: the token file, else ``TAUCETI_QUEUE_TOKEN``.
+
+    There is deliberately no fallback to ``GH_TOKEN``, ``GITHUB_TOKEN`` or ``gh auth token``: on a
+    shared host those are the operator's personal token, whose quota every agent on the account
+    shares, and the worker must never draw on it silently."""
     from tauceti_worker.config import Die
 
     path = os.environ.get("TAUCETI_QUEUE_TOKEN_FILE")
@@ -752,15 +916,42 @@ def worker_token() -> str:
         if not token:
             raise Die(f"the queue token file {path} is empty")
         return token
-    for key in ("TAUCETI_QUEUE_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
-        value = os.environ.get(key)
-        if value:
-            return value.strip()
-    result = subprocess.run(["gh", "auth", "token"], text=True, capture_output=True, check=False)
-    token = result.stdout.strip()
-    if result.returncode != 0 or not token:
-        raise Die("no GitHub token for the queue service: set TAUCETI_QUEUE_TOKEN_FILE or log in with gh")
-    return token
+    value = (os.environ.get("TAUCETI_QUEUE_TOKEN") or "").strip()
+    if value:
+        return value
+    raise Die(
+        "no GitHub credential for the queue repair worker: set TAUCETI_QUEUE_GITHUB_APP to the queue App's"
+        " credential directory, or TAUCETI_QUEUE_TOKEN_FILE to a mode 0600 file holding the token of the"
+        " worker's dedicated repository-admin account (GH_TOKEN and gh's login are not used)"
+    )
+
+
+def use_worker_token(token: str) -> None:
+    """Make the worker's own ``gh`` calls (admin checks, submission pushes) use its dedicated token.
+
+    Agents never inherit it: their environment clears ``GH_TOKEN`` and points gh at an empty config."""
+    disable_git_hooks()
+    os.environ["GH_TOKEN"] = token
+    os.environ.pop("GITHUB_TOKEN", None)
+
+
+def disable_git_hooks() -> None:
+    """Add the hook resets to the worker's own command-scope git config, once: every git process the
+    worker runs (checkouts, status, fetches, ref updates, pushes) then holds its token without
+    running hooks."""
+    try:
+        count = max(int(os.environ.get("GIT_CONFIG_COUNT", "0")), 0)
+    except ValueError:
+        count = 0
+    last = {}
+    for index in range(count):
+        last[os.environ.get(f"GIT_CONFIG_KEY_{index}", "").lower()] = os.environ.get(f"GIT_CONFIG_VALUE_{index}")
+    if all(last.get(key.lower()) == value for key, value in _NO_GIT_HOOKS):
+        return
+    for index, (key, value) in enumerate(_NO_GIT_HOOKS, count):
+        os.environ[f"GIT_CONFIG_KEY_{index}"] = key
+        os.environ[f"GIT_CONFIG_VALUE_{index}"] = value
+    os.environ["GIT_CONFIG_COUNT"] = str(count + len(_NO_GIT_HOOKS))
 
 
 def verify_admin(repository: str) -> None:
@@ -772,12 +963,23 @@ def verify_admin(repository: str) -> None:
     from tauceti_worker.config import Die, NoProgress
     from tauceti_worker.security_audit import api
 
+    app = worker_app()
+    failure = refresh_github_token()
+    if failure:
+        raise NoProgress(failure)
     try:
         answer = api(f"repos/{repository}")
     except NoProgress as error:
         if re.search(r"\bHTTP 404\b|\bNot Found\b", str(error)):
             raise Die(f"the queue repair task requires repository-admin permission on {repository}: {error}") from error
         raise
+    if app is not None:
+        # An installation token has no admin bit on the repository; the App acts on it when the
+        # installation covers it (the read above) with contents write. The service trusts the App's
+        # local-worker bearer by its key, not by this check.
+        if app.tokens.granted_permissions().get("contents") != "write":
+            raise Die(f"the queue App's installation token has no contents write on {repository}")
+        return
     if answer.get("permissions", {}).get("admin") is not True:
         raise Die(f"the queue repair task requires repository-admin permission on {repository}")
 
@@ -1058,6 +1260,8 @@ def _fetch_retained_once(
     earlier attempt of the same call, which are not fetched again; the refs the remote lacks are
     raised together by name."""
     done = done if done is not None else set()
+    if failure := refresh_github_token():  # a public origin needs none; a private one does
+        log(f"task {task.task_id}: {failure}")
     specs = retained_refspecs(task)
     missing: dict[str, str] = {}
     pending = [entry for entry in specs if entry[1] not in done]
@@ -1883,13 +2087,19 @@ def delivery_identity(cfg: RunnerConfig, task: Task, tip: str) -> dict:
 
 def check_submission_access(cfg: RunnerConfig, task: Task, logdir: Path) -> dict:
     """Exercise receive-pack authentication without changing any remote ref."""
+    failure = refresh_github_token()
+    if failure:
+        log(f"task {task.task_id}: {failure}")
+        return {"rc": 75, "error": failure}
     remote = cfg.push_remote or f"https://github.com/{task.repository}"
     return repair.run_logged(
         [
             "git",
             "-c",
             "push.followTags=false",
+            *(argument for key, value in _NO_GIT_HOOKS for argument in ("-c", f"{key}={value}")),
             "push",
+            "--no-verify",
             "--dry-run",
             "--porcelain",
             "--force",
@@ -1913,8 +2123,17 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
     """
     require_task_execution(cfg=cfg, task=task)
     remote = cfg.push_remote or f"https://github.com/{task.repository}"
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("TAUCETI_PUSH_", "TAUCETI_CLAIM_", "GIT_CONFIG_"))}
+    failure = refresh_github_token()
+    if failure:
+        log(f"task {task.task_id}: {failure}")
+        return {"rc": 75, "ok": False, "error": failure, "ref": task.submission_ref, "remote": remote}
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k == "GIT_CONFIG_GLOBAL" or not k.startswith(("TAUCETI_PUSH_", "TAUCETI_CLAIM_", "GIT_CONFIG_"))
+    }
     env.update(
+        app_git_environment(remote),
         TAUCETI_PUSH_REF=task.submission_ref,
         TAUCETI_PUSH_EXPECT=expect or "",
         TAUCETI_PUSH_REMOTE=remote,
@@ -1923,7 +2142,7 @@ def push_result(cfg: RunnerConfig, task: Task, worktree: Path, tip: str, logdir:
     )
     record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
     if record["rc"] == 78 and not expect:
-        observed = git(worktree, "ls-remote", remote, task.submission_ref, check=False).split()
+        observed = git(worktree, "ls-remote", remote, task.submission_ref, check=False, env=env).split()
         if observed:
             env["TAUCETI_PUSH_EXPECT"] = observed[0]
             record = repair.run_logged([str(GIT_SAFE_PUSH)], worktree, logdir / "push.log", env=env, timeout=600)
@@ -2806,6 +3025,9 @@ def admin_login() -> str | None:
     from tauceti_worker.config import NoProgress
     from tauceti_worker.security_audit import api
 
+    app = worker_app()
+    if app is not None:
+        return app.login
     try:
         return str(api("user").get("login") or "") or None
     except (NoProgress, OSError, AttributeError):
@@ -2817,7 +3039,12 @@ def make_client(cfg: RunnerConfig) -> TaskClient:
         if not cfg.token:
             raise TaskBindingMismatch("an explicit native queue bearer is required; GitHub fallback is unavailable")
         return TaskClient(cfg.service, cfg.token, cfg.worker, binding=cfg.binding)
-    return TaskClient(cfg.service, cfg.token or worker_token(), cfg.worker)
+    app = None if cfg.token else worker_app()
+    if app is not None:
+        return TaskClient(cfg.service, app.bearer, cfg.worker)
+    token = cfg.token or worker_token()
+    use_worker_token(token)
+    return TaskClient(cfg.service, token, cfg.worker)
 
 
 def claim_and_run(
@@ -3147,6 +3374,9 @@ def serve(
         "worker": cfg.worker,
         "service": cfg.service,
         "root": str(cfg.root),
+        # The code this process was started from (its release's baked revision), for the installer's
+        # check and the operator; read once, so it never follows later changes on disk.
+        "revision": STARTUP_REVISION,
         "started_at": time.time(),
         "tasks": 0,
         "outcomes": {},
@@ -3277,19 +3507,35 @@ def preflight(cfg: RunnerConfig, *, min_free_gib: float = 20.0) -> list[dict]:
         check("providers", bool(cfg.providers), ", ".join(cfg.providers) + f"; rate {cfg.rate or 'default'} ({curve})")
     except ValueError as error:
         check("providers", False, f"rate {cfg.rate!r}: {error}")
+    token_ok = False
+    app = None
     try:
-        cfg.token or worker_token()
+        app = None if cfg.token else worker_app()
+        if app is not None:
+            failure = refresh_github_token()
+            if failure:
+                raise RuntimeError(failure)
+        else:
+            use_worker_token(cfg.token or worker_token())
+        token_ok = True
         check("github token", True, f"from {token_source()}")
     except Exception as error:
         check("github token", False, str(error))
     try:
         from tauceti_worker.security_audit import api
 
-        login = str(api("user").get("login") or "")
-        admin = api(f"repos/{cfg.repository}").get("permissions", {}).get("admin") is True
-        check("repository admin", admin, f"{login or 'unknown login'} on {cfg.repository}")
+        if not token_ok:
+            raise RuntimeError("not checked without the worker's own token")
+
+        if app is not None:
+            verify_admin(cfg.repository)
+            check("repository access", True, f"{app.login} with contents write on {cfg.repository}")
+        else:
+            login = str(api("user").get("login") or "")
+            admin = api(f"repos/{cfg.repository}").get("permissions", {}).get("admin") is True
+            check("repository admin", admin, f"{login or 'unknown login'} on {cfg.repository}")
     except Exception as error:
-        check("repository admin", False, str(error))
+        check("repository access" if app is not None else "repository admin", False, str(error))
     cached = read_admin_check(cfg)
     if cached:
         age = time.time() - cached["verified_at"]
