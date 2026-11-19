@@ -115,6 +115,11 @@ class AdmissionInputs:
         return port is not None and port.readmit(int(number), head)
 
 
+# Recent listings re-read PRs updated this long before the newest update already seen, so an update
+# whose time Forgejo recorded slightly out of order is not skipped.
+RECENT_MARGIN_SECONDS = 120
+
+
 class NativePoller:
     """Direct native discovery with the existing due/dirty intake ledger."""
 
@@ -126,6 +131,10 @@ class NativePoller:
         self._lock = threading.Lock()
         self.stopping = threading.Event()
         self._discovery_at = 0
+        # Between full listings, the PRs Forgejo says changed since the newest update time seen
+        # (its own clock, less a margin) are listed every pass (`forgejo_recent_listing`).
+        self._recent_at = 0
+        self._recent_since = None
         self.wake = lambda: None
         configure = getattr(registry.native, "configure_admission_polling", None)
         if configure is not None:
@@ -134,7 +143,27 @@ class NativePoller:
     def interval(self):
         due = self.state.summary()["next_attempt_at"]
         next_at = self._discovery_at if due is None else min(self._discovery_at, due)
+        if self._recent_enabled():
+            next_at = min(next_at, self._recent_at)
         return max(0, next_at - self.controller.clock())
+
+    def _recent_enabled(self):
+        return (
+            self._recent_since is not None
+            and callable(getattr(self.registry.native, "list_recent_pull_requests", None))
+            and bool(self.controller.setting("forgejo_recent_listing"))
+        )
+
+    def _newest(self, pulls, newest=0.0):
+        from .forgejo_source import _forge_time
+
+        times = [_forge_time((p.admission or {}).get("updated_at")) for p in pulls]
+        return max([newest, *times])
+
+    def _observe_listed(self, pull):
+        details = pull.admission or {}
+        version = self._listed_version(pull, details.get("discovery_version"))
+        self.state.observe(pull.number, pull.head_sha, version, recheck_after=details.get("recheck_seconds", 0))
 
     def request_discovery(self):
         self._serial += 1
@@ -274,16 +303,13 @@ class NativePoller:
         if controller.clock() >= self._discovery_at:
             serial = self._serial
             try:
+                listing_started = controller.clock()
                 pulls = registry.native.list_open_pull_requests(registry.profile.forgejo.repository.name)
                 summary["listed"] = len(pulls)
                 seen = set()
                 for pull in pulls:
                     seen.add(pull.number)
-                    details = pull.admission or {}
-                    version = self._listed_version(pull, details.get("discovery_version"))
-                    self.state.observe(
-                        pull.number, pull.head_sha, version, recheck_after=details.get("recheck_seconds", 0)
-                    )
+                    self._observe_listed(pull)
                 for row in controller.store.rows("admission_work", {"repository": self.state.repository}):
                     if row["number"] not in seen and row["disposition"] != "closed":
                         self.state.observe(row["number"], row["head_sha"], "absent:" + registry.mode, urgent=True)
@@ -293,10 +319,33 @@ class NativePoller:
                 next_at = controller.clock() + max(
                     registry.poll_seconds, controller.setting("approval_poll_interval_seconds")
                 )
+                # Recent listings resume from the newest update this listing saw, less a margin
+                # for updates made while it paged (the listing took `listing_started` onwards).
+                newest = self._newest(pulls)
+                if newest:
+                    margin = RECENT_MARGIN_SECONDS + (controller.clock() - listing_started)
+                    self._recent_since = newest - margin
+                self._recent_at = controller.clock() + registry.poll_seconds
             except Exception as error:
                 summary["errors"].append(type(error).__name__)
                 next_at = controller.clock() + controller.setting("outbox_retry_seconds")
             self._discovery_at = next_at if serial == self._serial else 0
+        elif self._recent_enabled() and controller.clock() >= self._recent_at:
+            try:
+                since = self._recent_since
+                pulls, newest, complete = registry.native.list_recent_pull_requests(
+                    registry.profile.forgejo.repository.name, since=since
+                )
+                summary["recent"] = len(pulls)
+                for pull in pulls:
+                    self._observe_listed(pull)
+                if not complete:
+                    self._discovery_at = 0  # more changed than a bounded recent listing reads
+                elif newest:
+                    self._recent_since = max(since, newest - RECENT_MARGIN_SECONDS)
+            except Exception as error:
+                summary["errors"].append("recent: " + type(error).__name__)
+            self._recent_at = controller.clock() + registry.poll_seconds
         started = time.monotonic()
         while not self.stopping.is_set():
             work = self.state.next_due()

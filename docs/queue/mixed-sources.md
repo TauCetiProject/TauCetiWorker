@@ -29,7 +29,13 @@ the existing queue. Native discovery errors appear in status without stopping
 GitHub discovery. The poller lists every open Forgejo PR at most once per
 `approval_poll_interval_seconds` (or at once when discovery is requested, for
 example by re-enabling Forgejo admission), and spends the passes in between,
-each bounded by `reconcile_interval_seconds`, on evaluations. Because mixed
+each bounded by `reconcile_interval_seconds`, on evaluations. Each of those
+passes first lists, newest first, only the open PRs Forgejo updated since the
+newest update time already seen (less two minutes, and less the length of the
+last full listing), so a new PR, push, label or comment is seen within a pass;
+a recent listing that needs more than four pages of 50 asks for a full listing
+instead. The runtime setting `forgejo_recent_listing` (default true) turns them off.
+Because mixed
 landing freezes a contribution at admission, an approved Forgejo input is read
 once more just before it joins a batch: unless the PR still shows the listed
 facts admission evaluated (head, state, labels, body, update time, comment

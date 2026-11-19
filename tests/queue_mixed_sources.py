@@ -448,6 +448,71 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.controller.tick()
         self.assertEqual(self.native_input()["state"], "inserted")
 
+    def recent_fixture(self):
+        """A native fake that reports update times and serves a recent listing."""
+        registry = self.registry()
+        poller = NativePoller(registry, self.controller)
+        self.updated = {}
+        recent_calls = []
+        plain = self.native.list_open_pull_requests
+
+        def stamped(pulls):
+            return [
+                dataclasses.replace(p, admission={**(p.admission or {}), "updated_at": self.updated.get(p.number, "")})
+                for p in pulls
+            ]
+
+        def full(repo, **kwargs):
+            return stamped(plain(repo, **kwargs))
+
+        def recent(repo, *, since):
+            recent_calls.append(since)
+            from tauceti_queue.forgejo_source import _forge_time
+
+            listed = [p for p in full(repo) if _forge_time(p.admission["updated_at"]) >= since]
+            newest = max([_forge_time(t) for t in self.updated.values()] or [0.0])
+            return listed, newest, True
+
+        self.native.list_open_pull_requests = full
+        self.native.list_recent_pull_requests = recent
+        return registry, poller, recent_calls
+
+    def test_recent_listing_finds_a_change_between_full_listings(self):
+        registry, poller, recent_calls = self.recent_fixture()
+
+        def listings():
+            return sum(name == "list_open_pull_requests" for name, _ in self.native.calls)
+
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()  # full listing; evaluates #1
+        full = listings()
+        self.assertEqual(recent_calls, [])
+        # A new PR opens after the full listing: the next pass's recent listing finds it.
+        self.native.create_pr(2, {"Two.lean": "two\n"})
+        self.updated[2] = "2026-11-19T04:05:00Z"
+        self.clock.advance(registry.poll_seconds)
+        summary = poller.run_once()
+        self.assertEqual(len(recent_calls), 1)
+        self.assertEqual(summary.get("recent"), 2)  # #1 too: it is within the margin of the newest update
+        self.assertEqual(poller.state.get(2)["evaluated_generation"], poller.state.get(2)["generation"])
+        self.assertLessEqual(listings() - full, 1)  # only the fixture's own use, no full re-listing
+        # Turned off, passes between full listings list nothing.
+        self.controller.set_setting("forgejo_recent_listing", False, "operator")
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(len(recent_calls), 1)
+
+    def test_an_incomplete_recent_listing_asks_for_a_full_one(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        self.native.list_recent_pull_requests = lambda repo, *, since: ([], 0.0, False)
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(poller.interval(), 0)  # the full listing is due at once
+
     def test_native_readmit_rereads_admission_and_refuses_another_head_or_a_closed_pr(self):
         registry = self.registry()
         head = self.native.create_pr(1, {"Native.lean": "native\n"})
