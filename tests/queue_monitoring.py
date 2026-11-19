@@ -725,8 +725,8 @@ def trim_one_batch_at_a_time(observation, budget):
                 raise ValueError("metadata exceeds public projection budget")
             observation[name] = observation[name][: max(0, len(observation[name]) - 100)]
             observation["collection_complete"][name] = False
-        observation["truncated"] = True
-        observation["coverage"] = "partial"
+            observation["truncated"] = True
+            observation["coverage"] = "partial"
 
 
 class ProjectionBudget(unittest.TestCase):
@@ -777,6 +777,23 @@ class ProjectionBudget(unittest.TestCase):
         self.assertEqual(value, expected)
         self.assertLessEqual(len(monitoring.encode(value)), budget)
         return len(full)
+
+    def test_shortened_terminal_history_is_not_partial(self):
+        value = self.observation(terminal=50, active=2, members_per_batch=10)
+        active = {b["id"] for b in value["batches"] if b["state"] in ("head", "open")}
+        monitoring.fit(value, len(monitoring.encode(value)) // 2)
+        self.assertEqual(value["coverage"], "observed")
+        self.assertFalse(value["truncated"])
+        self.assertTrue(all(value["collection_complete"].values()))
+        self.assertTrue(active < {b["id"] for b in value["batches"]})
+        self.assertLess(len(value["batches"]), 52)
+
+    def test_active_only_overflow_is_partial(self):
+        value = self.observation(terminal=2, active=3, members_per_batch=300)
+        monitoring.fit(value, len(monitoring.encode(value)) // 2)
+        self.assertEqual(value["coverage"], "partial")
+        self.assertTrue(value["truncated"])
+        self.assertFalse(value["collection_complete"]["members"])
 
     def test_terminal_history_is_shortened_oldest_first(self):
         value = self.observation(terminal=200, active=3, members_per_batch=20)
