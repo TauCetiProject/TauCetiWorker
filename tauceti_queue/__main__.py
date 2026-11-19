@@ -672,6 +672,11 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
 
 # --- emergency -------------------------------------------------------------------------------------
 
+# The controller answers an emergency request once it holds the controller lock, and one unit of its
+# work can hold that lock for minutes: recording the landing of a large batch takes about a second
+# per member (five minutes for batch 455's 480 members on 2026-11-19). Wait well past that.
+EMERGENCY_TIMEOUT_SECONDS = 900.0
+
 
 def cmd_emergency(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
     words = list(args.words)
@@ -699,9 +704,14 @@ def cmd_emergency(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]]
             method="POST",
             body=body,
             token=_operator_token(args.token, getattr(args, "token_file", None)),
+            timeout=EMERGENCY_TIMEOUT_SECONDS,
         )
     except RuntimeError as exc:
         _log(str(exc))
+        return 1
+    except OSError as exc:
+        # The service may still apply a request it received: the answer, not the request, was lost.
+        _log(f"no answer from the queue service ({exc}); it may still apply the request, so check `status`")
         return 1
     print(json.dumps(document, indent=2, sort_keys=True))
     return 0 if document.get("accepted") or document.get("cancelled") else 1

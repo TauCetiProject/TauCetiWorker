@@ -9,7 +9,7 @@ import time
 from . import chain
 from .admission_state import AdmissionState
 from .controller import ControllerError
-from .mixed_identity import SourceNumber
+from .mixed_identity import SourceNumber, source_record
 from .store import dumps, loads
 
 
@@ -127,7 +127,12 @@ class NativePoller:
 
     def __init__(self, registry, controller):
         self.registry, self.controller = registry, controller
-        self.state = AdmissionState(controller.store, registry.profile.forgejo.repository.key, clock=controller.clock)
+        self.state = AdmissionState(
+            controller.store,
+            registry.profile.forgejo.repository.key,
+            clock=controller.clock,
+            inputs=(controller.repository, source_record(registry.number(1))),
+        )
         self.last_summary = None
         self._serial = 0
         self._lock = threading.Lock()
