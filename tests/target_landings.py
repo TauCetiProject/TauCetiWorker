@@ -184,6 +184,9 @@ class Proof(unittest.TestCase):
         for message in [
             original.replace(NATIVE, NATIVE.replace("@91", "@92")),
             original + "\nSource-PR: other/repo#7",
+            original + "\nSource-PR: malformed subject with spaces",
+            original + "\nAccepted-Head: invalid",
+            original + "\nAccepted-Head:",
             original.replace("Accepted-Head:", "Not-Accepted-Head:"),
             original.replace("Source-PR:", "> Source-PR:"),
         ]:

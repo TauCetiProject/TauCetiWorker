@@ -110,9 +110,13 @@ def native_commit_binds(read_json: Callable[[str], object], repository: str, sha
         row = read_json(f"{path}/git/commits/{sha}")
         if not isinstance(row, dict) or row.get("sha") != sha or not isinstance(row.get("message"), str):
             return False
-        sources = set(re.findall(r"(?im)^Source-PR:[ \t]*(\S+)[ \t]*$", row["message"]))
-        heads = set(re.findall(r"(?im)^Accepted-Head:[ \t]*([0-9a-f]{40})[ \t]*$", row["message"]))
-        if {value.casefold() for value in sources} != {subject.casefold()} or len(heads) != 1:
+        sources = {value.strip() for value in re.findall(r"(?im)^Source-PR:[ \t]*([^\r\n]*)", row["message"])}
+        heads = {value.strip() for value in re.findall(r"(?im)^Accepted-Head:[ \t]*([^\r\n]*)", row["message"])}
+        if (
+            {value.casefold() for value in sources} != {subject.casefold()}
+            or len(heads) != 1
+            or not _SHA.fullmatch(next(iter(heads)))
+        ):
             return False
         parents = row.get("parents")
         tree = row.get("tree")
