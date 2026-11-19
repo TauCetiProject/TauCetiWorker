@@ -550,6 +550,21 @@ class Publication(Tmp):
         reconcile._sync(first)
         self.assertEqual(first.read_text(), broadened)
 
+    def test_a_tick_is_not_pushed_once_a_commit_hook_changes_what_it_was_given(self):
+        first = self.clone("first")
+        _, still, ticked = self.ticked()
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text(
+            "#!/bin/sh\nsed 's/a synthetic goal/a rewritten goal/' targets.md > t.tmp && mv t.tmp targets.md"
+            " && git add targets.md\n"
+        )
+        hook.chmod(0o755)
+        self.assertIsNone(reconcile.publish(first, LIST, ticked, ["n"], still=still))
+        self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", LIST)
+        self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
+        self.assertEqual(t.parse_targets(first.read_text()).find("zero-one").status, "open")
+        self.assertIn("a rewritten goal", first.read_text())
+
     def test_a_tick_another_host_already_published_leaves_the_rebased_clone_alone(self):
         first, second = self.clone("first"), self.clone("second")
         _, still, ticked = self.ticked()

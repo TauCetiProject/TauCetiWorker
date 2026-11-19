@@ -654,8 +654,9 @@ def _push(path: Path, still=None) -> bool | None:
     local and goes with a later call.
 
     With `still`, HEAD is this look's own commit: the sync keeps it at the tip, a copy the rebase
-    emptied (the remote already has its edit) is dropped and None returned, and one after which
-    `still(the file)` fails is not pushed."""
+    emptied (the remote already has its edit) is dropped and None returned, and a commit whose
+    list, as committed after any hook, fails `still` is not pushed, before the first push as after
+    a sync."""
     upstream = _upstream(path)
     if upstream is None:
         return True
@@ -664,6 +665,10 @@ def _push(path: Path, still=None) -> bool | None:
         ahead = _git(path, "rev-list", "--count", "@{upstream}..HEAD")
         if ahead.returncode == 0 and ahead.stdout.strip() in ("", "0"):
             return True
+        committed = _git(path, "show", f"HEAD:./{path.name}") if still is not None else None
+        if committed is not None and (committed.returncode != 0 or not still(committed.stdout)):
+            log("reconcile: the committed list changed what this look's verdicts were given; not pushed")
+            return False
         pushed = _git(path, "push", "-q", upstream[0], f"HEAD:{upstream[1]}", timeout=300)
         if pushed.returncode == 0:
             log(f"reconcile: pushed the target list to {upstream[0]}")
@@ -674,9 +679,6 @@ def _push(path: Path, still=None) -> bool | None:
                 _git(path, "reset", "-q", "--soft", "HEAD~1")
                 log(f"reconcile: {upstream[0]} already has this look's edits; the rebased list is kept")
                 return None
-            if still is not None and not still(path.read_text()):
-                log(f"reconcile: {upstream[0]} changed what this look's verdicts were given; not pushed")
-                return False
     log(f"reconcile: push to {upstream[0]} failed ({one_line(pushed.stderr)}); the commit stays local")
     return False
 
