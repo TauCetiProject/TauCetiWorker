@@ -180,6 +180,12 @@ other line stays as it was:
 | That pull request closed unmerged | `[ ]`, with `#N` added to `closed:` |
 | That pull request is open, merged into another branch, or was not read | unchanged |
 
+A pull request the merge queue closed counts as merged only with the landing
+proof [Live statuses](#live-statuses) describes, read from its own forge; one
+whose proof is refused counts as closed unmerged, and one without proof leaves
+the item as it is. A round that selects only `reconcile` chooses no model and
+does not wait for one under pace.
+
 An `in flight:` clause is removed when its item is settled. The `closed:` clause
 is passed to the next agent given the item, like any other clause. The merged
 side reads, on each forge, the 1000 most recent merged pull requests that carry
