@@ -310,8 +310,8 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         # Only listed facts of this PR. A time component, or the base branch tip (which moves
         # for every open PR at each landing), would re-flag every PR at once; like GitHub,
         # admission depends on the merge base, not the tip. Evidence the listing cannot see
-        # (statuses, permissions, the merge base) is rechecked after `recheck_seconds`, behind
-        # PRs that really changed.
+        # (statuses, permissions, the merge base) is rechecked after `recheck_seconds`, taking
+        # turns with PRs that really changed.
         return digest(
             {
                 "source": self.repository_identity.record(),

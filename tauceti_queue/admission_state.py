@@ -14,6 +14,7 @@ class AdmissionState:
         self.repository = repository
         self.clock = clock
         self.resource_key = f"state:admission_resources:{repository}"
+        self._recheck_turn = False
 
     def get(self, number: int) -> dict | None:
         return self.store.row("admission_work", {"repository": self.repository, "number": number})
@@ -23,7 +24,7 @@ class AdmissionState:
 
         An unchanged observation re-flags nothing, except that a source whose version cannot
         see all evidence (`recheck_after`) re-evaluates a settled PR once its last attempt is
-        that old. Such a recheck waits behind every PR with a real change.
+        that old. Such rechecks take turns with PRs that really changed (`next_due`).
         """
         with self.store.transaction():
             row = self.get(number)
@@ -114,18 +115,23 @@ class AdmissionState:
         """Choose after each completed attempt, so a newly arrived revocation need not wait
         behind a stale copy of the backlog. Resource waits retain a logical evaluation's FIFO
         place; failures, and source changes after an attempt, rejoin at the current time, while a
-        change before any attempt keeps the place. Rechecks follow real changes. Alternating priority and
-        FIFO selections give both revocations and ordinary pending PRs service under continuing traffic.
+        change before any attempt keeps the place. Alternating priority and FIFO selections give
+        both revocations and ordinary pending PRs service under continuing traffic. Real changes and
+        periodic rechecks likewise take turns, so neither starves the other.
         """
         order = "a.urgent DESC, " if prefer_urgent else ""
+        if not urgent_only:
+            order += "a.recheck DESC, " if self._recheck_turn else "a.recheck, "
         query, params = self._pending_query()
         rows = self.store.query(
             query
             + "AND ready_at<=? "
             + ("AND a.urgent=1 " if urgent_only else "")
-            + f"ORDER BY {order}a.recheck,COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id LIMIT 1",
+            + f"ORDER BY {order}COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id LIMIT 1",
             (*params, self.clock()),
         )
+        if rows and not urgent_only:
+            self._recheck_turn = not self._recheck_turn
         return rows[0] if rows else None
 
     def complete(self, work: dict, version: str, authorization: str, disposition: str) -> bool:

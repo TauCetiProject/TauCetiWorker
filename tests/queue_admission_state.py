@@ -241,6 +241,19 @@ class AdmissionStateTests(unittest.TestCase):
         self.assertEqual(sorted(drained), [n for n in numbers if n != 7])
         self.assertEqual(self.state.summary()["pending"], 0)
 
+    def test_continuing_real_changes_cannot_starve_a_recheck(self):
+        self.state.observe(1, "head", "v1", recheck_after=900)
+        self._evaluate(1)
+        self.now += 901
+        self.state.observe(1, "head", "v1", recheck_after=900)
+        served = []
+        for number in range(2, 6):
+            self.now += 1
+            self.state.observe(number, "head", "v1")
+            served += self._evaluate(1)
+        self.assertIn(1, served[:2])
+        self.assertEqual(sorted(served), [1, 2, 3, 4])
+
     def test_real_change_on_a_queued_recheck_promotes_it_without_losing_age(self):
         for number in (1, 2):
             self.state.observe(number, "head", "v1", recheck_after=900)
