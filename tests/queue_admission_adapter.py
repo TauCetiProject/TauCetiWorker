@@ -708,7 +708,7 @@ class BumpGuardFloorTests(unittest.TestCase):
 class LocalMergeBaseTests(unittest.TestCase):
     """`admission_local_merge_base`: the clone answers when it can vouch for the answer."""
 
-    def snapshot(self, *, local, shallow=False):
+    def snapshot(self, *, local, shallow=False, resumed_local=False):
         with tempfile.TemporaryDirectory() as directory:
             repo = FakeRepo(directory)
             base = repo.main_sha()
@@ -729,6 +729,15 @@ class LocalMergeBaseTests(unittest.TestCase):
             c.background_floor = 0
             adapter = ga.GitHubAdapter(c, repo=TAUCETI, clone_dir=repo.clone)
             adapter.local_merge_base = local
+            if resumed_local:
+                # A read that took its merge base locally, then waited while the setting went off.
+                pull = ga.PullRequest.from_json(raw)
+                adapter._admission_reads[(TAUCETI, 42)] = {
+                    "generation": 1,
+                    "pull": pull,
+                    "merge_base": head,
+                    "merge_base_source": "local",
+                }
             with c.deferred_requests():
                 snapshot = adapter.admission_snapshot(TAUCETI, 42, generation=1)
             compared = [call for call in transport.calls if "/compare/" in str(call)]
@@ -746,6 +755,11 @@ class LocalMergeBaseTests(unittest.TestCase):
         self.assertEqual(snapshot.paths, ("TauCeti/A.lean",))
         self.assertEqual(compared, [])
         self.assertEqual(sources, {"local": 1, "compare": 0})
+
+    def test_turning_it_off_mid_read_asks_compare(self):
+        snapshot, base, compared, sources = self.snapshot(local=False, resumed_local=True)
+        self.assertEqual(snapshot.merge_base_sha, base)
+        self.assertEqual(len(compared), 1)
 
     def test_a_shallow_clone_falls_back_to_compare(self):
         snapshot, base, compared, sources = self.snapshot(local=True, shallow=True)
@@ -774,6 +788,15 @@ class LocalMergeBaseTests(unittest.TestCase):
             self.assertEqual(adapter._local_merge_base(a, b), root)
             self.assertIsNone(adapter._local_merge_base(left, right))
             self.assertIsNone(adapter._local_merge_base(a, "f" * 40))
+            # Grafts rewrite ancestry without making the clone shallow: the clone cannot vouch.
+            grafts = Path(directory) / ".git" / "info" / "grafts"
+            grafts.parent.mkdir(parents=True, exist_ok=True)
+            grafts.write_text(f"{a}\n")
+            self.assertIsNone(adapter._local_merge_base(a, b))
+            grafts.unlink()
+            # Replacement refs are ignored, as GitHub ignores them.
+            run_git(directory, "replace", "--graft", b)
+            self.assertEqual(adapter._local_merge_base(a, b), root)
             self.assertEqual(transport.calls, [])
 
 

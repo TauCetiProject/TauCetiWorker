@@ -1219,12 +1219,18 @@ class GitHubAdapter:
         """
         if not self.clone_dir or not SHA.fullmatch(base) or not SHA.fullmatch(head):
             return None
+        if any(os.environ.get(name) for name in ("GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE")):
+            return None  # an environment that rewrites ancestry
         try:
             if chain.git(self.clone_dir, "rev-parse", "--is-shallow-repository").strip() != "false":
                 return None
+            grafts = chain.git(self.clone_dir, "rev-parse", "--git-path", "info/grafts").strip()
+            if os.path.exists(os.path.join(self.clone_dir, grafts)):
+                return None  # grafts change ancestry without making the clone shallow
             if not chain.object_exists(self.clone_dir, base) or not chain.object_exists(self.clone_dir, head):
                 return None
-            bases = chain.git(self.clone_dir, "merge-base", "--all", base, head).split()
+            # Replacement refs change ancestry too; GitHub's answer ignores them.
+            bases = chain.git(self.clone_dir, "--no-replace-objects", "merge-base", "--all", base, head).split()
         except chain.ChainError:
             return None
         return bases[0] if len(bases) == 1 and SHA.fullmatch(bases[0]) else None
@@ -1248,6 +1254,10 @@ class GitHubAdapter:
             self.fetch_refs(repo, missing)
         # The pending head stays reachable across local GC until it is replaced or closed.
         chain.git(self.clone_dir, "update-ref", f"{chain.REF_NAMESPACE}/admission/{number}", pull.head_sha)
+        if progress.get("merge_base_source") == "local" and not self.local_merge_base:
+            # The setting was turned off while this read waited: compare answers, as it now must.
+            progress.pop("merge_base", None)
+            progress.pop("merge_base_source", None)
         if "merge_base" not in progress:
             local = self._local_merge_base(pull.base_sha, pull.head_sha) if self.local_merge_base else None
             if local is not None:
