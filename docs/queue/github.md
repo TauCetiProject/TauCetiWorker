@@ -94,7 +94,7 @@ accepts a status only when it names the candidate's own run (a status from anoth
 attempt, or a `pull_request` event on a member branch is not the candidate's verdict). The attempt
 passes only when all three are bound and `success`; a red `scope` or `bump-guard` beside a green
 `build` is a source failure of the head carrying the status description (a restricted path without a
-current admin approval, an oversized diff, a new file over 1000 lines, a failed pin validation), and a
+current admin approval, an oversized diff, a new file over 1250 lines, a failed pin validation), and a
 completed run with an absent, pending or unbound `build` status is observed again for
 `LOG_GRACE_SECONDS` (600 seconds) before it counts as infrastructure failure. The same grace
 applies to a green `build` with companion verdicts still missing. The completion timestamp is frozen

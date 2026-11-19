@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_queue import feeds, webhook
+from tauceti_queue import diff_guard, feeds, webhook
 from tauceti_queue.admission import AdmissionPolicy, AdmissionPoller, policy
 from tauceti_queue.fakes import make_controller, reopen_controller
 from tauceti_queue.github_adapter import GitHubClient, RateLimited, RequestDeferred
@@ -137,12 +137,15 @@ class AdmissionTests(unittest.TestCase):
         return head
 
     def test_self_tested_heads_must_pass_the_pr_level_diff_guards(self):
-        long = "".join(f"theorem t{i} : {i} = {i} := rfl\n" for i in range(1001))
+        long = "".join(f"theorem t{i} : {i} = {i} := rfl\n" for i in range(1251))
         head = self.self_tested({"TauCeti/Long.lean": long})
         self.assertEqual(self.intake.run_once()["approved"], 0)
         self.assertEqual(self.controller.inputs(), [])
         decision = json.loads(self.intake.state.get(1)["decision"])
-        self.assertIn("TauCeti/Long.lean: new Lean files must be at most 1000 lines", decision["reason"])
+        self.assertIn(
+            f"TauCeti/Long.lean: new Lean files must be at most {diff_guard.ci_git.NEW_FILE_LINE_CAP} lines",
+            decision["reason"],
+        )
         comments = [json.loads(row["payload"]) for row in self.controller.store.rows("outbox", {"kind": "comment"})]
         self.assertEqual(len(comments), 1)
         self.assertIn("cannot join the merge queue", comments[0]["body"])

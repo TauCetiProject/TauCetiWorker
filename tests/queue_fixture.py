@@ -862,8 +862,8 @@ class LoopTermination(QueueFixture):
                 "source": {"forge": {"kind": "github", "url": "https://github.com"}, "name": PROJECT, "id": 1},
                 "source_forge": "github",
                 "head": heads[102],
-                "reasons": ["+2400 added lines (cap 2000)"],
-                "additions": 2400,
+                "reasons": ["+3400 added lines (cap 3000)"],
+                "additions": 3400,
             }
             return "fail", diagnostics.parse_log(["MEMBER-POLICY-REJECTED " + json.dumps(record)])
 
@@ -882,7 +882,7 @@ class LoopTermination(QueueFixture):
         self.assertEqual((failure["action"], json.loads(failure["members"])), ("withdraw", [f"{PROJECT}#102"]))
         self.assertIn("review-size policy", self.controller.status()["escalations"][-1]["cause"])
         self.tick()
-        self.assertIn("+2400 added lines", self.github.comments_for(102)[0]["body"])
+        self.assertIn("+3400 added lines", self.github.comments_for(102)[0]["body"])
         self.run_ci()
         self.tick(2)
         self.assertIsNone(self.head())
@@ -905,8 +905,8 @@ class LoopTermination(QueueFixture):
                 "measured": "batch-commit",
                 "batch_commit": commit.sha,
                 "parent": commit.parents[0],
-                "reasons": ["Huge.lean: new Lean files must be at most 1000 lines (found 1001)."],
-                "additions": 1001,
+                "reasons": ["Huge.lean: new Lean files must be at most 1250 lines (found 1251)."],
+                "additions": 1251,
             }
             return "fail", diagnostics.parse_log(["MEMBER-POLICY-REJECTED " + json.dumps(record)])
 
@@ -927,7 +927,7 @@ class LoopTermination(QueueFixture):
         self.assertEqual(failure["action"], "repair")
         claimed = self.controller.claim_task("w", "admin-worker")
         [finding] = [d for d in claimed.diagnostics if d.get("kind") == "policy"]
-        self.assertEqual((finding["measured"], finding["additions"]), ("batch-commit", 1001))
+        self.assertEqual((finding["measured"], finding["additions"]), ("batch-commit", 1251))
         self.controller.release_task(claimed.task_id, claimed.claim_token, "agent_failed", "handing to the agent")
         split = self.agent(
             script=lambda task: {
@@ -962,7 +962,7 @@ class LoopTermination(QueueFixture):
         self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
         self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
         self.tick()
-        self.assertIn("new Lean files must be at most 1000 lines", self.github.comments_for(102)[0]["body"])
+        self.assertIn("new Lean files must be at most 1250 lines", self.github.comments_for(102)[0]["body"])
 
     def failing_module(self, path, content, module):
         """CI that fails while `path` holds `content`, reporting the error in `module` and naming no member."""
