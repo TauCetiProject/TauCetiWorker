@@ -19,6 +19,7 @@ import base64
 import glob
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -157,17 +158,24 @@ def broken_refs(remote: dict[str, str]) -> list[str]:
 
 
 def root_commands(server_path: str, broken: list[str]) -> list[str]:
+    """One subshell that stops at the first failure, so nothing runs outside the repository."""
     lines = [
-        f"cd {server_path}",
-        "ls -l packed-refs; find refs -type f -empty -print",
+        "( set -e",
+        f"  cd -- {shlex.quote(server_path)}",
+        "  test -f HEAD",
+        "  test -d refs",
+        "  ls -l packed-refs || true",
+        "  find refs -type f -empty -print",
     ]
     if broken:
-        lines.append("rm -f " + " ".join(broken))
+        lines.append("  rm -f -- " + " ".join(shlex.quote(name) for name in broken))
     lines += [
-        "find refs -type f -empty -delete",
-        "# An empty packed-refs holds nothing; move it aside so git does not read it.",
-        'test -s packed-refs || { test -e packed-refs && mv packed-refs "packed-refs.empty-$(date +%Y%m%d%H%M)"; }',
-        "git for-each-ref --count=5; git fsck --connectivity-only 2>&1 | tail -5",
+        "  find refs -type f -empty -delete",
+        "  # An empty packed-refs holds nothing; move it aside so git does not read it.",
+        '  if test -e packed-refs && ! test -s packed-refs; then mv packed-refs "packed-refs.empty-$(date +%Y%m%d%H%M)"; fi',
+        "  git for-each-ref --count=5",
+        "  git fsck --connectivity-only 2>&1 | tail -5",
+        ")",
     ]
     return lines
 
@@ -190,7 +198,7 @@ def cmd_check(args) -> int:
     if not healthy:
         say()
         say("Forgejo refuses pushes while broken refs exist. As root (or the Forgejo service user) on the")
-        say("server, in the repository directory, run:")
+        say("server, paste this block; it stops at the first failure:")
         say()
         for line in root_commands(args.server_path, broken):
             say(f"  {line}")
@@ -227,7 +235,10 @@ def make_staging(mirror: Path, fleet: list[Path]) -> Path:
     """A private repository that can read the mirror's and the fleet's objects without writing to them."""
     stage = Path(tempfile.mkdtemp(prefix="forgejo-restore.")) / "stage.git"
     git(None, "init", "-q", "--bare", str(stage))
-    alternates = [str(Path(repo) / "objects") for repo in [mirror, *fleet] if (Path(repo) / "objects").is_dir()]
+    # Alternates are resolved relative to the staging object directory, so write absolute paths.
+    alternates = [
+        str((Path(repo) / "objects").resolve()) for repo in [mirror, *fleet] if (Path(repo) / "objects").is_dir()
+    ]
     (stage / "objects" / "info" / "alternates").write_text("".join(f"{path}\n" for path in alternates))
     return stage
 
@@ -274,7 +285,7 @@ def plan_refs(args, target: Target, stage: Path, fleet: list[Path]) -> tuple[lis
     items: dict[str, Item] = {}
     excluded = tuple(args.exclude)
 
-    if not target.owner and not args.skip_main:
+    if not target.owner and not args.skip_main and not "refs/heads/main".startswith(excluded):
         github = ls_remote(args.github_url, git_env(), "refs/heads/main")
         sha = github.get("refs/heads/main")
         if not sha:
@@ -321,8 +332,8 @@ def plan_refs(args, target: Target, stage: Path, fleet: list[Path]) -> tuple[lis
             repo = head.get("repo") or {}
             owner = ((repo.get("owner") or {}).get("login") or "").lower()
             ref = f"refs/heads/{branch}"
-            if not branch or ref in items or ref.startswith(excluded):
-                continue
+            if not branch or ref in items or ref.startswith(excluded) or ref == "refs/heads/main":
+                continue  # main only ever comes from GitHub
             if owner and owner != base_owner:
                 continue  # the head lives in a fork; the fork's own refs are untouched by a base-repo loss
             candidates = {}
@@ -380,7 +391,11 @@ def push(
     args = ["push", "--porcelain", "--no-verify"]
     args += [f"--force-with-lease={item.ref}:" for item in batch]
     args += [url] + [f"{item.sha}:{item.ref}" for item in batch]
-    proc = git(stage, *args, env=env, timeout=timeout, check=False)
+    try:
+        proc = git(stage, *args, env=env, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        # The server may have accepted some refs; the retry lists the target again first.
+        return subprocess.CompletedProcess(args, 124, "", f"push timed out after {timeout:.0f}s"), {}
     flags = {}
     for line in proc.stdout.splitlines():
         parts = line.split("\t")
@@ -389,8 +404,9 @@ def push(
     return proc, flags
 
 
-def push_all(args, stage: Path, url: str, env: dict, items: list[Item], results: Path) -> None:
-    pending = [item for item in items if item.status == "planned"]
+def push_all(args, stage: Path, url: str, env: dict, selected: list[Item], items: list[Item], results: Path) -> None:
+    """Push the planned refs of `selected`; every checkpoint writes the whole plan, `items`."""
+    pending = [item for item in selected if item.status == "planned"]
     for start in range(0, len(pending), args.batch_size):
         batch = pending[start : start + args.batch_size]
         for attempt in range(args.attempts):
@@ -476,22 +492,24 @@ def restore_from(args, target: Target, remote: dict[str, str], stage: Path, flee
         say("dry run: nothing pushed. Rerun with --execute to push the planned refs.")
         return 0
 
-    main = [item for item in items if item.ref == "refs/heads/main" and item.status == "planned"]
-    rest = [item for item in items if item.ref != "refs/heads/main"]
+    # Base main belongs to the main sync account; a fork's main is an ordinary ref of the fork.
+    is_main = (lambda item: item.ref == "refs/heads/main") if not target.owner else (lambda item: False)
+    main = [item for item in items if is_main(item) and item.status == "planned"]
+    rest = [item for item in items if not is_main(item)]
     if main:
         verify_identity(target, Path(args.main_token_file).expanduser(), args.main_user)
     if any(item.status == "planned" for item in rest):
         verify_identity(target, Path(args.token_file).expanduser(), args.user)
     if main:
         env = git_env(target.base_url, args.main_user, Path(args.main_token_file).expanduser())
-        push_all(args, stage, target.url, env, main, results)
+        push_all(args, stage, target.url, env, main, items, results)
         write_results(results, items)
         if main[0].status != "pushed":
             say(f"main was not pushed: {main[0].detail}")
             return 1
         say(f"main pushed as {args.main_user}: {main[0].sha}")
     env = git_env(target.base_url, args.user, Path(args.token_file).expanduser())
-    push_all(args, stage, target.url, env, rest, results)
+    push_all(args, stage, target.url, env, rest, items, results)
     write_results(results, items)
     say(f"pushed: {summary(items)}")
     return verify(args, target, items)
@@ -505,26 +523,38 @@ def verify(args, target: Target, items: list[Item]) -> int:
     wanted = [item for item in items if item.status in ("pushed", "present", "planned", "failed")]
     missing = [item.ref for item in wanted if remote.get(item.ref) != item.sha]
     say(f"ls-remote: {len(wanted) - len(missing)}/{len(wanted)} planned refs match; {len(remote)} refs in total")
-    skipped = [item for item in items if item not in wanted]
-    if skipped:
-        say(f"not restored: {summary(skipped)} (see the plan for each ref)")
     for ref in missing[:30]:
         say(f"  mismatch: {ref} remote={remote.get(ref)}")
-    problems = len(missing)
+    unrecoverable = [item for item in items if item.status == "missing-object"]
+    for item in unrecoverable[:30]:
+        say(f"  not restored, object missing: {item.ref} {item.sha}")
+    kept = [item for item in items if item.status == "exists-different"]
+    if kept:
+        say(f"left as found (the target had another SHA): {len(kept)} refs")
+    problems = len(missing) + len(unrecoverable)
     if not target.owner:
-        by_ref = {item.ref: item for item in wanted}
+        by_ref = {item.ref: item for item in items}
         try:
             pulls = open_pulls(target.base_url, target.repository, None)
         except (OSError, ValueError) as error:
-            say(f"warning: could not list open PRs: {error}")
-            pulls = []
+            say(f"error: could not list open PRs, so their heads are unverified: {error}")
+            return 1
         base_owner = target.repository.split("/", 1)[0].lower()
-        checked = wrong = lagging = 0
+        checked = wrong = lagging = unplanned = 0
         for pull in pulls:
             head = pull.get("head") or {}
             owner = (((head.get("repo") or {}).get("owner") or {}).get("login") or "").lower()
+            if owner and owner != base_owner:
+                continue
             item = by_ref.get(f"refs/heads/{head.get('ref')}")
-            if item is None or (owner and owner != base_owner):
+            if item is None:
+                unplanned += 1
+                if unplanned <= 30:
+                    say(
+                        f"  PR #{pull['number']}: branch {head.get('ref')} was not restored (no copy found or excluded)"
+                    )
+                continue
+            if item.status in ("exists-different", "missing-object"):
                 continue
             checked += 1
             pull_head = remote.get(f"refs/pull/{pull['number']}/head")
@@ -537,7 +567,9 @@ def verify(args, target: Target, items: list[Item]) -> int:
         say(f"open PRs: {checked - wrong}/{checked} base-repository PRs show the planned head in the API")
         if lagging:
             say(f"  {lagging} of them have no matching refs/pull/N/head yet; Forgejo rewrites it after a push")
-        problems += wrong
+        if unplanned:
+            say(f"open PRs without a restored branch: {unplanned}")
+        problems += wrong + unplanned
     return 0 if problems == 0 else 1
 
 
@@ -561,7 +593,7 @@ def parse(argv):
     parser.add_argument("--results", default="~/.local/share/tauceti-forgejo-mirror/restore-results.json")
     sub = parser.add_subparsers(dest="command", required=True)
     check = sub.add_parser("check", help="report broken refs and print the root commands that clear them")
-    check.add_argument("--server-path", default="/var/lib/forgejo/repositories/tauceticproject/tauceti.git")
+    check.add_argument("--server-path", default="/var/lib/forgejo/repositories/taucetiproject/tauceti.git")
     restore = sub.add_parser("restore", help="plan, and with --execute push, the missing refs")
     restore.add_argument("--execute", action="store_true", help="push (default: dry run)")
     restore.add_argument("--mirror", default="~/.local/share/tauceti-forgejo-mirror/TauCeti.git")

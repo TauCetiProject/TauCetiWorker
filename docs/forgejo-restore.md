@@ -51,10 +51,12 @@ Evicted members wait again at their original age with their approvals.
 ## 3. Get root to clear the broken refs
 
 Forgejo refuses every push while a broken ref exists, and git cannot delete one remotely. Someone
-with root on the server (Joscha or Sebastian in November) runs the commands `check` printed, in
-the repository directory (`/var/lib/forgejo/repositories/tauceticproject/tauceti.git`; override with
-`check --server-path`). They remove the listed broken refs and any empty loose ref files, move an
-empty `packed-refs` aside, and show `git for-each-ref` and `git fsck --connectivity-only` output.
+with root on the server (Joscha or Sebastian in November) pastes the block `check` printed. It
+runs in a subshell with `set -e`, changes to the repository directory
+(`/var/lib/forgejo/repositories/taucetiproject/tauceti.git`; override with `check --server-path`)
+and stops at the first failure. It removes the listed broken refs (shell-quoted) and any empty
+loose ref files, moves an empty `packed-refs` aside, and shows `git for-each-ref` and
+`git fsck --connectivity-only` output.
 A `packed-refs` that is non-empty but truncated shows up as an error from `git for-each-ref`; it
 needs the same move aside. Rerun `check` until it reports no broken refs. An empty repository with
 no main is fine at this point.
@@ -108,8 +110,10 @@ meantime. A batch that fails with a transient error is listed again and retried 
 Results are saved after each batch, and rerunning `restore --execute` only sends what is still
 missing. In November 740 branches took about 6 minutes.
 
-The command ends with `verify`: every planned ref must match on `ls-remote`, and every open
-base-repository PR's API `head.sha` must equal the planned SHA. Forgejo recomputes PR heads and
+The command ends with `verify`. It fails unless every planned ref matches on `ls-remote`, no
+planned ref lacks its commit, the open PR list can be read, every open base-repository PR has a
+restored branch, and each such PR's API `head.sha` equals the planned SHA. Refs left alone because
+the target had another SHA are reported, not counted as failures. Forgejo recomputes PR heads and
 `refs/pull/N/head` shortly after the push, so rerun it after a few minutes if some lag:
 
 ```sh

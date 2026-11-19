@@ -270,7 +270,8 @@ class RestoreTests(unittest.TestCase):
             code, out = self.run_restore(command="check")
         self.assertEqual(code, 1)
         self.assertIn("main MISSING", out)
-        self.assertIn("rm -f refs/heads/tauceti-ci/x/candidate refs/tauceti-claims/v2/abc", out)
+        self.assertIn("rm -f -- refs/heads/tauceti-ci/x/candidate refs/tauceti-claims/v2/abc", out)
+        self.assertIn("cd -- /var/lib/forgejo/repositories/taucetiproject/tauceti.git", out)
         self.assertIn("find refs -type f -empty -delete", out)
         # restore refuses while the server still has broken refs
         with mock.patch.object(restore, "ls_remote", lambda *args, **kw: broken):
@@ -278,6 +279,101 @@ class RestoreTests(unittest.TestCase):
         self.put(self.target, "refs/heads/main", self.main)
         code, out = self.run_restore(command="check")
         self.assertEqual(code, 0, out)
+
+    def test_root_commands_quote_ref_names_and_stop_on_failure(self):
+        lines = restore.root_commands("/srv/repo dir", ["refs/heads/a;id"])
+        script = "\n".join(lines)
+        self.assertIn("rm -f -- 'refs/heads/a;id'", script)
+        self.assertIn("cd -- '/srv/repo dir'", script)
+        self.assertTrue(lines[0].startswith("( set -e"))
+        # The block really stops when the directory is wrong.
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, cwd=self.tmp)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("uid=", proc.stdout)
+
+    def test_main_never_comes_from_the_fleet_or_past_an_exclusion(self):
+        self.pulls.append(self.pull(9, "main", self.main))
+        self.put(self.fleet, "refs/tauceti/published/push/main", self.main)
+        code, out = self.run_restore("--skip-main")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("refs/heads/main", self.results())
+        code, out = self.run_restore("--exclude", "refs/heads/")
+        self.assertEqual(code, 0, out)
+        self.assertFalse(any(ref.startswith("refs/heads/") for ref in self.results()))
+
+    def test_a_forks_main_uses_the_fork_token(self):
+        fork = self.forge / "alice/TauCeti.git"
+        self.put(fork, "refs/heads/main", self.main)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            mirror.main(
+                ["--repo", str(self.mirror), "fetch", "--base-url", str(self.forge), "--repository", "Org/TauCeti"]
+                + ["--no-fork-discovery", "--fork", "alice", "--accept-loss"]
+            )
+        git(fork, "update-ref", "-d", "refs/heads/main")
+        git(fork, "update-ref", "-d", "refs/heads/feature")
+        self.tokens["main"].unlink()  # not needed for a fork
+        code, out = self.run_restore("--execute", fork="alice")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(refs(fork), {"refs/heads/main": self.main, "refs/heads/feature": self.alice_sha})
+
+    def test_relative_paths_work(self):
+        relative = os.path.relpath(self.mirror)
+        argv = ["--base-url", str(self.forge), "--results", str(self.tmp / "results.json"), "restore"]
+        argv += ["--mirror", relative, "--github-url", str(self.github), "--no-fallback"]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = restore.main(["--repository", "Org/TauCeti"] + argv)
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertFalse(any(item["status"] == "missing-object" for item in self.results().values()))
+
+    def test_verify_fails_on_unrecovered_work(self):
+        self.pulls.append(self.pull(11, "roadmap/lost", self.main))
+        self.assertEqual(self.run_restore("--execute")[0], 1)
+        code, out = self.run_restore(command="verify")
+        self.assertEqual(code, 1)
+        self.assertIn("PR #11: branch roadmap/lost was not restored", out)
+        self.pulls.pop()
+        self.assertEqual(self.run_restore(command="verify")[0], 0)
+        # An unreadable PR list is not a pass.
+        with mock.patch.object(restore, "open_pulls", mock.Mock(side_effect=OSError("down"))):
+            self.assertEqual(self.run_restore(command="verify")[0], 1)
+        # Nor is a planned ref whose commit no copy has.
+        plan = json.loads((self.tmp / "results.json").read_text())
+        plan.append({"ref": "refs/heads/roadmap/gone", "sha": "1" * 40, "source": "mirror", "status": "missing-object"})
+        (self.tmp / "results.json").write_text(json.dumps(plan))
+        self.assertEqual(self.run_restore(command="verify")[0], 1)
+
+    def test_an_interrupted_push_keeps_the_whole_plan(self):
+        real = restore.push
+        calls = []
+
+        def dies(stage, url, env, batch, timeout):
+            calls.append(1)
+            if len(calls) == 3:
+                raise KeyboardInterrupt
+            return real(stage, url, env, batch, timeout)
+
+        with mock.patch.object(restore, "push", dies), self.assertRaises(KeyboardInterrupt):
+            self.run_restore("--execute")
+        self.assertEqual(set(self.results()), set(self.expected()))
+        self.assertEqual(self.run_restore(command="verify")[0], 1)
+        self.assertEqual(self.run_restore("--execute")[0], 0)
+
+    def test_a_push_timeout_is_retried(self):
+        real = restore.git
+        calls = []
+
+        def slow(repo, *args, **kw):
+            if args and args[0] == "push":
+                calls.append(1)
+                if len(calls) == 2:
+                    raise subprocess.TimeoutExpired(["git", "push"], 1)
+            return real(repo, *args, **kw)
+
+        with mock.patch.object(restore, "git", slow):
+            code, out = self.run_restore("--execute")
+        self.assertEqual(code, 0, out)
+        self.assertIn("exit 124", out)
+        self.assertEqual(refs(self.target), self.expected())
 
     def test_verify_reports_wrong_pr_heads(self):
         self.assertEqual(self.run_restore("--execute")[0], 0)
