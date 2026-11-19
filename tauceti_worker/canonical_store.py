@@ -373,10 +373,12 @@ def _pin(path):
 
     Nothing else can reuse our `O_PATH` descriptor, so its `fdinfo` and `fstat` describe one file.
     If we cannot open one (out of descriptors, say), a plain stat with an unknown identity
-    `(None, None, stat)`, which proves nothing either way; None if `path` names nothing.
+    `(None, None, stat)`, which proves nothing either way; None once the fd is closed.
     """
     try:
         ours = os.open(path, os.O_PATH | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None  # Closed: a stat now would name whatever reused the fd.
     except OSError:
         ours = None
     if ours is not None:
