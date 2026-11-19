@@ -3859,6 +3859,50 @@ class WorkerAsTheQueueApp(Fixture):
         )
         self.assertNotIn("personal", filled.stdout)
 
+    def test_a_repositorys_own_github_headers_and_helpers_do_not_apply(self):
+        personal = self.root / "personal-gitconfig"
+        personal.write_text("[http]\n\textraHeader = Authorization: Basic personal\n")
+        remote = f"https://github.com/{PROJECT}"
+        clone = self.root / "credential-clone"
+        subprocess.run(["git", "init", "-q", str(clone)], check=True)
+        for key, value in (
+            ("http.https://github.com/.extraheader", "AUTHORIZATION: basic local"),  # as actions/checkout leaves it
+            (f"http.{remote}.extraheader", "AUTHORIZATION: basic repository"),
+            ("credential.https://github.com.helper", "store"),
+        ):
+            subprocess.run(["git", "-C", str(clone), "config", key, value], check=True)
+        environment = patch.dict(
+            os.environ, {"GIT_CONFIG_GLOBAL": str(personal), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_COUNT": "0"}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        pins = patch.object(repair_task, "_app_git_config", ())
+        pins.start()
+        self.addCleanup(pins.stop)
+        repair_task.pin_app_credentials()
+
+        def config(*args, env=None):
+            result = subprocess.run(
+                ["git", "-C", str(clone), "config", *args], capture_output=True, text=True, env=env, check=False
+            )
+            return result.stdout.splitlines()
+
+        # push_result drops the inherited command-scope config and passes only the App's pins.
+        pushing = {k: v for k, v in os.environ.items() if k == "GIT_CONFIG_GLOBAL" or not k.startswith("GIT_CONFIG_")}
+        pushing.update(repair_task.app_git_environment(remote))
+        for env in (None, pushing):
+            self.assertEqual(config("--get-urlmatch", "http.extraHeader", "https://github.com/", env=env), [""])
+            helpers = config("--get-urlmatch", "credential.helper", "https://github.com", env=env)
+            self.assertTrue(helpers[-1].endswith(" auth git-credential"), helpers)
+        self.assertEqual(config("--get-urlmatch", "http.extraHeader", remote, env=pushing), [""])
+        # Agents' isolation replaces the command-scope pins; the global config still resets the host's own.
+        agent = {**os.environ, **{k: v for k, v in repair.isolation_env(self.root / "isolation", {}).items() if v}}
+        self.assertEqual(
+            config("--global", "--get-urlmatch", "http.extraHeader", "https://github.com/", env=agent), [""]
+        )
+        helpers = config("--global", "--get-urlmatch", "credential.helper", "https://github.com", env=agent)
+        self.assertTrue(helpers[-1].endswith(" auth git-credential"), helpers)
+
     def test_a_push_without_a_mintable_token_does_not_run(self):
         from tauceti_queue import github_app
 
