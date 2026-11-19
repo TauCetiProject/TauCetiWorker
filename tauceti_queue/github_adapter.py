@@ -56,6 +56,8 @@ from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
 
 API = github_app.API
 API_VERSION = "2022-11-28"
+# Installation requests (GraphQL: points) left in a window below which background reads wait for the reset.
+DEFAULT_BACKGROUND_FLOOR = 1000
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
 STAGING_WORKFLOW = "pr-build.yml"
@@ -211,6 +213,7 @@ class GitHubClient:
         api: str = API,
         clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        background_floor: int = DEFAULT_BACKGROUND_FLOOR,
     ) -> None:
         self._tokens = tokens
         self._transport = transport
@@ -221,6 +224,9 @@ class GitHubClient:
         self._priority = threading.Condition(self._lock)
         self._essential: dict[str, int] = {}
         self._resource_limits: dict[str, dict] = {}
+        # Background reads stop while a bucket has at most this many requests (GraphQL: points)
+        # left, until it resets; essential requests keep the reserved floor.
+        self.background_floor = background_floor
         self._background_at: dict[str, float] = {}
         self._local = threading.local()
         self._blocked_until: dict[str, float] = {}
@@ -247,6 +253,11 @@ class GitHubClient:
                     target, key = self._blocked_until, resource
                 target[key] = max(target.get(key, 0), deadline)
 
+    def release_background_holds(self) -> None:
+        """Forget restored background waits; the live quota and current floor decide the next read."""
+        with self._lock:
+            self._background_at.clear()
+
     def stats(self) -> dict:
         with self._lock:
             return {
@@ -266,12 +277,9 @@ class GitHubClient:
         with self._lock:
             return self.remaining, self.reset_at
 
-    def _record(self, headers: dict[str, str], resource="core", *, cost=None) -> None:
+    def _record(self, headers: dict[str, str], resource="core") -> None:
         with self._lock:
             record = self._resource_limits.setdefault(resource, {})
-            previous_remaining, previous_reset = record.get("remaining"), record.get("reset_at")
-            if isinstance(cost, int) and cost > 0:
-                record["cost"] = cost
             try:
                 if "x-ratelimit-remaining" in headers:
                     record["remaining"] = int(headers["x-ratelimit-remaining"])
@@ -286,32 +294,61 @@ class GitHubClient:
                 self.limit = record.get("limit")
                 self.reset_at = record.get("reset_at")
             remaining, reset = record.get("remaining"), record.get("reset_at")
-            now = self._clock()
-            observed = "x-ratelimit-remaining" in headers or cost is not None
-            if observed and remaining is not None and reset is not None and reset > now:
+            if (
+                "x-ratelimit-remaining" in headers
+                and remaining is not None
+                and reset is not None
+                and reset > self._clock()
+            ):
                 if remaining <= 0:
                     self._blocked_until[resource] = reset + 1
-                else:
-                    # Background reads share the real remaining window; essential requests
-                    # consume their share immediately and their responses adjust this spacing.
-                    next_at = now + record.get("cost", 1) * (reset - now) / remaining
-                    if previous_reset == reset and previous_remaining is not None and remaining <= previous_remaining:
-                        next_at = max(next_at, self._background_at.get(resource, 0))
-                    self._background_at[resource] = min(reset + 1, next_at)
+
+    def _background_hold(self, resource) -> float:
+        """When background reads of `resource` may resume (the caller holds `_lock`).
+
+        At or below `background_floor` that is the window's reset: the floor is reserved for
+        essential requests. A wait restored from before a restart holds until its own deadline.
+        """
+        record = self._resource_limits.get(resource, {})
+        remaining, reset = record.get("remaining"), record.get("reset_at")
+        hold = self._background_at.get(resource, 0)
+        if remaining is not None and reset is not None and remaining <= self.background_floor:
+            hold = max(hold, reset + 1)
+        return hold
+
+    def _floor_deferral(self, resource) -> RequestDeferred | None:
+        with self._lock:
+            hold = self._background_hold(resource)
+        if hold <= self._clock():
+            return None
+        return RequestDeferred(
+            f"background reads wait for the GitHub quota reset at the {self.background_floor}-request floor",
+            retry_at=hold,
+            resource=resource + ":background",
+        )
 
     # -- requests
 
-    def _send(self, method, url, headers, body, *, resource, deferred):
+    def _send(self, method, url, headers, body, *, resource, deferred, floor=False, record=None):
         # Essential queue/CI requests never wait for background intake. Before each intake
-        # request, let already-active essential work finish on that bucket. There is no fixed
-        # quota reserve; unrelated buckets and essential requests remain free to run.
+        # request, let already-active essential work finish on that bucket, then check the floor
+        # again with their responses recorded. Unrelated buckets and essential requests remain
+        # free to run.
         with self._priority:
             while deferred and self._essential.get(resource, 0):
                 self._priority.wait()
             if not deferred:
                 self._essential[resource] = self._essential.get(resource, 0) + 1
+        if floor:
+            pending = self._floor_deferral(resource)
+            if pending is not None:
+                raise pending
         try:
-            return self._transport(method, url, headers, body)
+            status, response_headers, data = self._transport(method, url, headers, body)
+            response_headers = {k.lower(): v for k, v in response_headers.items()}
+            if record is not None:
+                record(response_headers)
+            return status, response_headers, data
         finally:
             if not deferred:
                 with self._priority:
@@ -323,8 +360,9 @@ class GitHubClient:
         """Background intake persists waits instead of sleeping inside a source read.
 
         This is thread-local: essential queue and command calls retain their existing retry
-        behavior. A known exhausted bucket refuses new reads until its original deadline;
-        trying another PR cannot move that deadline further away.
+        behavior. Background reads run at full speed until a bucket of the installation reaches
+        `background_floor`, then wait for its reset. A known exhausted bucket refuses new reads
+        until its original deadline; trying another PR cannot move that deadline further away.
         """
         previous = getattr(self._local, "deferred", False)
         prior_background = getattr(self._local, "background", False)
@@ -377,14 +415,9 @@ class GitHubClient:
                     raise RateLimited("GitHub resource wait", retry_at=deadline, resource=blocked_resource)
                 self._sleep(deadline - self._clock())
             if background:
-                with self._lock:
-                    next_at = self._background_at.get(resource, 0)
-                if next_at > self._clock():
-                    raise RequestDeferred(
-                        "background read paced by remaining GitHub capacity",
-                        retry_at=next_at,
-                        resource=resource + ":background",
-                    )
+                pending = self._floor_deferral(resource)
+                if pending is not None:
+                    raise pending
         body = None if json_body is None else json.dumps(json_body).encode()
         accepted = set(ok) | set(tolerate)
         attempt = 0
@@ -407,17 +440,24 @@ class GitHubClient:
                 used_installation = True
             with self._lock:
                 self.requests += 1
+            # GET /user uses an operator/worker bearer, and GET /app uses an App JWT. Neither is
+            # the installation bucket used for queue/intake work, so neither is recorded or floored.
             status, response_headers, data = self._send(
-                method, url, headers, body, resource=resource, deferred=background
+                method,
+                url,
+                headers,
+                body,
+                resource=resource,
+                deferred=background,
+                floor=background and token is None,
+                record=(
+                    None
+                    if token is not None
+                    else lambda seen: self._record(
+                        seen, seen.get("x-ratelimit-resource") or (resource if not record_limit else "core")
+                    )
+                ),
             )
-            response_headers = {k.lower(): v for k, v in response_headers.items()}
-            if token is None:
-                # GET /user uses an operator/worker bearer, and GET /app uses an App JWT.
-                # Neither is the installation bucket used for queue/intake work.
-                self._record(
-                    response_headers,
-                    response_headers.get("x-ratelimit-resource") or (resource if not record_limit else "core"),
-                )
             if status in accepted:
                 return Response(status, response_headers, data)
             if status == 401 and used_installation and attempt == 1:
@@ -571,7 +611,7 @@ class GitHubClient:
             reset = _timestamp(rate.get("resetAt"))
             if reset is not None:
                 headers["x-ratelimit-reset"] = str(reset)
-            self._record(headers, "graphql", cost=rate["cost"])
+            self._record(headers, "graphql")
         return data
 
     def fetch_bare(self, url: str) -> tuple[int, bytes]:

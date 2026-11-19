@@ -65,7 +65,7 @@ class AdmissionState:
 
     def _pending_query(self, columns="a.*"):
         # A shared resource wait is one deadline, not a new failed attempt for every PR.
-        # Urgent revocations use essential priority and may bypass background pacing.
+        # Urgent revocations use essential priority and may bypass the background quota floor.
         ready = (
             "CASE WHEN a.urgent=1 AND a.retry_resource LIKE '%:background' "
             "AND EXISTS(SELECT 1 FROM inputs i WHERE i.repository=a.repository "
@@ -148,6 +148,18 @@ class AdmissionState:
             deadlines = self.store.get_setting(self.resource_key, {})
             deadlines[resource] = max(deadlines.get(resource, 0), until)
             self.store.set_setting(self.resource_key, deadlines, "admission", self.clock())
+
+    def release_background_waits(self) -> None:
+        """Forget waits for the background quota floor, after the floor setting changed."""
+        with self.store.transaction():
+            deadlines = self.store.get_setting(self.resource_key, {})
+            kept = {k: v for k, v in deadlines.items() if not k.endswith(":background")}
+            if kept != deadlines:
+                self.store.set_setting(self.resource_key, kept, "admission", self.clock())
+            self.store.execute(
+                "UPDATE admission_work SET next_attempt_at=0 WHERE repository=? AND retry_resource LIKE '%:background'",
+                (self.repository,),
+            )
 
     def summary(self) -> dict:
         query, params = self._pending_query(
