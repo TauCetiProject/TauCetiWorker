@@ -395,6 +395,14 @@ class Task:
         """The base the result must sit on: ``onto`` (the batch base itself for a repair)."""
         return self.onto or self.base
 
+    @property
+    def conflict_step(self) -> dict | None:
+        """A rebase task's conflict when it names the one ``commit`` to resolve onto ``clean_prefix_tip``."""
+        if self.kind not in repair.REBASE_KINDS:
+            return None
+        conflict = task_findings(self).get("conflict") or {}
+        return conflict if conflict.get("commit") and conflict.get("clean_prefix_tip") else None
+
 
 class _NoTaskRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -1275,7 +1283,8 @@ def _fetch_retained_once(
         names = sorted(missing)
         shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
         raise RuntimeError(f"{len(names)} retained ref(s) not fetchable: {shown} ({missing[names[0]]})")
-    for sha in (task.base, task.tip, task.validation_base):
+    step = task.conflict_step or {}
+    for sha in (task.base, task.tip, task.validation_base, *filter(None, [step.get("clean_prefix_tip")])):
         if git(clone, "cat-file", "-t", sha, check=False).strip() != "commit":
             git(clone, "fetch", "--quiet", "origin", sha, check=False)
         if git(clone, "cat-file", "-t", sha, check=False).strip() != "commit":
@@ -2285,7 +2294,9 @@ def _run_task(
     outcome.update(task_id=task.task_id, status="running", worker=cfg.worker)
     state.progress_outcome = outcome
     continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits else None
-    start_tip = continuation["tip"] if continuation else task.tip
+    # A rebase task resolves one conflicting commit onto the replay's clean prefix; the queue replays the rest.
+    step = task.conflict_step
+    start_tip = continuation["tip"] if continuation else step["clean_prefix_tip"] if step else task.tip
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
     known_checks = bool(continuation) or known_check_failures(task)
@@ -2354,6 +2365,17 @@ def _run_task(
 
     try:
         state.write("claimed", worker=cfg.worker, service=cfg.service, resumed=resuming)
+        if task.kind in repair.REBASE_KINDS and step is None:
+            return release_task(
+                cfg,
+                client,
+                task,
+                state,
+                "agent_failed",
+                "the conflict task names no conflicting commit to resolve; the queue replays and recreates it",
+                outcome,
+                lease,
+            )
         if task.repository != cfg.repository:
             verify_admin(task.repository)
         from tauceti_queue.repair_cache import task_cache
@@ -2394,6 +2416,8 @@ def _run_task(
                     warm=repair_publish.warm(cfg.publish, task),
                     build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
                 )
+            if step is not None:
+                repair.apply_conflict(worktree, start_tip, step["commit"])
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
                 missing = [a["revision"][:12] for a in artifacts["warm_attempts"] if not a["mapping_found"]]
@@ -2462,7 +2486,14 @@ def _run_task(
                     outcome,
                     lease,
                 )
-        chain_before = read_chain(cfg.clone, task.base, task.tip)
+        if step is not None:
+            # The clean prefix and the one conflicting commit: the commits after it are not the agent's.
+            chain_before = [
+                *read_chain(cfg.clone, task.validation_base, start_tip),
+                *read_chain(cfg.clone, f"{step['commit']}^", step["commit"]),
+            ]
+        else:
+            chain_before = read_chain(cfg.clone, task.base, task.tip)
         prompt_chain = read_chain(cfg.clone, task.validation_base, start_tip) if continuation else chain_before
         ownership = repair_context.compute(
             cfg.clone,
@@ -2561,6 +2592,30 @@ def _run_task(
             else None
         )
         pushed: str | None = state.record.get("pushed_tip") if pending_delivery else None
+
+        def attempt_result(attempt: int) -> tuple[str, dict]:
+            """The attempt's result and the queue's checks on it: for a conflict, the commit the worker
+            makes of the working tree on the clean prefix (whatever the agent did to HEAD or history);
+            otherwise the chain at HEAD."""
+            if step is not None:
+                tip, report = repair.commit_resolution(
+                    cfg.clone, worktree, start_tip, step["commit"], list(step.get("paths") or [])
+                )
+            else:
+                tip = git(worktree, "rev-parse", "HEAD").strip()
+                report = repair.chain_report(
+                    cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                )
+            git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
+            return tip, report
+
+        def explanation_request(names: list[str], tip: str) -> str:
+            if step is not None:
+                return repair.resolution_explanation_prompt(names[0] if names else str(step.get("member")))
+            return repair.explanation_prompt(
+                names, repair.read_chain(cfg.clone, task.validation_base, tip), base=task.validation_base
+            )
+
         attempt = 0
         validation_retries = 0
         verify_rounds = 0
@@ -2647,21 +2702,13 @@ def _run_task(
                     return cancelled("the agent was cancelled")
                 if agent["status"] in RELEASED_AGENT_STATUSES:
                     return release_task(cfg, client, task, state, agent["status"], agent.get("reason"), outcome, lease)
-            tip = git(worktree, "rev-parse", "HEAD").strip()
-            git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
-            report = repair.chain_report(
-                cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
-            )
+            tip, report = attempt_result(attempt)
             if report["ok"] and report["unexplained"] and not cancel.is_set():
                 follow = run_repair_agent(
                     cfg,
                     task,
                     worktree,
-                    repair.explanation_prompt(
-                        report["unexplained"],
-                        repair.read_chain(cfg.clone, task.validation_base, tip),
-                        base=task.validation_base,
-                    ),
+                    explanation_request(report["unexplained"], tip),
                     logdir,
                     cancel,
                     state,
@@ -2677,12 +2724,10 @@ def _run_task(
                     return release_task(
                         cfg, client, task, state, follow["status"], follow.get("reason"), outcome, lease
                     )
-                tip = git(worktree, "rev-parse", "HEAD").strip()
-                git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
-                report = repair.chain_report(
-                    cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
-                )
-            report["dirty"] = bool(git(worktree, "status", "--porcelain", "--untracked-files=no").strip())
+                tip, report = attempt_result(attempt)
+            report["dirty"] = step is None and bool(
+                git(worktree, "status", "--porcelain", "--untracked-files=no").strip()
+            )
             report["unchanged"] = tip == task.tip
             report["agent_failed"] = agent["status"] == "failed"
             state.write("validated", attempt=attempt, tip=tip, report=report)
@@ -2700,7 +2745,9 @@ def _run_task(
                     detail = f"agent exited {agent.get('rc')}\n{detail}"
                 if attempt < cfg.agent_attempts:
                     feedback = (
-                        "Local validation of the previous attempt's chain:\n"
+                        f"Local validation of the previous attempt's resolution:\n{detail}"
+                        if step is not None
+                        else "Local validation of the previous attempt's chain:\n"
                         + detail
                         + f"\n\nThe chain the task started from is retained at `{RESULT_REF_PREFIX}/{task.task_id}/input` "
                         f"(tip `{task.tip[:12]}`, on base `{task.validation_base[:12]}`)."
@@ -2891,9 +2938,7 @@ def _run_task(
                     cfg,
                     task,
                     worktree,
-                    repair.explanation_prompt(
-                        named, repair.read_chain(cfg.clone, task.validation_base, tip), base=task.validation_base
-                    ),
+                    explanation_request(named, tip),
                     logdir,
                     cancel,
                     state,

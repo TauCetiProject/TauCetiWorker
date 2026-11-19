@@ -863,12 +863,19 @@ class ScriptedAgent:
         return result
 
     def produce(self, task: Task) -> str:
-        """Build the replacement chain in the agent's clone and push it to the task's submission ref."""
+        """Build the replacement chain (for a conflict task, the resolved commit) in the agent's clone and
+        push it to the task's submission ref."""
         self.invocations += 1
         run_git(self.clone, "fetch", "-q", str(self.repo.origin), *task.retained_refs, task.base, task.tip, task.onto)
         resolutions = self.script(task)
         commits = chain.chain_commits(self.clone, task.base, task.tip)
         new_tip = task.onto
+        diagnostics = task.diagnostics if isinstance(task.diagnostics, list) else []
+        step = next((d for d in diagnostics if d.get("kind") == "conflict" and d.get("commit")), None)
+        if step is not None:
+            # A conflict task's result is the one resolved commit on the clean prefix, as the worker makes it.
+            commits = [chain.read_commit(self.clone, step["commit"])]
+            new_tip = step["clean_prefix_tip"]
         for commit in commits:
             source_pr = commit.source_pr or commit.sha
             resolution = resolutions.get(source_pr)
