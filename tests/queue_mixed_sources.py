@@ -563,6 +563,22 @@ class Mixed(MixedFixture, unittest.TestCase):
         poller.run_once()
         self.assertEqual(poller._comments_since, newest - 120)
 
+    def test_native_insertion_rejudges_a_review_no_listing_or_feed_reported(self):
+        poller, head = self.native_approved()
+        original = self.native.admission_policy.evaluate
+
+        def revoked(snapshot):  # the scoreboard was edited to red; nothing else changed
+            result, *rest = original(snapshot)
+            return ({**result, "merge": False, "review_safe": False}, *rest)
+
+        self.native.admission_policy.evaluate = revoked
+        self.controller.tick()
+        row = self.native_input()
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "admission-recheck"))
+        self.assertFalse(poller.is_current(1, head))
+        poller.run_once()
+        self.assertEqual(self.native_input()["state"], "cancelled")
+
     def test_native_insertion_is_held_when_the_merge_base_moved(self):
         poller, head = self.native_approved()
         work = poller.state.get(1)

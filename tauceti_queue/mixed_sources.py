@@ -192,7 +192,7 @@ class NativePoller:
         registry, controller = self.registry, self.controller
         since = self._comments_since
         # One read drains the window: 200 pages of 50 is far beyond a pass's comments (about two
-        # a minute on production), and a window read in one go cannot shift under itself.
+        # a minute on production), and a deletion during the read can still shift a comment past it, which the review check before insertion and the rechecks cover.
         rows, newest, complete = registry.native.list_recent_comments(
             registry.profile.forgejo.repository.name, since=since, max_pages=COMMENT_FEED_PAGES
         )
@@ -358,6 +358,25 @@ class NativePoller:
         if blocked:
             # Approval refuses these labels; one added after approval keeps the head out too.
             return "blocked-label: " + ", ".join(blocked)
+        # Scoreboard edits move neither the PR's update time nor its comment count, and the
+        # comment feed is best effort, so the review itself is read and judged once more here.
+        snapshot_of = getattr(self.registry.native, "admission_snapshot", None)
+        if snapshot_of is not None and work["authorization_key"]:
+            try:
+                snapshot = snapshot_of(self.registry.profile.forgejo.repository.name, int(number))
+                result, authorization, *_ = self.registry.native.admission_policy.evaluate(snapshot)
+            except Exception as error:  # noqa: BLE001 - an unreadable review never admits
+                return f"review unavailable: {type(error).__name__}"
+            if (
+                snapshot.pull.head_sha != head
+                or not result.get("merge")
+                or not result.get("review_safe")
+                or head in result.get("recovery_heads", ())
+                or authorization != work["authorization_key"]
+            ):
+                self._reevaluate(work, urgent=True)
+                self.wake()
+                return "review changed since evaluation"
         return None
 
     def run_once(self, *, reason="interval"):

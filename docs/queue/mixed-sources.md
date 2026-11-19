@@ -47,8 +47,9 @@ Because mixed
 landing freezes a contribution at admission, an approved Forgejo input is read
 once more just before it joins a batch: unless the PR still shows the listed
 facts admission evaluated (head, state, labels, body, update time, comment
-count) and the merge base it was reviewed against, the insertion is held and
-the PR is evaluated again, and a blocking
+count) and the merge base it was reviewed against, and unless its review, read
+and judged once more, still admits the same scoreboard, the insertion is held
+and the PR is evaluated again, and a blocking
 label (`hold`, `wip` and the others approval refuses) holds it while it stays.
 `admit` enables native inputs in that same queue, including
 qualified repair tasks and exact candidate CI. Pause new native acceptance with
