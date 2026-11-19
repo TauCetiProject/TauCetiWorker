@@ -25,7 +25,6 @@ from .constants import (
     _GH_TRANSIENT_RE,
     CLAIMS,
     CONTEST_CLAIM_EMOJI,
-    GH_INROUND_WAIT,
     GH_SECONDARY_BASE,
     GH_TRANSIENT_BASE,
     GH_TRANSIENT_TRIES,
@@ -416,14 +415,18 @@ def _find_fork() -> str | None:
     return None
 
 
-@functools.lru_cache(maxsize=1)
 def ensure_fork() -> str:
     """The contributor's own fork of TAUCETI (`owner/repo`), creating it if absent. The worker pushes
     authored branches here and opens PRs from it, so it never needs write access to canonical. Fails
     closed if the resolved fork can't be pushed to (e.g. a token scoped only to the base repo)."""
     from .worker_sources import current
 
-    source = current()
+    return _source_fork(current())
+
+
+@functools.lru_cache(maxsize=4)
+def _source_fork(source) -> str:
+    # Keyed by the selected source: a round can resolve its GitHub claim fork and its native fork.
     if source is not None:
         return source.writable_repository().name
 
@@ -434,6 +437,9 @@ def ensure_fork() -> str:
             f"push to your fork (a token scoped only to {TAUCETI} is not enough), or set TAUCETI_FORK."
         )
     return fork
+
+
+ensure_fork.cache_clear = _source_fork.cache_clear
 
 
 def _resolve_fork() -> str:
@@ -513,9 +519,9 @@ def _parse_iso8601(s: str | None) -> int | None:
 # ============================================================================
 # GitHub REST rate limits. A 403 mid-round wastes the agent's work, so we wait the limit out and retry
 # rather than failing the round (see GH_* constants). gh prints the limit kind on stdout/stderr.
-# Two kinds, handled differently because of the ROUND_TIMEOUT hard cap on a child round:
-#  - SECONDARY ("abuse") limits clear after a short, unspecified cooldown → wait IN PLACE and retry,
-#    bounded by GH_INROUND_WAIT so the wait can't blow the round timeout.
+# Two kinds, handled differently:
+#  - SECONDARY ("abuse") limits clear after a short, unspecified cooldown → wait IN PLACE and retry
+#    until it clears; only the round's hard cap (TAUCETI_ROUND_TIMEOUT) bounds the wait.
 #  - PRIMARY limits clear only at the hourly bucket reset → too long to wait under the round cap, so
 #    surface immediately and let the loop preflight (cmd_loop, no hard cap) wait the reset out before
 #    relaunching. (GitHub buckets core and graphql resets independently; the preflight watches both.)
@@ -583,10 +589,10 @@ def github_budget() -> dict | None:
 
 def _gh_secondary_wait(text: str, attempt: int) -> int:
     """Seconds to wait before retrying a SECONDARY-limited `gh` call: honor a Retry-After if gh echoed
-    one, else exponential from GH_SECONDARY_BASE. >= 1s, clamped to the in-round budget."""
+    one, else exponential from GH_SECONDARY_BASE. >= 1s."""
     ra = _parse_retry_after(_gh_retry_after(text))
     nap = int(ra) if ra is not None else GH_SECONDARY_BASE * (1 << min(attempt, 4))
-    return max(1, min(nap, GH_INROUND_WAIT))
+    return max(1, nap)
 
 
 def _gh_retry_after(text: str) -> str | None:
@@ -595,9 +601,9 @@ def _gh_retry_after(text: str) -> str | None:
     return m.group(1) if m else None
 
 
-def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROUND_WAIT) -> subprocess.CompletedProcess:
+def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int | None = None) -> subprocess.CompletedProcess:
     """Run a `gh` command, waiting out a SECONDARY GitHub rate limit IN PLACE and retrying so the limit
-    costs a pause, not a discarded round (bounded by max_wait so it can't blow ROUND_TIMEOUT). A PRIMARY
+    costs a pause, not a discarded round (``max_wait`` optionally bounds the total wait). A PRIMARY
     (hourly) limit is surfaced immediately — waiting an hour inside a round under the 90-min cap would
     just be SIGKILLed; the loop preflight waits that reset out instead.
 
@@ -610,7 +616,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
     if source is not None:
         from .source_cli import execute
 
-        return execute(argv[1:] if argv[0] == "gh" else argv, source)
+        return execute(argv[1:] if argv[0] == "gh" else argv, source, cwd=cwd)
     waited = 0
     attempt = 0
     tries = 0
@@ -624,7 +630,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
             if not (_gh_transient(text) and _gh_read_only(argv)) or tries >= GH_TRANSIENT_TRIES:
                 return p
             nap = GH_TRANSIENT_BASE << tries
-            if waited + nap > max_wait:
+            if max_wait is not None and waited + nap > max_wait:
                 return p
             log(f"gh: {one_line(text, 120)} — transient, retrying in {nap}s ({' '.join(argv[1:3])})")
             time.sleep(nap)
@@ -643,7 +649,7 @@ def gh_run(argv: list[str], *, cwd: Path | None = None, max_wait: int = GH_INROU
             )
             return p
         nap = _gh_secondary_wait(text, attempt)
-        if waited + nap > max_wait:
+        if max_wait is not None and waited + nap > max_wait:
             log(
                 f"gh: secondary rate limit, but the in-round wait budget is spent ({waited}s) — "
                 f"surfacing the error so the round backs off"
@@ -919,6 +925,20 @@ class GitHub:
     def add_label(self, pr: int, name: str) -> bool:
         result = self._gh(["api", "-X", "POST", f"repos/{self.repo}/issues/{int(pr)}/labels", "-f", f"labels[]={name}"])
         return result.returncode == 0
+
+    def pull_for_head(self, owner: str, branch: str) -> int | None:
+        """The number of the one open PR whose head is `owner:branch`, fresh; None when absent or unreadable."""
+        if not re.fullmatch(r"[A-Za-z0-9-]+", owner) or not branch or any(ch in branch for ch in "&?# "):
+            return None
+        with transport.read_context(fresh=True):
+            result = self._gh(["api", f"repos/{self.repo}/pulls?state=open&head={owner}:{branch}"])
+        if result.returncode:
+            return None
+        try:
+            rows = json.loads(result.stdout)
+        except ValueError:
+            return None
+        return int(rows[0]["number"]) if isinstance(rows, list) and len(rows) == 1 else None
 
     def bump_repair_requested(self, pr: int, head: str) -> int | None:
         """Fresh proof of a stopped singleton, never a pending retry or speculative label."""
@@ -1231,7 +1251,8 @@ class GitHub:
         per guarded round per PR, so collapsing ~5 REST calls into 1 GraphQL call is the bulk of the
         round's GitHub spend. None on any failure (caller treats that as 'can't tell'). Review threads are
         fetched first:100; on the rare PR with more, we fall back to the exact paginated REST count so the
-        guard never undercounts a comment that landed on a later thread."""
+        guard never undercounts a comment that landed on a later thread. `edited` is when the description
+        was last replaced (None: never), which lets the guard see a description repair."""
         from .github_state import read
 
         available, row = read(self.repo, "progress", number=pr)
@@ -1240,8 +1261,8 @@ class GitHub:
         owner, _, name = self.repo.partition("/")
         q = (
             "query($owner:String!,$name:String!,$pr:Int!){repository(owner:$owner,name:$name){"
-            "pullRequest(number:$pr){headRefOid state isDraft labels(first:100){nodes{name}} comments{totalCount}"
-            "reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
+            "pullRequest(number:$pr){headRefOid state isDraft lastEditedAt labels(first:100){nodes{name}} "
+            "comments{totalCount} reviewThreads(first:100){totalCount nodes{comments{totalCount}}}}}}"
         )
         p = self._gh(
             ["api", "graphql", "-f", f"query={q}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"pr={pr}"]
@@ -1266,8 +1287,47 @@ class GitHub:
                     if "isDraft" in d and "labels" in d
                     else {}
                 ),
+                **({"edited": d["lastEditedAt"]} if "lastEditedAt" in d else {}),
             }
         except (json.JSONDecodeError, KeyError, TypeError):
+            return None
+
+    def pr_description_repair(self, pr: int, edited: str | None, ncomments: int) -> bool | None:
+        """Whether this account replaced the PR description after `edited`, its earlier edit time, and
+        wrote one of the comments added since the PR had `ncomments`. Read from the PR in one request,
+        because the mutation journal that records the same is optional. A peer's edit or reply is not
+        this account's. None when it cannot be told: a failed read, or more review threads or new
+        comments than the request shows."""
+        owner, _, name = self.repo.partition("/")
+        q = (
+            "query($owner:String!,$name:String!,$pr:Int!){viewer{login} repository(owner:$owner,name:$name){"
+            "pullRequest(number:$pr){lastEditedAt editor{login} "
+            "comments(last:10){totalCount nodes{createdAt author{login}}} reviewThreads(first:100){totalCount "
+            "nodes{comments(last:10){totalCount nodes{createdAt author{login}}}}}}}}"
+        )
+        p = self._gh(
+            ["api", "graphql", "-f", f"query={q}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"pr={pr}"]
+        )
+        if p.returncode != 0:
+            return None
+        try:
+            payload = json.loads(p.stdout)
+            if payload.get("errors"):
+                return None
+            me = payload["data"]["viewer"]["login"].lower()
+            d = payload["data"]["repository"]["pullRequest"]
+            threads = d["reviewThreads"]
+            if threads["totalCount"] > 100:
+                return None
+            written = [d["comments"], *(t["comments"] for t in threads["nodes"])]
+            new = sum(c["totalCount"] for c in written) - ncomments
+            if d["lastEditedAt"] in (None, edited) or ((d["editor"] or {}).get("login") or "").lower() != me or new < 1:
+                return False
+            if new > 10:
+                return None
+            newest = sorted((n for c in written for n in c["nodes"]), key=lambda n: n["createdAt"], reverse=True)
+            return any(((n["author"] or {}).get("login") or "").lower() == me for n in newest[:new])
+        except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
             return None
 
     def _pr_progress_state_rest(self, pr: int, head: str, state: str | None = None) -> dict | None:

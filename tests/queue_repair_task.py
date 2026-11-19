@@ -12,11 +12,11 @@ stopping the agent without a submission; a chain the service rejects, retried on
 a locally invalid chain retried with the local report; a content change without an explanation,
 completed by a follow-up turn in the same session; artifacts unavailable (released, or left to expire
 when the service has no release endpoint); inference unavailable after bounded retries; an ordinary
-agent failure released as such; a second claimant refused; and a checkpointed task resumed in its
-recorded session. The long-running worker (``serve``): the claim/run/submit cycle with the provider
+agent failure released as such; a second claimant refused; and a task left mid-attempt abandoned and
+its claim released. The long-running worker (``serve``): the claim/run/submit cycle with the provider
 outcome reported to ``/tasks/inference`` and idle polling until stopped; a failing service and a
-failing task that do not end the loop; SIGTERM stopping the agent while keeping the claim and
-checkpoint, which the next start resumes; and the host preflight checks. The streaming repair: the
+failing task that do not end the loop; SIGTERM stopping the agent and releasing the claim; and the host
+preflight checks. The streaming repair: the
 worker's background ``lake build --iofail`` (a scripted stub emitting two errors with a pause between
 them) launches the agent after the first error with the "Build in progress" section, the error list and
 the lock behave as the prompt says, and ``--no-stream-repair`` restores the sequential flow.
@@ -30,6 +30,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -38,6 +39,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -52,15 +54,20 @@ BIN.mkdir()
 HOME = TMP / "home"
 HOME.mkdir()
 os.environ["PATH"] = f"{BIN}:{os.environ.get('PATH', '')}"
+# Bind inference to this fixture even when another launch context supplies its own PATH.
+os.environ["TAUCETI_CLAUDE_CMD"] = str(BIN / "claude")
 os.environ["HOME"] = str(HOME)
 os.environ["TAUCETI_CACHE_SERVICE"] = ""  # the worker's own cache warming is not exercised here
 os.environ["TAUCETI_WORKER_ID"] = "queue-repair-test"
 os.environ["GH_TOKEN"] = "worker-token"
+os.environ["TAUCETI_QUEUE_TOKEN"] = "worker-token"
 for key in ("TAUCETI_RUNTIME_STATUS", "TAUCETI_FLEET_ADMISSION_FILE", "CLAUDE_CONFIG_DIR", "TAUCETI_STREAM"):
     os.environ.pop(key, None)
 
 from tauceti_queue import chain as chain_tool  # noqa: E402
+from tauceti_queue import diagnostics as queue_diagnostics  # noqa: E402
 from tauceti_queue import (  # noqa: E402
+    diff_guard,
     repair,
     repair_audit,
     repair_context,
@@ -270,7 +277,7 @@ launch = {
 }
 started = time.time()
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "TAUCETI_QUEUE_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
 fcntl.flock(call_lock, fcntl.LOCK_UN)
 call_lock.close()
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
@@ -1212,6 +1219,7 @@ class HappyPath(Fixture):
         self.assertNotIn("repair task 1", prompt, "task identifiers are not in the prompt")
         self.assertNotIn(f"Source-PR: {PROJECT}#3", prompt, "the member listings are in the file")
         self.assertIsNone(calls[0]["env"]["GH_TOKEN"])
+        self.assertIsNone(calls[0]["env"]["TAUCETI_QUEUE_TOKEN"], "the worker's own token stays out of agents")
         self.assertTrue(calls[0]["env"]["GIT_CONFIG_VALUE_0"].endswith("no-push"))
         self.assertTrue(calls[0]["env"]["CLAUDE_CONFIG_DIR"].startswith(str(self.root / "state")))
         self.assertEqual(calls[0]["cwd"], str(self.root / "state" / "worktrees" / "task-1"))
@@ -1484,6 +1492,42 @@ class RebaseArtifacts(Fixture):
     def fetches(self) -> list[str]:
         return [c.split("--rev=")[1] for c in self.lake_calls() if c.startswith("cache get")]
 
+    def test_explanation_follow_up_preserves_the_new_rebase_target(self):
+        self.raw["kind"] = "pre_rebase"
+        os.environ["STUB_AGENT_MODE"] = "no-explanation"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1]["resume"], "sess-1")
+        self.assertIn(f"chain on `{self.onto[:12]}`", calls[1]["prompt"])
+        self.assertNotIn(f"chain on `{self.content.base[:12]}`", calls[1]["prompt"])
+        described = re.search(re.escape(f"{PROJECT}#2") + r": `([0-9a-f]{12})`", calls[1]["prompt"])
+        self.assertIsNotNone(described)
+        sh(cfg.clone, "merge-base", "--is-ancestor", self.onto, described[1])
+        self.assertNotIn("BROKEN", sh(cfg.clone, "show", f"{described[1]}:TauCeti/Two.lean"))
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        comparison = chain_tool.compare(self.content.bare, self.content.base, self.content.tip, self.onto, pushed)
+        self.assertTrue(comparison.ok, comparison)
+
+    def test_service_explanation_retry_preserves_the_new_rebase_target(self):
+        self.service.result_script = [
+            {
+                "accepted": False,
+                "reason": "explanation-required",
+                "violations": [{"code": "explanation-required", "source_pr": f"{PROJECT}#2"}],
+            }
+        ]
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.service.results), 2)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn(f"chain on `{self.onto[:12]}`", calls[1]["prompt"])
+        self.assertNotIn(f"chain on `{self.content.base[:12]}`", calls[1]["prompt"])
+
     def observe_log(self) -> list[str]:
         lines: list[str] = []
         original = repair_task.log
@@ -1502,6 +1546,32 @@ class RebaseArtifacts(Fixture):
         self.raw["diagnostics"][0]["onto"] = moved
         self.service.tasks = {1: self.raw}
         return moved
+
+    def test_changed_rebase_dependencies_are_prepared_on_target_and_input_is_restored(self):
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        target = commit(seed, "bump dependency", {"lake-manifest.json": '{"packages": []}\n'})
+        sh(seed, "fetch", "--quiet", str(self.content.bare), self.content.tip)
+        task = repair_task.Task.from_json(
+            {**self.raw, "onto": target, "claim_token": "x", "expires_at": time.time() + 60}
+        )
+        sh(seed, "checkout", "--quiet", "--detach", self.content.tip)
+        package = seed / ".lake" / "packages" / "hydrated"
+        for fail in (False, True):
+            try:
+                with repair_task.artifact_checkout(seed, task, self.content.tip):
+                    self.assertEqual(sh(seed, "rev-parse", "HEAD"), target)
+                    self.assertTrue((seed / "lake-manifest.json").is_file())
+                    package.parent.mkdir(parents=True, exist_ok=True)
+                    package.write_text("prepared dependency objects")
+                    if fail:
+                        raise RuntimeError("cache transport failed")
+            except RuntimeError:
+                if not fail:
+                    raise
+            self.assertEqual(sh(seed, "rev-parse", "HEAD"), self.content.tip)
+            self.assertFalse((seed / "lake-manifest.json").exists())
+            self.assertEqual(package.read_text(), "prepared dependency objects")
 
     def test_the_rebase_target_is_fetched_first(self):
         os.environ["STUB_LAKE_CACHE_FAIL_REVS"] = self.content.base  # the stale base has no outputs
@@ -2094,28 +2164,6 @@ class Providers(Fixture):
         self.assertTrue(call["codex_credentials"])
         self.assertEqual(call["env"]["CODEX_HOME"], str(self.root / "state" / "codex-home"))
 
-    def test_a_resumed_session_keeps_its_provider_even_over_pace(self):
-        # An interrupted task resumes the recorded codex thread, ahead of a now-eligible claude and
-        # without re-checking codex's pace: the work was admitted when it started.
-        os.environ["STUB_AGENT_MODE"] = "resume-only"
-        cfg = self.config(providers=("claude", "codex"))
-        claim = self.service.preclaim(1, "old-token", cfg.worker)
-        task = repair_task.Task.from_json(self.service.task_record(1, claim))
-        repair_task.fetch_retained(cfg.clone, task)
-        worktree = cfg.root / "worktrees" / "task-1"
-        repair.checkout_worktree(cfg.clone, task.tip, worktree)
-        state = repair_task.TaskState(cfg.tasks_dir / "1", task)
-        state.write("agent_running", agent_attempt=1, provider="codex")
-        from tauceti_worker.runtime_status import atomic_json
-
-        atomic_json(state.session_path, {"session": "thread-old", "cwd": str(worktree)})
-        self.statuses["codex"] = (False, "weekly ahead of pace")
-        outcomes = repair_task.resume_pending(cfg, self.client(cfg))
-        self.assertEqual([o["status"] for o in outcomes], ["adopted"], outcomes)
-        calls = self.agent_calls()
-        self.assertEqual([(c["agent"], c["resume"]) for c in calls], [("codex", "thread-old")])
-        self.assertEqual(self.provider_attempts(outcomes[0]), [("codex", "ran")])
-
     def test_the_heartbeat_counts_the_providers(self):
         self.statuses["claude"] = (False, "weekly exhausted")
         self.break_launch("codex")
@@ -2214,7 +2262,8 @@ class QueueCacheNote(Fixture):
         from tauceti_worker import agents
 
         @contextlib.contextmanager
-        def missed(cwd, env, logdir):
+        def missed(cwd, env, logdir, *, queue_mathlib=False):
+            self.assertTrue(queue_mathlib)  # the queue keeps its own Mathlib until it shares too
             env["TAUCETI_PR_CACHE_MISS"] = "1"  # what the host preparation does on that miss
             yield None
 
@@ -2273,9 +2322,8 @@ class AgentTimeout(Fixture):
         self.assertEqual([r["reason"] for r in self.service.releases], ["agent_failed"])
 
 
-class Resume(Fixture):
-    def test_checkpointed_task_resumes_its_session(self):
-        os.environ["STUB_AGENT_MODE"] = "resume-only"
+class Abandon(Fixture):
+    def test_a_task_left_mid_agent_is_abandoned_and_its_claim_released(self):
         cfg = self.config()
         client = self.client(cfg)
         # A previous runner claimed the task, prepared the worktree and was running the agent in sess-old.
@@ -2291,25 +2339,24 @@ class Resume(Fixture):
         from tauceti_worker.runtime_status import atomic_json
 
         atomic_json(state.session_path, {"session": "sess-old", "cwd": str(worktree)})
-        outcomes = repair_task.resume_pending(cfg, client)
-        self.assertEqual([o["status"] for o in outcomes], ["adopted"], outcomes)
-        calls = self.agent_calls()
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["resume"], "sess-old")
-        self.assertIn("has resumed your session", calls[0]["prompt"])
-        self.assertEqual(
-            self.lake_calls(), ["build --iofail"], "artifacts are not prepared again on resume; the worker verifies"
-        )
-        self.assertTrue(self.state()["resumed"])
+        outcomes = repair_task.retry_deliveries(cfg, client)
+        self.assertEqual([(o["status"], o["reason"]) for o in outcomes], [("released", "worker-stopped")])
+        self.assertEqual(self.agent_calls(), [], "nothing of the attempt is continued")
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
+        self.assertIsNone(self.service.live_claim(1))
+        self.assertFalse(worktree.exists())
+        outcome = repair_task.claim_and_run(cfg, client)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.agent_calls()[0]["resume"], None, "a fresh run, not a resume")
 
-    def test_a_checkpoint_whose_claim_is_gone_is_not_resumed(self):
+    def test_a_record_whose_claim_is_gone_is_not_continued(self):
         cfg = self.config()
         task = repair_task.Task.from_json(
             {**self.content.task(), "claim_token": "gone", "expires_at": time.time() + 5, "renew_after": 0.2}
         )
         state = repair_task.TaskState(cfg.tasks_dir / "1", task)
         state.write("agent_running")
-        self.assertEqual(repair_task.resume_pending(cfg, self.client(cfg)), [])
+        self.assertEqual(repair_task.retry_deliveries(cfg, self.client(cfg)), [])
         self.assertEqual(self.state()["state"], "claim_lost")
         self.assertEqual(self.agent_calls(), [])
 
@@ -2447,7 +2494,7 @@ class Serve(Fixture):
         self.assertNotIn("artifacts_backoff", result["summary"])
         self.assertEqual(self.agent_calls(), [])
 
-    def test_sigterm_interrupts_the_agent_keeps_the_claim_and_the_next_start_resumes(self):
+    def test_sigterm_abandons_the_attempt_and_releases_the_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
         os.environ["STUB_SLEEP"] = "30"
         cfg = self.config(poll_seconds=0.2)
@@ -2470,27 +2517,19 @@ class Serve(Fixture):
         summary = repair_task.serve(cfg, self.client(cfg), stop)  # the main thread: where the handler runs
         self.assertLess(time.monotonic() - started, 25, "the sleeping agent was stopped promptly")
         self.assertEqual(stop.reason, "SIGTERM")
-        self.assertEqual(summary["outcomes"], {"interrupted": 1}, summary)
+        self.assertEqual(summary["outcomes"], {"released": 1}, summary)
         state = self.state()
-        self.assertEqual(state["state"], "interrupted")
-        self.assertEqual(state["phase"], "agent_running")
-        # Nothing was submitted or released, the claim is still ours and the worktree is kept.
+        self.assertEqual(state["state"], "released")
+        self.assertEqual(state["reason"], "worker-stopped")
+        # Nothing was submitted, the claim was released at once and the worktree removed.
         self.assertEqual(self.service.results, [])
-        self.assertEqual(self.service.releases, [])
-        self.assertEqual(self.service.inference_reports, [])
-        self.assertIsNotNone(self.service.live_claim(1), "the claim is kept for the next start")
-        self.assertTrue((self.root / "state" / "worktrees" / "task-1").is_dir())
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
+        self.assertIsNone(self.service.live_claim(1), "the task is claimable again at once")
+        self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
         self.assertEqual(self.heartbeat(cfg)["state"], "stopped")
-        # The next start renews the claim and resumes the recorded session in the kept worktree.
-        os.environ["STUB_AGENT_MODE"] = "resume-only"
-        outcomes = repair_task.resume_pending(cfg, self.client(cfg))
-        self.assertEqual([o["status"] for o in outcomes], ["adopted"], outcomes)
-        calls = self.agent_calls()
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[1]["resume"], "sess-1")
-        self.assertIn("has resumed your session", calls[1]["prompt"])
-        self.assertEqual(len(self.service.results), 1)
-        self.assertEqual(self.state()["state"], "adopted")
+        # The next start has nothing to continue.
+        self.assertEqual(repair_task.retry_deliveries(cfg, self.client(cfg)), [])
+        self.assertEqual(len(self.agent_calls()), 1)
 
     def test_stop_before_a_claim_does_not_claim(self):
         cfg = self.config(poll_seconds=0.1)
@@ -2745,10 +2784,9 @@ class ReleaseRetry(Fixture):
         self.assertEqual(len(self.service.releases), 1)
 
 
-class StopAndResume(Fixture):
-    """A claim never outlives the worker that holds it: a stop before the agent runs releases it, a
-    restart releases or resumes whatever a stopped run left, and a claim refused for our own stale
-    claim is given back and retried at once."""
+class StopAndRelease(Fixture):
+    """A claim never outlives the worker that holds it: a stop releases it, a restart releases whatever
+    a stopped run left, and a claim refused for our own stale claim is given back and retried at once."""
 
     RETAINED_TIP = "refs/heads/queue/batch-1/tip"
 
@@ -2800,20 +2838,16 @@ class StopAndResume(Fixture):
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
 
-    def test_sigterm_with_the_agent_running_renews_the_claim_before_checkpointing(self):
+    def test_sigterm_with_the_agent_running_releases_the_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
         os.environ["STUB_SLEEP"] = "30"
         cfg = self.config(poll_seconds=0.2)
         stop = self.install_handlers()
         self.terminate_when(lambda: self.checkpoint_state() == "agent_running", delay=1.0)
-        renewals_before = self.service.renewals
         summary = repair_task.serve(cfg, self.client(cfg), stop)
-        self.assertEqual(summary["outcomes"], {"interrupted": 1}, summary)
-        claim = self.service.live_claim(1)
-        self.assertIsNotNone(claim, "the claim is kept for the resume")
-        self.assertGreater(self.service.renewals, renewals_before)
-        self.assertAlmostEqual(claim["expires_at"], self.state()["task"]["expires_at"], delta=1.0)
-        self.assertEqual(self.service.releases, [])
+        self.assertEqual(summary["outcomes"], {"released": 1}, summary)
+        self.assertIsNone(self.service.live_claim(1))
+        self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
 
     def test_on_start_a_checkpoint_stopped_before_the_agent_is_released_and_claimed_fresh(self):
         cfg = self.config()
@@ -2824,7 +2858,7 @@ class StopAndResume(Fixture):
         state = repair_task.TaskState(cfg.tasks_dir / "1", task)
         state.write("claimed", worker=cfg.worker)
         self.assertIsNone(client.claim(), "the stale claim blocks a fresh one (concurrency)")
-        outcomes = repair_task.resume_pending(cfg, client)
+        outcomes = repair_task.retry_deliveries(cfg, client)
         self.assertEqual([(o["status"], o["reason"]) for o in outcomes], [("released", "worker-stopped")])
         self.assertEqual([r["reason"] for r in self.service.releases], ["worker-stopped"])
         self.assertEqual(self.state()["state"], "released")
@@ -3631,7 +3665,7 @@ class Preflight(Fixture):
         checks = repair_task.preflight(cfg, min_free_gib=0)
         by_name = {c["check"]: c for c in checks}
         self.assertTrue(all(c["ok"] for c in checks), checks)
-        self.assertEqual(by_name["github token"]["detail"], "from $GH_TOKEN")
+        self.assertEqual(by_name["github token"]["detail"], "from $TAUCETI_QUEUE_TOKEN")
         self.assertEqual(by_name["repository admin"]["detail"], f"stub-worker on {PROJECT}")
         self.assertIn("revision fakefakefak", by_name["service"]["detail"])
         self.assertIn(str(self.content.bare), by_name["content clone"]["detail"])
@@ -3657,6 +3691,315 @@ class Preflight(Fixture):
 
         with self.assertRaises(Die):
             repair_task.worker_token()
+
+    def test_no_silent_fallback_to_a_personal_token(self):
+        from tauceti_worker.config import Die
+
+        personal = patch.dict(os.environ, {"GH_TOKEN": "personal", "GITHUB_TOKEN": "personal"})
+        personal.start()
+        self.addCleanup(personal.stop)
+        for key in ("TAUCETI_QUEUE_TOKEN_FILE", "TAUCETI_QUEUE_TOKEN"):
+            os.environ.pop(key, None)
+        with patch("subprocess.run", side_effect=AssertionError("gh auth token")):
+            with self.assertRaises(Die) as refused:
+                repair_task.worker_token()
+        self.assertIn("TAUCETI_QUEUE_TOKEN_FILE", str(refused.exception))
+        self.assertEqual(repair_task.token_source(), "none configured")
+        checks = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
+        self.assertFalse(checks["github token"]["ok"])
+        self.assertFalse(checks["repository admin"]["ok"], "the operator's gh login is not checked instead")
+
+    def test_the_worker_token_is_the_one_its_own_gh_calls_use(self):
+        token_file = self.root / "token"
+        token_file.write_text("dedicated\n")
+        environment = patch.dict(os.environ, {"TAUCETI_QUEUE_TOKEN_FILE": str(token_file), "GITHUB_TOKEN": "personal"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        repair_task.make_client(self.config(token=None))
+        self.assertEqual(os.environ["GH_TOKEN"], "dedicated")
+        self.assertNotIn("GITHUB_TOKEN", os.environ)
+
+
+class WorkerAsTheQueueApp(Fixture):
+    """``TAUCETI_QUEUE_GITHUB_APP``: the worker mints App installation tokens and a local-worker bearer."""
+
+    PEM = None
+
+    def app(self, permissions=None):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from tauceti_queue import github_app
+
+        if WorkerAsTheQueueApp.PEM is None:
+            WorkerAsTheQueueApp.PEM = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+            )
+        credentials = github_app.AppCredentials(
+            app_id=5607007,
+            slug="tauceti-queue",
+            installation_id=178451644,
+            private_key_pem=self.PEM,
+            webhook_secret=b"",
+        )
+        clock = [1_800_000_000.0]
+        minted = []
+
+        def transport(method, url, headers, body):
+            minted.append(json.loads(body))
+            expires = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock[0] + 3600))
+            granted = permissions or {"contents": "write", "workflows": "write", "metadata": "read"}
+            payload = {"token": f"ghs_installation{len(minted)}", "expires_at": expires, "permissions": granted}
+            return 201, {}, json.dumps(payload).encode()
+
+        app = repair_task.WorkerApp(credentials, transport, clock=lambda: clock[0])
+        environment = patch.dict(
+            os.environ, {"TAUCETI_QUEUE_GITHUB_APP": str(self.root / "app"), "GITHUB_TOKEN": "personal"}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        for key in ("TAUCETI_QUEUE_TOKEN", "TAUCETI_QUEUE_TOKEN_FILE"):
+            os.environ.pop(key, None)
+        installed = patch.object(repair_task, "_worker_app", app)
+        installed.start()
+        self.addCleanup(installed.stop)
+        return app, credentials, clock, minted
+
+    def test_the_service_bearer_is_a_fresh_local_worker_bearer(self):
+        from tauceti_queue import github_app
+
+        app, credentials, clock, minted = self.app()
+        client = repair_task.make_client(self.config(token=None))
+        first = client.token()
+        self.assertTrue(github_app.verify_local_worker_bearer(credentials, first, clock[0]))
+        clock[0] += 600
+        self.assertTrue(github_app.verify_local_worker_bearer(credentials, client.token(), clock[0]))
+        self.assertFalse(github_app.verify_local_worker_bearer(credentials, first, clock[0]), "an old one expires")
+        self.assertEqual(minted, [], "the service bearer spends no GitHub request")
+        self.assertEqual(repair_task.admin_login(), "tauceti-queue[bot]")
+
+    def test_gh_and_git_get_a_current_installation_token_with_narrowed_permissions(self):
+        app, _, clock, minted = self.app()
+        self.assertIsNone(repair_task.refresh_github_token())
+        self.assertEqual(os.environ["GH_TOKEN"], "ghs_installation1")
+        self.assertNotIn("GITHUB_TOKEN", os.environ)
+        self.assertEqual(minted, [{"permissions": repair_task.WORKER_APP_PERMISSIONS}])
+        repair_task.verify_admin(PROJECT)
+        self.assertEqual(len(minted), 1, "the token is reused while it is fresh")
+        clock[0] += 3600 - 60
+        repair_task.verify_admin(PROJECT)
+        self.assertEqual(os.environ["GH_TOKEN"], "ghs_installation2", "renewed before it expires")
+        checks = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
+        self.assertTrue(checks["github token"]["ok"], checks["github token"])
+        self.assertEqual(checks["repository access"]["detail"], f"tauceti-queue[bot] with contents write on {PROJECT}")
+        self.assertNotIn("ghs_installation", json.dumps(checks))
+
+    def test_an_installation_without_contents_write_stops_the_worker(self):
+        from tauceti_worker.config import Die
+
+        self.app(permissions={"contents": "read", "metadata": "read"})
+        with self.assertRaises(Die):
+            repair_task.verify_admin(PROJECT)
+
+    def test_an_unmintable_token_defers_rather_than_using_another(self):
+        from tauceti_queue import github_app
+        from tauceti_worker.config import NoProgress
+
+        app, *_ = self.app()
+        os.environ["GH_TOKEN"] = "personal"
+        with patch.object(app.tokens, "token", side_effect=github_app.CredentialsError("HTTP 502", retryable=True)):
+            with self.assertRaises(NoProgress):
+                repair_task.verify_admin(PROJECT)
+        self.assertEqual(os.environ["GH_TOKEN"], "personal", "unchanged; the push path then refuses to push")
+
+    def test_loading_the_app_hides_the_hosts_gh_login(self):
+        from tauceti_queue import github_app
+
+        self.app()
+        directory = self.root / "app"
+        directory.mkdir()
+        (directory / "github-app.json").write_text(json.dumps({"id": 1, "installation_id": 2, "slug": "tauceti-queue"}))
+        (directory / "github-private-key.pem").write_bytes(self.PEM)
+        os.environ.update(GH_TOKEN="personal", GH_CONFIG_DIR=str(HOME / ".config" / "gh"))
+        with patch.object(repair_task, "_worker_app", None):
+            app = repair_task.worker_app()
+            self.assertIsInstance(app.credentials, github_app.AppCredentials)
+        self.assertNotIn("GH_TOKEN", os.environ)
+        self.assertEqual(list(Path(os.environ["GH_CONFIG_DIR"]).iterdir()), [])
+
+    def test_git_asks_only_gh_for_github_credentials(self):
+        personal = self.root / "personal-gitconfig"
+        personal.write_text(
+            '[credential "https://github.com"]\n\thelper = !f() { echo username=me; echo password=personal; }; f\n'
+            "[http]\n\textraHeader = Authorization: Basic personal\n[user]\n\tname = Kept\n"
+        )
+        environment = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(personal)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        repair_task.pin_app_credentials()
+
+        # Outside any repository: a CI checkout's own config carries actions/checkout's extraHeader.
+        def config(*args):
+            result = subprocess.run(
+                ["git", "config", *args], cwd=self.root, capture_output=True, text=True, check=False
+            )
+            return result.stdout.splitlines()
+
+        self.assertEqual(config("--get-all", "user.name"), ["Kept"], "the user's own config still applies")
+        self.assertEqual(config("--get-urlmatch", "http.extraHeader", "https://github.com/"), [""])
+        helpers = config("--get-urlmatch", "credential.helper", "https://github.com")
+        self.assertTrue(helpers[-1].endswith(" auth git-credential"), helpers)
+        filled = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false"},
+            check=False,
+        )
+        self.assertNotIn("personal", filled.stdout)
+
+    def test_a_repositorys_own_github_headers_and_helpers_do_not_apply(self):
+        personal = self.root / "personal-gitconfig"
+        personal.write_text("[http]\n\textraHeader = Authorization: Basic personal\n")
+        remote = f"https://github.com/{PROJECT}"
+        clone = self.root / "credential-clone"
+        subprocess.run(["git", "init", "-q", str(clone)], check=True)
+        for key, value in (
+            ("http.https://github.com/.extraheader", "AUTHORIZATION: basic local"),  # as actions/checkout leaves it
+            (f"http.{remote}.extraheader", "AUTHORIZATION: basic repository"),
+            ("credential.https://github.com.helper", "store"),
+        ):
+            subprocess.run(["git", "-C", str(clone), "config", key, value], check=True)
+        environment = patch.dict(
+            os.environ, {"GIT_CONFIG_GLOBAL": str(personal), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_COUNT": "0"}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        pins = patch.object(repair_task, "_app_git_config", ())
+        pins.start()
+        self.addCleanup(pins.stop)
+        repair_task.pin_app_credentials()
+
+        def config(*args, env=None):
+            result = subprocess.run(
+                ["git", "-C", str(clone), "config", *args], capture_output=True, text=True, env=env, check=False
+            )
+            return result.stdout.splitlines()
+
+        # push_result drops the inherited command-scope config and passes only the App's pins.
+        pushing = {k: v for k, v in os.environ.items() if k == "GIT_CONFIG_GLOBAL" or not k.startswith("GIT_CONFIG_")}
+        pushing.update(repair_task.app_git_environment(remote))
+        for env in (None, pushing):
+            self.assertEqual(config("--get-urlmatch", "http.extraHeader", "https://github.com/", env=env), [""])
+            helpers = config("--get-urlmatch", "credential.helper", "https://github.com", env=env)
+            self.assertTrue(helpers[-1].endswith(" auth git-credential"), helpers)
+        self.assertEqual(config("--get-urlmatch", "http.extraHeader", remote, env=pushing), [""])
+        # Agents' isolation replaces the command-scope pins; the global config still resets the host's own.
+        agent = {**os.environ, **{k: v for k, v in repair.isolation_env(self.root / "isolation", {}).items() if v}}
+        self.assertEqual(
+            config("--global", "--get-urlmatch", "http.extraHeader", "https://github.com/", env=agent), [""]
+        )
+        helpers = config("--global", "--get-urlmatch", "credential.helper", "https://github.com", env=agent)
+        self.assertTrue(helpers[-1].endswith(" auth git-credential"), helpers)
+
+    def assert_worktree_hooks_do_not_run(self, cfg_token):
+        """Hooks an agent leaves in its worktree, in the shared hooks directory or through the worktree's
+        own ``core.hooksPath``, run neither in the worker's ordinary git calls nor in its pushes."""
+        sh(self.content.clone, "config", "extensions.worktreeConfig", "true")
+        common = Path(sh(self.content.clone, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        unpinned = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG_")}
+        for index, location in enumerate(("shared", "worktree config")):
+            with self.subTest(location=location):
+                worktree = self.root / f"agent-worktree-{index}"
+                sh(self.content.clone, "worktree", "add", "-q", "--detach", str(worktree), self.content.base)
+                hooks = common / "hooks"
+                if location == "worktree config":
+                    hooks = worktree / "agent-hooks"
+                    sh(worktree, "config", "--worktree", "core.hooksPath", str(hooks))
+                hooks.mkdir(exist_ok=True)
+                leaked = self.root / f"leaked-token-{index}"
+                for name in ("pre-push", "reference-transaction", "post-checkout", "fsmonitor"):
+                    hook = hooks / name
+                    hook.write_text(f'#!/bin/sh\necho "{name}: $GH_TOKEN" >> {shlex.quote(str(leaked))}\n')
+                    hook.chmod(0o755)
+                probe = ["git", "-C", str(worktree), "update-ref", f"refs/probe/{index}", self.content.tip]
+                subprocess.run(probe, env=unpinned, check=True)
+                sh(worktree, "config", "--worktree", "core.fsmonitor", str(hooks / "fsmonitor"))
+                self.assertTrue(leaked.exists(), "the hooks are live without the worker's pins")
+                leaked.unlink()
+                # The worker's ordinary calls inherit its environment.
+                sh(worktree, "checkout", "-q", "--detach", self.content.tip)
+                sh(worktree, "update-ref", f"refs/worker/{index}", self.content.tip)
+                sh(worktree, "status", "--porcelain")
+                task = types.SimpleNamespace(
+                    task_id=f"7{index}",
+                    repository=PROJECT,
+                    submission_ref=f"refs/tauceti-queue/submissions/7{index}/1",
+                    tip=self.content.tip,
+                )
+                cfg = self.config(token=cfg_token, clone=worktree)
+                with patch.object(repair_task, "require_task_execution"):
+                    self.assertEqual(repair_task.check_submission_access(cfg, task, self.root)["rc"], 0)
+                    record = repair_task.push_result(cfg, task, worktree, self.content.tip, self.root, None)
+                self.assertTrue(record["ok"], record)
+                self.assertEqual(sh(self.content.bare, "rev-parse", task.submission_ref), self.content.tip)
+                self.assertFalse(leaked.exists(), leaked.read_text() if leaked.exists() else "")
+                for name in ("pre-push", "reference-transaction", "post-checkout", "fsmonitor"):
+                    (hooks / name).unlink()
+
+    def test_hooks_in_the_agents_worktree_do_not_run_with_the_app_token(self):
+        self.app()
+        pins = patch.object(repair_task, "_app_git_config", ())
+        pins.start()
+        self.addCleanup(pins.stop)
+        environment = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull})
+        environment.start()
+        self.addCleanup(environment.stop)
+        repair_task.pin_app_credentials()
+        self.assertIsNone(repair_task.refresh_github_token())
+        self.assert_worktree_hooks_do_not_run(None)
+
+    def test_hooks_in_the_agents_worktree_do_not_run_with_the_worker_token(self):
+        environment = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_COUNT": "0"})
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop("TAUCETI_QUEUE_GITHUB_APP", None)
+        repair_task.use_worker_token("worker-token")
+        repair_task.use_worker_token("worker-token")
+        self.assertEqual(os.environ["GIT_CONFIG_COUNT"], str(len(repair_task._NO_GIT_HOOKS)), "added once")
+        self.assert_worktree_hooks_do_not_run(TOKEN)
+
+    def test_a_push_without_a_mintable_token_does_not_run(self):
+        from tauceti_queue import github_app
+
+        app, *_ = self.app()
+        task = types.SimpleNamespace(
+            task_id="7", repository=PROJECT, submission_ref="refs/tauceti-queue/submissions/7/1"
+        )
+        with (
+            patch.object(app.tokens, "token", side_effect=github_app.CredentialsError("HTTP 502", retryable=True)),
+            patch.object(repair_task, "require_task_execution"),
+            patch.object(repair, "run_logged", side_effect=AssertionError("pushed")),
+        ):
+            record = repair_task.push_result(self.config(token=None), task, self.root, "a" * 40, self.root, None)
+            self.assertEqual((record["ok"], record["rc"]), (False, 75))
+            self.assertEqual(repair_task.check_submission_access(self.config(token=None), task, self.root)["rc"], 75)
+
+    def test_the_app_and_a_worker_token_together_are_refused(self):
+        from tauceti_worker.config import Die
+
+        self.app()
+        os.environ["TAUCETI_QUEUE_TOKEN"] = "worker-token"
+        with patch.object(repair_task, "_worker_app", None), self.assertRaises(Die):
+            repair_task.worker_app()
+
+    def test_agents_inherit_neither_the_app_directory_nor_a_token(self):
+        self.app()
+        changes = repair.isolation_env(self.root / "isolation", {})
+        for key in ("GH_TOKEN", "GITHUB_TOKEN", "TAUCETI_QUEUE_GITHUB_APP", "TAUCETI_QUEUE_CONFIG"):
+            self.assertIsNone(changes[key], key)
 
 
 def pairs(argv: list[str], flag: str) -> list[tuple[str, str]]:
@@ -3761,12 +4104,12 @@ class SandboxedBuilds(Fixture):
         self.assertIn(repair_sandbox.DISABLE_VARIABLE, detail)
 
     def test_preflight_runs_true_in_the_sandbox(self):
-        by_name = {c["check"]: c for c in repair_task.preflight(self.config(), min_free_gib=0)}
+        by_name = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
         self.assertTrue(by_name["build sandbox"]["ok"], by_name["build sandbox"])
         self.assertIn(str(BIN / "bwrap"), by_name["build sandbox"]["detail"])
         self.assertEqual(self.bwrap_calls()[-1]["argv"][-2:], ["--", "true"])
         (BIN / "sandbox-env.json").write_text("{}")  # the stub now fails, as a broken bwrap would
-        by_name = {c["check"]: c for c in repair_task.preflight(self.config(), min_free_gib=0)}
+        by_name = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
         self.assertFalse(by_name["build sandbox"]["ok"])
 
 
@@ -4116,6 +4459,21 @@ class ErrorParsing(unittest.TestCase):
 
 
 class Records(unittest.TestCase):
+    def test_a_pathless_verification_finding_reaches_the_next_repair_prompt(self):
+        root = Path(tempfile.mkdtemp(prefix="pathless-", dir=TMP))
+        content = Content(root)
+        task = repair_task.Task.from_json({**content.task(12), "claim_token": "x", "expires_at": time.time() + 60})
+        seed = root / "seed"
+        chain = repair.read_chain(seed, content.base, content.tip)
+        context = repair_task.prompt_context(task, None, listings=repair.listings_path(seed))
+        findings = repair_task.task_findings(task)
+        findings["compiler_errors"] = [{"path": "", "message": "the repaired chain failed verification"}]
+        with patch.object(repair, "git", side_effect=AssertionError("pathless findings have no file ownership")):
+            self.assertEqual(repair.owners_of(seed, chain, ""), [])
+        prompt = repair.compose_prompt(context, findings, chain, seed)
+        self.assertIn("Build/verification diagnostic (no file path)", prompt)
+        self.assertIn("the repaired chain failed verification", prompt)
+
     def test_a_pre_rebase_prompt_lists_the_errors_its_preparation_left(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)
@@ -4668,15 +5026,17 @@ class Records(unittest.TestCase):
     def test_the_shell_limit_is_the_repair_task_s_own(self):
         from tauceti_worker import agents
 
-        deadline = time.time() + 3 * 3600
+        self.addCleanup(patch.stopall)
+        patch("tauceti_worker.agents.time.time", return_value=1000).start()
+        deadline = 1000 + 3 * 3600
         with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": str(repair.SHELL_LIMIT_SECONDS)}):
             env = agents._foreground_shell_env(deadline)
         self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "7200000")
         self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "7200000")
         with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": ""}):
-            self.assertEqual(agents._foreground_shell_env(deadline)["BASH_MAX_TIMEOUT_MS"], "600000")
+            self.assertEqual(agents._foreground_shell_env(deadline)["BASH_MAX_TIMEOUT_MS"], "10800000")
         with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": "7200"}):
-            self.assertEqual(agents._foreground_shell_env(time.time() + 30)["BASH_MAX_TIMEOUT_MS"][:2], "29")
+            self.assertEqual(agents._foreground_shell_env(time.time() + 30)["BASH_MAX_TIMEOUT_MS"], "30000")
 
     def test_admin_predicate(self):
         repair_task.verify_admin(PROJECT)
@@ -4710,6 +5070,81 @@ class Records(unittest.TestCase):
         short = repair.chain_report(seed, content.base, content.tip, tip, [m["source_pr"] for m in content.members[:2]])
         self.assertFalse(short["ok"])
         self.assertTrue(any("unknown-member" in p for p in short["problems"]))
+
+    def test_the_review_size_policy_measures_each_commit_against_its_parent_and_accepts_a_split(self):
+        root = Path(tempfile.mkdtemp(prefix="review-size-", dir=TMP))
+        content = Content(root)
+        seed = root / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", content.base)
+        chain = repair.read_chain(seed, content.base, content.tip)
+        long_file = "".join(f"theorem t{i} : True := trivial\n" for i in range(1251))
+        for commit_ in chain:
+            sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
+            if commit_.pr == 2:
+                (seed / "TauCeti" / "Long.lean").write_text(long_file)
+                sh(seed, "add", "-A")
+                sh(seed, "commit", "--quiet", "--amend", "--no-edit")
+        tip = sh(seed, "rev-parse", "HEAD")
+        members = [m["source_pr"] for m in content.members]
+        report = repair.chain_report(seed, content.base, content.tip, tip, members)
+        self.assertFalse(report["ok"])
+        [entry] = report["review_size"]
+        self.assertEqual(entry["pr"], 2)
+        self.assertIn(
+            f"TauCeti/Long.lean: new Lean files must be at most {diff_guard.ci_git.NEW_FILE_LINE_CAP} lines (found 1251)",
+            entry["violations"][0],
+        )
+        self.assertTrue(any(p.startswith("review-size: #2 (commit ") for p in report["problems"]))
+
+        # The agent's check script reports the same rejection, and `--size` measures one commit.
+        record = {
+            "source_pr": 2,
+            "head": content.members[1]["accepted_head"],
+            "reasons": ["long"],
+            "measured": "batch-commit",
+            "batch_commit": tip,
+            "parent": content.base,
+        }
+        raw = {**content.task(1), "diagnostics": [queue_diagnostics.member_policy_finding(json.dumps(record))]}
+        task = repair_task.Task.from_json({**raw, "claim_token": "x", "expires_at": time.time() + 60})
+        listings = repair.listings_path(seed)
+        prompt = repair.compose_prompt(
+            repair_task.prompt_context(task, None, listings=listings),
+            repair_task.task_findings(task),
+            repair.read_chain(seed, content.base, tip),
+            seed,
+        )
+        self.assertIn("## The review-size policy", prompt)
+        self.assertIn("Splitting the change inside the batch is a valid repair", prompt)
+        self.assertIn("python3 .tauceti-repair/check --size <commit>", prompt)
+        check = listings.parent / "check"
+
+        def run(*args: str) -> tuple[int, str]:
+            result = subprocess.run([sys.executable, str(check), *args], cwd=seed, text=True, capture_output=True)
+            return result.returncode, result.stdout.strip()
+
+        rc, problem = run()
+        self.assertEqual(rc, 1)
+        self.assertIn("(#2): the staging review-size policy measures this commit against its parent", problem)
+        second = sh(seed, "rev-list", "--reverse", f"{content.base}..HEAD").split()[1]
+        rc, measured = run("--size", second)
+        self.assertEqual((rc, json.loads(measured)["new_files_too_long"]), (1, [["TauCeti/Long.lean", 1251]]))
+
+        # Splitting the long file inside member 2's own commit satisfies the policy.
+        sh(seed, "checkout", "--quiet", "--detach", content.base)
+        for commit_ in chain:
+            sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
+            if commit_.pr == 2:
+                lines = long_file.splitlines(keepends=True)
+                (seed / "TauCeti" / "Long.lean").write_text("".join(lines[:650]))
+                (seed / "TauCeti" / "Long2.lean").write_text("".join(lines[650:]))
+                sh(seed, "add", "-A")
+                sh(seed, "commit", "--quiet", "--amend", "--no-edit")
+        split = sh(seed, "rev-parse", "HEAD")
+        report = repair.chain_report(seed, content.base, content.tip, split, members)
+        self.assertEqual(report["review_size"], [])
+        self.assertTrue(report["ok"], report["problems"])
+        self.assertEqual(run(), (0, "ok"))
 
 
 TOOLS_REPOSITORY, TOOLS_REF = make_tools_repository(TMP / "tools")
@@ -4840,7 +5275,7 @@ class WorkerAudits(Fixture):
         self.assertEqual(self.service.done, set())
         self.assertEqual(len(self.service.results), 1)
         before = (len(self.agent_calls()), len(self.lake_calls()))
-        [saved] = repair_task.resume_pending(cfg, client)
+        [saved] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(saved["reason"], "repair-checkpoint", saved)
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
         self.assertFalse((cfg.root / "worktrees/task-1").exists())
@@ -4882,7 +5317,7 @@ class WorkerAudits(Fixture):
             pending = repair_task.claim_and_run(cfg, client)
         self.assertEqual(pending["status"], "delivery_pending", pending)
         before = (len(self.agent_calls()), len(self.lake_calls()))
-        [recovered] = repair_task.resume_pending(cfg, client)
+        [recovered] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(recovered["status"], "adopted", recovered)
         self.assertEqual(recovered["response"]["reason"], "already-adopted")
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
@@ -4970,7 +5405,7 @@ class WorkerAudits(Fixture):
             pending = repair_task.claim_and_run(cfg, client)
         self.assertEqual(pending["status"], "delivery_pending", pending)
         before = (len(self.agent_calls()), len(self.lake_calls()))
-        [recovered] = repair_task.resume_pending(cfg, client)
+        [recovered] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(recovered["status"], "adopted", recovered)
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
 
@@ -4983,7 +5418,7 @@ class WorkerAudits(Fixture):
         before = (len(self.agent_calls()), len(self.lake_calls()))
         self.assertEqual(self.service.releases, [])
         self.assertTrue((cfg.root / "worktrees/task-1").exists())
-        [outcome] = repair_task.resume_pending(cfg, client)
+        [outcome] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
         self.assertFalse((cfg.root / "worktrees/task-1").exists())
@@ -4995,7 +5430,7 @@ class WorkerAudits(Fixture):
             self.assertEqual(repair_task.claim_and_run(cfg, client)["status"], "delivery_pending")
         before = (len(self.agent_calls()), len(self.lake_calls()))
         cfg.worker_audits = True
-        [outcome] = repair_task.resume_pending(cfg, client)
+        [outcome] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual(len(self.agent_calls()), before[0])
         self.assertGreater(len(self.lake_calls()), before[1])
@@ -5935,7 +6370,7 @@ class EarlyPublication(Fixture):
             pending = repair_task.claim_and_run(cfg, client)
         self.assertEqual(pending["status"], "delivery_pending", pending)
         before = (len(self.agent_calls()), len(self.lake_builds()))
-        [recovered] = repair_task.resume_pending(cfg, client)
+        [recovered] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(recovered["status"], "adopted", recovered)
         self.assertEqual((len(self.agent_calls()), len(self.lake_builds())), before)
         records = repair_publish.BACKGROUND.wait(60)
@@ -6093,6 +6528,34 @@ class EarlyPublication(Fixture):
         self.assertEqual(len(calls), 2)
         self.assertTrue(repair_publish.BACKGROUND.wait(20)[0]["published"])
         self.assertEqual(list((cfg.root / "worktrees").glob("task-1-publish-*")), [])
+
+
+class ToolsMainPin(unittest.TestCase):
+    """``ref = "main"`` follows TauCetiTools main; each audit checks out its current commit."""
+
+    def test_main_resolves_to_the_branch_tip_and_moves_with_it(self):
+        self.assertEqual(
+            repair_audit.parse_tools_pin('[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "main"\n'),
+            ("TauCetiProject/TauCetiTools", "main"),
+        )
+        with self.assertRaises(repair_audit.Unavailable):
+            repair_audit.parse_tools_pin('[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "develop"\n')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, first = make_tools_repository(root / "tools")
+            sh(repo, "branch", "-M", "main")
+            os.environ[repair_audit.URL_VARIABLE] = str(repo)
+            self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
+            checkout = repair_audit.tools_checkout(root / "checkouts", "TauCetiProject/TauCetiTools", "main")
+            self.assertEqual(checkout.name, first)
+            (repo / "tauceti_tools" / "moved.py").write_text("")
+            sh(repo, "add", "-A")
+            sh(repo, "-c", "user.name=T", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "move")
+            moved = repair_audit.tools_checkout(root / "checkouts", "TauCetiProject/TauCetiTools", "main")
+            self.assertEqual(moved.name, sh(repo, "rev-parse", "HEAD"))
+            self.assertNotEqual(moved.name, first)
+            with self.assertRaises(repair_audit.Unavailable):
+                repair_audit.tools_checkout(root / "checkouts", "TauCetiProject/TauCetiTools", "absent")
 
 
 if __name__ == "__main__":

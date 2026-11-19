@@ -30,14 +30,16 @@ The profile is one JSON object with exactly these fields:
 | `project_configuration_sha256` | SHA-256 of those exact project bytes |
 | `execution_policy` | Approved `ExecutionPolicy.record(with_config=False)` object |
 | `workflow_revision` | Immutable GitHub execution caller commit, 40 hex characters |
-| `publishers` | Object with `generation`, `reviews`, `statuses`, and `recoveries` |
+| `publishers` | Object with `recoveries` |
 | `control_policy_file` | Absolute path to the existing source-bound control policy |
 | `source_credentials` | Object with `origin`, `api_token_file`, and `git_token_file` |
 | `source_webhook_secret_file` | Absolute path to the separate Forgejo webhook secret |
 
-`publishers.generation` is the approved fresh 32-hex authority generation. Its
-three roles are nonempty arrays of source-local numeric user IDs, with no
-duplicates. `source_credentials.origin` has exactly `kind` and `url`; it must match
+`publishers.recoveries` is a nonempty array of source-local numeric user IDs,
+with no duplicates: the controller's own source account, whose recovery holds
+count as the GitHub bot logins' do. Scoreboards and commit statuses need no
+enrollment; they count as on GitHub, and older profiles' `generation`, `reviews` and `statuses`
+keys are ignored. `source_credentials.origin` has exactly `kind` and `url`; it must match
 the independently approved policy before token files are read. Source API/Git
 tokens and webhook secrets are visible ASCII; the webhook secret has at least
 32 characters. Credentials never appear in command arguments or status.
@@ -56,7 +58,10 @@ The queue TOML must explicitly name `repository`, `canonical_branch`,
 `listen_port`, `public_url`, `admission_source`, `admission_rubrics`, and
 `admission_lean_root`. Paths are absolute. Source/branch, project Lean root,
 and source/execution policy must agree. The project must declare a nonempty
-`review.rubrics` list matching `admission_rubrics` in the same order.
+`review.rubrics` list matching `admission_rubrics` in the same order. A rubric the
+pinned review policy is phasing in for the source repository is required as well,
+of PRs above that repository's own cutoff; the review engine adds it to the
+project's list by the same table, so neither list names it.
 `admission_source` must be `policy`. Start rehearsal profiles with
 `publication_enabled = false`; persisted runtime controls keep their existing
 precedence after startup.

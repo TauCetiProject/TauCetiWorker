@@ -174,6 +174,11 @@ def run_round(w, opts, *, use_fleet_focus=True):
             log(f"{name}: unavailable; " + "; ".join(result.errors))
         else:
             log(f"{name}: {result.n_open_nondraft} open PRs; {result.status_label_line()}")
+            if result.detail_reads or result.detail_deferred:
+                log(
+                    f"{name}: read review state for {result.detail_reads} PR(s); "
+                    f"{result.detail_deferred} PR(s) with no cached observation left for later surveys"
+                )
             for error in result.errors:
                 log(error)
     healthy = [
@@ -322,17 +327,13 @@ def display_survey(cfg, gh):
     return result
 
 
-def recover_native(cfg, ctx, opts):
-    """Reconcile retained native publication before model admission."""
-    from .repair_recovery import recover
-    from .source_claims import SourceClaims
+def publish_native_reviews(cfg, prs=()):
+    """Retry publication of rendered native-forge review output before model admission."""
     from .source_publication import pending
-    from .work_units import Worker
 
     source = native_source(cfg)
     cfg = source_config(cfg, source)
     if source.anonymous_discovery:
         return False
     with activate(source, cfg):
-        worker = Worker(cfg, source, ReviewState(cfg, source), Counters(cfg), ctx, SourceClaims(cfg, ctx, source))
-        return pending(source, cfg, numbers=getattr(opts, "prs", ())) or recover(worker, opts)
+        return pending(source, cfg, numbers=prs)

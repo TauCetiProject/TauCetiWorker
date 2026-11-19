@@ -189,19 +189,21 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             TAUCETI_PROCESS_CONTAINMENT="invalid-old-policy",
             TAUCETI_VERIFY_STATE=str(self.state),
             TAUCETI_LOCAL_LINT_CACHE=str(self.home / "local-lint-cache"),
-            TAUCETI_VERIFY_MIN_FREE_PERCENT="0",
-            TAUCETI_VERIFY_STORAGE_DIR=str(self.home / "verification-storage"),
-            TAUCETI_VERIFY_STORAGE_BYTES=str(512 * 1024**2),
-            TAUCETI_VERIFY_CANDIDATE_BYTES=str(64 * 1024**2),
-            TAUCETI_VERIFY_MIN_FREE_BYTES="1",
             TAUCETI_VERIFY_CACHE_DIR=str(self.home / "cache"),
             TAUCETI_VERIFY_BASE=self.base,
-            TAUCETI_VERIFY_CHECKPOINT_MARGIN="0",
             TAUCETI_LOCAL_AXIOMS_CACHE=str(self.home / "local-axioms-cache"),
         )
         self.environ = patch.dict(os.environ, self.env, clear=True)
         self.environ.start()
         self.addCleanup(self.environ.stop)
+
+    def on_main(self, name, contents):
+        """Land a change outside the library on main: a candidate edit there fails the scope guard."""
+        write(self.root, name, contents)
+        git(self.root, "commit", "-qam", f"main changes {name}")
+        self.base = git(self.root, "rev-parse", "HEAD")
+        git(self.root, "update-ref", "refs/remotes/origin/main", self.base)
+        os.environ["TAUCETI_VERIFY_BASE"] = self.base
 
     def verify(self, **kwargs):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -293,8 +295,8 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["commands"][-1]["exit"], 23)
         os.environ.pop("FIXTURE_MODE")
-        # Candidate-owned style scripts cannot replace the shared implementation.
-        write(self.root, "scripts/lint-style.sh", "false | cat\n")
+        # Candidate-owned style scripts cannot replace the shared implementation, even once main has them.
+        self.on_main("scripts/lint-style.sh", "false | cat\n")
         result = self.verify(stage="lint")
         self.assertEqual(result["status"], "success", result.get("error"))
 
@@ -402,7 +404,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertIn("TauCeti.New", scope(self.root, self.base, "ordinary")["modules"])
         self.assertEqual(local_main(self.root), self.base)
 
-    def test_owner_death_leaves_incomplete_receipt_and_recoverable_job(self):
+    def test_owner_death_leaves_incomplete_receipt_and_no_continuation_state(self):
         p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60")
         try:
             self.wait_calls(p)
@@ -420,7 +422,8 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             self.assertFalse(running(owned_tool), "verification tool survived its owner")
             receipt = json.loads(next(self.state.glob("verification/*/receipt.json")).read_text())
             self.assertEqual(receipt["status"], "incomplete")
-            self.assertEqual(len(list((self.state / "verification-pending").glob("*.json"))), 1)
+            for name in ("verification-pending", "verification-jobs", "verification-candidates"):
+                self.assertFalse((self.state / name).exists(), name)
             q = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker2"))
             out, _ = q.communicate(timeout=10)
             self.assertEqual(q.returncode, 0, out)
@@ -429,14 +432,18 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
                 p.kill()
                 p.communicate(timeout=10)
 
-    def test_deadline_interrupts_child_and_sigterm(self):
-        # Leave startup/probing time before exercising cancellation of the live child.
-        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60", TAUCETI_ROUND_DEADLINE=str(time.time() + 10))
-        out, _ = p.communicate(timeout=20)
+    def test_round_deadline_does_not_interrupt_verification(self):
+        # An already-passed round deadline is not a verification limit: the checks run to completion.
+        p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="2", TAUCETI_ROUND_DEADLINE=str(time.time() - 60))
+        out, _ = p.communicate(timeout=30)
         result = json.loads(out)
-        self.assertEqual(result["status"], "incomplete")
-        self.assertLess(result["commands"][-1]["exit"], 0)
-        (self.root / ".lake/calls").unlink()
+        self.assertEqual(result["status"], "success", result.get("error"))
+        self.assertEqual(Path(result["receipt"]).parent.parent, self.state / "verification")
+        for name in ("verification-pending", "verification-jobs", "verification-candidates", "verification-job-index"):
+            self.assertFalse((self.state / name).exists(), name)
+        self.assertNotIn("continuation_job", result)
+
+    def test_sigterm_interrupts_child(self):
         p = self.spawn(FIXTURE_MODE="sleep", TAUCETI_VERIFY_STATE=str(self.home / "sigterm-state"))
         self.wait_calls(p)
         p.send_signal(signal.SIGTERM)
@@ -628,11 +635,8 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "failed", result.get("error"))
 
     def test_missing_parent_tools_do_not_crash_identity_readiness_or_json_receipt(self):
-        from tauceti_worker.verification_jobs import tool_readiness
-
         with patch.object(verification_tools, "root", side_effect=verification_tools.Unavailable("Tools removed")):
             self.assertIsInstance(verification_tools.identity(), str)
-            self.assertIsInstance(tool_readiness({}), str)
             result = self.verify(stage="build")
         self.assertEqual(result["status"], "incomplete", result.get("error"))
         self.assertEqual(result["incomplete_reason"], "tool-missing")
@@ -669,17 +673,13 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             result = self.verify(stage="shim-expiry", reuse=False)
             self.assertEqual(result["status"], "failed", (code, result.get("error")))
 
-    def test_tools_changes_invalidate_receipts_and_readiness(self):
-        from tauceti_worker.verification_jobs import tool_readiness
-
+    def test_tools_changes_invalidate_receipts(self):
         tools = self.home / "installed-tools"
         marker = write(tools, "checker.py", "# installed Tools revision one\n")
         with patch.object(verification_tools, "root", return_value=tools):
             first = self.verify(stage="build")
-            before = tool_readiness({})
             marker.write_text("# installed Tools revision two\n")
             second = self.verify(stage="build")
-            self.assertNotEqual(before, tool_readiness({}))
         self.assertEqual(first["status"], "success", first.get("error"))
         self.assertEqual(second["status"], "success", second.get("error"))
         self.assertNotEqual(first["fingerprint"], second["fingerprint"])
@@ -699,7 +699,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
 
     def test_explicit_lint_modules_are_bound_inputs(self):
         modules = write(self.home, "lint-modules.txt", "TauCeti.B\n")
-        write(self.root, "scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
+        self.on_main("scripts/lint-env.sh", 'cat "$LINT_ONLY_MODULES"\n')
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertEqual(result["status"], "success", result.get("error"))
         lint = next(c for c in result["commands"] if "environment" in c["argv"])
@@ -709,19 +709,13 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         result = self.verify(stage="lint", lint_modules=modules)
         self.assertNotIn("reused_from", result["phases"]["lint"])
 
-    def test_bubble_checkpoint_survives_incomplete_verification(self):
+    def test_bubble_verification_keeps_no_source_checkpoint(self):
         write(self.root, "TauCeti/A.lean", "candidate edit\n")
-        write(self.root, "TauCeti/Untracked.lean", "untracked edit\n")
-        with patch.dict(os.environ, TAUCETI_VERIFY_BUBBLE="1", TAUCETI_VERIFY_CHECKPOINT_MARGIN="10"):
-            result = self.verify(stage="build", deadline=time.time() + 1)
-        self.assertEqual(result["status"], "incomplete")
-        checkpoint = Path(result["source_checkpoint"])
-        self.assertTrue(checkpoint.is_file())
-        self.assertIn("candidate edit", checkpoint.with_name("source.patch").read_text())
-        import tarfile
-
-        with tarfile.open(checkpoint.with_name("untracked.tar")) as archive:
-            self.assertEqual(archive.extractfile("TauCeti/Untracked.lean").read(), b"untracked edit\n")
+        with patch.dict(os.environ, TAUCETI_VERIFY_BUBBLE="1", FIXTURE_MODE="fail"):
+            result = self.verify(stage="build")
+        self.assertNotEqual(result["status"], "success")
+        self.assertNotIn("source_checkpoint", result)
+        self.assertFalse((self.state / "verification-checkpoints").exists())
 
     def test_content_cache_rechecks_changed_ctime(self):
         self.verify(stage="build")
@@ -761,14 +755,17 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--lint-modules", result.stdout)
 
-    def test_host_wrapper_keeps_shell_work_foreground_and_bounds_each_command(self):
+    def test_host_wrapper_keeps_verification_foreground_until_the_round_deadline(self):
         from tauceti_worker.agents import host_agent_argv, local_verification
 
-        with patch.dict(os.environ, TAUCETI_ROUND_DEADLINE=str(time.time() + 1800)):
+        with (
+            patch("tauceti_worker.agents.time.time", return_value=1000),
+            patch.dict(os.environ, TAUCETI_ROUND_DEADLINE="2800", TAUCETI_SHELL_LIMIT_SECONDS=""),
+        ):
             _, env = host_agent_argv("fixture prompt", "claude")
         self.assertEqual(env["TAUCETI_VERIFY_PYTHON"], sys.executable)
-        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "600000")
-        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "600000")
+        self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "1800000")
+        self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "1800000")
         self.assertEqual(env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
         self.assertIn(sys.executable, local_verification("ordinary"))
 

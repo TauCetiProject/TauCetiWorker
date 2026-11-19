@@ -5,6 +5,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,7 +22,7 @@ from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
 from tauceti_worker.config import Config, Die, NoProgress
 from tauceti_worker.multi_source import collect, deduplicate
 from tauceti_worker.review_state import Meta
-from tauceti_worker.source_cli import api_command
+from tauceti_worker.source_cli import api_command, checkout
 from tauceti_worker.source_execution import still_actionable
 from tauceti_worker.source_identity import SourceActor
 from tauceti_worker.source_survey import worker_survey
@@ -30,6 +31,58 @@ from tauceti_worker.worker_sources import configure, source_config
 
 
 class Sources(unittest.TestCase):
+    def test_native_cli_token_loading_does_not_require_host_root_uid_mapping(self):
+        from tauceti_queue.control_policy_file import ControlPolicyError
+        from tauceti_worker.source_cli import load_source
+        from tauceti_worker.worker_sources import native_source
+
+        credential = self.root / "worker-token"
+        credential.write_text("private-test-token\n")
+        credential.chmod(0o600)
+        environment = dict(
+            TAUCETI_SOURCE_BINDING=json.dumps(self.identity.record()),
+            TAUCETI_FORGEJO_ORIGIN=self.repo.forge.url,
+            TAUCETI_FORGEJO_REPO=self.repo.name,
+            TAUCETI_FORGEJO_REPOSITORY_ID=str(self.identity.native_id),
+            TAUCETI_FORGEJO_TOKEN_FILE=str(credential),
+            TAUCETI_FORGEJO_USER_ID="3",
+        )
+        with (
+            patch.dict(os.environ, environment),
+            patch("tauceti_queue.control_policy_file._directory", side_effect=ControlPolicyError("unmapped root UID")),
+            patch("tauceti_worker.forgejo_worker.ForgejoWorkerSource", return_value=self.source),
+            patch("tauceti_tools.forge.Forgejo") as client,
+        ):
+            self.assertIs(native_source(self.cfg), self.source)
+            self.assertIs(self.source.shared_inventory, True)
+            client.reset_mock()
+            self.assertIs(load_source(), self.source)
+            client.assert_called_once_with(self.repo.forge, token="private-test-token")
+            self.source.validate_binding.assert_called_once()
+            credential.chmod(0o644)
+            with self.assertRaises(ValueError):
+                load_source()
+            credential.chmod(0o600)
+            link = self.root / "symlink-token"
+            link.symlink_to(credential)
+            os.environ["TAUCETI_FORGEJO_TOKEN_FILE"] = str(link)
+            with self.assertRaises(OSError):
+                load_source()
+
+    def test_native_author_claim_uses_shared_github_namespace_resolution(self):
+        from tauceti_worker.source_claims import main
+
+        with (
+            patch.object(sys, "argv", ["claim-source", "acquire", "author/Algebra/test"]),
+            patch.dict(os.environ, {"TAUCETI_WORKER_ID": "native-worker"}),
+            patch("tauceti_worker.worker_sources.shared_github_environment", return_value=contextlib.nullcontext()),
+            patch("tauceti_worker.github.claims_repo", return_value="team/shared-claims"),
+            patch("tauceti_tools.claims.GitClaim") as claim,
+        ):
+            claim.return_value.command.return_value = 0
+            self.assertEqual(main(), 0)
+            self.assertEqual(claim.call_args.args[:3], ("team/shared-claims", "author/Algebra/test", "native-worker"))
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
@@ -55,6 +108,50 @@ class Sources(unittest.TestCase):
             self.root / "quota",
         )
 
+    def checkout_fixture(self):
+        def git(*args, cwd):
+            return subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@example.org", *args],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        remote = self.root / "remote"
+        remote.mkdir()
+        git("init", "-q", "-b", "main", cwd=remote)
+        git("commit", "-q", "--allow-empty", "-m", "base", cwd=remote)
+        git("checkout", "-q", "-b", "patch-1", cwd=remote)
+        git("commit", "-q", "--allow-empty", "-m", "proposal", cwd=remote)
+        sha = git("rev-parse", "HEAD", cwd=remote)
+        local = self.root / "local"
+        git("clone", "-q", str(remote), str(local), cwd=self.root)
+        self.source.api.pull.return_value = {
+            "head": {"sha": sha, "ref": "patch-1", "repo": {"full_name": "one/project"}}
+        }
+        return remote, local, sha, git
+
+    def test_pr_checkout_accepts_the_worker_branch_that_round_worktrees_pass(self):
+        from tauceti_worker.round_worktrees import local_branch
+
+        remote, local, sha, git = self.checkout_fixture()
+        branch = local_branch(self.cfg, 9)
+        cwd = os.getcwd()
+        os.chdir(local)
+        self.addCleanup(os.chdir, cwd)
+        with patch("tauceti_tools.forge.RepositoryRef", return_value=Mock(clone_url=str(remote))):
+            # The same argument shape as the fix/rebase checkout in work_units.
+            self.assertEqual(checkout(["9", "--force", "--branch", branch], self.source), 0)
+        self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=local), branch)
+        self.assertEqual(git("rev-parse", "HEAD", cwd=local), sha)
+        self.assertEqual(git("config", f"branch.{branch}.merge", cwd=local), "refs/heads/patch-1")
+        self.assertEqual(git("config", f"branch.{branch}.remote", cwd=local), str(remote))
+        # Without --branch the local branch keeps the PR's own name, as gh does.
+        with patch("tauceti_tools.forge.RepositoryRef", return_value=Mock(clone_url=str(remote))):
+            self.assertEqual(checkout(["9", "--force"], self.source), 0)
+        self.assertEqual(git("rev-parse", "--abbrev-ref", "HEAD", cwd=local), "patch-1")
+
     def row(self, number=1, *, author=3, login="worker", head="a" * 40):
         return {
             "number": number,
@@ -71,7 +168,7 @@ class Sources(unittest.TestCase):
             "updatedAt": "2026-11-11T00:00:00Z",
         }
 
-    def native_survey(self, rows, *, blocking=False, metadata=None, roadmap="any", skip=()):
+    def native_survey(self, rows, *, blocking=False, metadata=None, roadmap="any", skip=(), numbers=()):
         self.source.open_prs.return_value = rows
         rs = Mock()
         if metadata is None and blocking:
@@ -90,9 +187,57 @@ class Sources(unittest.TestCase):
             skip=list(skip),
             deep=True,
             stages=["review", "fix", "rebase"],
-            numbers=(),
+            numbers=numbers,
             count_all_roadmaps=True,
         )
+
+    def test_shared_inventory_surveys_preserve_explicit_targets_and_binding_checks(self):
+        self.source.shared_inventory = True
+        self.source.cache_namespace = "d" * 64
+        self.source.inventory_fields = tuple(self.row())
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.root / "shared-discovery")):
+            first = self.native_survey([self.row()])
+            cached = self.native_survey([self.row(2)])
+            self.assertEqual([p.number for p in first.open_prs], [1])
+            self.assertEqual([p.number for p in cached.open_prs], [1])
+            self.assertEqual(self.source.open_prs.call_count, 1)
+            explicit = self.native_survey([self.row(2)], numbers=(2,))
+            self.assertEqual([p.number for p in explicit.open_prs], [2])
+            self.assertEqual(self.source.open_prs.call_count, 2)
+            self.source.binding_current.return_value = False
+            rejected = self.native_survey([self.row(2)])
+            self.assertTrue(rejected.github_failed)
+            self.assertEqual(rejected.dependency_wait["operation"], "binding")
+
+    def test_bound_round_gh_runs_this_runtimes_shim_in_the_round_checkout(self):
+        from tauceti_worker import github, worker_sources
+
+        checkout = self.root / "checkout"
+        # A PR checkout is untrusted: it must not shadow the runtime's own modules.
+        (checkout / "tauceti_worker").mkdir(parents=True)
+        (checkout / "tauceti_worker" / "__init__.py").write_text("raise SystemExit('shadowed')\n")
+        self.source.token_file = self.root / "token"
+        self.source.identity = self.identity
+        marker = worker_sources._selected.set(self.source)
+        self.addCleanup(worker_sources._selected.reset, marker)
+        with (
+            patch.dict(os.environ, {"PATH": str(self.root / "no-gh-here")}),
+            patch("tauceti_worker.source_cli.subprocess.run") as run,
+        ):
+            github.gh_run(["gh", "pr", "checkout", "9", "--force"], cwd=checkout)
+        argv, kwargs = run.call_args.args[0], run.call_args.kwargs
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(argv[1:4], ["-P", "-m", "tauceti_worker.source_cli"])
+        self.assertEqual(argv[4:], ["pr", "checkout", "9", "--force"])
+        self.assertEqual(kwargs["cwd"], checkout)
+        probe = subprocess.run(
+            [sys.executable, "-P", "-c", "import tauceti_worker; print(tauceti_worker.__file__)"],
+            cwd=checkout,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(probe.returncode, 0, probe.stderr)
+        self.assertNotIn(str(checkout), probe.stdout)
 
     def test_default_sources_and_new_pr_destination(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -249,6 +394,162 @@ ci="one/project"
         )
         self.assertFalse(still_actionable("review", SimpleNamespace(gh=self.source), None, candidate))
         self.source.live_pull.assert_not_called()
+
+    def native_worker(self):
+        from tauceti_worker.forgejo_worker import ForgejoWorkerSource
+
+        api = Mock(forge=self.repo.forge, _token="token")
+        source = ForgejoWorkerSource(self.identity, api, token_file=self.root / "token")
+        return SimpleNamespace(gh=source, cfg=self.cfg, counters=Mock(), rs=Mock())
+
+    def test_native_prompt_rewrites_only_complete_content_repository_references(self):
+        from tauceti_worker.agents import TAUCETI, fill_prompt
+
+        template = self.root / "prompt.txt"
+        canonical = "https://github.com/" + TAUCETI
+        shared = [TAUCETI + suffix for suffix in ("Roadmap", "Data", "Review", "-claims", ".archive", ".git-other")]
+        lines = [
+            canonical,
+            canonical + "/pull/7",
+            canonical + ".git",
+            "--repo " + TAUCETI,
+            canonical + ".",
+            canonical + ",",
+            "--repo " + TAUCETI + ")",
+        ]
+        for name in shared:
+            lines.extend(["https://github.com/" + name, "--repo " + name])
+        template.write_text("\n".join(lines) + "\n__CLAIMED__")
+        untrusted = canonical + " --repo " + TAUCETI
+        with patch("tauceti_worker.worker_sources.current", return_value=self.source):
+            rendered = fill_prompt(template, CLAIMED=untrusted).splitlines()
+        native = self.repo.forge.url.removeprefix("https://") + "/" + self.repo.name
+        self.assertEqual(
+            rendered[:7],
+            [
+                self.repo.url,
+                self.repo.url + "/pull/7",
+                self.repo.url + ".git",
+                "--repo " + native,
+                self.repo.url + ".",
+                self.repo.url + ",",
+                "--repo " + native + ")",
+            ],
+        )
+        self.assertEqual(rendered[7:-1], lines[7:])
+        self.assertEqual(rendered[-1], untrusted)
+
+    def test_git_mergeability_is_only_requested_for_owned_unpaused_prs(self):
+        source = self.native_worker().gh
+        source.authenticated_actor = Mock(return_value=self.actor)
+        source.binding_current = Mock(return_value=True)
+        source.pr_progress_state = Mock(return_value=None)
+        rows = [self.row(number=n, author=4 if n == 2 else 3) for n in range(1, 5)]
+        for row in rows:
+            row["mergeable"] = "UNKNOWN"
+        rows[2]["labels"] = [{"name": "hold"}]
+        rows[3]["isDraft"] = True
+        source.open_prs = Mock(return_value=rows)
+        cfg = source_config(self.cfg, source)
+        with patch.object(type(source), "resolve_mergeability", return_value="CONFLICTING") as proof:
+            worker_survey(
+                cfg,
+                source,
+                Mock(),
+                Counters(cfg),
+                roadmap="any",
+                skip=[],
+                deep=True,
+                stages=["rebase"],
+                numbers=(),
+                count_all_roadmaps=True,
+            )
+        proof.assert_called_once_with(source, cfg.state, 1, "a" * 40)
+
+    def test_authoring_has_no_pull_request_for_the_native_source_to_authorize(self):
+        worker = self.native_worker()
+        self.assertTrue(still_actionable("roadmap", worker, None, Candidate(0, "", "Algebra")))
+        self.assertFalse(still_actionable("review", worker, None, Candidate(1, "a" * 40)))
+
+    def test_dispatch_authors_on_the_native_source(self):
+        from tauceti_worker import work_units
+        from tauceti_worker.config import NoProgress
+
+        worker = self.native_worker()
+        worker.gh.pr_list = Mock(return_value=[])
+        options = work_units.RoundOpts(
+            only=["roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False
+        )
+        with (
+            patch.dict(os.environ),
+            patch.object(work_units.shutil, "which", return_value="/usr/bin/claude"),
+            patch.object(work_units, "_check_stage_read_quota"),
+            patch.object(work_units, "do_roadmap", return_value=0) as author,
+            patch("tauceti_worker.activity.select"),
+            # The stubbed round opens no pull request, so the progress guard ends it afterwards.
+            self.assertRaisesRegex(NoProgress, "nothing landed"),
+        ):
+            work_units.dispatch("roadmap", worker, Survey("worker"), Candidate(0, "", "Algebra"), options)
+        author.assert_called_once()
+
+    def test_native_authoring_after_a_declined_github_review_pushes_to_the_native_fork(self):
+        from tauceti_worker import github, work_units
+        from tauceti_worker.config import NoProgress
+        from tauceti_worker.multi_source import run_round
+
+        for cached in (github.ensure_fork, github._resolve_claims_repo):
+            cached.cache_clear()
+            self.addCleanup(cached.cache_clear)
+        reviewing = SimpleNamespace(
+            cfg=self.cfg,
+            gh=Mock(repo=github.TAUCETI, worker_capable=False),
+            rs=Mock(),
+            counters=Mock(read=Mock(return_value=0)),
+        )
+        review_work = Survey("worker")
+        review_work.reviewable.actionable.append(Candidate(1, "a" * 40))
+        self.source.token_file = self.root / "token"
+        self.source.api.request.return_value = {"id": 3, "email": "worker@example.org"}
+        self.source.writable_repository.return_value = RepositoryRef(self.repo.forge, "native-user/TauCeti")
+        self.source.pr_list.return_value = []
+        authoring = SimpleNamespace(cfg=self.cfg, gh=self.source, rs=Mock(), counters=Mock(read=Mock(return_value=0)))
+        observations = [("github", reviewing, review_work), ("forgejo", authoring, Survey("worker"))]
+        options = work_units.RoundOpts(
+            only=["review", "roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False
+        )
+        launches = []
+
+        def launch(checkout, prompt, *args, **kwargs):
+            launches.append((dict(os.environ), prompt))
+            return 0
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": "forgejo"}),
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch.object(github, "shared_claims_granted", return_value=False),
+            patch.object(github, "_resolve_fork", return_value="github-user/TauCeti"),
+            patch.object(github, "can_push", return_value=True),
+            patch.object(work_units, "_claim_held_elsewhere", return_value=True),
+            patch.object(work_units, "mirror_creds"),
+            patch("tauceti_worker.review_diagnostics.refund_stale_head_errors"),
+            patch("tauceti_worker.activity.select"),
+            patch.object(work_units.shutil, "which", return_value="/usr/bin/claude"),
+            patch.object(work_units, "_check_stage_read_quota"),
+            patch.object(work_units, "avoid_list", return_value="none"),
+            patch.object(work_units, "fetch_ref", return_value=True),
+            patch.object(work_units, "stage_rubrics", return_value=None),
+            patch.object(work_units, "prepare_checkout", return_value=True),
+            patch.object(work_units, "run_agent_host", side_effect=launch),
+            # The agent opens no pull request, so the progress guard ends the round afterwards.
+            self.assertRaisesRegex(NoProgress, "nothing landed"),
+        ):
+            os.environ.pop("CLAIM_REPO", None)
+            os.environ.pop("TAUCETI_FORK", None)
+            run_round(None, options)
+        [(environment, prompt)] = launches
+        self.assertEqual(environment["TAUCETI_PUSH_REMOTE"], "https://git.example.org/native-user/TauCeti")
+        self.assertIn("--head native-user:roadmap/", prompt)
+        self.source.writable_repository.assert_called_once_with()
 
     def test_github_identity_outage_does_not_hide_native_inventory(self):
         worker = SimpleNamespace(cfg=self.cfg, gh=Mock(repo="one/project"), rs=Mock(), counters=Mock(), rc=None)
@@ -456,10 +757,10 @@ ci="one/project"
         self.assertEqual(counters.read("review-err-1"), 0)
         self.assertTrue(counters.unchanged_review_recent(1, "a" * 40))
 
-    def test_native_recovery_runs_without_provider_admission(self):
+    def test_native_review_publication_runs_without_provider_admission(self):
         import contextlib
 
-        from tauceti_worker.multi_source import recover_native
+        from tauceti_worker.multi_source import publish_native_reviews
 
         with (
             patch("tauceti_worker.multi_source.native_source", return_value=self.source),
@@ -469,7 +770,7 @@ ci="one/project"
             patch("tauceti_worker.cli.resolve_work_model", side_effect=AssertionError("provider admission")),
         ):
             self.source.anonymous_discovery = False
-            self.assertTrue(recover_native(self.cfg, None, SimpleNamespace()))
+            self.assertTrue(publish_native_reviews(self.cfg))
             pending.assert_called_once()
 
     def test_native_execution_failure_does_not_invalidate_github_authoring_inventory(self):
@@ -695,9 +996,6 @@ ci="one/project"
                     patch("tauceti_worker.loop.run_round_subprocess", side_effect=KeyboardInterrupt) as launch,
                     patch("tauceti_worker.loop.github_budget", return_value={}),
                     patch("tauceti_worker.loop.fleet_admission_reason", return_value=None),
-                    patch("tauceti_worker.verification_jobs.resume_pending"),
-                    patch("tauceti_worker.verification_jobs.reap_continuations"),
-                    patch("tauceti_worker.repair_recovery.due", return_value=False),
                 ):
                     cmd_loop(args, self.cfg, only=["review"], agent="deepseek")
                 child = build_parser().parse_args(["_round", *launch.call_args.args[0]])
@@ -794,7 +1092,7 @@ ci="one/project"
         self.assertTrue(work.is_dir())
         self.assertEqual(json.loads(receipt.read_text())["threads"][0]["body"], "paid finding")
         receipt.write_text(json.dumps(dict(state="published")))
-        with patch("tauceti_worker.work_recovery.live_users", return_value=[]):
+        with patch("tauceti_worker.live_use.live_users", return_value=[]):
             collect_review_scratch(self.cfg, fresh_report())
         self.assertFalse(work.exists())
 
@@ -807,18 +1105,18 @@ ci="one/project"
         (work / "review-context.json").write_text(
             json.dumps({"source": self.identity.record(), "store": str(self.cfg.store), "pr": 1, "process": {"pid": 7}})
         )
-        with patch("tauceti_worker.work_recovery.owner_stopped", return_value=False):
+        with patch("tauceti_worker.live_use.owner_stopped", return_value=False):
             self.assertFalse(pending(self.source, self.cfg))
             self.assertTrue(work.exists())
         with (
-            patch("tauceti_worker.work_recovery.owner_stopped", return_value=True),
-            patch("tauceti_worker.work_recovery.live_users", return_value=["active reviewer"]),
+            patch("tauceti_worker.live_use.owner_stopped", return_value=True),
+            patch("tauceti_worker.live_use.live_users", return_value=["active reviewer"]),
         ):
             self.assertFalse(pending(self.source, self.cfg))
             self.assertTrue(work.exists())
         with (
-            patch("tauceti_worker.work_recovery.owner_stopped", return_value=True),
-            patch("tauceti_worker.work_recovery.live_users", return_value=[]),
+            patch("tauceti_worker.live_use.owner_stopped", return_value=True),
+            patch("tauceti_worker.live_use.live_users", return_value=[]),
         ):
             self.assertFalse(pending(self.source, self.cfg))
             self.assertFalse(work.exists())

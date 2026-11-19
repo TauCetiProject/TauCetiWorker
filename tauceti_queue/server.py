@@ -9,14 +9,21 @@ same process. Routes:
     GET  /status                                      the controller's status JSON plus the service's
                                                       revision, start time, GitHub client counters,
                                                       webhook counters and the identity cache
+    GET  /status/summary                              the sections the monitoring publisher reads,
+                                                      waiting at most HEALTHZ_LOCK_WAIT_SECONDS for
+                                                      the controller lock (else the last snapshot)
     GET  /repositories/<n>/active-batches?base=..     tauceti-bors.observation/v1 (feeds.py)
     GET  /repositories/<n>/candidates?base=..         tauceti-bors.candidates/v1 (feeds.py)
     POST /webhook/github                              HMAC-verified GitHub deliveries (webhook.py)
     POST /tasks/claim                                 worker endpoints: JSON bodies, authenticated by
     POST /tasks/<id>/renew                            a GitHub token in `Authorization: Bearer`,
-    POST /tasks/<id>/result                           resolved to a login through `GET /user`
+    POST /tasks/<id>/result                           resolved to a login through `GET /user` (or a
+                                                      co-located worker's `local_worker_bearer`,
+                                                      signed with the App key, for these alone)
     POST /admin/settings                              same bearer scheme; the controller checks the
     POST /admin/urgent                                caller's repository-admin permission
+    POST /admin/emergency                             `{"repo", "pr", "reason"}`: an emergency request
+    POST /admin/emergency-cancel                      `{"repo", "pr"}`: its withdrawal
     POST /admin/revoke-identity                       `{"login": ...}`: forget the cached identity
                                                       and admin answers for a login
 
@@ -26,7 +33,8 @@ controller's `DEFAULT_SETTINGS`, each value of the type of that setting's initia
 The controller methods behind them: `status()`, `handle_event`, `claim_task(worker_identity,
 github_login)`, `renew_task(task_id, worker_identity, github_login, body)`, `submit_task(task_id,
 worker_identity, github_login, body)`, `update_settings(github_login, settings)`, `mark_urgent(repo,
-pr, actor)`, and the `feeds.FeedSource` reads. A controller may raise `PermissionError` (403),
+pr, actor)`, `request_emergency(repo, pr, actor, surface=, reason=)`, `cancel_emergency(repo, pr,
+actor, surface=)`, and the `feeds.FeedSource` reads. A controller may raise `PermissionError` (403),
 `LookupError` (404) or `ValueError` (400); anything else is a 500 with the traceback logged.
 """
 
@@ -39,7 +47,6 @@ import json
 import logging
 import pathlib
 import re
-import subprocess
 import threading
 import time
 import traceback
@@ -47,7 +54,7 @@ import urllib.parse
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import feeds, webhook
+from . import feeds, github_app, webhook
 from .ports import GitHubUnavailable
 from .source_authority import (
     NativeQueueAuthority,
@@ -116,14 +123,16 @@ class ServerConfig:
 
 
 def running_revision(package_dir: pathlib.Path | None = None) -> str:
-    """The git SHA of the running checkout, so a deployment can be verified from `/status`."""
-    root = (package_dir or pathlib.Path(__file__).resolve().parent).parent
-    try:
-        return subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    """The git SHA of the code this process runs, so a deployment can be verified from `/status`.
+
+    Read once when the server starts: the release's baked `_revision.py` when present (each install
+    bakes one into its own release directory), else `git rev-parse HEAD` in the package's checkout.
+    Empty when neither answers.
+    """
+    from . import runtime
+
+    revision = runtime.running_revision(package_dir or pathlib.Path(__file__).resolve().parent)
+    return "" if revision.sha == "unknown" else revision.sha
 
 
 class BearerAuth:
@@ -134,6 +143,11 @@ class BearerAuth:
     out of their claims. With a `store` the digests and logins (never the tokens) are persisted, so
     a restart during such an outage keeps them too. A 401 from GitHub still evicts the entry and
     refuses the token.
+
+    A bearer of the form `github_app.local_worker_bearer` (a co-located repair worker holding the
+    App's private key) is checked against the adapter's App credentials with no GitHub request and no
+    cache entry, and resolves to the App's bot login (`local_worker_login`), which the controller
+    trusts for claims and submissions and `_admin` refuses.
     """
 
     def __init__(
@@ -145,6 +159,13 @@ class BearerAuth:
         store=None,
         max_age: float = MAX_AGE_SECONDS,
     ) -> None:
+        app_credentials = getattr(adapter, "app_credentials", None)
+        credentials = app_credentials() if callable(app_credentials) else None
+        self.local_credentials = credentials if isinstance(credentials, github_app.AppCredentials) else None
+        self.local_login = (
+            github_app.local_worker_login(self.local_credentials) if self.local_credentials is not None else None
+        )
+        self.clock = clock
         self.cache = StaleCache(
             adapter.user_for_token,
             ttl=ttl,
@@ -168,15 +189,44 @@ class BearerAuth:
         token = header[len("Bearer ") :].strip()
         if not token:
             return None
+        if token.startswith(github_app.LOCAL_WORKER_PREFIX):
+            if self.local_credentials is None or not github_app.verify_local_worker_bearer(
+                self.local_credentials, token, self.clock()
+            ):
+                log.warning("refused a local-worker bearer that is stale or not signed by the App's key")
+                return None
+            return self.local_login, 0
         digest = hashlib.sha256(token.encode()).hexdigest()
         try:
-            return self.cache.get(digest, token)
+            identity = self.cache.get(digest, token)
         except GitHubUnavailable as error:
             log.warning("bearer identity lookup failed with nothing cached for %s: %s", digest[:12], error)
             return None
+        if identity is not None and self.local_login is not None and identity[0] == self.local_login:
+            return None  # Only the App's key, never a GitHub token, speaks for the local worker login.
+        return identity
 
 
 HEALTHZ_LOCK_WAIT_SECONDS = 0.5
+# `/status/summary`: the small sections `tauceti_queue.monitoring` reads every few seconds. The full
+# document carries every open task's diagnostics and every waiting input (megabytes); the summary
+# omits them and, like `/healthz`, never waits long for a reconciliation pass.
+STATUS_SUMMARY_KEYS = (
+    "schema",
+    "generated_at",
+    "repository",
+    "canonical_branch",
+    "canonical_sha",
+    "service",
+    "settings",
+    "publication_enabled",
+    "inference_hold",
+    "head",
+    "alerts",
+    "stuck_heads",
+    "snapshot",
+    "stale_seconds",
+)
 
 
 class NativeBearerAuth:
@@ -536,6 +586,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b"ok\n", "text/plain")
         elif path in ("/status", "/status/"):
             self._call(self._status)
+        elif path == "/status/summary":
+            self._call(self._status_summary)
         elif path == "/statistics":
             self._call(self._statistics)
         elif path == "/healthz":
@@ -588,6 +640,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/urgent":
             self._admin_urgent()
             return
+        if path in ("/admin/emergency", "/admin/emergency-cancel"):
+            self._admin_emergency(cancel=path.endswith("-cancel"))
+            return
         if path == "/admin/primary":
             self._admin_primary()
             return
@@ -596,6 +651,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/admin/rebuild-head":
             self._admin_rebuild_head()
+            return
+        if path == "/admin/evict-native":
+            self._admin_evict_native()
             return
         if path == "/admin/import-bors":
             self._admin_import_bors()
@@ -645,6 +703,14 @@ class Handler(BaseHTTPRequestHandler):
         status.update(self._counters())
         return status
 
+    def _status_summary(self) -> dict:
+        status = self._status(wait=HEALTHZ_LOCK_WAIT_SECONDS)
+        summary = {key: status[key] for key in STATUS_SUMMARY_KEYS if key in status}
+        if isinstance(summary.get("head"), dict):
+            # The head's task carries the same bulky diagnostics as `tasks`; keep its identity and stall.
+            summary["head"] = {key: summary["head"][key] for key in ("id", "stall") if key in summary["head"]}
+        return summary
+
     def _healthz(self) -> dict:
         # The liveness probe must answer within a second even while a tick holds the controller lock.
         status = self._status(wait=HEALTHZ_LOCK_WAIT_SECONDS)
@@ -680,6 +746,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._error(403, str(error))
                 return False
             return True
+        if login == getattr(self.server.auth, "local_login", None):
+            self._error(403, "the local repair worker's credential is for the worker endpoints only")
+            return False
         repo = next(iter(self.server.config.repositories.values()), None)
         if not repo:
             self._error(403, f"{login} is not a repository admin")
@@ -719,6 +788,10 @@ class Handler(BaseHTTPRequestHandler):
     def _feed(self, which: str, repo: str, query: dict, *, source=None) -> dict:
         if source is None:
             source = feeds.feed_source(self.server.controller)
+        with feeds.read_snapshot(source) as snapshot:
+            return self._feed_document(which, repo, query, source=snapshot)
+
+    def _feed_document(self, which: str, repo: str, query: dict, *, source) -> dict:
         base = (query.get("base") or [None])[0]
         if not base:
             canonical = getattr(source, "canonical_branch", None)
@@ -885,6 +958,24 @@ class Handler(BaseHTTPRequestHandler):
             lambda: self.server.controller.rebuild_head(repo, identity[0], **self._source_task_kwargs(refresh=True))
         )
 
+    def _admin_evict_native(self) -> None:
+        identity, body = self._authenticated_json()
+        if identity is None or body is None or not self._admin(identity[0]):
+            return
+        if self.server.source_authority is not None:
+            self._error(400, "native-member eviction is for the GitHub-primary controller")
+            return
+        withdraw = body.get("withdraw", [])
+        if (
+            set(body) - {"repo", "withdraw"}
+            or not isinstance(withdraw, list)
+            or not all(isinstance(number, int) and not isinstance(number, bool) and number > 0 for number in withdraw)
+        ):
+            self._error(400, 'body must be {"withdraw": [GitHub PR numbers]} (optional `repo`)')
+            return
+        repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
+        self._call(lambda: self.server.controller.evict_native(repo, identity[0], withdraw=withdraw))
+
     def _admin_primary(self) -> None:
         identity, body = self._authenticated_json()
         if identity is None or body is None or not self._admin(identity[0]):
@@ -975,6 +1066,26 @@ class Handler(BaseHTTPRequestHandler):
         if not self._admin(identity[0]):
             return
         self._call(lambda: self.server.controller.mark_urgent(repo, pr, identity[0]))
+
+    def _admin_emergency(self, *, cancel: bool) -> None:
+        """`POST /admin/emergency {repo, pr, reason}` and `/admin/emergency-cancel {repo, pr}`. `repo` is
+        passed to the controller, whose source checks accept a qualified native key too."""
+        identity, body = self._authenticated_json()
+        if identity is None or body is None:
+            return
+        repo = str(body.get("repo") or next(iter(self.server.config.repositories.values()), ""))
+        pr = body.get("pr")
+        reason = body.get("reason", "")
+        if not repo or not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0 or not isinstance(reason, str):
+            self._error(400, "`repo` must name a repository, `pr` be a positive integer and `reason` text")
+            return
+        if not self._admin(identity[0]):
+            return
+        controller = self.server.controller
+        if cancel:
+            self._call(lambda: controller.cancel_emergency(repo, pr, identity[0], surface="endpoint"))
+        else:
+            self._call(lambda: controller.request_emergency(repo, pr, identity[0], surface="endpoint", reason=reason))
 
     def _admin_import_bors(self) -> None:
         """Bors's state at the cutover: `{"observation": feed, "candidates": journal | [journals], "dry_run", "release_head"}`."""

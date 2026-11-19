@@ -24,6 +24,9 @@ cd "$(dirname "$0")/.." || exit 1
 # Unit fixtures use their mocked transport, never the public production mirror.
 # Service tests explicitly override this; default-resolution tests remove it.
 export TAUCETI_GITHUB_STATE_URL=""
+# Rounds start a background cleanup collector on hosts without the systemd timer. Fixtures and
+# lifecycle scripts must never launch one against the checkout's or the host's real data.
+export TAUCETI_BACKGROUND_CLEANUP=off
 
 FAIL_FAST=0
 JOBS=1
@@ -50,6 +53,8 @@ trap 'rm -rf "$RUN_ROOT"' EXIT
 
 # stdlib-only python tests, run with the project interpreter
 RUN_STDLIB=(
+  build_resources.py
+  build_cache_wait.py
   activity.py
   activity_git.py
   activity_costs.py
@@ -66,22 +71,28 @@ RUN_STDLIB=(
   queue_repair_task.py
   queue_repair_locks.py
   queue_repair_cleanup.py
+  queue_install_releases.py
   queue_repair_cache.py
   queue_claude_stdin.py
   expanded_cache.py
+  canonical_store.py
   cache_storage.py
   local_lint.py
   lean_pressure.py
   repair_pressure.py
   repair_parallel_fold.py
+  round_storage.py
   shared_mathlib.py
   agent_cmds.py
   agent_transcript.py
   auto_stage_priority.py
   automatic_bump.py
   bump_attestation.py
+  self_tested_label.py
+  native_self_tested.py
   authoring_profiles.py
   bubble_cache.py
+  cache_probe_user_agent.py
   bubble_version.py
   branch_claim_repo.py
   build_status_rollup.py
@@ -99,6 +110,8 @@ RUN_STDLIB=(
   fork_authoring.py
   fleet_capacity.py
   forge_inventory.py
+  forgejo_mirror.py
+  forgejo_restore.py
   forge_contracts.py
   forgejo_reads.py
   github_accounts.py
@@ -129,12 +142,13 @@ RUN_STDLIB=(
   local_axioms.py
   verification.py
   verification_audit.py
-  verification_storage.py
   ledger_blocking.py
   loop_sigterm.py
+  graceful_restart.py
   mirror_creds.py
   mirror_creds_macos.py
   oauth_refresh_loop.py
+  oauth_user_agent.py
   observability_failures.py
   open_pr_pages.py
   overlaps.py
@@ -195,6 +209,8 @@ RUN_STDLIB=(
   queue_statistics.py
   queue_admission_state.py
   queue_admission.py
+  queue_admission_evidence.py
+  queue_insertion_check.py
   queue_admission_adapter.py
   queue_config.py
   queue_cli.py
@@ -219,11 +235,13 @@ RUN_STDLIB=(
   review_runtime.py
   review_unchanged_memo.py
   synchronous_state_repair.py
+  source_mergeability.py
   review_scheduling.py
   review_state_freshness.py
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
+  round_crash_reasons.py
   round_file_changes.py
   round_group_sweep.py
   resources.py
@@ -233,6 +251,8 @@ RUN_STDLIB=(
   scoreboard_trust.py
   security_audit.py
   security_audit_served.py
+  security_audit_pool.py
+  security_audit_claude.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py
@@ -250,9 +270,8 @@ RUN_STDLIB=(
   worker_manager_discovery.py
   worker_scopes.py
   workflow_backstop.py
-  recovery_maintenance.py
-  work_recovery.py
-  repair_recovery.py
+  live_use.py
+  round_worktrees.py
 )
 # special-cased python tests (handled explicitly in run_one)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
@@ -266,7 +285,7 @@ SKIP=(integration_forgejo_worker.py egress.sh integration_repair_fixture.py inte
 # Modules whose storage fixtures compare inode/device identity and sweep real directories. They
 # failed on Namespace runners' filesystem (#409) and run on GitHub's native ubuntu-24.04 image in
 # CI; everything else is the `portable` group and runs anywhere.
-NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py verification_storage.py retention.py)
+NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py retention.py)
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.

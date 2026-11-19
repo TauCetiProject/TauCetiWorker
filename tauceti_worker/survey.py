@@ -261,12 +261,15 @@ class PRInfo:
     updated_at: str = ""
     bump_integration_failed: bool = False
     self_tested: bool = False
+    # A failed `scope` status on this head. For a self-tested head, which skips PR CI, PR status
+    # posts it when the diff fails PR CI's size guards; queue admission refuses that head too.
+    scope_failed: bool = False
     work_targets: tuple[str, ...] = ()
     origin_pr: str = ""
 
     @property
     def review_ready(self) -> bool:
-        return self.build_success or self.self_tested
+        return self.build_success or (self.self_tested and not self.scope_failed)
 
     @property
     def needs_ci_repair(self) -> bool:
@@ -293,11 +296,10 @@ class PRInfo:
         # check-run collided with this status context; TauCeti#1156 renamed it to `sandboxed-build`, so
         # no check-run named `build` exists at all now.) A PR with no `build` status yet is pending —
         # neither success nor failed — and simply waits for the trusted build to post.
-        from tauceti_tools.self_tested import accepted, context
+        from tauceti_tools.self_tested import accepted
 
         local = d.get("baseRefName", "main") == "main" and accepted(
             d.get("labels"),
-            next((c.get("state") for c in rollup if c.get("context") == context(d["number"])), ""),
             member=True,
             branch=d.get("headRefName", ""),
         )
@@ -325,6 +327,7 @@ class PRInfo:
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
             self_tested=local,
+            scope_failed=any(c.get("context") == "scope" and c.get("state") in BUILD_FAIL for c in rollup),
             work_targets=work_target_keys(d.get("body", "")),
             origin_pr=origin_pr_url(d.get("body", "")),
             bump_integration_failed=any(
@@ -347,6 +350,7 @@ class Candidate:
     rebase_budget_key: str = ""  # immutable budget chosen by this survey, including its verified progress epoch
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
+    bump_pending: bool = False  # an automatic bump taken before its build finished
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
     source_repository: RepositoryRef | None = None
@@ -405,6 +409,10 @@ class Survey:
     dependency_wait: dict | None = None
     discovery_gaps: int = 0  # diagnostic only; partial history never stops work selection
     discovery_gap_prs: list[int] = field(default_factory=list)
+    # A native source survey's per-PR review-history reads (at most SURVEY_DETAIL_READS), and the PRs
+    # it left unclassified because no cached observation describes their current state. Diagnostic.
+    detail_reads: int = 0
+    detail_deferred: int = 0
     errors: list[str] = field(default_factory=list)
     # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
     # can't review them and CI's round cap can't catch them (rounds never advance), so each round
@@ -925,7 +933,18 @@ def survey(
     # reads no review state at all and its callers need not supply one.
     if rs is not None:
         rs.observe(prs)
-    classify_survey(cfg, gh, rs, counters, sv, enabled=enabled, deep=deep, compact=compact, cached_only=cached_only)
+    classify_survey(
+        cfg,
+        gh,
+        rs,
+        counters,
+        sv,
+        enabled=enabled,
+        deep=deep,
+        compact=compact,
+        cached_only=cached_only,
+        allow_queue_owned=bool(numbers),
+    )
     if deep:
         from .github_transport import event
 
@@ -958,6 +977,7 @@ def classify_survey(
     review_without_ci=False,
     supports_external_repair=True,
     pending=None,
+    allow_queue_owned=False,
 ):
     """One scheduling policy over normalized inventory and source capabilities.
 
@@ -996,6 +1016,7 @@ def classify_survey(
         for p in nondraft
         if (sv.owns(p) or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
+        and (allow_queue_owned or "bors-staging" not in {label.lower() for label in p.labels})
     ]
     facts = {row["pr"]["number"]: row["review"] for row in compact or []}
     gaps: set[int] = set()
@@ -1140,6 +1161,8 @@ def classify_survey(
                 (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
             continue
         m = rs.gh_meta(p.number)
+        if m.provenance == "deferred":
+            continue  # unread this survey (detail budget spent); a later survey reads it
         if m.provenance in {"stale", "fetch_failed"}:
             gaps.add(p.number)
             continue
@@ -1232,6 +1255,9 @@ def classify_survey(
                     ).append(c)
                 continue
             meta = rs.gh_meta(p.number)
+            if meta.provenance == "deferred":
+                sv.fix_waiting.append((p.number, "review state not read this survey"))
+                continue
             blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
             pending_contest = False
@@ -1294,11 +1320,15 @@ def classify_survey(
     #    out from under the last-known-good bump and TauCeti/ needs adapting. We adapt it; we never
     #    author a bump (the bot owns opening them, CI owns merging the green ones). This is the
     #    bump-specific CI-fixer: fix-ci defers a red bump PR here (rebase still owns its conflicts and
-    #    fix still owns its review findings).
+    #    fix still owns its review findings). An automatic bump is also taken while its build is
+    #    still PENDING: a full rebuild against a new Mathlib takes hours of CI, and a worker with a
+    #    warm cache finds the breakage in minutes. It stays actionable until CI is green or a round
+    #    has verified the head locally (`self-tested`).
     for p in tended if "bump" in enabled else []:
         integration = p.build_success and p.bump_integration_failed
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
-        if not (branch and (p.needs_ci_repair or integration)):
+        pending = p.automatic_bump and not (p.build_success or p.build_failed or p.self_tested)
+        if not (branch and (p.needs_ci_repair or integration or pending)):
             continue
         if {label.lower() for label in p.labels} & {
             "keep",
@@ -1313,13 +1343,21 @@ def classify_survey(
         c = Candidate(
             p.number,
             p.head_oid,
-            "bump-mathlib, singleton integration failed" if integration else "bump-mathlib, build red",
+            "bump-mathlib, singleton integration failed"
+            if integration
+            else "bump-mathlib, build pending"
+            if pending
+            else "bump-mathlib, build red",
             bump_integration_failure=integration,
+            bump_pending=pending,
         )
         per_head = counters.read(f"bump-{p.number}-{p.head_oid[:12]}")
         per_pr = counters.read(f"bump-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_BUMP_ATTEMPTS
-        if not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS):
+        # One round per pending head; once CI fails, the ordinary red-build retries apply.
+        if (pending and per_head) or (
+            not p.automatic_bump and (per_head >= MAX_BUMP_ATTEMPTS or per_pr >= MAX_BUMP_PR_ATTEMPTS)
+        ):
             sv.bump.suppressed.append(c)
         else:
             sv.bump.actionable.append(c)

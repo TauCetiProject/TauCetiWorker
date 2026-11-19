@@ -114,7 +114,7 @@ def recover(worker, *, numbers=()):
 
     from tauceti_tools.forge import GITHUB
 
-    from . import work_recovery
+    from . import live_use
     from .retention import locked, read_json
 
     root = worker.cfg.state / "review-work"
@@ -150,10 +150,10 @@ def recover(worker, *, numbers=()):
                 if not (
                     owner.get("finished")
                     or context.get("lifecycle") == 2
-                    or work_recovery.owner_stopped(owner.get("process", context.get("process")))
+                    or live_use.owner_stopped(owner.get("process", context.get("process")))
                 ):
                     continue
-                if work_recovery.live_users(work):
+                if live_use.live_users(work):
                     continue
                 plan = next((work / name for name in ("post_plan.json", "plan.json") if (work / name).is_file()), None)
                 if not receipt and not plan:
@@ -186,6 +186,6 @@ def recover(worker, *, numbers=()):
         from .config import log
 
         log("review recovery: paid output awaits its original publisher or record repair; affected heads withheld")
-    if result.returncode not in (82, 84, 86):
+    if result.returncode not in (82, 84, 86, 87):
         raise NoProgress("rendered review output remains retained for publication retry")
     return False
