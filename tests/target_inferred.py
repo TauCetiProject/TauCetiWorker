@@ -205,6 +205,11 @@ class Confirmed(Tmp):
             "namespace C\ntheorem _root_.y : True := trivial\nprivate def D.z := 0\ninstance : Inhabited Nat := ⟨0⟩\nend C\n"
         )
         self.assertEqual(reconcile.declarations(text), {"A.B.x", "y", "C.D.z"})
+        commented = (
+            "namespace A\n/-- The interval includes its\nend point. /- nested\nend B -/ still a comment -/\n"
+            'theorem x : True := trivial\n-- end A\ndef s := "\nend A" \nend A\ntheorem y : True := trivial\n'
+        )
+        self.assertEqual(reconcile.declarations(commented), {"A.x", "A.s", "y"})
 
 
 class Audit(Tmp):

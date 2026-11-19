@@ -476,12 +476,39 @@ _LEAN_DECLARATION = re.compile(
 _LEAN_SCOPE = re.compile(r"^\s*(?:(namespace)\s+(\S+)|(?:noncomputable\s+)?(section)\b|(end)\b)")
 
 
+def _code(text: str) -> str:
+    """`text` with Lean comments (line comments and nested block comments, doc comments included)
+    and string literals blanked to spaces, keeping every newline, so only commands remain."""
+    out, depth, i, quoted = [], 0, 0, False
+    while i < len(text):
+        pair = text[i : i + 2]
+        if depth:
+            depth += 1 if pair == "/-" else -1 if pair == "-/" else 0
+            step = 2 if pair in ("/-", "-/") else 1
+        elif quoted:
+            quoted = not (text[i] == '"')
+            step = 2 if text[i] == "\\" else 1
+        elif pair == "/-":
+            depth, step = 1, 2
+        elif pair == "--":
+            step = (text.find("\n", i) if "\n" in text[i:] else len(text)) - i
+        elif text[i] == '"':
+            quoted, step = True, 1
+        else:
+            out.append(text[i])
+            i += 1
+            continue
+        out.append("".join(c if c == "\n" else " " for c in text[i : i + step]))
+        i += step
+    return "".join(out)
+
+
 def declarations(text: str) -> set[str]:
     """The fully qualified names a Lean file declares, from its `namespace`/`section`/`end` nesting
     and `_root_.` prefixes. A reading of the source's lines, not an elaboration."""
     scopes: list[list[str]] = []
     found = set()
-    for line in text.splitlines():
+    for line in _code(text).splitlines():
         scope = _LEAN_SCOPE.match(line)
         if scope and scope.group(1):
             scopes.append(scope.group(2).split("."))
