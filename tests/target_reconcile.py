@@ -752,5 +752,57 @@ class Wiring(Tmp):
             tc.cmd_work(args, only=["reconcile"], agent="claude", one_round=True)
 
 
+class ModelFree(Tmp):
+    """A reconciliation-only round needs no provider: none is chosen, paced or bridged."""
+
+    def test_dispatch_in_api_billing_mode_enters_no_model_bridge(self):
+        opts = work.RoundOpts(only=["reconcile"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False)
+        cfg = SimpleNamespace(state=self.tmp, logdir=self.tmp / "logs", wid="worker3")
+        w = SimpleNamespace(cfg=cfg, counters=tc.Counters(cfg), gh=SimpleNamespace(repo="org/repo"))
+        with (
+            patch.dict(os.environ, {"TAUCETI_RUNTIME_STATUS": str(self.tmp / "status.json")}),
+            patch.object(work, "log"),
+            patch("tauceti_worker.claude_api.api_mode", return_value=True),
+            patch("tauceti_worker.claude_api.api_context", side_effect=AssertionError("no model bridge")),
+            patch.object(reconcile, "run", return_value=0) as run,
+        ):
+            self.assertEqual(
+                work.dispatch("reconcile", w, tc.Survey(worker_id="worker3"), tc.Candidate(0, "", ""), opts), 0
+            )
+        run.assert_called_once()
+
+    def test_a_one_shot_reconciliation_chooses_no_model(self):
+        cli = importlib.import_module("tauceti_worker.cli")
+        self.assertTrue(work.model_free_selection(["reconcile"]))
+        self.assertFalse(work.model_free_selection(["reconcile", "fix"]))
+        self.assertFalse(work.model_free_selection([]))
+        paced = dict(dry=False, ignore_quota=False, quota_cmd=None, fresh=True, already_paced=False)
+        with (
+            patch.object(cli, "resolve_work_model", side_effect=tc.NoProgress("no model under pace right now")),
+            patch.object(cli, "api_mode", return_value=False),
+        ):
+            self.assertEqual(cli.round_work_model(None, ["reconcile"], "claude", **paced), "claude")
+            with self.assertRaisesRegex(tc.NoProgress, "no model under pace"):
+                cli.round_work_model(None, ["reconcile", "fix"], "claude", **paced)
+
+    def test_a_reconciliation_loop_launches_without_a_model_under_pace(self):
+        loop = importlib.import_module("tauceti_worker.loop")
+        args = tc.build_parser().parse_args(["work", "--only", "reconcile", "--loop"])
+
+        def sleep(seconds):
+            raise KeyboardInterrupt
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://fixture.invalid"}),
+            patch.object(loop, "choose_model", side_effect=AssertionError("no provider is chosen")),
+            patch.object(loop, "github_budget", return_value={}),
+            patch.object(loop, "run_round_subprocess", return_value=0) as launched,
+            patch.object(loop, "report_runtime"),
+            patch.object(loop.time, "sleep", side_effect=sleep),
+        ):
+            loop.cmd_loop(args, SimpleNamespace(wid="fixture"), only=["reconcile"], agent="claude")
+        launched.assert_called()
+
+
 if __name__ == "__main__":
     unittest.main()

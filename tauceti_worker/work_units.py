@@ -1465,6 +1465,11 @@ def _model_free(stage: str) -> bool:
     return stage == "reconcile"
 
 
+def model_free_selection(only) -> bool:
+    """Whether every stage `only` selects starts no agent, so the round needs no model at all."""
+    return bool(only) and all(_model_free(stage) for stage in only)
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Return its rc, or None to decline this candidate and try another.
 
@@ -1640,14 +1645,15 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
         stack.enter_context(admission_unit(w.cfg.wid if w is not None and hasattr(w, "cfg") else ""))
         try:
-            stack.enter_context(
-                api_context(
-                    w.cfg.wid if api_mode() else "",
-                    stage,
-                    host=not bubble or stage == "progress",
-                    model=profile.model if profile else (review_model if stage == "review" else None),
+            if not model_free:
+                stack.enter_context(
+                    api_context(
+                        w.cfg.wid if api_mode() else "",
+                        stage,
+                        host=not bubble or stage == "progress",
+                        model=profile.model if profile else (review_model if stage == "review" else None),
+                    )
                 )
-            )
         except (BudgetError, OSError) as error:
             if not api_mode():
                 raise
