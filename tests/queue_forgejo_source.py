@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from contextlib import closing
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -355,6 +356,47 @@ class NativeSource(unittest.TestCase):
         with patch.object(self.source, "_git", return_value=subprocess.CompletedProcess([], 0, b"README.md\0", b"")):
             with self.assertRaises(ports.PromotionRefused):
                 self.source.verify_candidate_approval(frozen)
+
+    def test_recent_listing_reads_newest_first_until_an_older_update(self):
+        def row(number, updated):
+            return {
+                "number": number,
+                "head": {"sha": "a" * 40},
+                "base": {"sha": "b" * 40, "ref": "main", "repo": {"id": 41}},
+                "user": {"id": 99, "login": "contributor"},
+                "state": "open",
+                "draft": False,
+                "merged": False,
+                "labels": [],
+                "title": "proof",
+                "body": "",
+                "updated_at": updated,
+                "comments": 0,
+            }
+
+        newest = [row(9, "2026-11-19T04:10:00Z"), row(5, "2026-11-19T04:05:00Z")]
+        older = [row(3, "2026-11-19T03:00:00Z"), row(2, "2026-11-19T02:00:00Z")]
+        pages = {1: newest, 2: older}
+        paths = []
+
+        def request(method, path, data=None, **kwargs):
+            paths.append(path)
+            self.assertIn("sort=recentupdate", path)
+            return copy.deepcopy(pages.get(int(path.rsplit("page=", 1)[1]), []))
+
+        self.api.request = Mock(side_effect=request)
+        since = datetime.fromisoformat("2026-11-19T04:00:00+00:00").timestamp()
+        items, latest, complete = self.source.list_recent_pull_requests("team/Math", since=since, page_size=2)
+        self.assertEqual([i.number for i in items], [9, 5])
+        self.assertTrue(complete)
+        self.assertEqual(latest, datetime.fromisoformat("2026-11-19T04:10:00+00:00").timestamp())
+        self.assertEqual(
+            items[0].admission["discovery_version"], self.source._discovery_version(self.source._pull(newest[0]))
+        )
+        self.assertEqual(len(paths), 2)  # the second page held the first older update
+        # A bounded read that never reaches `since` says so, so the caller lists in full.
+        items, _, complete = self.source.list_recent_pull_requests("team/Math", since=0, page_size=2, max_pages=1)
+        self.assertFalse(complete)
 
     def test_discovery_does_not_fetch_histories_and_isolates_a_malformed_pr(self):
         row = {

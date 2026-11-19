@@ -26,6 +26,15 @@ from .github_adapter import comment_marker
 from .task_identity import NATIVE_GIT_REFS
 
 
+def _forge_time(value):
+    from datetime import datetime
+
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return 0.0
+
+
 @dataclass(frozen=True)
 class NativePublishers:
     """The queue's own source accounts, whose recovery holds count like GitHub's bot logins."""
@@ -335,8 +344,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             seen.add(number)
             try:
                 pull = self._pull(row)
-                details = {"discovery_version": self._discovery_version(pull), "recheck_seconds": self.refresh_seconds}
-                item = ports.OpenPullRequest(pull.number, pull.head_sha, pull.base_ref, pull.draft, (), details)
+                item = self._listed(pull)
             except (ForgeError, ValueError, TypeError, KeyError):
                 item = ports.OpenPullRequest(
                     number, "", "", False, (), {"incomplete": "native pull metadata unavailable"}
@@ -346,6 +354,46 @@ class ForgejoSourceAdapter(ForgejoGitSource):
                 on_page([item])
         self._bound(repo)
         return result
+
+    def _listed(self, pull):
+        details = {
+            "discovery_version": self._discovery_version(pull),
+            "recheck_seconds": self.refresh_seconds,
+            "updated_at": pull.updated_at,
+        }
+        return ports.OpenPullRequest(pull.number, pull.head_sha, pull.base_ref, pull.draft, (), details)
+
+    def list_recent_pull_requests(self, repo, *, since, page_size=50, max_pages=4):
+        """Open PRs updated at or after `since` (the forge's own clock), newest first.
+
+        Returns (items, newest update time seen, complete). Pages are read until a PR older than
+        `since` appears; `complete` is False when `max_pages` ran out first, and the caller then
+        needs a full listing. Closed PRs are not listed: the full listing finds them absent.
+        """
+        self._bound(repo)
+        items, newest = [], 0.0
+        for page in range(1, max_pages + 1):
+            rows = self.client.request(
+                "GET",
+                f"repos/{self.repository.name}/pulls?state=open&sort=recentupdate&limit={page_size}&page={page}",
+            )
+            if not isinstance(rows, list):
+                raise Incomplete("native recent pull listing is malformed")
+            for row in rows:
+                pull = self._pull(row)
+                updated = _forge_time(pull.updated_at)
+                if not updated:
+                    raise Incomplete("native pull has no update time")
+                newest = max(newest, updated)
+                if updated < since:
+                    self._bound(repo)
+                    return items, newest, True
+                items.append(self._listed(pull))
+            if len(rows) < page_size:
+                self._bound(repo)
+                return items, newest, True
+        self._bound(repo)
+        return items, newest, False
 
     def verify_candidate_approval(self, frozen):
         if frozen.policy.source != self.repository_identity or frozen.request.source != self.repository_identity:
