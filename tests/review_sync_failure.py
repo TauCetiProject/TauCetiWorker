@@ -15,6 +15,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from fixtures.review_runtime_stub import install_runtime_stub
+
+install_runtime_stub()
+
 import tauceti_worker as tc
 
 wu = tc.work_units
@@ -57,7 +61,7 @@ class FakeRS:
 
 
 class FakeGH:
-    pass
+    repo = "TauCetiProject/TauCeti"
 
 
 _tmp = tempfile.TemporaryDirectory()

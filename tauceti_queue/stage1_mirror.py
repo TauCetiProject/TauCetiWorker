@@ -85,7 +85,7 @@ class MainMirror:
         if result.returncode:
             raise EvidenceUnavailable("mirror control comparison is unavailable")
         if result.stdout:
-            raise ValueError("execution control files changed; deploy and approve their new caller explicitly")
+            raise ValueError("execution control files changed relative to the trusted baseline")
 
     def _ensure_objects(self, source, *commits):
         if (

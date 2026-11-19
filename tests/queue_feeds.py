@@ -2,19 +2,21 @@
 """The Bors-compatible feeds (tauceti_queue.feeds) against the schema fixture derived from saved
 production responses.
 
-Covered: the committed schema accepts the committed production sample and (when the operator's
-saved responses are present at ~/tmp/bors-journal) the full responses; the validator rejects a
+Covered: the committed schema accepts the committed production sample; the validator rejects a
 missing key, an unknown key and a type change; feeds generated from a fake controller view validate
 with the same top-level keys, schema strings and timestamp units as Bors; the generated observation
 satisfies the TauCetiTools `bors_observation.py` and `bors_scope_approval.py` readers that the
 scope-approval check and the workers use; and a `batch_id` query fills `requested_batch`.
 """
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -23,7 +25,6 @@ sys.path.insert(0, str(REPO))
 from tauceti_queue import feeds  # noqa: E402
 
 FIXTURES = REPO / "tests" / "fixtures"
-SAVED = pathlib.Path.home() / "tmp" / "bors-journal"
 TAUCETI = "TauCetiProject/TauCeti"
 HEAD = "a" * 40
 BASE = "b" * 40
@@ -75,15 +76,26 @@ class Schema(unittest.TestCase):
         self.assertEqual(feeds.validate_observation(self.sample["observation"], self.schema), [])
         self.assertEqual(feeds.validate_candidates(self.sample["candidates"], self.schema), [])
 
-    def test_full_saved_responses_validate_when_present(self):
-        observation = SAVED / "active-batches-2026-11-04T0745Z.json"
-        if not observation.is_file():
-            self.skipTest("saved production responses are not on this machine")
-        self.assertEqual(feeds.validate_observation(json.loads(observation.read_text()), self.schema), [])
-        for name in ("candidates-latest.json", "candidates-2026-11-04T0416Z.json"):
-            path = SAVED / name
-            if path.is_file():
-                self.assertEqual(feeds.validate_candidates(json.loads(path.read_text()), self.schema), [], name)
+    def test_validate_captures_command(self):
+        # External captures are explicitly supplied, never discovered in the operator's home.
+        with tempfile.TemporaryDirectory() as tmp:
+            observation = pathlib.Path(tmp) / "observation.json"
+            candidates = pathlib.Path(tmp) / "candidates.json"
+            observation.write_text(json.dumps(self.sample["observation"]))
+            candidates.write_text(json.dumps(self.sample["candidates"]))
+            command = ["feeds", "validate", str(observation), str(candidates)]
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(feeds.main(command), 0)
+            changed = json.loads(candidates.read_text())
+            changed["candidates"][0]["snapshot"]["members"][0]["declaration_names"] = {}
+            candidates.write_text(json.dumps(changed))
+            before = candidates.read_text()
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                self.assertEqual(feeds.main(command), 1)
+            self.assertIn(str(candidates), output.getvalue())
+            self.assertIn("unknown key 'declaration_names'", output.getvalue())
+            self.assertEqual(candidates.read_text(), before)
 
     def test_validator_catches_drift(self):
         doc = copy.deepcopy(self.sample["observation"])
@@ -385,6 +397,16 @@ class Generated(unittest.TestCase):
         self.assertIn("null", derived["keys"]["requested_batch"]["types"])
 
 
+class AdminScope(unittest.TestCase):
+    def test_an_admin_reapproval_counts_only_at_its_own_head_and_never_replaces_admin_evidence(self):
+        original = {"admin": True, "actor_id": 1, "merge_base_sha": MERGE_BASE}
+        again = {"actor_id": 2, "merge_base_sha": BASE, "head_sha": HEAD}
+        self.assertEqual(feeds._admin_scope(dict(original, admin_reapproval=again), HEAD)["actor_id"], 1)
+        self.assertEqual(feeds._admin_scope({"admin": False, "admin_reapproval": again}, HEAD)["actor_id"], 2)
+        self.assertIsNone(feeds._admin_scope({"admin": False, "admin_reapproval": again}, TIP))
+        self.assertIsNone(feeds._admin_scope({"admin": False}, HEAD))
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -392,6 +414,30 @@ if __name__ == "__main__":
 class OverTheController(unittest.TestCase):
     """The feeds generated from the real controller's records (tauceti_queue.controller over the
     end-to-end fakes): an approved PR inserted into the open batch, sealed into a head and built."""
+
+    def test_feed_snapshot_keeps_one_committed_generation_and_refreshes_for_the_next_request(self):
+        import tempfile
+
+        from tauceti_queue import fakes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            controller, github, _repo, _clock = fakes.make_controller(tmp)
+            self.addCleanup(controller.store.close)
+            head = github.create_pr(101, {"A.lean": "a\n"})
+            controller.approve(TAUCETI, 101, head, "reviewer")
+            controller.tick()
+            source = feeds.ControllerFeedSource(controller)
+            controller.batches = lambda *_: self.fail("feed escaped its own store snapshot")
+            with feeds.read_snapshot(source) as snapshot:
+                before = feeds.observation_feed(snapshot, TAUCETI, "main", now=1000)
+                batch = before["batch_ids"][0]
+                controller.store.update("batches", {"id": batch}, state="landed")
+                self.assertEqual(feeds.observation_feed(snapshot, TAUCETI, "main", now=1000), before)
+            with feeds.read_snapshot(source) as snapshot:
+                self.assertEqual(
+                    feeds.observation_feed(snapshot, TAUCETI, "main")["batch_ids"],
+                    [number for number in before["batch_ids"] if number != batch],
+                )
 
     def test_feeds_from_a_live_controller(self):
         import tempfile

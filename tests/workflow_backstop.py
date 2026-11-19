@@ -219,6 +219,130 @@ class StorageAndAuthority(unittest.TestCase):
             self.assertEqual(api.runs("update.yml", "main", repo_id=12), [run()])
         read.assert_called_once_with("repos/org/repo/actions/workflows/update.yml/runs", branch="main", per_page="1")
 
+    def test_ambient_gh_account_is_used_without_app_credentials(self):
+        completed = wb.subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        with patch.object(wb.subprocess, "run", return_value=completed) as run_gh:
+            wb.GitHub("org/repo").read("repos/org/repo")
+        self.assertIsNone(run_gh.call_args.kwargs["env"])
+
+    def test_app_token_replaces_ambient_credentials(self):
+        class Tokens:
+            def token(self):
+                return "installation-token"
+
+        completed = wb.subprocess.CompletedProcess([], 0, stdout="ok\n", stderr="")
+        ambient = {
+            "GH_TOKEN": "user",
+            "GITHUB_TOKEN": "user",
+            "GH_ENTERPRISE_TOKEN": "user",
+            "GITHUB_ENTERPRISE_TOKEN": "user",
+            "GH_HOST": "example.com",
+            "PATH": "/bin",
+        }
+        with (
+            patch.dict(wb.os.environ, ambient, clear=True),
+            patch.object(wb.subprocess, "run", return_value=completed) as run_gh,
+        ):
+            self.assertEqual(wb.GitHub("org/repo", lambda _id: Tokens(), 12).dispatch("update.yml", "main"), "ok")
+        self.assertEqual(
+            run_gh.call_args.kwargs["env"], {"GH_TOKEN": "installation-token", "GH_HOST": "github.com", "PATH": "/bin"}
+        )
+
+    def test_app_token_failure_or_empty_token_defers_without_running_gh(self):
+        from tauceti_queue.github_app import CredentialsError
+
+        class Failing:
+            def token(self):
+                raise CredentialsError("installation token request failed with HTTP 401")
+
+        class Empty:
+            def token(self):
+                return ""
+
+        for source in (Failing(), Empty()):
+            with (
+                self.subTest(source=type(source).__name__),
+                patch.object(wb.subprocess, "run") as run_gh,
+                self.assertRaises(wb.ObservationError),
+            ):
+                wb.GitHub("org/repo", lambda _id, source=source: source).read("repos/org/repo")
+            run_gh.assert_not_called()
+
+    def test_first_repository_read_narrows_unpinned_tokens(self):
+        class Tokens:
+            def __init__(self, repository_id):
+                self.repository_id = repository_id
+
+            def token(self):
+                return f"token-{self.repository_id}"
+
+        requested = []
+
+        def tokens(repository_id):
+            requested.append(repository_id)
+            return Tokens(repository_id)
+
+        outputs = iter(['{"id": 12, "default_branch": "main"}', "ok"])
+        environments = []
+
+        def run_gh(_args, **kwargs):
+            environments.append(kwargs["env"]["GH_TOKEN"])
+            return wb.subprocess.CompletedProcess([], 0, stdout=next(outputs), stderr="")
+
+        api = wb.GitHub("org/repo", tokens)
+        with patch.object(wb.subprocess, "run", side_effect=run_gh):
+            api.repository()
+            api.dispatch("update.yml", "main")
+        self.assertEqual((requested, environments), ([None, 12], ["token-None", "token-12"]))
+
+    def test_app_tokens_use_backstop_permissions_and_pinned_repository(self):
+        from tauceti_queue import github_app
+
+        credentials = github_app.AppCredentials(1, "app", 2, b"key", b"")
+        with patch.object(github_app, "load_execution_credentials", return_value=credentials) as load:
+            tokens = wb.app_tokens(Path("/credentials"), 12)
+        load.assert_called_once_with(Path("/credentials"), systemd_credentials=False)
+        self.assertEqual((tokens.repository_id, tokens.permissions), (12, wb.APP_PERMISSIONS))
+        with patch.object(github_app, "load_execution_credentials", side_effect=FileNotFoundError("secret path")):
+            with self.assertRaisesRegex(wb.ObservationError, "^GitHub App credentials unavailable: FileNotFoundError$"):
+                wb.app_tokens(Path("/credentials"), None)
+
+    def test_only_the_systemd_credentials_directory_skips_the_ancestor_walk(self):
+        from tauceti_queue import github_app
+
+        credentials = github_app.AppCredentials(1, "app", 2, b"key", b"")
+        for directory, expected in (("/run/credentials/unit", True), ("/home/user/.config/app", False)):
+            with (
+                self.subTest(directory=directory),
+                patch.dict(wb.os.environ, {"CREDENTIALS_DIRECTORY": "/run/credentials/unit"}),
+                patch.object(github_app, "load_execution_credentials", return_value=credentials) as load,
+            ):
+                wb.app_tokens(Path(directory), None)
+            load.assert_called_once_with(Path(directory), systemd_credentials=expected)
+        with (
+            patch.dict(wb.os.environ, {}, clear=True),
+            patch.object(github_app, "load_execution_credentials", return_value=credentials) as load,
+        ):
+            wb.app_tokens(Path("/run/credentials/unit"), None)
+        load.assert_called_once_with(Path("/run/credentials/unit"), systemd_credentials=False)
+
+    def test_main_loads_app_credentials_after_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            wb.atomic(path, {"version": 1, "repo_id": 12, "dispatches": {}})
+            with (
+                patch.object(wb, "app_tokens", return_value="tokens") as tokens,
+                patch.object(wb, "GitHub", return_value=FakeGitHub()) as github,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    wb.main(["--repo", "org/repo", "--state", str(path), "--github-app-dir", directory]), 0
+                )
+        (repo, factory, repository_id), _ = github.call_args
+        self.assertEqual((repo, repository_id), ("org/repo", 12))
+        self.assertEqual(factory(12), "tokens")
+        tokens.assert_called_once_with(Path(directory), 12)
+
     def test_state_roundtrip_and_corruption(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.json"

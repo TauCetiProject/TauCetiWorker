@@ -28,6 +28,10 @@
 #      CLAIM_GITDIR (explicit scratch object store override).
 set -uo pipefail
 
+if [[ -n "${TAUCETI_SOURCE_BINDING:-}" ]]; then
+    exec "${TAUCETI_SOURCE_PYTHON:?native worker interpreter required}" -m tauceti_worker.source_claims "$@"
+fi
+
 REPO="${CLAIM_REPO:-${TAUCETI_REPO:-TauCetiProject/TauCeti}}"
 URL="https://github.com/$REPO"
 WID="${TAUCETI_WORKER_ID:-$(hostname)-$$}"

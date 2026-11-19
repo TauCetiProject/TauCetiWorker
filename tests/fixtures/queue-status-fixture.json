@@ -312,7 +312,6 @@
     "inference_hold_backoff_max_seconds": 3600,
     "inference_hold_backoff_seconds": 60,
     "infrastructure_retry_backoff_seconds": 60,
-    "infrastructure_retry_limit": 3,
     "insertion_age_window": 16,
     "lost_run_seconds": 3600,
     "membership_label": "bors-staging",

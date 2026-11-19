@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import signal
 
 TAUCETI = os.environ.get("TAUCETI_REPO", "TauCetiProject/TauCeti")
 BASE_BRANCH = os.environ.get("TAUCETI_BASE_BRANCH", "main")
@@ -51,7 +52,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "bae9af5ba114a73e0cc15823f335f503618b327b")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "ddaaed27a70d9f376d300edf32d521843c27cc16")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
 # Keep the usual immutable SHA readable, and hash other refs so a branch name containing
@@ -144,18 +145,30 @@ STATUS_LABELS = (
 # Loop timing. Env-overridable for tuning and tests.
 POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota checks while waiting
 
-ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "5400"))  # 90 min hard cap per round
+# Hard safety cap per round, against a hung agent or tool: the loop kills the round's whole process
+# group and abandons it (nothing is checkpointed or continued). Work, including verification, is
+# expected to finish inside the round, so this is set far above any healthy round, not as a budget.
+ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "21600"))  # 6 h
+
+# How long a loop-spawned round waits for its worker's round.lock before giving up without failure.
+# Another worker's round briefly holds it while removing this worker's leftover worktree, and a round
+# of a restarted loop can still be finishing.
+ROUND_LOCK_WAIT = int(os.environ.get("TAUCETI_ROUND_LOCK_WAIT", "120"))
 
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
+
+# A managed worker's wrapper sends this to its loop driver (never to a round's process group) to
+# request a graceful restart: the loop exits at its next round boundary, or at once between rounds.
+DRAIN_SIGNAL = signal.SIGUSR1
 
 EX_DOCUMENTATION_WAIT = 79  # Progress plan/facts deployment churn, without failed-round backoff
 EX_NOPROGRESS = 75  # round did NO productive work (distinct from error=1 / success=0)
 EX_ADMISSION_WAIT = 76  # Fleet capacity/API funding/queue/throughput wait, outside the round timeout
 EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-round backoff
-EX_RECOVERY_IDLE = 80  # Mechanical recovery found no available work; select normal work immediately
 EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
 REVIEW_HEAD_CHANGED_EXIT = 82  # Review command refused a superseded selection before inference
 REVIEW_PREPARATION_WAIT_EXIT = 83  # Transport/host preparation failed before any paid review
+REVIEW_PUBLICATION_SUPERSEDED_EXIT = 87  # Saved paid review superseded by a newer publication
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
@@ -167,13 +180,11 @@ BACKOFF_MAX = int(os.environ.get("TAUCETI_BACKOFF_MAX", "900"))  # cap on the es
 # GitHub REST rate-limit handling. We pace LLM quota carefully; GitHub's REST budget needs the same
 # care, or a 403 mid-round throws away the agent's (expensive) work. Two layers:
 #  - gh_run() waits IN PLACE for a rate limit to clear and retries (so a transient limit costs a pause,
-#    not a lost round), bounded by GH_INROUND_WAIT so it can't blow ROUND_TIMEOUT.
+#    not a lost round); only the round's hard cap bounds the wait.
 #  - cmd_loop preflights core budget BEFORE launching a round (no hard cap there) — the right place to
 #    wait out an hourly primary reset, and what keeps us from launching the review engine (whose own
 #    diff fetch would 403) without enough budget to finish.
 GH_MIN_BUDGET = int(os.environ.get("TAUCETI_GH_MIN_BUDGET", "200"))  # core requests a round needs to finish
-
-GH_INROUND_WAIT = int(os.environ.get("TAUCETI_GH_INROUND_WAIT", "900"))  # cap on gh_run's in-place wait (15 min)
 
 GH_SECONDARY_BASE = 60  # first secondary-limit sleep when no Retry-After is given (then exponential)
 
@@ -231,6 +242,18 @@ SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached
 SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
+
+# Native source surveys list every open PR once, then read review history for at most this many PRs
+# that no cached observation describes at their current (head, updatedAt). Every other PR is
+# classified from the cache or left for a later survey, so a survey's cost does not grow with the
+# number of open PRs. Explicit `--pr` targets are always read.
+SURVEY_DETAIL_READS = max(1, int(os.environ.get("TAUCETI_SURVEY_DETAIL_READS", "4")))
+
+# How long a native source's discussion and review-thread observation, keyed on the PR's
+# (updatedAt, head), may answer survey triage. Forgejo does not move updatedAt for comment edits or
+# deletions, so this bounds that blind spot. Such reads are `assumed`, never `fresh`; dispatch
+# re-reads the selected PR before acting on it.
+SOURCE_FACTS_TTL = int(os.environ.get("TAUCETI_SOURCE_FACTS_TTL", str(6 * 3600)))
 
 # Agents.
 OPENROUTER_MODELS = {

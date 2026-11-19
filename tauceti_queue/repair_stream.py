@@ -161,7 +161,9 @@ class StreamingBuild:
         self.directory.mkdir(parents=True, exist_ok=True)
         self.errors_path.write_text("")
         repair_tools.take_lock(self.lock_path, log=lambda *a, **k: None)
-        argv = [*self.lake, "build", "--iofail"]
+        from tauceti_queue.repair_publish import build_flags
+
+        argv = [*self.lake, "build", *build_flags(self.worktree)]
         self.started_at = time.monotonic()
         with self.log_path.open("wb") as handle:
             handle.write(f"$ {' '.join(argv)}\n".encode())
@@ -252,7 +254,11 @@ class StreamingBuild:
             "`member` (the PR whose squash commit last touched the file) and `commit`; both grow while the build "
             "runs, so read the error list again before deciding what is left. When the build ends, the worker "
             f"appends a `build finished, exit N, M errors total` line to the error list and removes `{directory}/{LOCK_FILE}`; "
-            "after a green build it first runs CI's audits and lints and appends their findings to the same list.",
+            + (
+                "after a green build it runs the assigned audits and lints and appends their findings to the same list."
+                if self.audit is not None
+                else "Full audits and lint run in staging."
+            ),
             "",
             "Start on the modules that have already failed while the build goes on; they are in the error list, and "
             "the running build will not revisit them. Edit only modules that have already failed: a module the build "
@@ -262,7 +268,7 @@ class StreamingBuild:
             "importing them) and returns Lake's exit status, so a fix is checked in seconds rather than by rerunning the "
             "whole library. "
             + (
-                "Return after the scoped checks; the worker runs the final full build, audits and lint."
+                "Return after the scoped checks; the worker completes its assigned verification before submission."
                 if worker_verifies
                 else "The same command with no modules runs the whole library with `--iofail`. The verdict is "
                 "still your own whole-library `lake build --iofail` after your fixes, once the lock is free."

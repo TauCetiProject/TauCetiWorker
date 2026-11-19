@@ -7,9 +7,10 @@ their repository-id mapping and `batch_id` query, webhook signature verification
 deduplication, routing of comments to command execution and of every event to the controller,
 bearer authentication of the worker and admin endpoints with its login cache (persisted across
 restarts, revalidated in the background, revocable), the controller
-error mapping (403, 404, 400, 500) and the urgent-lane request validation.
+error mapping (403, 404, 400, 500), the urgent-lane request validation and the emergency endpoints.
 """
 
+import dataclasses
 import http.client
 import json
 import sys
@@ -23,7 +24,7 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 from queue_feeds import FakeSource  # noqa: E402
 
-from tauceti_queue import feeds, server, webhook  # noqa: E402
+from tauceti_queue import feeds, github_app, server, webhook  # noqa: E402
 from tauceti_queue.github_adapter import PullRequest  # noqa: E402
 from tauceti_queue.ports import GitHubUnavailable  # noqa: E402
 
@@ -123,6 +124,14 @@ class FakeController(FakeSource):
         if pr == 404:
             raise LookupError("no such approved PR")
         return {"urgent": pr}
+
+    def request_emergency(self, repo, pr, actor, *, surface, reason=""):
+        self.calls.append(("request_emergency", repo, pr, actor, surface, reason))
+        return {"accepted": True, "reason": "accepted", "behind": None}
+
+    def cancel_emergency(self, repo, pr, actor, *, surface):
+        self.calls.append(("cancel_emergency", repo, pr, actor, surface))
+        return {"cancelled": True, "reason": "cancelled"}
 
     def import_bors_state(self, observation, candidates=None, *, dry_run=False, release_head=False):
         self.calls.append(("import_bors_state", observation.get("schema"), candidates, dry_run, release_head))
@@ -236,6 +245,38 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(body["github"], {"requests": 12, "rate_limit_remaining": 4800})
         self.assertEqual(set(body["webhooks"]), {"received", "duplicates", "ignored"})
 
+    def test_status_summary_omits_bulk_sections_and_waits_briefly(self):
+        full = {
+            "queue": {"approved_waiting": 3},
+            "settings": {"insertion_age_window": 16},
+            "head": {"id": 7, "stall": None, "task": {"diagnostics": ["x" * 3_000_000]}},
+            "alerts": ["x"],
+            "tasks": [{"diagnostics": "big"}],
+            "waiting": {"inputs": []},
+            "open_batches": [],
+            "snapshot": True,
+            "stale_seconds": 4.0,
+        }
+
+        def status(*, wait=None):
+            self.controller.status_waits.append(wait)
+            return dict(full)
+
+        with patch.object(self.controller, "status", status):
+            status, body = self.request("GET", "/status/summary")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.status_waits[-1], server.HEALTHZ_LOCK_WAIT_SECONDS)
+        self.assertEqual(
+            body,
+            {
+                "settings": {"insertion_age_window": 16},
+                "head": {"id": 7, "stall": None},
+                "alerts": ["x"],
+                "snapshot": True,
+                "stale_seconds": 4.0,
+            },
+        )
+
     def test_frozen_admission_header_only_for_native_observation(self):
         def fetch(path):
             connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -249,7 +290,13 @@ class ServerTest(unittest.TestCase):
         status, header, ordinary = fetch(path)
         self.assertEqual(status, 200)
         self.assertIsNone(header)  # compatibility FeedSource makes no frozen claim
-        native = feeds.ControllerFeedSource(object())
+        from types import SimpleNamespace
+
+        from tauceti_queue.store import Store
+
+        store = Store()
+        self.addCleanup(store.close)
+        native = feeds.ControllerFeedSource(SimpleNamespace(store=store))
         with (
             patch.object(feeds, "feed_source", return_value=native),
             patch.object(feeds, "observation_feed", return_value=ordinary),
@@ -392,6 +439,16 @@ class ServerTest(unittest.TestCase):
         status, body = self.request("POST", "/tasks/17/renew", {"claim_token": "t1"}, self.bearer("ghp_worker"))
         self.assertEqual((status, body), (200, {"task_id": 17, "expires_at": 1_793_776_000.0}))
         self.assertEqual(self.controller.calls[-1], ("renew_task", 17, "t1"))
+        with patch.object(
+            self.controller,
+            "task_check_policy",
+            create=True,
+            return_value={"checks_owner": "staging", "renew_after": 15},
+        ):
+            status, renewed = self.request("POST", "/tasks/17/renew", {"claim_token": "t1"}, self.bearer("ghp_worker"))
+        self.assertEqual(status, 200)
+        self.assertEqual(renewed["checks_owner"], "staging")
+        self.assertEqual(renewed["renew_after"], 15)
         self.assertEqual(self.request("POST", "/tasks/17/renew", {}, self.bearer("ghp_worker"))[0], 400)
         status, body = self.request("POST", "/tasks/17/renew", {"claim_token": "stale"}, self.bearer("ghp_worker"))
         self.assertEqual((status, body), (409, {"error": "claim-expired", "detail": "the claim expired"}))
@@ -556,6 +613,27 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(self.controller.calls[-1], ("rebuild_head", TAUCETI, "kim-em"))
 
+    def test_emergency_endpoints_need_an_admin_and_pass_qualified_keys_to_the_controller(self):
+        body = {"repo": TAUCETI, "pr": 42, "reason": "harness bump"}
+        self.assertEqual(self.request("POST", "/admin/emergency", body, self.bearer("ghp_worker"))[0], 403)
+        self.assertEqual(self.request("POST", "/admin/emergency", dict(body, pr="42"), self.bearer("ghp_kim"))[0], 400)
+        self.assertEqual(self.request("POST", "/admin/emergency", dict(body, pr=True), self.bearer("ghp_kim"))[0], 400)
+        status, reply = self.request("POST", "/admin/emergency", body, self.bearer("ghp_kim"))
+        self.assertEqual((status, reply["accepted"]), (200, True))
+        self.assertEqual(
+            self.controller.calls[-1], ("request_emergency", TAUCETI, 42, "kim-em", "endpoint", "harness bump")
+        )
+        # A qualified Forgejo key is not refused by the endpoint: the controller's source checks decide.
+        forgejo = "forgejo:forge.example/TauCeti"
+        status, _ = self.request("POST", "/admin/emergency", {"repo": forgejo, "pr": 5}, self.bearer("ghp_kim"))
+        self.assertEqual(status, 200)
+        self.assertEqual(self.controller.calls[-1], ("request_emergency", forgejo, 5, "kim-em", "endpoint", ""))
+        status, reply = self.request(
+            "POST", "/admin/emergency-cancel", {"repo": TAUCETI, "pr": 42}, self.bearer("ghp_kim")
+        )
+        self.assertEqual((status, reply["cancelled"]), (200, True))
+        self.assertEqual(self.controller.calls[-1], ("cancel_emergency", TAUCETI, 42, "kim-em", "endpoint"))
+
     def test_import_bors_and_reconcile_approvals_endpoints(self):
         feed = {"schema": "tauceti-bors.observation/v1", "repo": TAUCETI, "batches": []}
         self.assertEqual(self.request("POST", "/admin/import-bors", {"observation": feed})[0], 401)
@@ -618,6 +696,94 @@ class ServerTest(unittest.TestCase):
             self.assertTrue(poller.requested)
         finally:
             self.server.poller = None
+
+
+class LocalWorkerBearer(ServerTest):
+    """A co-located repair worker authenticates with a bearer signed by the App's private key."""
+
+    CREDENTIALS = github_app.AppCredentials(
+        app_id=5607007, slug="tauceti-queue", installation_id=178451644, private_key_pem=b"key", webhook_secret=b""
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        credentials = cls.CREDENTIALS
+        original = FakeAdapter.__init__
+
+        class AppAdapter(FakeAdapter):
+            def __init__(self):
+                original(self)
+                self.tokens["ghp_impostor"] = ("tauceti-queue[bot]", 9)
+
+            def app_credentials(self):
+                return credentials
+
+        cls.controller = FakeController()
+        cls.adapter = AppAdapter()
+        cls.clock = [1_793_775_999.0]
+        config = server.ServerConfig(
+            webhook_secret=SECRET,
+            repositories={1: TAUCETI},
+            adapter=cls.adapter,
+            host="127.0.0.1",
+            port=0,
+            revision="abc123",
+            clock=lambda: cls.clock[0],
+        )
+        cls.server = server.create_server(cls.controller, config)
+        cls.port = cls.server.server_address[1]
+        server.serve_in_thread(cls.server)
+
+    def local(self, *, at=None, credentials=None):
+        issued = self.clock[0] if at is None else at
+        return self.bearer(github_app.local_worker_bearer(credentials or self.CREDENTIALS, issued))
+
+    def test_the_worker_endpoints_accept_it_as_the_app_without_asking_github(self):
+        lookups, admin_checks = self.adapter.lookups, self.adapter.admin_checks
+        status, body = self.request("POST", "/tasks/claim", {"worker": "w1"}, self.local())
+        self.assertEqual((status, body["task"]), (200, "repair-2650"))
+        self.assertEqual(self.controller.calls[-1], ("claim_task", "w1", "tauceti-queue[bot]"))
+        status, _ = self.request("POST", "/tasks/7/renew", {"claim_token": "t1"}, self.local(at=self.clock[0] - 299))
+        self.assertEqual(status, 200)
+        self.assertEqual((self.adapter.lookups, self.adapter.admin_checks), (lookups, admin_checks))
+
+    def test_admin_endpoints_refuse_it(self):
+        admin_checks = self.adapter.admin_checks
+        for path, body in (
+            ("/admin/settings", {"insertion_age_window": 8}),
+            ("/admin/urgent", {"repo": TAUCETI, "pr": 42}),
+            ("/admin/retry-ci", {}),
+            ("/admin/revoke-identity", {"login": "kim-em"}),
+            ("/admin/primary", {"primary": "github"}),
+            ("/admin/rebuild-head", {}),
+            ("/admin/evict-native", {"withdraw": [1]}),
+            ("/admin/emergency", {"repo": TAUCETI, "pr": 42, "reason": "r"}),
+            ("/admin/emergency-cancel", {"repo": TAUCETI, "pr": 42}),
+            ("/admin/import-bors", {"observation": {}}),
+            ("/admin/reconcile-approvals", {}),
+        ):
+            status, answer = self.request("POST", path, body, self.local())
+            self.assertEqual(status, 403, (path, answer))
+        self.assertEqual(self.controller.calls, [])
+        self.assertEqual(self.adapter.admin_checks, admin_checks, "no GitHub admin read is spent on it")
+
+    def test_stale_future_or_forged_bearers_and_impostor_tokens_are_refused(self):
+        other = dataclasses.replace(self.CREDENTIALS, private_key_pem=b"another key")
+        for headers in (
+            self.local(at=self.clock[0] - 301),
+            self.local(at=self.clock[0] + 61),
+            self.local(credentials=other),
+            self.bearer(github_app.LOCAL_WORKER_PREFIX + "1793775999.00"),
+            self.bearer(github_app.LOCAL_WORKER_PREFIX + "x.y"),
+            self.bearer("ghp_impostor"),
+        ):
+            self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "w1"}, headers)[0], 401, headers)
+        self.assertEqual(self.controller.calls, [])
+
+    def test_a_server_without_app_credentials_refuses_it(self):
+        auth = server.BearerAuth(FakeAdapter(), ttl=60, clock=lambda: self.clock[0])
+        header = "Bearer " + github_app.local_worker_bearer(self.CREDENTIALS, self.clock[0])
+        self.assertIsNone(auth.resolve(header))
 
 
 class PersistentIdentities(unittest.TestCase):

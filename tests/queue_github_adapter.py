@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -157,6 +158,34 @@ class AppAuth(unittest.TestCase):
         source.invalidate()
         self.assertEqual(source.token(), "ghs_two")
         self.assertEqual(source.refreshes, 3)
+
+    def test_team_membership_is_read_by_the_queue_app_only_with_members_permission(self):
+        pem, _ = key_pair()
+        clock = Clock(app.parse_github_time("2027-01-15T09:00:00Z"))
+        transport = FakeTransport()
+        token_url = "https://api.github.com/app/installations/178451644/access_tokens"
+        transport.add(
+            "POST",
+            token_url,
+            201,
+            {"token": "ghs_one", "expires_at": "2027-01-15T10:00:00Z", "permissions": {"contents": "write"}},
+        )
+        source = app.InstallationTokenSource(credentials(pem), transport, clock=clock)
+        client = ga.GitHubClient(source, transport, clock=clock, sleep=clock.sleep)
+        adapter = ga.GitHubAdapter(client, repo=TAUCETI)
+        path = "orgs/TauCetiProject/teams/self-tested/memberships/alice"
+        with self.assertRaises(ga.RequestDeferred) as missing:
+            adapter.team_member_read(path)
+        self.assertIn("Members: read", str(missing.exception))
+        self.assertEqual(missing.exception.retry_at, clock.now + ga.MEMBERS_PERMISSION_RETRY_SECONDS)
+        self.assertEqual(len(transport.calls), 1, "no membership request without the permission")
+        source.invalidate()
+        transport.responses[f"POST {token_url}"] = [
+            (201, {}, {"token": "ghs_two", "expires_at": "2027-01-15T10:00:00Z", "permissions": {"members": "read"}})
+        ]
+        transport.add("GET", f"https://api.github.com/{path}", 200, {"state": "active"})
+        self.assertEqual(adapter.team_member_read(path), {"state": "active"})
+        self.assertEqual(transport.calls[-1][2]["Authorization"], "Bearer ghs_two")
 
     def test_execution_token_is_minted_for_an_immutable_repository_id_on_every_refresh(self):
         pem, _ = key_pair()
@@ -384,6 +413,17 @@ def adapter(transport, git=None):
 
 
 class Adapter(unittest.TestCase):
+    def test_reporting_recovery_dispatch_references_the_original_run_without_building(self):
+        transport = FakeTransport()
+        url = f"https://api.github.com/repos/{TAUCETI}/actions/workflows/retry-ci-status.yml/dispatches"
+        transport.add("POST", url, 204)
+        adapter(transport).retry_status_delivery(TAUCETI, "123", 2, base_ref="main")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(
+            json.loads(transport.calls[0][3]),
+            {"ref": "main", "inputs": {"source_run_id": "123", "source_attempt": "2"}},
+        )
+
     def test_declaration_names_uses_exact_successful_status_run_attempt_and_job(self):
         from tauceti_queue import declaration_names as dn
 
@@ -456,6 +496,11 @@ class Adapter(unittest.TestCase):
         self.assertEqual(len(t.calls), 2)
         a, _ = setup(jobs=[{"id": 55, "name": "sandboxed-build"}, {"id": 56, "name": "sandboxed-build"}])
         self.assertEqual(a.declaration_names(TAUCETI, HEAD)["reason"], "build_job_ambiguous")
+        # A stub caller of the reusable pr-build prefixes its job names.
+        a, _ = setup(
+            jobs=[{"id": 55, "name": "pr-build / sandboxed-build", "status": "completed", "conclusion": "success"}]
+        )
+        self.assertEqual(a.declaration_names(TAUCETI, HEAD)["added"], {"TauCeti.A": ["Ns.shared", "Ns.α"]})
         self.assertEqual(dn.parse_log("DECLARATION-NAMES " + json.dumps(raw), BASE)["reason"], "head_mismatch")
         for invalid in [
             dict(raw, complete=False, added={}),
@@ -501,6 +546,21 @@ class Adapter(unittest.TestCase):
         a = adapter(transport)
         self.assertEqual(a.pr_merge_base(TAUCETI, 42, HEAD), "d" * 40)
         self.assertIsNone(a.pr_merge_base(TAUCETI, 42, "e" * 40), "a moved head gets no merge base")
+
+    def test_main_ci_run_is_one_unretried_call(self):
+        transport = FakeTransport()
+        url = f"https://api.github.com/repos/{TAUCETI}/actions/workflows/ci.yml/runs?head_sha={BASE}&event=push&per_page=1"
+        run = {"id": 7, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/x/runs/7"}
+        transport.add("GET", url, 200, {"workflow_runs": [run]})
+        transport.add("GET", url.replace(BASE, HEAD), 200, {"workflow_runs": []})
+        transport.add("GET", url.replace(BASE, "d" * 40), 502, {})
+        a = adapter(transport)
+        found = a.main_ci_run(TAUCETI, BASE)
+        self.assertEqual((found.run_id, found.conclusion, found.html_url), ("7", "failure", run["html_url"]))
+        self.assertIsNone(a.main_ci_run(TAUCETI, HEAD))
+        with self.assertRaises(ga.GitHubError):
+            a.main_ci_run(TAUCETI, "d" * 40)
+        self.assertEqual(sum("/actions/workflows/ci.yml/" in call[1] for call in transport.calls), 3)
 
     def test_cancel_run(self):
         transport = FakeTransport()
@@ -765,7 +825,7 @@ class Adapter(unittest.TestCase):
             "jobs": [
                 {
                     "id": 70,
-                    "name": "sandboxed-build",
+                    "name": "candidate / sandboxed-build",
                     "runner_name": "h7",
                     "labels": [],
                     "status": "completed",
@@ -1183,6 +1243,81 @@ class Polling(unittest.TestCase):
         stub.remaining = 150
         self.assertEqual(poller.poll(refs), [], "below the reserve nothing is polled")
         self.assertEqual(poller.skipped, 2)
+
+
+class LeasedMainPublication(unittest.TestCase):
+    def setUp(self):
+        from types import SimpleNamespace
+
+        from tauceti_queue.fakes import FakeRepo, run_git
+
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = FakeRepo(self.tmp.name)
+        self.base = self.repo.main_sha()
+        self.middle = self.repo.commit_branch({"Middle.lean": "middle\n"}, "middle", push_to="refs/heads/candidate")
+        self.tip = self.repo.commit_branch(
+            {"Tip.lean": "tip\n"}, "tip", start=self.middle, push_to="refs/heads/candidate"
+        )
+        run_git(self.repo.clone, "fetch", "-q", "origin", "refs/heads/candidate")
+        self.git = run_git
+        self.race = self.lose_reply = False
+        self.commands = []
+
+        def git_transport(command, **kwargs):
+            self.commands.append(command)
+            if self.race:
+                run_git(self.repo.origin, "update-ref", "refs/heads/main", self.middle, self.base)
+            command = [
+                str(self.repo.origin) if item == f"https://github.com/{TAUCETI}.git" else item for item in command
+            ]
+            result = subprocess.run(command, **kwargs)
+            if self.lose_reply and result.returncode == 0:
+                raise subprocess.TimeoutExpired(command, 600)
+            return result
+
+        self.adapter = adapter(FakeTransport(), git=git_transport)
+        self.adapter.clone_dir = str(self.repo.clone)
+        self.adapter._tokens = SimpleNamespace(token=lambda: "fixture-token")
+        self.adapter.ref_sha = lambda *args: self.repo.main_sha()
+
+    def test_real_git_expected_old_lease_refuses_racing_candidate_ancestor(self):
+        self.race = True
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.actual_parent, self.middle)
+        self.assertEqual(self.repo.main_sha(), self.middle)
+        self.assertIn(f"--force-with-lease=refs/heads/main:{self.base}", self.commands[0])
+        self.assertNotIn("fixture-token", " ".join(self.commands[0]))
+
+    def test_lost_leased_push_reply_is_confirmed_by_main_readback(self):
+        self.lose_reply = True
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertTrue(result.ok)
+        self.assertEqual(self.repo.main_sha(), self.tip)
+
+    def test_non_descendant_is_never_pushed_even_with_an_explicit_lease(self):
+        self.git(self.repo.origin, "update-ref", "refs/heads/main", self.tip)
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.tip, self.base)
+        self.assertFalse(result.ok)
+        self.assertEqual(self.commands, [])
+        self.assertEqual(self.repo.main_sha(), self.tip)
+
+    def test_definite_server_hook_rejection_returns_a_refusal_with_unchanged_main(self):
+        hook = self.repo.origin / "hooks" / "pre-receive"
+        hook.write_text("#!/bin/sh\necho 'fixture protection' >&2\nexit 1\n")
+        hook.chmod(0o700)
+        result = self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.actual_parent, self.base)
+        self.assertIn("remote rejected", result.error)
+        self.assertEqual(self.repo.main_sha(), self.base)
+
+    def test_exit_zero_without_an_acknowledgement_or_visible_tip_is_uncertain(self):
+        self.adapter._git = lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", "")
+        with self.assertRaisesRegex(ga.GitHubError, "no definitive acknowledgement"):
+            self.adapter.fast_forward_leased(TAUCETI, "main", self.base, self.tip)
+        self.assertEqual(self.repo.main_sha(), self.base)
 
 
 if __name__ == "__main__":

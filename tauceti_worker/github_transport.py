@@ -1,4 +1,4 @@
-"""Shared GitHub reads and allow-listed HTTP accounting, including gh subprocesses.
+"""Shared read caching and allow-listed GitHub HTTP accounting, including gh subprocesses.
 
 No tokens, query strings, request/response bodies or raw debug traces enter accounting.
 Cache entries are credential-scoped; fresh checks bypass them, and writes invalidate them.
@@ -23,9 +23,11 @@ from urllib.parse import urlsplit
 
 _fresh = contextvars.ContextVar("github_fresh", default=False)
 _direct = contextvars.ContextVar("github_direct", default=False)
+_advisory = contextvars.ContextVar("source_advisory", default=False)
 _retry_reads = contextvars.ContextVar("github_retry_reads", default=True)
 _revision = contextvars.ContextVar("github_revision", default="")
 _cache_hit = contextvars.ContextVar("github_cache_hit", default=False)
+_cache_only = contextvars.ContextVar("source_cache_only", default=False)
 _request_context = contextvars.ContextVar("github_request_context", default=None)
 
 
@@ -75,13 +77,27 @@ def register_principal(user_id: int, login: str, env=None):
             continue
 
 
+class CacheOnlyMiss(Exception):
+    """A cache-only read found no current observation; nothing was fetched."""
+
+
 @contextlib.contextmanager
-def read_context(*, fresh: bool = False, revision: str = "", direct: bool = False, retry: bool = True):
+def read_context(
+    *,
+    fresh: bool = False,
+    revision: str = "",
+    direct: bool = False,
+    retry: bool = True,
+    advisory: bool | None = None,
+    cache_only: bool = False,
+):
     a = _fresh.set(_fresh.get() or fresh)
     b = _revision.set(revision or _revision.get())
     c = _cache_hit.set(False)
     d = _direct.set(_direct.get() or direct)
     e = _retry_reads.set(_retry_reads.get() and retry)
+    f = _advisory.set(_advisory.get() if advisory is None else advisory)
+    g = _cache_only.set(_cache_only.get() or cache_only)
     try:
         yield
     finally:
@@ -90,6 +106,17 @@ def read_context(*, fresh: bool = False, revision: str = "", direct: bool = Fals
         _cache_hit.reset(c)
         _direct.reset(d)
         _retry_reads.reset(e)
+        _advisory.reset(f)
+        _cache_only.reset(g)
+
+
+def cache_only():
+    """Answer source reads only from current cached observations, raising CacheOnlyMiss otherwise."""
+    return _cache_only.get()
+
+
+def advisory_reads():
+    return _advisory.get()
 
 
 def direct_reads():
@@ -185,6 +212,21 @@ def invalidate_permissions(repo, env=None):
         pass
 
 
+def shared_generation(scope):
+    """An explicitly scoped cache generation, independent of unrelated writes."""
+    try:
+        return _generation_file(scope).read_text()
+    except OSError:
+        return ""
+
+
+def invalidate_shared(scope):
+    try:
+        atomic(_generation_file(scope), uuid.uuid4().hex)
+    except OSError:
+        pass
+
+
 def invalidate(args=None):
     """Invalidate mutable reads affected by a write, without expiring permissions or immutable data."""
     try:
@@ -242,24 +284,116 @@ def event(value: dict):
         pass
 
 
-def shared_read(key, fetch, *, ttl: float = 30, identity=None, immutable: bool = False):
+def prune_shared_cache():
+    """Cap persisted read data, with one inexpensive cleanup per five minutes."""
+    from tauceti_worker.read_cache import prune_read_cache
+
+    cache = root() / "cache"
+    marker = cache / ".pruned.json"
+
+    def recent():
+        try:
+            return 0 <= time.time() - marker.stat().st_mtime < 300
+        except OSError:
+            return False
+
+    if recent():
+        return
+    try:
+        with locked(cache / ".prune.lock", timeout=0.05):
+            if recent():
+                return
+            # Above the live set: two review observations per open PR plus listings and other reads.
+            prune_read_cache(cache, max_files=8192, max_bytes=256 * 1024 * 1024)
+            atomic(marker, {"time": time.time()})
+    except OSError:
+        pass  # Cache cleanup never gates a source read.
+
+
+def _shared_path(key, identity):
+    digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
+    return root() / "cache" / identity / (digest + ".json")
+
+
+def update_shared(key, mutate, *, identity, generation_scope, lock_timeout: float = 5) -> bool:
+    """Replace one current cached value in place, keeping its age and revision.
+
+    The lock excludes an in-flight leader, whose result could predate the correction. False means
+    nothing current was updated (no entry, another generation, a held lock or storage failure); the
+    caller then decides whether to invalidate instead.
+    """
+    path = _shared_path(key, identity)
+    try:
+        with locked(path.with_suffix(".lock"), timeout=lock_timeout):
+            cached = json.loads(path.read_text())
+            if cached["generation"] != shared_generation(generation_scope):
+                return False
+            atomic(path, {**cached, "value": mutate(cached["value"])})
+            return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def shared_read(
+    key,
+    fetch,
+    *,
+    ttl: float = 30,
+    identity=None,
+    immutable: bool = False,
+    lock_timeout: float = 30,
+    generation_scope=None,
+    coalesce_failures: bool = False,
+):
     """Coalesce a complete logical read under a per-key lock. Never cache failures.
 
     Network/parser exceptions propagate; unavailable storage merely disables caching. Generation
     checks prevent an overlapping write from publishing a pre-write result after invalidation.
+    Explicit generation scopes use invalidate_shared rather than unrelated GitHub writes.
+    Opt-in completion markers share unavailable reads only with existing waiters.
+    The default invokes each caller's fetch after failures, preserving fetch side effects.
     """
     identity = identity or scope()
-    if not identity or _fresh.get() or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1":
+    bypass = not identity or _fresh.get() or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1"
+    if bypass and _cache_only.get():
+        raise CacheOnlyMiss("shared cache bypassed")
+    if bypass:
         return fetch()
-    digest = hashlib.sha256(json.dumps(key, sort_keys=True).encode()).hexdigest()
-    path = root() / "cache" / identity / (digest + ".json")
+    requested_at = time.time()
+    path = _shared_path(key, identity)
+    attempt = path.with_suffix(".attempt")
+
+    def current_generation():
+        return generation(key) if generation_scope is None else shared_generation(generation_scope)
+
+    if _cache_only.get():
+        # Atomic replacement makes an unlocked read safe; waiting on a leader would be a fetch.
+        try:
+            cached = json.loads(path.read_text())
+            if (
+                (immutable or cached["generation"] == current_generation())
+                and cached.get("revision", "") == _revision.get()
+                and 0 <= time.time() - cached["time"] < ttl
+            ):
+                _cache_hit.set(True)
+                return cached["value"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        raise CacheOnlyMiss("no current shared observation")
+
+    def finished(outcome):
+        if not coalesce_failures:
+            return
+        with contextlib.suppress(OSError):
+            atomic(attempt, {"finished_at": time.time(), "revision": _revision.get(), "outcome": outcome})
+
     try:
-        cm = locked(path.with_suffix(".lock"))
+        cm = locked(path.with_suffix(".lock"), timeout=lock_timeout)
         cm.__enter__()
     except OSError:
         return fetch()
     try:
-        epoch = generation(key)
+        epoch = current_generation()
         try:
             cached = json.loads(path.read_text())
             if (
@@ -267,20 +401,78 @@ def shared_read(key, fetch, *, ttl: float = 30, identity=None, immutable: bool =
                 and cached.get("revision", "") == _revision.get()
                 and 0 <= time.time() - cached["time"] < ttl
             ):
+                with contextlib.suppress(OSError):
+                    os.utime(path, follow_symlinks=False)
                 event({"kind": "cache_hit", "read": key[0]})
                 _cache_hit.set(True)
                 return cached["value"]
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        value = fetch()
-        if value is not None and (immutable or generation(key) == epoch):
+        retry_unlocked = False
+        refetched = False
+        if coalesce_failures:
             try:
-                atomic(path, {"time": time.time(), "generation": epoch, "revision": _revision.get(), "value": value})
-            except OSError:
+                previous = json.loads(attempt.read_text())
+                completed = previous["finished_at"]
+                if (
+                    previous["revision"] == _revision.get()
+                    and requested_at < completed
+                    and 0 <= time.time() - completed <= lock_timeout
+                ):
+                    if previous["outcome"] == "unavailable":
+                        # Coalesce only callers that already waited for this attempt.
+                        # A request starting after it ended still gets its own fetch.
+                        return None
+                    # A successful read invalidated by an overlapping write
+                    # needs one new leader, not one full read per waiter.
+                    refetched = previous["outcome"] == "invalidated"
+                    retry_unlocked = not refetched
+            except (OSError, ValueError, KeyError, TypeError):
                 pass
-        return value
+            if not retry_unlocked:
+                try:
+                    # If storage cannot record completion, do not serialize network
+                    # reads behind a cache that cannot publish anything.
+                    atomic(attempt, {"revision": _revision.get(), "outcome": "pending"})
+                except OSError:
+                    retry_unlocked = True
+        if not retry_unlocked:
+            try:
+                value = fetch()
+                saved = False
+                generation_current = immutable or current_generation() == epoch
+                if value is not None and generation_current:
+                    try:
+                        atomic(
+                            path,
+                            {"time": time.time(), "generation": epoch, "revision": _revision.get(), "value": value},
+                        )
+                        saved = True
+                    except OSError:
+                        pass
+                if saved:
+                    prune_shared_cache()
+                if saved and coalesce_failures:
+                    with contextlib.suppress(OSError):
+                        attempt.unlink(missing_ok=True)
+                else:
+                    # At most one replacement fetch per waiting cohort. A
+                    # second overlapping write leaves no shareable inventory;
+                    # later callers can try again without a parallel stampede.
+                    outcome = (
+                        "unavailable"
+                        if value is None or refetched and not generation_current
+                        else ("retry" if generation_current else "invalidated")
+                    )
+                    finished(outcome)
+                return value
+            except BaseException:
+                finished("retry")
+                raise
     finally:
         cm.__exit__(None, None, None)
+    # Exceptions or broken cache storage must not serialize every full fetch.
+    return fetch()
 
 
 def remember_quota(record, identity):
@@ -693,23 +885,16 @@ def execute(argv, *, env=None, wait: bool = False, **kwargs):
     from tauceti_worker import github_outbox
 
     args = argv[1:]
-    if (
-        effective.get("TAUCETI_RECOVERY_CONTINUATION") == "1"
-        and not proxy_readonly(args)
-        and not github_outbox.local_operation(args)
-    ):
-        return subprocess.CompletedProcess(
-            argv, 1, "", "Recovery continuation cannot publish; supervisor verification is required\n"
-        )
     context = _request_context.set({})
     stdin_body = any(
         a in ("--input", "--body-file", "-F") and i + 1 < len(args) and args[i + 1] == "-" for i, a in enumerate(args)
     ) or any(a.endswith("=@-") for a in args)
     if stdin_body and kwargs.get("input") is None and not sys.stdin.isatty():
         kwargs["input"] = sys.stdin.read()
+    began = time.time()
     intent = github_outbox.prepare(argv, effective, kwargs.get("cwd"), kwargs.get("input"))
     try:
-        if intent and not github_outbox.may_send(intent):
+        if intent and not github_outbox.may_send(intent, effective, began):
             from tauceti_worker.config import GitHubUnavailable
 
             raise GitHubUnavailable(
@@ -788,7 +973,7 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
         else "core"
     )
     started = time.monotonic()
-    ceiling = min(900, max(0, int(effective.get("TAUCETI_GH_PROXY_WAIT", "900"))))
+    ceiling = min(3600, max(0, int(effective.get("TAUCETI_GH_PROXY_WAIT", "3600"))))
     sent_intent = False
     observed_resource = endpoint is not None
     while True:
@@ -822,8 +1007,13 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             delay = mutation_slot(effective)
             if delay:
                 if time.monotonic() - started + delay > ceiling:
+                    from tauceti_worker.constants import EX_GITHUB_WAIT
+
+                    # A pacing wait must reach the worker's infrastructure-wait
+                    # path, without spending its review-error budget.
+                    record_block("publication", time.time() + delay, scope(effective))
                     blocked = subprocess.CompletedProcess(
-                        argv, 1, "", f"gh: publication pacing; Retry-After: {int(delay) + 1}\n"
+                        argv, EX_GITHUB_WAIT, "", f"gh: publication pacing; Retry-After: {int(delay) + 1}\n"
                     )
                     blocked.github_before_request = True
                     return blocked
@@ -1113,15 +1303,20 @@ def _install_proxy(*, bindir=None):
         if not real:
             return
         os.environ["TAUCETI_REAL_GH"] = real
-    # A stable directory survives HOME isolation and uvx's interpreter changes.
-    bindir = bindir or root() / "bin"
-    bindir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    proxy = bindir / "gh"
     import shlex
 
     content = (
         f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} --proxy "$@"\n'
     )
+    # A stable directory survives HOME isolation and uvx's interpreter changes.
+    # Each runtime gets its own launcher: during a live rollout several runtimes
+    # run side by side, and a shared launcher would let one runtime's rounds
+    # execute another runtime's gh routing code.
+    if bindir is None:
+        (root() / "bin").mkdir(parents=True, exist_ok=True, mode=0o700)
+        bindir = root() / "bin" / hashlib.sha256(content.encode()).hexdigest()[:16]
+    bindir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    proxy = bindir / "gh"
     if not proxy.exists() or proxy.read_text() != content:
         atomic_script = proxy.with_name("gh." + uuid.uuid4().hex)
         atomic_script.write_text(content)
@@ -1292,6 +1487,7 @@ if __name__ == "__main__":
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from tauceti_worker.config import GitHubUnavailable
         from tauceti_worker.constants import EX_GITHUB_WAIT
+        from tauceti_worker.github_outbox import NOT_POSTED
 
         try:
             p = execute(["gh", *args], wait=os.environ.get("TAUCETI_GITHUB_EPHEMERAL") != "1")
@@ -1299,9 +1495,7 @@ if __name__ == "__main__":
             # The shell caller cannot catch Python exceptions. Preserve the
             # infrastructure wait marker for its owning worker's stage guard.
             record_block("publication", error.retry_at or time.time() + 60)
-            p = subprocess.CompletedProcess(
-                args, EX_GITHUB_WAIT, "", f"gh: {error}; publication retained for recovery\n"
-            )
+            p = subprocess.CompletedProcess(args, EX_GITHUB_WAIT, "", f"gh: {error}.\n{NOT_POSTED}\n")
         finally:
             if not readonly:
                 invalidate(args)

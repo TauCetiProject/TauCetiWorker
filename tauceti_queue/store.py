@@ -11,7 +11,11 @@ Tables:
 - `settings`: runtime settings and small pieces of controller state (`key`, JSON `value`, actor, time).
 - `inputs`: approved inputs, one row per accepted PR revision, with the waiting/reserved/inserted/
   landed/cancelled state, priority, urgency, the retained ref of the accepted head, the `no_repair`
-  opt-out and, for a `problem-anticipated` withdrawal, what it waits for (`anticipated`).
+  opt-out, the blocking labels its PR gained after approval (`blocked_labels`, which keep it out of
+  batches) and, for a `problem-anticipated` withdrawal, what it waits for (`anticipated`).
+- `admission_evidence`, `admission_evidence_comments`, `admission_evidence_statuses`: the PR
+  evidence admission's shadow keeps from webhook deliveries and full reads
+  (`tauceti_queue/admission_evidence.py`); empty unless `admission_evidence_mode` is `shadow`.
 - `batches`: identity, version, base, tip, sealed flag, state (`open`, `head`, `landed`, `removed`),
   `state=open, sealed=1` denotes the fixed-membership successor, separate from the sole head;
   the expected parent recorded for promotion and, for a non-head batch, the version a `prepare` task
@@ -20,7 +24,8 @@ Tables:
   tip a `prepare` task last built and repaired on the head's tip).
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
   the task that edited it, the explanation collected from its message, the `no_repair` opt-out and
-  whether it was `withdrawn` (an emptied `no_repair` member whose commit stays until the head lands).
+  whether it was `withdrawn` (a member the queue sent back, an emptied `no_repair` member or one an
+  adopted repair emptied, whose empty commit stays until the head lands).
 - `claims`: batch identity and version, operation, worker identity, token, expiry, release.
 - `tasks`: repair, rebase-conflict, pre-rebase and prepare tasks with their diagnostics and state; a
   `prepare` task of a batch's pre-rebased chain carries the batch tip that chain covers
@@ -34,6 +39,10 @@ Tables:
   (`cancelled_by`, empty otherwise), why (`cancel_reason`) and GitHub's answer (`cancel_result`).
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
+- `failures`: one row per failed CI attempt of a head (`attempt_id` unique): its fingerprint
+  (`tauceti_queue/escalation.py`: verdict class, attributed members, digest of the finding lines),
+  the lines themselves, and what the controller did about it (`action`: `repair`, `withdraw`,
+  `bisect`, `dissolve`, `hold`), so the same failure on the same batch is recognised however often it recurs.
 - `journal`: an append-only log of what the controller did, for status and tests.
 - `identity_cache`: answers GitHub gave about workers and operators, kept across restarts so a
   restart during a quota outage does not lock them out: per `namespace` (`bearer`, a token's
@@ -62,6 +71,7 @@ CREATE TABLE IF NOT EXISTS inputs (
     id INTEGER PRIMARY KEY,
     repository TEXT NOT NULL,
     number INTEGER NOT NULL,
+    source_identity TEXT NOT NULL DEFAULT '',
     head_sha TEXT NOT NULL,
     title TEXT NOT NULL DEFAULT '',
     description TEXT NOT NULL DEFAULT '',
@@ -88,7 +98,8 @@ CREATE TABLE IF NOT EXISTS inputs (
     anticipated TEXT NOT NULL DEFAULT '{}',
     declaration_names TEXT NOT NULL DEFAULT '{}',
     declaration_fetch_attempts INTEGER NOT NULL DEFAULT 0,
-    declaration_retry_at REAL NOT NULL DEFAULT 0
+    declaration_retry_at REAL NOT NULL DEFAULT 0,
+    blocked_labels TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS inputs_state ON inputs (repository, state);
 CREATE TABLE IF NOT EXISTS admission_work (
@@ -105,6 +116,7 @@ CREATE TABLE IF NOT EXISTS admission_work (
     cancelled_head_sha TEXT NOT NULL DEFAULT '',
     cancelled_at REAL NOT NULL DEFAULT 0,
     urgent INTEGER NOT NULL DEFAULT 0,
+    recheck INTEGER NOT NULL DEFAULT 0,
     first_pending_at REAL NOT NULL DEFAULT 0,
     attempted_at REAL NOT NULL DEFAULT 0,
     queue_at REAL,
@@ -116,6 +128,60 @@ CREATE TABLE IF NOT EXISTS admission_work (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS admission_pr ON admission_work (repository, number);
 CREATE INDEX IF NOT EXISTS admission_due ON admission_work (repository, next_attempt_at, attempted_at);
+CREATE TABLE IF NOT EXISTS admission_evidence (
+    id INTEGER PRIMARY KEY,
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL DEFAULT '',
+    base_sha TEXT NOT NULL DEFAULT '',
+    base_ref TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT '',
+    draft INTEGER NOT NULL DEFAULT 0,
+    body TEXT NOT NULL DEFAULT '',
+    labels TEXT NOT NULL DEFAULT '[]',
+    author TEXT NOT NULL DEFAULT '',
+    head_ref TEXT NOT NULL DEFAULT '',
+    head_repo TEXT NOT NULL DEFAULT '',
+    pr_updated_at REAL NOT NULL DEFAULT 0,
+    comments_count INTEGER NOT NULL DEFAULT -1,
+    count_updated_at REAL NOT NULL DEFAULT 0,
+    seeded_at REAL NOT NULL DEFAULT 0,
+    seeded_until REAL NOT NULL DEFAULT 0,
+    received_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_evidence_pr ON admission_evidence (repository, number);
+CREATE TABLE IF NOT EXISTS admission_evidence_comments (
+    id INTEGER PRIMARY KEY,
+    repository TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    comment_id INTEGER NOT NULL,
+    author TEXT NOT NULL DEFAULT '',
+    author_id INTEGER NOT NULL DEFAULT 0,
+    app_id INTEGER NOT NULL DEFAULT 0,
+    relevant INTEGER NOT NULL DEFAULT 0,
+    body TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_text TEXT NOT NULL DEFAULT '',
+    html_url TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    received_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_evidence_comment ON admission_evidence_comments (repository, number, comment_id);
+CREATE TABLE IF NOT EXISTS admission_evidence_statuses (
+    id INTEGER PRIMARY KEY,
+    repository TEXT NOT NULL,
+    sha TEXT NOT NULL,
+    context TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT '',
+    status_id INTEGER NOT NULL DEFAULT 0,
+    sender TEXT NOT NULL DEFAULT '',
+    seeded_at REAL NOT NULL DEFAULT 0,
+    seeded_until REAL NOT NULL DEFAULT 0,
+    ambiguous INTEGER NOT NULL DEFAULT 0,
+    received_at REAL NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS admission_evidence_status ON admission_evidence_statuses (repository, sha, context);
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY,
     repository TEXT NOT NULL,
@@ -138,7 +204,8 @@ CREATE TABLE IF NOT EXISTS batches (
     pre_rebase_source TEXT,
     pre_rebase_edits TEXT NOT NULL DEFAULT '{}',
     pre_rebase_at REAL,
-    pre_rebase_prepared TEXT
+    pre_rebase_prepared TEXT,
+    lane TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,
@@ -146,6 +213,7 @@ CREATE TABLE IF NOT EXISTS members (
     input_id INTEGER NOT NULL,
     source_pr TEXT NOT NULL,
     number INTEGER NOT NULL,
+    source_identity TEXT NOT NULL DEFAULT '',
     accepted_head TEXT NOT NULL,
     position INTEGER NOT NULL,
     commit_sha TEXT,
@@ -300,6 +368,20 @@ CREATE TABLE IF NOT EXISTS outbox (
     result TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS outbox_state ON outbox (state, next_attempt_at);
+CREATE TABLE IF NOT EXISTS failures (
+    id INTEGER PRIMARY KEY,
+    batch_id INTEGER NOT NULL,
+    batch_version INTEGER NOT NULL,
+    attempt_id INTEGER NOT NULL UNIQUE,
+    fingerprint TEXT NOT NULL,
+    verdict_class TEXT NOT NULL,
+    members TEXT NOT NULL DEFAULT '[]',
+    digest TEXT NOT NULL,
+    lines TEXT NOT NULL DEFAULT '[]',
+    at REAL NOT NULL,
+    action TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS failures_batch ON failures (batch_id, fingerprint);
 CREATE TABLE IF NOT EXISTS identity_cache (
     namespace TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -314,6 +396,7 @@ CREATE TABLE IF NOT EXISTS journal (
     batch_id INTEGER,
     detail TEXT NOT NULL DEFAULT '{}'
 );
+CREATE INDEX IF NOT EXISTS journal_batch_kind ON journal (batch_id, kind, id);
 """
 
 
@@ -322,13 +405,17 @@ TABLES = "".join(statement + ";\n" for statement in SCHEMA.split(";") if stateme
 
 
 def dumps(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+    from .mixed_identity import encode
+
+    return json.dumps(encode(value), sort_keys=True, separators=(",", ":"))
 
 
 def loads(text: str | None, default: Any = None) -> Any:
     if text is None or text == "":
         return default
-    return json.loads(text)
+    from .mixed_identity import decode
+
+    return json.loads(text, object_hook=decode)
 
 
 def declared_columns() -> dict[str, list[tuple[str, str]]]:
@@ -377,6 +464,28 @@ class Store:
         self._add_missing_columns()
         self._connection.executescript(SCHEMA)
 
+    @contextmanager
+    def read_snapshot(self):
+        """A fresh committed WAL snapshot without holding the controller's connection lock."""
+        if str(self.path) == ":memory:":
+            with self._lock:
+                yield self
+            return
+        snapshot = Store.__new__(Store)
+        snapshot.path = self.path
+        snapshot._connection = sqlite3.connect(
+            "file:" + urllib.parse.quote(str(self.path)) + "?mode=ro", uri=True, isolation_level=None
+        )
+        snapshot._connection.row_factory = sqlite3.Row
+        snapshot._lock = threading.RLock()
+        snapshot._depth = 0
+        try:
+            snapshot._connection.execute("PRAGMA query_only=ON")
+            snapshot._connection.execute("BEGIN")
+            yield snapshot
+        finally:
+            snapshot._connection.close()
+
     def _add_missing_columns(self) -> None:
         """Add to each table every column `SCHEMA` declares that the database's table lacks.
 
@@ -421,13 +530,27 @@ class Store:
     def query(self, sql: str, params=()) -> list[dict[str, Any]]:
         """Fetch a complete read under the shared connection lock."""
         with self._lock:
-            return [dict(row) for row in self._connection.execute(sql, params).fetchall()]
+            return [self._record(dict(row)) for row in self._connection.execute(sql, params).fetchall()]
 
     def execute(self, sql: str, params: tuple[Any, ...] | list[Any] = ()) -> sqlite3.Cursor:
         with self._lock:
             return self._connection.execute(sql, params)
 
+    @staticmethod
+    def _record(row):
+        from .mixed_identity import qualify_record
+
+        return qualify_record(row)
+
     def insert(self, table: str, **row: Any) -> int:
+        from .mixed_identity import SourceNumber, source_record
+
+        if table in {"inputs", "members"} and isinstance(row.get("number"), SourceNumber):
+            identity = source_record(row["number"])
+            if row.get("source_identity", identity) != identity:
+                raise ValueError("queue record source identity mismatch")
+            row["source_identity"] = identity
+            row["number"] = int(row["number"])
         columns = ", ".join(row)
         marks = ", ".join("?" for _ in row)
         with self.transaction():
@@ -438,7 +561,7 @@ class Store:
         if not values:
             return 0
         sets = ", ".join(f"{column} = ?" for column in values)
-        clause, params = self._where(where)
+        clause, params = self._where(where, qualified=table in {"inputs", "members"})
         with self.transaction():
             cursor = self.execute(f"UPDATE {table} SET {sets}{clause}", [*values.values(), *params])
             return cursor.rowcount
@@ -450,7 +573,7 @@ class Store:
         order: str | None = None,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        clause, params = self._where(where or {})
+        clause, params = self._where(where or {}, qualified=table in {"inputs", "members"})
         sql = f"SELECT * FROM {table}{clause}"
         if order:
             sql += f" ORDER BY {order}"
@@ -460,24 +583,36 @@ class Store:
         # without the controller lock): the fetch must happen under the same lock as the execute, or a
         # concurrent statement resets the cursor mid-read (seen as `IndexError` on `/status` live).
         with self._lock:
-            return [dict(row) for row in self._connection.execute(sql, params).fetchall()]
+            return [self._record(dict(row)) for row in self._connection.execute(sql, params).fetchall()]
 
     def row(self, table: str, where: Mapping[str, Any], order: str | None = None) -> dict[str, Any] | None:
         found = self.rows(table, where, order=order, limit=1)
         return found[0] if found else None
 
     def count(self, table: str, where: Mapping[str, Any] | None = None) -> int:
-        clause, params = self._where(where or {})
+        clause, params = self._where(where or {}, qualified=table in {"inputs", "members"})
         with self._lock:
             return int(self._connection.execute(f"SELECT COUNT(*) FROM {table}{clause}", params).fetchone()[0])
 
     @staticmethod
-    def _where(where: Mapping[str, Any]) -> tuple[str, list[Any]]:
+    def _where(where: Mapping[str, Any], *, qualified=False) -> tuple[str, list[Any]]:
         if not where:
             return "", []
         parts: list[str] = []
         params: list[Any] = []
         for column, value in where.items():
+            if qualified and column == "number" and "source_identity" not in where:
+                from .mixed_identity import source_record
+
+                numbers = list(value) if isinstance(value, (list, tuple, set)) else [value]
+                parts.append(
+                    "(" + " OR ".join("(number = ? AND source_identity = ?)" for _ in numbers) + ")"
+                    if numbers
+                    else "0 = 1"
+                )
+                for number in numbers:
+                    params.extend([int(number), source_record(number)])
+                continue
             if value is None:
                 parts.append(f"{column} IS NULL")
             elif isinstance(value, (list, tuple, set)):

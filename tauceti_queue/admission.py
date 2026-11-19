@@ -17,10 +17,9 @@ from contextlib import nullcontext
 from datetime import datetime
 
 from runner import admission_policy as policy
-from tauceti_tools.self_tested import accepted
-from tauceti_tools.self_tested import context as local_context
 
 from .admission_state import AdmissionState
+from .controller import COMMENT_MARKER
 from .eligibility import KEEP
 from .github_adapter import RequestDeferred
 from .store import dumps, loads
@@ -32,11 +31,15 @@ EXPLICIT_WITHDRAWALS = frozenset(
         "cancelled",
         "conflicts-with-main",
         "missing-source",
+        "missing-source-recheck",
         "landed-externally",
         "problem-anticipated",
         "empty-commit",
+        "queue-withdrawn",
     }
 )
+# Admission dispositions under which a queue-refused head is not re-admitted (`readmit`).
+READMIT_REFUSED = frozenset({"closed", "draft", "review-unsafe"})
 CONTEXTS = ("build", "scope", "bump-guard")
 HUMAN_INFRASTRUCTURE_APPROVAL_VERSION = 1
 
@@ -95,8 +98,7 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
             "statuses": {
                 key: (source.get("statuses", {}).get(key) or "").lower()
                 for key in sorted(
-                    set(CONTEXTS)
-                    | {k for k in source.get("statuses", {}) if k.startswith(("self-tested/", "_native_"))}
+                    set(CONTEXTS) | {k for k in source.get("statuses", {}) if k.startswith("self-tested/")}
                 )
             },
         }
@@ -107,19 +109,21 @@ def recovery_heads(comments):
     return policy.rebase_request_heads(comments) | policy.rebase_request_heads(comments, stalled=True)
 
 
-def relevant_comment(comment):
+def relevant_comment(comment, *, native=False):
+    """Native recovery requests are author-checked when evaluated, not here."""
     body = comment.get("body") or ""
     return (
         policy.SCOREBOARD_MARKER in body
         or bool(recovery_heads([comment]))
-        or body.startswith("Merge-queue recovery for head `")
-        and "<!--tauceti-source:v2 " in body
+        or native
+        and body.startswith("Merge-queue recovery for head `")
     )
 
 
 class AdmissionPolicy:
-    def __init__(self, *, rubrics, prefix: str, allow_files):
+    def __init__(self, *, rubrics, prefix: str, allow_files, repository: str = ""):
         self.rubrics = tuple(rubrics)
+        self.repository = repository
         self.prefix = prefix
         self.allow_files = tuple(allow_files)
         if not self.rubrics or not prefix or not all(self.rubrics):
@@ -144,23 +148,52 @@ class AdmissionPolicy:
             }
         )
 
+    def rubrics_for(self, number):
+        """The rubrics PR `number` must have green: the configured ones, then any the pinned review
+        policy is phasing in for this repository's PRs above its cutoff.
+
+        The review engine runs a rubric being phased in only on those PRs, so requiring it of an
+        earlier one would hold that PR for a row no review adds. The table is the pinned policy's:
+        it reaches this service when the pin moves, and a pin that predates it requires the
+        configured rubrics of every PR. Each forge numbers its own PRs, so the table has a cutoff
+        for each repository: the GitHub service names its repository `owner/name`, and a native
+        source names its own by its qualified key. A policy that names none takes no phased rubric.
+        """
+        phased = getattr(policy, "with_phased_rubrics", None)
+        if phased is None or not self.repository:
+            return self.rubrics
+        return tuple(phased(self.rubrics, self.repository, number))
+
     def evaluate(self, snapshot):
+        rubrics = self.rubrics_for(snapshot.pull.number)
         result = policy.decide_from_comments(
             snapshot.comments,
             snapshot.pull.head_sha,
-            set(self.rubrics),
+            set(rubrics),
             snapshot.paths,
             snapshot.statuses.get("build", ""),
-            snapshot.statuses.get("bump-guard", ""),
+            (
+                "success"
+                if snapshot.self_tested and set(snapshot.paths) & {"lean-toolchain", "lake-manifest.json"}
+                else snapshot.statuses.get("bump-guard", "")
+            ),
             merge_path_prefix=self.prefix,
             merge_allow_file=self.allow_files,
-            table_rubrics=self.rubrics,
+            table_rubrics=rubrics,
             scope=snapshot.statuses.get("scope", ""),
             merge_base_sha=snapshot.merge_base_sha,
-            self_tested=accepted(
-                snapshot.pull.labels, snapshot.statuses.get(local_context(snapshot.pull.number)), member=True
-            ),
+            self_tested=snapshot.self_tested,
         )
+        if snapshot.diff_guard:
+            # The PR-level diff guards PR CI would have run. A violating head is never admitted;
+            # review state is untouched, so a head a human already queued is not withdrawn here.
+            result = {
+                **result,
+                "merge": False,
+                "diff_guard": list(snapshot.diff_guard),
+                "reason": "PR-level diff guards failed: " + "; ".join(snapshot.diff_guard),
+            }
+            result.pop("self_tested", None)
         result["recovery_heads"] = sorted(recovery_heads(snapshot.comments))
         if result["review_safe"] and snapshot.pull.head_sha in result["recovery_heads"]:
             result.update(merge=False, reason="waiting on a trusted recovery request for this head")
@@ -168,7 +201,7 @@ class AdmissionPolicy:
         comment, meta = board if board else ({}, {})
         states = meta.get("states")
         if not isinstance(states, dict) or not states:
-            states = policy.states_from_table(comment.get("body"), self.rubrics)
+            states = policy.states_from_table(comment.get("body"), rubrics)
         # CI/configuration, formatting, timestamps, costs and token accounting are not approval intent.
         authorization = (
             dumps(
@@ -218,11 +251,38 @@ class AdmissionPoller:
         self.last_summary = None
         self.stopping = threading.Event()
         self._prefer_urgent = True
+        self._insertion_held = {}  # number -> (head, evaluated version, no re-read before)
+        self._delivery = threading.local()  # per webhook thread: a delivery that changed nothing
+        from .admission_evidence import ADMISSION_LABELS, EvidenceCache, Shadow
+
+        fake_repo = getattr(adapter, "repo", None)
+        clone = getattr(adapter, "clone_dir", None) or getattr(fake_repo, "clone", None)
+        self.evidence = EvidenceCache(
+            controller.store,
+            repo,
+            clock=clock,
+            clone=str(clone) if clone else None,
+            relevant_comment=relevant_comment,
+            relevant_labels=lambda: KEEP | controller._no_repair_labels() | ADMISSION_LABELS,
+            base_branch=controller.canonical_branch,
+        )
+        self.shadow = Shadow(
+            self.evidence,
+            self.policy,
+            journal=controller.store.journal,
+            blocking_labels=controller._blocking_labels,
+        )
         # Restore retry deadlines as-is. Discovery is due at startup independently of pending work.
         saved = controller.store.get_setting("state:admission_discovery", {})
         self._discovery_at = float(saved.get("retry_at", 0))
         controller.admission = self
-        waiting = controller.store.rows("inputs", {"repository": repo, "state": ["waiting", "reserved"]})
+        from .mixed_identity import SourceNumber
+
+        waiting = [
+            row
+            for row in controller.store.rows("inputs", {"repository": repo, "state": ["waiting", "reserved"]})
+            if not isinstance(row["number"], SourceNumber)
+        ]
         waiting_numbers = {row["number"] for row in waiting}
         for work in controller.store.rows("admission_work", {"repository": repo}):
             previous_policy = loads(work["decision"], {}).get("evidence", {}).get("policy_digest")
@@ -235,6 +295,47 @@ class AdmissionPoller:
     def is_current(self, number, head):
         work = self.state.get(number)
         return bool(work and work["head_sha"] == head and work["generation"] == work["evaluated_generation"])
+
+    def insertion_check(self, number, head):
+        """None when the PR's admission inputs still match those admission evaluated for `head`, else
+        why not. Runs without the controller lock, before an approved head joins a batch.
+
+        `is_current` only consults local records, so a missed webhook would let a revoked review or
+        a failed status reach a batch until the next discovery. Behind `admission_insertion_check`,
+        this re-reads the inputs and compares their digest with the evaluated one. Any difference,
+        or a read that fails, holds the insertion (fail closed); a difference also has the PR
+        evaluated again. If the next read differs from that same evaluation again, reads wait an
+        approval-poll interval, so a digest that can never match costs no quota on every pass.
+        """
+        if not self.controller.setting("admission_insertion_check"):
+            return None
+        read = getattr(self.adapter, "admission_insertion_source", None)
+        if read is None:
+            return None  # an adapter without the read keeps today's local check
+        work = self.state.get(number)
+        if not work or work["head_sha"] != head or work["generation"] != work["evaluated_generation"]:
+            return "not evaluated at this head"
+        held = self._insertion_held.get(number)
+        if held and held[:2] == (head, work["evaluated_version"]) and self.clock() < held[2]:
+            # The last read disagreed with this very evaluation: wait before reading again, so a
+            # digest that never matches holds the head without spending quota on every pass.
+            return "inputs differed from this evaluation at the last check; waiting before reading again"
+        try:
+            source = read(self.repo, number, head)
+        except Exception as error:  # noqa: BLE001 - an unreadable source never admits
+            return f"unavailable: {error}"
+        if source.get("head") != head:
+            self.invalidate(number, urgent=True)
+            return "head moved"
+        if self._version(source) != work["evaluated_version"]:
+            if held and held[:2] == (head, work["evaluated_version"]):
+                log.warning("admission #%s: insertion check differs again from an unchanged evaluation", number)
+            retry = self.clock() + self.controller.setting("approval_poll_interval_seconds")
+            self._insertion_held[number] = (head, work["evaluated_version"], retry)
+            self.invalidate(number, head=head, urgent=True)
+            return "inputs changed since evaluation"
+        self._insertion_held.pop(number, None)
+        return None
 
     def interval(self):
         pending = self.state.summary()["next_attempt_at"]
@@ -259,6 +360,18 @@ class AdmissionPoller:
         )
         self.wake()
 
+    def readmit(self, number, head):
+        """Called under the controller lock when a `missing-source` refusal of `head` may no longer hold:
+        the PR is read again, and the evaluation restores the input if it would admit the head
+        (`Controller.restore_missing_source`). False when admission last saw another head, or the PR
+        closed, drafted or not review-safe."""
+        work = self.state.get(number)
+        if work is None or work["head_sha"] != head or work["disposition"] in READMIT_REFUSED:
+            return False
+        self.state.dirty(number, head=head, urgent=True)
+        self.wake()
+        return True
+
     def accept_manual(self, number, head):
         """A successfully applied operator approval is fresh intent, unlike reevaluation."""
         self.state.dirty(number, head=head, urgent=True)
@@ -270,6 +383,26 @@ class AdmissionPoller:
             cancelled_at=0,
         )
         self.wake()
+
+    def evidence_mode(self):
+        return self.controller.setting("admission_evidence_mode")
+
+    def evidence_event(self, kind, payload):
+        """Record a verified delivery in the evidence cache (shadow only); never fails the delivery."""
+        if kind not in ("pull_request", "issue_comment", "status", "push") or self.evidence_mode() == "off":
+            return
+        self._delivery.unchanged = None
+        try:
+            changed = self.evidence.apply_event(kind, payload)
+        except Exception as error:  # noqa: BLE001 - a failed write only means the PR is dirtied as before
+            log.warning("admission evidence: %s delivery not recorded: %s", kind, error)
+            return
+        if changed is False:
+            self._delivery.unchanged = payload  # this thread's delivery; see `handle_event`
+
+    def evidence_status(self):
+        mode = self.evidence_mode()
+        return {"mode": mode} if mode == "off" else {"mode": mode, "shadow": self.shadow.summary()}
 
     def handle_event(self, kind, payload):
         """Persist before webhook acknowledgement. No GitHub call or policy evaluation here."""
@@ -307,12 +440,28 @@ class AdmissionPoller:
                 kind == "status"
                 and detail.get("context") not in CONTEXTS
                 and not str(detail.get("context", "")).startswith("self-tested/")
-                and not str(detail.get("context", "")).startswith(("tauceti-review/", "tauceti-recovery/"))
             ):
                 return
             if kind == "check_run" and detail.get("name") == "merge eligibility":
                 return
             sha = detail.get("head_sha") or detail.get("sha")
+            if self.evidence_mode() == "events" and getattr(self._delivery, "unchanged", None) is payload:
+                rows = self.controller.store.rows("admission_work", {"repository": self.repo, "head_sha": sha})
+                cached = self.controller.store.row(
+                    "admission_evidence_statuses",
+                    {"repository": self.repo, "sha": sha, "context": detail.get("context")},
+                )
+                if (
+                    len(rows) == 1  # a head shared by PRs: one PR's seed proves nothing about another's evaluation
+                    and cached is not None
+                    and all(
+                        r["generation"] == r["evaluated_generation"] and cached["seeded_at"] >= r["attempted_at"]
+                        for r in rows
+                    )
+                ):
+                    # The last completed evaluation of the only PR at this head installed exactly
+                    # this state from its own read, and no delivery has changed it since.
+                    return
             if sha and self.controller.store.row("ci_attempts", {"head_sha": sha}):
                 return  # the service's candidate CI is output, not PR review evidence
             numbers = {p["number"] for p in detail.get("pull_requests", ()) if p.get("number")}
@@ -354,7 +503,9 @@ class AdmissionPoller:
                 if "incomplete" in pull.admission
                 else pull.admission.get("discovery_version") or self._version(pull.admission)
             )
-            self.state.observe(pull.number, pull.head_sha, version)
+            self.state.observe(
+                pull.number, pull.head_sha, version, recheck_after=pull.admission.get("recheck_seconds", 0)
+            )
 
     def run_once(self, *, reason="interval"):
         with self._lock:
@@ -365,6 +516,18 @@ class AdmissionPoller:
                 return self._run(reason)
 
     def _run(self, reason):
+        client = getattr(self.adapter, "client", None)
+        floor = int(self.controller.setting("github_background_floor"))
+        if client is not None and getattr(client, "background_floor", floor) != floor:
+            # Waits recorded under the old floor end at the next read, which checks the new one.
+            client.background_floor = floor
+            client.release_background_holds()
+            self.state.release_background_waits()
+            if self.controller.store.get_setting("state:admission_discovery", {}).get("retry_at"):
+                with self._discovery_lock:
+                    self._discovery_at = min(self._discovery_at, self.clock())
+        if hasattr(self.adapter, "local_merge_base"):
+            self.adapter.local_merge_base = bool(self.controller.setting("admission_local_merge_base"))
         configure_polling = getattr(self.adapter, "configure_admission_polling", None)
         if configure_polling is not None:
             configure_polling(
@@ -439,7 +602,7 @@ class AdmissionPoller:
         self.state.attempted(work)
         try:
             client = getattr(self.adapter, "client", None)
-            revocation = bool(
+            revocation = bool(work.get("emergency")) or bool(
                 work["urgent"]
                 and self.controller.store.row(
                     "inputs", {"repository": self.repo, "number": work["number"], "state": ["waiting", "reserved"]}
@@ -449,13 +612,6 @@ class AdmissionPoller:
             with deferred(urgent=revocation) if deferred is not None else nullcontext():
                 self._evaluate(work, summary)
         except Exception as error:
-            if (
-                getattr(error, "publication_kind", None) == "recovery"
-                and getattr(error, "number", None) == work["number"]
-            ):
-                reconcile = getattr(self.controller, "reconcile_source_recovery", None)
-                if reconcile is not None:
-                    reconcile(work["number"], getattr(error, "head", None), getattr(error, "nonce", None))
             self.state.defer(
                 work,
                 self._retry_at(error),
@@ -494,6 +650,18 @@ class AdmissionPoller:
         elif reason == "empty-commit":
             rows = self.controller.store.rows(
                 "journal", {"kind": "landed", "batch_id": current["batch_id"]}, order="id DESC", limit=1
+            )
+            withdrawn = self.controller.store.query(
+                "SELECT at FROM journal WHERE kind='member-withdrawn-empty' AND batch_id=? "
+                "AND json_extract(detail, '$.number')=? ORDER BY id DESC LIMIT 1",
+                (current["batch_id"], current["number"]),
+            )
+            boundary = withdrawn[0]["at"] if withdrawn else (rows[0]["at"] if rows else None)
+        elif reason == "queue-withdrawn":
+            rows = self.controller.store.query(
+                "SELECT at FROM journal WHERE kind='queue-withdrawn' AND batch_id=? "
+                "AND json_extract(detail, '$.number')=? ORDER BY id DESC LIMIT 1",
+                (current["batch_id"], current["number"]),
             )
             boundary = rows[0]["at"] if rows else None
         # Missing history is held conservatively. Never infer approval from a comment edit.
@@ -539,8 +707,16 @@ class AdmissionPoller:
 
     def _evaluate(self, work, summary):
         epoch = self._source_epoch()
-        snapshot = self.adapter.admission_snapshot(self.repo, work["number"], generation=work["generation"])
+        started = self.clock()
+        single = getattr(self.adapter, "admission_snapshot_single", None)
+        read = single if self.evidence_mode() == "events" and single is not None else self.adapter.admission_snapshot
+        snapshot = read(self.repo, work["number"], generation=work["generation"])
         result, authorization, evidence, comment, meta = self.policy.evaluate(snapshot)
+        if self.evidence_mode() in ("shadow", "events"):
+            try:
+                self.shadow.compare(snapshot, result, started, authorization)
+            except Exception as error:  # noqa: BLE001 - the shadow never changes or blocks a decision
+                log.warning("admission shadow #%s: %s", work["number"], error)
         current_input = self.controller.input_for(self.repo, work["number"])
         human_review = self._human_owned_approval(snapshot, current_input, comment)
         if human_review:
@@ -576,6 +752,8 @@ class AdmissionPoller:
             if human_review and approval_binding(current) != approval_binding(current_input):
                 self.state.dirty(work["number"], urgent=True)
                 return
+            if result.get("diff_guard") and pull.state == "open" and not pull.draft:
+                self._diff_guard_comment(pull, result["diff_guard"])
             requested = result["recovery_heads"]
             labels = {label.lower() for label in pull.labels}
             if (
@@ -585,7 +763,6 @@ class AdmissionPoller:
                 and result["review_safe"]
                 and not labels & KEEP
                 and requested
-                and not result.get("recovery_authority_hold")
             ):
                 held, labelled = pull.head_sha in requested, "needs-rebase" in labels
                 if held != labelled:
@@ -600,6 +777,9 @@ class AdmissionPoller:
                             "admission_generation": work["generation"],
                         },
                     )
+            if current and current["head_sha"] == pull.head_sha:
+                # Corrects a missed label delivery, whatever this evaluation decides.
+                self.controller.note_blocking_labels(current, pull.labels)
             if current and current["head_sha"] != pull.head_sha:
                 self.controller._pull_request_event(
                     {"number": pull.number, "action": "synchronize", "pull_request": {"head": {"sha": pull.head_sha}}},
@@ -616,7 +796,7 @@ class AdmissionPoller:
                     self.clock(),
                 )
                 disposition = "closed" if pull.state != "open" else "draft"
-            elif not result["review_safe"] or result.get("recovery_authority_hold"):
+            elif not result["review_safe"]:
                 withdrawn = self.controller._withdraw(self.repo, pull.number, "review-unsafe", "tauceti-queue policy")
                 summary["revoked"] += int(withdrawn["withdrawn"])
                 disposition = "review-unsafe"
@@ -629,6 +809,8 @@ class AdmissionPoller:
                     disposition = (
                         "already-approved" if current["state"] in ("waiting", "reserved") else current["state"]
                     )
+                elif (restored := self.controller.restore_missing_source(pull.number, pull.head_sha, pull)) is not None:
+                    disposition = restored
                 elif self._cancelled(current_work, snapshot, authorization, comment, meta):
                     disposition = "withdrawn"
                 else:
@@ -673,6 +855,26 @@ class AdmissionPoller:
                 self.controller._count("admission_approvals")
             summary["evaluated"] += 1
         self.controller._wake.set()
+
+    def _diff_guard_comment(self, pull, violations):
+        """Tell the author once per head why admission refused it, through the existing outbox."""
+        if not self.controller.setting("publication_enabled"):
+            return
+        body = (
+            "This PR cannot join the merge queue: it fails the PR-level diff guards that PR CI runs, "
+            "which admission checks itself because the PR skipped PR CI.\n\n"
+            + "\n".join(f"- {line}" for line in violations)
+            + "\n\nRun `lake lint` locally to reproduce. Push a fix and admission will reconsider the new head."
+        )
+        self.controller._enqueue(
+            "comment",
+            f"diff-guard:{pull.number}:{pull.head_sha}",
+            {
+                "number": pull.number,
+                "body": body,
+                "marker": f"<!-- {COMMENT_MARKER} diff-guard:{pull.head_sha} -->",
+            },
+        )
 
     def _human_owned_approval(self, snapshot, current, scoreboard):
         """Keep an exact, live admin approval only where machine review is absent.

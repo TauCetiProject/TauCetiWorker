@@ -56,6 +56,7 @@ are unix seconds, run and comment ids strings, `repo` is `owner/name`, SHAs are 
 | `dispatch_candidate(repo, *, head_sha, base_sha, base_ref, batch_id, members, repair_outputs_revs=()) -> str` | `POST /repos/{repo}/dispatches` with `event_type: tauceti-bors-staging` and `client_payload {head_sha, base_sha, batch_id, members, base_ref, repair_outputs_revs}`, what Bors sends plus `repair_outputs_revs` (the list of SHAs whose published outputs CI may restore, see controller.md); `members` entries are `{pr, head_sha}` when given as mappings and `{pr}` for bare numbers (see findings); returns the run title `bors branch=<b> batch=<id> head=<sha> base=<sha>` as the dispatch id |
 | `find_candidate_run(repo, *, batch_id, head_sha, base_sha, base_ref="main", since=None) -> CandidateRun \| None` | one list call `GET /actions/workflows/pr-build.yml/runs?event=repository_dispatch&created=<since-60s>..<now+60s>` matched on `display_title`, then the attempt's jobs; `phases` are the jobs and their steps as `CandidatePhase(name, started_at, completed_at, status, detail=conclusion)`; `runner_name`, `runner_labels` and `host` come from the `sandboxed-build` job; a completed unsuccessful run carries `diagnostics` (below); two runs with the same title raise `AmbiguousCandidateRun`, except that with `since` (the controller passes the attempt's dispatch time) the newest run created at or after it answers, because an infrastructure re-dispatch of the same head, base and batch legitimately creates a second run with the same title |
 | `commit_status(repo, sha, context) -> Status \| None` | the latest status for `context` from `GET /commits/{sha}/status`, with `run_id` parsed from `/actions/runs/<id>` in the target URL |
+| `main_ci_run(repo, sha) -> CandidateRun \| None` | the newest `GET /actions/workflows/ci.yml/runs?head_sha=<sha>&event=push&per_page=1`, without jobs: one call that raises rather than retrying or waiting on a limit; `None` when `ci.yml` has no run for the SHA (it coalesces bursts of pushes). The controller reads it only for an escalation's base health ([escalation.md](escalation.md)) |
 | `fast_forward(repo, branch, expected_parent, tip) -> FastForwardResult(ok, actual_parent, error)` | reads `refs/heads/<branch>`; if it is not `expected_parent`, reports the actual parent without writing; else `PATCH /git/refs/heads/<branch>` with `force: false`; a 422 (non-fast-forward) re-reads the ref and reports it as a moved parent with GitHub's message |
 | `update_ref(repo, ref, sha)` | force-updates `refs/<ref>` by pushing `+<sha>:refs/<ref>` from the service's clone with the token in the `GIT_CONFIG_*` header, so the retained commit's objects (which exist only in that clone) travel with the ref; without a clone the Git Data API creates or moves the ref, which works only for objects GitHub already has (retained candidate refs, never the base branch). The controller pushes the head's retained ref this way before every dispatch, since CI checks the candidate out by SHA |
 | `post_comment(repo, number, body, marker) -> str` | appends `<!-- tauceti-queue <marker> -->`; a comment already carrying the marker is edited (or left alone when identical), never duplicated |
@@ -93,7 +94,7 @@ accepts a status only when it names the candidate's own run (a status from anoth
 attempt, or a `pull_request` event on a member branch is not the candidate's verdict). The attempt
 passes only when all three are bound and `success`; a red `scope` or `bump-guard` beside a green
 `build` is a source failure of the head carrying the status description (a restricted path without a
-current admin approval, an oversized diff, a new file over 1000 lines, a failed pin validation), and a
+current admin approval, an oversized diff, a new file over 1250 lines, a failed pin validation), and a
 completed run with an absent, pending or unbound `build` status is observed again for
 `LOG_GRACE_SECONDS` (600 seconds) before it counts as infrastructure failure. The same grace
 applies to a green `build` with companion verdicts still missing. The completion timestamp is frozen
@@ -121,7 +122,7 @@ and mapped to the controller's records, dicts with `kind`, `module`, `message` a
 | log line | kind |
 | --- | --- |
 | `TauCeti/A/B.lean:12:3: error: ...`, `error: TauCeti/A/B.lean:12:3: ...` | `compiler` on `TauCeti.A.B` |
-| `audit-driver: import TauCeti.X failed, environment already contains '...' from TauCeti.Y` | `audit` on both modules |
+| `audit-driver: import TauCeti.X failed, environment already contains '...' from M` | `audit` on `TauCeti.X`, and on `M` when it is a project module |
 | `duplicate-declarations: name is declared in both M and N` | `audit` on the project modules |
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON) | `lint` on the defining path, `unknown` kept |
 | `Some required targets logged failures:` then `- TauCeti.A.B` | `compiler` per target, only when nothing was located |
@@ -130,7 +131,10 @@ Infrastructure findings (`kind == "infrastructure"`, with a `reason`) come from 
 `cancelled`, `timed_out`, `startup_failure`, `action_required` or `stale` run, a cancelled or
 timed-out job, a failed `finalize-merge-group-build` job (the `build` status may be missing), a lost
 runner named in the log, an unavailable log, or a completed failure with no status published. The
-controller uses those alone for classification and hands the rest to the repair task unchanged.
+controller uses those alone for classification and hands the rest to the repair task unchanged. The
+finalizer exits nonzero after it posts a failed `build` status, so once that status is bound to the
+run the finalizer's own finding is ignored: a bound `build=failure` with no other infrastructure
+finding is a source failure, repaired from the parsed findings or, when none parse, from the status.
 
 ## Admission: how approvals arrive
 
@@ -142,7 +146,8 @@ and approval-poll thread own pending work and missed policy observations; see
 [Primary admission](operations.md#primary-admission).
 
 **Comment commands.** `bors r+`, `bors merge`, `bors r=login`, `bors p=N`, `bors r-`, `bors cancel`
-in issue comments and review bodies, from collaborators with push access, parsed below.
+in issue comments and review bodies, from collaborators with push access, parsed below; `bors emergency`
+and `bors emergency-` from repository admins only.
 
 **Legacy eligibility checks (explicit pre-cutover mode only).** TauCetiReview's reusable
 `merge-only.yml` and `merge-sweep.yml` run `runner/backend.py eligibility`, which publishes an
@@ -192,9 +197,15 @@ fenced `diff` block. A diff longer than 400 lines shows the first 400 and a note
 line count and a link to the commit. Then the earlier edited revisions, the PRs the explanation
 mentions and the retained ref, as before. Each summary is journaled as `edit-summary` (number,
 commit, accepted head, `diff_lines`, `truncated`) and counted in `edit_summaries`. A clean member's
-comment is unchanged. A final empty contribution instead receives a rejection notice quoting the
-same accumulated explanations, has its staging label removed, and is closed without the merged
-title prefix. Existing externally merged placeholders and opt-out withdrawals retain their handling.
+comment is unchanged. A contribution an adopted repair reduces to an empty commit is withdrawn at
+adoption (`withdraw_emptied_at_adoption`): one comment, keyed `withdrawn-comment:<input>`, says that
+the queue withdrew it from the batch, what failed (the repair task's CI run and up to eight
+findings, or its rebase conflict), the accepted revision, the agent's explanation quoted, and what to
+do next (rebase, fix, approve again); its staging label is removed, its approval withdrawn, and the
+PR stays open. A final empty contribution not withdrawn at adoption instead receives a rejection
+notice at landing quoting the same accumulated explanations and failure lines, has its staging label
+removed, and is closed without the merged title prefix. Existing externally merged placeholders and
+opt-out withdrawals retain their handling.
 
 **The `repaired-in-queue` label.** Beside `dont-repair-in-queue` (the author's opt-out) and
 `needs-rebase` (the author must act), the queue marks the PRs it changed: every landed member that
@@ -218,6 +229,11 @@ reduces it to an empty commit and appends three lines naming the cause, `Interac
 `Interacting-File: <path>` and `Finding: <conflict, duplicate declaration, rename ripple or build
 error>: <sentence>`. A submission that changes such a member other than by emptying it (or by the
 queue's own empty commit for a PR already on `main`) is rejected as `no-repair-edited`.
+
+A control-file change in the control-file lane ([mixed-sources.md](mixed-sources.md), "The
+control-file lane") has `no_repair` as well, whatever its labels: no label event clears it, and a
+readmitted input keeps it. Its withdrawal comment says it changes control files outside the native
+path policy, which the queue never edits, instead of naming the label.
 
 **The withdrawal comment.** When an adopted chain (a repair, a rebase conflict, a preparation, or
 a pre-rebase the seal uses) has emptied a `no_repair` member, the PR is withdrawn as
@@ -261,6 +277,8 @@ nothing (`bors merged this`, `bors cancelled it`, `bors single-handedly`).
 | `bors cancel` | `controller.cancel(repo, pr, commenter)` |
 | `bors single on\|off` | accepted without effect |
 | `bors ping` | `:pong: pong` |
+| `bors emergency` | repository admins only (`adapter.repository_admin`; anyone else gets one `:lock: Permission denied` reply): `controller.request_emergency(repo, pr, commenter, surface="comment", reason=<comment URL>, live_head=<live head>)`; the reply says the request was accepted (and behind which PR it is queued) or why it was refused (`disabled`, `not-approved`, `head-moved`, ...) |
+| `bors emergency-` | repository admins only: `controller.cancel_emergency(repo, pr, commenter, surface="comment")`; refused once the emergency batch is landing |
 | `bors try`, `try-`, `retry`, `delegate`/`d` forms, `link`, `stack`, `unlink` | refused with a reply saying the merge queue does not run them |
 
 Anything after a complete command refuses the whole line with Bors's reply shape (`:-1: bors did not
@@ -347,11 +365,19 @@ object. Lists that were empty in every saved response (`held`, `bump_repairs`,
 `handoff.released_github_prs`) take their item shape from Bors's `api_controller.ex` and the readers.
 `requested_batch`, always null in the saved responses, is linked to the `batches[]` record that
 Bors's `batch_detail` serves there. Four paths are widened beyond what was observed, each for a
-documented reason below (`batch_id`, `runner_*_at`, `unknown_reason`). The fixture validates the
-two source files and the older `candidates-2026-11-04T0416Z.json` with zero errors, and
-`tests/fixtures/bors-feeds-sample.json` is a 20 KB cut of the sources that the tests validate on
-every machine. `feeds.validate` reports a wrong type, a missing required key, an unknown key, a
-changed schema string or timestamp unit, so drift in either direction fails `tests/queue_feeds.py`.
+documented reason below (`batch_id`, `runner_*_at`, `unknown_reason`).
+`tests/fixtures/bors-feeds-sample.json` is a small cut of the sources that the tests validate on
+every machine. Ordinary tests read only committed fixtures; they never discover captures in an
+operator's home directory. To compare two external captures with the committed schema explicitly,
+run `python -m tauceti_queue.feeds validate <active-batches.json> <candidates.json>`. This read-only
+command reports the file and path of each mismatch and exits nonzero on drift. It does not
+regenerate fixtures or change the supported format.
+
+`feeds.validate` reports a wrong type, a missing required key, an unknown key, a changed schema
+string or timestamp unit. This is a strict format audit, not proof that every difference breaks
+a consumer. For example, later saved candidates contain extra `declaration_names` and
+`inherited_handoff` fields; those require an explicit compatibility decision before changing the
+baseline. Do not regenerate the schema merely to make a newer capture pass.
 
 ### Observation feed, field by field
 
@@ -412,6 +438,8 @@ status plus `revision` and `started_at`.
 | `POST /tasks/inference` | bearer; body `{worker, ok, error}`; `report_inference(...)`; 204 |
 | `POST /admin/settings` | bearer and repository admin; `set_setting(key, value, login)` per key; `{settings, actor}` |
 | `POST /admin/urgent` | bearer and repository admin; body `{repo, pr}`; `mark_urgent(repo, pr, login)` |
+| `POST /admin/emergency` | bearer and repository admin; body `{repo, pr, reason}`; `request_emergency(repo, pr, login, surface="endpoint", reason=)`; `repo` goes to the controller unchecked, so a qualified Forgejo key is accepted where the controller's source checks accept it |
+| `POST /admin/emergency-cancel` | bearer and repository admin; body `{repo, pr}`; `cancel_emergency(repo, pr, login, surface="endpoint")` |
 | `POST /admin/retry-ci` | bearer and repository admin; `retry_ci(repo, login)` |
 
 Bearer tokens are GitHub tokens resolved to a login through `GET /user` (cached by token digest for

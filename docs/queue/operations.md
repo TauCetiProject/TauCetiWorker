@@ -26,11 +26,21 @@ uv run python scripts/tauceti_queue_github_app.py url
 Open the printed URL as an organization owner, set a webhook secret in the form (GitHub does not
 accept one through the URL), and create the App. The URL requests exactly these repository
 permissions: contents write, pull requests write, issues write, checks read, statuses write,
-actions write, workflows write, metadata read; and subscribes to these events: pull request,
+actions write, workflows write, metadata read, and the organization permission members read; and subscribes to these events: pull request,
 pull request review, issue comment, status, check run, check suite, push, workflow run. Pass
 `--webhook-url https://<host>/webhook/github` once the service host exists. Without it GitHub creates
 the App with no webhook and discards the event subscription, so both are added on the App's settings
 page later (Public endpoint, step 7); the API can edit an App webhook but not create one.
+
+Admission checks the `self-tested` route's team membership
+(`orgs/TauCetiProject/teams/self-tested/memberships/<login>`) with the App's own installation token,
+which needs **Organization permissions > Members: Read-only**. The App registered on 2026-11-04 lacks
+it: add it under
+[Permissions & events](https://github.com/organizations/TauCetiProject/settings/apps/tauceti-queue/permissions),
+then an organization owner accepts the changed permissions on the installation. Until then a
+self-tested PR's evaluation is deferred (15 minutes at a time) with that reason; it is neither
+admitted nor withdrawn, and no personal token is used instead. `SELF_TESTED_TEAM_TOKEN` in the
+service environment names an explicit token for this read instead of the App.
 
 For the deployed **primary intake**, narrow the App subscriptions in
 [Permissions & events](https://github.com/organizations/TauCetiProject/settings/apps/tauceti-queue/permissions):
@@ -113,7 +123,8 @@ build and how long each phase took, and makes placement decisions from those mea
 
 | Path | Content |
 | --- | --- |
-| `~/TauCetiQueue` | checkout of `TauCetiProject/TauCetiWorker` at the installed revision; the unit runs `uv run tauceti-queue serve` from here |
+| `~/TauCetiQueue` | the shared clone of `TauCetiProject/TauCetiWorker` that releases are made from; the installers fetch into it and never change its working tree |
+| `~/TauCetiQueue-releases/<sha>-<time>/` | one release per install: a detached worktree of the shared clone with its own `.venv`, baked `tauceti_queue/_revision.py` and `.tauceti-queue-release` marker; each installed unit names its own release, and the controller runs `uv run tauceti-queue serve` from its release |
 | `~/.config/tauceti-queue/config.toml` | the configuration (below); created from `services/queue/config.toml.example` on first install |
 | `~/.config/tauceti-queue/environment` | optional `TAUCETI_QUEUE_*` overrides read by the unit (`EnvironmentFile`); never secrets |
 | `~/.config/tauceti-queue/github-app.json`, `github-private-key.pem`, `github-webhook-secret` | the App credentials (GitHub App section) |
@@ -144,13 +155,14 @@ its source (`default`, `file`, `env:VARIABLE`, `hostname`) and the problems that
 | `database` | `~/.local/state/tauceti-queue/queue.sqlite3` | the SQLite file |
 | `credentials_dir` | `~/.config/tauceti-queue` | where the three App credential files live |
 | `log_dir` | `~/.local/state/tauceti-queue/logs` | the service's own log files |
+| `ci_recovery_report` | `~/.local/state/tauceti-ci-recovery/stuck-heads.json` | the CI recovery pass's stuck-head report, read for status and its alert ([escalation.md](escalation.md), "Stuck PR heads") |
 | `listen_host`, `listen_port` | `127.0.0.1`, `8780` | the local listen address the tunnel forwards to |
 | `public_url` | `https://queue.taucetiproject.org` | the public base; the webhook address is `<public_url>/webhook/github` |
 | `reconcile_interval_seconds` | `30` | the loop's cadence between event-driven wakeups |
 | `review_app_id` | `3947238` | identifies legacy automatic publications so policy mode can ignore late output; pre-cutover eligibility mode trusts this App |
 | `admission_source` | `policy` | primary policy intake; `eligibility` is only the explicit pre-cutover configuration |
 | `admission_lean_root` | `TauCeti` | trusted project root, converted to the allowed Lean path prefix |
-| `admission_rubrics` | the ten standard rubrics | required review rubrics, comma separated; trusted service configuration |
+| `admission_rubrics` | the ten standard rubrics | required review rubrics, comma separated; trusted service configuration. A rubric the pinned review policy is phasing in (`PHASED_RUBRICS`) is also required, of PRs above its cutoff for their source repository: GitHub and Forgejo number their PRs separately, so each has its own |
 | `admission_extra_files` | empty | extra allowed repository paths, comma separated, beyond the configured root file, Lake pins and bibliography |
 | `[settings] insertion_age_window` | `16` | initial runtime control (plan, "Runtime controls") |
 | `[settings] repair_concurrency` | `1` | initial runtime control |
@@ -175,20 +187,99 @@ Normal source discovery recovers missed policy observations. GitHub does not aut
 failed webhooks; inspect failed deliveries after a restart and redeliver missed operator commands.
 
 ```sh
-# first time: get the installer, then let it manage the checkout
+# first time: get the installer; it clones ~/TauCetiQueue when absent
 git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue
 ~/TauCetiQueue/services/queue/install.sh                     # origin/main
 ~/TauCetiQueue/services/queue/install.sh --revision <sha>    # a pinned revision
+services/queue/release.sh status                             # what each unit names and runs
 ```
 
-`services/queue/install.sh` is idempotent. It fetches, fast-forwards the checkout to the requested
-revision (refusing local modifications or a non-fast-forward target rather than forcing), runs `uv
-sync`, bakes the revision into `tauceti_queue/_revision.py`, writes `config.toml` and `environment` from
-the examples when absent, runs `check-config`, installs the units, `systemctl --user daemon-reload`,
-enables and restarts `tauceti-queue.service` and the backup timer, and then verifies the deployment by
-reading `/status` until the service answers and comparing the reported `service.revision` with the
-checkout. Exit 0 means the running service is the installed revision; exit 2 means it answered with a
-different revision or not at all, and the next step is `journalctl --user -u tauceti-queue -n 50`.
+**One release directory per install.** Each install materialises the requested revision as its own
+directory, `~/TauCetiQueue-releases/<sha>-<UTC time>/`: a detached `git worktree` of the shared
+clone `~/TauCetiQueue` with its own uv environment and baked revision. The installer then hands off
+to that release's copy of itself (so the installer logic is always the target revision's, whichever
+copy was started), renders only the units it installs so that every code path in them names the
+release, and restarts only those units. Other units keep their own release untouched: nothing
+changes under a running process, a crash restarts the same code, and each process reports the
+revision it was started from (`/status` for the controller, `revision` in a repair worker's
+`worker.json`, the first journal line of the monitoring units). A repair instance gets its own unit
+file, `tauceti-queue-repair@NAME.service`, rendered from the template, which takes precedence over
+`tauceti-queue-repair@.service`, so installing one worker never changes what another (re)starts
+from. A release is built once and never resynced, so its TauCetiTools commit is the one current at
+its creation. Data and configuration (`~/TauCetiQueue-data`, `~/.config/tauceti-queue`) stay where
+they are.
+
+`services/queue/release.sh status` lists each queue unit with the revision its unit file names and
+the revision its running process runs (marked `*` when the process still runs another directory,
+for example after `--no-restart`). After a successful install the installer removes release
+directories that no file under `~/.config/systemd/user` names and that no running process uses as
+its working directory (background publications included), keeping the newest 5 of those for
+rollback (`TAUCETI_QUEUE_RELEASE_KEEP`); `services/queue/release.sh gc` does the same by hand. Only
+names of the form `<sha>-<time>` are collected; hand-made worktrees in that directory are left alone.
+
+**The controller, the repair workers and the monitoring units run origin/main HEAD, each from its
+own release directory.** Never use systemd drop-ins (`~/.config/systemd/user/tauceti-queue*.service.d/*.conf`)
+for queue units: they silently override the installed unit and each other, so the release
+directories, `release.sh status` and the installers stop describing what runs. `install.sh`,
+`install-repair.sh` and `install-monitoring.sh` ([monitoring.md](monitoring.md)) refuse to run while
+one exists for a unit they install. Settings belong in `~/.config/tauceti-queue/environment` (or
+`repair-environment*`, `monitoring-environment`) or in the unit files in this repository.
+
+Running any revision other than origin/main HEAD (`--revision`, `--release`, `--checkout` or
+`TAUCETI_QUEUE_CHECKOUT`) requires explicit permission from a human operator, and the installers
+print a warning when it happens. Whoever does it must rerun the installer with no arguments as soon
+as their change lands on main. `/status` reports the running revision, so such a deployment stays
+visible.
+
+`services/queue/install.sh` is idempotent. It fetches into the shared clone, refuses a target that
+does not descend from the revision the service runs now (rather than forcing it), creates the
+release, runs `uv sync` there, bakes the revision into the release's `tauceti_queue/_revision.py`,
+writes `config.toml` and `environment` from the examples when absent, runs `check-config`, installs
+`tauceti-queue.service` and the backup service and timer pointing at the release, `systemctl --user
+daemon-reload`, enables and restarts `tauceti-queue.service` and the backup timer, and then verifies
+the deployment by reading `/status` until the service answers, comparing the reported
+`service.revision` with the release and checking that the service's main process runs from the
+release. Exit 0 means the running service is the installed release; exit 2 means it answered with a
+different revision, from another directory, or not at all, and the next step is `journalctl --user
+-u tauceti-queue -n 50`.
+
+**Rollback** points a unit back at a previous release directory and restarts only it, without
+rebuilding anything: list the candidates with `ls ~/TauCetiQueue-releases` (or `release.sh status`
+for the ones in use), then run the matching installer with `--release`, for example
+`~/TauCetiQueue/services/queue/install.sh --release ~/TauCetiQueue-releases/<sha>-<time>` or
+`install-repair.sh --instance 2 --release ...`. It warns like `--revision`, runs that release's own
+installer and verifies as usual. The installers refuse to move a unit backwards with `--revision`;
+`--release` is the explicit way.
+
+**Migration from the shared checkout.** Before this layout every unit ran from `~/TauCetiQueue`
+itself. The first install with the new installers works from that layout live, one unit at a time,
+with no drain: start the release-aware installer from a fresh clone so that `~/TauCetiQueue`'s
+working tree, which the not yet migrated units still run, is not changed:
+
+```sh
+git clone -q https://github.com/TauCetiProject/TauCetiWorker.git /tmp/tcq-bootstrap
+~/TauCetiQueue/services/queue/backup.sh               # as before any controller install
+/tmp/tcq-bootstrap/services/queue/install.sh
+/tmp/tcq-bootstrap/services/queue/install-repair.sh                # each right after its worker.json reports idle
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 2
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 3
+/tmp/tcq-bootstrap/services/queue/install-monitoring.sh
+/tmp/tcq-bootstrap/services/queue/install-repair-cleanup.sh --database ... --clone ... --root ...   # the arguments in "Terminal repair worktree cleanup"
+/tmp/tcq-bootstrap/services/queue/release.sh status
+```
+
+Each command moves only its own units to a new release; the others keep running from
+`~/TauCetiQueue` until their turn. When `release.sh status` shows no queue unit left on
+`~/TauCetiQueue`, fast-forward it once (`git -C ~/TauCetiQueue merge --ff-only origin/main`) so that
+its scripts are the release-aware ones; from then on any copy can start an install, because it hands
+off to the target release's installer. The old `tauceti-queue-repair@.service` template stays
+installed and still names `~/TauCetiQueue`, but no instance with its own unit file uses it. Other
+host units outside this repository that use `~/TauCetiQueue/.venv` keep working; that environment
+is no longer updated by the installers. Until that fast-forward, a migrated unit can be moved back
+to the shared checkout, which still holds the old code and environment: install the old unit file
+(`git -C ~/TauCetiQueue show HEAD:services/queue/<unit>`) into `~/.config/systemd/user/`, remove an
+instance's own `tauceti-queue-repair@NAME.service`, `daemon-reload` and restart that unit. After it,
+roll back with `--release` instead.
 
 `--no-restart` installs without restarting (the running service keeps its revision; verification then
 reports the mismatch deliberately). The unit has `Restart=always`, `TimeoutStopSec=120` and
@@ -210,15 +301,51 @@ uv run tauceti-queue status --json | jq .service
 uv run tauceti-queue status --url https://queue.taucetiproject.org   # through the tunnel
 ```
 
+While the head's CI run is in progress, `status` also reads that run's live build report from the
+public CI operations snapshot (`https://ci-data.taucetiproject.org`, no GitHub calls) and prints a
+line such as `build: phase build, 44,180 jobs done, ~54% of ~81.8k jobs (from last PR build), 905/min,
+ETA ~19 Nov 20:10 AEDT`. Lake's own total grows as it discovers jobs, so the percentage and ETA use
+the receiver's estimate, the latest finished build's final job count; without one only the done count
+and rate are shown.
+TauCetiTools' build reporter, outside the bwrap sandbox, posts these counters every fifteen seconds;
+they come from candidate output, so they are observations only. When the report is unavailable the
+head shows its running step alone (`tauceti_queue/build_progress.py`).
+
 ## Current deployment
 
-The controller, SQLite store, content clone, public tunnel, repair workers, monitoring publisher,
-history timer and backup timer run as `kim` on **chungus2**. Repair execution moved on November 7;
-the remaining controller services moved on November 8. Both public hostnames,
-`queue.taucetiproject.org` and `bors.taucetiproject.org`, now terminate at the same tunnel on
-chungus2. The configured canonical branch remains `main` and publication/admission remain enabled.
-Read the actual revision from `/status`; the relocation retained `6348a0116c2c` rather than
-combining a host move with an upgrade.
+The controller, SQLite store, content clone, public tunnel, monitoring publisher,
+history timer and backup timer run as `kim` on **tauchonki2** since November 10.
+Both public hostnames, `queue.taucetiproject.org` and `bors.taucetiproject.org`,
+terminate at the existing tunnel identity on that host. Canonical `main`, publication,
+automatic admission and the persisted three-worker concurrency policy are unchanged.
+
+Repair workers transfer individually at fresh idle heartbeats with no live claims.
+During the transition, existing claims continue on chungus2 and renew against the
+same public queue URL; replacement workers use `@tauchonki2` identities. A finite
+handoff service on chungus2 stops each old worker only when idle, starts its
+counterpart on tauchonki2, mirrors retained task observations, and collects source
+worktrees against a fresh read-only snapshot of the destination database. Never
+restart a retired source worker to repair apparent inactivity without checking
+current claims and the handoff receipt first.
+
+New staging builds are pinned by repository variable `STAGING_RUNS_ON` to
+`fleet-74773fc7f54d4877add11d80113fe340`, tauchonki2's reserved staging-only runner.
+Its CPU weight is 10000 versus 100 for ordinary PR runners. Staging compiler
+memory-admission sleeps are disabled; ordinary CI retains its admission policy.
+Physical VM/cgroup limits still apply. Already-running staging builds finish on
+their original host; neither routing changes nor controller relocation moves them.
+
+The November 10 cutover stopped the old writer and tunnel, transferred a consistent
+SQLite backup with verified integrity and table counts, synchronized final source
+refs and publisher state, and verified local health before enabling the destination
+tunnel. Public service returned after approximately 40 seconds. Active staging and
+repair processes retained their run identities. The source controller, tunnel,
+monitoring and backup units are disabled and masked to prevent competing writers
+or stale publication. The App delivery journal covered the cutover window: all eight
+relevant missed deliveries were confirmed successful; 1,417 failed notifications
+were discarded by the existing primary-intake filter. Migration evidence and final source snapshot are under
+`~/TauCetiQueue-data/migration-tauchonki2-20261110/` on chungus2; the destination
+holds its runtime checks and transfer receipts under the same path.
 
 All active processes use systemd user units. There are no detached controller/tunnel supervisors
 on the destination. The retired units on chungus are masked and its `run-service.sh`,
@@ -228,9 +355,8 @@ final database backup and migration evidence remain under
 and agent logs remain there as history; task JSON needed for reporting was copied to chungus2.
 Do not resurrect any retired unit while the new controller is authoritative.
 
-Chungus2 still has `Linger=no`. The user manager provides ordinary process recovery while it is
-running, but startup after reboot or loss of that manager is not guaranteed. The explicit host move
-does not claim to complete the postponed reboot-supervision work.
+Tauchonki2 has `Linger=yes`; the enabled user units and timers start with its user manager
+after reboot. Verify the public endpoint, backup, monitoring and worker claims after recovery.
 
 Production repair admission uses `repair_concurrency=3` and `background_start_limit=2`.
 Count all live claims when starting a task: a non-head task can increase the total to
@@ -246,27 +372,28 @@ additional user unit is `tauceti-queue-repair@3.service`, using the private
 worktree cleanup and public monitoring (and historical telemetry) when enabling it.
 Existing active workers need not restart for controller admission changes.
 
-Paths on chungus2, where they differ from the default layout:
+Paths on tauchonki2, where they differ from the default layout:
 
 | Path | Content |
 | --- | --- |
-| `~/TauCetiQueue` | shared code checkout for controller and repair workers at the installed revision |
-| `~/.config/tauceti-queue/config.toml` | `host = "chungus2"`, existing App/review/admission configuration and data paths |
+| `~/TauCetiQueue` | shared clone that releases are made from |
+| `~/TauCetiQueue-releases/<sha>-<time>/` | one release per install; each queue unit names its own (`services/queue/release.sh status`) |
+| `~/.config/tauceti-queue/config.toml` | `host = "tauchonki2"`, existing App/review/admission configuration and data paths |
 | `~/.config/tauceti-queue/environment` | controller overrides, including `SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt` for NixOS TLS trust |
 | `~/TauCetiQueue-data/clone` | controller content clone, including retained private source refs |
 | `~/TauCetiQueue-data/queue.sqlite3` (+ `-wal`, `-shm`) | authoritative queue database |
 | `~/TauCetiQueue-data/logs` | service-owned files; process logs use `journalctl --user -u tauceti-queue` |
 | `~/TauCetiQueue-data/repair-clone`, `repair`, `repair-2`, `repair-3` | separate repair Git clone and worker task/cache roots; active tasks use private writable dependencies |
-| `~/TauCetiQueue-data/mathlib-packages` | retained original dependency seed; no longer configured for live repairs |
+| `~/TauCetiQueue-data/repair-shared/lake-cache` | one shared Lake cache for all repair workers, seeded from the source host |
 | `~/TauCetiQueue-data/monitoring/` | publisher identity/epoch/delta state, private token, prepared observations and pinned exporter release |
 | `~/TauCetiQueue-data/reports/` | retained pilot inputs and Bors baseline used by the history timer |
 | `~/.local/state/tauceti-queue/backups/` | daily and pre-deployment SQLite backups; an immediate destination backup was verified |
-| `~/.cloudflared/config.yml`, `<tunnel id>.json`, `cert.pem` | existing tunnel identity and configuration; DNS did not change |
-| `~/TauCetiQueue-data/controller-migration-20261108/` | final source snapshot, member/settings comparison, webhook recovery and destination migration evidence |
+| `~/.config/tauceti-queue/tunnel/config.yml`, `<tunnel id>.json` | existing tunnel identity and configuration; DNS did not change |
+| `~/TauCetiQueue-data/migration-tauchonki2-20261110/` | cutover checks, runtime setup and worker-handoff evidence |
 
 ### Supervision and deployment
 
-On chungus2:
+On tauchonki2:
 
 ```sh
 systemctl --user status tauceti-queue cloudflared-tauceti-queue
@@ -277,24 +404,23 @@ systemctl --user list-timers 'tauceti-queue*'
 
 The controller and repair units use `LimitNOFILE=65536`. Their process supervisors remain outside
 worker OOM victim groups. Monitoring/history units retain their previous limits and run independently
-of scheduling. The old repair-observation SSH mirror is retired: the publisher now reads the local
-worker roots and verifies their local processes directly.
+of scheduling. The publisher reads local worker roots directly. During the November 10 transition,
+retained source observations are mirrored under `legacy-chungus2/`; remote PID liveness
+is unverified. The finite handoff service refreshes those observations until each old worker stops.
 
-Before an update, take an online backup with `services/queue/backup.sh`, verify the target revision
-and fast-forward the checkout. Use the service installer for controller deployment or explicitly
-bake `_revision.py` and restart `tauceti-queue.service`. Since the checkout is shared, an update
-that changes repair code also needs each repair worker restarted through its unit; a running task
-is checkpointed and resumed. Keep ordinary admissions enabled. Verify public revision, accepted
+Before an update, take an online backup with `services/queue/backup.sh` and verify the target
+revision. Use the service installer for controller deployment; it creates the controller's own
+release and restarts only `tauceti-queue.service`. The repair workers and monitoring keep their
+releases until their own installers run, so an update that changes repair code needs
+`install-repair.sh` for each worker (and `release.sh status` shows which units still run older
+code); a running task is abandoned and its claim released, so install a worker right after
+`worker.json` reports `idle` to avoid losing its task. Keep ordinary admissions enabled. Verify public revision, accepted
 members, claims, CI identity and useful progress after the update; do not use the retired shell
 helpers on chungus.
 
-A plain `git pull` does not refresh the baked revision. Before a manual service restart:
-
-```sh
-cd ~/TauCetiQueue
-printf 'SHA = "%s"\nDIRTY = False\n' "$(git rev-parse HEAD)" > tauceti_queue/_revision.py
-systemctl --user restart tauceti-queue
-```
+Never edit or `git pull` inside a release directory: units may run from it, and its baked
+revision would stop describing the code. A manual `systemctl --user restart` of a unit restarts the
+same release.
 
 Stop a service through its unit rather than killing arbitrary process patterns. On a host without
 lingering, the units/timers may need starting after a reboot/user-manager restart. Confirm public
@@ -342,7 +468,7 @@ members/settings and source objects before starting the new controller. Switch t
 only after local health is verified. Audit/redeliver outage webhooks, run a destination backup and
 verify monitoring/history and worker claims.
 
-Rollback to chungus requires transferring the **current** chungus2 database and source/publisher
+Rollback to the previous host requires transferring the **current** tauchonki2 database and source/publisher
 state after stopping its authoritative services. The old pre-move backup is historical, not a safe
 replacement for work accepted since cutover. Restore/unmask the source units and configuration only
 once destination ownership has ended. Retained credentials and originals make rollback possible;
@@ -353,8 +479,8 @@ old data is kept until an operator authorizes cleanup.
 When a head's CI fails with attributable diagnostics the service creates a repair task (or a
 rebase-conflict task when a canonical advance conflicts); nothing happens to it until a worker claims
 it. `tauceti_queue/repair_task.py` ([repair-task.md](repair-task.md)) is that worker, and
-`services/queue/tauceti-queue-repair.service` runs it continuously as a systemd user unit: resume
-checkpointed tasks, claim, prepare warm artifacts, run the repair agent, push the chain to the task's
+`services/queue/tauceti-queue-repair.service` runs it continuously as a systemd user unit: retry
+pending deliveries, claim, prepare warm artifacts, run the repair agent, push the chain to the task's
 submission ref, submit it, report the provider outcome to `/tasks/inference` (the inference hold),
 sleep the poll interval when nothing is claimable. A task's failure, a service outage or a refused
 authorization is logged and retried on the next pass; the loop never exits for them. The worker's
@@ -364,6 +490,20 @@ and relies on the service's own admin enforcement; only the API saying the accou
 stops it, and `--check` reports the cached verification's age. The worker runs
 on the service host today; it only needs the service URL, so it can run on any host meeting the
 requirements below (the service's `repair_concurrency` setting bounds how many hold a task at once).
+
+Repairs run below the CI and staging VMs that share their host. Every repair unit runs in
+`tauceti-repair.slice` (installed by `install-repair.sh` beside TauCetiFleet's `tauceti-fleet.slice`
+under `tauceti.slice`, with `CPUWeight=10` and `IOWeight=10` against the fleet slice's 100), at
+`Nice=10` with the lowest best-effort IO priority (not the idle class, which could stall the claim
+lease's renewal); every thread and child inherits these, bwrap sandboxes and the agent's processes
+included, and the background publisher's transient unit is started in the same slice with the same
+settings. The slice weight is what counts against the VMs: the cgroup CPU controller shares a busy
+host between sibling slices by weight, so a reniced process in `app.slice` competes as `app.slice`
+does. The weights are work-conserving, so repairs slow down under a staging build and never stop.
+Disk traffic is ordered only where the block layer honours cgroup weights or IO priorities (BFQ,
+mq-deadline, or io.cost configured for the device); tauchonki2's devices use `none`, so there
+nothing orders it. A `renice` by hand affects only the thread it names, not the other threads of a
+multithreaded process such as `lake` or the worker, nor their later children.
 
 Queue repair sessions using Claude (subscription or API) give Bash EOF on its default stdin.
 The worker atomically writes `bash-env.sh` beside its persistent private Claude config and selects
@@ -417,12 +557,37 @@ succeeds before then continues the claim.
   `/run/current-system/sw/bin/bwrap`. A host without it may set `TAUCETI_QUEUE_SANDBOX=0` in the
   environment file, which runs builds unsandboxed and says so in the log on every build.
 - **Credentials**, by name; never print their values.
-  - The GitHub token of the worker's account, which must be a repository admin on
+  - On the queue service's host, the queue App: `TAUCETI_QUEUE_GITHUB_APP` names the directory holding
+    `github-app.json` and `github-private-key.pem` (the service's own `~/.config/tauceti-queue`). The
+    worker mints installation tokens itself, narrowed to contents write, workflows write and metadata
+    read, kept in memory and renewed five minutes before they expire; it exports the current one as
+    `GH_TOKEN` for its own `gh` calls and for the submission push through `gh auth git-credential`,
+    and points its `gh` at an empty config so the host's gh login is never read. Its git reads a
+    private global config that includes `~/.gitconfig` and then resets every GitHub credential helper
+    and `http.extraHeader`, leaving `gh auth git-credential` alone, so no personal helper answers a
+    fetch or push and no storing helper keeps the token. Its local check
+    before claiming is that the installation reads the repository with contents write. To the service
+    it presents `github_app.local_worker_bearer`: a timestamp and an HMAC keyed by the App's private
+    key, minted per request and accepted for five minutes. The service verifies it with its own copy
+    of the key, with no GitHub request, and resolves it to the App's bot login (`tauceti-queue[bot]`),
+    which may claim, renew, release, checkpoint, submit and report inference; every `/admin/` route
+    refuses it, and no GitHub token can resolve to that login. Trust: any process that can read the
+    App's private key can now act as a repair worker. Such a process can already mint installation
+    tokens that push to the content repository and act as the queue itself, so this adds no new
+    holder of power; the bearer does not expose the key, and a captured one is a worker credential
+    for at most five minutes. Rotating the App key revokes it.
+  - Elsewhere, the GitHub token of the worker's dedicated account, which must be a repository admin on
     `TauCetiProject/TauCeti`: the service applies `security_audit.require_admin` to the login the
     bearer token resolves to at claim and at submit, and the worker applies the same predicate before
-    claiming. Source order: `TAUCETI_QUEUE_TOKEN_FILE` (a mode 0600 file), `TAUCETI_QUEUE_TOKEN`,
-    `GH_TOKEN`, `GITHUB_TOKEN`, else `gh auth token` from the account's gh login. The same account's
-    git credentials push the submission ref (`gh auth setup-git`, or the token in the helper).
+    claiming. It is read from `TAUCETI_QUEUE_TOKEN_FILE` (a mode 0600 file), else
+    `TAUCETI_QUEUE_TOKEN`; without either the worker refuses to start. It never falls back to
+    `GH_TOKEN`, `GITHUB_TOKEN` or `gh auth token`: on a shared host those are an operator's personal
+    token, whose hourly quota every agent on that account shares. Use an account other than the
+    operator's (a second token of the same user shares the same quota). The worker exports the token
+    as `GH_TOKEN` for its own `gh` calls, so its admin checks and the git push of the submission ref
+    (through `gh auth setup-git`'s helper) use the same account; agents never inherit it. Make
+    `gh auth git-credential` the only GitHub credential helper (as `gh auth setup-git` writes it),
+    so no stored personal token answers the push first.
   - One credential per provider in the chain `TAUCETI_QUEUE_PROVIDERS` (default `claude,codex,api`;
     [repair-task.md](repair-task.md), "Providers"). `claude`: Claude Code's credentials in
     `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude`), copied into the task's isolated config
@@ -451,8 +616,7 @@ On the colocated controller/repair host, install the lifecycle collector after d
 worker/publisher ownership leases:
 
 ```sh
-cd ~/TauCetiQueue
-services/queue/install-repair-cleanup.sh \
+~/TauCetiQueue/services/queue/install-repair-cleanup.sh \
   --database ~/TauCetiQueue-data/queue.sqlite3 \
   --clone ~/TauCetiQueue-data/repair-clone \
   --root ~/TauCetiQueue-data/repair \
@@ -549,21 +713,26 @@ had 0.154.0, which failed this way; 0.166.0 answers normally on the same Pro acc
 ### Install and update
 
 ```sh
-git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue   # if not already present
-~/TauCetiQueue/services/queue/install-repair.sh                   # origin/main
+~/TauCetiQueue/services/queue/install-repair.sh                   # origin/main (clones ~/TauCetiQueue when absent)
 ~/TauCetiQueue/services/queue/install-repair.sh --revision <sha>  # a pinned revision
 ~/TauCetiQueue/services/queue/install-repair.sh --instance 2      # another worker
 ```
 
-`install-repair.sh` is idempotent and live. It fast-forwards the checkout, runs `uv sync`, writes
+The rules in [Install and update](#install-and-update) apply here too: no drop-ins, and origin/main HEAD
+unless a human operator has given permission for another revision.
+
+`install-repair.sh` is idempotent and live. It creates the worker's own release (as above), runs
+`uv sync` there, writes
 `~/.config/tauceti-queue/repair-environment` from `services/queue/repair-environment.example` when
 absent (then review it: service URL, worker name, clone, task root, credential locations), clones the
-content repository when absent, runs the worker's host checks, installs the unit, enables and
-restarts it, and verifies that the unit is active and that the restarted process (the unit's
-`MainPID`) reports itself serving in `<task root>/worker.json`. Exit 0 means the worker is serving;
+content repository when absent, runs the worker's host checks, installs only this worker's unit
+pointing at the release, enables and restarts it, and verifies that the unit is active, that its
+main process runs from the release, and that the restarted process (the unit's `MainPID`) reports
+itself serving at the release's revision in `<task root>/worker.json`. Exit 0 means the worker is serving;
 1 a setup or host-check failure; 2 an inactive or silent unit, and the next step is
 `journalctl --user -u tauceti-queue-repair -n 50`. `--no-restart` installs without interrupting a
-running task. The queue service, its backup timer and the fleet units are not touched.
+running task. The queue service, its backup timer, the other workers and the fleet units are not
+touched.
 
 An instance uses `tauceti-queue-repair@NAME.service` and `repair-environment-NAME`. When that file
 is absent, the installer copies the singleton's provider/cache configuration and supplies a distinct
@@ -571,16 +740,15 @@ worker identity and task root. Both service forms execute the virtual environmen
 so `MainPID` matches `worker.json`. `Restart=always`, `OOMPolicy=kill` and disabled start-rate limiting
 keep worker-cgroup kills recoverable without an external restart loop or a new memory cap.
 
-A restart (or `systemctl --user stop`) sends SIGTERM: a running agent is stopped, its claim and
-checkpoint are kept (`tasks/<id>/task.json` in state `interrupted`, the worktree in place), and the
-restarted worker renews the claim and resumes the same model session. A task that has already
+A restart (or `systemctl --user stop`) sends SIGTERM: a running agent is stopped, the attempt
+abandoned, its claim released (`worker-stopped`) and its worktree removed. A task that has already
 validated its chain finishes the push and submission first. `TimeoutStopSec=300`; a worker killed
 beyond that leaves the claim to expire (`claim_ttl_seconds`, 900) and the task is re-exposed.
 
 ### Verify, logs, stop
 
 ```sh
-cd ~/TauCetiQueue && uv run python -m tauceti_queue.repair_task --check   # tools, token, admin, service, clone, credentials, disk
+cd "$(systemctl --user show -p WorkingDirectory --value tauceti-queue-repair)" && UV_NO_SYNC=1 uv run python -m tauceti_queue.repair_task --check   # tools, token, admin, service, clone, credentials, disk
 systemctl --user status tauceti-queue-repair
 journalctl --user -u tauceti-queue-repair -f
 jq . "$(. ~/.config/tauceti-queue/repair-environment; echo "$TAUCETI_QUEUE_TASK_ROOT")/worker.json"
@@ -588,7 +756,7 @@ jq . "$(. ~/.config/tauceti-queue/repair-environment; echo "$TAUCETI_QUEUE_TASK_
 
 `--check` prints one line per host requirement and exits 1 when any fails, naming the token's source
 and the login, never the token, and whether the api key is set, never the key. `worker.json` is the
-worker's heartbeat: `pid`, `state` (`starting`, `claiming`, `running`, `idle`, `stopping`, `stopped`),
+worker's heartbeat: `pid`, `revision` (read once at startup from the release), `state` (`starting`, `claiming`, `running`, `idle`, `stopping`, `stopped`),
 `tasks`, `outcomes` by status, `providers` (per provider: `ran`, `skipped`, `failed` counts), `errors`
 and `last_error`, `last_outcome` (with the task's `provider` and `provider_attempts`), `started_at` and
 `updated_at`. The service side of the same facts is
@@ -596,8 +764,8 @@ and `last_error`, `last_outcome` (with the task's `provider` and `provider_attem
 the status document. Each task's record is `<task root>/tasks/<id>/` (`task.json`, `outcome.json`,
 `logs/` with the agent transcript, prompt, push and build logs).
 
-To stop the worker: `systemctl --user stop tauceti-queue-repair` (a running task is interrupted and
-resumed at the next start, as above); to stop it from coming back, `systemctl --user disable --now
+To stop the worker: `systemctl --user stop tauceti-queue-repair` (a running task is abandoned and
+its claim released, as above); to stop it from coming back, `systemctl --user disable --now
 tauceti-queue-repair`. To stop without interrupting a task (finish the current one, claim no more),
 stop it right after `worker.json` reports `idle`. For instances 2 and 3, use
 `tauceti-queue-repair@2.service` and `tauceti-queue-repair@3.service` in the same commands. Current repair workers use these units even
@@ -667,7 +835,8 @@ that is older than GitHub reconciles on restart, which is the same path as recov
 
 After every `install.sh` (and after any restart), in this order:
 
-1. **Revision.** `uv run tauceti-queue status --expect-revision $(git -C ~/TauCetiQueue rev-parse HEAD)`
+1. **Revision.** `uv run tauceti-queue status --expect-revision <installed sha>` (the installer does
+   this; `services/queue/release.sh status` shows the sha each unit names and runs)
    exits 0; `service.started_at` is after the restart; `service.controller` is `running` (`unavailable`
    with a reason means a component is missing from this revision).
 2. **The two feeds answer.** `curl -s https://queue.taucetiproject.org/api/observation | jq .schema`
@@ -720,7 +889,6 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `claim_ttl_seconds` | `900` | integer, at least 0 |
 | `dispatch_timeout_seconds` | `600` | integer, at least 0 |
 | `lost_run_seconds` | `14400` | integer, at least 0 |
-| `infrastructure_retry_limit` | `3` | integer, at least 0 |
 | `infrastructure_retry_backoff_seconds` | `60` | integer, at least 0 |
 | `inference_failure_threshold` | `3` | integer, at least 0 |
 | `inference_hold_backoff_seconds` | `60` | integer, at least 0 |
@@ -729,6 +897,10 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `outbox_retry_max_seconds` | `900` | integer, at least 0 |
 | `polling_interval_seconds` | `60` | integer, at least 0 |
 | `approval_poll_interval_seconds` | `900` | integer, at least 1 |
+| `github_background_floor` | `1000` | integer, at least 0; queue App requests left at which admission reads wait for the reset |
+| `admission_evidence_mode` | `off` | `off`, `shadow` or `events`; see "Admission evidence shadow" below |
+| `admission_local_merge_base` | `false` | true takes a GitHub PR's merge base from the local clone when it is complete and the merge base is unique there, instead of the compare API; `status.admission.merge_base_sources` counts both |
+| `admission_insertion_check` | `false` | true re-reads a GitHub PR's admission inputs (one GraphQL call) before its approved head joins a batch, and holds the insertion unless they match what admission evaluated |
 | `membership_label` | `bors-staging` | text |
 | `repaired_label` | `repaired-in-queue` | text; empty disables |
 | `insertion_probe_budget_seconds` | `20` | integer, at least 0 |
@@ -738,6 +910,26 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `prepare_quiet_seconds` | `600` | integer, at least 0 |
 | `pre_rebase_enabled` | `true` | `true` or `false` |
 | `prepare_pre_rebased` | `true` | `true` or `false` |
+| `withdraw_emptied_at_adoption` | `true` | `true` or `false` ([reject-empty-commits.md](reject-empty-commits.md)) |
+| `failure_repeat_limit` | `2` | integer, at least 0; 0 disables ([escalation.md](escalation.md)) |
+| `repair_fruitless_claim_limit` | `3` | integer, at least 0; 0 disables |
+| `source_failure_round_limit` | `6` | integer, at least 0; 0 disables |
+| `policy_rejection_withdraw` | `true` | `true` or `false` |
+| `attribution_max_members` | `10` | integer, at least 0; 0: no bound |
+| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff |
+| `automatic_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
+| `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
+| `escalation_alert_seconds` | `86400` | integer, at least 0 |
+| `emergency_enabled` | `false` | `true` or `false`; accept `bors emergency` requests (below, after Rebuilding the head) |
+| `emergency_evict` | `false` | `true` or `false`; let the emergency batch take the head from a running head that is neither about to land nor publishing its final oleans |
+| `forgejo_placement_enabled` | `true` | `true` or `false`; `false` keeps waiting Forgejo inputs out of insertion while Forgejo is unavailable ([mixed-sources.md](mixed-sources.md), "Landing GitHub work while Forgejo is unavailable") |
+| `forgejo_recent_listing` | `true` | `true` or `false`; between full Forgejo listings, list the open Forgejo PRs updated since the last listing on every pass ([mixed-sources.md](mixed-sources.md)) |
+| `forgejo_recheck_seconds` | `21600` | integer, at least 0; a settled Forgejo PR whose listed facts are unchanged is evaluated again this long after its last attempt ([mixed-sources.md](mixed-sources.md)) |
+| `control_lane_enabled` | `false` | `true` or `false`; stage GitHub control-file PRs in their own lane batch ([mixed-sources.md](mixed-sources.md), "The control-file lane") |
+
+Escalations (withdrawals, bisections, the start and end of an infrastructure backoff) are sent as Zulip direct messages when
+`TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
+configuration file; see [escalation.md](escalation.md), "Alerts and notifications".
 
 
 ## Primary admission
@@ -771,7 +963,7 @@ Build changes invalidate decisions independently of PR `updated_at`; queue outpu
 comments do not. A normal advance of the target that leaves the merge base unchanged creates no
 new evaluation. Missing or incomplete source reads never imply approval or removal of unseen work.
 
-Pending PRs have no invocation, PR-count, fixed-reserve or lifetime-attempt allowance. REST and
+Pending PRs have no invocation, PR-count or lifetime-attempt allowance. REST and
 GraphQL waits retain their absolute server deadline. Intake does not sleep on an exhausted bucket;
 other runnable work proceeds. Resident pagination buffers retain pages already read during a quota
 wait. After a process restart the database still owns pending work and deadlines, and source
@@ -779,7 +971,7 @@ reconciliation restores observations. There are no admission workflow reruns or 
 
 PRs waiting for the same API resource share its observed deadline in the existing database.
 Advancing that deadline does not create another attempt or write for every waiting PR. Source
-failures remain local to their PR, and urgent revocations can bypass background pacing while still
+failures remain local to their PR, and urgent revocations can bypass the background floor while still
 respecting actual server cooldowns. Startup restores these waits into the shared client, including
 for newly observed PRs. Expected resource waits count as `deferred`, rather than poll errors.
 
@@ -788,12 +980,50 @@ does not require repeated rounds through the entire backlog. New input and genui
 failures rejoin at the current time; a changing or failing PR therefore lets other work proceed.
 The last-attempt timestamp and oldest-pending age remain separate diagnostics.
 
-Background reads are paced across each resource's remaining window, using REST requests and
-reported GraphQL point costs separately. Queue/CI calls, queued-review revocations and final
-head/CI fences receive priority. Source preparation resumes at the next eligible read without
+Background reads run at full speed while the queue App installation has more than
+`github_background_floor` requests left in the current window (REST requests and GraphQL points
+are separate buckets). At or below the floor they stop until that bucket resets: the evaluation
+is deferred to the reset time, and the floor stays available to queue/CI calls, commands,
+queued-review revocations and final head/CI fences, which receive priority. The floor applies only
+to the installation's quota; requests made with another token are never counted against it. Source preparation resumes at the next eligible read without
 restarting from its first request. The final fence reads current CI independently of PR timestamps.
 An approved input with a pending review change cannot be inserted until evaluation completes;
 the same check protects a replay that was already in progress when the change arrived.
+
+Admission evidence shadow (decision 38 step 4, slice 1). With `admission_evidence_mode` set to
+`shadow`, the service keeps each GitHub PR's admission evidence (head, base, labels, body, every
+comment id with the bodies of scoreboards and recovery requests, and the newest status per head
+and context) in `admission_evidence*` tables, filled from verified webhook deliveries and from each
+full read (`tauceti_queue/admission_evidence.py`). Before each full read refreshes the cache, the
+same policy evaluates the cached evidence, with the merge base and paths from the local clone, and
+`status.admission.evidence.shadow` counts the outcome: `match`, `race` (a delivery arrived during
+the read), `unseeded`, `gap` (GitHub's comment count disagrees), `status-order-unknown`, `merge-base-unknown`,
+`paths-unknown` or `mismatch`, with the differing fields and, for a verdict difference, its
+direction (`cache-would-admit`, `cache-would-refuse`, `cache-keeps`, `cache-revokes`); mismatches
+are also journaled as `admission-shadow`, and `with_differences` counts every comparison that found a difference, whatever its outcome. The shadow makes no GitHub request and never changes a
+decision; `off` (the default) writes nothing. Switch it live with `tauceti-queue settings set
+admission_evidence_mode shadow`.
+
+`events` (slice 5) keeps the shadow and changes two things. Each evaluation reads the PR, its
+labels, every comment and the head's statuses with one GraphQL call
+(`GitHubAdapter.admission_snapshot_single`), takes the merge base and paths from the clone, and
+runs the same policy; self-tested membership and bump-guard reads stay live and are fenced again
+afterwards. A PR whose read one response cannot complete (over 100 comments or labels), whose
+head commit does not match, or whose merge base the clone cannot vouch for takes the full read as
+before; `status.admission.snapshot_sources` counts both paths. And a commit status delivery
+that leaves the cached state of its commit and context unchanged no longer re-dirties the PR. The
+check before insertion (`admission_insertion_check`) should be on before `events` is.
+
+Insertion check (decision 38 step 4, slice 3). `is_current` consults only the queue's own
+records, so a lost webhook could let a revoked review, an edited scoreboard or a failed status
+reach a batch until the next discovery pass. With `admission_insertion_check` true, after a clean
+replay and before a GitHub input joins a batch, the service re-reads the PR's head, target,
+state, labels, body, every comment and the head's statuses in one GraphQL call (more pages for
+over 100 comments or labels) and compares their digest with the one admission evaluated. A
+difference, or a read that fails, holds the insertion: the input stays waiting with
+`last_probe = admission-recheck`, the PR is evaluated again at once, and the counter
+`insertion_checks_held` and the journal kind `insertion-check-held` record it;
+`insertion_checks_passed` counts insertions that passed. Forgejo inputs keep their current checks.
 
 Manual withdrawal records a separate head/authorization fence, even before the first policy
 evaluation. CI/configuration changes, incidental review edits and repeated polls cannot revive it.
@@ -930,7 +1160,7 @@ identity, so a branch exception alone does not distinguish those processes.
 Keep it out of updates to a fenced host without the explicit authority decision.
 Record the identity behind each repair token and fallback login; retain any
 repository-admin credential only in the named administrative profile, outside
-retired unattended repair runtimes. Preserve the corresponding recovery records.
+retired unattended repair runtimes.
 
 This is a cutover condition, not an instruction to stop current production during
 preparation. Keep normal worker/CI admissions enabled until the authorized
@@ -944,7 +1174,29 @@ and lets the next tick dispatch a fresh attempt. It is for a head whose commits 
 without a source change, for example after a chain tool fix changed the commit message format and the
 head's CI failed on a consequence of the old format; it is refused while the head is claimed and when a
 member carries agent edits, which a rebuild would discard. `POST /admin/retry-ci` stays the action for
-exhausted infrastructure retries.
+persistent infrastructure failures; automatic retries continue with capped backoff.
+
+### Landing a PR urgently: `bors emergency`, not an admin merge
+
+To land an approved PR ahead of the queue (a harness or staging fix, a broken `main`), a repository
+admin comments `bors emergency` on it (withdraw with `bors emergency-`), or runs
+`uv run tauceti-queue emergency TauCetiProject/TauCeti <pr> --reason "<why>"` (`emergency cancel ...`
+to withdraw; `POST /admin/emergency` and `/admin/emergency-cancel` underneath). The command waits up
+to 15 minutes for the answer, since the controller answers only once it holds its lock, which
+recording a large batch's landing can keep for minutes; if the answer is lost anyway, the request
+may still have been applied, so check `status`. Use this, not an admin
+merge: an admin merge supersedes the running head's CI and leaves `main` on a revision only `ci.yml`
+publishes, while the emergency lane lands the PR through the queue, as the next head in a batch of
+its own, on a pass of its own staging run, with its Lake cache published. With `emergency_evict` off
+the emergency batch waits for the running head to land. With it on (`uv run tauceti-queue settings
+set emergency_evict true`), the emergency batch takes the head at once unless the running head is about
+to land (a pending promotion, a pass, a successful run whose verdicts are being bound) or publishing its
+final oleans; the evicted head's run is cancelled, it keeps its chain and claimed repair work, and it
+becomes the head again when the emergency batch lands or ends. The journal's `evicted` entry says why
+it was not protected. The PR must be approved at its live head first.
+The lane is disabled until `uv run tauceti-queue settings set emergency_enabled true`; until then
+every request is refused `disabled`. `status.emergency` shows the request, what it waits for and any
+CI run still being cancelled.
 
 ## Monitoring
 
@@ -969,7 +1221,11 @@ revision and start time (`service.revision`, `service.started_at`), and the effe
 the newest `updated_at` among the phases; `tauceti-queue status` prints exactly these.
 
 A reconciliation pass holds the controller lock, and `/status` waits at most two seconds for it
-(`/healthz` half a second). When a pass runs longer, the endpoints answer with the snapshot the last
+(`/healthz` and `/status/summary` half a second). `/status/summary` is the small subset the
+monitoring publisher reads every few seconds (`schema`, `generated_at`, `canonical_sha`, `service`,
+`settings`, `inference_hold`, the head's `id` and `stall`, `alerts`, `stuck_heads` and the snapshot
+markers), without the tasks' diagnostics and the waiting inputs that make the full document
+megabytes. When a pass runs longer, the endpoints answer with the snapshot the last
 pass or operator action took, marked `snapshot: true` with its age in `stale_seconds`; a live read has
 neither key. The feeds (`/repositories/1/active-batches`, `/repositories/1/candidates`) read the store
 directly and never wait for the lock. A pass itself is bounded: insertion probes stop after
@@ -1076,3 +1332,7 @@ crashed publishers' snapshots. Cache retention follows successful early manifest
 The upload receives the key only in its own environment. There is no staging polling,
 waiter or cross-service coordination. This gives uploads a head start; it does not
 guarantee a hit if publication remains slower than verification and staging setup.
+
+The [mixed-source queue configuration](mixed-sources.md) adds an explicit,
+default-disabled Forgejo input to the existing queue. It documents observation,
+admission, trusted native reviews, CI roles and the serialized primary change.

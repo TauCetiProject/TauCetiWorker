@@ -17,21 +17,196 @@ from pathlib import Path
 
 _pkg = Path(__file__).resolve().parent  # …/tauceti_worker
 HERE = _pkg if (_pkg / "prompts").is_dir() else _pkg.parent
+INSTALLED = HERE == _pkg  # a wheel (uv tool, pip, Fleet runtime), not a source checkout
+
+
+def login_home() -> Path:
+    """The account's home from the password database. Worker isolation changes $HOME."""
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        return Path(os.path.expanduser("~"))
+
+
+def user_data_root() -> Path:
+    """Per-user worker data for installed packages, outside the replaceable install.
+
+    Anchored at the login home, never $HOME: an isolated worker runs with $HOME inside its own
+    state, and must keep selecting the root that holds that state."""
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg and Path(xdg).expanduser().is_absolute():  # the spec ignores relative values
+        return Path(xdg).expanduser() / "tauceti"
+    if sys.platform == "darwin":
+        return login_home() / "Library" / "Application Support" / "tauceti" / "data"
+    return login_home() / ".local" / "share" / "tauceti"
+
+
+# What a data root holds. Data inside a virtualenv looks disposable: Fleet keeps every staged
+# runtime, and deleting one with `rm -rf` or a runtime cleanup would take the workers' data with it.
+DATA_PARTS = ("state", "checkouts", "logs", "host-repositories")
+FLEET_RUNTIMES = "worker-runtimes"
+
+
+def fleet_data_root() -> Path | None:
+    """The fixed data root of a Fleet-installed worker, or None outside Fleet.
+
+    Fleet stages each worker revision as a virtualenv under <fleet>/worker-runtimes/<revision>/;
+    every revision shares <fleet>/worker-data/root, so switching revisions never moves data."""
+    if not INSTALLED:
+        return None
+    for parent in HERE.parents:
+        if parent.parent.name == FLEET_RUNTIMES:
+            return parent.parent.parent / "worker-data" / "root"
+    return None
+
+
+def virtualenv_of(path: Path) -> Path | None:
+    """The virtualenv or package directory that contains ``path``, or None."""
+    for parent in (path, *path.parents):
+        if parent.name in ("site-packages", "dist-packages") or (parent / "pyvenv.cfg").is_file():
+            return parent
+    return None
+
+
+def virtualenv_data(root: Path) -> list[tuple[Path, Path, bool]]:
+    """(part, enclosing virtualenv, whether it exists) for each part of ``root`` whose data is
+    or would be inside a virtualenv. Symbolic links are followed: a runtime whose parts link to
+    a root outside it holds no data itself."""
+    found = []
+    for name in DATA_PARTS:
+        part = root / name
+        if (venv := virtualenv_of(Path(os.path.realpath(part)))) is not None:
+            found.append((part, venv, part.exists()))
+    return found
+
+
+def refuse_virtualenv_data_root(root: Path | None = None, *, warn: bool = True) -> None:
+    """Refuse to start worker data inside a virtualenv; warn about worker state already there.
+
+    Established state is not refused: stopping every worker on a host whose root is still pinned
+    inside a runtime would be an outage, and the data has to be moved out by hand first."""
+    from .config import Die, warn_red
+
+    root = legacy_data_root() if root is None else root
+    found = virtualenv_data(root)
+    if not found:
+        return
+    if not (root / "state").is_dir():
+        raise Die(
+            f"worker data root {root} is inside the virtualenv {found[0][1]}, where it would look disposable. "
+            "Set TAUCETI_LEGACY_DATA_ROOT to a directory outside it."
+        )
+    if warn:
+        for part, venv, _exists in found:
+            warn_red(f"worker data {part} is inside the virtualenv {venv}; move it out of the runtime")
+
+
+def held_lock_files() -> set[tuple[int, int]] | None:
+    """(st_dev, st_ino) of files that are locked (Linux) or open (macOS) right now, or None.
+
+    Observed without taking any lock: probing with flock could make an older worker's own
+    exclusive acquisition fail, and an unmanaged loop then runs without its slot reservation."""
+    import re
+
+    try:
+        text = Path("/proc/locks").read_text()
+    except OSError:
+        text = None
+    if text is not None:
+        held = set()
+        for line in text.splitlines():
+            if "->" in line:
+                continue  # a waiter, not a holder
+            for token in line.split():
+                if match := re.fullmatch(r"([0-9a-f]+):([0-9a-f]+):(\d+)", token):
+                    held.add((os.makedev(int(match[1], 16), int(match[2], 16)), int(match[3])))
+        return held
+    if sys.platform != "darwin":
+        return None
+    try:
+        import psutil
+    except ImportError:
+        return None
+    held = set()
+    for process in psutil.process_iter():
+        try:
+            if process.uids().real != os.getuid():
+                continue
+            files = process.open_files()
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            continue  # system agents; worker processes are always inspectable
+        for item in files:
+            try:
+                info = os.stat(item.path)
+            except OSError:
+                continue
+            held.add((info.st_dev, info.st_ino))
+    return held
+
+
+def _older_generation_live(root: Path) -> bool:
+    """Whether a worker or round of an earlier installation still holds a lock under ``root``.
+
+    Such a loop keeps its package-relative root until it exits, and the rounds it starts run the
+    upgraded code; they must keep using its root rather than split from it. Unknown counts as
+    live: the package directory then simply stays selected, as before this change."""
+    try:
+        locks = [*root.glob("state/*/instance.lock"), *root.glob("state/*/round.lock")]
+    except OSError:
+        return False
+    if not locks:
+        return False
+    held = held_lock_files()
+    if held is None:
+        return True
+    # On overlayfs, stat() can report a layer's device while /proc/locks reports the overlay's,
+    # so an inode number alone also counts; a false match only keeps the old root selected.
+    inodes = {ino for _dev, ino in held}
+    for lock in locks:
+        try:
+            info = lock.stat()
+        except OSError:
+            continue
+        if (info.st_dev, info.st_ino) in held or info.st_ino in inodes:
+            return True
+    return False
 
 
 def legacy_data_root(default: Path | None = None) -> Path:
-    """Keep existing worker data when changing the installed code revision.
+    """Where worker state/, checkouts/ and logs/ live.
 
-    Assets stay beside the code. An explicit data root is inherited by round,
-    verification and cleanup subprocesses, including isolated worker homes.
+    An explicit TAUCETI_LEGACY_DATA_ROOT wins and is inherited by round, verification and
+    cleanup subprocesses, including isolated worker homes. A source checkout keeps them beside
+    the code (gitignored). An installed package uses user_data_root(): data inside the package
+    directory was silently kept across `uv tool upgrade` yet destroyed by `--force` or
+    `uninstall`, and the collector deletes what earlier installations left there. The default
+    is resolved once per process and exported, so every descendant agrees on it. A Fleet runtime
+    uses fleet_data_root() instead, unless user_data_root() already holds state and it does not.
     """
     raw = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     if not raw:
-        return HERE if default is None else default
+        if default is not None and default != HERE:
+            return default
+        if not INSTALLED:
+            return HERE
+        root = HERE if _older_generation_live(HERE) else _installed_data_root()
+        os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(root)
+        return root
     root = Path(raw).expanduser()
     if not root.is_absolute():
         raise ValueError("TAUCETI_LEGACY_DATA_ROOT must be an absolute path")
     return root.resolve()
+
+
+def _installed_data_root() -> Path:
+    fleet, user = fleet_data_root(), user_data_root()
+    if fleet is None or ((user / "state").is_dir() and not (fleet / "state").exists()):
+        return user  # existing workers keep their state until an operator moves it
+    return fleet
 
 
 # The branch-lease helper the agents run on PATH inside a round. Overridable for tests.
@@ -115,7 +290,9 @@ def self_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
     HERE is the repo root (which contains tauceti_worker/), so putting it on PYTHONPATH lets the
     child `python -m tauceti_worker`; in a wheel the package is already importable and this is a
     harmless no-op."""
-    base = dict(os.environ if env is None else env)
+    from .build_resources import defaults
+
+    base = defaults(dict(os.environ if env is None else env))
     existing = base.get("PYTHONPATH")
     base["PYTHONPATH"] = os.pathsep.join([str(HERE)] + ([existing] if existing else []))
     ensure_ssl_cert_file(base)

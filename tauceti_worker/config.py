@@ -47,6 +47,25 @@ def security_audit_problem(only, *, agent="auto", prs=(), author_override=False,
     return None
 
 
+@contextlib.contextmanager
+def environment(**changes):
+    """Set (or, for None, unset) environment variables for the duration of a block."""
+    previous = {key: os.environ.get(key) for key in changes}
+    try:
+        for key, value in changes.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = str(value)
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def max_open_prs() -> int:
     return positive_integer(os.environ.get("TAUCETI_MAX_OPEN_PRS", MAX_OPEN_PRS))
 
@@ -78,6 +97,14 @@ def roadmap_skip() -> list[str]:
     "all areas" (any) case; an explicit --roadmap-only area takes precedence over it (see do_roadmap)."""
     raw = os.environ.get("TAUCETI_ROADMAP_SKIP", "")
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
+
+
+def roadmap_targets() -> Path | None:
+    """The operator's target list for roadmap rounds (see docs/target-lists.md), read live from
+    TAUCETI_ROADMAP_TARGETS so --roadmap-targets is inherited by loop children. None when unset or
+    blank: roadmap rounds choose their own target. The file itself is read once per round."""
+    raw = os.environ.get("TAUCETI_ROADMAP_TARGETS", "").strip()
+    return Path(raw) if raw else None
 
 
 EXTRA_ROADMAP_PROMPT_MAX_CHARS = 4096
@@ -451,6 +478,10 @@ class AdmissionUnavailable(NoProgress):
     def __init__(self, message: str, *, state: str = "waiting-budget"):
         super().__init__(message)
         self.state = state
+
+
+class SourceUnavailable(NoProgress):
+    """A source dependency failed before a paid unit could start."""
 
 
 class GitHubUnavailable(NoProgress):

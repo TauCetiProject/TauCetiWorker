@@ -15,6 +15,7 @@ Exit 0 = all cases agree; 1 = a mismatch.
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -103,8 +104,10 @@ def survey_with(pr=1, build_success=True):
     return sv
 
 
-def still(stage, rs, c=None, sv=None, gh=None):
-    return wu._still_actionable(stage, worker(rs, gh), sv or survey_with(), c or tc.Candidate(1, HEAD, ""))
+def still(stage, rs, c=None, sv=None, gh=None, *, explicit=False):
+    return wu._still_actionable(
+        stage, worker(rs, gh), sv or survey_with(), c or tc.Candidate(1, HEAD, ""), explicit=explicit
+    )
 
 
 # --- review ---------------------------------------------------------------------------------------
@@ -115,10 +118,28 @@ check("a review candidate that still stands is taken", still("review", rs), True
 check("...having read every answer live", [f for _, f in rs.forced], [True] * len(rs.forced))
 check("...and without busting a cache other processes share", rs.busted, [])
 
+# A shared fresh scoreboard can decline already-reviewed candidates before any
+# direct PR-header request. Sixty workers must not spend sixty GraphQL points
+# just to rediscover that no review is needed.
+with patch.object(FakeGH, "pr_view", side_effect=AssertionError("completed head needs no direct eligibility read")):
+    for _ in range(60):
+        check("completed head skips its direct header read", still("review", FakeRS(clean_head=HEAD)), False)
+# Stale cached verdicts cannot short-circuit the fresh head check.
+with patch.object(FakeGH, "pr_view", return_value=FakeGH().view) as headers:
+    still("review", FakeRS(meta=tc.Meta({"head_sha": HEAD}, "stale"), clean_head=HEAD))
+    check("stale evidence still checks the candidate head", headers.call_count, 1)
+
 for pause in ("hold", "on-hold", "human"):
     gh = FakeGH()
     gh.view["labels"] = [{"name": pause}]
     check("live pause declines review: " + pause, still("review", FakeRS(), gh=gh), False)
+
+# Shared discovery may predate queue intake. The selected live header owns this decision.
+for stage in ("review", "fix"):
+    gh = FakeGH()
+    gh.view["labels"] = [{"name": "bors-staging"}]
+    check(f"new queue ownership declines {stage}", still(stage, FakeRS(), gh=gh), False)
+    check(f"explicit target overrides queue ownership for {stage}", still(stage, FakeRS(), gh=gh, explicit=True), True)
 
 check("a head reviewed since the survey is declined", still("review", FakeRS(clean_head=HEAD)), False)
 carried = FakeRS(meta=tc.Meta({"head_sha": HEAD, "states": {"reuse": "green"}, "runs": []}, "fresh"))
@@ -235,6 +256,56 @@ for provenance in ("stale", "fetch_failed"):
 for stage in ("fix-ci", "bump", "roadmap", "progress"):
     rs = FakeRS()
     check(f"{stage} needs no re-read", (still(stage, rs), rs.busted), (True, []))
+
+
+# The optional source proof is a prelaunch capability, after ordinary writer,
+# head, base, draft and pause checks. It cannot itself authorize a candidate.
+class ProofGH(FakeGH):
+    def __init__(self, *, allowed=True, proof="CONFLICTING", **view):
+        super().__init__()
+        self.allowed, self.proof, self.calls = allowed, proof, []
+        self.view.update(baseRefName="main", mergeable="UNKNOWN", labels=[])
+        self.view.update(view)
+
+    def authorize_candidate(self, candidate, *, require_writer=False):
+        self.calls.append(("authorize", require_writer))
+        return self.allowed
+
+    def resolve_mergeability(self, state, pr, head):
+        self.calls.append(("proof", state, pr, head))
+        return self.proof
+
+
+for changes, expected, probe in (
+    ({}, True, True),
+    ({"allowed": False}, False, False),
+    ({"proof": "UNKNOWN"}, False, True),
+    ({"state": "CLOSED"}, False, False),
+    ({"headRefOid": "other"}, False, False),
+    ({"baseRefName": "other"}, False, False),
+    ({"isDraft": True}, False, False),
+    ({"labels": [{"name": "hold"}]}, False, False),
+    ({"labels": [{"name": "bors-staging"}]}, False, False),
+    ({"mergeable": "MERGEABLE"}, False, False),
+    ({"mergeable": "CONFLICTING"}, True, False),
+):
+    gh = ProofGH(**changes)
+    w = worker(FakeRS(), gh)
+    w.cfg.state = Path("/unused-probe-state")
+    with patch("tauceti_worker.state_repair.repair_selected"):
+        actual = wu._still_actionable("rebase", w, survey_with(), tc.Candidate(1, HEAD))
+    check(f"native prelaunch checks {changes}", actual, expected)
+    calls = [("authorize", True)] + ([("proof", w.cfg.state, 1, HEAD)] if probe else [])
+    check(f"native proof follows authorization {changes}", gh.calls, calls)
+
+gh = ProofGH(labels=[{"name": "bors-staging"}])
+w = worker(FakeRS(), gh)
+w.cfg.state = Path("/unused-probe-state")
+check(
+    "explicit rebase overrides live queue ownership",
+    wu._still_actionable("rebase", w, survey_with(), tc.Candidate(1, HEAD), explicit=True),
+    True,
+)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

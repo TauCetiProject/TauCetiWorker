@@ -24,15 +24,22 @@ an unproven essential rehearsal result means migration readiness is incomplete.
 | Administrative access | Separate named GitHub administrator profile for protection/secret/workflow changes; never use its token as the runtime dispatcher or observer |
 | GitHub main update rule | Created repository ruleset ID, full effective policy and sole mirror-App bypass; exact ownership transfer or removal command for rollback |
 | App key holders | Mirror App ID/installation ID, every automated holder of its private keys or source-writing credentials, owning repository/host, and the exact retirement command and read-back for each |
-| Controls | Reviewed configuration/policy bytes, immutable Worker/Tools revisions, protected caller/control commit, and expected old tips |
+| Controls | Reviewed configuration/policy bytes, immutable Worker/Tools revisions, protected parent workflow ID/path, caller/control commit, and expected old tips |
 | Existing work | Timestamped PR/branch/tag inventory, claim namespaces, queue records, spending history, prepared outputs, and a disposition/owner for unsettled work |
 | Automation | Old source writers to fence, retained execution jobs, temporary manual duties, and the mirror repair schedule |
 | Evidence | Real failing/fixed CI, stale-head/base refusal, exact promotion, App-triggered mirror, main cache/docs outputs, interruption repair, backup and rollback |
 
+One person may own every manual responsibility. Record the duties and verified
+access; separate people are not required. The [rehearsal record](forgejo-stage1-rehearsal.md)
+distinguishes completed tests from the remaining destination checks.
+
 The implementation baseline is Worker
 [`e4ce95894d4f0e4ca3c7214d93eeba284d1b2bf8`](https://github.com/TauCetiProject/TauCetiWorker/pull/647)
-and Tools
-[`d43efb27dd27e8dc0b7b36f31320b8c069ff7a1a`](https://github.com/TauCetiProject/TauCetiTools/pull/213).
+and the tested workflow harness is Tools
+[`08d5a676a9717444ce5a2bdd13f35a7c1ad9f40c`](https://github.com/TauCetiProject/TauCetiTools/pull/216).
+This harness supersedes the earlier Tools #213 baseline. Use the
+[installed revision table](forgejo-stage1-rehearsal.md#tested-installed-revisions)
+for the operator's separate declared dependencies and standalone contributor client.
 Record any subsequently adopted reviewed revisions explicitly. The operator and
 workflow harness have independent installations/pins; installing a new Actions
 harness does not authorize overriding the operator's declared dependencies.
@@ -531,11 +538,44 @@ If returning development authority to GitHub:
    expected common case keeps the current mirrored tip. Do not reset to the
    pre-cutover backup and discard the new contributions. If recovery uses an older
    backup, restore the retained post-cutover Git objects and reconcile them first.
-4. After the native writer and mirror are fenced, transfer the recorded main update
-   ruleset to the approved returning GitHub writer before deploying GitHub-mode
-   controls. If the returning writer is the same App, retain the rule and verify
-   its exact bypass. Otherwise use the reviewed replacement policy, or remove only
-   this repository rule by its recorded ID after verifying its identity:
+4. With native writes and the mirror fenced, retire each old source-mode caller
+   from the deployment record. Disable its protected dispatch parent by recorded
+   workflow ID and read back the state before returning source automation:
+
+   ```sh
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" workflow disable "$source_parent_workflow_id" \
+     --repo "github.com/$execution_owner/$execution_name"
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com \
+     "repos/$execution_owner/$execution_name/actions/workflows/$source_parent_workflow_id" \
+     --jq '.state == "disabled_manually" or error("source dispatch parent is not disabled")'
+   ```
+
+   Before deploying the canonical GitHub caller or re-enabling source automation,
+   explicitly set its native-source opt-in to false. Use a command that handles an
+   absent variable as well as an existing one; a raw `PATCH` of a nonexistent
+   variable fails before deployment:
+
+   ```sh
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" variable set FORGEJO_SOURCE_CI_ENABLED \
+     --repo "github.com/$execution_owner/$execution_name" --body false
+   GH_TOKEN="$(cat "$administrator_token_file")" \
+     "$administrator_gh" api --hostname github.com \
+     "repos/$execution_owner/$execution_name/actions/variables/FORGEJO_SOURCE_CI_ENABLED" \
+     --jq '.value == "false" or error("native source opt-in still enabled")'
+   ```
+
+   This variable is an opt-in for callers that consume it. It does not fence a
+   different deployed caller that hard-codes source mode. Retire that caller and
+   deploy the reviewed GitHub-mode controls as well as fencing native writes.
+
+   Transfer the recorded main update ruleset to the approved returning GitHub
+   writer before deploying GitHub-mode controls. If the returning writer is the
+   same App, retain the rule and verify its exact bypass. Otherwise use the reviewed
+   replacement policy, or remove only this repository rule by its recorded ID after
+   verifying its identity:
 
    ```sh
    GH_TOKEN="$(cat "$administrator_token_file")" \
@@ -551,6 +591,7 @@ If returning development authority to GitHub:
    Transfer credentials only after those fences and protections are confirmed. Verify the
    GitHub provenance readers still reject qualified native `Source-PR` citations
    as GitHub-number authority before re-enabling source automation.
+
 5. Move unsettled native contributions by explicit head/URL correspondence and
    fresh GitHub review/CI. Retain native discussions and prepared work; do not
    reinterpret native approvals as GitHub approvals or repeat paid inference.

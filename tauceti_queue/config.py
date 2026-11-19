@@ -19,6 +19,7 @@ through the admin endpoint (`tauceti-queue settings set`), never by editing this
     database = "~/.local/state/tauceti-queue/queue.sqlite3"
     credentials_dir = "~/.config/tauceti-queue"
     log_dir = "~/.local/state/tauceti-queue/logs"
+    ci_recovery_report = "~/.local/state/tauceti-ci-recovery/stuck-heads.json"
     listen_host = "127.0.0.1"
     listen_port = 8780
     public_url = "https://queue.taucetiproject.org"
@@ -88,10 +89,15 @@ class Config:
     canonical_branch: str = ""  # empty until discovered from the repository
     host: str = ""  # empty: this machine's host name
     publication_enabled: bool = False
+    forgejo_mode: str = "disabled"  # disabled, observe, admit; independent of publication_enabled
+    forgejo_profile: str = ""  # explicit private source/execution profile; never read while disabled
+    forgejo_admission_enabled: bool = True  # runtime intake switch; source access is controlled separately
     content_clone: Path = Path("~/.local/share/tauceti-queue/content")
     database: Path = Path("~/.local/state/tauceti-queue/queue.sqlite3")
     credentials_dir: Path = Path("~/.config/tauceti-queue")
     log_dir: Path = Path("~/.local/state/tauceti-queue/logs")
+    # The stuck-head report the CI recovery pass on this host writes (`stuck_heads.py`).
+    ci_recovery_report: Path = Path("~/.local/state/tauceti-ci-recovery/stuck-heads.json")
     listen_host: str = "127.0.0.1"
     listen_port: int = 8780
     public_url: str = "https://queue.taucetiproject.org"
@@ -271,6 +277,13 @@ def validate(config: Config, *, check_credentials: bool = True) -> list[str]:
         problems.append("reconcile_interval_seconds must be at least 1")
     if config.review_app_id < 1:
         problems.append("review_app_id must be a positive GitHub App id")
+    if config.forgejo_mode not in {"disabled", "observe", "admit"}:
+        problems.append("forgejo_mode must be disabled, observe or admit")
+    if config.forgejo_mode != "disabled":
+        if not config.forgejo_profile or not Path(config.forgejo_profile).is_absolute():
+            problems.append("enabled Forgejo requires an explicit absolute forgejo_profile path")
+        if config.admission_source != "policy":
+            problems.append("Forgejo requires policy admission")
     if config.admission_source not in ("eligibility", "policy"):
         problems.append("admission_source must be eligibility or policy")
     if not config.admission_rubrics or any(
@@ -337,7 +350,11 @@ def discover_canonical_branch(config: Config, timeout: float = 30) -> str:
 
 def runtime_settings(config: Config) -> dict[str, Any]:
     """The runtime controls the file seeds into the store: `[settings]` and `publication_enabled`."""
-    return {**config.settings.as_dict(), "publication_enabled": config.publication_enabled}
+    return {
+        **config.settings.as_dict(),
+        "publication_enabled": config.publication_enabled,
+        "forgejo_admission_enabled": config.forgejo_admission_enabled,
+    }
 
 
 def effective_runtime_settings(config: Config, stored: dict[str, dict[str, Any]] | None) -> dict[str, dict[str, Any]]:

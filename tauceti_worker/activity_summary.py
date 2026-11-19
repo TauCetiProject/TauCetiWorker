@@ -14,30 +14,6 @@ COST_WINDOWS = ("24h", "7d", "total")
 # Shared PR inventories reconcile hourly. Allow a missed cycle before warning;
 # the preparer's five-minute reads do not make the underlying evidence younger.
 PR_STALE_SECONDS = 2 * 3600
-RECOVERY_COUNTS = (
-    "records",
-    "retained",
-    "blocked",
-    "preserved",
-    "reset",
-    "superseded",
-    "incomplete",
-    "corrupt",
-    "errors",
-    "cleanup_backlog",
-) + tuple(
-    "recovery_" + state
-    for state in (
-        "retained",
-        "eligible",
-        "resuming",
-        "verified",
-        "publication_pending",
-        "published",
-        "obsolete",
-        "blocked",
-    )
-)
 
 
 def amount(value, *, rate=False):
@@ -64,39 +40,53 @@ def hourly_rate(spent, covered_seconds):
     )
 
 
-def measured_pr_weight(row):
-    """Full weight for measured landed PRs, half for measured open PRs."""
-    if row.get("measured_pr_weight") is not None:
-        return Decimal(str(row["measured_pr_weight"]))
-    # Older prepared summaries have only unweighted coverage counts.
-    weight = Decimal(row.get("landed_prs", 0)) + Decimal(row.get("open_prs", 0)) / 2
-    known = row.get("known_loc_prs", 0)
-    count = known + row.get("missing_loc_prs", 0)
-    return weight * known / count if count else weight
-
-
 def loc_estimate(row):
-    """Keep partial PR coverage useful without fetching any additional data."""
-    measured = Decimal(row.get("landed_loc_added", 0)) + Decimal(row.get("open_loc_added", 0)) / 2
-    weighted = measured
+    """Estimate missing measurements using only PRs that landed in the window."""
+    # Creation-cohort summaries cannot be converted into landing windows.
+    if row.get("loc_basis") != "landed_at":
+        return dict(landed_loc=None, loc_estimated=False, usd_per_loc=None)
+    measured = Decimal(row.get("landed_loc_added", 0))
+    landed = measured
     missing = bool(row.get("missing_loc_prs"))
-    if missing:
-        known_weight = measured_pr_weight(row)
-        total_weight = Decimal(row.get("landed_prs", 0)) + Decimal(row.get("open_prs", 0)) / 2
-        if known_weight > 0:
-            weighted = measured * total_weight / known_weight
+    known = row.get("known_loc_prs", 0)
+    if missing and known:
+        landed = measured * row.get("landed_prs", 0) / known
     cost = row.get("estimated_usd")
     rate = None
     if cost is not None:
         cost = Decimal(cost)
-        # No measured output means zero LOC, never an invented positive denominator.
-        rate = cost / weighted if weighted else Decimal("Infinity") if cost else Decimal(0)
+        rate = cost / landed if landed else Decimal("Infinity") if cost else Decimal(0)
     return dict(
-        measured_weighted_loc=str(measured),
-        weighted_loc=str(weighted),
+        landed_loc=str(landed),
         loc_estimated=missing,
         usd_per_loc=str(rate) if rate is not None else None,
     )
+
+
+def attribution_backfilling(row):
+    # Older collectors exposed one flag for historical backfill and live refresh.
+    return bool(row.get("attribution_backfilling", row.get("attribution_preparing", False)))
+
+
+def attributed_rate(row):
+    if attribution_backfilling(row):
+        return None
+    if row.get("attribution_known_prs") == 0 and (
+        row.get("attribution_missing_prs") or row.get("attribution_preparing")
+    ):
+        return None
+    loc, cost = row.get("attributed_loc"), row.get("estimated_usd")
+    if loc is None or cost is None:
+        return None
+    loc, cost = Decimal(loc), Decimal(cost)
+    return str(cost / loc if loc else Decimal("Infinity") if cost else Decimal(0))
+
+
+def attributed_rate_display(row):
+    rate = attributed_rate(row)
+    if rate is None:
+        return "—"
+    return "~" + amount(rate, rate=True)
 
 
 def display(value, default_kinds=()):
@@ -124,6 +114,14 @@ def display(value, default_kinds=()):
                 f"{cleanup.get('protected_bytes', 0) / 2**30:.1f} GiB held by live workers; "
                 f"{cleanup.get('reclaimed_bytes', 0) / 2**30:.1f} GiB space recovered; checked {age}s ago"
             )
+            if "named_bytes" in cleanup:
+                # du counts each hard link, so named bytes alone prove nothing about disk use.
+                print(
+                    f"  Cache storage: {cleanup['named_bytes'] / 2**30:.1f} GiB named (du, every link); "
+                    f"{cleanup['managed_bytes'] / 2**30:.1f} GiB allocated in "
+                    f"{cleanup.get('unique_inodes', 0):,} unique inodes; "
+                    f"{cleanup.get('free_bytes', 0) / 2**30:.1f} GiB filesystem free"
+                )
             if cleanup.get("pressure"):
                 print("  Disk cleanup requested; live work and saved source remain protected")
     if expanded := s.get("expanded_cache"):
@@ -147,6 +145,9 @@ def display(value, default_kinds=()):
         ]
         rounds.append(("  " + kind, counts))
     rounds.append(("    failed/timed out", [sum(r["failed"] for r in s["rounds"][w].values()) for w in report_windows]))
+    closed = [sum(r.get("closed", 0) for r in s["rounds"][w].values()) for w in report_windows]
+    if any(closed):
+        rounds.append(("    closed own PR", closed))
     unconfirmed = [sum(r.get("unknown", 0) for r in s["rounds"][w].values()) for w in report_windows]
     if any(unconfirmed):
         rounds.append(("    outcome unconfirmed", unconfirmed))
@@ -210,8 +211,8 @@ def display(value, default_kinds=()):
     cost_rows = []
     loc_rows = []
     if costs.get("windows"):
-        # Compatibility for snapshots prepared before partial-coverage estimates.
-        windows = {w: {**r, **loc_estimate(r)} if "loc_estimated" not in r else r for w, r in costs["windows"].items()}
+        # Recompute rates from the window evidence, guarding older cohort summaries.
+        windows = {w: {**r, **loc_estimate(r)} for w, r in costs["windows"].items()}
         for key, label in (
             ("spent_usd", "API cost: completed sessions"),
             (
@@ -237,37 +238,62 @@ def display(value, default_kinds=()):
                 )
             )
         cost_rows.append(("API cost: estimated total", [amount(windows[w].get("estimated_usd")) for w in cost_windows]))
-        for key, label in (
-            ("landed_loc_added", "Authored Lean LOC: landed"),
-            ("open_loc_added", "Authored Lean LOC: open"),
-        ):
-            loc_rows.append((label, [str(windows[w].get(key, 0)) for w in cost_windows]))
         loc_rows.append(
             (
-                "Lean LOC (landed + ½ open)",
+                "Landed Lean LOC",
                 [
-                    "~" + number(f"{Decimal(windows[w]['weighted_loc']):.1f}")
-                    if windows[w].get("loc_estimated")
-                    else number(windows[w].get("weighted_loc", 0))
+                    "—"
+                    if windows[w]["landed_loc"] is None
+                    else ("~" if windows[w].get("loc_estimated") else "")
+                    + number(f"{Decimal(windows[w]['landed_loc']):.1f}")
                     for w in cost_windows
                 ],
             )
         )
         loc_rows.append(
             (
-                "Estimated $ / weighted LOC",
+                "Estimated $ / landed LOC",
                 [
                     ("~" if windows[w].get("loc_estimated") else "") + amount(windows[w].get("usd_per_loc"), rate=True)
                     for w in cost_windows
                 ],
             )
         )
+        if any(windows[w].get("attribution_version") for w in cost_windows):
+            loc_rows.extend(
+                [
+                    (
+                        "Attributed landed Lean LOC",
+                        [
+                            "—"
+                            if attribution_backfilling(windows[w]) or windows[w].get("attributed_loc") is None
+                            else "~" + number(f"{Decimal(windows[w]['attributed_loc']):.1f}")
+                            for w in cost_windows
+                        ],
+                    ),
+                    (
+                        "Estimated $ / attributed LOC",
+                        [attributed_rate_display(windows[w]) for w in cost_windows],
+                    ),
+                    (
+                        "Landed PRs with attribution data",
+                        [
+                            "—"
+                            if windows[w].get("attribution_known_prs") is None
+                            else f"{windows[w]['attribution_known_prs']}/{windows[w]['attribution_known_prs'] + windows[w]['attribution_missing_prs']}"
+                            for w in cost_windows
+                        ],
+                    ),
+                ]
+            )
         if any(windows[w].get("missing_loc_prs") for w in cost_windows):
             loc_rows.append(
                 (
-                    "Authored PRs with measured LOC",
+                    "Landed PRs with measured LOC",
                     [
-                        f"{windows[w].get('known_loc_prs', 0)}/{windows[w].get('known_loc_prs', 0) + windows[w].get('missing_loc_prs', 0)}"
+                        "—"
+                        if windows[w].get("loc_basis") != "landed_at"
+                        else f"{windows[w].get('known_loc_prs', 0)}/{windows[w].get('known_loc_prs', 0) + windows[w].get('missing_loc_prs', 0)}"
                         for w in cost_windows
                     ],
                 )
@@ -315,10 +341,12 @@ def display(value, default_kinds=()):
             max(len(h), *(len(str(values[i])) for _, values in [*cost_rows, *loc_rows]))
             for i, h in enumerate(cost_headers)
         ]
-        table("Costs / initiated PR output", cost_headers, cost_rows, cost_widths)
+        table("Costs / landed PR output", cost_headers, cost_rows, cost_widths)
         table(None, cost_headers, loc_rows, cost_widths)
+        if any(windows[w].get("loc_basis") != "landed_at" for w in cost_windows):
+            print("Landed LOC unavailable from older summaries; refresh activity collectors.")
         if any(windows[w].get("loc_estimated") for w in cost_windows):
-            print("~ Missing LOC estimated from measured PRs; zero if none measured. Unknown PR states count as zero.")
+            print("~ Missing LOC estimated from measured landed PRs; zero if none measured.")
     funding = costs.get("funding")
     if funding:
         print()
@@ -361,39 +389,6 @@ def display(value, default_kinds=()):
                 messages.add(reason)
             for message in sorted(messages):
                 print(f"  {label}: {message}")
-    recovery = s.get("work_recovery")
-    if recovery and (any(recovery.get(key) for key in RECOVERY_COUNTS) or recovery.get("preparation_metadata_entries")):
-        print()
-        print(
-            f"Local work recovery: {recovery.get('records', 0)} saved, "
-            f"{recovery.get('retained', 0)} checkouts moved aside, "
-            f"{recovery.get('incomplete', 0)} incomplete, {recovery.get('corrupt', 0)} corrupt, {recovery.get('errors', 0)} errors"
-        )
-        if any(recovery.get(key, 0) for key in RECOVERY_COUNTS if key.startswith("recovery_")):
-            print(
-                "Repair recovery: "
-                + ", ".join(
-                    f"{recovery.get('recovery_' + state, 0)} {state.replace('_', '-')}"
-                    for state in (
-                        "eligible",
-                        "resuming",
-                        "verified",
-                        "publication_pending",
-                        "published",
-                        "obsolete",
-                        "blocked",
-                    )
-                )
-            )
-        print(
-            f"  Cleanup: {recovery.get('cleanup_backlog', 0)} queued, "
-            f"oldest {int(recovery.get('cleanup_oldest_age_seconds', 0))}s; "
-            f"preparation {recovery.get('preparation_seconds', 0):.3f}s, "
-            f"read {recovery.get('preparation_read_bytes', 0)}B, "
-            f"hashed {recovery.get('preparation_hash_bytes', 0)}B"
-        )
-        for reason in recovery.get("reasons", []):
-            print("  " + reason)
     if ci_rows:
         table("CI history", headers, ci_rows, widths)
     print()
@@ -513,8 +508,10 @@ def combine(values):
                 continue
             for kind, counts in types.items():
                 row = s["rounds"][w].setdefault(kind, dict(finished=0, failed=0, unknown=0))
-                for key in row:
+                for key in ("finished", "failed", "unknown"):
                     row[key] += counts.get(key, 0)
+                if counts.get("closed"):
+                    row["closed"] = row.get("closed", 0) + counts["closed"]
     cleanup = [v["storage_cleanup"] for v in known if v.get("storage_cleanup")]
     if cleanup:
         s["storage_cleanup"] = dict(
@@ -523,6 +520,8 @@ def combine(values):
                 key: sum(row.get(key, 0) for row in cleanup)
                 for key in (
                     "managed_bytes",
+                    "named_bytes",
+                    "unique_inodes",
                     "protected_bytes",
                     "reclaimed_bytes",
                     "free_bytes",
@@ -533,6 +532,10 @@ def combine(values):
             },
             pressure=any(row.get("pressure", False) for row in cleanup),
         )
+        if not all("named_bytes" in row for row in cleanup):
+            # A host on an older collector reports no link-aware totals; a partial sum would mislead.
+            s["storage_cleanup"].pop("named_bytes")
+            s["storage_cleanup"].pop("unique_inodes")
     expanded = [v["expanded_cache"] for v in known if v.get("expanded_cache")]
     if expanded:
         s["expanded_cache"] = {
@@ -549,11 +552,9 @@ def combine(values):
             k: sum(r.get(k, 0) for r in rows)
             for k in (
                 "landed_loc_added",
-                "open_loc_added",
                 "missing_loc_prs",
                 "known_loc_prs",
                 "landed_prs",
-                "open_prs",
             )
         }
         for key in (
@@ -570,7 +571,8 @@ def combine(values):
                 if compatible_costs and all(r.get(key) is not None for r in rows) and len(known) == len(values)
                 else None
             )
-        row["measured_pr_weight"] = float(sum((measured_pr_weight(r) for r in rows), Decimal(0)))
+        if all(r.get("loc_basis") == "landed_at" for r in rows):
+            row["loc_basis"] = "landed_at"
         if accounting_versions == {2, 3} and row.get("active_accrued_usd") is not None:
             row["active_accrued_usd"] = str(
                 sum(
@@ -587,6 +589,16 @@ def combine(values):
                 )
             )
         row.update(loc_estimate(row))
+        if any(r.get("attribution_version") for r in rows):
+            compatible = len(known) == len(values) and all(r.get("attribution_version") == 1 for r in rows)
+            row["attribution_version"] = 1
+            row["attribution_preparing"] = any(r.get("attribution_preparing") for r in rows)
+            row["attribution_backfilling"] = any(attribution_backfilling(r) for r in rows)
+            for field in ("attribution_known_prs", "attribution_missing_prs"):
+                row[field] = sum(r[field] for r in rows) if compatible else None
+            row["attributed_loc"] = (
+                str(sum((Decimal(r.get("attributed_loc") or "0") for r in rows), Decimal(0))) if compatible else None
+            )
         s["costs"]["windows"][w] = row
     if any(v.get("costs", {}).get("spending") for v in known):
         s["costs"]["spending"] = {}
@@ -656,20 +668,6 @@ def combine(values):
         s["shared_mathlib"]["reasons_by_mode"] = {
             mode: sorted(reasons) for mode, reasons in sorted(reasons_by_mode.items())
         }
-    recovery = [v.get("work_recovery", {}) for v in known]
-    if any(recovery):
-        s["work_recovery"] = {key: sum(row.get(key, 0) for row in recovery) for key in RECOVERY_COUNTS}
-        for key in (
-            "preparation_seconds",
-            "preparation_read_bytes",
-            "preparation_hash_bytes",
-            "preparation_metadata_entries",
-        ):
-            s["work_recovery"][key] = sum(row.get(key, 0) for row in recovery)
-        s["work_recovery"]["cleanup_oldest_age_seconds"] = max(
-            (row.get("cleanup_oldest_age_seconds", 0) for row in recovery), default=0
-        )
-        s["work_recovery"]["reasons"] = sorted({reason for row in recovery for reason in row.get("reasons", [])})
     funds = [v.get("costs", {}).get("funding") for v in known]
     if all(funds) and len(known) == len(values):
         s["costs"]["funding"] = {

@@ -19,6 +19,50 @@ from tauceti_worker.constants import EX_GITHUB_WAIT, EX_NOPROGRESS
 
 
 class GitHubPauseTests(unittest.TestCase):
+    def test_publication_pacing_preserves_review_budget_and_counts_as_waiting(self):
+        from tauceti_worker import activity
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.dict(
+                os.environ,
+                {
+                    "TAUCETI_GITHUB_SHARED_DIR": tmp,
+                    "GH_TOKEN": "fixture",
+                    "TAUCETI_WORKER_ID": "fixture",
+                    "TAUCETI_GH_PROXY_WAIT": "0",
+                },
+            ),
+            patch.object(transport, "mutation_slot", return_value=60),
+            patch.object(transport.subprocess, "run") as send,
+            patch.object(activity, "emit") as emit,
+        ):
+            values = {"review-err-7": 2}
+            worker = SimpleNamespace(
+                counters=SimpleNamespace(
+                    read=lambda key: values[key], write=lambda key, value: values.__setitem__(key, value)
+                )
+            )
+            candidate = SimpleNamespace(pr=7, head="abc")
+
+            def paced(*_args):
+                values["review-err-7"] += 1
+                return transport.execute(
+                    ["gh", "api", "-X", "POST", "repos/org/repo/issues/7/comments", "-f", "body=review"],
+                    wait=True,
+                ).returncode
+
+            round_ = activity.Round("fixture")
+            round_.select("review")
+            with self.assertRaises(GitHubUnavailable) as waiting:
+                work_units._run_github_stage("review", paced, worker, None, candidate, None, False)
+            round_.finish(waiting.exception)
+            self.assertEqual(values["review-err-7"], 2)
+            self.assertGreater(waiting.exception.retry_at, round_.started_at + 59)
+            self.assertIn("round_waited", [call.args[0] for call in emit.call_args_list])
+            self.assertNotIn("round_finished", [call.args[0] for call in emit.call_args_list])
+            send.assert_not_called()
+
     def test_stage_preserves_accrued_attempts_and_propagates_reset(self):
         with (
             tempfile.TemporaryDirectory() as tmp,

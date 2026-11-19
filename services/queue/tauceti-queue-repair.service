@@ -1,7 +1,7 @@
 # Tau Ceti AI merge queue repair worker (docs/queue/operations.md, "Repair worker").
 #
 # A systemd user unit on a host with the Lean toolchain, `claude` and `gh`. It runs
-# `python -m tauceti_queue.repair_task` from the checkout at ~/TauCetiQueue as a long-running worker:
+# `python -m tauceti_queue.repair_task` from its release directory as a long-running worker:
 # claim a repair or rebase-conflict task from the queue service, prepare warm artifacts, run the
 # repair agent, push the chain to the task's submission ref and submit it; sleep when nothing is
 # claimable. `services/queue/install-repair.sh` installs it and checks it is serving.
@@ -9,6 +9,13 @@
 # Configuration is the environment file below (service URL, worker name, poll interval, the content
 # clone, the task root and where the credentials are); secrets stay in files of mode 0600, never
 # in this unit. Logs go to the journal: `journalctl --user -u tauceti-queue-repair -f`.
+#
+# WARNING: never add a systemd drop-in (*.service.d/*.conf) for this unit: drop-ins silently
+# override what install-repair.sh installs, and the installers refuse to run while one exists. The
+# installer renders this file with the code paths below pointing at the unit's own release
+# directory, ~/TauCetiQueue-releases/<sha>-<time> (services/queue/release.sh). It runs origin/main
+# HEAD; running any other revision requires explicit permission from a human operator and must be
+# undone as soon as the change lands on main.
 
 [Unit]
 Description=Tau Ceti AI merge queue repair worker
@@ -41,6 +48,16 @@ StandardError=journal
 SyslogIdentifier=tauceti-queue-repair
 LimitNOFILE=65536
 UMask=0077
+# Repairs yield to CI and staging builds on the same host (tauceti-repair.slice). Every thread and
+# child inherits the niceness and IO class from the exec, and the slice's weights cover any process
+# in the unit's cgroup, including bwrap sandboxes and the agent's. Background publications join the
+# slice too (tauceti_queue/repair_publish.py). Neither CPUWeight=idle nor the idle IO class: the
+# claim lease, which renews from a thread of this process and touches the task root, must keep
+# renewing under a full staging build, so the lowest best-effort IO priority instead.
+Slice=tauceti-repair.slice
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 WantedBy=default.target

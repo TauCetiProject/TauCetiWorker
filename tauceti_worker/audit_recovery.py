@@ -106,6 +106,167 @@ def native_finals(work: Path) -> list[dict]:
     return result
 
 
+def claude_records(work: Path, *, seen: set[Path] | None = None) -> list[tuple[str, object]]:
+    """Every Haiku answer, note and tool request this attempt and its lineage recorded.
+
+    Sources are the retained session (what a resume loads), every captured
+    stream-json transcript (including an interrupted launch's partial output)
+    and, through `previous-block.json`, the attempts this one continued.
+    Returns ("final", structured output), ("note", text) or ("tool", name).
+    Unreadable history raises; callers treat that as an unresolved judgment.
+    """
+    from . import security_audit as sa
+
+    work = work.resolve()
+    seen = set() if seen is None else seen
+    if work in seen:
+        raise Die("security-audit: cyclic continuation lineage")
+    seen.add(work)
+    records: list[tuple[str, object]] = []
+    sessions = sa.claude_sessions(work)
+    if len(sessions) > 1:
+        raise Die("security-audit: retained Claude history is ambiguous")
+    transcripts = [work / "model-transcript.jsonl", *sorted(work.glob("*/model-transcript.jsonl"))]
+    for path in [*sessions, *(t for t in transcripts if t.is_file())]:
+        for row in sa.jsonl_rows(path.read_text(encoding="utf-8")):
+            if row.get("type") == "result" and row.get("structured_output") is not None:
+                records.append(("final", row["structured_output"]))
+            if row.get("type") != "assistant":
+                continue
+            message = row.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str):
+                content = [{"type": "text", "text": content}]
+            if not isinstance(content, list):
+                raise ValueError("unreadable assistant message")
+            for item in content:
+                if not isinstance(item, dict):
+                    raise ValueError("unreadable assistant content")
+                if item.get("type") == "tool_use":
+                    if item.get("name") == "StructuredOutput":
+                        records.append(("final", item.get("input")))
+                    else:
+                        records.append(("tool", item.get("name")))
+                elif item.get("type") == "text":
+                    records.append(("note", item.get("text", "")))
+    previous = work / "previous-block.json"
+    if previous.exists():
+        parent = Path(json.loads(previous.read_text())["attempt"]).resolve()
+        if parent.parent != work.parent or not parent.name.startswith("attempt-"):
+            raise Die("security-audit: continuation lineage is outside this worker's state")
+        records.extend(claude_records(parent, seen=seen))
+    return records
+
+
+def note_judgment(text) -> dict | None:
+    """A note that carries a judgment counts as one; an unreadable one is unresolved."""
+    if not isinstance(text, str):
+        raise ValueError("unreadable assistant note")
+    if '"verdict"' not in text:
+        return None
+    body = text.strip()
+    if body.startswith("```"):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+        body = body.rsplit("```", 1)[0]
+    value = json.loads(body)
+    if not isinstance(value, dict):
+        raise ValueError("unreadable judgment note")
+    return value
+
+
+def claude_judgments(work: Path) -> list:
+    """Every judgment-shaped Haiku output, in recorded order."""
+    result = []
+    for kind, value in claude_records(work):
+        if kind == "final":
+            result.append(value)
+        elif kind == "note":
+            judgment = note_judgment(value)
+            if judgment is not None:
+                result.append(judgment)
+    return result
+
+
+def claude_safe_history(work: Path, batch: dict, paged: bool, *, protocol: int = 4) -> bool:
+    """The Haiku counterpart of safe_history: only reads and passes/unfinished turns so far."""
+    try:
+        records = claude_records(work)
+        for kind, value in records:
+            if kind == "tool" and not (paged and value == "mcp__audit__read_page"):
+                return False
+        return all(safe_judgment(value, batch, paged, protocol=protocol) for value in claude_judgments(work))
+    except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def claude_clean(work: Path) -> bool:
+    """No Haiku output for this attempt holds a finding or uncertainty a fresh attempt would discard."""
+    try:
+        return all(
+            isinstance(value, dict) and value.get("findings") == [] and value.get("verdict") in ("unfinished", "pass")
+            for value in claude_judgments(work)
+        )
+    except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def claude_finals(work: Path) -> list:
+    """Structured outputs in the retained session itself, the history a resume loads."""
+    from . import security_audit as sa
+
+    sessions = sa.claude_sessions(work)
+    if len(sessions) != 1:
+        raise Die("security-audit: retained Claude session is missing or ambiguous")
+    finals = []
+    for row in sa.jsonl_rows(sessions[0].read_text(encoding="utf-8")):
+        message = row.get("message")
+        content = message.get("content") if row.get("type") == "assistant" and isinstance(message, dict) else None
+        for item in content if isinstance(content, list) else ():
+            if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("name") == "StructuredOutput":
+                finals.append(item.get("input"))
+    return finals
+
+
+def retained_claude(work: Path, previous: dict) -> tuple[Path, dict, dict]:
+    """Validate a stopped protocol-4 Haiku attempt for continuation in its own session.
+
+    Recovery owns this state. Do not call on a live attempt or from status readers.
+    """
+    from . import security_audit as sa
+
+    original = Path(previous["attempt"]).resolve()
+    if original.parent != work.resolve() or not original.name.startswith("attempt-"):
+        raise Die("security-audit: recovery attempt is outside this worker's state")
+    batch = json.loads((original / "input.json").read_text())
+    digest = hashlib.sha256(sa.serialize({k: v for k, v in batch.items() if k != "input_digest"}).encode()).hexdigest()
+    if digest != batch["input_digest"]:
+        raise Die("security-audit: retained input digest mismatch")
+    if previous["from_sha"] != batch["from_sha"] or previous["to_sha"] != batch["commits"][-1]["sha"]:
+        raise Die("security-audit: recovery range changed")
+    execution = json.loads((original / "execution.json").read_text())
+    if execution.get("argv", [None])[0] != "claude" or execution.get("protocol_version") != 4:
+        raise Die("security-audit: only a protocol-4 Haiku attempt continues in its Claude session")
+    if execution.get("reader_digest") != sa.inspection_profile(4)["reader_digest"]:
+        raise Die("security-audit: retained inspection reader changed")
+    if execution.get("legacy_history") or execution.get("coverage_history"):
+        raise Die("security-audit: Haiku attempts have no allowed earlier judgments")
+    identity = {"input_digest": digest, "commits": [c["sha"] for c in batch["commits"]]}
+    if execution.get("batch_identity") != identity:
+        raise Die("security-audit: retained launch belongs to another batch")
+    if execution.get("prompt_digest") != hashlib.sha256((original / "prompt.txt").read_bytes()).hexdigest():
+        raise Die("security-audit: retained inspection prompt digest mismatch")
+    sa.validate_claude_profile(execution, original, batch)
+    sa.reconcile_coverage(original, batch)
+    if not claude_safe_history(original, batch, execution["paged"]):
+        raise Die("security-audit: previous findings or uncertainty forbid automatic recovery")
+    ledger = work / "ledger.jsonl"
+    for line in ledger.read_text().splitlines() if ledger.exists() else ():
+        row = json.loads(line)
+        if row.get("batch") == digest and "verdict" in row and row["verdict"]["verdict"] != "pass":
+            raise Die("security-audit: a recorded source verdict remains binding")
+    return original, batch, execution
+
+
 def mechanical_output(
     transcript: str,
     batch: dict,
@@ -413,7 +574,7 @@ def recover(cfg, opts, previous: dict) -> bool:
     if completed is not None:
         check_current_batch(work, batch)
         evidence = {
-            "actor": sa.api("user")["login"],
+            "actor": sa.admin_login(),
             "batch": batch["input_digest"],
             "from_sha": batch["from_sha"],
             "to_sha": batch["commits"][-1]["sha"],
@@ -464,7 +625,7 @@ def recover(cfg, opts, previous: dict) -> bool:
     save(state_path, state)  # Reserve the budget before launch; a restart cannot reset it.
     check_current_batch(work, batch)
     target = batch["commits"][-1]["sha"]
-    actor = sa.api("user")["login"]
+    actor = sa.admin_login()
     attempt = work / f"attempt-{time.time_ns()}"
     attempt.mkdir()
     (attempt / "input.json").write_text(sa.serialize(batch))

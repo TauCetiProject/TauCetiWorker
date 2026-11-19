@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -56,10 +57,18 @@ def request(config: dict, method: str, params: dict) -> dict:
 
 
 def save(path: Path, value: dict) -> None:
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value, sort_keys=True))
-    temporary.chmod(0o600)
-    temporary.replace(path)
+    # A unique temporary per call: concurrent pool reviewers can save the same
+    # state file, and a shared temporary name would let one rename the other's.
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(json.dumps(value, sort_keys=True))
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def report(work: Path, block: dict) -> dict:

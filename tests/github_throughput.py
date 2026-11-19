@@ -14,10 +14,46 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import github_outbox as outbox
 from tauceti_worker import github_transport as tr
+from tauceti_worker.constants import EX_GITHUB_WAIT
 
 
 def reserve(queue):
     queue.put(tr.mutation_slot(os.environ))
+
+
+# A long publication backoff waits in place without another API call. The old
+# 15-minute budget rejected this sleep before the completed work could publish.
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(os.environ, {"GH_TOKEN": "test", "TAUCETI_GITHUB_SHARED_DIR": tmp}),
+    patch.object(tr, "mutation_slot", side_effect=[1800, 0]),
+    patch.object(tr.time, "sleep") as sleep,
+    patch.object(tr.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "{}", "")) as send,
+):
+    started = time.time()
+    result = tr.execute(["gh", "pr", "create", "--repo", "org/repo", "--head", "author:branch"], wait=True)
+    assert result.returncode == 0
+    sleep.assert_called_once_with(1800)
+    send.assert_called_once()
+    assert not outbox.intent_paths() and tr.blocking_event_since(started) is None
+
+# Even a caller with an explicitly exhausted wait budget pauses rather than
+# charging a failed round, and the existing publication intent remains retryable.
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(os.environ, {"GH_TOKEN": "test", "TAUCETI_GITHUB_SHARED_DIR": tmp, "TAUCETI_GH_PROXY_WAIT": "1"}),
+    patch.object(tr, "mutation_slot", return_value=2),
+    patch.object(tr.time, "sleep") as sleep,
+    patch.object(tr.subprocess, "run") as send,
+):
+    started = time.time()
+    result = tr.execute(["gh", "pr", "create", "--repo", "org/repo", "--head", "author:branch"], wait=True)
+    assert result.returncode == EX_GITHUB_WAIT and result.github_deferred
+    assert tr.blocking_event_since(started)["resource"] == "publication"
+    sleep.assert_not_called()
+    send.assert_not_called()
+    paths = outbox.intent_paths()
+    assert len(paths) == 1 and json.loads(paths.pop().read_text())["status"] == "rejected"
 
 
 with (
@@ -123,6 +159,32 @@ with (
         )
     assert new.exists() and not old.exists()
     assert not list(Path(tmp).rglob("*.failed"))  # Superseded work is deleted, not archived.
+
+# Recovery can keep an intent locked during a request or a long backoff. A
+# different comment must remain publishable, even while the first edit's
+# preparation guard is also held. Use real flock locks, with immediate failure
+# if preparation accidentally tries to acquire either unrelated lock.
+with (
+    tempfile.TemporaryDirectory() as tmp,
+    patch.dict(os.environ, {"GH_TOKEN": "test", "TAUCETI_GITHUB_SHARED_DIR": tmp}),
+):
+    real_locked = tr.locked
+    with patch.object(tr, "locked", wraps=real_locked) as locks:
+        old = outbox.prepare(
+            ["gh", "api", "-X", "PATCH", "repos/org/repo/issues/comments/7", "-f", "body=old"], os.environ
+        )
+    comment_guard = locks.call_args_list[0].args[0]
+    with (
+        real_locked(comment_guard),
+        real_locked(old.with_suffix(".lock")),
+        patch.object(tr, "locked", side_effect=lambda path: real_locked(path, timeout=0)),
+        patch.dict(os.environ, {"TAUCETI_WORKER_ID": "another-worker"}),
+    ):
+        new = outbox.prepare(
+            ["gh", "api", "-X", "PATCH", "repos/org/repo/issues/comments/8", "-f", "body=new"], os.environ
+        )
+    assert old.exists() and new.exists(), "unrelated comment edits must not block or supersede one another"
+
 from tauceti_worker import activity
 
 with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_ACTIVITY_DIR": tmp}):

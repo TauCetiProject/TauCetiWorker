@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import base64
 import dataclasses
+import hashlib
+import hmac
 import json
 import os
 import pathlib
@@ -72,12 +74,14 @@ class AppCredentials:
     webhook_secret: bytes = dataclasses.field(repr=False)
 
     @classmethod
-    def load(cls, directory: pathlib.Path | str | None = None) -> AppCredentials:
+    def load(cls, directory: pathlib.Path | str | None = None, *, webhook: bool = True) -> AppCredentials:
+        """The App's credentials; `webhook=False` (a repair worker, which receives no deliveries)
+        neither needs nor reads the webhook secret."""
         root = config_dir(directory)
         meta_path = root / "github-app.json"
         key_path = root / "github-private-key.pem"
         secret_path = root / "github-webhook-secret"
-        for path in (meta_path, key_path, secret_path):
+        for path in (meta_path, key_path, *((secret_path,) if webhook else ())):
             if not path.is_file():
                 raise CredentialsError(f"missing credential file {path}")
         try:
@@ -97,23 +101,69 @@ class AppCredentials:
         pem = key_path.read_bytes()
         if b"PRIVATE KEY-----" not in pem:
             raise CredentialsError(f"{key_path} is not a PEM private key")
-        secret = secret_path.read_bytes().strip()
-        if not secret:
+        secret = secret_path.read_bytes().strip() if webhook else b""
+        if webhook and not secret:
             raise CredentialsError(f"{secret_path} is empty")
         return cls(
             app_id=app_id, slug=slug, installation_id=installation_id, private_key_pem=pem, webhook_secret=secret
         )
 
 
-def load_execution_credentials(directory):
+# A co-located repair worker authenticates to the queue service with a short-lived bearer derived
+# from the App's private key (`local_worker_bearer`), since an installation token cannot answer the
+# `GET /user` the service resolves GitHub bearers with. Only a process that can read the private key
+# can make one, and such a process can already mint installation tokens that push to the content
+# repository, so the bearer grants nothing the key does not. The service accepts it for the worker
+# endpoints only, as the App's bot login; the admin endpoints keep requiring a human admin.
+LOCAL_WORKER_PREFIX = "tq-local-worker.v1."
+# How old (and how far in the future) a local-worker bearer's timestamp may be when it arrives.
+LOCAL_WORKER_MAX_AGE_SECONDS = 300
+LOCAL_WORKER_MAX_SKEW_SECONDS = 60
+
+
+def local_worker_login(credentials: AppCredentials) -> str:
+    """The login a local-worker bearer authenticates as: the App's bot account."""
+    return f"{credentials.slug}[bot]"
+
+
+def _local_worker_mac(credentials: AppCredentials, issued: int) -> str:
+    key = hmac.new(credentials.private_key_pem, b"tauceti-queue local worker bearer v1", hashlib.sha256).digest()
+    message = f"{credentials.app_id}:{credentials.installation_id}:{issued}".encode()
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def local_worker_bearer(credentials: AppCredentials, now: float | None = None) -> str:
+    """A bearer for the queue service's worker endpoints, valid for `LOCAL_WORKER_MAX_AGE_SECONDS`."""
+    issued = int(now if now is not None else time.time())
+    return f"{LOCAL_WORKER_PREFIX}{issued}.{_local_worker_mac(credentials, issued)}"
+
+
+def verify_local_worker_bearer(credentials: AppCredentials, token: str, now: float) -> bool:
+    """Whether `token` is a current `local_worker_bearer` of these credentials."""
+    if not token.startswith(LOCAL_WORKER_PREFIX):
+        return False
+    issued_text, _, mac = token[len(LOCAL_WORKER_PREFIX) :].partition(".")
+    if re.fullmatch(r"[0-9]{1,12}", issued_text) is None:
+        return False
+    issued = int(issued_text)
+    if not now - LOCAL_WORKER_MAX_AGE_SECONDS <= issued <= now + LOCAL_WORKER_MAX_SKEW_SECONDS:
+        return False
+    return hmac.compare_digest(mac.encode(), _local_worker_mac(credentials, issued).encode())
+
+
+def load_execution_credentials(directory, *, systemd_credentials: bool = False):
+    """Execution App credentials from ``directory``, or from ``$CREDENTIALS_DIRECTORY`` if asked."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
     from tauceti_tools.ci_candidate import read_json
 
-    from .control_policy_file import read_control_policy
+    from .control_policy_file import read_control_policy, read_systemd_credential
+
+    def read(name):
+        return read_systemd_credential(name) if systemd_credentials else read_control_policy(directory / name)
 
     directory = pathlib.Path(directory)
-    metadata = read_json(read_control_policy(directory / "github-app.json"), max_bytes=128 * 1024)
+    metadata = read_json(read("github-app.json"), max_bytes=128 * 1024)
     if (
         not isinstance(metadata, dict)
         or any(type(metadata.get(key)) is not int or metadata[key] <= 0 for key in ("id", "installation_id"))
@@ -121,7 +171,7 @@ def load_execution_credentials(directory):
         or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", metadata["slug"]) is None
     ):
         raise ValueError("invalid execution App metadata")
-    key = read_control_policy(directory / "github-private-key.pem")
+    key = read("github-private-key.pem")
     if not isinstance(serialization.load_pem_private_key(key, password=None), rsa.RSAPrivateKey):
         raise ValueError("invalid execution App key")
     # The execution App only dispatches CI. Native ingress uses its own secret.
@@ -238,6 +288,12 @@ class InstallationTokenSource:
                 current = self._fetch()
                 self._current = current
             return current.value
+
+    def granted_permissions(self) -> dict[str, str]:
+        """The permissions GitHub granted the current installation token (minting one if needed)."""
+        self.token()
+        with self._lock:
+            return dict(self._current.permissions) if self._current is not None else {}
 
     def invalidate(self) -> None:
         """Drop the cached token, for example after GitHub answers 401 with it."""

@@ -321,10 +321,6 @@ class SealedSuccessor(ControllerCase):
                 controller.tick()
         controller.tick()
         successor = controller.status()["sealed_successor"]
-        own = controller.claim_task("background-worker", "admin-worker")
-        self.assertNotIn("pre_rebased", own.extra)
-        controller.release_task(own.task_id, own.claim_token, "prepared_clean")
-        controller.tick()
         speculative = controller.claim_task("background-worker", "admin-worker")
         self.assertTrue(speculative.extra["pre_rebased"])
         controller.release_task(speculative.task_id, speculative.claim_token, "prepared_clean")

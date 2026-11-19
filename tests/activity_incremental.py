@@ -117,6 +117,33 @@ class PreparationTests(unittest.TestCase):
     def funding(self, db):
         return json.loads(db.execute("SELECT value FROM meta WHERE key='activity_funding'").fetchone()[0])
 
+    def test_landing_window_upgrade_replaces_old_creation_deltas_in_existing_prefixes(self):
+        fixture = self.fixture()
+        with contextlib.closing(activity._connect()) as db, db:
+            p = db.execute("SELECT * FROM prs WHERE number=1").fetchone()
+            key = json.dumps([p["repo"], p["number"]], separators=(",", ":"))
+            rollup.replace(
+                db,
+                "pr",
+                key,
+                rollup.events(
+                    rollup.subjects(p["worker"], p["scope"]),
+                    [
+                        rollup.point(
+                            p["created"], dict(authored=1, landed_loc_added=100, landed_prs=1, known_loc_prs=1)
+                        ),
+                        rollup.point(p["landed"], dict(landed=1)),
+                    ],
+                ),
+            )
+            old = activity._summary(db, fixture.now + 1, "scope", "machine")
+            self.assertEqual(old["costs"]["windows"]["7d"]["landed_loc_added"], 200)
+            db.execute("DELETE FROM report_sources WHERE name='pr-landing-windows-v1'")
+        with contextlib.closing(activity._connect()) as db, db:
+            updated = activity._summary(db, fixture.now + 1, "scope", "machine")
+            self.assertEqual(updated["costs"]["windows"]["7d"]["landed_loc_added"], 300)
+            self.assertEqual(updated["costs"]["windows"]["7d"]["known_loc_prs"], 2)
+
     def test_idle_prepare_never_enumerates_or_loads_settled_sessions(self):
         fixture = self.fixture()
         with contextlib.closing(activity._connect()) as db, db:

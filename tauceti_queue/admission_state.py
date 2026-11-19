@@ -7,23 +7,49 @@ from collections.abc import Callable
 
 from .store import Store, dumps
 
+# `inputs.urgent` of an input with an emergency request (`Controller.URGENT_EMERGENCY`).
+URGENT_EMERGENCY = 2
+
 
 class AdmissionState:
-    def __init__(self, store: Store, repository: str, *, clock: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        store: Store,
+        repository: str,
+        *,
+        clock: Callable[[], float] = time.time,
+        inputs: tuple[str, str] | None = None,
+    ):
+        """`inputs` names the controller's `inputs` rows this ledger's PRs are: their repository and
+        `source_identity`. By default those of a GitHub ledger, `(repository, "")`."""
         self.store = store
         self.repository = repository
         self.clock = clock
+        self.inputs = inputs or (repository, "")
         self.resource_key = f"state:admission_resources:{repository}"
+        self._recheck_turn = False
 
     def get(self, number: int) -> dict | None:
         return self.store.row("admission_work", {"repository": self.repository, "number": number})
 
-    def observe(self, number: int, head: str, version: str, *, urgent: bool = False) -> bool:
-        """A complete discovery snapshot supplies a version, not a completed evaluation."""
+    def observe(self, number: int, head: str, version: str, *, urgent: bool = False, recheck_after: float = 0) -> bool:
+        """A complete discovery snapshot supplies a version, not a completed evaluation.
+
+        An unchanged observation re-flags nothing, except that a source whose version cannot
+        see all evidence (`recheck_after`) re-evaluates a settled PR once its last attempt is
+        that old. Such rechecks take turns with PRs that really changed (`next_due`).
+        """
         with self.store.transaction():
             row = self.get(number)
             if row is not None and row["head_sha"] == head and row["observed_version"] == version:
-                return False
+                if (
+                    not recheck_after
+                    or row["generation"] != row["evaluated_generation"]
+                    or self.clock() - row["attempted_at"] < recheck_after
+                ):
+                    return False
+                self._dirty(number, head, version, urgent, recheck=True)
+                return True
             self._dirty(number, head, version, urgent)
             return True
 
@@ -32,7 +58,7 @@ class AdmissionState:
         with self.store.transaction():
             self._dirty(number, head, "", urgent)
 
-    def _dirty(self, number: int, head: str, version: str, urgent: bool) -> None:
+    def _dirty(self, number: int, head: str, version: str, urgent: bool, *, recheck: bool = False) -> None:
         if type(number) is not int or number <= 0:
             raise ValueError("admission needs a positive PR number")
         row = self.get(number)
@@ -50,6 +76,11 @@ class AdmissionState:
             )
             return
         pending = row["generation"] != row["evaluated_generation"]
+        queue_at = row["queue_at"]
+        # A pending PR keeps its place until it has had an attempt there; repeated
+        # re-observation must not push never-attempted work behind later arrivals.
+        if not pending or row["attempted_at"] >= (queue_at if queue_at is not None else row["first_pending_at"]):
+            queue_at = now
         self.store.update(
             "admission_work",
             {"id": row["id"]},
@@ -58,14 +89,23 @@ class AdmissionState:
             generation=row["generation"] + 1,
             urgent=int(urgent or row["urgent"]),
             first_pending_at=row["first_pending_at"] if pending else now,
-            queue_at=now,
+            queue_at=queue_at,
+            recheck=int(recheck),
             next_attempt_at=0,
             retry_resource="",
         )
 
     def _pending_query(self, columns="a.*"):
         # A shared resource wait is one deadline, not a new failed attempt for every PR.
-        # Urgent revocations use essential priority and may bypass background pacing.
+        # Urgent revocations use essential priority and may bypass the background quota floor.
+        # `emergency`: the PR's live input carries an emergency request, which waits on this
+        # evaluation before its batch can be built, so it goes ahead of all other pending work.
+        # Uncorrelated, so it is evaluated once per query rather than once per pending PR.
+        emergency = (
+            "a.number IN (SELECT e.number FROM inputs e WHERE e.repository=? AND e.source_identity=? "
+            "AND e.state IN ('waiting','reserved','inserted') "
+            f"AND e.urgent={URGENT_EMERGENCY} AND json_extract(e.evidence,'$.emergency') IS NOT NULL)"
+        )
         ready = (
             "CASE WHEN a.urgent=1 AND a.retry_resource LIKE '%:background' "
             "AND EXISTS(SELECT 1 FROM inputs i WHERE i.repository=a.repository "
@@ -73,18 +113,19 @@ class AdmissionState:
             "ELSE MAX(a.next_attempt_at,COALESCE(d.value,0)) END"
         )
         query = (
-            f"SELECT {columns}, {ready} AS ready_at FROM admission_work a "
+            f"SELECT {columns}, {ready} AS ready_at, {emergency} AS emergency FROM admission_work a "
             "LEFT JOIN json_each(?) d ON d.key=a.retry_resource "
             "WHERE a.repository=? AND a.generation!=a.evaluated_generation "
         )
-        return query, (dumps(self.store.get_setting(self.resource_key, {})), self.repository)
+        return query, (*self.inputs, dumps(self.store.get_setting(self.resource_key, {})), self.repository)
 
     def due(self) -> list[dict]:
         """A finite current generation; no PR-count ceiling and no lifetime retry limit."""
         query, params = self._pending_query()
         return self.store.query(
             query
-            + "AND ready_at<=? ORDER BY a.urgent DESC,COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id",
+            + "AND ready_at<=? ORDER BY emergency DESC,a.urgent DESC,a.recheck,"
+            + "COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id",
             (*params, self.clock()),
         )
 
@@ -94,18 +135,25 @@ class AdmissionState:
     def next_due(self, *, prefer_urgent=True, urgent_only=False):
         """Choose after each completed attempt, so a newly arrived revocation need not wait
         behind a stale copy of the backlog. Resource waits retain a logical evaluation's FIFO
-        place; source changes and failures rejoin at the current time. Alternating priority and
-        FIFO selections give both revocations and ordinary pending PRs service under continuing traffic.
+        place; failures, and source changes after an attempt, rejoin at the current time, while a
+        change before any attempt keeps the place. Alternating priority and FIFO selections give
+        both revocations and ordinary pending PRs service under continuing traffic. Real changes and
+        periodic rechecks likewise take turns, so neither starves the other. A PR whose emergency
+        request waits on admission comes before all of these, in every selection.
         """
-        order = "a.urgent DESC, " if prefer_urgent else ""
+        order = "emergency DESC, " + ("a.urgent DESC, " if prefer_urgent else "")
+        if not urgent_only:
+            order += "a.recheck DESC, " if self._recheck_turn else "a.recheck, "
         query, params = self._pending_query()
         rows = self.store.query(
             query
             + "AND ready_at<=? "
-            + ("AND a.urgent=1 " if urgent_only else "")
+            + ("AND (a.urgent=1 OR emergency) " if urgent_only else "")
             + f"ORDER BY {order}COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id LIMIT 1",
             (*params, self.clock()),
         )
+        if rows and not urgent_only:
+            self._recheck_turn = not self._recheck_turn
         return rows[0] if rows else None
 
     def complete(self, work: dict, version: str, authorization: str, disposition: str) -> bool:
@@ -119,6 +167,7 @@ class AdmissionState:
                 authorization_key=authorization,
                 disposition=disposition,
                 urgent=0,
+                recheck=0,
                 queue_at=None,
                 next_attempt_at=0,
                 last_error="",
@@ -148,6 +197,18 @@ class AdmissionState:
             deadlines = self.store.get_setting(self.resource_key, {})
             deadlines[resource] = max(deadlines.get(resource, 0), until)
             self.store.set_setting(self.resource_key, deadlines, "admission", self.clock())
+
+    def release_background_waits(self) -> None:
+        """Forget waits for the background quota floor, after the floor setting changed."""
+        with self.store.transaction():
+            deadlines = self.store.get_setting(self.resource_key, {})
+            kept = {k: v for k, v in deadlines.items() if not k.endswith(":background")}
+            if kept != deadlines:
+                self.store.set_setting(self.resource_key, kept, "admission", self.clock())
+            self.store.execute(
+                "UPDATE admission_work SET next_attempt_at=0 WHERE repository=? AND retry_resource LIKE '%:background'",
+                (self.repository,),
+            )
 
     def summary(self) -> dict:
         query, params = self._pending_query(

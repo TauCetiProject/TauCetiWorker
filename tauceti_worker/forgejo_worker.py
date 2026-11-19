@@ -1,0 +1,390 @@
+"""Native Forgejo operations used by a selected Worker unit."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+from tauceti_tools.forge import ForgeError, Incomplete, RepositoryRef
+
+from .forgejo_reads import ForgejoReadSource
+
+
+class ForgejoWorkerSource(ForgejoReadSource):
+    supports_contest_reactions = False
+    supports_label_requests = False
+    worker_capable = True
+    supports_review_sandbox = False
+
+    @property
+    def review_repository(self):
+        return self.repository.key
+
+    def __init__(self, identity, api, *, token_file, cache=None):
+        super().__init__(identity.repository, api, cache=cache)
+        self.identity = identity
+        self.token_file = Path(token_file) if token_file else None
+        self.anonymous_discovery = token_file is None
+        self.repo = self.repository.name
+        self._mergeability_cache = {}
+
+    def resolve_mergeability(self, state, number, head):
+        from .source_mergeability import resolve
+
+        return resolve(self, state, number, head)
+
+    def validate_binding(self):
+        row = self.api.repository(self.repository)
+        if (
+            type(row.get("id")) is not int
+            or row["id"] != self.identity.native_id
+            or row.get("full_name", "").casefold() != self.repo.casefold()
+            or row.get("archived") is not False
+        ):
+            raise Incomplete("the Forgejo worker repository binding changed")
+        return row
+
+    def authorize_candidate(self, candidate, *, require_writer=False):
+        if candidate.source_repository != self.repository or candidate.source_repository_id != self.identity.native_id:
+            return False
+        self.validate_binding()
+        if not require_writer:
+            return True
+        actor = self.authenticated_actor()
+        row = self.live_pull(candidate.pr)
+        if row is None:
+            return None
+        return actor is not None and row["user"]["id"] == int(actor.principal.native_id)
+
+    def writable_repository(self):
+        """Use an explicit writable fork, or authorized same-repository branches."""
+        from tauceti_tools.forge_write import ForgejoWriter
+
+        actor = self.authenticated_actor()
+        if actor is None:
+            raise Incomplete("Forgejo author identity unavailable")
+        override = os.environ.get("TAUCETI_FORGEJO_FORK")
+        if override:
+            target = RepositoryRef(self.repository.forge, override)
+            row = self.api.repository(target)
+            if target != self.repository and (
+                row.get("fork") is not True or row.get("parent", {}).get("id") != self.identity.native_id
+            ):
+                raise Incomplete("the configured Forgejo fork has a different parent")
+        else:
+            row = self.validate_binding()
+            target = self.repository
+            if row.get("permissions", {}).get("push") is not True:
+                target = RepositoryRef(self.repository.forge, actor.login + "/" + self.repo.split("/")[1])
+                try:
+                    row = self.api.repository(target)
+                except ForgeError as error:
+                    if error.status != 404:
+                        raise
+                    ForgejoWriter(self.api, expected_user_id=actor.principal.native_id).fork(self.repository)
+                    row = self.api.repository(target)
+                if row.get("fork") is not True or row.get("parent", {}).get("id") != self.identity.native_id:
+                    raise Incomplete("the Forgejo fork parent could not be verified")
+        if row.get("permissions", {}).get("push") is not True or row.get("archived"):
+            raise Incomplete("the Forgejo contributor cannot push the selected branch repository")
+        return target
+
+    def _gh(self, args):
+        from .source_cli import execute
+
+        return execute(args, self)
+
+    def live_pull(self, pr):
+        return self._read("live_pull", [pr], lambda: self.api.pull(self.repository, pr), fresh=True, number=pr)
+
+    def pr_list(self, fields, *, author=None, state="open"):
+        rows = self._read(
+            "pr_list",
+            [fields, author, state],
+            lambda: self.reader.pulls(self.repository, fields, state=state, author=author),
+        )
+        if rows is None:
+            raise Incomplete("Forgejo PR listing is unavailable")
+        return rows
+
+    def merged_prs(self, search, *, limit=200):
+        """`GitHub.merged_prs` on this source: number, title, body, URL and base branch of the `limit` most recently
+        created pull requests merged into `content_base()` whose body matches the GitHub-style `search`
+        (`body_matches`; its qualifiers are not native and are ignored), among the closed pull requests the client's
+        page bound reaches. One item's search (`landed_pr`) goes to the native keyword search for
+        its slug, which reaches a pull request of any age. Raises SourceUnavailable when it fails."""
+        import urllib.parse
+
+        from .config import SourceUnavailable
+        from .github import BORS_MERGED_PREFIX
+        from .targets import MARKER_TAG, MergedPRs, body_matches, content_base, search_id, search_phrases
+
+        phrases = search_phrases(search)
+        keyword = search_id(phrases) or next((p for p in phrases if p != MARKER_TAG), None)
+        if keyword is None:
+            path = f"repos/{self.repository.name}/pulls?state=closed"
+        else:
+            query = urllib.parse.urlencode({"type": "pulls", "state": "closed", "q": keyword})
+            path = f"repos/{self.repository.name}/issues?{query}"
+
+        def merged(row):
+            # A pull listing row says `merged`; an issue search row says it under `pull_request`. The
+            # queue lands a pull request by squash and closes it, unmerged, under BORS_MERGED_PREFIX.
+            if (row if keyword is None else row.get("pull_request") or {}).get("merged") is True:
+                return True
+            return row.get("state") == "closed" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
+
+        def base(row):
+            if keyword is not None:  # an issue search row names no base branch
+                row = self.api.pull(self.repository, row["number"])
+            return (row.get("base") or {}).get("ref") or ""
+
+        def on_base(row):
+            row["baseRefName"] = base(row)
+            return row["baseRefName"] == content_base()
+
+        def fetch():
+            rows = []
+            complete = True
+            # Stop at the client's page bound, where `pages` would raise, rather than fail the read.
+            for n, batch in enumerate(self.api.pages(path), 1):
+                # The base is checked before counting, so landings on other branches never fill `limit`.
+                rows += [r for r in batch if merged(r) and body_matches(r.get("body") or "", phrases) and on_base(r)]
+                if len(rows) >= limit or n >= self.api.max_pages:
+                    complete = False
+                    break
+            found = [
+                {
+                    "number": r["number"],
+                    "title": r.get("title") or "",
+                    "body": r.get("body") or "",
+                    "url": self.repository.pull_url(r["number"]),
+                    "baseRefName": r["baseRefName"],
+                    "state": "MERGED"
+                    if (r if keyword is None else r.get("pull_request") or {}).get("merged") is True
+                    else "CLOSED",
+                }
+                for r in rows[:limit]
+            ]
+            return {"rows": found, "complete": complete}
+
+        result = self._read("merged_prs", ["candidates-v3", search, limit], fetch)
+        if result is None:
+            raise SourceUnavailable("Forgejo merged pull request listing is unavailable")
+        return MergedPRs(result["rows"], complete=result["complete"])
+
+    def target_queue_landed(self, number, branch):
+        from .target_landings import queue_landed
+
+        def fetch():
+            failures = []
+
+            def read_json(path):
+                try:
+                    if "/git/commits/" in path:
+                        from tauceti_tools.forge_api import execute, plan
+                        from tauceti_tools.forge_command import parse_command
+
+                        # Forgejo's raw commit JSON nests the message and tree; the Tools
+                        # adapter normalizes it and verifies the actual Git tree object.
+                        output, _, _ = execute(plan(parse_command(["api", path])), self.api)
+                        return json.loads(output)
+                    return self.api.request("GET", path)
+                except ForgeError as error:
+                    suffix = path.split("/", 3)[-1]
+                    candidate_read = suffix.startswith(("compare/", "git/commits/"))
+                    oversized_compare = (
+                        suffix.startswith("compare/")
+                        and isinstance(error, Incomplete)
+                        and str(error) == "Forgejo response exceeded the configured byte limit"
+                    )
+                    if (error.status in (404, 422) and candidate_read) or oversized_compare:
+                        return None  # Invalid or unprovably large candidates cannot complete an item.
+                    failures.append(error)
+                    raise
+                except (OSError, ValueError) as error:
+                    failures.append(error)
+                    raise
+
+            def comments():
+                rows = self.issue_comments(number)
+                if rows is None:
+                    error = Incomplete("native target landing comments are unavailable")
+                    failures.append(error)
+                    raise error
+                return rows
+
+            subject = f"{self.repository.forge.key}/{self.repository.name}@{self.identity.native_id}#{number}"
+            verified = queue_landed(
+                self.repository.name,
+                number,
+                branch,
+                read_json=read_json,
+                read_comments=comments,
+                native=True,
+                subject=subject,
+                alternate_subjects=(f"{self.repository.key}#{number}",),
+            )
+            if failures:
+                raise failures[0]
+            return verified
+
+        result = self._read("target_queue_landed", [number, branch], fetch)
+        if result is None:
+            from .config import SourceUnavailable
+
+            raise SourceUnavailable("native target landing evidence is unavailable")
+        return result
+
+    def issue_list(self, repository, **options):
+        from .github import GitHub
+
+        return GitHub().issue_list(repository, **options)
+
+    def shared_github_login(self):
+        result = self._gh(["api", "--hostname", "github.com", "user", "--jq", ".login"])
+        if result.returncode:
+            raise Incomplete("the GitHub roadmap account is unavailable")
+        return result.stdout.strip()
+
+    def add_label(self, pr, name):
+        from tauceti_tools.forge_write import ForgejoWriter
+
+        self.validate_binding()
+        ForgejoWriter(self.api).edit(self.repository, pr, pull=True, add_labels=[name])
+        self.invalidate(pr)
+        self.invalidate_discovery()
+        return True
+
+    def pull_for_head(self, owner, branch):
+        """Fresh, unambiguous PR lookup for a branch published by a roadmap round."""
+        if not owner or not branch:
+            return None
+        # Narrow discovery on the server; still verify its branch and owner below.
+        rows = self._read(
+            "pull_for_head",
+            [owner, branch],
+            lambda: self.reader.pulls(
+                self.repository, ["number", "headRefName", "headRepositoryOwner"], state="open", head=branch
+            ),
+            fresh=True,
+            cacheable=False,
+        )
+        matches = [
+            row["number"]
+            for row in rows or []
+            if row.get("headRefName") == branch
+            and (row.get("headRepositoryOwner") or {}).get("login", "").casefold() == owner.casefold()
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def commit_status(self, sha, context):
+        # Native source statuses do not grant execution authority.
+        return ""
+
+    def rebase_requested(self, pr, head):
+        return False
+
+    def rebase_request_body(self, pr, head):
+        return ""
+
+    def bump_repair_requested(self, pr, head):
+        return None
+
+    def pr_progress_state(self, pr):
+        from .worker_sources import pull_url
+
+        row = self.live_pull(pr)
+        if row is None:
+            return None
+        head = row["head"]["sha"]
+        comments = self.issue_comments(pr, fresh=True)
+        reviews = self.reviews(pr, fresh=True)
+        findings = self.review_comments(pr, fresh=True)
+        if comments is None or reviews is None or findings is None:
+            return None
+        value = {
+            "state": row["state"].upper(),
+            "head": head,
+            "comments": comments,
+            "reviews": reviews,
+            "url": pull_url(pr),
+        }
+        return {
+            "head": head,
+            "state": value["state"],
+            "ncomments": len({item["id"] for item in comments + findings}) + len(reviews),
+            "signature": json.dumps(value, sort_keys=True, default=str),
+        }
+
+    def review_comments(self, number, *, fresh=False):
+        def fetch():
+            from tauceti_tools.review_source import review_comments
+
+            conversation = self.issue_comments(number, fresh=fresh)
+            if conversation is None:
+                raise Incomplete("native review conversation unavailable")
+            return review_comments(self.api, self.repository, number, conversation=conversation)
+
+        return self._read("review_comments", [number], fetch, number=number, fresh=fresh)
+
+    def api_jq(self, path, jq):
+        result = self._gh(["api", path, "--jq", jq])
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def ensure_stuck_issue(self, pr, reason, diagnostic=""):
+        # Use the originating PR conversation so an unavailable issue tracker cannot
+        # route a diagnostic to the same-numbered GitHub PR.
+        from tauceti_tools.forge_write import ForgejoWriter
+
+        marker = "<!--tauceti-worker-stuck-->"
+        comments = self.issue_comments(pr, fresh=True)
+        if comments is None or any(marker in row.get("body", "") for row in comments):
+            return
+        ForgejoWriter(self.api).comment(
+            self.repository, pr, marker + "\nWorker review requires attention. " + reason, pull=True
+        )
+
+    def fresh_claim_age(self, comment_id, emoji="eyes"):
+        return None
+
+    def add_reaction(self, comment_id, emoji="eyes"):
+        return False
+
+    def remove_reaction(self, comment_id, emoji="eyes"):
+        return False
+
+    def write_cli_configuration(self, path):
+        from tauceti_tools.project import active
+
+        project = active()
+        raw = project.raw if project else {}
+        repos = raw.get("repositories", {})
+        # These are CLI routing bindings only. Worker keeps its human-owned project snapshot.
+        lines = [
+            "schema_version = 2",
+            "[forges.worker_source]",
+            'kind = "forgejo"',
+            "url = " + json.dumps(self.repository.forge.url),
+            "[repositories]",
+            'content = { forge = "worker_source", name = ' + json.dumps(self.repo) + " }",
+        ]
+        for role, default in (
+            ("roadmap", "TauCetiProject/TauCetiRoadmap"),
+            ("review", "TauCetiProject/TauCetiReview"),
+            ("data", "TauCetiProject/TauCetiData"),
+            ("claims", "TauCetiProject/tauceti-claims"),
+        ):
+            value = project.repository_ref(role).name if role in repos else default
+            lines.append(role + " = " + json.dumps(value))
+        lines.extend(
+            [
+                "[ci]",
+                'backend = "github-actions"',
+                "repository = " + json.dumps(os.environ.get("TAUCETI_REPO", self.repo)),
+            ]
+        )
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_text("\n".join(lines) + "\n")
+        path.chmod(0o600)

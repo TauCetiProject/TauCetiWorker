@@ -65,6 +65,35 @@ class AdmissionStateTests(unittest.TestCase):
         self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 3)
         self.assertEqual(self.state.next_due(prefer_urgent=False)["number"], 1)
 
+    def test_a_pending_emergency_request_comes_before_every_other_selection(self):
+        from tauceti_queue.controller import URGENT_EMERGENCY
+        from tauceti_queue.store import dumps
+
+        self.assertEqual(URGENT_EMERGENCY, 2)
+        for number in (1, 2, 3):
+            self.state.dirty(number, urgent=True)
+            self.now += 1
+        self.state.observe(4, "head", "v1")  # neither urgent nor first in line
+        flagged = {"emergency": {"actor": "admin", "requested_at": self.now}}
+        common = {"repository": "o/r", "number": 4, "head_sha": "head", "approved_at": self.now}
+        self.store.insert("inputs", **common, state="cancelled", urgent=2, evidence=dumps(flagged))
+        self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 1, "a terminal input asks nothing")
+        native = self.store.insert(
+            "inputs", **common, state="waiting", urgent=2, evidence=dumps(flagged), source_identity='{"x":1}'
+        )
+        self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 1, "another source's PR 4")
+        native_state = AdmissionState(self.store, "o/r", clock=lambda: self.now, inputs=("o/r", '{"x":1}'))
+        self.assertEqual(native_state.next_due(prefer_urgent=False)["number"], 4)
+        self.store.update("inputs", {"id": native}, source_identity="other")
+        self.store.insert("inputs", **common, state="waiting", urgent=2, evidence=dumps({}))
+        self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 1, "urgent=2 alone is not a request")
+        self.store.insert("inputs", **common, state="reserved", urgent=2, evidence=dumps(flagged))
+        for kwargs in ({"prefer_urgent": True}, {"prefer_urgent": False}, {"urgent_only": True}):
+            self.assertEqual(self.state.next_due(**kwargs)["number"], 4, kwargs)
+        self.assertEqual([row["number"] for row in self.state.due()], [4, 1, 2, 3])
+        self.state.complete(self.state.get(4), "v1", "review4", "already-approved")
+        self.assertEqual(self.state.next_due(prefer_urgent=True)["number"], 1)
+
     def test_paced_evaluation_keeps_fifo_place_until_complete(self):
         for number in range(1, 4):
             self.state.observe(number, "head", "v1")
@@ -129,6 +158,7 @@ class AdmissionStateTests(unittest.TestCase):
     def test_queue_position_survives_restart_and_moves_on_new_source(self):
         for number in (1, 2):
             self.state.observe(number, "head", "v1")
+            self.state.attempted(self.state.get(number))
             self.state.defer(self.state.get(number), self.now + 10, "source unavailable")
         self.store.close()
         self.store = Store(self.path)
@@ -180,6 +210,92 @@ class AdmissionStateTests(unittest.TestCase):
         self.assertEqual(self.state.next_due(prefer_urgent=False)["number"], 1)
         self.assertEqual(self.state.get(1)["queue_at"], queue_at)
         self.assertEqual([r["number"] for r in self.state.due()], [1, *range(3, 13)])
+
+    def _discovery_pass(self, numbers, version, *, recheck_after=0):
+        # A real listing observes each PR at a slightly later time, newest PR first.
+        for number in sorted(numbers, reverse=True):
+            self.now += 0.001
+            self.state.observe(number, "head", version(number), recheck_after=recheck_after)
+
+    def _evaluate(self, count):
+        done = []
+        for _ in range(count):
+            work = self.state.next_due(prefer_urgent=False)
+            if work is None:
+                break
+            self.state.attempted(work)
+            self.now += 1
+            self.assertTrue(self.state.complete(work, work["observed_version"], "review", "waiting"))
+            done.append(work["number"])
+        return done
+
+    def test_relisting_every_pass_cannot_starve_the_oldest_pending_prs(self):
+        # Each pass relists 60 PRs but evaluates only 4; observations keep changing, as a
+        # time-bucketed version did. Every PR must still be evaluated, oldest first.
+        numbers = range(1, 61)
+        passes, evaluated = 0, []
+        while len(set(evaluated)) < len(numbers):
+            passes += 1
+            self.assertLessEqual(passes, 16, f"never evaluated: {sorted(set(numbers) - set(evaluated))}")
+            self._discovery_pass(numbers, lambda number, p=passes: f"bucket-{p}")
+            evaluated += self._evaluate(4)
+        self.assertEqual(passes, 15)
+        self.assertEqual(evaluated[:4], [60, 59, 58, 57], "first listing order")
+
+    def test_unchanged_relisting_neither_reflags_nor_moves_pending_prs(self):
+        self._discovery_pass(range(1, 21), lambda number: "same")
+        before = {n: (self.state.get(n)["generation"], self.state.get(n)["queue_at"]) for n in range(1, 21)}
+        for _ in range(10):
+            self.now += 900
+            self._discovery_pass(range(1, 21), lambda number: "same", recheck_after=900)
+        after = {n: (self.state.get(n)["generation"], self.state.get(n)["queue_at"]) for n in range(1, 21)}
+        self.assertEqual(after, before)
+
+    def test_changed_pr_is_evaluated_ahead_of_rechecks_and_rechecks_all_drain(self):
+        numbers = range(1, 41)
+        self._discovery_pass(numbers, lambda number: "v1", recheck_after=900)
+        self.assertEqual(len(self._evaluate(100)), 40)
+        self.now += 901
+        # Every settled PR is now due for a recheck, but one PR really changed.
+        self._discovery_pass(numbers, lambda number: "v2" if number == 7 else "v1", recheck_after=900)
+        self.assertEqual(self.state.summary()["pending"], 40)
+        self.assertEqual(self._evaluate(1), [7])
+        self.assertFalse(self.state.get(7)["recheck"])
+        # The rechecks drain in their own FIFO order and later relistings do not re-flag them.
+        drained = []
+        for _ in range(10):
+            self._discovery_pass(numbers, lambda number: "v2" if number == 7 else "v1", recheck_after=900)
+            drained += self._evaluate(4)
+        self.assertEqual(drained[:2], [40, 39])
+        self.assertEqual(sorted(drained), [n for n in numbers if n != 7])
+        self.assertEqual(self.state.summary()["pending"], 0)
+
+    def test_continuing_real_changes_cannot_starve_a_recheck(self):
+        self.state.observe(1, "head", "v1", recheck_after=900)
+        self._evaluate(1)
+        self.now += 901
+        self.state.observe(1, "head", "v1", recheck_after=900)
+        served = []
+        for number in range(2, 6):
+            self.now += 1
+            self.state.observe(number, "head", "v1")
+            served += self._evaluate(1)
+        self.assertIn(1, served[:2])
+        self.assertEqual(sorted(served), [1, 2, 3, 4])
+
+    def test_real_change_on_a_queued_recheck_promotes_it_without_losing_age(self):
+        for number in (1, 2):
+            self.state.observe(number, "head", "v1", recheck_after=900)
+        self._evaluate(2)
+        self.now += 901
+        self.state.observe(1, "head", "v1", recheck_after=900)
+        queue_at = self.state.get(1)["queue_at"]
+        self.now += 1
+        self.state.observe(3, "head", "v1")
+        self.now += 1
+        self.state.observe(1, "head", "v2", recheck_after=900)
+        self.assertEqual((self.state.get(1)["queue_at"], self.state.get(1)["recheck"]), (queue_at, 0))
+        self.assertEqual(self.state.next_due(prefer_urgent=False)["number"], 1)
 
     def test_existing_database_uses_pending_age_without_rewriting_queue_position(self):
         old_path = Path(self.tmp.name) / "old.sqlite"

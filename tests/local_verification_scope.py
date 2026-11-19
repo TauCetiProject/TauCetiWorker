@@ -306,6 +306,61 @@ def main():
         check(f"{name}: no bare unscoped audit command block", "\nlake exe axioms\n" not in text)
         check(f"{name}: no stale DuplicateDeclarations script", "DuplicateDeclarations.lean" not in text)
 
+    # Both verifier paths add the same optional publication instruction.
+    from unittest.mock import patch
+
+    for helper in ("0", "1"):
+        with patch.dict(os.environ, TAUCETI_VERIFY_HELPER=helper, TAUCETI_SELF_TESTED="1"):
+            text = tc.agents.local_verification("ordinary")
+            check(
+                f"self-tested helper={helper}: label the PR after verification",
+                "Apply the `self-tested` label to the PR" in text
+                and "gh-safe-pr-create" in text
+                and "matching verification receipt" in text
+                and "failed, incomplete, or outdated" in text,
+            )
+            check(
+                f"self-tested helper={helper}: author-only comment fallback for missing label permissions",
+                "lack label permissions" in text
+                and ".permissions.triage" in text
+                and "do not run `gh pr edit`" in text
+                and "you are the PR author" in text
+                and "gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested" in text
+                and "do not post duplicate requests" in text,
+            )
+            check(
+                f"self-tested helper={helper}: keep declaration across fix pushes",
+                "Keep the label in place through fix/rebase pushes" in text
+                and "--remove-label self-tested" in text
+                and "A push clears" not in text,
+            )
+            check(
+                f"self-tested helper={helper}: remove only on failed local verification, never for PR CI",
+                "Remove it only when local verification of the current head actually fails" in text
+                and "verification fails or is incomplete" not in text
+                and "Never remove `self-tested` (or post `-self-tested`) to request or re-trigger PR CI" in text
+                and "`awaiting-CI` or `ci-failed` labels" in text,
+            )
+            for policy in ("bump", "full-lint", "lint-repair"):
+                check(
+                    f"self-tested helper={helper}: excludes {policy}",
+                    "Apply the self-tested label after verification" not in tc.agents.local_verification(policy),
+                )
+        with patch.dict(os.environ, TAUCETI_SELF_TESTED="0"):
+            check(
+                f"self-tested helper={helper}: off by default",
+                "Apply the self-tested label after verification" not in tc.agents.local_verification("ordinary"),
+            )
+
+    with (
+        patch.dict(os.environ, TAUCETI_SELF_TESTED="1"),
+        patch(
+            "tauceti_worker.worker_sources.repository_url",
+            return_value="https://git.example.org/Other/Project",
+        ),
+    ):
+        check("self-tested never labels a different source", tc.agents.self_tested_guidance("ordinary") == "")
+
     # Policy comes from surveyed labels and branch only.
     sp = tc.agents.scope_policy
     check("ordinary PR", sp(("roadmap/Foo",), "feature") == "ordinary")

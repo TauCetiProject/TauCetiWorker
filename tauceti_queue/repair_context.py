@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 
 from tauceti_queue import declaration_names as compiled_names
+from tauceti_queue.mixed_identity import SourceNumber, public
 from tauceti_queue.repair import LISTINGS_DIR, ChainCommit, git
 
 FILES_FILE = "files.jsonl"
@@ -312,7 +313,10 @@ def member_contexts(
         member.removed = {name: path for name, path in removed.items() if name not in moved}
         member.renamed = [pair for pair in pairs if pair[0] not in moved and pair[1] not in moved]
     for member, commit in zip(members, chain, strict=True):
-        record = compiled_names.accepted((declaration_names or {}).get(member.pr), commit.accepted_head or "")
+        record = compiled_names.accepted(
+            (declaration_names or {}).get(str(member.pr) if isinstance(member.pr, SourceNumber) else member.pr),
+            commit.accepted_head or "",
+        )
         if record is None:
             continue
         member.declaration_names = record
@@ -714,9 +718,9 @@ def cross_batch_lines(record: dict | None) -> list[str]:
 def write_files(context: RepairContext, worktree: Path) -> None:
     directory = worktree / LISTINGS_DIR
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / FILES_FILE).write_text("".join(json.dumps(m.files_record()) + "\n" for m in context.members))
-    (directory / DECLS_FILE).write_text("".join(json.dumps(m.decls_record()) + "\n" for m in context.members))
-    (directory / COLLISIONS_FILE).write_text("".join(json.dumps(r) + "\n" for r in context.records()))
+    (directory / FILES_FILE).write_text("".join(json.dumps(public(m.files_record())) + "\n" for m in context.members))
+    (directory / DECLS_FILE).write_text("".join(json.dumps(public(m.decls_record())) + "\n" for m in context.members))
+    (directory / COLLISIONS_FILE).write_text("".join(json.dumps(public(r)) + "\n" for r in context.records()))
 
 
 def compute(

@@ -9,7 +9,16 @@ import sys
 from pathlib import Path
 
 from .agents import _shq
-from .config import Config, _only_label, _skip_label, extra_roadmap_prompt, roadmap_areas, roadmap_only, roadmap_skip
+from .config import (
+    Config,
+    _only_label,
+    _skip_label,
+    extra_roadmap_prompt,
+    roadmap_areas,
+    roadmap_only,
+    roadmap_skip,
+    roadmap_targets,
+)
 from .constants import ALLOWED_TASKS, KIND_BY_NAME, KIND_KEYS, TAUCETI
 from .github import GitHub
 from .paths import entry_cmd
@@ -30,8 +39,21 @@ from .worker_manager import (
 )
 
 
+def candidate_label(candidate):
+    repository = candidate.source_repository
+    prefix = "forgejo " if repository is not None and repository.forge.kind == "forgejo" else ""
+    return f"{prefix}#{candidate.pr}"
+
+
+def candidate_key(value):
+    repository = getattr(value, "source_repository", None)
+    if repository is not None and repository.forge.kind == "github":
+        repository = None
+    return (repository.key if repository is not None else "github", getattr(value, "pr", getattr(value, "number", 0)))
+
+
 def _sample(cands: list[Candidate], n: int = 3) -> str:
-    nums = [f"#{c.pr}" if c.pr else c.reason for c in cands]
+    nums = [candidate_label(c) if c.pr else c.reason for c in cands]
     head = " ".join(nums[:n])
     return head + (f" +{len(nums) - n}" if len(nums) > n else "")
 
@@ -93,8 +115,8 @@ def _expansion_rows(sv: Survey, name: str, titles: dict, areas: list | None) -> 
         return [("    └ (none)", "")]
     rows = []
     for c, supp in cands:
-        title = titles.get(c.pr) or c.reason or ""
-        label = f"    └ #{c.pr}" if c.pr else "    └ " + (c.head or name)
+        title = titles.get(candidate_key(c)) or titles.get(c.pr) or c.reason or ""
+        label = f"    └ {candidate_label(c)}" if c.pr else "    └ " + (c.head or name)
         rows.append((label, title + ("  (suppressed)" if supp else "")))
     return rows
 
@@ -125,11 +147,13 @@ def render_survey(
         return
 
     expanded = expanded or set()
-    titles = {p.number: p.title for p in sv.open_prs}
+    titles = {candidate_key(p): p.title for p in sv.open_prs}
 
     header = f"[bold]{TAUCETI}[/]   worker: {sv.worker_id}   open: {sv.status_label_line()}"
     if account := os.environ.get("TAUCETI_GITHUB_ACCOUNT"):
         header += "\ngithub: " + escape(account)
+    if getattr(sv, "source_states", None):
+        header += "\n" + " · ".join(f"{name} {state}" for name, state in sv.source_states.items())
     if quota_snap is not None:
         header += "\nquota: " + quota_line(quota_snap)
     console.print(Panel(header, title="tauceti"))
@@ -167,12 +191,14 @@ def launch_cmd(
     roadmap_skip: str | None = None,
     github_account: str | None = None,
     extra_roadmap_prompt: str | None = None,
+    roadmap_targets: Path | None = None,
 ) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
     `roadmap_only`/`roadmap_skip` (the raw env values for the current roadmap dials) are embedded as
     --roadmap-only/--roadmap-skip so the copied/logged command reproduces what [o]/[x] set instead of
     silently reverting to the shell default. They are passed through verbatim (an explicit empty string
-    is meaningful and overrides an inherited env var), and only omitted when unset (None)."""
+    is meaningful and overrides an inherited env var), and only omitted when unset (None). A target
+    list is embedded as an absolute path, since the command may be pasted elsewhere."""
     cmd = entry_cmd() + ["work"]
     account = github_account if github_account is not None else os.environ.get("TAUCETI_GITHUB_ACCOUNT")
     if account is not None:
@@ -191,6 +217,8 @@ def launch_cmd(
         cmd += ["--roadmap-skip", roadmap_skip]
     if extra_roadmap_prompt is not None:
         cmd.append(f"--extra-roadmap-prompt={extra_roadmap_prompt}")  # one argument: the text may start with `-`
+    if roadmap_targets is not None:
+        cmd += ["--roadmap-targets", str(Path(roadmap_targets).expanduser().resolve())]
     return cmd
 
 
@@ -236,7 +264,7 @@ def _dashboard_app(cfg, loader=None):
 
     def default_loader():
         gh = GitHub()
-        sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+        sv = dashboard_survey(cfg, gh)
         _, q = Quota(cfg).choose(None)
         areas = roadmap_areas(gh)  # [] on failure; the area picker falls back to free text
         return sv, q, areas
@@ -510,7 +538,7 @@ def _dashboard_app(cfg, loader=None):
             sv = self.sv
             if sv is None or sv.github_failed:
                 return
-            titles = {p.number: p.title for p in sv.open_prs}
+            titles = {candidate_key(p): p.title for p in sv.open_prs}
             sel_name = ALLOWED_TASKS[self.sel]
             for name in ALLOWED_TASKS:
                 num = KIND_BY_NAME[name]
@@ -809,13 +837,27 @@ def _dashboard_app(cfg, loader=None):
             one = " ".join(
                 _shq(a)
                 for a in launch_cmd(
-                    None, self.model_dial, self.bubble, False, roadmap_only(), skip, extra_roadmap_prompt=guidance
+                    None,
+                    self.model_dial,
+                    self.bubble,
+                    False,
+                    roadmap_only(),
+                    skip,
+                    extra_roadmap_prompt=guidance,
+                    roadmap_targets=roadmap_targets(),
                 )
             )
             loop = " ".join(
                 _shq(a)
                 for a in launch_cmd(
-                    None, self.model_dial, self.bubble, True, roadmap_only(), skip, extra_roadmap_prompt=guidance
+                    None,
+                    self.model_dial,
+                    self.bubble,
+                    True,
+                    roadmap_only(),
+                    skip,
+                    extra_roadmap_prompt=guidance,
+                    roadmap_targets=roadmap_targets(),
                 )
             )
             copied = True
@@ -843,6 +885,7 @@ def _dashboard_app(cfg, loader=None):
                         roadmap_skip=skip,
                         github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
                         extra_roadmap_prompt=guidance,
+                        roadmap_targets=str(targets) if (targets := roadmap_targets()) is not None else None,
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",
@@ -882,18 +925,31 @@ def _dashboard_app(cfg, loader=None):
     return Dashboard()
 
 
+def dashboard_survey(cfg, gh):
+    from .worker_sources import enabled
+
+    if enabled():
+        from .multi_source import display_survey
+
+        return display_survey(cfg, gh)
+    return survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+
+
 def cmd_tui(args) -> int:
     """Default view: available work plus persistent desired/actual worker monitoring. Over a pipe or
     without a TTY it prints a survey snapshot. A one-round action exits and owns the tty; a loop action
     adds a durable worker definition for the portable manager to reconcile."""
     from rich.console import Console
 
+    from .worker_sources import configure
+
+    configure(args)
     console = Console()
     cfg = Config.resolve(None)
 
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         gh = GitHub()
-        sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+        sv = dashboard_survey(cfg, gh)
         _, q = Quota(cfg).choose(None)
         render_survey(sv, console, q)
         console.print("[dim](not a TTY — snapshot only; use `tauceti status [--json]` in scripts)[/]")

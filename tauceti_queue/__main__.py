@@ -27,6 +27,11 @@
         permission with the same predicate as the security audit. `--token-file` instead reads a
         private dedicated bearer, requires an explicit queue origin and refuses redirects. Native
         controls still require source-bound enrollment and current source admin permission.
+    tauceti-queue emergency [cancel] REPO PR [--reason TEXT] [--url URL] [--token TOKEN | --token-file FILE]
+        Request (or with `cancel`, withdraw) the emergency lane for an approved PR through
+        `/admin/emergency` (`/admin/emergency-cancel`): the PR becomes the next head in a batch of its
+        own. The same token handling and admin check as `settings set`; refused `disabled` until the
+        `emergency_enabled` setting is true.
     tauceti-queue import-bors --feed URL|FILE [--candidates URL|FILE ...] [--dry-run] [--release-head]
         The cutover import (`tauceti_queue.bors_import`): read Bors's observation feed and candidate
         journals, post them to the service's `/admin/import-bors` endpoint, print what was (or, with
@@ -98,9 +103,12 @@ class Service:
         self.controller: Any = None
         self.server: Any = None
         self.poller: Any = None
+        self.forgejo_poller: Any = None
         self.loop_module: ModuleType | None = None
         self.unavailable_reason: str | None = None
         self.native = native
+        if native is not None and config.forgejo_mode != "disabled":
+            raise ValueError("native-only launch cannot also enable a mixed source")
         self.native_http = None
         self._native_store_lock = None
         self._native_listener = None
@@ -114,30 +122,29 @@ class Service:
     # change is one edit here.
 
     def open_store(self) -> None:
-        if self.native is not None:
-            # Reserve the existing store before a constructor can commit any
-            # binding or publisher rotation. Two native services must not share
-            # a writable queue, even if they listen on different ports.
-            import fcntl
-            import stat
+        # Reserve the existing store before a constructor can commit any
+        # binding or publisher rotation. Two queue services must not share
+        # a writable queue, even if they listen on different ports.
+        import fcntl
+        import stat
 
-            database = self.config.database.resolve()
-            database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            fd = os.open(str(database) + ".native-service.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-            try:
-                info = os.fstat(fd)
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != os.geteuid()
-                    or info.st_mode & 0o077
-                    or info.st_nlink != 1
-                ):
-                    raise ValueError("native service lock must be an owned private regular file")
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BaseException:
-                os.close(fd)
-                raise
-            self._native_store_lock = fd
+        database = self.config.database.resolve()
+        database.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(str(database) + ".native-service.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077
+                or info.st_nlink != 1
+            ):
+                raise ValueError("native service lock must be an owned private regular file")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._native_store_lock = fd
         module = _optional("store")
         if module is None:
             self.unavailable_reason = "tauceti_queue.store is not installed"
@@ -190,6 +197,7 @@ class Service:
                 wired.http,
             )
             self.native_http.prebound_socket = listener
+            self.controller.public_url = self.config.public_url
             self.loop_module = _optional("loop")
             return
         module = _optional("controller")
@@ -200,6 +208,13 @@ class Service:
         if not (clone / "HEAD").exists() and not (clone / ".git").exists():
             self.unavailable_reason = f"content clone missing at {clone}; see docs/queue/operations.md"
             return
+        mixed = None
+        if self.config.forgejo_mode != "disabled":
+            from .mixed_profile import MixedProfile
+            from .mixed_sources import MixedSources
+
+            profile = MixedProfile.load(self.config.forgejo_profile, self.config)
+            mixed = MixedSources(profile, self.config, self.store, self.github, clone)
         self.controller = module.Controller(
             self.store,
             self.github,
@@ -207,7 +222,12 @@ class Service:
             self.config.repository,
             revision=self.runtime.revision.sha,
             canonical_branch=self.config.canonical_branch or None,
+            mixed=mixed,
+            revision_map_probe=module.revision_map_published,
+            live_progress=_live_progress,
         )
+        self.controller.public_url = self.config.public_url
+        self.controller.stuck_heads_report = str(self.config.ci_recovery_report)
         self.loop_module = _optional("loop")
         poll_module = _optional("approval_poll")
         if poll_module is not None and hasattr(self.github, "list_open_pull_requests"):
@@ -221,6 +241,7 @@ class Service:
                     self.config.repository,
                     AdmissionPolicy(
                         rubrics=self.config.admission_rubrics.split(","),
+                        repository=self.config.repository,
                         prefix=root.replace(".", "/") + "/",
                         allow_files=policy.default_allow_files(root)
                         + [s for s in self.config.admission_extra_files.split(",") if s],
@@ -230,6 +251,9 @@ class Service:
                 self.poller = poll_module.ApprovalPoller(
                     self.controller, self.github, self.config.repository, review_app_id=self.config.review_app_id
                 )
+
+        if mixed is not None:
+            self.forgejo_poller = mixed.connect(self.controller, self.poller)
 
     def seed_settings(self) -> None:
         """Seed the store with the configuration file's runtime controls (`serve` only).
@@ -254,6 +278,12 @@ class Service:
         document = rt.status_document(
             self.runtime, self.config.settings.as_dict(), controller_status, self.unavailable_reason
         )
+        document["forgejo"] = {"mode": self.config.forgejo_mode}
+        if self.forgejo_poller is not None:
+            document["forgejo"].update(
+                source=self.forgejo_poller.registry.profile.forgejo.record(),
+                observation=self.forgejo_poller.last_summary,
+            )
         if self.native is not None:
             policy = self.native.execution_policy
             document["service"].update(
@@ -296,10 +326,16 @@ class Service:
             if self.poller is not None and poll_module is not None:
                 poll_loop = poll_module.ApprovalPollLoop(self.poller)
                 poll_loop.start()
+            native_loop = None
+            if self.forgejo_poller is not None and poll_module is not None:
+                native_loop = poll_module.ApprovalPollLoop(self.forgejo_poller)
+                native_loop.start()
             try:
                 while not self.stop.wait(self.config.reconcile_interval_seconds):
                     pass
             finally:
+                if native_loop is not None:
+                    native_loop.stop(timeout=DEFAULT_STOP_GRACE)
                 if poll_loop is not None:
                     poll_loop.stop(timeout=DEFAULT_STOP_GRACE)
                 loop.stop(timeout=DEFAULT_STOP_GRACE)
@@ -321,6 +357,13 @@ class Service:
         if self._native_store_lock is not None:
             os.close(self._native_store_lock)
             self._native_store_lock = None
+
+
+def _live_progress(run_id: str, run_attempt: int) -> dict[str, Any] | None:
+    """The head run's public live build report, for the controller's stall report."""
+    from . import build_progress
+
+    return build_progress.lookup(run_id, run_attempt, fetch_json)
 
 
 def _install_signal_handlers(stop: rt.StopSignal) -> None:
@@ -392,6 +435,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # --- status ----------------------------------------------------------------------------------------
 
 
+USER_AGENT = "tauceti-queue/1"
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -409,6 +455,9 @@ def fetch_json(
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, method=method)
     request.add_header("Accept", "application/json")
+    # Cloudflare in front of the public CI data (ci-data.taucetiproject.org) refuses urllib's default
+    # User-Agent with HTTP 403 ("blocked access based on your browser's signature").
+    request.add_header("User-Agent", USER_AGENT)
     if data is not None:
         request.add_header("Content-Type", "application/json")
     if token:
@@ -452,6 +501,9 @@ def cmd_status(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = 
     except RuntimeError as exc:
         _log(str(exc))
         return 1
+    from . import build_progress
+
+    build_progress.attach(document, fetch)
     if args.json:
         print(json.dumps(document, indent=2, sort_keys=True))
     else:
@@ -492,6 +544,13 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         _log(str(exc))
         return 1
     problems = configuration.validate(config, check_credentials=launch is None)
+    if config.forgejo_mode in {"observe", "admit"}:
+        from .mixed_profile import MixedProfile
+
+        try:
+            MixedProfile.load(config.forgejo_profile, config)
+        except ConfigError as error:
+            problems.append(str(error))
     stored = _stored_settings(config)
     values = config.as_dict()
     if launch:
@@ -625,6 +684,53 @@ def cmd_settings(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] 
         return 1
 
 
+# --- emergency -------------------------------------------------------------------------------------
+
+# The controller answers an emergency request once it holds the controller lock, and one unit of its
+# work can hold that lock for minutes: recording the landing of a large batch takes about a second
+# per member (five minutes for batch 455's 480 members on 2026-11-19). Wait well past that.
+EMERGENCY_TIMEOUT_SECONDS = 900.0
+
+
+def cmd_emergency(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = fetch_json) -> int:
+    words = list(args.words)
+    cancel = len(words) == 3 and words[0] == "cancel"
+    if cancel:
+        words = words[1:]
+    if len(words) != 2:
+        _log("usage: tauceti-queue emergency [cancel] REPO PR [--reason TEXT]")
+        return 2
+    repo, raw = words
+    try:
+        pr = int(raw)
+        if pr <= 0:
+            raise ValueError
+    except ValueError:
+        _log(f"PR must be a positive integer, got {raw!r}")
+        return 2
+    body: dict[str, Any] = {"repo": repo, "pr": pr}
+    if not cancel:
+        body["reason"] = args.reason or ""
+    try:
+        base, fetch = _operator_target(args, fetch)
+        document = fetch(
+            base + ("/admin/emergency-cancel" if cancel else "/admin/emergency"),
+            method="POST",
+            body=body,
+            token=_operator_token(args.token, getattr(args, "token_file", None)),
+            timeout=EMERGENCY_TIMEOUT_SECONDS,
+        )
+    except RuntimeError as exc:
+        _log(str(exc))
+        return 1
+    except OSError as exc:
+        # The service may still apply a request it received: the answer, not the request, was lost.
+        _log(f"no answer from the queue service ({exc}); it may still apply the request, so check `status`")
+        return 1
+    print(json.dumps(document, indent=2, sort_keys=True))
+    return 0 if document.get("accepted") or document.get("cancelled") else 1
+
+
 # --- import-bors and reconcile-approvals -----------------------------------------------------------
 
 
@@ -730,6 +836,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
     )
 
+    emergency = commands.add_parser(
+        "emergency",
+        help="request or withdraw the emergency lane for an approved PR",
+        description="tauceti-queue emergency [cancel] REPO PR: post to /admin/emergency or /admin/emergency-cancel.",
+    )
+    emergency.add_argument("words", nargs="+", metavar="[cancel] REPO PR")
+    emergency.add_argument("--reason", help="why the PR must land now (journaled with the request)")
+    emergency.add_argument("--url", help="service base URL (default: the configured listen address)")
+    emergency.add_argument("--config", help="configuration file used to find the listen address")
+    emergency_token = emergency.add_mutually_exclusive_group()
+    emergency_token.add_argument("--token", help="operator GitHub token (default: GITHUB_TOKEN, then gh auth token)")
+    emergency_token.add_argument(
+        "--token-file", type=Path, help="private operator bearer file; requires explicit --url; no credential discovery"
+    )
+
     importer = commands.add_parser("import-bors", help="import Bors's approved PRs and running head at the cutover")
     importer.add_argument("--feed", required=True, help="Bors's observation feed (active-batches): a URL or a file")
     importer.add_argument(
@@ -775,6 +896,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return cmd_check_config(args)
         if args.command == "settings":
             return cmd_settings(args)
+        if args.command == "emergency":
+            return cmd_emergency(args)
         if args.command == "import-bors":
             return cmd_import_bors(args)
         if args.command == "reconcile-approvals":
