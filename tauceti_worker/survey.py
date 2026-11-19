@@ -261,12 +261,15 @@ class PRInfo:
     updated_at: str = ""
     bump_integration_failed: bool = False
     self_tested: bool = False
+    # A failed `scope` status on this head. For a self-tested head, which skips PR CI, PR status
+    # posts it when the diff fails PR CI's size guards; queue admission refuses that head too.
+    scope_failed: bool = False
     work_targets: tuple[str, ...] = ()
     origin_pr: str = ""
 
     @property
     def review_ready(self) -> bool:
-        return self.build_success or self.self_tested
+        return self.build_success or (self.self_tested and not self.scope_failed)
 
     @property
     def needs_ci_repair(self) -> bool:
@@ -324,6 +327,7 @@ class PRInfo:
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
             self_tested=local,
+            scope_failed=any(c.get("context") == "scope" and c.get("state") in BUILD_FAIL for c in rollup),
             work_targets=work_target_keys(d.get("body", "")),
             origin_pr=origin_pr_url(d.get("body", "")),
             bump_integration_failed=any(

@@ -134,6 +134,18 @@ with tempfile.TemporaryDirectory() as tmp:
         assert 2 in [c.pr for c in ordinary.reviewable.actionable], (
             "persistent label must schedule review without a receipt"
         )
+        # PR status posts PR CI's failed `scope` on a self-tested head over the diff-size guards,
+        # which admission refuses, so no review is spent on it. The status binds that head only.
+        compact[1]["pr"]["statusCheckRollup"].append({"context": "scope", "state": "FAILURE"})
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            oversized = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review", "fix-ci"])
+        assert 2 not in [c.pr for c in oversized.reviewable.actionable], "a failed scope must not be reviewed"
+        assert 2 not in [c.pr for c in oversized.red_ci.actionable], "a self-tested head is never sent to fix-ci"
+        compact[1]["pr"]["statusCheckRollup"][-1]["state"] = "SUCCESS"
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, compact)):
+            passing = mod.survey(cfg, gh, ReviewState(cfg, gh), counters, stages=["review"])
+        assert 2 in [c.pr for c in passing.reviewable.actionable], "only a failed scope withholds review"
+        compact[1]["pr"]["statusCheckRollup"].pop()
         compact[1]["pr"]["labels"].pop()
         compact[1]["pr"]["statusCheckRollup"] = old_rollup
         compact[0]["review"]["contest"] = {"id": 101, "rubric": "reuse", "created_at": "now"}
