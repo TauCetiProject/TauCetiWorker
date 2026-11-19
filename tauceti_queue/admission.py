@@ -777,6 +777,9 @@ class AdmissionPoller:
                             "admission_generation": work["generation"],
                         },
                     )
+            if current and current["head_sha"] == pull.head_sha:
+                # Corrects a missed label delivery, whatever this evaluation decides.
+                self.controller.note_blocking_labels(current, pull.labels)
             if current and current["head_sha"] != pull.head_sha:
                 self.controller._pull_request_event(
                     {"number": pull.number, "action": "synchronize", "pull_request": {"head": {"sha": pull.head_sha}}},
@@ -806,11 +809,6 @@ class AdmissionPoller:
                     disposition = (
                         "already-approved" if current["state"] in ("waiting", "reserved") else current["state"]
                     )
-                    blocked = self.controller._blocking_labels(pull)
-                    if blocked and current["state"] in ("waiting", "reserved"):
-                        # A blocking label added after approval, its webhook missed: held until it goes.
-                        self.controller.block_for_labels(current, blocked, self.clock())
-                        disposition = f"blocked-label: {', '.join(blocked)}"
                 elif (restored := self.controller.restore_missing_source(pull.number, pull.head_sha, pull)) is not None:
                     disposition = restored
                 elif self._cancelled(current_work, snapshot, authorization, comment, meta):

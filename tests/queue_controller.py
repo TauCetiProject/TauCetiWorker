@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
@@ -2750,46 +2751,53 @@ class BlockingLabelAfterApproval(ControllerCase):
             },
         )
 
-    def test_a_waiting_input_is_held_while_labelled_and_returns_at_its_age(self):
+    def held(self, number):
+        row = self.controller.input_for(PROJECT, number)
+        return row["state"], json.loads(row["blocked_labels"])
+
+    def test_a_waiting_input_is_held_while_labelled_and_placed_once_it_goes(self):
         head, result = self.approve(101, {"A.lean": "a\n"})
-        approved_at = result["input"]["approved_at"]
         self.label_event(101, "labeled", "Hold", ["Hold"])
-        row = self.controller.input_for(PROJECT, 101)
-        self.assertEqual((row["state"], row["reason"]), ("cancelled", "blocked-label"))
+        self.assertEqual(self.held(101), ("waiting", ["hold"]))
         self.controller.tick()
         self.assertEqual(self.controller.store.count("members"), 0, "a held input joins no batch")
-        self.assertEqual(self.controller.approve(PROJECT, 101, head, "r")["reason"], "blocked-label: hold")
+        self.assertEqual(self.controller.status()["waiting"]["inputs"][0]["blocked_labels"], ["hold"])
         self.label_event(101, "labeled", "wip", ["Hold", "wip"])
         self.label_event(101, "unlabeled", "Hold", ["wip"])
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "cancelled", "wip still blocks")
-        self.label_event(101, "unlabeled", "wip", [], head={"sha": head})
-        row = self.controller.input_for(PROJECT, 101)
-        self.assertEqual((row["id"], row["state"], row["approved_at"]), (result["input"]["id"], "waiting", approved_at))
         self.controller.tick()
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+        self.assertEqual(self.held(101), ("waiting", ["wip"]), "wip still blocks")
+        self.label_event(101, "unlabeled", "wip", [])
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual((row["id"], row["approved_at"]), (result["input"]["id"], result["input"]["approved_at"]))
+        self.controller.tick()
+        self.assertEqual(self.held(101), ("inserted", []))
 
-    def test_a_withdrawal_or_new_head_while_held_needs_a_new_approval(self):
+    def test_a_delivery_without_a_label_list_applies_its_one_label(self):
         self.approve(101, {"A.lean": "a\n"})
-        self.approve(102, {"B.lean": "b\n"})
-        for number in (101, 102):
-            self.label_event(number, "labeled", "hold", ["hold"])
-        self.controller.unapprove(PROJECT, 101, "kim")
-        self.controller.handle_event(
-            "pull_request", {"action": "synchronize", "number": 102, "pull_request": {"head": {"sha": "f" * 40}}}
-        )
-        self.assertEqual(
-            [self.controller.input_for(PROJECT, n)["reason"] for n in (101, 102)], ["unapproved", "head-changed"]
-        )
-        for number in (101, 102):
-            self.label_event(number, "unlabeled", "hold", [])
-        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["cancelled"] * 2)
+        for action in ("labeled", "unlabeled"):
+            self.controller.handle_event(
+                "pull_request", {"action": action, "number": 101, "label": {"name": "wip"}, "pull_request": {}}
+            )
+            self.assertEqual(self.held(101), ("waiting", ["wip"] if action == "labeled" else []))
+
+    def test_a_label_arriving_during_the_probe_keeps_the_input_out(self):
+        self.approve(101, {"A.lean": "a\n"})
+        build = chain.build
+
+        def label_then_build(*args, **kwargs):
+            self.label_event(101, "labeled", "hold", ["hold"])
+            return build(*args, **kwargs)
+
+        with mock.patch.object(chain, "build", label_then_build):
+            self.controller.tick()
+        self.assertEqual(self.held(101), ("waiting", ["hold"]))
+        self.assertEqual(self.controller.store.count("members"), 0)
 
     def test_a_member_is_not_withdrawn_by_a_blocking_label(self):
         self.approve(101, {"A.lean": "a\n"})
         self.controller.tick()
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
         self.label_event(101, "labeled", "hold", ["hold"])
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+        self.assertEqual(self.held(101), ("inserted", []))
 
 
 class EditSummary(ControllerCase):
