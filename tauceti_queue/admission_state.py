@@ -18,12 +18,24 @@ class AdmissionState:
     def get(self, number: int) -> dict | None:
         return self.store.row("admission_work", {"repository": self.repository, "number": number})
 
-    def observe(self, number: int, head: str, version: str, *, urgent: bool = False) -> bool:
-        """A complete discovery snapshot supplies a version, not a completed evaluation."""
+    def observe(self, number: int, head: str, version: str, *, urgent: bool = False, recheck_after: float = 0) -> bool:
+        """A complete discovery snapshot supplies a version, not a completed evaluation.
+
+        An unchanged observation re-flags nothing, except that a source whose version cannot
+        see all evidence (`recheck_after`) re-evaluates a settled PR once its last attempt is
+        that old. Such a recheck waits behind every PR with a real change.
+        """
         with self.store.transaction():
             row = self.get(number)
             if row is not None and row["head_sha"] == head and row["observed_version"] == version:
-                return False
+                if (
+                    not recheck_after
+                    or row["generation"] != row["evaluated_generation"]
+                    or self.clock() - row["attempted_at"] < recheck_after
+                ):
+                    return False
+                self._dirty(number, head, version, urgent, recheck=True)
+                return True
             self._dirty(number, head, version, urgent)
             return True
 
@@ -32,7 +44,7 @@ class AdmissionState:
         with self.store.transaction():
             self._dirty(number, head, "", urgent)
 
-    def _dirty(self, number: int, head: str, version: str, urgent: bool) -> None:
+    def _dirty(self, number: int, head: str, version: str, urgent: bool, *, recheck: bool = False) -> None:
         if type(number) is not int or number <= 0:
             raise ValueError("admission needs a positive PR number")
         row = self.get(number)
@@ -50,6 +62,11 @@ class AdmissionState:
             )
             return
         pending = row["generation"] != row["evaluated_generation"]
+        queue_at = row["queue_at"]
+        # A pending PR keeps its place until it has had an attempt there; repeated
+        # re-observation must not push never-attempted work behind later arrivals.
+        if not pending or row["attempted_at"] >= (queue_at if queue_at is not None else row["first_pending_at"]):
+            queue_at = now
         self.store.update(
             "admission_work",
             {"id": row["id"]},
@@ -58,7 +75,8 @@ class AdmissionState:
             generation=row["generation"] + 1,
             urgent=int(urgent or row["urgent"]),
             first_pending_at=row["first_pending_at"] if pending else now,
-            queue_at=now,
+            queue_at=queue_at,
+            recheck=int(recheck),
             next_attempt_at=0,
             retry_resource="",
         )
@@ -84,7 +102,8 @@ class AdmissionState:
         query, params = self._pending_query()
         return self.store.query(
             query
-            + "AND ready_at<=? ORDER BY a.urgent DESC,COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id",
+            + "AND ready_at<=? ORDER BY a.urgent DESC,a.recheck,"
+            + "COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id",
             (*params, self.clock()),
         )
 
@@ -94,7 +113,8 @@ class AdmissionState:
     def next_due(self, *, prefer_urgent=True, urgent_only=False):
         """Choose after each completed attempt, so a newly arrived revocation need not wait
         behind a stale copy of the backlog. Resource waits retain a logical evaluation's FIFO
-        place; source changes and failures rejoin at the current time. Alternating priority and
+        place; failures, and source changes after an attempt, rejoin at the current time, while a
+        change before any attempt keeps the place. Rechecks follow real changes. Alternating priority and
         FIFO selections give both revocations and ordinary pending PRs service under continuing traffic.
         """
         order = "a.urgent DESC, " if prefer_urgent else ""
@@ -103,7 +123,7 @@ class AdmissionState:
             query
             + "AND ready_at<=? "
             + ("AND a.urgent=1 " if urgent_only else "")
-            + f"ORDER BY {order}COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id LIMIT 1",
+            + f"ORDER BY {order}a.recheck,COALESCE(a.queue_at,a.first_pending_at),a.first_pending_at,a.id LIMIT 1",
             (*params, self.clock()),
         )
         return rows[0] if rows else None
@@ -119,6 +139,7 @@ class AdmissionState:
                 authorization_key=authorization,
                 disposition=disposition,
                 urgent=0,
+                recheck=0,
                 queue_at=None,
                 next_attempt_at=0,
                 last_error="",

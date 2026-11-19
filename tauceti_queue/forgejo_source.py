@@ -307,17 +307,16 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         )
 
     def _discovery_version(self, pull):
-        # The bounded polling backstop rechecks permissions and source evidence
-        # without refetching
-        # unchanged immutable Git objects on every discovery.
+        # Only listed facts of this PR. A time component, or the base branch tip (which moves
+        # for every open PR at each landing), would re-flag every PR at once; like GitHub,
+        # admission depends on the merge base, not the tip. Evidence the listing cannot see
+        # (statuses, permissions, the merge base) is rechecked after `recheck_seconds`, behind
+        # PRs that really changed.
         return digest(
             {
                 "source": self.repository_identity.record(),
                 "policy": self.admission_policy.revision,
-                "pull": pull.__dict__,
-                "refresh": int(
-                    (self.clock() + int(digest(pull.number)[:8], 16) % self.refresh_seconds) // self.refresh_seconds
-                ),
+                "pull": {key: value for key, value in pull.__dict__.items() if key != "base_sha"},
             }
         )
 
@@ -336,7 +335,7 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             seen.add(number)
             try:
                 pull = self._pull(row)
-                details = {"discovery_version": self._discovery_version(pull)}
+                details = {"discovery_version": self._discovery_version(pull), "recheck_seconds": self.refresh_seconds}
                 item = ports.OpenPullRequest(pull.number, pull.head_sha, pull.base_ref, pull.draft, (), details)
             except (ForgeError, ValueError, TypeError, KeyError):
                 item = ports.OpenPullRequest(

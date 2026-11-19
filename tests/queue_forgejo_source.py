@@ -381,6 +381,18 @@ class NativeSource(unittest.TestCase):
             found[0].admission["discovery_version"], self.source._discovery_version(self.source._pull(row))
         )
         self.assertEqual(self.source.list_open_pull_requests("team/Math", admission=True), found)
+        self.assertEqual(found[0].admission["recheck_seconds"], 900)
+        # A later listing of the same pull is the same observation: time alone must not re-flag it.
+        self.source.configure_admission_polling(clock=lambda: 1000 + 86400, refresh_seconds=900)
+        self.assertEqual(self.source.list_open_pull_requests("team/Math", admission=True), found)
+        landed = {**row, "base": {**row["base"], "sha": "c" * 40}}
+        self.assertEqual(
+            self.source._discovery_version(self.source._pull(landed)), found[0].admission["discovery_version"]
+        )
+        changed = {**row, "updated_at": "2026-11-09T00:00:00Z", "comments": 1}
+        self.assertNotEqual(
+            self.source._discovery_version(self.source._pull(changed)), found[0].admission["discovery_version"]
+        )
 
     def test_native_source_never_fabricates_github_app_or_quota(self):
         with self.assertRaises(Unsupported):
