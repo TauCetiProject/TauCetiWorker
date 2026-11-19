@@ -260,7 +260,7 @@ def plan_groups(
 def read_errors(directory: Path) -> list[dict] | None:
     """The compiler errors of the streaming build's ``errors.jsonl`` in ``directory`` (the worktree's
     ``.tauceti-repair``), with the audit and lint findings the worker appended (``kind`` ``audit`` or
-    ``lint``), without its event lines; None when there is no such file."""
+    ``lint``), without its event lines and ``rerun`` entries; None when there is no such file."""
     path = directory / repair_stream.ERRORS_FILE
     if not path.exists():
         return None
@@ -270,8 +270,8 @@ def read_errors(directory: Path) -> list[dict] | None:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(entry, dict) or entry.get("event"):
-            continue
+        if not isinstance(entry, dict) or entry.get("event") or entry.get("kind") == repair_stream.RERUN:
+            continue  # a rerun entry is a module edited during the build, not an error of it
         if entry.get("file") or entry.get("kind") in CHECK_KINDS:
             errors.append(entry)
     return errors

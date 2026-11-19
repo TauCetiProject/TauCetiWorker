@@ -429,6 +429,12 @@ error list are at those paths and grow, modules that have already failed may be 
 build` of its own may start while the lock exists, and `.tauceti-repair/build <Module> ...` (the scoped
 build script of `tauceti_queue/repair_tools.py`, whose lock the streaming build takes through
 `take_lock` so the two never overlap) waits for the lock and builds only the named modules.
+Lake from v4.37.0-rc1 fails a module whose source changed while Lean compiled it ("module source
+file: ... changed since build began; rerun the build", https://github.com/leanprover/lean4/pull/16457),
+which here means the agent edited it under the running build. The worker records that as a `kind`
+`rerun` entry (`module`, `file`, `message`, no member) rather than a compiler error, counts it in the
+`build finished` line and the outcome's `stream_build.reruns`, leaves it out of the parallel path's
+findings, and the prompt tells the agent to rebuild the module and its dependents with the scoped build.
 When the build ends the worker appends a `build finished, exit N, M errors total` line to the error
 list, removes the lock and copies the log to `tasks/<id>/logs/stream-build.log`; the outcome records
 the build under `stream_build`. When worker verification is enabled, the agent returns after focused
