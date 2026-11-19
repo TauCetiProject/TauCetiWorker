@@ -587,7 +587,8 @@ class StuckHeads(QueueFixture):
         self.assertEqual(len(self.notifier.messages), 1)
         message = self.notifier.messages[0]
         self.assertIn("2 PR heads stuck without CI or a final state since", message)
-        self.assertIn("AEDT", message)
+        started = stuck_heads.datetime.fromtimestamp(self.clock() - 7 * 3600, stuck_heads.TIMEZONE)
+        self.assertIn(started.strftime("since %a %d %b %H:%M AEDT"), message)
         self.assertIn("https://github.com/TauCetiProject/TauCeti/pull/43797 no-ci", message)
         self.assertTrue(any("stuck without CI" in alert for alert in self.controller.status()["alerts"]))
         self.assertEqual(len(self.controller.store.journal_entries("stuck-heads-notified")), 1)
@@ -600,6 +601,36 @@ class StuckHeads(QueueFixture):
         self.write(since_hours=6.5)  # a new period
         self.tick()
         self.assertEqual(len(self.notifier.messages), 2)
+
+    def test_malformed_reports_are_invalid_not_fatal_or_silent(self):
+        now = self.clock()
+        good = {
+            "schema": stuck_heads.SCHEMA,
+            "repo": "TauCetiProject/TauCeti",
+            "observed_at": now,
+            "complete": True,
+            "stuck_since": now - 7 * 3600,
+            "heads": [{"pr": 1, "head": "a" * 40, "reason": "no-ci", "last_push_at": now - 9 * 3600}],
+        }
+        cases = [
+            dict(good, observed_at=10**400),
+            dict(good, observed_at=now + 3600),
+            dict(good, heads=None),
+            dict(good, stuck_since=None),
+            dict(good, heads=[dict(good["heads"][0], last_push_at=float("inf"))]),
+            dict(good, heads=["not a head"]),
+        ]
+        self.report.parent.mkdir(parents=True, exist_ok=True)
+        for case in cases:
+            with self.subTest(case=str(case)[:120]):
+                self.report.write_text(json.dumps(case))
+                self.tick()
+                self.assertEqual(self.controller.status()["stuck_heads"]["state"], "invalid")
+        self.report.write_text("[" * 100000 + "]" * 100000)
+        self.tick()
+        self.assertEqual(self.controller.status()["stuck_heads"]["state"], "invalid")
+        self.assertEqual(self.notifier.messages, [])
+        self.assertIn("stuck heads: report invalid", rt.summarize(self.controller.status()))
 
     def test_stale_missing_or_foreign_reports_never_message(self):
         for kwargs, state in (

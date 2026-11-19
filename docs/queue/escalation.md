@@ -195,7 +195,9 @@ that report (`tauceti_queue/stuck_heads.py`):
   `invalid`), the count, the oldest head's age and up to 30 heads; the summary of
   `tauceti-queue status` prints `stuck heads: N, oldest Xh`;
 - the public observation publishes one `stuck_head` condition per listed head (with its last push
-  time) after a `stuck_heads_observed` condition, so `tauceti-fleet status` shows the same line;
+  time) after a `stuck_heads_observed` condition (and `stuck_heads_partial` after an incomplete
+  pass), within its bound of 100 conditions, so `tauceti-fleet status` shows the same line; a
+  malformed report is `invalid` and never sends anything;
 - once a fresh report's count has stayed above zero for six hours (its `stuck_since`), the status
   gains an alert and the operator gets one Zulip direct message through the outbox, keyed by the
   start of the stuck period (`notify:stuck-heads:<repository>:<stuck_since>`), listing the PRs with

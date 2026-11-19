@@ -20,6 +20,7 @@ direct message per stuck period through the escalation notifier (`escalation.md`
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
@@ -39,10 +40,17 @@ MAX_BYTES = 1_000_000
 # The status alert's wording, which the public observation recognises (`monitoring.py`).
 ALERT_TEXT = "stuck without CI or a final state"
 TIMEZONE = ZoneInfo("Australia/Sydney")
+# A report from the future beyond this clock skew is not trusted.
+SKEW_SECONDS = 600
+# Epoch seconds beyond this are not times (year 5138).
+LATEST = 1e11
 
 
 def _number(value: Any) -> float | None:
-    return float(value) if type(value) in (int, float) and value >= 0 else None
+    """An epoch time as a float, or None unless it is a finite, representable, nonnegative number."""
+    if type(value) not in (int, float) or not 0 <= value < LATEST:
+        return None
+    return float(value) if math.isfinite(value) else None
 
 
 def read(path: str | Path | None, now: float, repository: str | None = None) -> dict[str, Any]:
@@ -66,12 +74,14 @@ def read(path: str | Path | None, now: float, repository: str | None = None) -> 
         if repository and report.get("repo") != repository:
             raise ValueError(f"report is for {report.get('repo')!r}")
         observed = _number(report.get("observed_at"))
-        if observed is None:
-            raise ValueError("report has no observation time")
+        if observed is None or observed > now + SKEW_SECONDS:
+            raise ValueError("report has no valid observation time")
+        if not isinstance(report.get("heads"), list):
+            raise ValueError("report has no list of heads")
         heads = []
-        for head in report.get("heads") or []:
-            pushed = _number(head.get("last_push_at"))
-            if type(head.get("pr")) is not int or pushed is None:
+        for head in report["heads"]:
+            pushed = _number(head.get("last_push_at")) if isinstance(head, Mapping) else None
+            if type(head.get("pr")) is not int or not 0 < head["pr"] < 10**9 or pushed is None or pushed > observed:
                 raise ValueError("malformed stuck head")
             heads.append(
                 {
@@ -82,10 +92,12 @@ def read(path: str | Path | None, now: float, repository: str | None = None) -> 
                     "run": head.get("run") if type(head.get("run")) is int else None,
                 }
             )
-    except (ValueError, TypeError, AttributeError) as error:
-        return section | {"state": "invalid", "detail": str(error)[:300]}
+        since = _number(report.get("stuck_since")) if heads else None
+        if heads and (since is None or since > observed):
+            raise ValueError("stuck heads without a valid stuck_since")
+    except (ValueError, TypeError, AttributeError, OverflowError, RecursionError) as error:
+        return section | {"state": "invalid", "detail": f"{type(error).__name__}: {error}"[:300]}
     heads.sort(key=lambda h: (h["last_push_at"], h["pr"]))
-    since = _number(report.get("stuck_since")) if heads else None
     return section | {
         "state": "stale" if now - observed > STALE_SECONDS else "fresh",
         "repo": report.get("repo"),

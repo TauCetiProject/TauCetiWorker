@@ -3535,6 +3535,8 @@ class Controller:
         now = self.clock()
         self._supersede_stale_source_tasks(now)
         self._expire_claims(now)
+        # Before anything that can end the pass early: the message depends only on the report.
+        self._notify_stuck_heads(now)
         if self.mixed is not None and self.mixed.mode == "admit" and self.setting("publication_enabled"):
             sync_key = f"mixed-sync:startup:{self.mixed.generation}:{self.revision}"
             self._enqueue("mixed-sync", sync_key, {})
@@ -3570,7 +3572,6 @@ class Controller:
             offer()
             step(now)
         offer()
-        self._notify_stuck_heads(now)
         self._drain_outbox(self.clock())
         self._set_state("last_tick_at", now)
         return list(self._reasons)

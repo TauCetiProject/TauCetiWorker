@@ -39,6 +39,7 @@ MAX_BYTES = 2_000_000
 BUILD_TAIL_BYTES = 64_000
 # The public observation's conditions are bounded (100); stuck heads take at most this many.
 STUCK_LISTED = 30
+MAX_CONDITIONS = 100
 
 
 def iso(value):
@@ -737,7 +738,11 @@ def project(
     stuck = status.get("stuck_heads") or {}
     if stuck.get("state") == "fresh" and numeric(stuck.get("observed_at")) is not None:
         conditions.append({"kind": "stuck_heads_observed", "since": iso(stuck["observed_at"])})
-        listed = [h for h in (stuck.get("heads") or [])[:STUCK_LISTED] if numeric(h.get("last_push_at")) is not None]
+        if not stuck.get("complete"):
+            conditions.append({"kind": "stuck_heads_partial"})
+        # Leave room for the truncation marker within the ingest's bound on conditions.
+        room = max(0, min(STUCK_LISTED, MAX_CONDITIONS - len(conditions) - 1))
+        listed = [h for h in (stuck.get("heads") or []) if numeric(h.get("last_push_at")) is not None][:room]
         conditions += [{"kind": "stuck_head", "since": iso(h["last_push_at"])} for h in listed]
         if type(stuck.get("count")) is int and stuck["count"] > len(listed):
             conditions.append({"kind": "stuck_heads_truncated"})

@@ -323,6 +323,7 @@ url = "https://private.invalid"
             "state": "fresh",
             "observed_at": now - 60,
             "count": 31,
+            "complete": True,
             "heads": [{"pr": 40000 + n, "last_push_at": now - 4 * 3600 - n} for n in range(30)],
         }
         alert = "31 PR heads stuck without CI or a final state for 7h (oldest 4h)"
@@ -331,6 +332,11 @@ url = "https://private.invalid"
         self.assertEqual(kinds, ["stuck_heads_observed"] + ["stuck_head"] * 30 + ["stuck_heads_truncated"])
         self.assertEqual(value["conditions"][1]["since"], monitoring.iso(now - 4 * 3600))
         self.assertNotIn("40000", json.dumps(value["conditions"]))
+        crowded = [f"head 9 task {n} (repair) unclaimed for 9s" for n in range(80)]
+        value = self.export(status={"stuck_heads": dict(stuck, complete=False), "alerts": crowded})
+        self.assertLessEqual(len(value["conditions"]), 100)
+        self.assertEqual(value["conditions"][1]["kind"], "stuck_heads_partial")
+        self.assertEqual(value["conditions"][-1]["kind"], "stuck_heads_truncated")
         for state in ("stale", "missing", "unconfigured"):
             value = self.export(status={"stuck_heads": dict(stuck, state=state)})
             self.assertEqual(value["conditions"], [])
