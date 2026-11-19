@@ -42,7 +42,6 @@ import json
 import logging
 import pathlib
 import re
-import subprocess
 import threading
 import time
 import traceback
@@ -119,14 +118,16 @@ class ServerConfig:
 
 
 def running_revision(package_dir: pathlib.Path | None = None) -> str:
-    """The git SHA of the running checkout, so a deployment can be verified from `/status`."""
-    root = (package_dir or pathlib.Path(__file__).resolve().parent).parent
-    try:
-        return subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    """The git SHA of the code this process runs, so a deployment can be verified from `/status`.
+
+    Read once when the server starts: the release's baked `_revision.py` when present (each install
+    bakes one into its own release directory), else `git rev-parse HEAD` in the package's checkout.
+    Empty when neither answers.
+    """
+    from . import runtime
+
+    revision = runtime.running_revision(package_dir or pathlib.Path(__file__).resolve().parent)
+    return "" if revision.sha == "unknown" else revision.sha
 
 
 class BearerAuth:

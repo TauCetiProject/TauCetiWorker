@@ -889,6 +889,10 @@ def main(argv=None):
         parser.error("interval must be between 5 and 300 seconds")
     if args.publish_url and (not args.token_file or not args.state_file or not args.publish_url.startswith("https://")):
         parser.error("publication requires an HTTPS endpoint, --token-file and --state-file")
+    from .runtime import running_revision
+
+    revision = running_revision()
+    print(f"queue monitoring: running revision {revision.sha} ({revision.source})", file=sys.stderr)
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())

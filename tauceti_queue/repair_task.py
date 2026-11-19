@@ -76,6 +76,7 @@ from tauceti_queue import (
     repair_publish,
     repair_sandbox,
     repair_stream,
+    runtime,
     task_transport,
 )
 from tauceti_queue.ports import REPAIR_CHECKPOINT
@@ -129,6 +130,7 @@ SUBSCRIPTION_PROVIDERS = ("claude", "codex")  # paced by the fleet's quota reade
 # Checkpoint states before the agent has run: an error there is released as ``artifacts_unavailable``.
 PRE_AGENT_PHASES = (None, "claimed", "sources_ready", "artifacts_ready", "artifacts_unavailable")
 HERE = Path(__file__).resolve().parent.parent
+STARTUP_REVISION = runtime.running_revision().sha
 GIT_SAFE_PUSH = HERE / "scripts" / "git-safe-push"
 DEFAULT_ROOT = Path(
     os.environ.get("TAUCETI_QUEUE_TASK_ROOT")
@@ -3147,6 +3149,9 @@ def serve(
         "worker": cfg.worker,
         "service": cfg.service,
         "root": str(cfg.root),
+        # The code this process was started from (its release's baked revision), for the installer's
+        # check and the operator; read once, so it never follows later changes on disk.
+        "revision": STARTUP_REVISION,
         "started_at": time.time(),
         "tasks": 0,
         "outcomes": {},
