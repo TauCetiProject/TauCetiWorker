@@ -32,6 +32,7 @@ import fcntl
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -457,11 +458,56 @@ def _fingerprint(checkout: Path, item: TargetItem, hits: dict[str, list[str]], a
     return digest.hexdigest()
 
 
+_LEAN_DECLARATION = re.compile(
+    r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:protected|private|noncomputable|scoped|unsafe|partial|nonrec)\s+)*"
+    r"(?:theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)\s+([^\s:({\[]+)"
+)
+_LEAN_SCOPE = re.compile(r"^\s*(?:(namespace)\s+(\S+)|(?:noncomputable\s+)?(section)\b|(end)\b)")
+
+
+def declarations(text: str) -> set[str]:
+    """The fully qualified names a Lean file declares, from its `namespace`/`section`/`end` nesting
+    and `_root_.` prefixes. A reading of the source's lines, not an elaboration."""
+    scopes: list[list[str]] = []
+    found = set()
+    for line in text.splitlines():
+        scope = _LEAN_SCOPE.match(line)
+        if scope and scope.group(1):
+            scopes.append(scope.group(2).split("."))
+        elif scope and scope.group(3):
+            scopes.append([])
+        elif scope and scope.group(4):
+            if scopes:
+                scopes.pop()
+        elif declared_here := _LEAN_DECLARATION.match(line):
+            name = declared_here.group(1)
+            if name.startswith("_root_."):
+                found.add(name[len("_root_.") :])
+            else:
+                found.add(".".join([*(part for parts in scopes for part in parts), name]))
+    return found
+
+
+def canonical(checkout: Path, file: str, name: str) -> str | None:
+    """`path#Full.Name` for a declaration the checkout's file declares, with the path normalized and
+    the name resolved to the one fully qualified declaration it is a dot-suffix of; None when the
+    path leaves the checkout or the name matches no declaration, or more than one."""
+    path = posixpath.normpath(file)
+    if not _FILE.fullmatch(path) or path.startswith("/") or ".." in path.split("/") or not _NAME.fullmatch(name):
+        return None
+    try:
+        text = (checkout / path).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    matches = {full for full in declarations(text) if full == name or full.endswith("." + name)}
+    return f"{path}#{matches.pop()}" if len(matches) == 1 else None
+
+
 def confirmed(checkout: Path, verdict, refused: Iterable[frozenset[str]] = ()) -> frozenset[str] | None:
-    """The `path#declaration` evidence of `verdict` when it is `{"landed": true, "evidence": [{"file":
-    ..., "declaration": ...}, ...]}` with one to MAX_EVIDENCE entries, every named file of the
-    checkout declares its name, and the evidence is not within what a `reopened:` clause (`refused`)
-    already found wanting; None for anything else."""
+    """The canonical `path#Full.Name` evidence (`canonical`) of `verdict` when it is `{"landed":
+    true, "evidence": [{"file": ..., "declaration": ...}, ...]}` with one to MAX_EVIDENCE entries,
+    each resolving to a declaration of the checkout, and the evidence is not within what a
+    `reopened:` clause (`refused`, compared canonically too) already found wanting; None otherwise."""
     if not (isinstance(verdict, dict) and verdict.get("landed") is True):
         return None
     entries = verdict.get("evidence")
@@ -470,15 +516,17 @@ def confirmed(checkout: Path, verdict, refused: Iterable[frozenset[str]] = ()) -
     found = set()
     for entry in entries:
         file, name = (entry.get("file"), entry.get("declaration")) if isinstance(entry, dict) else (None, None)
-        if not (isinstance(file, str) and isinstance(name, str) and _FILE.fullmatch(file) and _NAME.fullmatch(name)):
+        resolved = canonical(checkout, file, name) if isinstance(file, str) and isinstance(name, str) else None
+        if resolved is None:
             return None
-        if ".." in Path(file).parts or not (checkout / file).is_file():
-            return None
-        if not declared(checkout, re.escape(name.rsplit(".", 1)[-1]), pathspec=file):
-            return None
-        found.add(f"{file}#{name}")
+        found.add(resolved)
     found = frozenset(found)
-    return None if any(found <= wanting for wanting in refused) else found
+
+    def known(reference: str) -> str:
+        path, _, name = reference.partition("#")
+        return canonical(checkout, path, name) or reference
+
+    return None if any(found <= {known(r) for r in wanting} for wanting in refused) else found
 
 
 def ask(w, profile, checkout: Path, targets: Targets, rows: list[dict]) -> dict:

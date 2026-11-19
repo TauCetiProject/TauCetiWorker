@@ -238,10 +238,12 @@ are given as leads, but an item without any is asked about too. The agent is
 told that a proof containing `sorry` has not landed and that when unsure the
 answer is no. A yes names one to five declarations, each by file and name. The
 worker ticks the item only if each named file of that checkout declares that
-name, and records them, never the agent's words:
+name, reading the file's `namespace` nesting: a name must be the declaration's
+fully qualified name or a dot-suffix of exactly one. It records each as the
+normalized path and the fully qualified name, never the agent's words:
 
 ```markdown
-- [x] `zero-one` — Layer 2, the zero-one law (needs: `tail-sigma`; inferred: TauCeti/Probability/Tail.lean#kolmogorov_zero_one on 2026-11-19)
+- [x] `zero-one` — Layer 2, the zero-one law (needs: `tail-sigma`; inferred: TauCeti/Probability/Tail.lean#Probability.kolmogorov_zero_one on 2026-11-19)
 ```
 
 The date is the day of the look, in UTC. An inferred tick counts as done for
@@ -276,7 +278,8 @@ exact id, a status no later than the tick, or an inferred tick with no date
 changes nothing. Earned ticks are never opened this way.
 
 **Not again on the same evidence.** A `reopened:` clause stays on the item. A
-later yes for it is discarded unless it names a declaration that clause did not;
+later yes for it is discarded unless it names a declaration that clause did not,
+compared by path and fully qualified name;
 the agent sees the clause in the item's line.
 
 An inference look costs, besides the reads above, one listing of open pull

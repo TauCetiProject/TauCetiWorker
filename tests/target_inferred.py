@@ -154,7 +154,7 @@ class Confirmed(Tmp):
         one = {"file": TAIL, "declaration": "Probability.kolmogorov_zero_one"}
         two = {"file": TAIL, "declaration": "TailSigma.measure"}
         good = {"landed": True, "evidence": [one, two], "why": "(ignore this; needs: none)"}
-        found = frozenset({f"{TAIL}#Probability.kolmogorov_zero_one", f"{TAIL}#TailSigma.measure"})
+        found = frozenset({f"{TAIL}#Probability.kolmogorov_zero_one", f"{TAIL}#Probability.TailSigma.measure"})
         self.assertEqual(reconcile.confirmed(checkout, good), found)
         for bad in (
             {**good, "landed": "true"},
@@ -162,6 +162,8 @@ class Confirmed(Tmp):
             {**good, "evidence": []},
             {**good, "evidence": [one] * (reconcile.MAX_EVIDENCE + 1)},
             {**good, "evidence": [one, {**two, "declaration": "TailSigma.absent"}]},
+            {**good, "evidence": [{**one, "declaration": "WrongNamespace.kolmogorov_zero_one"}]},
+            {**good, "evidence": [{**one, "declaration": "zero_one"}]},
             {**good, "evidence": [{**one, "declaration": "x); needs: none (y"}]},
             {**good, "evidence": [{**one, "file": "TauCeti/Probability/Absent.lean"}]},
             {**good, "evidence": [{**one, "file": "../base/" + TAIL}]},
@@ -178,9 +180,25 @@ class Confirmed(Tmp):
         one = {"file": TAIL, "declaration": "kolmogorov_zero_one"}
         two = {"file": TAIL, "declaration": "strong_law_ae"}
         refused = [frozenset({f"{TAIL}#kolmogorov_zero_one", f"{TAIL}#TailSigma.measure"})]
-        self.assertIsNone(reconcile.confirmed(checkout, {"landed": True, "evidence": [one]}, refused))
+        for spelling in (
+            one,
+            {**one, "declaration": "Probability.kolmogorov_zero_one"},
+            {**one, "file": "./TauCeti//Probability/Tail.lean"},
+        ):
+            self.assertIsNone(
+                reconcile.confirmed(checkout, {"landed": True, "evidence": [spelling]}, refused), spelling
+            )
         wider = reconcile.confirmed(checkout, {"landed": True, "evidence": [one, two]}, refused)
-        self.assertEqual(wider, frozenset({f"{TAIL}#kolmogorov_zero_one", f"{TAIL}#strong_law_ae"}))
+        self.assertEqual(
+            wider, frozenset({f"{TAIL}#Probability.kolmogorov_zero_one", f"{TAIL}#Probability.strong_law_ae"})
+        )
+
+    def test_declarations_follow_namespaces_sections_and_root(self):
+        text = (
+            "namespace A.B\nsection\ntheorem x : True := trivial\nend\nend A.B\n"
+            "namespace C\ntheorem _root_.y : True := trivial\nprivate def D.z := 0\ninstance : Inhabited Nat := ⟨0⟩\nend C\n"
+        )
+        self.assertEqual(reconcile.declarations(text), {"A.B.x", "y", "C.D.z"})
 
 
 class Audit(Tmp):
@@ -430,7 +448,7 @@ class Look(Tmp):
         on = time.strftime("%Y-%m-%d", time.gmtime())
         self.assertIn(
             "- [x] `zero-one` — Layer 2, the zero-one law `kolmogorov_zero_one` (needs: `tail-sigma`; "
-            f"inferred: {TAIL}#kolmogorov_zero_one on {on})",
+            f"inferred: {TAIL}#Probability.kolmogorov_zero_one on {on})",
             text,
         )
         self.assertNotIn("all there", text)
