@@ -608,6 +608,15 @@ class ForgejoLists(Tmp):
         self.assertIn(f"landed: {self.repo.pull_url(3)})", text)
         self.assertEqual(sorted(call.args for call in proof.call_args_list), [(3, "main"), (12, "main")])
 
+    def test_an_in_flight_url_is_read_whatever_its_scheme_case_or_trailing_slash(self):
+        self.merged_rows = []
+        self.states = {12: {"state": "MERGED", "body": ""}}
+        url = self.repo.pull_url(12)
+        for written in ("HTTPS" + url[len("https") :], url + "/"):
+            self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {written}"))
+            self.assertEqual(self.reconcile(self.forgejo)[0], 0, written)
+            self.assertIn(f"(needs: none; landed: {written})", self.path.read_text())
+
     def test_a_partial_url_with_an_uppercase_scheme_is_still_an_exclusion(self):
         self.merged_rows = []
         url = self.repo.pull_url(7)

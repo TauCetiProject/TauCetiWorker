@@ -78,7 +78,7 @@ class Source:
         return self.repository.pull_url(number) if self.native else f"#{number}"
 
     def number(self, ref: str) -> int | None:
-        found = re.fullmatch(r"https?://\S*?(\d+)" if self.native else r"#(\d+)", ref)
+        found = re.fullmatch(r"https?://\S*?(\d+)/?" if self.native else r"#(\d+)", ref, re.I)
         if found is None or (self.native and ref_key(self.repository.pull_url(int(found.group(1)))) != ref_key(ref)):
             return None
         return int(found.group(1))

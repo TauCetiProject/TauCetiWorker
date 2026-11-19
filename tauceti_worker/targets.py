@@ -229,7 +229,7 @@ def inflight_ref(item: TargetItem) -> str | None:
     URL of a Forgejo one."""
     for clause in item.meta:
         key, _, value = clause.partition(":")
-        found = re.search(r"https?://[^\s,;]+|#\d+", value)
+        found = re.search(r"https?://[^\s,;]+|#\d+", value, re.I)
         if key.strip().lower() == "in flight" and found:
             return found.group(0)
     return None
