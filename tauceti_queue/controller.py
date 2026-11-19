@@ -223,6 +223,9 @@ INPUT_INSERTED = "inserted"
 INPUT_LANDED = "landed"
 INPUT_CANCELLED = "cancelled"
 MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # an input waiting for a source or a newer canonical base
+# The evidence key of a `missing-source` refusal's dependency fingerprint: what `main` and the batches
+# introducing sources held for the refused gaps. The refused head is re-admitted when it changes.
+MISSING_SOURCE_WATCH = "missing_source_watch"
 # The cancellation reason of a `no_repair` member the agent emptied: withdrawn until the PR it
 # interacts with lands on `main` (then `needs-rebase`) or leaves the queue (then re-admitted).
 PROBLEM_ANTICIPATED = "problem-anticipated"
@@ -666,6 +669,8 @@ class Controller:
         ):
             raise ValueError("controller source repository or branch differs from its CI policy")
         self._canonical: str | None = self.store.get_setting("state:canonical_sha")
+        # The canonical commit and active batch tips `_recheck_missing_sources` last looked at.
+        self._missing_source_signature: tuple[Any, ...] | None = None
         # Labels this process has made sure exist in the repository (`_ensure_labels`).
         self._labels_ensured: set[tuple[str, str]] = set()
         # Where escalations are told to the operator besides the status page (`_notify`): the Zulip
@@ -1307,12 +1312,14 @@ class Controller:
             ):
                 with self.store.transaction():
                     self.admission.withdraw(pr, head_sha or (current or {}).get("head_sha", ""))
+                    self._drop_missing_source(current, reason, now)
                     if current is not None and current["state"] in (INPUT_WAITING, INPUT_RESERVED):
                         self.store.update("inputs", {"id": current["id"]}, state=INPUT_CANCELLED, reason=reason)
                         self.store.journal(now, "withdrawn", number=pr, reason=reason, actor=actor)
                         self._refresh_snapshot()
                         return {"withdrawn": True, "reason": reason}
             if current is None or current["state"] in (INPUT_LANDED, INPUT_CANCELLED):
+                self._drop_missing_source(current, reason, now)
                 return {"withdrawn": False, "reason": "not-waiting"}
             if current["state"] == INPUT_INSERTED:
                 self.store.journal(now, "withdrawal-refused", number=pr, reason=reason, actor=actor)
@@ -1322,6 +1329,13 @@ class Controller:
                 self.store.journal(now, "withdrawn", number=pr, reason=reason, actor=actor)
             self._refresh_snapshot()
             return {"withdrawn": True, "reason": reason}
+
+    def _drop_missing_source(self, current: dict[str, Any] | None, reason: str, now: float) -> None:
+        """A withdrawal of a PR its `missing-source` refusal left cancelled: the refusal is no longer the
+        last word, so `_recheck_missing_sources` must not re-admit it."""
+        if current is not None and current["state"] == INPUT_CANCELLED and current["reason"] == "missing-source":
+            self.store.update("inputs", {"id": current["id"]}, reason=reason)
+            self.store.journal(now, "missing-source-dropped", number=current["number"], reason=reason)
 
     def set_priority(self, repo: str, pr: int, priority: int) -> dict[str, Any]:
         with self._lock:
@@ -1554,6 +1568,14 @@ class Controller:
         if current["state"] == INPUT_INSERTED:
             # Scenario 21: closing, relabelling, re-reviewing a member changes nothing; the content lands.
             self.store.journal(now, "member-event-ignored", number=number, action=action, batch_id=current["batch_id"])
+            return
+        if current["state"] == INPUT_CANCELLED and current["reason"] == "missing-source":
+            # A refusal `_recheck_missing_sources` would re-admit no longer stands for the PR as it is.
+            moved = action == "synchronize" and (pull.get("head") or {}).get("sha") not in (None, current["head_sha"])
+            reason = {"closed": "closed", "converted_to_draft": "draft"}.get(action, "head-changed" if moved else "")
+            if reason:
+                self.store.update("inputs", {"id": current["id"]}, reason=reason)
+                self.store.journal(now, "missing-source-dropped", number=number, reason=reason)
             return
         if current["state"] not in (INPUT_WAITING, INPUT_RESERVED):
             return
@@ -3548,6 +3570,7 @@ class Controller:
             self._reasons.append("Forgejo admission is disabled; mixed work is retained pending explicit enablement")
             return list(self._reasons)
         self._follow_anticipated(now)
+        self._recheck_missing_sources(now)
         hold = self._state("inference_hold")
         if hold:
             self._reasons.append(f"inference hold since {hold['since']:.0f}: {hold['last_error']}")
@@ -4253,6 +4276,10 @@ class Controller:
                     "at": now,
                 },
             ][-8:]
+            try:
+                evidence[MISSING_SOURCE_WATCH] = self._dependency_watch([(row, listed)])[0]
+            except chain.ChainError:
+                evidence[MISSING_SOURCE_WATCH] = ""  # the next recheck pass records it
             with self.store.transaction():
                 self.store.update(
                     "inputs",
@@ -4442,6 +4469,173 @@ class Controller:
                 "marker": f"<!-- {COMMENT_MARKER} missing-source:{row['head_sha']} -->",
             },
         )
+
+    def _blob_ids(self, specs: list[str]) -> dict[str, str]:
+        """The blob id at each `commit:path` in `specs`, "" where there is none, in one `cat-file` call."""
+        specs = sorted(set(specs))
+        if not specs:
+            return {}
+        result = chain._git(
+            self.clone, "cat-file", "--batch-check=%(objectname) %(objecttype)", input="\n".join(specs) + "\n"
+        )
+        lines = result.stdout.splitlines() if result.returncode == 0 else []
+        if len(lines) != len(specs):
+            raise chain.ChainError(f"git cat-file --batch-check failed: {result.stderr.strip()}")
+        ids = {}
+        for spec, line in zip(specs, lines, strict=True):
+            fields = line.split()
+            ids[spec] = fields[0] if len(fields) == 2 and fields[1] == "blob" else ""
+        return ids
+
+    def _dependency_watch(
+        self, refusals: list[tuple[dict[str, Any], list[dict[str, Any]]]], *, at: dict[int, str] | None = None
+    ) -> list[str]:
+        """The dependency fingerprint of each `(input, gaps)` refusal, for `MISSING_SOURCE_WATCH`.
+
+        It covers, on the canonical commit (or `at[input id]`), the blob at each gap's importer and at its
+        missing source, and the active batches whose tip introduces a source the PR imports (absent from
+        the batch's base). An importer that drops the import, a source that lands or reappears, and a
+        provider entering a batch all change it; landings elsewhere on `main` do not.
+        """
+        batches = [b for b in [self._head(), *self._open_batches()] if b is not None and b["tip"]]
+        canonical = self._canonical or ""
+        specs: list[str] = []
+        for row, gaps in refusals:
+            commit = (at or {}).get(row["id"], canonical)
+            for gap in gaps:
+                provider = gap["module"].replace(".", "/") + ".lean"
+                specs += [f"{commit}:{gap['path']}", f"{commit}:{provider}"]
+                if gap.get("changed"):
+                    specs += [f"{b[key]}:{provider}" for b in batches for key in ("tip", "base")]
+        ids = self._blob_ids([spec for spec in specs if not spec.startswith(":")])
+        prints = []
+        for row, gaps in refusals:
+            commit = (at or {}).get(row["id"], canonical)
+            facts = []
+            for gap in gaps:
+                provider = gap["module"].replace(".", "/") + ".lean"
+                incoming = sorted(
+                    b["id"]
+                    for b in batches
+                    if gap.get("changed")
+                    and ids.get(f"{b['tip']}:{provider}")
+                    and not ids.get(f"{b['base']}:{provider}")
+                )
+                facts.append(
+                    {
+                        "path": gap["path"],
+                        "module": gap["module"],
+                        "importer": ids.get(f"{commit}:{gap['path']}", ""),
+                        "source": ids.get(f"{commit}:{provider}", ""),
+                        "incoming": incoming,
+                    }
+                )
+            prints.append(admission_planning.fingerprint(facts))
+        return prints
+
+    def _recheck_missing_sources(self, now: float) -> None:
+        """Re-admit `missing-source` refusals whose dependency fingerprint changed, at their original age.
+
+        A refused PR imports a module nothing provides, or removes one something still imports. Landing
+        the provider, an importer dropping the import, or a batch introducing the provider can resolve
+        that without a new push, so whenever the canonical commit or an active batch's tip moves, each
+        newest refusal of a PR still at its refused head is fingerprinted again (`_dependency_watch`);
+        one that changed waits again and is probed as any waiting input, which refuses it again if a gap
+        remains. The refusal comment is keyed by head, so a repeated refusal posts nothing new. With an
+        admission port the PR's admission is re-read before the input can be inserted; without one the
+        live PR is read here. Refusals recorded before the fingerprint existed compare against the base
+        of the batch that refused them.
+        """
+        if self._canonical is None:
+            return
+        batches = [b for b in [self._head(), *self._open_batches()] if b is not None]
+        signature = (self._canonical, tuple(sorted((b["id"], b["tip"]) for b in batches)))
+        if signature == self._missing_source_signature:
+            return
+        refusals: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+        baseline: dict[int, str] = {}
+        for row in self.store.rows(
+            "inputs",
+            {"repository": self.repository, "state": INPUT_CANCELLED, "reason": "missing-source"},
+            order="id",
+        ):
+            if isinstance(row["number"], SourceNumber) and not (
+                self.mixed is not None and self.mixed.mode == "admit" and self.setting("forgejo_admission_enabled")
+            ):
+                continue
+            current = self._input_for(row["number"])
+            gaps = loads(row["last_probe"], None)
+            if current is None or current["id"] != row["id"] or not isinstance(gaps, list) or not gaps:
+                continue
+            if not all(isinstance(g, dict) and g.get("path") and g.get("module") for g in gaps):
+                continue
+            evidence = loads(row["evidence"], {})
+            if MISSING_SOURCE_WATCH not in evidence:
+                refused = [e for e in evidence.get("merge_selection", []) if e.get("kind") == "missing_source"]
+                if not refused or not refused[-1].get("base"):
+                    continue
+                baseline[row["id"]] = refused[-1]["base"]
+            refusals.append((row, gaps))
+        if not refusals:
+            self._missing_source_signature = signature
+            return
+        try:
+            prints = self._dependency_watch(refusals)
+            legacy = [(row, gaps) for row, gaps in refusals if row["id"] in baseline]
+            before = dict(
+                zip([row["id"] for row, _ in legacy], self._dependency_watch(legacy, at=baseline), strict=True)
+            )
+        except chain.ChainError as error:
+            self._note_reason(f"missing-source recheck unavailable: {error}")
+            return
+        self._missing_source_signature = signature
+        for (row, gaps), fingerprint in zip(refusals, prints, strict=True):
+            evidence = loads(row["evidence"], {})
+            recorded = before[row["id"]] if row["id"] in before else evidence.get(MISSING_SOURCE_WATCH)
+            if fingerprint != recorded:
+                self._readmit_missing_source(row, gaps, fingerprint, now)
+            elif row["id"] in before:
+                evidence[MISSING_SOURCE_WATCH] = fingerprint  # from now on, batches introducing a source count
+                self.store.update("inputs", {"id": row["id"]}, evidence=dumps(evidence))
+
+    def _readmit_missing_source(
+        self, row: dict[str, Any], gaps: list[dict[str, Any]], fingerprint: str, now: float
+    ) -> None:
+        """Return a `missing-source` refusal to waiting at its original age (`_recheck_missing_sources`)."""
+        evidence = loads(row["evidence"], {})
+        if self.admission is None:
+            pull, reason = self.validate_pull(self.repository, row["number"], row["head_sha"])
+            if reason is not None and reason.startswith("fetch-failed"):
+                self._note_reason(f"missing-source recheck of #{row['number']} waits for GitHub: {reason}")
+                self._missing_source_signature = None
+                return
+            if reason is None and self._blocking_labels(pull):
+                reason = "blocked-label"
+            if reason is not None:
+                # The PR moved on, closed or is blocked: only a new approval brings it back.
+                evidence[MISSING_SOURCE_WATCH] = fingerprint
+                self.store.update("inputs", {"id": row["id"]}, evidence=dumps(evidence))
+                return
+        with self.store.transaction():
+            if self.admission is not None and not self.admission.readmit(row["number"], row["head_sha"]):
+                return
+            evidence[MISSING_SOURCE_WATCH] = fingerprint
+            self.store.update(
+                "inputs",
+                {"id": row["id"]},
+                state=INPUT_WAITING,
+                reason="",
+                batch_id=None,
+                evidence=dumps(evidence),
+                passes_waited=0,
+                last_probe="missing-source-recheck",
+                last_probe_tip="",
+                last_probe_base="",
+                probe_conflicts="{}",
+            )
+            self._count("missing_source_rechecks")
+            self.store.journal(now, "missing-source-recheck", number=row["number"], head=row["head_sha"], gaps=gaps[:8])
+        self._wake.set()
 
     def _conflict_request(self, row: dict[str, Any], paths: list[str], now: float) -> None:
         if not self.setting("publication_enabled"):

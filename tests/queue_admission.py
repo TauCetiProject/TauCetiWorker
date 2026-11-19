@@ -551,6 +551,33 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.intake.run_once()["approved"], 0)
         self.assertEqual(self.controller.inputs()[0]["state"], "cancelled")
 
+    def test_missing_source_refusal_is_readmitted_through_a_fresh_admission_read(self):
+        for number in (1, 2):
+            head = self.github.create_pr(number, {f"TauCeti/P{number}.lean": "module\nimport TauCeti.Later\n"})
+            self.review(number, comment=10 + number)
+            for context in ("build", "scope"):
+                self.github.statuses[(head, context)] = Status("success", "", "", self.clock(), None)
+        self.assertEqual(self.intake.run_once()["approved"], 2)
+        self.controller.tick()
+        self.assertEqual([r["reason"] for r in self.controller.inputs()], ["missing-source"] * 2)
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.get(1)["disposition"], "withdrawn")
+        self.github.prs[2]["state"] = "closed"
+        self.intake.invalidate(2)
+        self.intake.run_once()
+        self.assertEqual(self.intake.state.get(2)["disposition"], "closed")
+        approved_at = self.controller.input_for(REPO, 1)["approved_at"]
+        self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
+        self.controller.tick()
+        row = self.controller.input_for(REPO, 1)
+        self.assertEqual((row["state"], row["approved_at"]), ("waiting", approved_at))
+        self.assertFalse(self.intake.is_current(1, row["head_sha"]), "admission reads the PR again first")
+        self.assertEqual(self.controller.input_for(REPO, 2)["state"], "cancelled", "a closed PR stays out")
+        self.assertEqual(self.intake.run_once()["approved"], 0)
+        self.assertEqual(self.intake.state.get(1)["disposition"], "already-approved")
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "inserted")
+
     def test_manual_reapproval_clears_withdrawal_intent(self):
         head = self.ready()
         self.intake.run_once()

@@ -35,6 +35,7 @@ from tauceti_queue.controller import (  # noqa: E402
     CANDIDATE_PUBLICATION_JOB,
     LOG_GRACE_SECONDS,
     MERGED_TITLE_PREFIX,
+    MISSING_SOURCE_WATCH,
     Controller,
     ControllerError,
     TaskError,
@@ -2285,6 +2286,104 @@ class MissingSource(QueueFixture):
             self.drive()
         self.assertEqual([r["state"] for r in self.controller.inputs() if r["number"] == 102], ["landed"])
         self.assertIsNotNone(self.repo.file_at("main", "TauCeti/Consumer.lean"))
+
+    def states(self, number):
+        return [r["state"] for r in self.controller.inputs() if r["number"] == number]
+
+    def rechecks(self):
+        return self.controller.store.count("journal", {"kind": "missing-source-recheck"})
+
+    def test_refused_import_is_readmitted_at_its_age_once_main_gains_the_source(self):
+        self.approve(101, {"TauCeti/Consumer.lean": "module\nimport TauCeti.Later\n"})
+        self.tick(2)
+        self.assertTrue(self.refused(101))
+        refused = next(r for r in self.controller.inputs() if r["number"] == 101)
+        # Unrelated landings change nothing the refusal depends on: no recheck, no probe.
+        self.repo.advance_main({"TauCeti/Unrelated.lean": "module\ndef unrelated := 1\n"})
+        self.tick(2)
+        self.assertTrue(self.refused(101))
+        self.assertEqual(self.rechecks(), 0)
+        self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
+        self.tick()
+        row = next(r for r in self.controller.inputs() if r["number"] == 101)
+        self.assertEqual((row["id"], row["approved_at"]), (refused["id"], refused["approved_at"]))
+        self.assertEqual(row["state"], "inserted")
+        self.assertEqual(self.rechecks(), 1)
+        self.assertEqual(self.controller.status()["counters"].get("missing_source_rechecks"), 1)
+        for _ in range(3):
+            self.drive()
+        self.assertEqual(self.states(101), ["landed"])
+        self.assertEqual(len(self.github.comments_for(101)), 2, "the refusal and the landing")
+
+    def test_removal_is_readmitted_once_main_drops_the_import(self):
+        self.approve(101, {"TauCeti/Provider.lean": None})
+        self.tick(2)
+        self.assertTrue(self.refused(101))
+        # The importer changes but still imports the module: rechecked, refused again, no new comment.
+        self.repo.advance_main(
+            {"TauCeti/Importer.lean": "module\npublic import TauCeti.Provider\ndef importer := provider + 0\n"}
+        )
+        self.tick(2)
+        self.assertTrue(self.refused(101))
+        self.assertEqual(self.rechecks(), 1)
+        self.assertEqual(self.controller.store.count("journal", {"kind": "probe-missing-source"}), 2)
+        self.assertEqual(len(self.github.comments_for(101)), 1, "one refusal notice per head")
+        self.tick(2)
+        self.assertEqual(self.rechecks(), 1, "a repeated refusal is not rechecked until something changes")
+        self.repo.advance_main({"TauCeti/Importer.lean": "module\ndef importer := 1\n"})
+        self.tick()
+        self.assertEqual(self.states(101), ["inserted"])
+        self.assertEqual(self.rechecks(), 2)
+
+    def test_source_entering_a_batch_readmits_the_refusal_to_wait_for_it(self):
+        self.approve(101, {"TauCeti/Consumer.lean": "module\nimport TauCeti.New\n"})
+        self.tick(2)
+        self.assertTrue(self.refused(101))
+        self.approve(102, {"TauCeti/New.lean": "module\ndef new := 1\n"})
+        self.tick()
+        self.assertEqual(self.states(102), ["inserted"])
+        self.tick()
+        self.assertEqual(self.rechecks(), 1)
+        self.assertEqual(self.states(101), ["waiting"])
+        for _ in range(4):
+            self.drive()
+        self.assertEqual(self.states(101), ["landed"])
+        self.assertEqual(len(self.github.comments_for(101)), 2, "the refusal and the landing")
+
+    def test_closed_or_pushed_refusal_is_not_readmitted(self):
+        self.approve(101, {"TauCeti/Consumer.lean": "module\nimport TauCeti.Later\n"})
+        self.approve(102, {"TauCeti/Other.lean": "module\nimport TauCeti.Later\n"})
+        self.tick(2)
+        self.assertTrue(self.refused(101) and self.refused(102))
+        self.github.close_pr(PROJECT, 101, "Change 101")
+        self.controller.handle_event(
+            "pull_request", {"action": "closed", "number": 101, "pull_request": {"number": 101, "merged": False}}
+        )
+        new_head = self.github.push_pr(102, {"TauCeti/Other.lean": "module\n"})
+        self.controller.handle_event(
+            "pull_request", {"action": "synchronize", "number": 102, "pull_request": {"head": {"sha": new_head}}}
+        )
+        self.assertEqual([r["reason"] for r in self.controller.inputs()], ["closed", "head-changed"])
+        self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
+        self.tick(2)
+        self.assertEqual(self.states(101) + self.states(102), ["cancelled", "cancelled"])
+        self.assertEqual(self.rechecks(), 0)
+
+    def test_refusal_recorded_before_the_fingerprint_compares_against_its_batch_base(self):
+        self.approve(101, {"TauCeti/Consumer.lean": "module\nimport TauCeti.Later\n"})
+        self.tick(2)
+        row = next(r for r in self.controller.inputs() if r["number"] == 101)
+        evidence = json.loads(row["evidence"])
+        evidence.pop(MISSING_SOURCE_WATCH)
+        self.controller.store.update("inputs", {"id": row["id"]}, evidence=json.dumps(evidence))
+        self.controller._missing_source_signature = None
+        self.repo.advance_main({"TauCeti/Unrelated.lean": "module\ndef unrelated := 1\n"})
+        self.tick()
+        self.assertEqual(self.rechecks(), 0)
+        self.assertIn(MISSING_SOURCE_WATCH, json.loads(self.controller.inputs()[0]["evidence"]))
+        self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
+        self.tick()
+        self.assertEqual(self.states(101), ["inserted"])
 
     def test_s25_gap_already_on_main_and_unavailable_scan_do_not_refuse(self):
         self.repo.advance_main({"TauCeti/Stale.lean": "module\nimport TauCeti.Gone\n"})

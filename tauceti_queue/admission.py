@@ -37,6 +37,8 @@ EXPLICIT_WITHDRAWALS = frozenset(
         "queue-withdrawn",
     }
 )
+# Admission dispositions under which a queue-refused head is not re-admitted (`readmit`).
+READMIT_REFUSED = frozenset({"closed", "draft", "review-unsafe"})
 CONTEXTS = ("build", "scope", "bump-guard")
 HUMAN_INFRASTRUCTURE_APPROVAL_VERSION = 1
 
@@ -294,6 +296,17 @@ class AdmissionPoller:
             cancelled_authorization=row["authorization_key"],
         )
         self.wake()
+
+    def readmit(self, number, head):
+        """Called under the controller lock when the queue undoes its own `missing-source` refusal of
+        `head`: the PR's admission is read again before the input can be inserted (`is_current`).
+        False when admission last saw another head, or the PR closed, drafted or not review-safe."""
+        work = self.state.get(number)
+        if work is None or work["head_sha"] != head or work["disposition"] in READMIT_REFUSED:
+            return False
+        self.state.dirty(number, head=head, urgent=True)
+        self.wake()
+        return True
 
     def accept_manual(self, number, head):
         """A successfully applied operator approval is fresh intent, unlike reevaluation."""

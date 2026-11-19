@@ -363,6 +363,23 @@ class Mixed(MixedFixture, unittest.TestCase):
         poller.withdraw(99, None)
         self.assertEqual(poller.state.get(99)["cancelled_head_sha"], "*")
 
+    def test_native_readmit_rereads_admission_and_refuses_another_head_or_a_closed_pr(self):
+        registry = self.registry()
+        head = self.native.create_pr(1, {"Native.lean": "native\n"})
+        poller = NativePoller(registry, self.controller)
+        self.controller.admission = __import__(
+            "tauceti_queue.mixed_sources", fromlist=["AdmissionInputs"]
+        ).AdmissionInputs(None, poller)
+        self.assertEqual(poller.run_once()["approved"], 1)
+        number = registry.number(1)
+        self.assertTrue(poller.is_current(1, head))
+        self.assertFalse(self.controller.admission.readmit(number, "f" * 40))
+        self.assertTrue(self.controller.admission.readmit(number, head))
+        self.assertFalse(poller.is_current(1, head), "re-read before the input can be inserted")
+        work = poller.state.get(1)
+        self.controller.store.update("admission_work", {"id": work["id"]}, disposition="closed")
+        self.assertFalse(self.controller.admission.readmit(number, head))
+
     def test_native_landed_head_is_not_readmitted_and_missing_head_is_retried(self):
         registry = self.registry()
         self.native.create_pr(1, {"Native.lean": "native\n"})
