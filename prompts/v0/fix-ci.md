@@ -6,7 +6,8 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   - `gh run view <run-id> --repo TauCetiProject/TauCeti --log-failed` (use the run id from the failing check)
 - If the failing stage's log shows a Lean process killed (signal 9, exit code 137), or ends with
   `The runner has received a shutdown signal` (exit code 143), investigate memory pressure before
-  calling it transient. A shutdown alone is not proof of OOM: a cancelled/superseded job or a reclaimed
+  calling it transient. Additional local reproduction of a memory-suspect build follows the bounded
+  diagnostic rules below. A shutdown alone is not proof of OOM: a cancelled/superseded job or a reclaimed
   runner can produce it too. Diagnose the failing stage first; do not rebuild every changed file just
   because a job was cancelled. Re-read the current head and its latest checks first: if a newer head
   or replacement run superseded this failure, leave it alone; if the current checks are green, stop
@@ -34,7 +35,7 @@ You are fixing FAILING CI on pull request #__PR__ of TauCetiProject/TauCeti, an 
   source demand exceeding the failing CI runner's budget, not merely local host pressure. These
   bounds apply to additional diagnostic runs; they add no extra final-verification pass. An actual
   repair still requires the normal local verification below and its resource-exhaustion stop/backoff.
-- If the cause remains undetermined and no safe diagnostic is available, do not manufacture a repair,
+- If the cause remains undetermined after any available safe diagnostics, or none is available, do not manufacture a repair,
   empty retry commit, closure or green result. Leave one concise evidence comment on this PR with the
   failed run/head, observed runner allocation, available diagnostic results and what is unavailable.
   First read existing comments: reuse equivalent evidence for the same head rather than posting it
