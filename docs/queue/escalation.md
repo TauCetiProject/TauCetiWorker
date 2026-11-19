@@ -184,6 +184,25 @@ service's environment (`~/.config/tauceti-queue/environment`) at a mode-0600 JSO
 entry completes as `notifier-unconfigured` and only the status alert remains; a file that cannot be
 read is itself reported as an alert.
 
+## Stuck PR heads
+
+The hourly CI recovery pass on the queue host (TauCetiTools `services/ci-recovery`) writes the open
+PR heads that have neither CI nor a final state three hours after their last push to
+`ci_recovery_report` (default `~/.local/state/tauceti-ci-recovery/stuck-heads.json`). The queue reads
+that report (`tauceti_queue/stuck_heads.py`):
+
+- `status.stuck_heads` carries its state (`fresh`, `stale` once older than three hours, `missing`,
+  `invalid`), the count, the oldest head's age and up to 30 heads; the summary of
+  `tauceti-queue status` prints `stuck heads: N, oldest Xh`;
+- the public observation publishes one `stuck_head` condition per listed head (with its last push
+  time) after a `stuck_heads_observed` condition (and `stuck_heads_partial` after an incomplete
+  pass), within its bound of 100 conditions, so `tauceti-fleet status` shows the same line; a
+  malformed report is `invalid` and never sends anything;
+- once a fresh report's count has stayed above zero for six hours (its `stuck_since`), the status
+  gains an alert and the operator gets one Zulip direct message through the outbox, keyed by the
+  start of the stuck period (`notify:stuck-heads:<repository>:<stuck_since>`), listing the PRs with
+  times in AEDT. A new message needs a new stuck period: a pass that finds no stuck head ends it.
+
 ## Settings
 
 | setting | initial | meaning |

@@ -226,6 +226,7 @@ class Service:
             revision_map_probe=module.revision_map_published,
         )
         self.controller.public_url = self.config.public_url
+        self.controller.stuck_heads_report = str(self.config.ci_recovery_report)
         self.loop_module = _optional("loop")
         poll_module = _optional("approval_poll")
         if poll_module is not None and hasattr(self.github, "list_open_pull_requests"):

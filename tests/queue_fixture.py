@@ -27,7 +27,9 @@ from tauceti_queue import (  # noqa: E402
     escalation,
     feeds,
     monitoring,
+    stuck_heads,
 )
+from tauceti_queue import runtime as rt  # noqa: E402
 from tauceti_queue.approval_poll import ApprovalPoller  # noqa: E402
 from tauceti_queue.controller import (  # noqa: E402
     CANDIDATE_BUILD_STEP,
@@ -539,6 +541,123 @@ class RecordingNotifier:
             self.lose -= 1
             raise RuntimeError("lost Zulip reply")
         return f"zulip {len(self.messages)}"
+
+
+class StuckHeads(QueueFixture):
+    """The CI recovery pass's stuck-head report: status, summary line and one direct message per period."""
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+        self.report = self.root / "ci-recovery" / "stuck-heads.json"
+        self.controller.stuck_heads_report = str(self.report)
+
+    def write(self, *, since_hours, observed_ago=60, prs=(43797, 43792), repo="TauCetiProject/TauCeti"):
+        now = self.clock()
+        heads = [
+            {"pr": pr, "head": "a" * 40, "reason": "no-ci", "last_push_at": now - (9 + i) * 3600, "run": None}
+            for i, pr in enumerate(prs)
+        ]
+        self.report.parent.mkdir(parents=True, exist_ok=True)
+        self.report.write_text(
+            json.dumps(
+                {
+                    "schema": stuck_heads.SCHEMA,
+                    "repo": repo,
+                    "observed_at": now - observed_ago,
+                    "complete": True,
+                    "stuck_since": now - since_hours * 3600 if heads else None,
+                    "heads": heads,
+                }
+            )
+        )
+
+    def test_a_short_stuck_period_is_reported_in_status_without_a_message(self):
+        self.write(since_hours=2)
+        self.tick()
+        status = self.controller.status()
+        self.assertEqual((status["stuck_heads"]["state"], status["stuck_heads"]["count"]), ("fresh", 2))
+        self.assertEqual(status["stuck_heads"]["heads"][0]["pr"], 43792)  # oldest push first
+        self.assertFalse(any("stuck without CI" in alert for alert in status["alerts"]))
+        self.assertEqual(self.notifier.messages, [])
+        self.assertEqual(rt.summarize(status).splitlines()[-2], "stuck heads: 2, oldest 10h")
+
+    def test_six_hours_stuck_sends_one_message_per_stuck_period(self):
+        self.write(since_hours=7)
+        self.tick(3)
+        self.assertEqual(len(self.notifier.messages), 1)
+        message = self.notifier.messages[0]
+        self.assertIn("2 PR heads stuck without CI or a final state since", message)
+        started = stuck_heads.datetime.fromtimestamp(self.clock() - 7 * 3600, stuck_heads.TIMEZONE)
+        self.assertIn(started.strftime("since %a %d %b %H:%M AEDT"), message)
+        self.assertIn("https://github.com/TauCetiProject/TauCeti/pull/43797 no-ci", message)
+        self.assertTrue(any("stuck without CI" in alert for alert in self.controller.status()["alerts"]))
+        self.assertEqual(len(self.controller.store.journal_entries("stuck-heads-notified")), 1)
+        self.clock.advance(3600)
+        self.write(since_hours=8)  # a later pass of the same period: the same start
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 1)
+        self.write(since_hours=0, prs=())
+        self.tick()
+        self.write(since_hours=6.5)  # a new period
+        self.tick()
+        self.assertEqual(len(self.notifier.messages), 2)
+
+    def test_a_partial_pass_counts_as_a_lower_bound(self):
+        self.write(since_hours=7)
+        report = json.loads(self.report.read_text())
+        self.report.write_text(json.dumps(dict(report, complete=False)))
+        self.tick()
+        self.assertIn("at least 2 (partial pass) PR heads stuck", self.notifier.messages[0])
+        self.assertIn("(partial pass)", rt.summarize(self.controller.status()))
+
+    def test_malformed_reports_are_invalid_not_fatal_or_silent(self):
+        now = self.clock()
+        good = {
+            "schema": stuck_heads.SCHEMA,
+            "repo": "TauCetiProject/TauCeti",
+            "observed_at": now,
+            "complete": True,
+            "stuck_since": now - 7 * 3600,
+            "heads": [{"pr": 1, "head": "a" * 40, "reason": "no-ci", "last_push_at": now - 9 * 3600}],
+        }
+        cases = [
+            dict(good, observed_at=10**400),
+            dict(good, observed_at=now + 3600),
+            dict(good, heads=None),
+            dict(good, stuck_since=None),
+            dict(good, heads=[dict(good["heads"][0], last_push_at=float("inf"))]),
+            dict(good, heads=["not a head"]),
+        ]
+        self.report.parent.mkdir(parents=True, exist_ok=True)
+        for case in cases:
+            with self.subTest(case=str(case)[:120]):
+                self.report.write_text(json.dumps(case))
+                self.tick()
+                self.assertEqual(self.controller.status()["stuck_heads"]["state"], "invalid")
+        self.report.write_text("[" * 100000 + "]" * 100000)
+        self.tick()
+        self.assertEqual(self.controller.status()["stuck_heads"]["state"], "invalid")
+        self.assertEqual(self.notifier.messages, [])
+        self.assertIn("stuck heads: report invalid", rt.summarize(self.controller.status()))
+
+    def test_stale_missing_or_foreign_reports_never_message(self):
+        for kwargs, state in (
+            (dict(since_hours=9, observed_ago=4 * 3600), "stale"),
+            (dict(since_hours=9, repo="someone/else"), "invalid"),
+        ):
+            with self.subTest(state=state):
+                self.write(**kwargs)
+                self.tick()
+                self.assertEqual(self.controller.status()["stuck_heads"]["state"], state)
+                self.assertEqual(self.notifier.messages, [])
+        self.report.unlink()
+        self.tick()
+        status = self.controller.status()
+        self.assertEqual(status["stuck_heads"]["state"], "missing")
+        self.assertIn("stuck heads: report missing", rt.summarize(status))
+        self.controller.stuck_heads_report = None
+        self.assertIsNone(stuck_heads.summary(self.controller.status()["stuck_heads"]))
 
 
 class FailureFingerprints(unittest.TestCase):

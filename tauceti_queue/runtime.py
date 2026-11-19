@@ -50,6 +50,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from . import stuck_heads
 from .config import STATUS_SCHEMA, Config
 
 PACKAGE_DIR = Path(__file__).resolve().parent
@@ -332,6 +333,9 @@ def summarize(document: Mapping[str, Any], now: datetime | None = None) -> str:
     count = waiting.get("count") if isinstance(waiting, Mapping) else document.get("approved_waiting")
     urgent = waiting.get("urgent") if isinstance(waiting, Mapping) else None
     lines.append(f"approved waiting: {count if count is not None else '?'}" + (f" ({urgent} urgent)" if urgent else ""))
+    stuck = stuck_heads.summary(document.get("stuck_heads"), now.timestamp() if now else time.time())
+    if stuck:
+        lines.append(stuck)
     task = document.get("pending_task")
     if task:
         lines.append(
