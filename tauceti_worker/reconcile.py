@@ -343,15 +343,21 @@ def _push(path: Path) -> bool:
 
 
 def _taken_back(base: str, ours: str, parent: str, current: str) -> str | None:
-    """`current` with each item `ours` changed from `base` set back to its `base` status and
-    clauses, found by area and slug so a line a hook reformatted is still found; an item `parent`
-    already holds as `ours` has it stays. None when an item cannot be put back."""
+    """`current` with this look's edit of each item (`ours` against `base`) undone where it still
+    stands, found by area and slug so a line a hook reformatted is still found: the status goes back
+    only while it is the one `ours` wrote, a clause `ours` added goes only while it is there as
+    written, and a clause `ours` removed returns only with the status. Whatever else changed the line
+    meanwhile stays. An item `parent` already holds as `ours` has it stays. None when an item cannot
+    be found or put back."""
 
     def listed(text: str) -> Targets | None:
         try:
             return parse_targets(text)
         except Die:
             return None
+
+    def key(clause: str) -> str:
+        return clause.partition(":")[0].strip().lower()
 
     before, after, held = listed(base), listed(ours), listed(parent)
     if before is None or after is None:
@@ -368,11 +374,17 @@ def _taken_back(base: str, ours: str, parent: str, current: str) -> str | None:
         found = now.find(item.slug) if now else None
         if found is None:
             return None
-        added = [m.partition(":")[0] for m in item.meta if m not in old.meta]
-        restored = [m for m in old.meta if m not in item.meta]
-        text = rewrite_item(text, found, old.status, drop=added, add=restored)
+        reverted = found.status == item.status
+        status = old.status if reverted else found.status
+        added = [m for m in item.meta if m not in old.meta and m in found.meta]
+        keys = {key(m) for m in added}
+        restored = [m for m in old.meta if m not in item.meta and key(m) not in {key(c) for c in found.meta}]
+        others = [m for m in found.meta if key(m) in keys and m not in added]
+        if not reverted and not added:
+            continue
+        text = rewrite_item(text, found, status, drop=keys, add=[*others, *(restored if reverted else ())])
         again = listed(text)
-        if again is None or again.find(item.slug) is None or again.find(item.slug).status != old.status:
+        if again is None or again.find(item.slug) is None or again.find(item.slug).status != status:
             return None
     return text
 

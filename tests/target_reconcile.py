@@ -315,6 +315,21 @@ class Publish(Tmp):
         self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
         self.assertEqual(git(self.tmp / "remote.git", "show", "main:targets.md") + "\n", EXAMPLE)
 
+    def test_a_failed_commit_keeps_an_operators_change_to_the_same_item(self):
+        first = self.clone("first")
+        listed = t.parse_targets(EXAMPLE)
+        a = t.rewrite_item(EXAMPLE, listed.find("strong-law"), "done", add=("landed: #7",))
+        by_hand = EXAMPLE.replace(
+            "- [ ] `strong-law` — the strong law (serves: G1; needs: `borel-cantelli`, `truncation-bounds`)",
+            "- [~] `strong-law` — the strong law (serves: G1; needs: `borel-cantelli`, `truncation-bounds`; "
+            "partial: #7; in flight: #8)",
+        )
+        hook = first.parent / ".git" / "hooks" / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ncat > targets.md <<'LIST'\n{by_hand}LIST\nexit 1\n")
+        hook.chmod(0o755)
+        self.assertIsNone(reconcile.publish(first, EXAMPLE, a, ["n"]))
+        self.assertEqual(first.read_text(), by_hand)
+
     def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
         from tauceti_worker.source_identity import SourceActor
         from tauceti_worker.worker_sources import activate
