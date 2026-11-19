@@ -191,6 +191,21 @@ PR removes that module, or imports it after a batch-mate removed it, landing the
 cannot repair the prospective tree. Those cases receive the ordinary missing-source request.
 A genuinely new module in another batch still waits for that batch to land before re-probing.
 
+A missing-source refusal is not final for its head. The refusal records a dependency fingerprint
+(`evidence.missing_source_watch`): for each gap, the blobs at its importer and at its missing source
+on the canonical commit, and the distinct such pairs at active batch tips that differ from it.
+Whenever the canonical commit or an active batch's tip moves, `_recheck_missing_sources` recomputes
+it for each PR's newest refusal. When it differs (the source landed, entered or left a batch, or an
+importer changed), the refusal becomes `missing-source-recheck` (journal `missing-source-recheck`)
+and admission (`readmit`) reads the PR again. If that read would admit the head (open, not a draft,
+review-safe, scoreboard green, no blocking label), `restore_missing_source` returns the same input
+to waiting at its original age (journal `missing-source-readmitted`, counter
+`missing_source_rechecks`), and it is probed like any waiting input, which refuses it again if a
+gap remains. The refusal comment is keyed by head, so a repeated refusal posts nothing new.
+Closing, drafting, pushing to or withdrawing a refused PR drops its refusal from the recheck.
+Refusals recorded before the fingerprint existed compare against the base of the batch that
+refused them, without batches.
+
 Background preparation (item 8 of "Pipeline acceleration behind the head" in the plan): while the
 head waits on CI or is being repaired, an open batch is built as assembled on its own base (never on
 the head's tip) and its internal failures are repaired by an agent, so that it is ready when it

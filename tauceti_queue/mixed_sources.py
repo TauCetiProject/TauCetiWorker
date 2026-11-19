@@ -105,6 +105,10 @@ class AdmissionInputs:
         if port is not None:
             return port.accept_manual(int(number), head)
 
+    def readmit(self, number, head):
+        port = self._for(number)
+        return port is not None and port.readmit(int(number), head)
+
 
 class NativePoller:
     """Direct native discovery with the existing due/dirty intake ledger."""
@@ -175,6 +179,17 @@ class NativePoller:
             cancelled_authorization=row["authorization_key"],
         )
         self.wake()
+
+    def readmit(self, number, head):
+        """As `AdmissionPoller.readmit`, for a native PR."""
+        from .admission import READMIT_REFUSED
+
+        work = self.state.get(int(number))
+        if work is None or work["head_sha"] != head or work["disposition"] in READMIT_REFUSED:
+            return False
+        self.state.dirty(int(number), head=head, urgent=True)
+        self.wake()
+        return True
 
     def accept_manual(self, number, head):
         self.state.dirty(int(number), head=head, urgent=True)
@@ -324,6 +339,14 @@ class NativePoller:
                         and current["state"] in {"waiting", "reserved", "inserted", "landed"}
                     ):
                         disposition = current["state"]
+                    elif (
+                        controller.setting("forgejo_admission_enabled")
+                        and (
+                            restored := controller.restore_missing_source(number, snapshot.pull.head_sha, snapshot.pull)
+                        )
+                        is not None
+                    ):
+                        disposition = restored
                     elif self._cancelled(work, snapshot, authorization, comment, meta):
                         disposition = "withdrawn"
                     elif not controller.setting("forgejo_admission_enabled"):
