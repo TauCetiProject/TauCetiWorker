@@ -62,6 +62,7 @@ from .config import (
     auto_assign_wid,
     extra_roadmap_prompt,
     is_git_url,
+    legacy_project,
     log,
     one_line,
     roadmap_only,
@@ -1434,6 +1435,10 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             os.kill(os.getpid(), signal.SIGTERM)
 
         threading.Thread(target=stop_with_parent, name="tauceti-parent-watch", daemon=True).start()
+    if is_loop_driver and legacy_project():
+        from .paths import refuse_virtualenv_data_root
+
+        refuse_virtualenv_data_root()
     if explicit:
         wid = sanitize_wid(explicit)
         # A top-level loop driver also reserves its slot, so an auto-assigned peer in another terminal
@@ -1700,11 +1705,18 @@ def cmd_host_doctor(args) -> int:
             "$KIRO_API_KEY" if (os.environ.get("KIRO_API_KEY") or "").strip() else str(kiro_db),
         )
     )
+    if legacy_project():
+        from .paths import virtualenv_data
+
+        root = legacy_data_root()
+        inside = virtualenv_data(root)
+        note = f"{inside[0][0]} is inside the virtualenv {inside[0][1]}; move it out" if inside else str(root)
+        rows.append(("data root", not inside, note))
     bad = 0
     print(f"tauceti doctor — worker '{cfg.wid}'")
     for name, ok, note in rows:
         mark = "ok " if ok else "MISSING"
-        if not ok and name in ("gh", "git", "uv/uvx", "gh auth"):
+        if not ok and name in ("gh", "git", "uv/uvx", "gh auth", "data root"):
             bad += 1
         print(f"  [{mark:7}] {name:14} {note}")
     return 1 if bad else 0

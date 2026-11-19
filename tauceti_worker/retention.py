@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from .config import Config, Die, legacy_project, log, worker_state_root
-from .paths import HERE, canonical_candidate, legacy_data_root, self_env
+from .paths import DATA_PARTS, HERE, canonical_candidate, legacy_data_root, self_env
 from .runtime_status import atomic_json, read_json
 
 LIFETIME = 3 * 86400
@@ -1037,7 +1037,23 @@ def data_roots():
             and any((path / name).is_dir() for name in ("state", "checkouts"))
         ):
             roots.add(path)
-    return [selected, *sorted(roots - {selected})]
+    # A root whose parts are symbolic links into another is an alias, not a second root: collecting
+    # both would take the same state lock twice and sweep the same data twice. Real data first.
+    kept, seen = [selected], _data_parts(selected)
+    for path in sorted(roots - {selected}, key=lambda root: (_links_parts(root), root)):
+        if not (parts := _data_parts(path)) & seen:
+            kept.append(path)
+            seen |= parts
+    return [selected, *sorted(kept[1:])]
+
+
+def _data_parts(root):
+    """Where the existing data parts of ``root`` really are, symbolic links followed."""
+    return {os.path.realpath(root / part) for part in DATA_PARTS if (root / part).exists()}
+
+
+def _links_parts(root):
+    return any((root / part).is_symlink() for part in DATA_PARTS)
 
 
 RETIRED_PARTS = ("state", "checkouts", "logs")
@@ -1097,12 +1113,14 @@ def retired_roots():
     candidates = set(data_roots()[1:]) if legacy_project() else set()
     if INSTALLED:
         candidates.add(HERE.resolve())
+    shared = _data_parts(selected)
     return sorted(
         root
         for root in candidates
         if not _same_file(root, selected)
         and not selected.is_relative_to(root)
         and not root.is_relative_to(selected)
+        and not _data_parts(root) & shared
         and (
             any((root / part).is_dir() and not (root / part).is_symlink() for part in RETIRED_PARTS)
             or any(root.glob(RETIRED_TRASH + "*"))
@@ -1476,20 +1494,21 @@ def retire_roots(report, *, dry=False, deadline=None):
     processes, mounts, configured = _processes(), mount_points(), _configured_texts()
     for root in roots:
         try:
-            if any((root / part).is_dir() for part in RETIRED_PARTS):
+            # A part that is a symbolic link belongs to the root it points into: never staged.
+            owned = [part for part in RETIRED_PARTS if (root / part).is_dir() and not (root / part).is_symlink()]
+            if owned:
                 if reason := _retirement_blocker(root, processes, mounts, configured):
                     note(report, "protected", f"{root}: {reason}")
                     continue
                 if dry:
-                    for part in RETIRED_PARTS:
-                        if (root / part).is_dir():
-                            note(report, "removed", str(root / part))
+                    for part in owned:
+                        note(report, "removed", str(root / part))
                     continue
                 with _idle_root(root) as idle:
                     if not idle:
                         note(report, "protected", f"{root}: a worker or round holds its lock")
                         continue
-                    for part in RETIRED_PARTS:
+                    for part in owned:
                         path = root / part
                         if path.is_dir() and not path.is_symlink():
                             path.rename(root / f"{RETIRED_TRASH}{part}-{os.getpid()}-{time.time_ns()}")

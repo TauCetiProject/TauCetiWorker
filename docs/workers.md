@@ -1,16 +1,26 @@
 # Persistent workers
 
-Worker data (`state/`, `checkouts/` and `logs/`) lives in one data root. An
-installed package (`uv tool install`, pip, a Fleet runtime) uses
+Worker data (`state/`, `checkouts/`, `logs/` and `host-repositories/`) lives in
+one data root. An installed package (`uv tool install`, pip) uses
 `$XDG_DATA_HOME/tauceti`, else `~/Library/Application Support/tauceti/data` on
 macOS, else `~/.local/share/tauceti`, so upgrading or reinstalling the code keeps
-it. A source checkout keeps it beside the code, gitignored. For the legacy
-TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects another absolute directory;
-round, verification and cleanup subprocesses inherit it, and bundled scripts and
-prompts remain with the code. Changing the location does not move data: the
-cleanup collector deletes data an earlier installation left in its package
-directory, and on Fleet hosts other runtimes' roots, once no worker or round
-holds their locks.
+it. A Fleet runtime uses `<fleet data>/worker-data/root` (normally
+`~/.local/share/tauceti-fleet/worker-data/root`), shared by every runtime
+revision; it keeps `~/.local/share/tauceti` only while that holds worker state
+and the fixed root does not. A source checkout keeps it beside the code,
+gitignored. For the legacy TauCeti project, `TAUCETI_LEGACY_DATA_ROOT` selects
+another absolute directory; round, verification and cleanup subprocesses inherit
+it, and bundled scripts and prompts remain with the code. Changing the location
+does not move data: the cleanup collector deletes data an earlier installation
+left in its package directory, and on Fleet hosts other runtimes' roots, once no
+worker or round holds their locks.
+
+A data root inside a virtualenv looks disposable, so `tauceti doctor` fails and
+a worker loop refuses to start when it would create data there. Data already
+inside one only draws a warning; move it out by renaming each part into the new
+root and leaving a symbolic link at the old name. The collector treats a root
+whose parts are symbolic links into another as an alias: it collects the target
+once, through the selected root, and never stages or deletes it through the link.
 
 ## Fleet admission and reporting
 

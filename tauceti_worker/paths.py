@@ -43,6 +43,63 @@ def user_data_root() -> Path:
     return login_home() / ".local" / "share" / "tauceti"
 
 
+# What a data root holds. Data inside a virtualenv looks disposable: Fleet keeps every staged
+# runtime, and deleting one with `rm -rf` or a runtime cleanup would take the workers' data with it.
+DATA_PARTS = ("state", "checkouts", "logs", "host-repositories")
+FLEET_RUNTIMES = "worker-runtimes"
+
+
+def fleet_data_root() -> Path | None:
+    """The fixed data root of a Fleet-installed worker, or None outside Fleet.
+
+    Fleet stages each worker revision as a virtualenv under <fleet>/worker-runtimes/<revision>/;
+    every revision shares <fleet>/worker-data/root, so switching revisions never moves data."""
+    if not INSTALLED:
+        return None
+    for parent in HERE.parents:
+        if parent.parent.name == FLEET_RUNTIMES:
+            return parent.parent.parent / "worker-data" / "root"
+    return None
+
+
+def virtualenv_of(path: Path) -> Path | None:
+    """The virtualenv or package directory that contains ``path``, or None."""
+    for parent in (path, *path.parents):
+        if parent.name in ("site-packages", "dist-packages") or (parent / "pyvenv.cfg").is_file():
+            return parent
+    return None
+
+
+def virtualenv_data(root: Path) -> list[tuple[Path, Path, bool]]:
+    """(part, enclosing virtualenv, whether it exists) for each part of ``root`` whose data is
+    or would be inside a virtualenv. Symbolic links are followed: a runtime whose parts link to
+    a root outside it holds no data itself."""
+    found = []
+    for name in DATA_PARTS:
+        part = root / name
+        if (venv := virtualenv_of(Path(os.path.realpath(part)))) is not None:
+            found.append((part, venv, part.exists()))
+    return found
+
+
+def refuse_virtualenv_data_root(root: Path | None = None) -> None:
+    """Refuse to create worker data inside a virtualenv; warn about data already there.
+
+    Existing data is not refused: stopping every worker on a host whose root is still pinned
+    inside a runtime would be an outage, and the data has to be moved out by hand first."""
+    from .config import Die, warn_red
+
+    root = legacy_data_root() if root is None else root
+    found = virtualenv_data(root)
+    if missing := [part for part, _venv, exists in found if not exists]:
+        raise Die(
+            f"worker data root {root} is inside the virtualenv {found[0][1]}; it would create "
+            f"{', '.join(map(str, missing))} there. Set TAUCETI_LEGACY_DATA_ROOT to a directory outside it."
+        )
+    for part, venv, _exists in found:
+        warn_red(f"worker data {part} is inside the virtualenv {venv}; move it out of the runtime")
+
+
 def held_lock_files() -> set[tuple[int, int]] | None:
     """(st_dev, st_ino) of files that are locked (Linux) or open (macOS) right now, or None.
 
@@ -124,7 +181,8 @@ def legacy_data_root(default: Path | None = None) -> Path:
     the code (gitignored). An installed package uses user_data_root(): data inside the package
     directory was silently kept across `uv tool upgrade` yet destroyed by `--force` or
     `uninstall`, and the collector deletes what earlier installations left there. The default
-    is resolved once per process and exported, so every descendant agrees on it.
+    is resolved once per process and exported, so every descendant agrees on it. A Fleet runtime
+    uses fleet_data_root() instead, unless user_data_root() already holds state and it does not.
     """
     raw = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")
     if not raw:
@@ -132,13 +190,20 @@ def legacy_data_root(default: Path | None = None) -> Path:
             return default
         if not INSTALLED:
             return HERE
-        root = HERE if _older_generation_live(HERE) else user_data_root()
+        root = HERE if _older_generation_live(HERE) else _installed_data_root()
         os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(root)
         return root
     root = Path(raw).expanduser()
     if not root.is_absolute():
         raise ValueError("TAUCETI_LEGACY_DATA_ROOT must be an absolute path")
     return root.resolve()
+
+
+def _installed_data_root() -> Path:
+    fleet, user = fleet_data_root(), user_data_root()
+    if fleet is None or ((user / "state").is_dir() and not (fleet / "state").exists()):
+        return user  # existing workers keep their state until an operator moves it
+    return fleet
 
 
 # The branch-lease helper the agents run on PATH inside a round. Overridable for tests.
