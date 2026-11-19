@@ -130,6 +130,8 @@ from .targets import (
     Targets,
     candidates,
     github_history_enabled,
+    inference_enabled,
+    inferred_needs,
     inventory_keys,
     landed_pr,
     live_targets,
@@ -137,6 +139,7 @@ from .targets import (
     open_pr,
     overlay_live,
     render_assignment,
+    render_report,
     target_markers,
 )
 from .worker_sources import pull_url as source_pull_url
@@ -1404,7 +1407,7 @@ def _build_cache_deferral(stage: str, c: Candidate) -> dict | None:
 
 def _model_free(stage: str) -> bool:
     """Whether `stage` starts no agent, so dispatch neither resolves nor probes one for it."""
-    return stage == "reconcile"
+    return stage == "reconcile" and not inference_enabled()
 
 
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
@@ -1692,7 +1695,7 @@ def do_overlap_fix(w, sv, c, opts, bubble):
 def do_reconcile(w, sv, c, opts, bubble):
     from .reconcile import run
 
-    return run(w, c)
+    return run(w, c, _effective_authoring_profile(opts) if inference_enabled() else None)
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
@@ -3207,11 +3210,19 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     only = c.reason or "any"
     skip = roadmap_skip()
     assignment = ""
+    report = None
     targets_path = roadmap_targets()
     if targets_path is not None:
         live, item = assign_target(w, targets_path, only, skip)
         only = item.area
         assignment = render_assignment(live, item)
+        needs = inferred_needs(live, item) if inference_enabled() else []
+        if needs:
+            report = (w.cfg.state / "target-report", item, needs)
+            shutil.rmtree(report[0], ignore_errors=True)
+            report[0].mkdir(parents=True)
+            shown = "/opt/target-report" if bubble else str(report[0])
+            assignment += render_report(item, needs, f"{shown}/prerequisites.txt")
         os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))
         report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
     elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
@@ -3301,7 +3312,9 @@ other contributors' claims, or the hard rules of the repo.
             mounts.append(f"{source_dir}:/opt/source:ro")
         if inventory_file is not None:
             mounts.append(f"{inventory_file}:/opt/source-targets.json:ro")
-        return run_in_bubble(
+        if report is not None:
+            mounts.append(f"{report[0]}:/opt/target-report:rw")
+        rc = run_in_bubble(
             w,
             TAUCETI,
             fill_prompt(
@@ -3330,6 +3343,8 @@ other contributors' claims, or the hard rules of the repo.
             mounts=mounts,
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
         )
+        _reopen_reported(report)
+        return rc
     if not prepare_checkout(w.cfg, work="roadmap", roadmap=only or None):
         raise Die("checkout failed")
     prompt = fill_prompt(
@@ -3362,7 +3377,22 @@ other contributors' claims, or the hard rules of the repo.
     finally:
         from .self_tested_label import scoped_publications
 
+        _reopen_reported(report)
         if (w.cfg.checkout / ".git").exists() and (published := scoped_publications(w.cfg.checkout, push_scope)):
             if c.progress is None:
                 c.progress = {}
             c.progress.update(published_branches=published, published_owner=fork_owner)
+
+
+def _reopen_reported(report) -> None:
+    """Open again the inferred prerequisites a roadmap round reported wanting (render_report)."""
+    if report is None:
+        return
+    from .activity import current_round_id
+    from .reconcile import reopen, reported
+
+    directory, item, needs = report
+    allowed = [dep.slug for dep in needs]
+    slugs = reported(directory / "prerequisites.txt", allowed)
+    if slugs:
+        reopen(slugs, allowed, f"{item.slug} round {(current_round_id() or str(int(time.time())))[:12]}")

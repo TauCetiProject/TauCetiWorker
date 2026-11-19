@@ -418,6 +418,8 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
 | `TAUCETI_RECONCILE_GAP` | `21600` | Seconds between looks at the target list by the [`reconcile` phase](target-lists.md#reconciliation), shared by the workers that reconcile one file on a host. |
+| `TAUCETI_ROADMAP_TARGETS_INFER` | _(unset)_ | `1` turns on [inferred completion](target-lists.md#inferred-completion): a `reconcile` look may tick an item the base branch already has, and a roadmap round may report such a tick wanting. |
+| `TAUCETI_ROADMAP_TARGETS_INFER_MAX` | `12` | Open items one inference look puts to the model. |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
 

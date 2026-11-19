@@ -264,6 +264,7 @@ RUN_STDLIB=(
   ssl_cert_file.py
   staging_journal_report.py
   status_labels.py
+  target_inferred.py
   target_list.py
   target_reconcile.py
   tend_bot_permissions.py

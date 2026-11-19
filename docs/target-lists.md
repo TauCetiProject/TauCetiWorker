@@ -60,13 +60,17 @@ first `## ` heading is shown to the agent with the items of its area.
   the item. `in flight: #N` on a `[~]` item names the pull request it waits on,
   which is how [reconciliation](#reconciliation) follows it. A GitHub pull
   request is named `#N` in these clauses and a Forgejo one by its URL, in any
-  case. Every other clause is passed to the agent as written.
+  case. `inferred:` and `reopened:` are written by
+  [inferred completion](#inferred-completion). Every other clause is passed to
+  the agent as written.
 - An item line that does not parse is logged and skipped. A `needs:` slug the
   file never defines is logged and blocks nothing.
 
 The file is read at the start of each roadmap round, so an edit takes effect on
 the next round. A worker writes to it only in the `reconcile` phase, which is
-off unless a worker's `only` names it (see [Reconciliation](#reconciliation)).
+off unless a worker's `only` names it (see [Reconciliation](#reconciliation)),
+and, with [inferred completion](#inferred-completion) on, after a roadmap
+round that reports an inferred prerequisite wanting.
 
 ## Live statuses
 
@@ -189,7 +193,79 @@ a commit that cannot be pushed goes with the next look. A branch that tracks
 nothing is committed and not pushed. Add the lock file to `.gitignore`.
 
 A look costs, on each forge it reads, one search for merged markers, plus one
-read per `in flight:` clause. It starts no model.
+read per `in flight:` clause. It starts no model unless inferred completion
+(below) is on.
+
+## Inferred completion
+
+A milestone can land without a pull request that carries its marker, and then
+nothing above ticks it and the items that need it wait for ever. With
+`TAUCETI_ROADMAP_TARGETS_INFER=1` in the worker's environment (or its `env` in
+`workers.toml`), a `reconcile` look also asks a host agent which open items the
+base branch already has, and a roadmap round can report such a tick wrong.
+Without the setting none of this section happens: no model is started, no
+roadmap file is read and the authoring prompt is unchanged.
+
+**Inferred tick.** After the edits above, the look takes the open items, under
+the live view, that are eligible or that an item not yet done needs, and are
+not in flight on an open pull request. It orders them by how many items not
+yet done wait on them, directly or through others, then in file order, and puts
+up to `TAUCETI_ROADMAP_TARGETS_INFER_MAX` of them (12 by default) to one host
+agent with the worker's authoring model. The agent reads a fresh shallow
+checkout of the content base (`TAUCETI_BASE_BRANCH`, `main` by default) on
+GitHub, the item's line and the list's goal, and the roadmap's `README.md`,
+pointed at the item's layer, as the authoritative statement of the milestone;
+the README comes from the roadmap repository as authoring rounds attach it.
+Declarations of the Lean names the description quotes, and of the slug's words,
+are given as leads, but an item without any is asked about too. The agent is
+told that a proof containing `sorry` has not landed and that when unsure the
+answer is no. A yes names one to five declarations, each by file and name. The
+worker ticks the item only if each named file of that checkout declares that
+name, and records them, never the agent's words:
+
+```markdown
+- [x] `zero-one` — Layer 2, the zero-one law (needs: `tail-sigma`; inferred: TauCeti/Probability/Tail.lean#kolmogorov_zero_one on 2026-11-19)
+```
+
+The date is the day of the look, in UTC. An inferred tick counts as done for
+`needs:` like any other. An item found not landed is not asked about again for
+seven days unless its line, the goal, its README or a file its leads are in
+changes. The tick is written only if the goal and the item's line are still as
+the agent was given them, and in a tracked list only if the look also pushes it,
+after any rebase, onto a list where they still are; otherwise the commit is
+undone, leaving any other edit it held uncommitted in the file, and the next
+look asks again.
+
+**Reopened by a dependent.** A roadmap round handed an item whose `needs:`
+include inferred ticks is told which they are, and that if one is missing or
+unusable for its item it writes that slug on a line of its own to a file the
+prompt names (in the worker's state, `target-report/prerequisites.txt`). After
+the round the worker reads at most 4 KiB of it, keeps only slugs that are
+inferred `needs:` of the item that round was handed, and opens each again: `[ ]`,
+its `inferred:` clause dropped and
+`reopened: <its evidence> by <item> round <round id>` added. It waits up to two
+minutes for the list's lock to do so, and does not move the look gap. A tick
+earned by a merged pull request (`landed:`, or an `[x]` without `inferred:`) is
+never opened this way.
+
+**Layer audit.** Items whose description begins `Layer N,` belong to that
+layer of the area's roadmap. When every such item of an area is ticked, and the
+area's own `tauceti-coverage:v1` header in the roadmap's `STATUS.md` names a
+layer with exactly that id in a state other than `done`, each inferred tick in
+the layer that is dated before the status header's date is opened again, with
+`reopened: <its evidence> by coverage <layer> <state> on <status date>`. A
+missing or unparseable header, a second header for the area, no layer with that
+exact id, a status no later than the tick, or an inferred tick with no date
+changes nothing. Earned ticks are never opened this way.
+
+**Not again on the same evidence.** A `reopened:` clause stays on the item. A
+later yes for it is discarded unless it names a declaration that clause did not;
+the agent sees the clause in the item's line.
+
+An inference look costs, besides the reads above, one listing of open pull
+requests on each forge, a shallow fetch of the content base, one `git grep` per
+quoted name and per slug, the roadmap attach the authoring round also makes,
+and one agent run when any item is to be asked about.
 
 ## What the agent sees
 
@@ -198,6 +274,8 @@ assigned slug and area, the instruction to author that item or a prerequisite
 inside the same roadmap and nothing else, the exact marker for the pull request
 body (with `"partial":true` when the pull request lands only part of the item),
 and the area's items with their live statuses under the file's preamble.
+With inferred completion on, it also names the item's inferred prerequisites
+and the file to report one wanting (see [Inferred completion](#inferred-completion)).
 `gh-safe-pr-create` refuses a body that does not carry the assigned item's
 marker; in a Forgejo round its `gh pr create` goes through the source-bound
 `gh`, so the check is the same on both forges.

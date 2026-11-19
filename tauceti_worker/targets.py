@@ -17,6 +17,8 @@ the worker uses:
                                        pull request body must carry
     rewrite_item(text, item, status)   the file's text with one item line changed, for the
                                        `reconcile` phase
+    inferred(item), reopened(item)     the evidence of an inferred tick, and the evidence a
+                                       reopening found wanting (TAUCETI_ROADMAP_TARGETS_INFER)
 
 `parse_targets`, `marker_keys`, `landed`, `overlay_live`, `eligible_items` and `eligible_areas`
 are the pure pieces those are built from; none of them reads GitHub or the environment.
@@ -294,6 +296,50 @@ def github_history_enabled() -> bool:
     return os.environ.get("TAUCETI_ROADMAP_TARGETS_GITHUB", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+_EVIDENCE_RE = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_./-]*\.lean)#([^\s,;#()]+)")
+_ON_RE = re.compile(r"\bon (\d{4}-\d{2}-\d{2})\s*$")
+_LAYER_RE = re.compile(r"(Layer [A-Za-z0-9.-]{1,33}),")
+
+
+def inference_enabled() -> bool:
+    """TAUCETI_ROADMAP_TARGETS_INFER: whether the `reconcile` phase may tick an item from the base
+    branch's source, and a roadmap round may report such a tick wanting. Off unless set to 1."""
+    return os.environ.get("TAUCETI_ROADMAP_TARGETS_INFER", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _clauses(item: TargetItem, key: str) -> list[str]:
+    return [c.partition(":")[2].strip() for c in item.meta if c.partition(":")[0].strip().lower() == key]
+
+
+def evidence_of(value: str) -> frozenset[str]:
+    """The `path#declaration` references a clause names."""
+    return frozenset(f"{path}#{name}" for path, name in _EVIDENCE_RE.findall(value))
+
+
+def inferred(item: TargetItem) -> tuple[frozenset[str], str | None] | None:
+    """The evidence and the date (`YYYY-MM-DD`, None when the clause has none) of an item ticked by
+    inference: done, with an `inferred:` clause naming evidence and no `landed:` clause. None for
+    any other item, a tick earned by a merged pull request in particular."""
+    if item.status != "done" or _clauses(item, "landed"):
+        return None
+    for value in _clauses(item, "inferred"):
+        if evidence := evidence_of(value):
+            on = _ON_RE.search(value)
+            return evidence, on.group(1) if on else None
+    return None
+
+
+def reopened(item: TargetItem) -> list[frozenset[str]]:
+    """The evidence each of an item's `reopened:` clauses found wanting."""
+    return [found for value in _clauses(item, "reopened") if (found := evidence_of(value))]
+
+
+def layer_of(item: TargetItem) -> str | None:
+    """The roadmap layer an item's description begins with (`Layer 3, ...`), exactly as written."""
+    found = _LAYER_RE.match(item.text)
+    return found.group(1) if found else None
+
+
 class GitHubMarkerReads:
     """A source for `live_targets`, `landed_pr` and `open_pr` made of the GitHub content
     repository's marker-bearing pull requests, for a round whose sources do not include GitHub (a
@@ -458,6 +504,19 @@ def rewrite_item(text: str, item: TargetItem, status: str, *, drop: Iterable[str
         lines[n] = body.rstrip() + (f" ({'; '.join(clauses)})" if clauses else "") + line[len(line.rstrip("\r\n")) :]
         break
     return "".join(lines)
+
+
+def inferred_needs(targets: Targets, item: TargetItem) -> list[TargetItem]:
+    """The items `item` needs that are ticked by inference rather than by a merged pull request."""
+    return [dep for slug in item.needs if (dep := targets.find(slug)) is not None and inferred(dep) is not None]
+
+
+def render_report(item: TargetItem, needs: list[TargetItem], path: str) -> str:
+    """The bullet, under the assignment, that lets the round report an inferred prerequisite wanting."""
+    names = ", ".join(f"`{dep.slug}`" for dep in needs)
+    return f"""\
+  - {names} {"is" if len(needs) == 1 else "are"} marked `[x]` because the worker read the base branch's source, not because a pull request for {"it" if len(needs) == 1 else "them"} merged; each `inferred:` clause names the declarations taken as evidence. If you find one of them missing, or present but unusable for `{item.slug}` (a different statement, too weak, or proved with `sorry`), write its slug on a line of its own to `{path}` and say in your final message what is missing. The worker opens such a prerequisite again; it reads nothing else from that file, and only these slugs.
+"""
 
 
 def render_assignment(targets: Targets, item: TargetItem) -> str:
