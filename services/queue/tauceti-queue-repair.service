@@ -51,10 +51,13 @@ UMask=0077
 # Repairs yield to CI and staging builds on the same host (tauceti-repair.slice). Every thread and
 # child inherits the niceness and IO class from the exec, and the slice's weights cover any process
 # in the unit's cgroup, including bwrap sandboxes and the agent's. Background publications join the
-# slice too (tauceti_queue/repair_publish.py). Not CPUWeight=idle: the claim lease must keep renewing.
+# slice too (tauceti_queue/repair_publish.py). Neither CPUWeight=idle nor the idle IO class: the
+# claim lease, which renews from a thread of this process and touches the task root, must keep
+# renewing under a full staging build, so the lowest best-effort IO priority instead.
 Slice=tauceti-repair.slice
 Nice=10
-IOSchedulingClass=idle
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 WantedBy=default.target

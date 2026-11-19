@@ -494,12 +494,16 @@ requirements below (the service's `repair_concurrency` setting bounds how many h
 Repairs run below the CI and staging VMs that share their host. Every repair unit runs in
 `tauceti-repair.slice` (installed by `install-repair.sh` beside TauCetiFleet's `tauceti-fleet.slice`
 under `tauceti.slice`, with `CPUWeight=10` and `IOWeight=10` against the fleet slice's 100), at
-`Nice=10` with `IOSchedulingClass=idle`; every thread and child inherits these, bwrap sandboxes
-and the agent's processes included, and the background publisher's transient unit is started in
-the same slice with the same settings. The slice weight is what counts against the VMs: the cgroup
-CPU controller shares a busy host between sibling slices by weight, so a reniced process in
-`app.slice` competes as `app.slice` does. A `renice` by hand affects only the thread it names, not
-the other threads of a multithreaded process such as `lake` or the worker, nor their later children.
+`Nice=10` with the lowest best-effort IO priority (not the idle class, which could stall the claim
+lease's renewal); every thread and child inherits these, bwrap sandboxes and the agent's processes
+included, and the background publisher's transient unit is started in the same slice with the same
+settings. The slice weight is what counts against the VMs: the cgroup CPU controller shares a busy
+host between sibling slices by weight, so a reniced process in `app.slice` competes as `app.slice`
+does. The weights are work-conserving, so repairs slow down under a staging build and never stop.
+Disk traffic is ordered only where the block layer honours cgroup weights or IO priorities (BFQ,
+mq-deadline, or io.cost configured for the device); tauchonki2's devices use `none`, so there
+nothing orders it. A `renice` by hand affects only the thread it names, not the other threads of a
+multithreaded process such as `lake` or the worker, nor their later children.
 
 Queue repair sessions using Claude (subscription or API) give Bash EOF on its default stdin.
 The worker atomically writes `bash-env.sh` beside its persistent private Claude config and selects

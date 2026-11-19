@@ -41,7 +41,7 @@ NICE = 10  # the niceness of the rehash and the upload
 # of the worker unit's priority: it joins the workers' slice (services/queue/tauceti-repair.slice)
 # and takes the same niceness and IO class as services/queue/tauceti-queue-repair.service.
 SLICE = "tauceti-repair.slice"
-UNIT_PRIORITY = ("Nice=10", "IOSchedulingClass=idle")
+UNIT_PRIORITY = ("Nice=10", "IOSchedulingClass=best-effort", "IOSchedulingPriority=7")
 RECORD = "publish.json"  # the background publication's record, in the task's logs/
 BACKGROUND_LOG = "publish.log"
 SPEC = "publish-spec.json"
@@ -218,9 +218,16 @@ def validate_native_stage(stage: Path) -> None:
 
 
 def niced(argv: list[str], nice: int, env: dict) -> list[str]:
-    """``argv`` under ``nice -n <nice>`` when ``nice`` is positive and on the ``PATH``."""
-    if nice > 0 and shutil.which("nice", path=env.get("PATH")):
-        return ["nice", "-n", str(nice), *argv]
+    """``argv`` at niceness at least ``nice``, by ``nice -n`` (which is relative) when it is on the
+    ``PATH``. A publisher already at that niceness (its unit's ``Nice=``, or a worker's inherited one)
+    runs ``argv`` as it is rather than at ``nice`` more."""
+    try:
+        current = os.getpriority(os.PRIO_PROCESS, 0)
+    except OSError:
+        current = 0
+    step = nice - current
+    if step > 0 and shutil.which("nice", path=env.get("PATH")):
+        return ["nice", "-n", str(step), *argv]
     return list(argv)
 
 

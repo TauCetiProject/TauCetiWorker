@@ -4,9 +4,11 @@
 # The name puts it under tauceti.slice, beside TauCetiFleet's tauceti-fleet.slice, which holds the
 # VMs. The cgroup CPU controller shares a busy host between siblings by weight, whatever the
 # processes' nice values: in app.slice (weight 100, beside tauceti.slice at 100) the workers were
-# never below the VMs, however reniced. Here the workers get at least 10/110 of tauceti.slice's CPU
-# when the VMs want all of it, and whatever the VMs leave otherwise. IOWeight acts only where the
-# block layer weighs cgroups (BFQ or io.cost); elsewhere it is ignored.
+# never below the VMs, however reniced. Here the workers get roughly a tenth of what the VMs get
+# when both want more CPU than tauceti.slice has, and whatever the VMs leave otherwise (the weights
+# are work-conserving, so repairs are slowed, never stopped). IOWeight acts only where the block
+# layer weighs cgroups (BFQ, or io.cost configured for the device); on devices using the `none`
+# scheduler without io.cost, as on tauchonki2 in 2026-11, nothing here orders disk traffic.
 #
 # install-repair.sh installs this file; never add a drop-in for it.
 

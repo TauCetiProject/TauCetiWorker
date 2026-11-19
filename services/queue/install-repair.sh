@@ -208,6 +208,13 @@ while :; do
       state="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("pid"), d.get("revision") or "-", d.get("state"), d.get("worker"), d.get("service"))' "$heartbeat" 2>/dev/null || true)"
       case "$state" in
         "$pid $target "*)
+          # The restarted worker runs in its slice, below the VMs (tauceti-repair.slice).
+          cgroup="$(systemctl --user show -p ControlGroup --value "$UNIT")"
+          case "$cgroup" in
+            */tauceti-repair.slice/*) ;;
+            *) log "$UNIT (pid $pid) runs in ${cgroup:-no cgroup}, not tauceti-repair.slice; see: systemctl --user status $UNIT"
+               exit 2 ;;
+          esac
           log "ok: $UNIT (pid $pid) is serving at revision ${target:0:12} from $RELEASE: ${state#"$pid $target" }"
           release_gc
           exit 0 ;;

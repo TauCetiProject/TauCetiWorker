@@ -3181,7 +3181,8 @@ class PublishOutputs(Fixture):
         # the transient unit starts from the user manager, so it is given the worker's priority
         self.assertIn("--slice=tauceti-repair.slice", args)
         self.assertIn("--property=Nice=10", args)
-        self.assertIn("--property=IOSchedulingClass=idle", args)
+        self.assertIn("--property=IOSchedulingClass=best-effort", args)
+        self.assertIn("--property=IOSchedulingPriority=7", args)
         self.assertIn(f"--setenv=LAKE_CACHE_DIR={env['LAKE_CACHE_DIR']}", args)
         self.assertFalse([a for a in args if "gh-secret" in a or "INVOCATION_ID" in a], args)
         self.assertEqual(args[-2:], ["tauceti_queue.repair_publish", str(logdir / repair_publish.SPEC)])
@@ -3197,6 +3198,16 @@ class PublishOutputs(Fixture):
                 self.assertEqual(re.findall(r"^Slice=(.*)$", text, re.M), [repair_publish.SLICE])
                 for prop in repair_publish.UNIT_PRIORITY:
                     self.assertEqual(re.findall(rf"^{prop.split('=')[0]}=(.*)$", text, re.M), [prop.split("=", 1)[1]])
+
+    def test_niced_reaches_a_target_niceness_without_compounding(self):
+        env = {"PATH": os.environ.get("PATH", "")}
+        with patch.object(repair_publish.os, "getpriority", return_value=0):
+            self.assertEqual(repair_publish.niced(["x"], 10, env), ["nice", "-n", "10", "x"])
+        with patch.object(repair_publish.os, "getpriority", return_value=4):
+            self.assertEqual(repair_publish.niced(["x"], 10, env), ["nice", "-n", "6", "x"])
+        for current in (10, 15):
+            with patch.object(repair_publish.os, "getpriority", return_value=current):
+                self.assertEqual(repair_publish.niced(["x"], 10, env), ["x"], "already at least that nice")
 
     def test_without_a_key_or_when_switched_off_nothing_is_put(self):
         for settings, reason in (
