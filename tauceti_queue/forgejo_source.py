@@ -396,6 +396,39 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         self._bound(repo)
         return items, newest, False
 
+    def list_recent_comments(self, repo, *, since, page_size=50, max_pages=20):
+        """PR comments created or edited at or after `since` (the forge's own clock).
+
+        Editing a comment does not change its PR's `updated_at` on Forgejo (checked on production:
+        the review bot edits its scoreboard in place), so the recent PR listing cannot see a
+        verdict that arrives as an edit. This repository-wide feed can. Returns (rows as
+        (PR number, comment), newest comment update seen, complete).
+        """
+        from datetime import UTC, datetime
+        from urllib.parse import urlencode
+
+        self._bound(repo)
+        stamp = datetime.fromtimestamp(max(0.0, since), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+        found, newest = [], 0.0
+        for page in range(1, max_pages + 1):
+            query = urlencode({"since": stamp, "limit": page_size, "page": page})
+            rows = self.client.request("GET", f"repos/{self.repository.name}/issues/comments?{query}")
+            if not isinstance(rows, list):
+                raise Incomplete("native comment feed is malformed")
+            if not rows:
+                self._bound(repo)
+                return found, newest, True
+            for row in rows:
+                if not isinstance(row, dict) or type(row.get("id")) is not int:
+                    raise Incomplete("native comment feed row is malformed")
+                newest = max(newest, _forge_time(row.get("updated_at")))
+                url = row.get("pull_request_url") or ""
+                tail = url.rstrip("/").rsplit("/", 1)[-1] if url else ""
+                if tail.isdigit():
+                    found.append((int(tail), row))
+        self._bound(repo)
+        return found, newest, False
+
     def verify_candidate_approval(self, frozen):
         if frozen.policy.source != self.repository_identity or frozen.request.source != self.repository_identity:
             raise ports.PromotionRefused("native candidate belongs to another repository")

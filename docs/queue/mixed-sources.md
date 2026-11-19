@@ -34,7 +34,14 @@ passes first lists, newest first, only the open PRs Forgejo updated since the
 newest update time already seen (less two minutes, and less the length of the
 last full listing), so a new PR, push, label or comment is seen within a pass;
 a recent listing that needs more than four pages of 50 asks for a full listing
-instead. The runtime setting `forgejo_recent_listing` (default true) turns them off.
+instead. Editing a comment does not change a Forgejo PR's update time (the review bot
+edits its scoreboard in place), so each of those passes also reads the
+repository's comment feed for comments created or edited since its last read
+(the position is kept across restarts) and evaluates again any settled PR whose
+scoreboard or recovery request changed. Evidence neither shows is rechecked
+`forgejo_recheck_seconds` (default 6 hours) after a PR's last evaluation. The
+runtime setting `forgejo_recent_listing` (default true) turns the recent
+listings and the comment feed off.
 Because mixed
 landing freezes a contribution at admission, an approved Forgejo input is read
 once more just before it joins a batch: unless the PR still shows the listed

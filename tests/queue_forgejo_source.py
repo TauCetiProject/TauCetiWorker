@@ -403,6 +403,49 @@ class NativeSource(unittest.TestCase):
         items, _, complete = self.source.list_recent_pull_requests("team/Math", since=0, page_size=2, max_pages=1)
         self.assertFalse(complete)
 
+    def test_comment_feed_reads_edits_by_update_time_and_names_their_prs(self):
+        pages = {
+            1: [
+                {
+                    "id": 5,
+                    "body": "x",
+                    "updated_at": "2026-11-19T04:34:45Z",
+                    "pull_request_url": "https://source.example/team/Math/pulls/1133",
+                },
+                {
+                    "id": 6,
+                    "body": "y",
+                    "updated_at": "2026-11-19T04:20:00Z",
+                    "pull_request_url": "",
+                    "issue_url": "https://source.example/team/Math/issues/7",
+                },
+            ],
+            2: [
+                {
+                    "id": 7,
+                    "body": "z",
+                    "updated_at": "2026-11-19T04:40:00Z",
+                    "pull_request_url": "https://source.example/team/Math/pulls/12",
+                }
+            ],
+            3: [],
+        }
+        paths = []
+
+        def request(method, path, data=None, **kwargs):
+            paths.append(path)
+            return copy.deepcopy(pages[int(path.rsplit("page=", 1)[1])])
+
+        self.api.request = Mock(side_effect=request)
+        since = datetime.fromisoformat("2026-11-19T04:00:00+00:00").timestamp()
+        rows, newest, complete = self.source.list_recent_comments("team/Math", since=since)
+        self.assertEqual([(n, r["id"]) for n, r in rows], [(1133, 5), (12, 7)])  # the issue comment is not a PR's
+        self.assertTrue(complete)
+        self.assertEqual(newest, datetime.fromisoformat("2026-11-19T04:40:00+00:00").timestamp())
+        self.assertIn("since=2026-11-19T04%3A00%3A00Z", paths[0])
+        _, _, complete = self.source.list_recent_comments("team/Math", since=since, max_pages=2)
+        self.assertFalse(complete)
+
     def test_discovery_does_not_fetch_histories_and_isolates_a_malformed_pr(self):
         row = {
             "number": 1,

@@ -106,6 +106,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Between the full Forgejo listings (once per approval-poll interval), list only the open
     # Forgejo PRs updated since the last listing, every reconcile pass, newest first.
     "forgejo_recent_listing": True,
+    # A settled Forgejo PR whose listed facts have not changed is evaluated again this long after
+    # its last attempt, for evidence neither the listings nor the comment feed show.
+    "forgejo_recheck_seconds": 21600,
     # False holds every waiting Forgejo input out of insertion (it keeps its approval and age) while the
     # Forgejo source cannot be used; `evict_native` returns the ones already in batches. True resumes.
     "forgejo_placement_enabled": True,

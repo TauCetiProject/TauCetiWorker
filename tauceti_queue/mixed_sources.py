@@ -135,6 +135,12 @@ class NativePoller:
         # (its own clock, less a margin) are listed every pass (`forgejo_recent_listing`).
         self._recent_at = 0
         self._recent_since = None
+        # Scoreboard edits do not move a Forgejo PR's update time, so between listings the
+        # repository comment feed is read too. Its position survives restarts.
+        self._comments_key = f"state:forgejo_comment_since:{self.state.repository}"
+        self._comments_since = controller.store.get_setting(self._comments_key, None)
+        self._comments_seen = {}
+        self._comments_at = 0
         self.wake = lambda: None
         configure = getattr(registry.native, "configure_admission_polling", None)
         if configure is not None:
@@ -144,7 +150,7 @@ class NativePoller:
         due = self.state.summary()["next_attempt_at"]
         next_at = self._discovery_at if due is None else min(self._discovery_at, due)
         if self._recent_enabled():
-            next_at = min(next_at, self._recent_at)
+            next_at = min(next_at, self._recent_at, self._comments_at)
         return max(0, next_at - self.controller.clock())
 
     def _recent_enabled(self):
@@ -163,7 +169,42 @@ class NativePoller:
     def _observe_listed(self, pull):
         details = pull.admission or {}
         version = self._listed_version(pull, details.get("discovery_version"))
-        self.state.observe(pull.number, pull.head_sha, version, recheck_after=details.get("recheck_seconds", 0))
+        # Facts the listing cannot see are rechecked after `forgejo_recheck_seconds`; changes it
+        # can see, and comment edits from the feed, are noticed within a pass.
+        recheck = self.controller.setting("forgejo_recheck_seconds") if details.get("recheck_seconds") else 0
+        self.state.observe(pull.number, pull.head_sha, version, recheck_after=recheck)
+
+    def _read_comment_feed(self, summary):
+        from .admission import relevant_comment
+        from .forgejo_source import _forge_time
+
+        registry, controller = self.registry, self.controller
+        since = self._comments_since
+        rows, newest, complete = registry.native.list_recent_comments(
+            registry.profile.forgejo.repository.name, since=since
+        )
+        dirtied = set()
+        for number, row in rows:
+            key = (row["id"], row.get("updated_at"))
+            if key in self._comments_seen or not relevant_comment(row, native=True):
+                continue
+            self._comments_seen[key] = _forge_time(row.get("updated_at"))
+            work = self.state.get(number)
+            if work is not None and work["disposition"] != "closed":
+                self.state.dirty(number)
+                dirtied.add(number)
+        summary["comment_feed"] = {"read": len(rows), "dirtied": len(dirtied)}
+        if not complete:
+            summary["errors"].append("comment feed: more than one bounded read")
+        if newest:
+            self._comments_since = max(since, newest - RECENT_MARGIN_SECONDS)
+            controller.store.set_setting(
+                self._comments_key, self._comments_since, "native queue policy", controller.clock()
+            )
+            # Edits older than the new position cannot be listed again; forget them.
+            self._comments_seen = {k: v for k, v in self._comments_seen.items() if v >= self._comments_since}
+        if dirtied:
+            self.wake()
 
     def request_discovery(self):
         self._serial += 1
@@ -346,6 +387,19 @@ class NativePoller:
             except Exception as error:
                 summary["errors"].append("recent: " + type(error).__name__)
             self._recent_at = controller.clock() + registry.poll_seconds
+        if (
+            self._recent_enabled()
+            and callable(getattr(registry.native, "list_recent_comments", None))
+            and controller.clock() >= self._comments_at
+        ):
+            if self._comments_since is None:
+                # First run: start a recheck interval back, so recent edits are not missed.
+                self._comments_since = self._recent_since - controller.setting("forgejo_recheck_seconds")
+            try:
+                self._read_comment_feed(summary)
+            except Exception as error:
+                summary["errors"].append("comments: " + type(error).__name__)
+            self._comments_at = controller.clock() + registry.poll_seconds
         started = time.monotonic()
         while not self.stopping.is_set():
             work = self.state.next_due()
