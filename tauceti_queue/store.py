@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS admission_work (
     cancelled_head_sha TEXT NOT NULL DEFAULT '',
     cancelled_at REAL NOT NULL DEFAULT 0,
     urgent INTEGER NOT NULL DEFAULT 0,
+    recheck INTEGER NOT NULL DEFAULT 0,
     first_pending_at REAL NOT NULL DEFAULT 0,
     attempted_at REAL NOT NULL DEFAULT 0,
     queue_at REAL,

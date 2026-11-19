@@ -389,7 +389,9 @@ class AdmissionPoller:
                 if "incomplete" in pull.admission
                 else pull.admission.get("discovery_version") or self._version(pull.admission)
             )
-            self.state.observe(pull.number, pull.head_sha, version)
+            self.state.observe(
+                pull.number, pull.head_sha, version, recheck_after=pull.admission.get("recheck_seconds", 0)
+            )
 
     def run_once(self, *, reason="interval"):
         with self._lock:

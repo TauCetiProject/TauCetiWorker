@@ -226,7 +226,9 @@ class NativePoller:
                             "mode": registry.mode,
                         }
                     )
-                    self.state.observe(pull.number, pull.head_sha, version)
+                    self.state.observe(
+                        pull.number, pull.head_sha, version, recheck_after=details.get("recheck_seconds", 0)
+                    )
                 for row in controller.store.rows("admission_work", {"repository": self.state.repository}):
                     if row["number"] not in seen and row["disposition"] != "closed":
                         self.state.observe(row["number"], row["head_sha"], "absent:" + registry.mode, urgent=True)
