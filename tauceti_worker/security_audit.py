@@ -2177,6 +2177,8 @@ def watch(cfg, *, min_commits: int) -> None:
     if not os.environ.get("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG"):
         return
     work = cfg.state / CURSOR
+    if pool_active(work):
+        return  # The pool owns this cursor and runs the watchdog on every pass, with its own threshold.
     audit_watchdog.check(work, lambda: observe(work), min_commits=min_commits)
 
 
@@ -2681,11 +2683,8 @@ if __name__ == "__main__":
         # Independent of audit rounds, so a dead or long-busy Worker or pool still produces the DM.
         from . import audit_watchdog
 
-        audit_watchdog.check(
-            args.state,
-            lambda: observe(args.state),
-            min_commits=int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS") or 1),
-        )
+        # The owner's (Worker or pool) last admission threshold, so this check never disagrees with it.
+        audit_watchdog.check(args.state, lambda: observe(args.state), min_commits=audit_watchdog.threshold(args.state))
     elif args.command == "pool":
         from .audit_pool import Chooser, Pool
         from .config import Config

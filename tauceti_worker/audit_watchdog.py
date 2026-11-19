@@ -16,7 +16,7 @@ import os
 import time
 from pathlib import Path
 
-from .audit_alerts import deliver, delivery_pending, save
+from .audit_alerts import deliver, delivery_pending, locked, save
 from .config import log
 from .constants import TAUCETI
 
@@ -63,8 +63,19 @@ def check(work: Path, observe, *, min_commits: int) -> None:
         delivery_pending(exc)
 
 
+def threshold(work: Path, default: int = 20) -> int:
+    """The admission threshold the cursor's owner last used; the standalone check must agree."""
+    value = load(work / "stall.json").get("min_commits")
+    return value if type(value) is int and value > 0 else default
+
+
 def _check(work: Path, observe, *, min_commits: int) -> None:
     work.mkdir(parents=True, exist_ok=True)
+    with locked(work / "stall.lock"):
+        _observe(work, observe, min_commits=min_commits)
+
+
+def _observe(work: Path, observe, *, min_commits: int) -> None:
     path = work / "stall.json"
     state = load(path)
     now = time.time()
@@ -83,7 +94,18 @@ def _check(work: Path, observe, *, min_commits: int) -> None:
         since = None  # The clock runs only while due work holds one cursor.
     if due and since is None:
         since = now
-    save(path, {"cursor": cursor, "since": since, "due": due, "pending": pending, "error": error, "checked": now})
+    save(
+        path,
+        {
+            "cursor": cursor,
+            "since": since,
+            "due": due,
+            "pending": pending,
+            "error": error,
+            "checked": now,
+            "min_commits": min_commits,
+        },
+    )
     held = now - since if due else 0.0
     if held < STALL_SECONDS:
         return

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -121,15 +123,33 @@ def content(value: dict, work: Path, marker: str) -> str:
     )
 
 
+@contextlib.contextmanager
+def locked(path: Path):
+    """Serialize a read-modify-write of shared audit state across the Worker, pool and timer."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def deliver(work: Path, identity: dict, render) -> bool:
     """Send one private DM per identity, durably deduplicated; True once it is known delivered.
 
     `render(marker)` builds the message; the marker lets an ambiguous earlier POST be reconciled.
     Raises on delivery failure after recording a 15-minute backoff; callers decide how to log.
+    The whole receipt/reconcile/send transaction holds a lock, so concurrent callers never both send.
     """
     configured = os.environ.get("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG")
     if not configured:
         return False
+    with locked(work / "zulip-alerts.lock"):
+        return _deliver(work, identity, render, configured)
+
+
+def _deliver(work: Path, identity: dict, render, configured: str) -> bool:
     config = json.loads(Path(configured).read_text())
     key = hashlib.sha256(
         json.dumps([config["site"], config["recipient_id"], identity], sort_keys=True).encode()

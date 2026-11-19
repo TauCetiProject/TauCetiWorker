@@ -178,6 +178,34 @@ class Watchdog(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertFalse((self.work / "stall.json").exists())
 
+    def test_concurrent_watchdogs_send_one_dm(self):
+        import threading
+        import time as real_time
+
+        def slow(config, method, params):
+            real_time.sleep(0.2)
+            return {"result": "success", "id": 9, "messages": []}
+
+        self.http.side_effect = slow
+        self.check(10000)
+        self.now = 13600
+        threads = [
+            threading.Thread(target=watchdog.check, args=(self.work, self.observe), kwargs={"min_commits": 20})
+            for _ in range(3)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_standalone_threshold_follows_the_owner(self):
+        self.assertEqual(watchdog.threshold(self.work), 20)
+        self.check(10000, min_commits=7)
+        self.assertEqual(watchdog.threshold(self.work), 7)
+        (self.work / "stall.json").write_text("not json")
+        self.assertEqual(watchdog.threshold(self.work), 20)
+
 
 if __name__ == "__main__":
     unittest.main()

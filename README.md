@@ -312,8 +312,11 @@ pool pass and the standalone command below record the cursor in `security-audit/
 Once audit work is due at one cursor (at least the configured threshold pending, or work
 already started there: a held block or a pool range that has not passed) and that cursor has
 not moved for an hour, an **Operational stall** DM is sent, then again daily while it stays held. An unobservable cursor (GitHub or
-git failures) counts as held, and the DM names the error. Run the command from a timer to
-cover a Worker or pool that is dead or busy for longer than an hour:
+git failures) counts as held, and the DM names the error. While a pool holds the state, it
+alone runs the watchdog. Checks and deliveries are serialized by local locks, so concurrent
+callers never send the same DM twice. Run the command from a timer to cover a Worker or pool
+that is dead or busy for longer than an hour; it uses the admission threshold its owner last
+recorded:
 
 ```bash
 python3 -m tauceti_worker.security_audit watchdog --state /path/to/worker/state/security-audit
