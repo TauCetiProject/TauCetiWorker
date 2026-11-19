@@ -529,6 +529,52 @@ class Mixed(MixedFixture, unittest.TestCase):
         self.assertEqual(poller.run_once()["comment_feed"]["dirtied"], 0)
         self.assertTrue(poller.is_current(1, head))
 
+    def test_feed_edits_that_drop_a_marker_count_and_an_incomplete_read_keeps_its_place(self):
+        registry, poller, recent_calls = self.recent_fixture()
+        feed, complete = [], [True]
+        newest = datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp()
+        self.native.list_recent_comments = lambda repo, *, since: (list(feed), newest, complete[0])
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+        listed = poller.state.get(1)["observed_version"]
+        position = poller._comments_since
+        feed[:] = [
+            (
+                1,
+                {
+                    "id": 50,
+                    "body": "no longer a scoreboard",
+                    "created_at": "2026-11-19T03:00:00Z",
+                    "updated_at": "2026-11-19T04:30:00Z",
+                },
+            )
+        ]
+        complete[0] = False
+        self.clock.advance(registry.poll_seconds)
+        poller.stopping.set()
+        summary = poller.run_once()
+        poller.stopping.clear()
+        self.assertEqual(summary["comment_feed"]["dirtied"], 1)  # an edit, whatever it says now
+        self.assertEqual(poller.state.get(1)["observed_version"], listed)  # listed facts kept
+        self.assertEqual(poller._comments_since, position)  # unread pages may hold older edits
+        complete[0] = True
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.assertEqual(poller._comments_since, newest - 120)
+
+    def test_native_insertion_is_held_when_the_merge_base_moved(self):
+        poller, head = self.native_approved()
+        work = poller.state.get(1)
+        decision = loads(work["decision"], {})
+        decision.setdefault("evidence", {})["merge_base_sha"] = "e" * 40
+        self.controller.store.update("admission_work", {"id": work["id"]}, decision=dumps(decision))
+        self.native._merge_base = lambda repo, pull: "f" * 40
+        self.controller.tick()
+        row = self.native_input()
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "admission-recheck"))
+        self.assertFalse(poller.is_current(1, head))
+
     def test_the_comment_feed_position_survives_a_restart(self):
         registry, poller, recent_calls = self.recent_fixture()
         positions = []

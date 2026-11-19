@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 
@@ -174,6 +175,15 @@ class NativePoller:
         recheck = self.controller.setting("forgejo_recheck_seconds") if details.get("recheck_seconds") else 0
         self.state.observe(pull.number, pull.head_sha, version, recheck_after=recheck)
 
+    def _reevaluate(self, work, *, urgent=False):
+        """Evaluate a PR again for evidence its listed facts do not show, keeping those facts:
+        they did not change, and the check before insertion compares them with the evaluated ones."""
+        with self.controller.store.transaction():
+            self.state.dirty(work["number"], urgent=urgent)
+            self.controller.store.update(
+                "admission_work", {"id": work["id"]}, observed_version=work["observed_version"]
+            )
+
     def _read_comment_feed(self, summary):
         from .admission import relevant_comment
         from .forgejo_source import _forge_time
@@ -185,18 +195,25 @@ class NativePoller:
         )
         dirtied = set()
         for number, row in rows:
-            key = (row["id"], row.get("updated_at"))
-            if key in self._comments_seen or not relevant_comment(row, native=True):
+            body = row.get("body") or ""
+            key = (row["id"], row.get("updated_at"), hashlib.sha256(body.encode()).hexdigest())
+            if key in self._comments_seen:
+                continue
+            # A new ordinary comment cannot change a verdict (and moves the PR's update time
+            # anyway); an edit can, even one that removes a scoreboard marker.
+            edited = _forge_time(row.get("updated_at")) > _forge_time(row.get("created_at"))
+            if not edited and not relevant_comment(row, native=True):
                 continue
             self._comments_seen[key] = _forge_time(row.get("updated_at"))
             work = self.state.get(number)
-            if work is not None and work["disposition"] != "closed":
-                self.state.dirty(number)
+            if work is not None and work["disposition"] != "closed" and number not in dirtied:
+                self._reevaluate(work)
                 dirtied.add(number)
         summary["comment_feed"] = {"read": len(rows), "dirtied": len(dirtied)}
         if not complete:
+            # Unread pages may hold older edits: keep the position until a read completes.
             summary["errors"].append("comment feed: more than one bounded read")
-        if newest:
+        elif newest:
             self._comments_since = max(since, newest - RECENT_MARGIN_SECONDS)
             controller.store.set_setting(
                 self._comments_key, self._comments_since, "native queue policy", controller.clock()
@@ -320,6 +337,20 @@ class NativePoller:
             self.state.observe(int(number), pull.head_sha, version, urgent=True)
             self.wake()
             return "source changed since evaluation"
+        decision = loads(work["decision"], {})
+        evaluated_base = (decision.get("evidence") or {}).get("merge_base_sha")
+        merge_base = getattr(self.registry.native, "_merge_base", None)
+        if evaluated_base and merge_base is not None:
+            # The listed facts omit the target tip; a merge base that moved under the same head
+            # (part of the PR landed through another) changes the reviewed diff.
+            try:
+                current_base = merge_base(self.registry.profile.forgejo.repository.name, pull)
+            except Exception as error:  # noqa: BLE001 - an unknown merge base never admits
+                return f"merge base unavailable: {type(error).__name__}"
+            if current_base != evaluated_base:
+                self._reevaluate(work, urgent=True)
+                self.wake()
+                return "merge base changed since evaluation"
         blocked = self.controller._blocking_labels(pull)
         if blocked:
             # Approval refuses these labels; one added after approval keeps the head out too.
