@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from .config import Die
-from .paths import HERE, legacy_data_root, login_home, user_data_root
+from .paths import HERE, fleet_data_root, legacy_data_root, login_home, user_data_root
 
 VERIFY_TMP = Path("/tmp")  # verification.cache_root()'s default parent
 UNITS = (
@@ -60,15 +60,17 @@ def inventory(include_config=False):
 
     home = login_home()
     delete, roots, overridden = [], [], []
-    stable = user_data_root()  # lexical: a symlink here is removed as a link, never followed
-    delete.append(stable)
-    roots.append(stable)
+    # The default roots are ours by name. Lexical: a symlink here is removed as a link, never followed.
+    stable = [user_data_root(), *filter(None, [fleet_data_root()])]
+    delete += stable
+    roots += stable
+    explicit = os.environ.get("TAUCETI_LEGACY_DATA_ROOT")  # before resolving exports the default
     selected = legacy_data_root()
     for root in [selected, *retired_roots()]:
-        if Path(os.path.abspath(root)) == Path(os.path.abspath(stable)) or _same(root, stable):
+        if any(Path(os.path.abspath(root)) == Path(os.path.abspath(own)) or _same(root, own) for own in stable):
             continue
         is_checkout = not INSTALLED and Path(root).resolve() == Path(HERE).resolve()
-        if root == selected and not is_checkout and os.environ.get("TAUCETI_LEGACY_DATA_ROOT"):
+        if root == selected and not is_checkout and explicit:
             # An operator-chosen root: generic state/checkouts/logs names prove no ownership.
             overridden.append(f"TAUCETI_LEGACY_DATA_ROOT={os.environ['TAUCETI_LEGACY_DATA_ROOT']}")
             continue
