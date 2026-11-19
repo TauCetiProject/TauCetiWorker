@@ -282,6 +282,8 @@ class StatusCommand(Base):
             "completed_tasks": 103917,
             "total_tasks": 113955,
             "tasks_per_minute": 850.4,
+            "estimated_total_tasks": 120000,
+            "estimate_source": {"run_id": "7", "job_class": "staging_build", "total_tasks": 120000},
         }
         run = {"run_id": "41934607574", "run_attempt": 1, "active": True}
         pages = {
@@ -310,22 +312,32 @@ class StatusCommand(Base):
             self.assertEqual(cli.cmd_status(args, fetch=fetch), 0)
         self.assertEqual(len(calls), 4, "the first page held the run, so later pages are not read")
         self.assertIn(
-            "  build: phase build, 103,917/113,955 Lake jobs (91.2%), 850/min, ETA 05 Nov 11:10 AEDT\n",
+            "  build: phase build, 103,917 jobs done, ~87% of ~120.0k jobs (from last staging run), 850/min,"
+            " ETA ~05 Nov 11:17 AEDT\n",
             out.getvalue(),
         )
         self.assertNotIn("Private", out.getvalue())
         text = build_progress.text(
             dict(report, phase="lint-env", completed_tasks=113955, tasks_per_minute=None), NOW.timestamp() + 600
         )
-        self.assertEqual(text, "build: phase environment lint, 113,955/113,955 Lake jobs (100.0%), reported 11m ago")
+        self.assertEqual(text, "build: phase environment lint, 113,955 jobs done, reported 11m ago")
+        # Without an estimate, or once the build passes it, only the done count and rate remain:
+        # Lake's own growing total is never used as a denominator.
+        for estimate in (None, 100000):
+            self.assertEqual(
+                build_progress.text(dict(report, estimated_total_tasks=estimate), NOW.timestamp()),
+                "build: phase build, 103,917 jobs done, 850/min",
+            )
         self.assertEqual(
             build_progress.text(dict(report, completed_tasks=None), NOW.timestamp()),
             "build: phase build, 25,433 TauCeti modules built",
         )
         self.assertIsNone(build_progress.text({"observed_at": "2026-11-04T23:59:00Z"}, NOW.timestamp()))
         self.assertEqual(
-            build_progress.text(dict(report, completed_tasks=100, tasks_per_minute=1e-300), NOW.timestamp()),
-            "build: phase build, 100/113,955 Lake jobs (0.1%), 0/min",
+            build_progress.text(
+                build_progress.reported(dict(report, completed_tasks=100, tasks_per_minute=1e-300)), NOW.timestamp()
+            ),
+            "build: phase build, 100 jobs done, ~0% of ~120.0k jobs (from last staging run), 0/min",
         )
         # A build job already finished while its run continues can sit behind terminal-only pages.
         terminal = {"records": [{"run_id": "1", "active": False}]}

@@ -303,7 +303,10 @@ uv run tauceti-queue status --url https://queue.taucetiproject.org   # through t
 
 While the head's CI run is in progress, `status` also reads that run's live build report from the
 public CI operations snapshot (`https://ci-data.taucetiproject.org`, no GitHub calls) and prints a
-line such as `build: phase build, 103,917/113,955 Lake jobs (91.2%), 850/min, ETA 05 Nov 11:10 AEDT`.
+line such as `build: phase build, 44,180 jobs done, ~54% of ~81.8k jobs (from last PR build), 905/min,
+ETA ~19 Nov 20:10 AEDT`. Lake's own total grows as it discovers jobs, so the percentage and ETA use
+the receiver's estimate, the latest finished build's final job count; without one only the done count
+and rate are shown.
 TauCetiTools' build reporter, outside the bwrap sandbox, posts these counters every fifteen seconds;
 they come from candidate output, so they are observations only. When the report is unavailable the
 head shows its running step alone (`tauceti_queue/build_progress.py`).
