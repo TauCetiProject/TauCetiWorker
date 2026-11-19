@@ -502,7 +502,11 @@ host between sibling slices by weight, so a reniced process in `app.slice` compe
 does. The weights are work-conserving, so repairs slow down under a staging build and never stop.
 Disk traffic is ordered only where the block layer honours cgroup weights or IO priorities (BFQ,
 mq-deadline, or io.cost configured for the device); tauchonki2's devices use `none`, so there
-nothing orders it. A `renice` by hand affects only the thread it names, not the other threads of a
+nothing orders it. The slice's `MemoryHigh=48G` (with no `MemoryMax`) bounds the repairs' memory,
+mostly file cache, so it is reclaimed before the host swaps under a staging build; above it the
+kernel reclaims and slows the slice's allocations and never kills a repair. The compiler wrapper
+ignores `memory.high`, so a repair working set above it slows to a crawl rather than waiting; the
+slice's `memory.events` `high` counter shows how often it is reached. A `renice` by hand affects only the thread it names, not the other threads of a
 multithreaded process such as `lake` or the worker, nor their later children.
 
 Queue repair sessions using Claude (subscription or API) give Bash EOF on its default stdin.
