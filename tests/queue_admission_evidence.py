@@ -126,7 +126,7 @@ class EvidenceTests(unittest.TestCase):
 
     def test_mode_is_validated(self):
         with self.assertRaises(ControllerError):
-            self.controller.set_setting("admission_evidence_mode", "events", "test")
+            self.controller.set_setting("admission_evidence_mode", "live", "test")
         self.controller.set_setting("admission_evidence_mode", "shadow", "test")
         self.assertEqual(self.controller.status()["admission"]["evidence"]["mode"], "shadow")
 
@@ -369,6 +369,41 @@ class EvidenceTests(unittest.TestCase):
         self.assertIsNone(EvidenceCache._tip({"sha": "p" * 40, "at": 105}, row))  # during the read
         self.assertEqual(EvidenceCache._tip({"sha": "p" * 40, "at": 120}, row), "p" * 40)  # after it
         self.assertIsNone(EvidenceCache._tip({"sha": "", "ambiguous": True, "at": 120}, row))
+
+    def test_events_mode_evaluates_from_the_single_read(self):
+        self.controller.set_setting("admission_evidence_mode", "events", "test")
+        self.ready()
+        used = []
+        full = self.github.admission_snapshot
+
+        def single(repo, number, *, generation=0):
+            used.append(number)
+            return full(repo, number, generation=generation)
+
+        self.github.admission_snapshot_single = single
+        self.evaluate()
+        self.assertEqual(used, [1])
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.controller.set_setting("admission_evidence_mode", "shadow", "test")
+        self.clock.advance(60)
+        self.evaluate()
+        self.assertEqual(used, [1])  # shadow keeps today's read
+
+    def test_events_mode_ignores_a_status_that_changes_nothing(self):
+        head = self.ready()
+        for mode, dirtied in (("shadow", True), ("events", False)):
+            self.controller.set_setting("admission_evidence_mode", mode, "test")
+            self.deliver("status", {"id": 1, "sha": head, "context": "build", "state": "success"})
+            self.intake.run_once()
+            self.assertTrue(self.intake.is_current(1, head))
+            generation = self.intake.state.get(1)["generation"]
+            self.deliver("status", {"id": 2, "sha": head, "context": "build", "state": "success"})
+            self.assertEqual(self.intake.state.get(1)["generation"] != generation, dirtied, mode)
+            self.intake.run_once()
+        # A status that does change the state still dirties the PR in events mode.
+        generation = self.intake.state.get(1)["generation"]
+        self.deliver("status", {"id": 3, "sha": head, "context": "build", "state": "failure"})
+        self.assertNotEqual(self.intake.state.get(1)["generation"], generation)
 
 
 if __name__ == "__main__":

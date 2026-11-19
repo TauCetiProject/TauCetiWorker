@@ -874,9 +874,9 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `polling_interval_seconds` | `60` | integer, at least 0 |
 | `approval_poll_interval_seconds` | `900` | integer, at least 1 |
 | `github_background_floor` | `1000` | integer, at least 0; queue App requests left at which admission reads wait for the reset |
-| `admission_evidence_mode` | `off` | `off` or `shadow`; see "Admission evidence shadow" below |
-| `admission_local_merge_base` | `false` | true takes a GitHub PR's merge base from the local clone when it is complete and the merge base is unique there, instead of the compare API; `status.admission.merge_base_sources` counts both |
+| `admission_evidence_mode` | `off` | `off`, `shadow` or `events`; see "Admission evidence shadow" below |
 | `admission_insertion_check` | `false` | true re-reads a GitHub PR's admission inputs (one GraphQL call) before its approved head joins a batch, and holds the insertion unless they match what admission evaluated |
+| `admission_local_merge_base` | `false` | true takes a GitHub PR's merge base from the local clone when it is complete and the merge base is unique there, instead of the compare API; `status.admission.merge_base_sources` counts both |
 | `membership_label` | `bors-staging` | text |
 | `repaired_label` | `repaired-in-queue` | text; empty disables |
 | `insertion_probe_budget_seconds` | `20` | integer, at least 0 |
@@ -977,6 +977,16 @@ direction (`cache-would-admit`, `cache-would-refuse`, `cache-keeps`, `cache-revo
 are also journaled as `admission-shadow`, and `with_differences` counts every comparison that found a difference, whatever its outcome. The shadow makes no GitHub request and never changes a
 decision; `off` (the default) writes nothing. Switch it live with `tauceti-queue settings set
 admission_evidence_mode shadow`.
+
+`events` (slice 5) keeps the shadow and changes two things. Each evaluation reads the PR, its
+labels, every comment and the head's statuses with one GraphQL call
+(`GitHubAdapter.admission_snapshot_single`), takes the merge base and paths from the clone, and
+runs the same policy; self-tested membership and bump-guard reads stay live and are fenced again
+afterwards. A PR whose read one response cannot complete (over 100 comments or labels), whose
+head commit does not match, or whose merge base the clone cannot vouch for takes the full read as
+before; `status.admission.snapshot_sources` counts both paths. And a commit status delivery
+that leaves the cached state of its commit and context unchanged no longer re-dirties the PR. The
+check before insertion (`admission_insertion_check`) should be on before `events` is.
 
 Insertion check (decision 38 step 4, slice 3). `is_current` consults only the queue's own
 records, so a lost webhook could let a revoked review, an edited scoreboard or a failed status

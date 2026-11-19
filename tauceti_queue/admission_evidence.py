@@ -28,7 +28,9 @@ cache cannot vouch for (never seeded, a comment count that disagrees with GitHub
 or uncomputable merge base) is recorded as such instead of as a verdict.
 
 `admission_evidence_mode` (a runtime setting): `off` (default) writes and compares nothing;
-`shadow` fills the cache and compares. Later slices add a mode that acts on the cache.
+`shadow` fills the cache and compares; `events` also evaluates from one GraphQL read
+(`GitHubAdapter.admission_snapshot_single`) and lets a status delivery that changes nothing in
+the cache leave the PR's evaluation alone.
 """
 
 from __future__ import annotations
@@ -43,7 +45,7 @@ from .store import dumps, loads
 
 log = logging.getLogger(__name__)
 
-MODES = ("off", "shadow")
+MODES = ("off", "shadow", "events")
 CONTEXTS = ("build", "scope", "bump-guard")
 ADMISSION_LABELS = frozenset({"needs-rebase", "self-tested", "full-lint", "lint-repair"})
 MISMATCH_LIMIT = 20
@@ -80,8 +82,11 @@ class EvidenceCache:
 
     # -- writes from deliveries
 
-    def apply_event(self, kind, payload) -> None:
-        """Record what one verified delivery says. Never reads GitHub or git, never decides."""
+    def apply_event(self, kind, payload) -> bool:
+        """Record what one verified delivery says. Never reads GitHub or git, never decides.
+
+        False only for a status delivery that leaves the cached state of its (commit, context)
+        exactly as it was, unambiguously: admission's evaluation already holds that state."""
         now = self.clock()
         with self.store.transaction():
             if kind == "pull_request":
@@ -93,7 +98,7 @@ class EvidenceCache:
                 self._comment(issue["number"], payload.get("comment") or {}, payload.get("action"), now)
                 self._count(issue["number"], issue.get("comments"), _time(issue.get("updated_at")), now)
             elif kind == "status":
-                self._status(payload, now)
+                return self._status(payload, now)
             elif kind == "push" and payload.get("ref") == f"refs/heads/{self.base_branch}":
                 after = str(payload.get("after") or "")
                 pushed = (payload.get("repository") or {}).get("pushed_at")
@@ -104,6 +109,7 @@ class EvidenceCache:
                     tie = pushed == current.get("pushed_at") and after != current.get("sha")
                     value = {"sha": "" if tie else after, "ambiguous": tie, "pushed_at": pushed, "at": now}
                     self.store.set_setting(self.tip_key, value, "admission evidence", now)
+        return True
 
     def _row(self, number):
         row = self.store.row("admission_evidence", self._key(number))
@@ -217,7 +223,7 @@ class EvidenceCache:
     def _status(self, payload, now):
         sha, context, status_id = str(payload.get("sha") or ""), payload.get("context"), payload.get("id")
         if len(sha) != 40 or not relevant_context(context) or type(status_id) is not int:
-            return
+            return True
         key = {"repository": self.repository, "sha": sha, "context": context}
         row = self.store.row("admission_evidence_statuses", key)
         state = str(payload.get("state") or "").lower()
@@ -230,11 +236,12 @@ class EvidenceCache:
         }
         if row is None:
             self.store.insert("admission_evidence_statuses", **key, **values)
-            return
+            return True
+        unchanged = not row["ambiguous"] and row["state"] == state
         if row["status_id"] > 0:
             if row["status_id"] < status_id:
                 self.store.update("admission_evidence_statuses", {"id": row["id"]}, **values)
-            return
+            return not unchanged
         # The row came from a full read, which gives no status id: order by creation time instead.
         # Anything created while the read ran (with a margin for clock skew) may or may not be in it.
         created = _time(payload.get("updated_at") or payload.get("created_at"))
@@ -242,6 +249,8 @@ class EvidenceCache:
             self.store.update("admission_evidence_statuses", {"id": row["id"]}, **values)
         elif created >= row["seeded_at"] - STATUS_SKEW_SECONDS and state != row["state"]:
             self.store.update("admission_evidence_statuses", {"id": row["id"]}, ambiguous=1, received_at=now)
+            return True
+        return not unchanged
 
     # -- writes from full reads
 

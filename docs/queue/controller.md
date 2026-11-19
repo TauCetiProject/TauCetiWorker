@@ -644,9 +644,9 @@ and reported in status:
 | `polling_interval_seconds` | 60 | polling fallback interval |
 | `approval_poll_interval_seconds` | 900 | interval of the approval reconciliation poll behind the webhooks |
 | `github_background_floor` | 1000 | queue App requests left at which admission's background reads wait for the window's reset |
-| `admission_evidence_mode` | `off` | `shadow` keeps admission evidence from webhooks and compares its verdict with each full read (`admission_evidence.py`); never decides |
-| `admission_local_merge_base` | false | merge base from the local clone (complete, unique merge base) instead of the compare API; compare answers otherwise |
+| `admission_evidence_mode` | `off` | `shadow` keeps admission evidence from webhooks and compares its verdict with each full read (`admission_evidence.py`); `events` also evaluates from one GraphQL read and ignores status deliveries that change nothing |
 | `admission_insertion_check` | false | re-read a GitHub PR's admission inputs before its head joins a batch; hold the insertion and evaluate again unless they match the evaluated digest |
+| `admission_local_merge_base` | false | merge base from the local clone (complete, unique merge base) instead of the compare API; compare answers otherwise |
 | `membership_label` | `bors-staging` | label added to member PRs at insertion |
 | `repaired_label` | `repaired-in-queue` | label added to a landed member whose commit the queue modified (one with an edit summary), created in the repository on first use; empty disables it |
 | `insertion_probe_budget_seconds` | 20 | wall-clock budget of one tick's insertion probes; the rest wait for the next tick, which follows at once |
