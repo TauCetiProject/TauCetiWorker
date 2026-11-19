@@ -85,12 +85,12 @@ def main():
     if sys.argv[2].startswith("author/"):
         from tauceti_tools.claims import GitClaim, script_path
 
-        from .constants import TAUCETI
+        from .github import claims_repo
         from .worker_sources import shared_github_environment
 
         with shared_github_environment():
             ttl = int(sys.argv[3]) if len(sys.argv) > 3 else CLAIM_TTL_S
-            claim = GitClaim(os.environ.get("CLAIM_REPO", TAUCETI), sys.argv[2], os.environ["TAUCETI_WORKER_ID"], ttl)
+            claim = GitClaim(claims_repo(), sys.argv[2], os.environ["TAUCETI_WORKER_ID"], ttl)
             claim.script = str(script_path())
             return claim.command(sys.argv[1])
     source = load_source()

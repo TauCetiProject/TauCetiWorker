@@ -140,6 +140,7 @@ def run(root: Path) -> int:
         if linters or findings["duplicates"]:
             repo, ref = audit.tools_pin(root)
             checkout = audit.tools_checkout(Path(settings["tools_root"]), repo, ref)
+            ref = checkout.name  # the exact commit, which keys the compiled drivers
             work = root / audit.WORK_DIR
             scripts = audit.materialize(checkout, root, work / "scripts")
             drivers, built = audit.build_drivers(root, scripts, env, ref, logdir / "drivers.log", None)

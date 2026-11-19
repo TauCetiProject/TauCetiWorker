@@ -351,6 +351,17 @@ class ActivityTests(unittest.TestCase):
         a.prepare(now=self.now)
         self.assertEqual(a.cached()["summary"]["rounds"], s["rounds"])
 
+    def test_own_pr_closure_is_a_finished_round_and_not_a_failure(self):
+        self.finish(10, kind="rebase", outcome="closed-by-agent")
+        self.finish(20, kind="rebase", outcome="failed")
+        a.prepare(now=self.now)
+        s = a.cached(group="machine")["summary"]
+        self.assertEqual(s["rounds"]["1h"]["rebase"], dict(finished=2, failed=1, unknown=0, closed=1))
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            a.display(a.cached(group="machine"))
+        self.assertRegex(output.getvalue(), r"\n    failed/timed out +1 ")
+        self.assertRegex(output.getvalue(), r"\n    closed own PR +1 ")
+
     def test_round_lifecycle_selection_no_work_waits_and_interruption(self):
         r = a.Round("worker")
         r.select("roadmap")
@@ -541,6 +552,13 @@ class ActivityTests(unittest.TestCase):
         receipts = [json.loads(p.read_text()) for p in (a.root() / "pending").glob("*.json")]
         self.assertEqual(len(receipts), 1)
         self.assertNotIn("round_id", receipts[0])
+
+    def test_closing_an_already_closed_pr_is_not_a_closure(self):
+        close = {"argv": ["pr", "close", "7", "--repo", "org/repo"]}
+        fleet_events.mutation(close, SimpleNamespace(stdout="", stderr="! Pull request org/repo#7 is already closed"))
+        fleet_events.mutation(close, SimpleNamespace(stdout="", stderr="✓ Closed pull request org/repo#7"))
+        receipts = [json.loads(p.read_text()) for p in (a.root() / "pending").glob("*.json")]
+        self.assertEqual(sorted(str(r.get("publication")) for r in receipts), ["None", "closure"])
 
     def test_pr_creation_is_recorded_without_fleet_journal(self):
         with patch.dict(os.environ, {"TAUCETI_FLEET_EVENTS": ""}):

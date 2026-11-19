@@ -28,6 +28,7 @@ Exit 0 = all assertions hold; 1 = a mismatch.
 
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -278,6 +279,45 @@ def main():
         check(f"default scope runs {', '.join(numbers)} of the {shape}-check template", run == numbers)
         check(f"default scope numbers the {shape}-check template's checks the same way", stated in rest)
     check("default scope declines every other check", "Each other line" in rest and "`declined — not run`" in rest)
+
+    # 10) A supersession closure names its replacement unambiguously and closes only after its
+    # evidence comment is visible. A `#N` in a commit subject is usually a Forgejo PR number, and
+    # a comment the gh wrapper retained was never posted.
+    outcome = fill_prompt(PROMPTS / "pr-outcome.md", **CALL_SITES["pr-outcome.md"])
+    head = CALL_SITES["pr-outcome.md"]["HEAD"]
+    check(
+        "pr-outcome.md: marker names the forge and replacement commit",
+        f"tauceti-superseded:v2 head={head} main=<full-main-SHA> by=<forge>#<N>@<replacement-SHA>" in outcome
+        and "by=#" not in outcome,
+    )
+    check(
+        "pr-outcome.md: Forgejo replacements are verified through the Source-PR trailer",
+        "`Source-PR: forgejo:...#N`" in outcome and "do not look it up with `gh pr view N`" in outcome,
+    )
+    order = [
+        outcome.find("if gh pr comment 123 --repo TauCetiProject/TauCeti --body-file"),
+        outcome.find(f'select(contains("tauceti-superseded:v2 head={head}"))'),
+        outcome.find("gh pr close 123 --repo TauCetiProject/TauCeti"),
+    ]
+    check("pr-outcome.md: comment, re-read for the marker, then close", -1 not in order and order == sorted(order))
+    check(
+        "pr-outcome.md: a held or failed comment leaves the PR open",
+        "exits 77 or prints `NOT confirmed as posted`" in outcome
+        and "do not close" in outcome
+        and "Leave the PR\nopen" in outcome,
+    )
+    # Run the example block with a stub `gh`: it closes only after a posted, visible comment.
+    block = outcome.split("```")[1].replace("<evidence-file>", "/dev/null")
+    for comment_exit, visible, closes in ((0, 1, True), (77, 1, False), (1, 1, False), (0, 0, False)):
+        stub = (
+            f'gh() {{ case "$2" in comment) return {comment_exit};; view) echo {visible};; '
+            "close) echo CLOSED;; esac; }\n"
+        )
+        ran = subprocess.run(["bash", "--noprofile", "--norc", "-c", stub + block], capture_output=True, text=True)
+        check(
+            f"pr-outcome.md: comment exit {comment_exit}, {visible} visible marker(s) -> close={closes}",
+            ran.returncode == 0 and ("CLOSED" in ran.stdout) == closes,
+        )
 
     print("FAIL" if fails else "PASS")
     return 1 if fails else 0

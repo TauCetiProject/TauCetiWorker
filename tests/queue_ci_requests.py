@@ -45,7 +45,6 @@ def policy(configuration=CONFIG):
         native,
         ".github/workflows/pr-build.yml",
         cc.RepositoryIdentity(RepositoryRef(GITHUB, "team/Tools"), 43),
-        "a" * 40,
         "main",
         "main",
         True,
@@ -99,7 +98,7 @@ class Requests(unittest.TestCase):
         attempt = self.attempt()
         original = self.ledger.freeze(attempt, (cc.Member(17, self.head),), now=100)
         configuration = CONFIG + b"\n# approved configuration upgrade\n"
-        upgraded_policy = replace(policy(configuration), harness_revision="d" * 40)
+        upgraded_policy = policy(configuration)
         upgraded = RequestLedger(
             self.store, self.repo.clone, upgraded_policy, configuration, workflow_revision="c" * 40
         )

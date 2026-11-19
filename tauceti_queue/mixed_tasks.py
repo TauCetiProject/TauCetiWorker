@@ -22,6 +22,31 @@ def binding(registry):
     }
 
 
+def public_binding(value):
+    """The validated record of a mixed task's queue binding (`binding()`), as monitoring publishes it."""
+    if not isinstance(value, dict) or set(value) != {"schema", "github", "forgejo", "policy_digest", "epoch"}:
+        raise ValueError("mixed task binding fields are unavailable")
+    if value["schema"] != SCHEMA:
+        raise ValueError("mixed task binding schema is unavailable")
+    github, native = RepositoryIdentity.parse(value["github"]), RepositoryIdentity.parse(value["forgejo"])
+    if github.repository.forge != GITHUB or native.repository.forge.kind != "forgejo":
+        raise ValueError("mixed task binding forges are unavailable")
+    if (
+        not isinstance(value["policy_digest"], str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["policy_digest"]) is None
+        or not isinstance(value["epoch"], str)
+        or re.fullmatch(r"[0-9a-f]{32}", value["epoch"]) is None
+    ):
+        raise ValueError("mixed task authority generation is unavailable")
+    return {
+        "schema": SCHEMA,
+        "github": github.record(),
+        "forgejo": native.record(),
+        "policy_digest": value["policy_digest"],
+        "epoch": value["epoch"],
+    }
+
+
 def validate(row):
     value = row.get("mixed_binding")
     if (

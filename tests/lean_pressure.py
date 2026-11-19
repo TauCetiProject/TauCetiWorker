@@ -188,6 +188,17 @@ class LeanPressure(unittest.TestCase):
             wait.assert_called_once()
             execute.assert_called_with("/real/lean", ["/real/lean", *args])
 
+    def test_serial_elaboration_workaround_only_changes_compiler_inputs_when_selected(self):
+        with patch.dict(os.environ, TAUCETI_LEAN_SERIAL_ELAB="1"):
+            self.assertEqual(
+                gate.compiler_arguments(["Main.lean", "-o", "out.olean"]),
+                ["-DElab.async=false", "Main.lean", "-o", "out.olean"],
+            )
+            for args in (["--version"], ["--server", "Main.lean"], ["-DElab.async=true", "Main.lean"]):
+                self.assertEqual(gate.compiler_arguments(args), args)
+        with patch.dict(os.environ, TAUCETI_LEAN_SERIAL_ELAB="0"):
+            self.assertEqual(gate.compiler_arguments(["Main.lean"]), ["Main.lean"])
+
     def test_missing_telemetry_does_not_start_lean(self):
         with (
             patch.object(gate, "real_lean", return_value=Path("/real/lean")),

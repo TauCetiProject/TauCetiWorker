@@ -83,6 +83,41 @@ specs = [
     wm.WorkerSpec(id="worker2", agent="codex", only=("review",)),
     wm.WorkerSpec(id="worker3", only=("roadmap",), roadmap_only="RepresentationTheory"),
 ]
+
+# Source selection survives declarative storage and reaches the ordinary work parser.
+from tauceti_worker.worker_sources import resolve_selection
+
+assert specs[0].as_dict() == {"id": "worker1", "enabled": True}
+for github, forgejo, destination in ((True, False, None), (False, True, "forgejo"), (True, True, "forgejo")):
+    spec = wm.WorkerSpec.from_dict(
+        dict(id="source-worker", github=github, forgejo=forgejo, new_pr_forge=destination), 0
+    )
+    assert wm.WorkerSpec.from_dict(spec.as_dict(), 0) == spec
+    argv = spec.work_argv()
+    args = build_parser().parse_args(argv[argv.index("work") :])
+    assert resolve_selection(
+        getattr(args, "github", True), getattr(args, "forgejo", False), getattr(args, "new_pr_forge", None)
+    ) == resolve_selection(github, forgejo, destination)
+for changes in (
+    dict(github=False, forgejo=False),
+    dict(forgejo="true"),
+    dict(github=1),
+    dict(new_pr_forge="other"),
+    dict(new_pr_forge="forgejo"),
+):
+    try:
+        wm.WorkerSpec.from_dict(dict(id="invalid-source", **changes), 0)
+    except wm.WorkersError:
+        pass
+    else:
+        raise AssertionError(f"accepted invalid source selection: {changes}")
+old_source = wm.WorkerSpec("source-worker")
+new_source = dataclasses.replace(old_source, github=False, forgejo=True, new_pr_forge="forgejo")
+live_source = dict(applied_spec=old_source.as_dict(), state="running")
+assert wm._defer_read_policy_reload(new_source, live_source), "source changes must preserve a paid round"
+with patch.object(wm, "_between_rounds", return_value=True):
+    assert not wm._defer_read_policy_reload(new_source, live_source)
+
 manager = None
 try:
     if sys.platform == "linux":

@@ -150,6 +150,11 @@ POLL = int(os.environ.get("TAUCETI_POLL", "300"))  # seconds between quota check
 # expected to finish inside the round, so this is set far above any healthy round, not as a budget.
 ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "21600"))  # 6 h
 
+# How long a loop-spawned round waits for its worker's round.lock before giving up without failure.
+# Another worker's round briefly holds it while removing this worker's leftover worktree, and a round
+# of a restarted loop can still be finishing.
+ROUND_LOCK_WAIT = int(os.environ.get("TAUCETI_ROUND_LOCK_WAIT", "120"))
+
 INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
 
 # A managed worker's wrapper sends this to its loop driver (never to a round's process group) to
@@ -163,6 +168,7 @@ EX_GITHUB_WAIT = 77  # GitHub quota/publication recovery pause, without failed-r
 EX_CLAIM_COLLISION = 81  # Peer owns the candidate; skip or briefly reselect, never failure backoff
 REVIEW_HEAD_CHANGED_EXIT = 82  # Review command refused a superseded selection before inference
 REVIEW_PREPARATION_WAIT_EXIT = 83  # Transport/host preparation failed before any paid review
+REVIEW_PUBLICATION_SUPERSEDED_EXIT = 87  # Saved paid review superseded by a newer publication
 
 BACKOFF_BASE = int(os.environ.get("TAUCETI_BACKOFF_BASE", "30"))  # first no-progress sleep (doubles each round)
 
@@ -236,6 +242,18 @@ SBCACHE_TTL = int(os.environ.get("TAUCETI_META_TTL", "120"))  # seconds a cached
 SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
+
+# Native source surveys list every open PR once, then read review history for at most this many PRs
+# that no cached observation describes at their current (head, updatedAt). Every other PR is
+# classified from the cache or left for a later survey, so a survey's cost does not grow with the
+# number of open PRs. Explicit `--pr` targets are always read.
+SURVEY_DETAIL_READS = max(1, int(os.environ.get("TAUCETI_SURVEY_DETAIL_READS", "4")))
+
+# How long a native source's discussion and review-thread observation, keyed on the PR's
+# (updatedAt, head), may answer survey triage. Forgejo does not move updatedAt for comment edits or
+# deletions, so this bounds that blind spot. Such reads are `assumed`, never `fresh`; dispatch
+# re-reads the selected PR before acting on it.
+SOURCE_FACTS_TTL = int(os.environ.get("TAUCETI_SOURCE_FACTS_TTL", str(6 * 3600)))
 
 # Agents.
 OPENROUTER_MODELS = {

@@ -324,12 +324,24 @@ def overlay(lean):
     return target
 
 
+def compiler_arguments(args):
+    """Optional stock-compiler workaround for asynchronous shutdown hangs."""
+    if (
+        os.environ.get("TAUCETI_LEAN_SERIAL_ELAB") == "1"
+        and "--server" not in args
+        and any(arg.endswith(".lean") for arg in args)
+        and not any(arg.startswith("-DElab.async=") for arg in args)
+    ):
+        return ["-DElab.async=false", *args]
+    return args
+
+
 def exec_lean(lean, args):
     # Python ignores these at startup; Lean should inherit a normal CLI disposition.
     for name in ("SIGPIPE", "SIGXFSZ"):
         if number := getattr(signal, name, None):
             signal.signal(number, signal.SIG_DFL)
-    os.execv(str(lean), [str(lean), *args])
+    os.execv(str(lean), [str(lean), *compiler_arguments(args)])
 
 
 def main(args=None):

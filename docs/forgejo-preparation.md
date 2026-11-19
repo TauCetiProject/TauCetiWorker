@@ -201,15 +201,18 @@ separate cache keys.
 
 Disposable review-state sidecars live below `sbcache/sources/<digest>/`, in private
 leaf directories with atomic private-file replacement. Best-effort pruning bounds
-recognized cache files across credential scopes to 384 files and 16 MiB after
-quiescent writes. It ignores unrelated files, outboxes and symlinks. These files
+recognized cache files across credential scopes to 8,192 files and 64 MiB after
+quiescent writes, above the live set of about three files per open PR. It ignores unrelated files, outboxes and symlinks. These files
 are disposable observations, not publication journals or durable decisions.
 Source file ages start before the request. Atomic replacements attempt a
 nonblocking directory lock and retain a later existing record when an older
 request finishes last. Lock contention skips the cache write.
-Source sidecars expire at the adapter's triage TTL even if the PR's update clock
-stays unchanged. Native Forgejo 17 does not move that clock for comment edits or
-deletions; forced reads bypass sidecars and the memory cache immediately.
+Source sidecars and the shared discussion and review-thread observations behind
+them are keyed on the PR's (updatedAt, head) and answer survey triage until that key
+changes, a write invalidates the PR, or `TAUCETI_SOURCE_FACTS_TTL` (6 hours) passes.
+Native Forgejo 17 does not move that clock for comment edits or deletions, so the
+backstop bounds that blind spot for triage; dispatch's forced reads bypass sidecars
+and every cache before acting on the selected PR.
 
 The adapter normalizes discussion/review timestamps to fixed-width UTC. Scoreboard
 selection orders equal timestamps by native comment ID. Typed PR projections
@@ -287,6 +290,17 @@ identities. Ownership, roadmap pressure, status-label counts and repair ownershi
 checks compare native IDs on the selected origin. A login rename preserves
 ownership; login reuse, unknown/ghost authors and another origin do not grant it.
 The existing GitHub survey JSON shape stays unchanged.
+
+An automatic worker survey uses one shared listing (60 seconds, failed pages
+retried in place) for ranking: ownership, labels, draft state, pending publication
+and local review counters. It then reads review history for at most
+`TAUCETI_SURVEY_DETAIL_READS` (4) PRs that no cached observation describes at their
+current (updatedAt, head), in the cascade's order (automatic bumps, ambiguous owned
+mergeability, owned PRs, other reviews) with a random order within each group, and
+stops at the first PR read that is fix or review work. Every other PR is classified
+from its cached observation or left for a later survey; a survey never falls back to
+reading every PR. Explicit `--pr` targets are read in full. A selected-state refresh
+replaces that PR's row in the shared listing instead of expiring it.
 
 Native `build` statuses are excluded from source survey CI classification. Native
 false mergeability remains unknown. This inventory provides no verified execution,
@@ -506,10 +520,10 @@ The GitHub dispatch transport does not automatically retransmit on server errors
 
 Unknown sends retain their attempt ID and candidate branch for reconciliation.
 If the run becomes visible, the existing title/time lookup associates it with the
-attempt; this is not a producer-verified request binding. A missing run
-alone does not prove rejection, so normal ticks do not retransmit uncertain sends
-after a timeout. An explicit operator `retry_ci` can supersede one after the same
-live-run check and observation of any completed run. Ordinary source preparation
+attempt; this is not a producer-verified request binding. An uncertain send with
+no run after `dispatch_timeout_seconds` becomes an infrastructure outcome and is
+resent with a fresh request; an explicit operator `retry_ci` can supersede one
+sooner after the same live-run check and observation of any completed run. Ordinary source preparation
 failures and dispatch rejections retry with capped exponential backoff,
 respecting a persisted server retry deadline. Permanent HTTP rejections also
 raise an operator alert so configuration can be repaired while retries continue.
@@ -632,18 +646,26 @@ cannot make a source candidate pass. Promotion rechecks current membership, curr
 passing evidence and fresh source approval before its source compare and set; an already
 visible promotion is reconciled without another write.
 
-Absent, expired, malformed or unavailable evidence keeps the request pending at the
-normal polling interval. A single transient observation failure on an already owned run
+For an owned run that is in progress, the controller also reads GitHub's jobs listing for
+its attempt at most once every five minutes (`SOURCE_PHASES_INTERVAL_SECONDS`), and once
+more when it completes. It records the job and step phases, runner and host as on the
+ordinary GitHub path, so status shows the current step and the stall report sees step
+changes. The phases are observational only: a failed read is a reason line, and they
+never establish ownership or a verdict.
+
+Unavailable evidence keeps the request pending at the normal polling interval. A single transient observation failure on an already owned run
 does not trigger the request-age alert. Liveness checks read current run metadata
 without downloading expired artifacts. Automatic retries skip repeated repository-wide
 discovery for already owned completed attempts; explicit operator retries additionally
 check for newly discovered duplicates. Discovery uses closed creation-time windows and
 splits ranges before the [filtered 1,000-run cap](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow). Limits on requests, records, pages and
-time precision yield an explicit unavailable result; exceeding them never proves a
-dispatch did not happen. An acknowledged or ambiguous send is never automatically
-repeated because no run is found. After its evidence deadline the status includes
-`reconciliation_required` and the exact request nonce. `retry_ci` refuses when ownership
-cannot be verified. For an owned completed run, an operator must name the exact current
+time precision yield an explicit unavailable result, which keeps the request pending.
+When a complete listing finds no live, unreadable or owned run for an acknowledged or
+ambiguous send after `dispatch_timeout_seconds`, the attempt becomes an infrastructure
+outcome (`unowned-run`) and is resent with a fresh request; a completed unowned attempt
+does not block that resend. An owned run that GitHub reports deleted (404) is likewise an
+infrastructure outcome (`lost-run`). While listings or reads fail, the status includes
+`reconciliation_required` and the exact request nonce after the evidence deadline. For an owned completed run, an operator must name the exact current
 request nonce shown in status to retire missing evidence and authorize a fresh dispatch;
 all discovered verified duplicates must also have finished. Fresh promotion reads
 release the controller lock and recheck local bindings on return. Source CI observation
@@ -655,18 +677,16 @@ outcome, hold, promotion generation and journal update share one transaction so 
 cannot strand the head behind a finished outbox key. The existing admin retry endpoint
 accepts the exact `request_id` nonce; native HTTP authentication still requires its
 separate qualified authority integration. After publication grace, a verified owned
-completed run with a failure, cancellation, timeout or startup failure enters the
-bounded infrastructure retry policy only after a complete authenticated artifact
-listing and fresh run metadata confirm the result is absent. Read failures and
-present-but-unreadable artifacts stay pending. Grace starts at the controller's
+completed run without a verified current result (absent, expired, unreadable or invalid,
+whatever its conclusion) enters the infrastructure retry policy and is resent; it never
+passes. Grace starts at the controller's
 first completed observation, tracked separately from GitHub's completion time so
-status and feed timestamps retain their original meaning. A successful run without a usable result
-still requires reconciliation. Repeated preparation/freeze failures raise alerts, and an
+status and feed timestamps retain their original meaning. Repeated preparation/freeze failures raise alerts, and an
 exact-nonce operator retry can retire a request that remains prepared. Re-observing a
 deferred passing result does not count the same CI run twice; transient per-attempt
 settings are removed after landing.
 
-Permanently missing ownership, automatic late and duplicate run cleanup, richer repair
+Automatic late and duplicate run cleanup, richer repair
 diagnostics, the native source port, qualified task/reporting metadata, native HTTP
 actor/approval authority, protected ref publication and Git transport identity binding
 remain activation gates.
@@ -760,94 +780,28 @@ bootstrap and trusted publisher integration are still required before activation
 
 `ForgejoSourceAdapter` connects PR metadata, immutable Git comparisons, comments,
 labels, publication and fresh repository permissions to the existing controller.
-`NativeAdmissionPolicy` uses the installed Review admission policy. Explicit
-`NativePublishers` lists identify review, status and recovery publishers by
-server-local principal ID, bound to the native source repository. The source API
-credential needs repository-admin permission to query other users' current
-permissions; Git publication still uses its separately supplied source bearer.
+`NativeAdmissionPolicy` uses the installed Review admission policy exactly as
+GitHub admission does: the newest completed scoreboard for the current head and
+merge base counts, whoever posted it, and the hard boundary is CI, scope, the
+axiom audit and bump-guard. Boards published before this parity, which carry a
+`tauceti-source:v2` provenance block, still count. `NativePublishers` names
+only the queue's own source accounts, by server-local principal ID: their
+`Merge-queue recovery for head` comments are recovery holds, as the GitHub bot
+logins' are. The source API credential needs repository-admin permission to
+query other users' current permissions; Git publication still uses its
+separately supplied source bearer.
 
-Native scoreboard and recovery comments carry a `tauceti-source:v2` binding
-naming the source origin/repository ID, authenticated issuer, publisher-policy
-generation and producer's policy revision. Comment authorship alone grants no
-authority: Forgejo repository writers may moderate another user's comments.
-A `tauceti-source-publication-intent/v3` record freezes a unique nonce, the exact
-body and a durable, increasing outbox sequence before any remote write. The
-sequence orders intent creation, including intents prepared during an outage;
-registration or completion delivery order never determines review precedence.
-Each intent owns a separate comment. Native append-only commit statuses register
-the intent first, then bind its comment ID and SHA-256 digest. Admission selects
-the greatest sequence and verifies current issuer permission, exact body and
-source binding. It never falls back to an older green verdict when the newest
-publication is pending, revoked, malformed, edited or deleted. Recovery clears
-use the same frozen-intent ordering, so an old clear cannot erase a newer hold.
-
-All publishers of one PR and kind must share the durable sequence allocator in
-the existing owner store. The queue uses its existing outbox row IDs for both holds and clears, through
-`enqueue_source_recovery`, and saves the complete intent in that row before
-sending. Reusing an intent key with a different decision is refused. Retries
-preserve the nonce, body and
-sequence, including after a lost accepted response. A superseded intent settles
-without resending; an unknown remote owned nonce reports restore reconciliation
-in the journal instead of silently dropping a newer desired local fact. A confirmed comment that was moderated raises
-`PublicationDamaged`; publish a new intent from the saved result rather than
-repeating inference. Review's trusted publication phase must integrate the same
-contract with its durable ledger before activation. Queue comments are operational
-prose: their embedded `tauceti` markers are escaped. Only an explicit trusted
-recovery payload can create a queue publication; quoted agent text never selects
-a review operation, even if publisher roles overlap. Commit-bound facts still
-publish when a PR closes or temporarily changes head, so reopening cannot revive
-a superseded green verdict.
-
-`NativePublishers.generation` is a fresh random 128-bit hexadecimal value from
-trusted private publisher configuration. Generate it after revoking old
-credentials, and distribute it privately with the new grants before publishing.
-Changing publisher grants or restoring an account requires a fresh generation;
-the queue refuses reused generations in its existing settings. Publications from
-prior generations grant no positive authority, including facts planted while an
-account was unconfigured. Any retired recovery history remains a blocking state
-until a current-generation explicit clear or hold is published. A rotation never
-silently releases a hold. The controller does not replay completed historical publications. Pending holds
-can rebind to the new generation; all pending old-authority clears settle as
-reconciliation-required, including clears not yet prepared. A release always
-needs a fresh explicit decision. Authority holds report a reconciliation reason,
-not a rebase request. Prefix, allow-file and ordinary consumer-policy changes keep
-the generation and reapply current rules to existing facts. Grant changes require
-republishing saved review results under the new generation, without new model
-work. Native PR CI statuses carry `tauceti-ci-status/v1:<generation>` descriptions;
-the latest CI status is selected before checking issuer authority. Review and
-recovery records exclude resolvable non-publishers before parsing or comparing
-sequences; they cannot poison a head with an oversized or malformed intent.
-Unresolved/deleted or synthetic issuers deny older facts without contributing
-an intent sequence. They retain the greatest trusted sequence observed before
-the barrier. Only that exact intent or a newer sequence can register after the
-barrier to reconcile it; a forged maximum sequence never permanently poisons publication.
-Retired recovery history conservatively blocks even if a restored backup lost
-both its generation and its publisher account. Historical records only deny;
-a current explicit clear or hold reconciles them. An untrusted writer may impose
-this deny state, but cannot override an existing current-generation decision. Reads and publication require the durable publisher-policy binding; a
-fresh adapter cannot silently start with incomplete historical grants. Authority
-holds withdraw waiting/reserved inputs before they consume candidate CI; inserted
-work retains the existing explicit promotion refusal and recovery procedure.
-Legacy publication protocols grant no authority.
-
-In-progress publications and initial scoreboards defer admission and promotion
-for a bounded wait (six hours by default). Closed, draft, retargeted and held PRs
-are evaluated immediately. An abandoned publication becomes review-unsafe after
-the configured wait; a confirmed review that was moderated is immediately unsafe
-rather than a transient read failure. At promotion either unsafe state refuses
-the exact candidate; an already inserted batch receives the existing explicit
-promotion hold, preserving its candidate and repair work for operator recovery.
-It is never silently rebuilt or merged. `publication_enabled=false` also blocks
-already frozen intents. OS permission/transport errors remain retryable; only a
-typed missing publisher grant settles for operator reconciliation. Publisher bootstrap, credential rotation
-and the tested operational recovery path remain activation requirements. After
-any queue-store restore, reconcile source facts and cost history, then install a
-fresh authority generation before resuming publication; outbox IDs and retired
-generation records may otherwise have rolled back. Never replay a stale backup
-clear or green result over newer source evidence. Confirmed owned recovery
-comments that are moderated are requeued only if they are still the latest
-desired fact; a newer queued clear is never overwritten.
-Forgejo Actions remain disabled on the source repository.
+Forgejo 17 routes `POST /repos/{owner}/{repo}/statuses/{sha}` through
+`reqRepoWriter(unit.TypeCode)`, so, as on GitHub, only users with write access
+to the code can post commit statuses. Forgejo Actions also creates statuses, as
+its system user (ID -2), for every workflow run, including workflows a PR
+brings, with the context `<workflow> / <job> (<event>)`. A `build`, `scope`,
+`bump-guard` or `self-tested/*` status therefore counts only while its creator
+currently has write, admin or owner permission; the newest status per context
+is selected first, so an older green cannot outlive a newer failure. Queue
+comments are operational prose: their embedded `tauceti` markers are escaped,
+and the queue edits only its own marked comments. Forgejo Actions remain
+disabled on the source repository.
 
 Promotion rereads the accepted PR heads and current review evidence. The trusted
 CI coordinator separately verifies the exact frozen candidate's build, scope and

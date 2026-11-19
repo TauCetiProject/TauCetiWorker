@@ -163,7 +163,7 @@ class Identity(unittest.TestCase):
 
     def test_policy_change_cannot_reinterpret_an_existing_claim(self):
         raw = self.raw()
-        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, harness_revision="e" * 40)
+        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, require_publication=False)
         with self.assertRaises(TaskError) as error:
             self.fixture.controller.renew_task(
                 raw["task_id"], raw["claim_token"], source_access=self.native.authority.authenticate("token")
@@ -172,7 +172,7 @@ class Identity(unittest.TestCase):
 
     def test_policy_upgrade_releases_old_claim_and_replaces_current_work(self):
         raw = self.raw()
-        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, harness_revision="e" * 40)
+        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, require_publication=False)
         controller = self.fixture.controller
         controller.tick()
         old = self.fixture.store.row("tasks", {"id": raw["task_id"]})
@@ -191,7 +191,7 @@ class Identity(unittest.TestCase):
 
         raw = self.raw()
         old_batch = self.fixture.store.row("batches", {"id": raw["batch_id"]})
-        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, harness_revision="e" * 40)
+        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, require_publication=False)
         result = self.fixture.controller.submit_task(
             raw["task_id"], raw["claim_token"], raw["tip"], source_access=self.native.authority.authenticate("token")
         )
@@ -206,7 +206,7 @@ class Identity(unittest.TestCase):
 
     def test_owner_can_release_stale_policy_work_before_the_next_tick(self):
         raw = self.raw()
-        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, harness_revision="e" * 40)
+        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, require_publication=False)
         self.fixture.controller.release_task(
             raw["task_id"],
             raw["claim_token"],
@@ -226,7 +226,7 @@ class Identity(unittest.TestCase):
         controller.set_setting("repair_concurrency", 2, "fixture-operator")
         task = self.native.claim()
         self.assertEqual(task.task_id, task_id)
-        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, harness_revision="e" * 40)
+        self.fixture.ledger.policy = replace(self.fixture.ledger.policy, require_publication=False)
         controller.release_task(
             task_id, task.claim_token, "prepared_clean", source_access=self.native.authority.authenticate("token")
         )
@@ -241,7 +241,7 @@ class Identity(unittest.TestCase):
         raw = self.raw()
 
         def refresh():
-            self.fixture.ledger.policy = replace(self.fixture.ledger.policy, harness_revision="e" * 40)
+            self.fixture.ledger.policy = replace(self.fixture.ledger.policy, require_publication=False)
             return self.native.authority.authenticate("token")
 
         result = self.fixture.controller.submit_task(
@@ -486,7 +486,7 @@ class ClientHTTP(unittest.TestCase):
         def changed(token):
             evidence = original(token)
             ledger = self.native.fixture.ledger
-            ledger.policy = replace(ledger.policy, harness_revision="e" * 40)
+            ledger.policy = replace(ledger.policy, require_publication=False)
             return evidence
 
         with patch.object(self.native.authority, "authenticate", side_effect=changed):
