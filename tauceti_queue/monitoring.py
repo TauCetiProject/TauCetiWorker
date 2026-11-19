@@ -511,12 +511,16 @@ def project(
                 break
             kept.append(row)
             room -= sizes.get(row["id"], 0)
+        member_params = tuple(public)
         member_columns = (
             "SELECT m.id,m.batch_id,m.input_id,m.number,m.accepted_head,m.position,m.commit_sha,m.provenance,"
             "m.task_id,m.explanation,m.added_at,m.removed,m.removed_reason,m.no_repair,m.withdrawn,"
             # Each member's own input, however old, rather than only the inputs published below.
             "i.title,i.author,i.state input_state,i.approved_at,i.landed_at,i.landed_sha,i.reason "
-            "FROM members m LEFT JOIN inputs i ON i.id=m.input_id WHERE m.batch_id IN "
+            # Only a public input's detail, as for the published inputs.
+            "FROM members m LEFT JOIN inputs i ON i.id=m.input_id AND "
+            + ("i." + in_public if public else "0")
+            + " WHERE m.batch_id IN "
         )
 
         def members_of(group, limit):
@@ -524,7 +528,7 @@ def project(
                 return []
             ids = [r["id"] for r in group]
             sql = member_columns + "(" + ",".join("?" * len(ids)) + ") ORDER BY m.id DESC LIMIT ?"
-            return rows(sql, (*ids, limit))
+            return rows(sql, (*member_params, *ids, limit))
 
         members = members_of(active, LIMIT + 1)
         members += members_of(kept, max(0, LIMIT + 1 - len(members)))
@@ -540,7 +544,8 @@ def project(
             "SELECT id,repository,number,head_sha,title,author,state,approved_at,batch_id,landed_at,landed_sha,"
             f"no_repair,reason FROM inputs WHERE state NOT IN ('waiting','reserved') AND {in_public} "
             "ORDER BY id DESC LIMIT ?",
-            (*public, TERMINAL_INPUTS),
+            # The receiver accepts at most LIMIT records per collection; live inputs come first.
+            (*public, max(0, min(TERMINAL_INPUTS, LIMIT - len(live_inputs)))),
         )
         # The exporter can start before the queue migrates an older ledger.
         columns = {r["name"] for r in rows("PRAGMA table_info(ci_attempts)")}

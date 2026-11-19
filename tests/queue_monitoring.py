@@ -322,6 +322,26 @@ url = "https://private.invalid"
         self.assertEqual(sorted(m["title"] for m in landed), ["Landed 0.0", "Landed 0.1"])
         self.assertTrue(all(m["approved_at"] for m in landed))
 
+    def test_a_member_never_carries_a_private_input_detail(self):
+        [batch] = self.landed_batches(1)
+        self.controller.store.execute(
+            "UPDATE inputs SET repository='OtherOrg/Private', title='PRIVATE_TITLE', author='PRIVATE_AUTHOR' "
+            "WHERE id=(SELECT input_id FROM members WHERE batch_id=?)",
+            (int(batch),),
+        )
+        value = self.export()
+        [member] = [m for m in value["members"] if m["batch_id"] == batch]
+        self.assertEqual((member["title"], member["author"]), ("", ""))
+        self.assertNotIn("PRIVATE", json.dumps(value))
+
+    def test_live_inputs_leave_terminal_inputs_only_the_remaining_records(self):
+        self.landed_batches(1, 1)
+        live = sum(1 for r in self.controller.store.rows("inputs") if r["state"] in ("waiting", "reserved"))
+        with patch.object(monitoring, "LIMIT", live + 1):
+            value = self.export()
+        self.assertEqual(len(value["inputs"]), live + 1)
+        self.assertTrue(value["collection_complete"]["inputs"])
+
     def test_git_failures_are_retried_without_discarding_previous_evidence(self):
         facts = monitoring.CommitFacts(self.repo.clone)
         first = self.export(facts=facts)
