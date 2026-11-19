@@ -119,6 +119,7 @@ class AdmissionInputs:
 # Recent listings re-read PRs updated this long before the newest update already seen, so an update
 # whose time Forgejo recorded slightly out of order is not skipped.
 RECENT_MARGIN_SECONDS = 120
+COMMENT_FEED_PAGES = 200  # the most pages of the comment feed one pass reads
 
 
 class NativePoller:
@@ -190,8 +191,10 @@ class NativePoller:
 
         registry, controller = self.registry, self.controller
         since = self._comments_since
+        # One read drains the window: 200 pages of 50 is far beyond a pass's comments (about two
+        # a minute on production), and a window read in one go cannot shift under itself.
         rows, newest, complete = registry.native.list_recent_comments(
-            registry.profile.forgejo.repository.name, since=since
+            registry.profile.forgejo.repository.name, since=since, max_pages=COMMENT_FEED_PAGES
         )
         dirtied = set()
         for number, row in rows:
@@ -211,7 +214,7 @@ class NativePoller:
                 dirtied.add(number)
         summary["comment_feed"] = {"read": len(rows), "dirtied": len(dirtied)}
         if not complete:
-            # Unread pages may hold older edits: keep the position until a read completes.
+            # Unread pages may hold older edits: keep the position (rechecks stay the backstop).
             summary["errors"].append("comment feed: more than one bounded read")
         elif newest:
             self._comments_since = max(since, newest - RECENT_MARGIN_SECONDS)

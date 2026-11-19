@@ -507,7 +507,7 @@ class Mixed(MixedFixture, unittest.TestCase):
     def test_a_scoreboard_edit_from_the_comment_feed_dirties_its_settled_pr_once(self):
         registry, poller, recent_calls = self.recent_fixture()
         feed = []
-        self.native.list_recent_comments = lambda repo, *, since: (list(feed), 0.0, True)
+        self.native.list_recent_comments = lambda repo, *, since, **kw: (list(feed), 0.0, True)
         head = self.native.create_pr(1, {"One.lean": "one\n"})
         self.updated[1] = "2026-11-19T04:00:00Z"
         poller.run_once()
@@ -533,7 +533,7 @@ class Mixed(MixedFixture, unittest.TestCase):
         registry, poller, recent_calls = self.recent_fixture()
         feed, complete = [], [True]
         newest = datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp()
-        self.native.list_recent_comments = lambda repo, *, since: (list(feed), newest, complete[0])
+        self.native.list_recent_comments = lambda repo, *, since, **kw: (list(feed), newest, complete[0])
         self.native.create_pr(1, {"One.lean": "one\n"})
         self.updated[1] = "2026-11-19T04:00:00Z"
         poller.run_once()
@@ -579,7 +579,7 @@ class Mixed(MixedFixture, unittest.TestCase):
         registry, poller, recent_calls = self.recent_fixture()
         positions = []
 
-        def feed(repo, *, since):
+        def feed(repo, *, since, **kw):
             positions.append(since)
             return [], datetime(2026, 11, 19, 5, tzinfo=UTC).timestamp(), True
 
