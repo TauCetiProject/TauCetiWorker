@@ -932,6 +932,42 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(len(self.controller.store.journal_entries("admission-evaluated")), before + 1)
         self.assertTrue(self.intake.is_current(1, head))
 
+    def test_evaluations_and_discovery_passes_journal_where_their_time_went(self):
+        self.ready(1)
+        self.ready(2)
+        self.intake.run_once()
+        entries = self.controller.store.journal_entries("admission-evaluated")
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            detail = entry["detail"]
+            for key in ("seconds", "read_seconds", "fetch_seconds", "lock_seconds"):
+                self.assertIsInstance(detail[key], float, key)
+                self.assertGreaterEqual(detail[key], 0, key)
+            self.assertLessEqual(detail["read_seconds"], detail["seconds"])
+        (discovered,) = self.controller.store.journal_entries("admission-discovered")
+        self.assertEqual(discovered["detail"]["prs"], 2)
+        self.assertGreaterEqual(discovered["detail"]["pages"], 1)
+        self.assertGreaterEqual(discovered["detail"]["seconds"], discovered["detail"]["evaluation_seconds"])
+
+    def test_a_discovery_pass_resumed_after_a_quota_wait_reports_all_its_pages(self):
+        self.ready(1)
+        original = self.github.list_open_pull_requests
+        calls = []
+
+        def paged(repo, **kwargs):
+            calls.append(1)
+            kwargs["on_page"]([])
+            if len(calls) == 1:
+                raise RequestDeferred("wait", retry_at=self.clock(), resource="graphql:background")
+            return original(repo, **kwargs)
+
+        self.github.list_open_pull_requests = paged
+        self.intake.run_once()
+        self.intake.run_once()
+        (discovered,) = self.controller.store.journal_entries("admission-discovered")
+        self.assertGreaterEqual(discovered["detail"]["pages"], 3, "both calls' pages")
+        self.assertIsNone(self.intake._discovery_timing)
+
     def test_pending_review_change_cannot_be_inserted_while_its_read_is_quota_blocked(self):
         self.ready()
         self.intake.run_once()
