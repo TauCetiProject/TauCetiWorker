@@ -166,6 +166,10 @@ def reconcile(
     live = live_pull_request(adapter, repo, pr)
     if live is None:
         return "absent"
+    note = getattr(controller, "note_blocking_labels", None)
+    current = controller.input_for(repo, pr) if callable(note) else None
+    if current is not None and current["head_sha"] == live.head_sha:
+        note(current, live.labels)  # an input whose label delivery was missed is held or released
     branch = canonical_branch or getattr(controller, "canonical_branch", None)
     branch = branch(repo) if callable(branch) else (branch or "main")
     decision = latest(adapter.eligibility_checks(repo, live.head_sha), repo, pr, live.head_sha, review_app_id)
@@ -177,10 +181,6 @@ def reconcile(
     if not decision.eligible or live.state != "open" or live.draft or live.base_ref != branch:
         return "waiting"
     labels = {label.lower() for label in live.labels}
-    note = getattr(controller, "note_blocking_labels", None)
-    current = controller.input_for(repo, pr) if callable(note) else None
-    if current is not None and current["head_sha"] == live.head_sha:
-        note(current, labels)  # a waiting input whose label delivery was missed is held or released
     if labels & KEEP:
         return "blocked"
     merge_base = adapter.pr_merge_base(repo, pr, live.head_sha)

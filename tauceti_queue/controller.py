@@ -1622,11 +1622,15 @@ class Controller:
             self.store.journal(now, "withdrawn", number=number, reason="draft")
 
     def _blocking_label_event(self, current: dict[str, Any], payload: dict[str, Any], now: float) -> None:
-        """A `labeled`/`unlabeled` delivery refreshes a waiting or reserved input's `blocked_labels`: from
-        the delivery's label list when it has one, else by the one label it names."""
-        if current["state"] not in (INPUT_WAITING, INPUT_RESERVED):
+        """A `labeled`/`unlabeled` delivery refreshes a live input's `blocked_labels`: from the delivery's
+        label list when it has one, else by the one label it names. A delivery for another head is
+        ignored. Deliveries can arrive out of order; with admission, the delivery also has the PR
+        evaluated again before it can be placed, and that read's labels are the ones that stand."""
+        if current["state"] not in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
             return
         pull = payload.get("pull_request") or {}
+        if (pull.get("head") or {}).get("sha") not in (None, current["head_sha"]):
+            return
         if isinstance(pull.get("labels"), list):
             labels = {str(label.get("name") if isinstance(label, dict) else label) for label in pull["labels"]}
         else:
@@ -1639,17 +1643,18 @@ class Controller:
         self.note_blocking_labels(current, labels, now)
 
     def note_blocking_labels(self, current: dict[str, Any], labels: Any, now: float | None = None) -> None:
-        """Record which blocking labels (`BLOCKING_LABELS`) the PR of a waiting or reserved input carries.
+        """Record which blocking labels (`BLOCKING_LABELS`) the PR of a live input carries.
 
-        `approve` refuses these labels; one added after approval keeps the input out of every batch
-        (ordinary, control lane and emergency) while it stays, and the input keeps its state, age and
-        approval, so removing the label is all it takes to place it again. An inserted member is not
-        touched (membership is fixed). Called for label deliveries and by admission and eligibility
-        with the labels of their fresh read, so a missed delivery is corrected there."""
+        `approve` refuses these labels; one added after approval keeps a waiting input out of every
+        batch (ordinary, control lane and emergency) while it stays, and the input keeps its state, age
+        and approval, so removing the label is all it takes to place it again. An inserted member stays
+        in its batch (membership is fixed); its labels are recorded so that, if the batch sends it back
+        to waiting, the hold applies. Called for label deliveries and by admission and eligibility with
+        the labels of their fresh read, so a missed delivery is corrected there."""
         blocked = sorted({str(label).lower() for label in labels or ()} & BLOCKING_LABELS)
         with self._lock:
             current = self.store.row("inputs", {"id": current["id"]})
-            if current is None or current["state"] not in (INPUT_WAITING, INPUT_RESERVED):
+            if current is None or current["state"] not in (INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED):
                 return
             if blocked == loads(current["blocked_labels"], []):
                 return

@@ -2797,7 +2797,12 @@ class BlockingLabelAfterApproval(ControllerCase):
         self.approve(101, {"A.lean": "a\n"})
         self.controller.tick()
         self.label_event(101, "labeled", "hold", ["hold"])
-        self.assertEqual(self.held(101), ("inserted", []))
+        self.assertEqual(self.held(101), ("inserted", ["hold"]), "kept in its batch, recorded should it return")
+
+    def test_a_delivery_for_another_head_is_ignored(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.label_event(101, "labeled", "hold", ["hold"], head={"sha": "f" * 40})
+        self.assertEqual(self.held(101), ("waiting", []))
 
 
 class EditSummary(ControllerCase):
