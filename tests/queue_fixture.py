@@ -3108,7 +3108,14 @@ class RepairOrReject(QueueFixture):
                 replaced.append(batch["id"])
                 # As a rebuild or repair submission would, meanwhile: a revision not on canonical.
                 tree = chain.tree_of(controller.clone, batch["base"])
-                tip = chain.git(controller.clone, "commit-tree", tree, "-p", batch["base"], "-m", "rebuilt").strip()
+                ident = {
+                    f"GIT_{who}_{key}": value
+                    for who in ("AUTHOR", "COMMITTER")
+                    for key, value in (("NAME", "t"), ("EMAIL", "t@example.invalid"))
+                }
+                tip = chain.git(
+                    controller.clone, "commit-tree", tree, "-p", batch["base"], "-m", "rebuilt", env=ident
+                ).strip()
                 replaced.append(tip)
                 with controller._lock:
                     controller.store.update("batches", {"id": batch["id"]}, version=batch["version"] + 1, tip=tip)
