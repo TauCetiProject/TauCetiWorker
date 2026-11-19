@@ -590,12 +590,14 @@ def start_background(
     systemd: bool | None = None,
     frozen: dict | None = None,
     python: str | None = None,
+    batch_id: str = "",
 ) -> dict:
     """Publish the worktree's outputs for ``revision`` in a process of its own and return at once.
 
     The publisher runs ``publish_outputs``, writes its record to ``logs/publish.json`` (``state``
-    ``published``, ``skipped`` or ``failed``) and its output to ``logs/publish.log``, and then removes
-    the worktree when ``remove_worktree`` (the caller leaves it in place for it). Under systemd
+    ``published``, ``skipped`` or ``failed``) and its output to ``logs/publish.log``, and then, when
+    ``remove_worktree`` (the caller leaves it in place for it), parks the worktree as the tree of
+    ``batch_id`` or removes it (``repair_cleanup.retire``). Under systemd
     (``systemd``, by default when the worker runs in a unit) it is a transient unit of its own, so a
     stop or restart of the worker does not kill it. The returned record says whether it was
     ``launched``; when it was not, the worktree is still the caller's. Never raises.
@@ -630,6 +632,7 @@ def start_background(
         "lake": list(lake),
         "clone": str(clone) if clone else None,
         "remove_worktree": bool(remove_worktree and clone),
+        "batch_id": str(batch_id),
         "nice": nice,
         "record": dict(record, state="running", launched=True),
     }
@@ -713,7 +716,7 @@ def run_spec(spec_path: Path) -> int:
 
 
 def _run_spec(spec_path: Path) -> int:
-    """The background publisher: publish as the spec says, write the record, then remove the worktree."""
+    """The background publisher: publish as the spec says, write the record, then park or remove the worktree."""
     spec = json.loads(spec_path.read_text())
     path = Path(spec["record"]["record"])
     worktree = Path(spec["worktree"])
@@ -741,10 +744,19 @@ def _run_spec(spec_path: Path) -> int:
     record["finished_at"] = time.time()
     repair.write_record(path, record)
     if spec.get("remove_worktree") and spec.get("clone"):
+        from tauceti_queue import repair_cleanup
+
         try:
-            repair.remove_worktree(Path(spec["clone"]), worktree)
+            repair_cleanup.retire(
+                Path(spec["clone"]),
+                worktree.parent.parent,
+                spec.get("batch_id", ""),
+                spec["task_id"],
+                worktree,
+                keep=True,
+            )
         except Exception as error:
-            log(f"could not remove {worktree}: {type(error).__name__}: {error}")
+            log(f"could not park or remove {worktree}: {type(error).__name__}: {error}")
     return 0
 
 

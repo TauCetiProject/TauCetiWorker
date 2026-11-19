@@ -49,8 +49,8 @@ worker"); the `api` provider's `ANTHROPIC_API_KEY` comes from the same environme
 below). Otherwise `--clone` defaults to the worker's content
 checkout (`Config.resolve().checkout`, the path `agents.prepare_checkout` maintains). `--root` defaults to `$TAUCETI_QUEUE_TASK_ROOT`, else
 `$TAUCETI_ACTIVITY_DIR/queue-repair`, else `~/.local/state/tauceti/queue-repair`; it holds the task
-checkpoints and logs (`tasks/<task_id>/`), the private worktrees (`worktrees/task-<task_id>`), the
-private Lake artifact pool (`lake-cache/`, `lake.toml`) and the agent's isolated Claude config.
+checkpoints and logs (`tasks/<task_id>/`), the private worktrees (`worktrees/task-<task_id>` while a
+task runs, `worktrees/batch-<batch_id>` between tasks), the private Lake artifact pool (`lake-cache/`, `lake.toml`) and the agent's isolated Claude config.
 
 ## Task protocol
 
@@ -179,8 +179,12 @@ has a time budget holds because the service re-exposes the task.
    worker's clone, check that base, tip and `onto` are commits, retain the input tip under
    `refs/tauceti-queue/task/<id>/input`, and check out the tip detached in
    `<root>/worktrees/task-<id>` (`repair.checkout_worktree`; an existing worktree is re-pointed so
-   its `.lake` outputs stay warm). Checkpoint `sources_ready`.
-3. **Artifacts.** `repair.prepare_artifacts`, exactly the experiment's recipe: `lake exe cache get`
+   its `.lake` outputs stay warm). When this worker has a parked tree for the task's batch, it is
+   moved to `task-<id>` first (`repair_cleanup.adopt`, [One tree per batch](#one-tree-per-batch)).
+   Checkpoint `sources_ready`.
+3. **Artifacts.** On a warm batch tree (below) nothing is fetched: the tree's own `.lake` is the
+   warm state, the record carries `warm_tree`, and any build here or later compiles only what changed.
+   Otherwise `repair.prepare_artifacts`, exactly the experiment's recipe: `lake exe cache get`
    for Mathlib (or a shared extracted `.lake/packages` through `--seed-packages`, the experiment's
    stand-in for the shared Mathlib view), `lake cache get --service tauceti-public --repo <repository>
    --rev=<revision>` into the private pool, then `lake build --iofail` at the tip, which restores every
@@ -395,14 +399,42 @@ has a time budget holds because the service re-exposes the task.
    modules) the audit's import took 5 s warm and 27 s cold, the duplicate check 3 s and the axiom scan of a
    PR's few modules 4 s; the lint of five changed modules took 45 s and the two driver builds about 4 s.
 6. **Submit and publish.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
-   then `adopted` or `not_adopted`), then publish the build outputs (below). The worktree is removed
-   afterwards (by the background publisher when one runs) unless `--keep-worktree`;
-   the [lifecycle collector](operations.md#terminal-repair-worktree-cleanup) overrides that retention
-   once the task or batch is terminal, including trees left by errors or process kills;
+   then `adopted` or `not_adopted`), then publish the build outputs (below). The worktree is then
+   parked as the batch's tree (by the background publisher when one runs) unless `--keep-worktree`;
+   the [lifecycle collector](operations.md#terminal-repair-worktree-cleanup) removes it once the task
+   or batch is terminal, including trees left by errors or process kills;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
    experiment CLI's `prune`). Every attempt's tip stays under
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
    outcome record.
+
+### One tree per batch
+
+A worker keeps one tree per batch, with its `.lake`, across the batch's tasks and across worker
+restarts (`tauceti_queue/repair_cleanup.py`). When a task ends, or a restarted worker abandons it,
+its tree is renamed to `<root>/worktrees/batch-<batch_id>` (`retire`, recording the task in
+`<root>/batch-trees/batch-<batch_id>.json`). Only a tree whose artifacts were prepared (`available` or
+`cold`) is parked; any other is removed as before, and so is a tree whose batch already has a parked
+one. The batch's next task on this worker renames the parked tree to its own `task-<id>` path
+(`adopt`). Each worker has its own root and a rename takes the tree whole, so two tasks never share
+one. Adoption deletes the previous task's `.tauceti-repair/` (which `git clean` keeps, since the clone
+excludes it), `.lake/outputs.jsonl` and `.lake/publication-stage`, and ends any rebase left in progress;
+the checkout then re-points the tree to the task's starting tip as for any reused tree.
+
+The adopted tree is warm when `lean-toolchain` and `lake-manifest.json` are unchanged between the
+commit it was parked at and every revision the task builds (its starting tip, and `onto` for a
+rebase). A warm tree fetches nothing: no Mathlib cache, no repair or public outputs, no ancestor
+walk. A miss means Lake compiles that module; it never releases the task. A tree whose toolchain or
+dependencies changed, or a batch's first task on this worker, prepares artifacts as described above.
+`outcome.sources.batch_tree` is `warm`, `adopted` (re-prepared) or `new`.
+
+The queue's agent rounds run with `host_caches=False` (`agents.run_agent_host`): the host's shared
+cache preparation and the canonical store's prepare and round-end relinking belong to the fleet's
+rounds, and the task has already prepared its own tree. A parked tree therefore holds its whole
+`.lake` (about 23 GiB of build outputs and 7 GiB of packages for TauCeti in November 2026). The
+lifecycle collector removes it once its batch has landed or been removed. Parked trees do not hold
+back the artifact pool's collection (`repair_cache`): Lake promotes a collected output back into the
+pool from the tree when it next needs it.
 
 **Known audit/lint findings.** When a repair task already carries located audit or lint
 findings for its frozen candidate, and no compiler errors, the worker fetches the warm artifacts
@@ -445,7 +477,7 @@ batches: `base` and `tip` are the open batch's own (never the head's tip), `onto
 streaming build, always, even under `--no-stream-repair`, since that build is how it learns whether
 anything fails: a build that finishes with exit 0 and no error releases the task as `prepared_clean`
 without starting an agent and publishes its outputs to the repair cache under the batch tip. When
-the build reports errors the agent (or the parallel group agents) is launched as for a repair, with
+the build reports errors the agent is launched as for a repair, with
 the "What happened" section saying that the batch has not yet been tried, that it should fix what
 fails to build so the batch is ready when it becomes the head, and that nothing it does is a verdict;
 the result is validated, pushed and submitted the same way, and the controller adopts it into the
@@ -465,7 +497,7 @@ the head's tip, the controller hands out a second preparation of the replayed ch
 `refs/tauceti-queue/batches/<id>/pre-rebased/<tip>`), the members are the commits of that chain, and
 `extra.pre_rebased` names the batch tip it covers (`source`), the batch's own base (`batch_base`) and
 the head's base (`head_base`). The worker runs it exactly like an own-base preparation, so the
-streaming build, the parallel groups, the in-place repair with edits folded into the owning members'
+streaming build, the in-place repair with edits folded into the owning members'
 commits, the worker's audits (against the head's tip) and the submission are unchanged. Only the
 artifacts differ: the repair namespace is asked for the pre-rebased tip and then the head's tip
 (`repair_publish.preferred`), the outputs the head's repair published, and the public cache for the
@@ -533,14 +565,10 @@ unchanged in all three.
 ## Parallel agents within one task
 
 Before the agent of phase 4 runs, a repair task's findings are split into independent groups
-(`tauceti_queue/repair_parallel.py`, `plan_groups`). When the worker streamed the first build, the
-findings are the task's diagnostics merged with that build's complete error list
-(`.tauceti-repair/errors.jsonl`, each error with its file, line, column and message; `read_errors`,
-`merge_errors`): the path waits for the streaming build to finish first, since a group is independent
-only against the whole list, and the outcome's `parallel.source` names `errors.jsonl` with the time
-waited. (With `--parallel-agents 1` the agent is launched at the first error as the streaming
-section describes; with the default of 3 a repair trades that head start for concurrent agents on the
-complete list.) Two failing modules share a group when one
+(`tauceti_queue/repair_parallel.py`, `plan_groups`). The findings are the ones the task already has
+(its diagnostics); the path never waits for a streaming build, so the agents start at once. A
+preparation, which has no diagnostics, therefore repairs sequentially from the streaming build's error
+list. Two failing modules share a group when one
 member's commit changes both, when the owning members' commits change a common file, or when a file
 one member changes `import`s a file of the other's (read from the files at the tip; nothing deeper is
 inferred). A finding in a module no member changes (a ripple into `main`) cannot be assigned and keeps
@@ -653,10 +681,10 @@ run (the explanation turn). Nothing continues a model session across runs.
 
 A claim never outlives the worker that holds it. On SIGTERM, at any phase before the result is
 validated, the attempt is abandoned and the claim released with reason `worker-stopped` so the
-service re-exposes the task at once; the worktree is removed. On start (`retry_deliveries`), every
+service re-exposes the task at once; the worktree is parked or removed ([One tree per batch](#one-tree-per-batch)). On start (`retry_deliveries`), every
 record of this worker still in flight (`claimed`, `sources_ready`, `artifacts_ready`,
 `artifacts_unavailable`, `agent_running`, `validated`, and `interrupted` from older releases) has its
-claim renewed and then released as `worker-stopped`, its worktree removed. Only a validated result
+claim renewed and then released as `worker-stopped`, its worktree parked or removed. Only a validated result
 whose delivery was under way (`delivery_pending`, `pushed`, `submitted`) is delivered again: the push
 to the submission ref and the `result` call are retried while the claim is live, and a claim the
 service no longer recognises is recorded as `claim_lost`, so a lost claim never produces a late
@@ -736,12 +764,13 @@ green). For the build sandbox, a recording `bwrap` stub checks the composed bind
 and the cleared environment, the disabled fallback's warning, failing closed without `bwrap`, and the
 `--check` line. The parallel path, with members #2 and #3 both broken: two group agents running at the
 same time in their own worktrees and child processes (under the Claude and the Codex argv shapes) with
-fixups folded into a valid chain that is adopted, the groups taken from the streaming build's
-`errors.jsonl` once it has finished, every build serialized by the shared lock and run through the
+fixups folded into a valid chain that is adopted, the groups taken from the task's diagnostics without
+waiting for the streaming build, every build serialized by the shared lock and run through the
 sandbox wrapper, a group whose agent fails (or whose fixups stray outside its files) handed to the
 sequential agent, a lost claim stopping the group agents, the build lock serializing two concurrent
 scoped builds and taking over a stale lock, a provider-neutral group prompt, and dependent or
-unassignable failures staying sequential. A `prepare` task whose batch builds is released as
+unassignable failures staying sequential. A batch's second task adopts the first task's parked tree
+and starts warm without fetching. A `prepare` task whose batch builds is released as
 `prepared_clean` without an agent, and one whose batch fails is repaired with the not-yet-tried
 prompt and adopted. No real inference and no network.
 

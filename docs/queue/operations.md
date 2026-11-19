@@ -633,7 +633,10 @@ worker/publisher ownership leases:
 `tauceti-queue-repair-cleanup.timer` runs independently of the workers, on startup and every minute
 after the preceding collection ends. It reads the local authoritative SQLite database without
 writing it. Landed/removed batches and submitted/superseded tasks are eligible, including worktrees
-left by failed attempts and `task-<id>-group-*` parallel worktrees. The collector removes their Git
+left by failed attempts and `task-<id>-group-*` parallel worktrees. A parked batch tree
+(`worktrees/batch-<id>`, about 30 GiB with its `.lake`) is removed once its batch has landed or been
+removed; its identity comes from the task recorded in `<root>/batch-trees/batch-<id>.json`, and a
+tree without a known task is kept and reported as `unknown`. The collector removes their Git
 worktree registrations and build/dependency directories; task JSON, logs, retained refs and artifact
 caches remain. `--keep-worktree` does not exempt terminal work from this collector.
 
@@ -747,7 +750,8 @@ so `MainPID` matches `worker.json`. `Restart=always`, `OOMPolicy=kill` and disab
 keep worker-cgroup kills recoverable without an external restart loop or a new memory cap.
 
 A restart (or `systemctl --user stop`) sends SIGTERM: a running agent is stopped, the attempt
-abandoned, its claim released (`worker-stopped`) and its worktree removed. A task that has already
+abandoned, its claim released (`worker-stopped`) and its worktree parked as its batch's tree
+(repair-task.md, "One tree per batch"). A task that has already
 validated its chain finishes the push and submission first. `TimeoutStopSec=300`; a worker killed
 beyond that leaves the claim to expire (`claim_ttl_seconds`, 900) and the task is re-exposed.
 

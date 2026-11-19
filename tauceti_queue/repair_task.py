@@ -1453,6 +1453,39 @@ def toolchain_changed(worktree: Path, base: str, tip: str) -> bool:
     return bool(git(worktree, "diff", "--name-only", base, tip, "--", "lean-toolchain", check=False).strip())
 
 
+def warm_tree(worktree: Path, task: Task, parked_at: str | None, start_tip: str) -> bool:
+    """Whether an adopted batch tree (parked at ``parked_at``) is warm for this task: its build and
+    dependencies hold for every revision the task builds, i.e. ``lean-toolchain`` and
+    ``lake-manifest.json`` are unchanged. A rebase also builds on ``onto``."""
+    if parked_at is None:
+        return False
+    targets = [start_tip, *([task.onto] if task.kind in repair.REBASE_KINDS else [])]
+    try:
+        return not any(
+            git(
+                worktree, "diff", "--name-only", parked_at, target, "--", "lean-toolchain", "lake-manifest.json"
+            ).strip()
+            for target in targets
+        )
+    except RuntimeError:
+        return False
+
+
+def retire_worktree(cfg: RunnerConfig, task: Task, artifacts: dict | None) -> str:
+    """Park the task's tree as its batch's tree when its artifacts were prepared, else remove it."""
+    from tauceti_queue import repair_cleanup
+
+    artifacts = artifacts or {}
+    return repair_cleanup.retire(
+        cfg.clone,
+        cfg.root,
+        task.batch_id,
+        task.task_id,
+        cfg.root / "worktrees" / f"task-{task.task_id}",
+        keep=bool(artifacts.get("available") or artifacts.get("cold")),
+    )
+
+
 @contextlib.contextmanager
 def artifact_checkout(worktree: Path, task: Task, start_tip: str):
     """Prepare changed rebase dependencies on the target, then restore the agent's input chain.
@@ -1903,7 +1936,7 @@ def run_repair_agent(
                         session_actor="queue-repair-task",
                         session_scope=task.task_id,
                         cache_note=False,
-                        queue_mathlib=True,  # this service prepares its own Mathlib until it shares too
+                        host_caches=False,  # the task prepared this tree; no per-round preparation or relinking
                     )
             except AgentLaunchUnavailable as error:
                 # Its own outcome, not the cache's: the artifacts were ready and the process never existed,
@@ -2005,26 +2038,15 @@ def run_parallel_groups(
     cancel: threading.Event,
     state: TaskState,
     env_lake: dict,
-    stream: repair_stream.StreamingBuild | None = None,
 ) -> tuple[dict, dict | None]:
-    """The parallel path of a repair (``repair_parallel``): split the findings into independent groups
-    and, with two or more and an eligible provider, run one agent per group in its own worktree and
-    child process, fold their fixups into the chain and run the verification build. With a streaming
-    build (``stream``) the path first waits for it to finish and takes the groups from its complete
-    error list, ``errors.jsonl``, merged with the task's diagnostics. Returns the record for the outcome
-    and the findings the sequential path still has to repair (None when nothing changes for it)."""
+    """The parallel path of a repair (``repair_parallel``): split the task's findings into independent
+    groups and, with two or more and an eligible provider, run one agent per group in its own worktree
+    and child process, fold their fixups into the chain and run the verification build. It never waits
+    for a streaming build: the groups come from the findings the task already has, and the agents start
+    at once. Returns the record for the outcome and the findings the sequential path still has to
+    repair (None when nothing changes for it)."""
     require_task_execution(cfg=cfg, task=task)
     record: dict = {"source": "diagnostics"}
-    if stream is not None:
-        waited = time.monotonic()
-        while not stream.finished.wait(0.5):
-            if cancel.is_set():
-                return {"status": "cancelled", "detail": "cancelled while the streaming build finished"}, None
-        record["stream_wait_seconds"] = round(time.monotonic() - waited, 1)
-    errors = repair_parallel.read_errors(repair.listings_path(worktree).parent)
-    if errors is not None:
-        findings = repair_parallel.merge_errors(findings, errors)
-        record.update(source=repair_stream.ERRORS_FILE, stream_errors=len(errors))
     groups, reason = repair_parallel.plan_groups(cfg.clone, chain, findings, worktree)
     if len(groups) < 2:
         log(f"task {task.task_id}: sequential repair ({reason})")
@@ -2328,6 +2350,7 @@ def _run_task(
             lake=cfg.lake,
             clone=cfg.clone,
             remove_worktree=not cfg.keep_worktree,
+            batch_id=task.batch_id,
         )
         outcome["publish"] = record
         if record.get("launched"):
@@ -2373,7 +2396,14 @@ def _run_task(
                 if stopping() and not lease.lost.is_set():
                     return cancelled("the worker stopped while the sources were fetched")
                 raise
+            from tauceti_queue import repair_cleanup
+
+            parked_at = repair_cleanup.adopt(cfg.clone, cfg.root, task.batch_id, worktree)
             outcome["sources"]["worktree_reused"] = checkout_worktree(cfg.clone, start_tip, worktree)
+            # The batch's tree from an earlier task on this worker: its `.lake` is the warm state, so
+            # nothing is fetched and Lake compiles only what changed since.
+            warm = warm_tree(worktree, task, parked_at, start_tip)
+            outcome["sources"]["batch_tree"] = "warm" if warm else "adopted" if parked_at else "new"
             if cfg.seed_packages:
                 repair.link_shared_packages(worktree, cfg.seed_packages)
             state.write("sources_ready", worktree=str(worktree), sources=outcome["sources"])
@@ -2393,6 +2423,7 @@ def _run_task(
                     preferred=repair_publish.preferred(cfg.publish, task),
                     warm=repair_publish.warm(cfg.publish, task),
                     build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
+                    fetch=not warm,
                 )
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
@@ -2584,7 +2615,7 @@ def _run_task(
                 # Independent failing groups are repaired by concurrent agents first; what they leave
                 # (nothing, a group that failed, a build that still fails) goes to the usual agent below.
                 parallel, remaining = run_parallel_groups(
-                    cfg, task, worktree, chain_before, findings, ownership, logdir, cancel, state, env_lake, stream
+                    cfg, task, worktree, chain_before, findings, ownership, logdir, cancel, state, env_lake
                 )
                 outcome["parallel"] = {k: v for k, v in parallel.items() if k != "remaining"}
                 if parallel["status"] == "cancelled":
@@ -2952,10 +2983,12 @@ def _run_task(
         outcome["seconds"] = round(time.monotonic() - started, 1)
         outcome["lease"] = {"renewals": lease.renewals, "errors": lease.errors, "lost": lease.lost.is_set()}
         # A task awaiting delivery keeps its worktree for the retry. A background publication owns it
-        # from its start and removes it when done.
+        # from its start and parks or removes it when done.
         if not cfg.keep_worktree and outcome.get("status") not in ("error", "delivery_pending") and not background:
             with contextlib.suppress(Exception):
-                repair.remove_worktree(cfg.clone, worktree)
+                outcome["worktree"] = retire_worktree(
+                    cfg, task, outcome.get("artifacts") or state.record.get("artifacts")
+                )
         with contextlib.suppress(Exception):
             repair.write_record(state_dir / "outcome.json", outcome)
         state.write_progress(outcome)
@@ -3155,12 +3188,12 @@ def retry_deliveries(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None
                     outcomes.append(outcome)
                     if not cfg.keep_worktree:
                         with contextlib.suppress(Exception):
-                            repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
+                            retire_worktree(cfg, task, record.get("artifacts"))
                     continue
             state.write("claim_lost", detail=f"delivery retry: {error}")
             if not cfg.keep_worktree:
                 with contextlib.suppress(Exception):
-                    repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
+                    retire_worktree(cfg, task, record.get("artifacts"))
             log(f"task {task.task_id}: claim no longer ours; not delivered")
             continue
         except ServiceError as error:
@@ -3180,7 +3213,7 @@ def retry_deliveries(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None
             )
             if not cfg.keep_worktree:
                 with contextlib.suppress(Exception):
-                    repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
+                    retire_worktree(cfg, task, record.get("artifacts"))
             continue
         if record.get("next_retry_at", 0) > time.time():
             continue
