@@ -1170,6 +1170,21 @@ class LostRuns(ControllerCase):
             time.sleep(0.01)
         self.assertFalse(self.controller._live_reading)
 
+    def test_a_failed_watermark_write_does_not_stop_polling(self):
+        advanced, reads, inline = self.live_reports()
+        self.github.start_runs()
+        with inline:
+            self.observe()
+            advanced["at"] = self.clock()
+            self.observe(LIVE_PROGRESS_SECONDS)
+            store = self.controller.store
+            with mock.patch.object(store, "set_setting", side_effect=sqlite3.OperationalError("locked")):
+                self.controller._read_live_progress(self.clock() + LIVE_PROGRESS_SECONDS)
+            self.assertFalse(self.controller._live_reading)
+            count = len(reads)
+            self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertGreater(len(reads), count)
+
     def test_live_progress_time_ignores_reports_without_counts_or_from_the_future(self):
         self.assertEqual(live_progress_at(None, 100), (None, None))
         self.assertEqual(live_progress_at({"completed_tasks": None, "observed_at": "x"}, 100), (None, None))

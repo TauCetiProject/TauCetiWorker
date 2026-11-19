@@ -3775,8 +3775,12 @@ class Controller:
             due = not self._live_reading and now - (entry or {}).get("checked_at", 0) >= LIVE_PROGRESS_SECONDS
             if due:
                 self._live_reading = True
-        if persist is not None:
-            self.store.set_setting(LIVE_PROGRESS_SETTING, persist)
+        try:
+            if persist is not None:
+                self.store.set_setting(LIVE_PROGRESS_SETTING, persist)
+        except Exception:
+            # The read below still goes ahead; only a reserved reader that never starts would stop polling.
+            logging.getLogger(__name__).exception("live progress watermark not saved")
         if not due:
             return
 
@@ -3806,7 +3810,12 @@ class Controller:
                 finally:
                     self._live_reading = False
 
-        threading.Thread(target=read, name="live-progress", daemon=True).start()
+        try:
+            threading.Thread(target=read, name="live-progress", daemon=True).start()
+        except Exception:
+            with self._live_lock:
+                self._live_reading = False
+            raise
 
     def _last_progress_at(self, attempt: dict[str, Any]) -> float:
         """The attempt's last step-level progress, or its live build counts' last advance if later."""
