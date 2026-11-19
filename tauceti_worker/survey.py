@@ -351,7 +351,7 @@ class Candidate:
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
     bump_pending: bool = False  # an automatic bump taken before its build finished
-    final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
+    final_resolution: bool = False  # existing own-PR fix or rebase budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
     source_repository: RepositoryRef | None = None
     source_repository_id: int | None = None
@@ -1087,6 +1087,7 @@ def classify_survey(
         if foreign:
             c.foreign_repair_base = integration
             c.reason = "explicitly scoped foreign-fork integration repair"
+        unreadable = False
         try:
             if budget_error:
                 raise RebaseBudgetUnavailable(budget_error)
@@ -1100,7 +1101,14 @@ def classify_survey(
         except RebaseBudgetUnavailable as error:
             c.reason = f"{reason}; {error}"
             c.attempts = MAX_REBASE_ATTEMPTS
+            unreadable = True
         c.budget = 1 if foreign else MAX_REBASE_ATTEMPTS
+        if c.attempts >= c.budget and not (foreign or handoff or unreadable) and sv.owns(p):
+            # Dispatch closes it after re-reading the budget, the claim and the live PR.
+            c.final_resolution = True
+            c.reason = "rebase attempts spent; close the authored PR"
+            sv.rebaseable.actionable.append(c)
+            continue
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit

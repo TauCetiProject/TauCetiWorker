@@ -72,6 +72,7 @@ from .constants import (
     EX_NOPROGRESS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
+    MAX_REBASE_ATTEMPTS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -110,6 +111,7 @@ from .survey import (
     Candidate,
     Counters,
     PRInfo,
+    RebaseBudgetUnavailable,
     Survey,
     bump_prs,
     bust_progress_cache,
@@ -1424,6 +1426,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
         return _close_spent_pr(w, sv, c, explicit=explicit)
+    if stage == "rebase" and getattr(c, "final_resolution", False):
+        return _close_spent_pr(w, sv, c, stage="rebase", explicit=explicit)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -2272,62 +2276,79 @@ FINAL_ATTEMPT_INSTRUCTION = (
 )
 
 
-def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:
-    """Retire an owned, still-blocked head after its existing repair attempts; no model call."""
+def _budget_spent(stage, w, c) -> bool:
+    if stage == "fix":
+        return w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS
+    key_for = getattr(w.counters, "rebase_budget_key", None)
+    try:
+        # A verified progress checkpoint since the survey starts a new budget under a new key.
+        key = key_for(c.pr) if key_for else f"rebase-pr-{c.pr}"
+        return bool(c.rebase_budget_key) and key == c.rebase_budget_key and w.counters.read(key) >= MAX_REBASE_ATTEMPTS
+    except RebaseBudgetUnavailable:
+        return False
+
+
+def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
+    """Retire an owned, still-blocked head after its existing repair or rebase attempts; no model call."""
     from .github_transport import read_context
 
     p = next((p for p in sv.open_prs if p.number == c.pr), None)
-    if (
-        not p
-        or not owns_pr(sv, p)
-        or p.automatic_bump
-        or c.foreign_repair_base
-        or w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
-    ):
+    if not p or not owns_pr(sv, p) or p.automatic_bump or c.foreign_repair_base or not _budget_spent(stage, w, c):
         return None
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
     try:
         with read_context(fresh=True, direct=True):
-            if not _still_actionable("fix", w, sv, replace(c, partial_history=False), explicit=explicit):
+            if not _still_actionable(stage, w, sv, replace(c, partial_history=False), explicit=explicit):
                 return None
-            live = w.gh.pr_view(c.pr, ["state", "headRefOid", "author", "labels", "isDraft"])
+            fields = ["state", "headRefOid", "author", "labels", "isDraft"]
+            live = w.gh.pr_view(c.pr, [*fields, "mergeable"] if stage == "rebase" else fields)
             if (
                 not live
                 or live.get("state") != "OPEN"
                 or live.get("headRefOid") != c.head
                 or live.get("isDraft") is not False
-                or _selected_pr_matches("fix", c, live, explicit=explicit) is not True
+                or _selected_pr_matches(stage, c, live, explicit=explicit) is not True
                 or not owns_author(sv, live.get("author"))
                 or {str(label.get("name", "")).lower() for label in live.get("labels", [])}
                 & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
             ):
                 return None
-            from .activity import select
-
-            select("fix")
-            report_runtime(
-                "running", phase="fix", target=f"PR #{c.pr}", detail="closing owned PR after spent repair attempts"
-            )
-            gh_run(
-                [
-                    "gh",
-                    "pr",
-                    "close",
-                    str(c.pr),
-                    "--repo",
-                    TAUCETI,
-                    "--comment",
+            if stage == "rebase":
+                resolver = getattr(type(w.gh), "resolve_mergeability", None)
+                if live.get("mergeable") == "UNKNOWN" and resolver is not None:
+                    live["mergeable"] = resolver(w.gh, w.cfg.state, c.pr, c.head)
+                # A mergeable head with a requested integration repair is a handoff, never closed here.
+                if live.get("mergeable") != "CONFLICTING":
+                    return None
+                base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+                spent = "rebase"
+                comment = (
+                    f"Closing because {MAX_REBASE_ATTEMPTS} attempts could not bring this branch up to date "
+                    f"with `{base}` at head `{c.head}`. The branch is retained; a fresh attempt can start "
+                    f"from current `{base}`."
+                )
+            else:
+                spent = "repair"
+                comment = (
                     f"Closing after {MAX_FIX_ATTEMPTS} repair attempts left review findings unresolved "
                     f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
-                    "remaining findings using the current review rubric.",
-                ]
+                    "remaining findings using the current review rubric."
+                )
+            from .activity import select
+
+            select(stage)
+            report_runtime(
+                "running", phase=stage, target=f"PR #{c.pr}", detail=f"closing owned PR after spent {spent} attempts"
             )
+            gh_run(["gh", "pr", "close", str(c.pr), "--repo", TAUCETI, "--comment", comment])
             after = w.gh.pr_view(c.pr, ["state"])
             if not after or after.get("state") not in {"CLOSED", "MERGED"}:
-                raise NoProgress(f"fix #{c.pr}: automatic closure not confirmed; retrying without another model call")
+                raise NoProgress(
+                    f"{stage} #{c.pr}: automatic closure not confirmed; retrying without another model call"
+                )
         w.rs.bust(c.pr)
-        log(f"fix #{c.pr}: confirmed closure after spent repair attempts")
+        log(f"{stage} #{c.pr}: confirmed closure after spent {spent} attempts")
         return 0
     finally:
         w.claims.stop_heartbeat()

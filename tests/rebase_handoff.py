@@ -115,11 +115,13 @@ def test_verified_progress_restores_budget_without_unbounded_retries():
             assert selected.attempts == 0 and selected.rebase_budget_key == epoch
             for _ in range(3):
                 counters.incr(epoch)
-            assert survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.suppressed[0].attempts == 3
+            spent = survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.actionable[0]
+            assert spent.attempts == 3 and spent.final_resolution  # an owned conflicting PR is closed
             # A new commit alone and a hold both leave that cap in place.
             raw["headRefOid"] = "b" * 40
             raw["statusCheckRollup"][0]["state"] = "FAILURE"
-            assert survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.suppressed[0].attempts == 3
+            spent = survey_mod.survey(cfg, gh, None, counters, deep=False).rebaseable.actionable[0]
+            assert spent.attempts == 3 and spent.final_resolution
             raw["mergeable"] = "MERGEABLE"
             raw["statusCheckRollup"][0]["state"] = "SUCCESS"
             raw["labels"] = [{"name": "hold"}]
