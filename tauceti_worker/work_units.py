@@ -3460,13 +3460,14 @@ def _reopen_reported(report) -> None:
         return
     from .activity import current_round_id
     from .reconcile import reopen, reported
+    from .targets import inferred
 
     directory, item, needs = report
-    allowed = [dep.slug for dep in needs]
-    slugs = reported(directory / "prerequisites.txt", allowed)
+    seen = {dep.slug: tick[0] for dep in needs if (tick := inferred(dep)) is not None}
+    slugs = reported(directory / "prerequisites.txt", seen)
     if not slugs:
         return
     try:
-        reopen(slugs, allowed, f"{item.slug} round {(current_round_id() or str(int(time.time())))[:12]}")
+        reopen(slugs, seen, f"{item.slug} round {(current_round_id() or str(int(time.time())))[:12]}")
     except OSError as error:
         log(f"target list: {', '.join(slugs)} not reopened ({error})")

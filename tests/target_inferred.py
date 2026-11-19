@@ -38,6 +38,7 @@ Goal: a synthetic goal for the fixture.
 - [ ] `aside` — Layer 2, a remark (needs: `strong-law`)
 - [ ] `loose` — Layer 4, unrelated (needs: `strong-law`)
 """
+SEEN = frozenset({f"{TAIL}#TailSigma.measure"})
 GIT_ENV = {
     "GIT_CONFIG_GLOBAL": os.devnull,
     "GIT_CONFIG_NOSYSTEM": "1",
@@ -270,7 +271,9 @@ class Reopen(Tmp):
 
     def test_an_inferred_tick_is_opened_again_and_an_earned_one_never(self):
         lock = self.path.with_name(".targets.md.lock")
-        self.assertEqual(reconcile.reopen(["tail-sigma", "borel"], ["tail-sigma", "borel"], "zero-one round abc"), 1)
+        self.assertEqual(
+            reconcile.reopen(["tail-sigma", "borel"], {"tail-sigma": SEEN, "borel": SEEN}, "zero-one round abc"), 1
+        )
         text = self.path.read_text()
         self.assertIn(
             f"- [ ] `tail-sigma` — Layer 1, the tail sigma-algebra (needs: none; reopened: {TAIL}#TailSigma.measure"
@@ -279,13 +282,25 @@ class Reopen(Tmp):
         )
         self.assertIn("- [x] `borel` — Layer 1, both Borel–Cantelli lemmas (needs: none; landed: #7)", text)
         self.assertEqual(lock.stat().st_mtime, 0)
-        self.assertEqual(reconcile.reopen(["tail-sigma"], ["tail-sigma"], "zero-one round abc"), 0)
+        self.assertEqual(reconcile.reopen(["tail-sigma"], {"tail-sigma": SEEN}, "zero-one round abc"), 0)
         self.assertEqual(self.path.read_text(), text)
 
     def test_a_slug_outside_what_the_round_was_shown_is_not_reopened(self):
-        self.assertEqual(reconcile.reopen(["tail-sigma"], ["borel"], "x"), 0)
-        self.assertEqual(reconcile.reopen(["tail-sigma"], ["tail-sigma"], "a (b; c)"), 1)
+        self.assertEqual(reconcile.reopen(["tail-sigma"], {"borel": SEEN}, "x"), 0)
+        self.assertEqual(reconcile.reopen(["tail-sigma"], {"tail-sigma": SEEN}, "a (b; c)"), 1)
         self.assertIn("by a b c)", self.path.read_text())
+
+    def test_a_late_report_does_not_revoke_an_inference_the_round_never_saw(self):
+        stale = t.parse_targets(self.path.read_text())
+        item, needs = stale.find("zero-one"), t.inferred_needs(stale, stale.find("zero-one"))
+        self.path.write_text(LIST.replace("#TailSigma.measure on 2026-01-01", "#Probability.tail_sigma on 2026-01-05"))
+        directory = self.tmp / "report"
+        directory.mkdir()
+        (directory / "prerequisites.txt").write_text("tail-sigma\n")
+        work._reopen_reported((directory, item, needs))
+        text = self.path.read_text()
+        self.assertEqual(t.parse_targets(text).find("tail-sigma").status, "done")
+        self.assertNotIn("reopened:", text)
 
     def test_the_round_wiring_reads_the_report_and_names_the_round(self):
         listed = t.parse_targets(self.path.read_text())

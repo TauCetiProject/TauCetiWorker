@@ -959,13 +959,14 @@ def reported(file: Path, allowed: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(slug for slug in slugs if slug in allowed))
 
 
-def reopen(slugs: Iterable[str], allowed: Iterable[str], by: str) -> int:
-    """Open again each of `slugs` that is in `allowed` and is still an inferred tick in the target
-    list, dropping its `inferred:` clause and recording its evidence and `by` in a `reopened:`
-    clause, so the same evidence does not tick it again. Waits up to REOPEN_WAIT seconds for the
-    list's lock and does not move the look gap. Returns how many items were opened."""
+def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str) -> int:
+    """Open again each of `slugs` that is in `seen` and is still ticked by inference on exactly the
+    evidence `seen` gives for it (what the reporting round was shown), dropping its `inferred:`
+    clause and recording that evidence and `by` in a `reopened:` clause, so the same evidence does
+    not tick it again. Waits up to REOPEN_WAIT seconds for the list's lock and does not move the
+    look gap. Returns how many items were opened."""
     listed = roadmap_targets()
-    slugs = [slug for slug in dict.fromkeys(slugs) if slug in set(allowed)]
+    slugs = [slug for slug in dict.fromkeys(slugs) if slug in seen]
     if listed is None or not slugs:
         return 0
     path = listed.resolve()
@@ -996,8 +997,8 @@ def reopen(slugs: Iterable[str], allowed: Iterable[str], by: str) -> int:
         for slug in slugs:
             item = targets.find(slug)
             tick = inferred(item) if item is not None else None
-            if tick is None:
-                log(f"reconcile: `{slug}` is not an inferred tick in {path.name}; not reopened")
+            if tick is None or tick[0] != seen[slug]:
+                log(f"reconcile: `{slug}` is no longer the inferred tick the round saw; not reopened")
                 continue
             clause = f"reopened: {_evidence(tick[0])} by {by}"
             changes.append(Change(item, "open", f"reopened by {by}", ("inferred",), (clause,)))
