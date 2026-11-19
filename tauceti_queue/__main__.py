@@ -487,6 +487,9 @@ def cmd_status(args: argparse.Namespace, fetch: Callable[..., dict[str, Any]] = 
     except RuntimeError as exc:
         _log(str(exc))
         return 1
+    from . import build_progress
+
+    build_progress.attach(document, fetch)
     if args.json:
         print(json.dumps(document, indent=2, sort_keys=True))
     else:

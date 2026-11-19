@@ -26,7 +26,9 @@ Status document layout (all times are UTC ISO 8601; absent sections are `null`):
     conditions      list of the first-line conditions from "Production monitoring", each
                     {"condition": ..., "since": ..., "detail": ...}
     head            batch, version, base, tip, members, claim, ci {run_id, runner, host,
-                    started_at, phases[{name, started_at, updated_at, progress}]}, waiting_for
+                    started_at, phases[{name, started_at, updated_at, progress}]}, waiting_for;
+                    `tauceti-queue status` adds ci.build_progress from the public live build
+                    report (`build_progress.py`) while the run is in progress
     open_batch      batch, size, oldest_member_age_seconds
     approved_waiting  count of approved inputs not yet inserted
     pending_task    the claimable repair or conflict task, if any
@@ -305,6 +307,13 @@ def summarize(document: Mapping[str, Any], now: datetime | None = None) -> str:
                     f"  step {step.get('index', '?')}/{step.get('total', '?')} {step.get('name', '?')} "
                     f"({step.get('job', '?')}), running {_age(step.get('started_at'), now)}"
                 )
+            progress = ci.get("build_progress")
+            if isinstance(progress, Mapping) and ci.get("status") == "in_progress":
+                from . import build_progress
+
+                line = build_progress.text(progress, (now or datetime.now(UTC)).timestamp())
+                if line:
+                    lines.append("  " + line)
             phases = list(ci.get("phases") or [])
             if len(phases) > 6:
                 lines.append(f"    ({len(phases) - 6} earlier phases)")
