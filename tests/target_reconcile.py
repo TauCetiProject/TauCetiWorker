@@ -387,10 +387,26 @@ class Round(Tmp):
         self.assertEqual(self.reconcile(), (None, "the target list is current"))
         self.assertLessEqual(time.time() - self.w.counters.read(reconcile.ATTEMPT_KEY), 5)
 
-    def test_bors_landings_count_as_merged(self):
-        self.w.gh = self.github(states={1234: {"state": "CLOSED", "title": "[Merged by Bors] - Truncation bounds"}})
-        self.assertEqual(self.reconcile(), (0, ""))
-        self.assertIn("(needs: none; landed: #1234)", self.path.read_text())
+    def test_a_queue_title_counts_as_merged_only_with_the_sources_landing_proof(self):
+        queued = {"state": "CLOSED", "title": "[Merged by Bors] - Truncation bounds"}
+        claimed = [(8, marker("MeasureTheory", "kolmogorov-zero-one"))]
+        self.w.gh = self.github(states={1234: queued})
+        self.assertEqual(self.reconcile(), (None, "the target list is current"))
+        self.assertEqual(self.path.read_text(), EXAMPLE)
+        asked = []
+        for proof, item in ((False, "(needs: none; closed: #1234)"), (True, "(needs: none; landed: #1234)")):
+            self.path.write_text(EXAMPLE)
+            self.w.gh = self.github(states={1234: queued})
+            self.w.gh.merged_prs = lambda search, limit: [
+                {"number": n, "body": body, "baseRefName": "main", "state": "CLOSED", "title": queued["title"]}
+                for n, body in claimed
+            ]
+            self.w.gh.target_queue_landed = lambda number, branch, proof=proof: asked.append(number) or proof
+            self.assertEqual(self.reconcile(), (0, ""))
+            text = self.path.read_text()
+            self.assertIn(item, text)
+            self.assertEqual("landed: #8" in text, proof)
+        self.assertEqual(sorted(asked), [8, 8, 1234, 1234])
 
     def test_one_look_at_a_time_and_none_without_reads(self):
         lock = os.open(self.path.with_name(".targets.md.lock"), os.O_RDWR | os.O_CREAT)
@@ -567,10 +583,12 @@ class ForgejoLists(Tmp):
         url = self.repo.pull_url(12)
         self.path.write_text(EXAMPLE.replace("in flight: #1234", f"in flight: {url}"))
         self.states = {12: {"state": "CLOSED", "title": landed, "body": ""}}
-        self.assertEqual(self.reconcile(self.forgejo), (0, ""))
+        with patch.object(self.forgejo, "target_queue_landed", return_value=True, create=True) as proof:
+            self.assertEqual(self.reconcile(self.forgejo), (0, ""))
         text = self.path.read_text()
         self.assertIn(f"(needs: none; landed: {url})", text)
         self.assertIn(f"landed: {self.repo.pull_url(3)})", text)
+        self.assertEqual(sorted(call.args for call in proof.call_args_list), [(3, "main"), (12, "main")])
 
     def test_a_partial_url_with_an_uppercase_scheme_is_still_an_exclusion(self):
         self.merged_rows = []

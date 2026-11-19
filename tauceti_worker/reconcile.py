@@ -30,7 +30,7 @@ from tauceti_tools.forge import GITHUB, RepositoryRef
 
 from .config import Die, SourceUnavailable, log, one_line, roadmap_targets
 from .constants import TAUCETI
-from .github import GitHubError, normalize_merged
+from .github import BORS_MERGED_PREFIX, GitHubError
 from .targets import (
     MERGED_SEARCH,
     GitHubMarkerReads,
@@ -47,6 +47,7 @@ from .targets import (
     partial_prs,
     ref_key,
     rewrite_item,
+    verified_landings,
 )
 
 GAP = int(os.environ.get("TAUCETI_RECONCILE_GAP", "21600"))
@@ -99,9 +100,23 @@ class Source:
     def merged_prs(self) -> list[dict]:
         return self._read("merged_prs", f"{MERGED_SEARCH} sort:updated-desc", limit=MERGED_LIMIT)
 
+    def target_queue_landed(self, number: int, branch: str) -> bool | None:
+        """The source's proof that the merge queue landed pull request `number` on `branch`; None
+        when the source has no such proof or could not read it."""
+        if getattr(self.reads, "target_queue_landed", None) is None:
+            return None
+        found = self._read("target_queue_landed", number, branch)
+        return found if isinstance(found, bool) else None
+
     def view(self, number: int) -> dict:
+        """The pull request's state, title, body and base. One closed under the queue's title is
+        MERGED only with the source's landing proof, CLOSED when the proof is refused, and unknown
+        (`{}`) when there is none."""
         row = self._read("pr_view", number, ["state", "title", "body", "baseRefName"]) or {}
-        return normalize_merged(row)
+        if row.get("state") == "CLOSED" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX):
+            proof = self.target_queue_landed(number, content_base())
+            return {} if proof is None else {**row, "state": "MERGED"} if proof else row
+        return row
 
 
 class _GitHubHistory(GitHubMarkerReads):
@@ -231,12 +246,18 @@ def apply(text: str, changes: Iterable[Change]) -> str:
 
 def observe(targets: Targets, read: list[Source]) -> Seen:
     """Read what `settle` needs from each source: its merged pull requests that carry a marker, and
-    one view per `in flight:` clause that names one of its pull requests. A clause naming a pull
-    request of no source in `read` is not looked at. Raises GitHubError or SourceUnavailable when a
+    one view per `in flight:` clause that names one of its pull requests. A pull request closed under
+    the queue's title counts as merged only with its source's landing proof (`verified_landings`,
+    `Source.view`). A clause naming a pull request of no source in `read` is not looked at. Raises GitHubError or SourceUnavailable when a
     listing fails."""
     merged: list[dict] = []
+    pending = [it for it in targets.items() if it.status != "done"]
     for source in read:
-        merged += source.merged_prs()
+        for row in source.merged_prs():
+            if row.get("state") != "CLOSED":
+                merged.append(row)
+            elif verified_landings(pending, [row], source):
+                merged.append({**row, "state": "MERGED"})
     named = {inflight_ref(it) for it in targets.items() if it.status == "inflight"} - {None}
     pulls = {}
     for ref in sorted(named):
