@@ -31,8 +31,9 @@ On the queue host these commands run as systemd user units from their own releas
 
 installs `tauceti-queue-monitoring.service` (the live publisher above),
 `tauceti-queue-task-activity.service` (the repair-phase observer below), and
-`tauceti-queue-monitoring-history.service` with its hourly timer (the history report below), then
-restarts the two long-running units. Host-specific extra arguments, such as retired workers' task
+`tauceti-queue-monitoring-history.service` with its hourly timer (the history report below), and
+`tauceti-queue-forgejo-team-sync.timer` (docs/forgejo-worker.md, "Claim access for contributor fleets"),
+then restarts the two long-running units. Host-specific extra arguments, such as retired workers' task
 roots, go in `~/.config/tauceti-queue/monitoring-environment` as `TAUCETI_QUEUE_MONITORING_ARGS`
 (`services/queue/monitoring-environment.example`). Never use systemd drop-ins for these units, and
 never point them at a hand-made directory: the installer creates their release, refuses to run
