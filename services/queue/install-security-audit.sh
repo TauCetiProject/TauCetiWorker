@@ -6,7 +6,7 @@
 # default ~/TauCetiQueue, whose own working tree is left alone), hands off to that release's copy
 # of this script, builds the release's uv environment, installs tauceti-queue-security-audit.service
 # pointing at the release, reloads, restarts it and checks that it stays active and runs from the
-# release. The pool restores its ranges from ~/TauCetiQueue-data/security-audit after a restart.
+# release. The pool restores its ranges from its state after a restart.
 # No other unit is touched. Unused release directories are then removed (services/queue/release.sh).
 #
 # Usage: services/queue/install-security-audit.sh [--revision REF | --release DIR] [--checkout DIR] [--no-restart] [--wait SECONDS]
@@ -89,7 +89,7 @@ release_build "$RELEASE" "$target"
 
 # --- configuration --------------------------------------------------------------------------------
 [ -f "$CONFIG_DIR/security-audit-zulip.json" ] || die "$CONFIG_DIR/security-audit-zulip.json is missing (README.md, private Zulip alerts)"
-mkdir -p "$HOME/TauCetiQueue-data/security-audit"
+mkdir -p "$HOME/TauCetiQueue-data/security-audit-pool/state/pool/security-audit"
 
 # --- unit -----------------------------------------------------------------------------------------
 mkdir -p "$UNIT_DIR"

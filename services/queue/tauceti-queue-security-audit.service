@@ -22,8 +22,10 @@ WorkingDirectory=%h/TauCetiQueue
 Environment=PYTHONUNBUFFERED=1
 Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+# The pool's state must be a worker's audit state under the data root (worker ID `pool`).
+Environment=TAUCETI_LEGACY_DATA_ROOT=%h/TauCetiQueue-data/security-audit-pool
 Environment=TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG=%h/.config/tauceti-queue/security-audit-zulip.json
-ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_worker.security_audit pool --state %h/TauCetiQueue-data/security-audit --parallel 16 --ignore-quota
+ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_worker.security_audit pool --state %h/TauCetiQueue-data/security-audit-pool/state/pool/security-audit --parallel 16 --ignore-quota
 Restart=on-failure
 RestartSec=60
 UMask=0077

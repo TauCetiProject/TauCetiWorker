@@ -371,7 +371,8 @@ python3 -m tauceti_worker.security_audit pool --state /path/to/worker/state/secu
 On the queue host, `services/queue/install-security-audit.sh` runs the pool as
 `tauceti-queue-security-audit.service` from its own origin/main release, like the other queue
 units (`docs/queue/operations.md`, "Install and update"): `--parallel 16 --ignore-quota` on
-`~/TauCetiQueue-data/security-audit`, with alerts configured by
+`~/TauCetiQueue-data/security-audit-pool/state/pool/security-audit` (worker `pool` under the data root
+`~/TauCetiQueue-data/security-audit-pool`), with alerts configured by
 `~/.config/tauceti-queue/security-audit-zulip.json`. The account's active gh credential must be a
 TauCeti admin.
 

@@ -394,10 +394,27 @@ class Releases(unittest.TestCase):
         unit = "tauceti-queue-security-audit.service"
         self.assertEqual(self.setting(unit, "WorkingDirectory"), str(release))
         exec_start = self.setting(unit, "ExecStart")
-        self.assertTrue(exec_start.startswith(f"{release}/.venv/bin/python -m tauceti_worker.security_audit pool "), exec_start)
-        self.assertIn("--state %h/TauCetiQueue-data/security-audit", exec_start)
+        self.assertTrue(
+            exec_start.startswith(f"{release}/.venv/bin/python -m tauceti_worker.security_audit pool "), exec_start
+        )
+        self.assertIn("--state %h/TauCetiQueue-data/security-audit-pool/state/pool/security-audit", exec_start)
         self.assertEqual(self.cwd(unit), str(release))
         self.assertEqual(self.pid("tauceti-queue-monitoring.service"), monitoring_pid)
+
+    def test_security_audit_unit_state_is_the_pool_workers_audit_state(self):
+        text = (REPO / "services/queue/tauceti-queue-security-audit.service").read_text().replace("%h", str(self.home))
+        root = re.search(r"^Environment=TAUCETI_LEGACY_DATA_ROOT=(\S+)$", text, re.M).group(1)
+        state = Path(re.search(r"--state (\S+)", text).group(1))
+        script = (
+            "import sys; from pathlib import Path; from tauceti_worker.config import Config; "
+            "s = Path(sys.argv[1]); print(Config.resolve(s.parent.name).state / 'security-audit')"
+        )
+        env = dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=root, HOME=str(self.home))
+        env.pop("TAUCETI_PROJECT_STATE", None)
+        resolved = subprocess.run(
+            [sys.executable, "-c", script, str(state)], cwd=REPO, env=env, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        self.assertEqual(Path(resolved), state)
 
     def test_security_audit_drop_in_is_refused(self):
         (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
