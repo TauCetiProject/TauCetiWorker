@@ -434,12 +434,9 @@ REMOTE = f"https://github.com/{TAUCETI}.git"
 def app_login() -> str:
     """The audit App's bot login, after confirming its token can write TauCeti contents."""
     metadata = app_metadata()
-    repositories = api("installation/repositories?per_page=100", as_app=True)
-    try:
-        names = {r["full_name"].lower() for r in repositories["repositories"]}
-    except (KeyError, TypeError, AttributeError) as exc:
-        raise NoProgress("security-audit: invalid GitHub response") from exc
-    if TAUCETI.lower() not in names:
+    # A repository-specific read: it succeeds only if the installation can access TauCeti.
+    repository = api(f"repos/{TAUCETI}", as_app=True)
+    if not isinstance(repository, dict) or str(repository.get("full_name", "")).lower() != TAUCETI.lower():
         raise Die(f"security-audit: the GitHub App in {APP_ENV} is not installed on {TAUCETI}")
     granted = _app_source.granted_permissions() if _app_source is not None else {}
     if granted.get("contents") != "write":
@@ -455,6 +452,14 @@ def admin_login() -> str:
     cursor push itself enforces)."""
     if app_dir() is not None:
         return app_login()
+    return human_admin_login()
+
+
+def human_admin_login() -> str:
+    """A person's gh login after confirming repository-admin permission; never the audit App.
+
+    Human attestation uses this even when the App is configured: only an administrator may
+    advance past findings without a passing inspection."""
     owner, name = TAUCETI.split("/")
     argv = [
         "gh",
@@ -1430,7 +1435,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
 
 def attest(state: Path, through: str, reason: str) -> None:
     """Explicit human sign-off for findings or input too large for one cheap session."""
-    require_admin()
+    human_admin_login()
     if not SHA.fullmatch(through) or not reason.strip():
         raise Die("attestation requires a full commit SHA and a nonempty human review reason")
     state.mkdir(parents=True, exist_ok=True)
@@ -1439,7 +1444,7 @@ def attest(state: Path, through: str, reason: str) -> None:
     refresh(repo, cursor, main)
     remaining = validate_history(repo, cursor, main, through)
     commits = remaining[: remaining.index(through) + 1]
-    actor = admin_login()
+    actor = human_admin_login()
     record(
         state / "ledger.jsonl",
         {

@@ -756,7 +756,7 @@ class Authority(unittest.TestCase):
 
     def test_audit_app_authority_and_dispatch(self):
         directory = self.app_fixture()
-        installed = {"repositories": [{"full_name": "TauCetiProject/TauCeti"}]}
+        installed = {"full_name": "TauCetiProject/TauCeti"}
         source = SimpleNamespace(granted_permissions=lambda: {"contents": "write", "metadata": "read"})
         ok = SimpleNamespace(returncode=0, stdout=json.dumps(installed), stderr="")
         with (
@@ -768,26 +768,41 @@ class Authority(unittest.TestCase):
             self.assertEqual(sa.admin_login(), "tauceti-security-audit[bot]")
             self.assertEqual(call.call_args.kwargs["env"]["GH_TOKEN"], "ghs-app-token")
             self.assertNotIn("graphql", call.call_args.args[0])
+            self.assertIn(f"repos/{sa.TAUCETI}", call.call_args.args[0])
             call.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
             sa.dispatch_advanced(Path("unused"), "d" * 40)
             self.assertIn(f"repos/{sa.TAUCETI}/dispatches", call.call_args.args[0])
             self.assertEqual(call.call_args.kwargs["env"]["GH_TOKEN"], "ghs-app-token")
-        for repositories, granted in (([], {"contents": "write"}), (installed["repositories"], {"contents": "read"})):
+        for repository, granted in (
+            ({"full_name": "other/repo"}, {"contents": "write"}),
+            (installed, {"contents": "read"}),
+        ):
             with (
-                self.subTest(repositories=repositories, granted=granted),
+                self.subTest(repository=repository, granted=granted),
                 patch.dict(sa.os.environ, {sa.APP_ENV: str(directory)}),
                 patch.object(sa, "app_token", return_value="ghs-app-token"),
                 patch.object(sa, "_app_source", SimpleNamespace(granted_permissions=lambda g=granted: g)),
                 patch.object(
-                    sa,
-                    "execute",
-                    return_value=SimpleNamespace(
-                        returncode=0, stdout=json.dumps({"repositories": repositories}), stderr=""
-                    ),
+                    sa, "execute", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(repository), stderr="")
                 ),
                 self.assertRaises(Die),
             ):
                 sa.admin_login()
+
+    def test_attestation_needs_a_human_admin_even_with_the_audit_app(self):
+        directory = self.app_fixture()
+        target = "b" * 40
+        with (
+            patch.dict(sa.os.environ, {sa.APP_ENV: str(directory)}),
+            patch.object(sa, "app_login", return_value="tauceti-security-audit[bot]") as app,
+            patch.object(sa, "human_admin_login", side_effect=Die("not an administrator")) as human,
+            patch.object(sa, "advance") as advance,
+            self.assertRaises(Die),
+        ):
+            sa.attest(Path("unused"), target, "reviewed by hand")
+        human.assert_called_once()
+        app.assert_not_called()
+        advance.assert_not_called()
 
     def test_audit_app_bypasses_only_the_cursor_ruleset(self):
         directory = self.app_fixture()
