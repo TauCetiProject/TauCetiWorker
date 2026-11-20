@@ -69,6 +69,7 @@ RUN_STDLIB=(
   worker_sizing.py
   queue_repair_experiment.py
   queue_repair_task.py
+  queue_lint_scope.py
   queue_repair_locks.py
   queue_repair_cleanup.py
   queue_install_releases.py

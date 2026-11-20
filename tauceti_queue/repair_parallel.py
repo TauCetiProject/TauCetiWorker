@@ -878,6 +878,7 @@ def repair_groups(
             lock_wait = time.monotonic()
             with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
                 record["lock_wait_seconds"] = round(time.monotonic() - lock_wait, 1)
+                built_head = repair_audit.lint_scope.snapshot(worktree)
                 # CI's offline bwrap sandbox, as every build the worker runs (``repair_sandbox``).
                 build = repair.run_logged(
                     repair_sandbox.sandboxed_lake(
@@ -898,6 +899,7 @@ def repair_groups(
                         logdir=logdir,
                         lake=tuple(cfg.lake),
                         timeout=cfg.build_timeout,
+                        verified_head=built_head,
                     )
                     record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
                     check_findings = checks["diagnostics"]

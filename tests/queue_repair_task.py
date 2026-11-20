@@ -547,6 +547,27 @@ LINT_DRIVER = r"""#!/usr/bin/env python3
 import os, sys, json
 from pathlib import Path
 args = sys.argv[1:]
+if args[0] != "--only-listed":
+    # The worker's whole-library pass of the environment-wide linters.
+    tag, marker, modules, *linters = args
+    stub = Path(os.environ["STUB_DIR"])
+    with (stub / "global-lint-runs.jsonl").open("a") as log:
+        log.write(json.dumps({"modules": Path(modules).read_text().splitlines(), "linters": linters}) + "\n")
+    if (stub / "global-lint-garbage").exists():
+        print("lint-env-driver: uncaught exception")
+        sys.exit(1)
+    found = stub / "global-lint-findings"
+    names = found.read_text().split() if found.exists() else []
+    if found.exists():
+        found.rename(stub / "global-lint-findings.reported")
+    header = f"-- Found {len(names)} errors in 9 declarations (plus 0 automatically generated ones) in TauCeti with {len(linters)} linters"
+    print(f"{tag}:1:0: error: {header}" if names else header)
+    if names:
+        print("/- The `simpNF` linter reports:\nSOME SIMP LEMMAS ARE NOT IN SIMP-NORMAL FORM. -/")
+        for name in names:
+            print(f"#check {name} /- simp can prove this -/")
+    print(Path(marker).read_text(), end="")
+    sys.exit(1 if names else 0)
 assert args[0] == "--only-listed", args
 _, tag, marker, scope, *linters = args
 stub = Path(os.environ["STUB_DIR"])
@@ -5547,11 +5568,23 @@ class WorkerAudits(Fixture):
             audits[0][audits[0].index("--") + 1 :][:6],
             ["lake", "env", "timeout", "--signal=TERM", "--kill-after=30", "3000s"],
         )
-        # Full lint includes unchanged source when no frozen scope policy is available.
-        self.assertEqual(
-            (self.stub_dir / "lint-scope.txt").read_text().split(),
-            ["TauCeti.A", "TauCeti.One", "TauCeti.Three", "TauCeti.Two"],
-        )
+        # The first lint, with no verified pass to compare against, covers the whole library and
+        # records its pass; the second covers the changed closure since that tip plus staging's scope
+        # (the members' modules), not the unchanged TauCeti.A.
+        self.assertEqual(first["checks"]["lint"]["scope"], "full")
+        self.assertIn("no verified lint pass", first["checks"]["lint_scope"]["reason"])
+        self.assertTrue(first["checks"]["lint_scope"]["recorded"])
+        self.assertEqual(second["checks"]["lint"]["scope"], "changed")
+        self.assertEqual(second["checks"]["lint_scope"]["reference"], first["tip"])
+        self.assertTrue(second["checks"]["lint_scope"]["recorded"])
+        self.assertEqual(second["checks"]["lint_scope"]["global"]["status"], "passed")
+        # The stub agent's second round changes no module, so no module is in the changed closure.
+        self.assertEqual(second["checks"]["lint_scope"]["modules"], 0)
+        self.assertEqual((self.stub_dir / "lint-scope.txt").read_text().split(), [])
+        # The environment-wide linters still ran over every module.
+        (wide,) = [json.loads(line) for line in (self.stub_dir / "global-lint-runs.jsonl").read_text().splitlines()]
+        self.assertEqual(wide["modules"], ["TauCeti.A", "TauCeti.One", "TauCeti.Three", "TauCeti.Two"])
+        self.assertEqual(wide["linters"], ["simpNF", "simpComm", "tacticAlt", "tacticDocs"])
         # The finding reached the agent as a diagnostic naming both modules, with their owners.
         calls = self.agent_calls()
         self.assertEqual(len(calls), 2)
@@ -5580,6 +5613,47 @@ class WorkerAudits(Fixture):
         self.assertEqual(outcome["verification"][0]["checks"]["lint"]["findings"], 1)
         prompt = self.agent_calls()[1]["prompt"]
         self.assertIn("- linter `simpNF`: `two` in `TauCeti/Two.lean` (PR #2's commit", prompt)
+        # A failed lint is no reference: the re-check lints the whole library again, and only its
+        # pass is recorded.
+        self.assertNotIn("recorded", outcome["verification"][0]["checks"]["lint_scope"])
+        self.assertEqual(outcome["verification"][1]["checks"]["lint"]["scope"], "full")
+        self.assertTrue(outcome["verification"][1]["checks"]["lint_scope"]["recorded"])
+        passes = (cfg.root / repair_audit.TOOLS_DIR / "lint-passes.jsonl").read_text().splitlines()
+        self.assertEqual([json.loads(line)["commit"] for line in passes], [outcome["verification"][1]["tip"]])
+
+    def test_a_scoped_lint_still_runs_the_environment_wide_linters_over_the_whole_library(self):
+        # The first verification fails on the audit and passes the lint; the second lints the changed
+        # closure and finds a simpNF violation in an unchanged module through the whole-library pass.
+        self.findings("audit-findings", DUPLICATE_LINE)
+        self.findings("global-lint-findings", "TauCeti.two")
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        first, second, third = outcome["verification"]
+        self.assertEqual((first["checks"]["lint"]["scope"], first["checks"]["lint"]["findings"]), ("full", 0))
+        self.assertFalse(second["ok"])
+        self.assertEqual(second["checks"]["lint"]["scope"], "changed")
+        self.assertEqual(second["checks"]["lint_scope"]["global"]["status"], "failed")
+        self.assertEqual(second["checks"]["lint"]["findings"], 1)
+        prompt = self.agent_calls()[2]["prompt"]
+        self.assertIn("simpNF: TauCeti.two (location unknown: unlocated)", prompt)
+        self.assertTrue(third["ok"])
+        self.assertEqual(third["checks"]["lint_scope"]["reference"], first["tip"])
+
+    def test_an_unreadable_environment_wide_report_falls_back_to_the_full_lint(self):
+        self.findings("audit-findings", DUPLICATE_LINE)
+        self.findings("global-lint-garbage", "")  # the driver exits without a report
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        second = outcome["verification"][1]
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(second["checks"]["lint"]["scope"], "full")
+        self.assertIn("the environment-wide linters' report", second["checks"]["lint_scope"]["reason"])
+        self.assertEqual(
+            (self.stub_dir / "lint-scope.txt").read_text().split(),
+            ["TauCeti.A", "TauCeti.One", "TauCeti.Three", "TauCeti.Two"],
+        )
 
     def test_a_finding_that_persists_is_never_submitted(self):
         self.findings("audit-findings-always", DUPLICATE_LINE)
@@ -5953,6 +6027,8 @@ class StreamAudits(WorkerAudits):
     test_prepare_runs_final_audits_and_reports_observed_duplicates = None
     test_a_duplicate_fails_the_verification_and_the_agent_is_run_on_it = None
     test_a_lint_finding_fails_the_verification = None
+    test_a_scoped_lint_still_runs_the_environment_wide_linters_over_the_whole_library = None
+    test_an_unreadable_environment_wide_report_falls_back_to_the_full_lint = None
     test_a_finding_that_persists_is_never_submitted = None
     test_without_the_setting_nothing_is_checked = None
     test_the_build_helper_runs_the_audits_after_a_green_whole_library_build = None

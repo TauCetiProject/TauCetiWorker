@@ -372,10 +372,22 @@ has a time budget holds because the service re-exposes the task.
    where the worker does not own final verification, the agent's full-library helper) it runs every check
    staging runs, all at once: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti
    module, duplicate declarations, axioms), the module-system check (`ModuleSystem.lean`), `lint-env.sh`
-   with the `lint-env-driver` over the full library, `lint-style.sh` (Mathlib's text linters and the
+   with the `lint-env-driver` (scope below), `lint-style.sh` (Mathlib's text linters and the
    header check) and `lint-dot-notation.py` against its baseline. Every task, head or background, gets
-   the same set; there is no check owner and nothing is deferred to staging. Without a frozen
-   GitHub scope-policy snapshot the worker uses staging's conservative full-lint fallback. The sources are the TauCetiTools pin
+   the same set; there is no check owner and nothing is deferred to staging. The environment lint's scope
+   (`tauceti_queue/lint_scope.py`, which lists the linters it treats as local and as environment-wide) is
+   the changed closure when that is sound: the TauCeti modules changed since a commit whose lint this
+   worker saw pass under the same TauCetiTools commit, toolchain, manifest and policy files
+   (`<root>/tauceti-tools/lint-passes.jsonl`) and their transitive importers. `lint-env.sh` runs on that
+   list in staging's batch mode (`LINT_CHANGED_ONLY=0`), and the environment-wide linters (`simpNF`,
+   `simpComm`, `tacticAlt`, `tacticDocs`) then run over the whole library through the pinned driver,
+   judged against the same baseline; if that report cannot be read, the full `lint-env.sh` runs instead.
+   The full library is linted directly without such a pass, with uncommitted changes, when anything but
+   TauCeti modules and documentation changed, when a changed line may set another module's attribute
+   (`attribute`, `existing`, `add_decl_doc`), when an import header cannot be read with certainty, when the
+   closure is the whole library anyway, or with `TAUCETI_QUEUE_SCOPED_LINT=0`. Only the verification
+   build and the parallel path's verification build record passes, for the commit that was checked out,
+   clean, both before the build and after the lint. The sources are the TauCetiTools pin
    the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into
    `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and the worktree's
    `scripts/` as policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
