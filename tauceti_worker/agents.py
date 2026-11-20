@@ -54,6 +54,7 @@ from .quota import (
     _safe_exists,
     _write_json_atomic,
     claude_dir,
+    claude_usage_credentials,
     codex_dir,
     mirror_creds,
 )
@@ -243,10 +244,19 @@ def _codex_model_unavailable(returncode: int, transcript: str) -> bool:
     return returncode != 0 and _codex_model_rejected(*_codex_error_details(transcript))
 
 
+def _without_usage_credentials(env: dict) -> dict:
+    """Keep usage-login configuration inside worker orchestration, away from agent processes."""
+    return {
+        k: v
+        for k, v in env.items()
+        if k not in ("TAUCETI_CLAUDE_USAGE_CREDENTIALS", "TAUCETI_CLAUDE_USAGE_OPERATOR_HOME")
+    }
+
+
 def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[str]:
     """Make one read-only, ephemeral request that cannot mutate the authoring checkout."""
     cfg.state.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
+    env = _without_usage_credentials(dict(os.environ))
     env.pop("OPENAI_API_KEY", None)  # authoring is subscription-paced; probe that same account
     env.pop("ANTHROPIC_API_KEY", None)
     command = [
@@ -414,7 +424,7 @@ def validate_kiro_model_access(cfg: Config, profile: AuthoringProfile) -> Author
         return profile
     _validate_kiro_model_pin(profile.model, profile.model_source)
     cfg.state.mkdir(parents=True, exist_ok=True)
-    env = kiro_process_env(dict(os.environ))
+    env = kiro_process_env(_without_usage_credentials(dict(os.environ)))
     try:
         result = subprocess.run(
             ["kiro-cli", "chat", "--list-models", "--format", "json"],
@@ -974,6 +984,7 @@ def host_agent_argv(
     from .build_resources import defaults
 
     env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
+    env = _without_usage_credentials(env)
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
@@ -1528,7 +1539,7 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
 
             if current() is None:
                 api_env.update(CLAIM_REPO=claims_repo(), TAUCETI_CLAIM_SH=CLAIM_SH)
-    env_kwargs = {"env": api_env} if api_env is not None else {}
+    env_kwargs = {"env": _without_usage_credentials(dict(os.environ) if api_env is None else api_env)}
     if os.environ.get("TAUCETI_STREAM"):
         return run_process(argv, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
@@ -2351,6 +2362,17 @@ def ensure_bubble_home(cfg: Config) -> dict:
                 f"writable Lean caches to the agent. Bubble said: {detail}"
             )
     return env
+
+
+def claude_review_file_flags(reviewers: str) -> list[str]:
+    """Require a compatible private-file reviewer only for separate-usage Claude subscriptions."""
+    if (
+        claude_usage_credentials() is not None
+        and _uses_claude_credentials(reviewers)
+        and os.environ.get("TAUCETI_CLAUDE_BILLING") != "api"
+    ):
+        return ["--auth", "subscription", "--require-claude-config-file"]
+    return []
 
 
 def _uses_claude_credentials(work_model: str) -> bool:
@@ -3247,6 +3269,8 @@ def _review_in_bubble_with(
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
     )
+    if strict_file_flags := claude_review_file_flags(reviewers):
+        inner += " " + " ".join(strict_file_flags)
     if result_file is not None:
         inner = f"env TAUCETI_REVIEW_RESULT_FILE=/opt/review-result/{shlex.quote(result_file.name)} " + inner
     if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api":
@@ -3549,6 +3573,9 @@ def isolate_home(wid: str) -> Path:
     Returns the worker home. Children inherit the exported variables (and, off macOS, $HOME)."""
     import shutil
 
+    from .quota import normalize_claude_usage_credentials
+
+    normalize_claude_usage_credentials()
     home = _worker_iso_home(wid)
     iso_claude, iso_codex = home / ".claude", home / ".codex"
     iso_kiro_home, iso_kiro_data = home / ".kiro", kiro_data_dir(home, {})

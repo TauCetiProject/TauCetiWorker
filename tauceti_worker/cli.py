@@ -99,9 +99,14 @@ from .quota import (
     Quota,
     _claude_keychain_creds,
     _safe_exists,
+    claude_agent_credential_route,
     claude_dir,
+    claude_usage_configuration_problem,
+    claude_usage_credentials,
+    claude_usage_identity_verified,
     codex_dir,
     effective_pace_specs,
+    normalize_claude_usage_credentials,
     pace_env,
     parse_pace_curve,
 )
@@ -170,6 +175,7 @@ environment (each flag overrides its matching variable; full reference linked be
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude token; see --auto-refresh)
+  TAUCETI_CLAUDE_USAGE_CREDENTIALS  a second Claude login read for usage only (agents on a setup-token)
   TAUCETI_FULL_QUALITY=1 same as --full-quality
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
@@ -1395,6 +1401,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             "--host is now the default (the agent runs directly on the host); it is a no-op. "
             "Pass --bubble to run inside the sandbox instead"
         )
+    normalize_claude_usage_credentials()
+    # The pacer reads this to know which Claude credential the agents receive; loop children re-pin it.
+    os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"] = claude_agent_credential_route(
+        only, bubble=getattr(args, "bubble", False)
+    )
     author_model = getattr(args, "author_model", None)
     author_effort = getattr(args, "author_effort", None)
     resolved_author_fallback_model = getattr(args, "resolved_author_fallback_model", None)
@@ -1528,9 +1539,13 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     from .activity import pin_root
 
     pin_root()
+    if problem := claude_usage_configuration_problem(Config.resolve(wid), check_identity=False):
+        raise Die(problem)
     if wid != "default" or getattr(args, "isolate_home", False):
         isolate_home(wid)
     cfg = Config.resolve(wid)
+    if problem := claude_usage_configuration_problem(cfg, check_identity=False):
+        raise Die(problem)
     # Tee this process's log() output to a per-worker file so a `work --loop` started in a bare terminal
     # still leaves an on-disk record to monitor. The loop driver picks one session file and exports its
     # path; the _round children it spawns inherit TAUCETI_LOG_FILE and append to the SAME file.
@@ -1772,6 +1787,21 @@ def cmd_host_doctor(args) -> int:
         # macOS keeps Claude creds in the login Keychain, not a file; the pacer reads them there.
         rows.append(
             ("claude creds", _claude_keychain_creds() is not None, 'macOS login Keychain ("Claude Code-credentials")')
+        )
+    usage_creds = claude_usage_credentials()
+    if usage_creds is not None:
+        problem = claude_usage_configuration_problem(cfg)
+        assertion = (
+            "local account fields agree"
+            if claude_usage_identity_verified(cfg)
+            else ("same-account identity is an operator assertion; no comparable local identity")
+        )
+        rows.append(
+            (
+                "claude usage",
+                _safe_exists(usage_creds) and not problem,
+                problem or f"{usage_creds} (usage only; {assertion}; agent phases checked by work)",
+            )
         )
     kiro_db = kiro_data_dir(cfg.home) / "data.sqlite3"
     rows.append(

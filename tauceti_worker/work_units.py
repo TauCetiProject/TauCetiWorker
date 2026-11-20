@@ -26,6 +26,7 @@ from .agents import (
     _claude_review_model,
     _codex_review_model_override,
     _kiro_review_model,
+    claude_review_file_flags,
     fetch_git_source,
     fetch_ref,
     fill_prompt,
@@ -1737,6 +1738,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
     github_started = time.time()
     pr, head = c.pr, c.head
     reviewers = opts.work_model
+    strict_file_flags = claude_review_file_flags(reviewers)
     if reviewers in ("auto", ""):
         raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
     errkey = f"review-err-{pr}"
@@ -1787,6 +1789,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                         str(w.cfg.store_dir),
                         "--post",
                         "--no-sync",
+                        *strict_file_flags,
                         "--reviewer",
                         reviewers,
                         *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
@@ -1884,6 +1887,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             w.rs.bust(pr)
         elif blocked_since(github_started):
             raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
+        elif rc == 2 and strict_file_flags:
+            raise NoProgress(
+                f"review #{pr}: Review command rejected the required Claude file-route configuration; "
+                "update the configured Review runtime — machine-wide, not charged to the PR"
+            )
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:
             # The engine stopped because the reviewer's provider is unusable — a revoked credential or
             # an exhausted subscription window — and it deliberately posted nothing (TauCetiReview#117).
