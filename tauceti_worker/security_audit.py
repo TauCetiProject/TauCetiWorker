@@ -2162,6 +2162,26 @@ def pool_active(work: Path) -> bool:
     return False
 
 
+def observe(work: Path) -> tuple[str, int]:
+    """The protected cursor and how many first-parent main commits it has not yet covered."""
+    repo = work / "objects.git"
+    cursor, main = remote_sha(CURSOR), remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
+    refresh(repo, cursor, main)
+    return cursor, len(validate_history(repo, cursor, main))
+
+
+def watch(cfg, *, min_commits: int) -> None:
+    """Run the cursor watchdog for this worker's audit state; a no-op without private alerts."""
+    from . import audit_watchdog
+
+    if not os.environ.get("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG"):
+        return
+    work = cfg.state / CURSOR
+    if pool_active(work):
+        return  # The pool owns this cursor and runs the watchdog on every pass, with its own threshold.
+    audit_watchdog.check(work, lambda: observe(work), min_commits=min_commits)
+
+
 def run(cfg, opts, *, min_commits: int = 1) -> int:
     if type(min_commits) is not int or min_commits < 1:
         raise Die("security-audit: minimum pending commits must be a positive integer")
@@ -2645,7 +2665,9 @@ if __name__ == "__main__":
     # GitHub and reviewer clients launched from here need the host's trust store.
     ensure_ssl_cert_file()
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["setup", "attest", "resume", "retry-service", "repair-output", "pool"])
+    parser.add_argument(
+        "command", choices=["setup", "attest", "resume", "retry-service", "repair-output", "pool", "watchdog"]
+    )
     parser.add_argument("--state", type=Path, required=True)
     parser.add_argument("--through", help="full main commit SHA reviewed by the human administrator")
     parser.add_argument("--reason", help="human review evidence; never a model re-roll")
@@ -2657,6 +2679,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.command == "setup":
         setup(args.state)
+    elif args.command == "watchdog":
+        # Independent of audit rounds, so a dead or long-busy Worker or pool still produces the DM.
+        from . import audit_watchdog
+
+        # The owner's (Worker or pool) last admission threshold, so this check never disagrees with it.
+        audit_watchdog.check(args.state, lambda: observe(args.state), min_commits=audit_watchdog.threshold(args.state))
     elif args.command == "pool":
         from .audit_pool import Chooser, Pool
         from .config import Config

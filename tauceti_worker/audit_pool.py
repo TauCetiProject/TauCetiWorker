@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import audit_watchdog
 from . import security_audit as sa
 from .audit_alerts import notify_block, save
 from .config import Die, NoProgress, log
@@ -142,6 +143,8 @@ class Pool:
         self.inherited: tuple[dict, dict, str, str] | None = None
         self.fetched: tuple[str, str] | None = None
         self.holding: str | None = None  # Cursor of a block awaiting human review, logged once.
+        # The latest (cursor, pending) a pass observed, or the error that prevented it: the watchdog's input.
+        self.observation: tuple[str, int] | BaseException = NoProgress("security-audit pool: not yet observed")
 
     # Persistence -----------------------------------------------------------
     def persist(self, slot: Slot) -> None:
@@ -679,10 +682,15 @@ class Pool:
     # Loop ------------------------------------------------------------------
     def step(self, executor) -> bool:
         """One control pass. A binding block at the cursor holds advancement, never the pool."""
-        cursor, main = sa.remote_sha(sa.CURSOR), sa.remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
-        if (cursor, main) != self.fetched:
-            sa.refresh(self.repo, cursor, main)
-            self.fetched = (cursor, main)
+        try:
+            cursor, main = sa.remote_sha(sa.CURSOR), sa.remote_sha(os.environ.get("TAUCETI_BASE_BRANCH", "main"))
+            if (cursor, main) != self.fetched:
+                sa.refresh(self.repo, cursor, main)
+                self.fetched = (cursor, main)
+            self.observation = (cursor, len(sa.validate_history(self.repo, cursor, main)))
+        except BaseException as exc:
+            self.observation = exc
+            raise
         self.sync(cursor, main)
         blocked = self.work / "blocked.json"
         hold = False
@@ -715,6 +723,7 @@ class Pool:
         else:
             self.holding = None
         cursor = self.advance(cursor)
+        self.observation = (cursor, len(sa.validate_history(self.repo, cursor, main)))
         self.refill(cursor, main)
         if self.slots:
             pending = len(sa.validate_history(self.repo, cursor, main))
@@ -725,6 +734,11 @@ class Pool:
         if self.admin():
             self.submit(executor)
         return True
+
+    def observed(self) -> tuple[str, int]:
+        if isinstance(self.observation, BaseException):
+            raise self.observation
+        return self.observation
 
     def serve(self, *, stop=None) -> None:
         """Run until a binding block holds the cursor, or `stop(pool)` returns true."""
@@ -742,6 +756,9 @@ class Pool:
                             return
                     except NoProgress as exc:
                         log(f"security-audit pool: {exc}; retrying")
+                    finally:
+                        # Every pass, including one that fails with any exception.
+                        audit_watchdog.check(self.work, self.observed, min_commits=self.min_commits)
                     if stop is not None and stop(self):
                         return
                     timeout = 30 if self.slots else POLL_SECONDS
