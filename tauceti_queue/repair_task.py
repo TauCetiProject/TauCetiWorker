@@ -75,6 +75,7 @@ from tauceti_queue import (
     repair,
     repair_audit,
     repair_context,
+    repair_numproj,
     repair_parallel,
     repair_publish,
     repair_sandbox,
@@ -2411,6 +2412,36 @@ def resolve_conflicts(
                         fetch_env,
                         1800,
                     )
+            # Projection-only conflicts after `main` renamed numeric projections resolve without the agent
+            # (`repair_numproj`); any other outcome leaves the agent the conflict as before, or what is left.
+            prepass = (
+                repair_numproj.prepass(worktree, prefix, commit, paths, env_lake, logdir)
+                if (artifacts or {}).get("available")
+                else None
+            )
+            if prepass is not None:
+                log(
+                    f"task {task.task_id}: numproj pre-pass on {source_pr}'s commit {commit[:12]}: "
+                    f"merged {prepass.merged}, remaining {prepass.remaining}"
+                )
+            if prepass is not None and prepass.clean:
+                repair.listings_path(worktree).parent.mkdir(exist_ok=True)  # excluded from the commit
+                (worktree / repair.LISTINGS_DIR / repair.EXPLANATION_FILE).write_text(prepass.note + "\n")
+                tip, report = repair.commit_resolution(
+                    cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads
+                )
+                rest = accept(source_pr, prefix, commit, tip, report)
+                state.write("conflict_validated", conflict=source_pr, attempt=0, tip=tip, report=report, numproj=True)
+                if rest is not None:
+                    log(f"task {task.task_id}: resolved {source_pr}'s commit {commit[:12]} by the numproj pre-pass")
+                    if not cancel.is_set():
+                        store_resolution(cfg.clone, task.task_id, commit, prefix, tip)
+                    resolved.append({"source_pr": source_pr, "commit": commit, "resolved": tip, "numproj": True})
+                    result = rest
+                    continue
+                # Not acceptable after all: the agent gets the conflict exactly as without the pre-pass.
+                paths = repair.apply_conflict(worktree, prefix, commit)
+                prepass = None
             log(f"task {task.task_id}: resolving {source_pr}'s commit {commit[:12]} onto {prefix[:12]}")
             feedback: str | None = None
             label = f"conflict-{len(resolved) + 1}"
@@ -2430,6 +2461,7 @@ def resolve_conflicts(
                     worker_verifies=cfg.worker_audits,
                 )
                 context.repair_context = ownership
+                context.prepass = prepass.note if prepass is not None else None
                 prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
                 agent = run_repair_agent(
                     cfg, task, worktree, prompt, logdir, cancel, state, env_lake, label=f"{label}-attempt-{attempt}"

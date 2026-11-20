@@ -144,6 +144,48 @@ to `agent_attempts`, with the report as feedback:
   not judged, and content moved between members in part is not detected mechanically, as for any
   repair.
 
+**Renamed numeric projections.** When `main` rewrites numeric projections (`x.1` to `x.fst`, as the
+toolchain bump to v4.37.0-rc1 did across the library), a member written against the old `main`
+conflicts wherever its change touches a rewritten line. Before the agent runs, the worker tries a
+mechanical pre-pass (`repair_numproj.prepass`). Take a conflicting commit C with parent P, and a
+conflicting Lean file that is a regular file of at most 256 kB in the prefix, P and C, with a numeric
+projection in P's or C's version. The worker runs TauCetiTools' numproj tool (`tauceti-tools numproj`,
+the installed package's `numproj_fix.py`) on copies of both versions, giving P' and C', and
+merges them with `git merge-file` with base P', ours the clean prefix and theirs C'. The tool elaborates
+each file against the worktree's warm build, so the pre-pass runs only when the task's artifacts are
+available, and the tool runs in the build sandbox like any build of member code, from a fresh copy of
+its scripts under `.lake/numproj/run-*` (removed afterwards); the compiled scanner is kept in
+`.lake/numproj/cache`, once per toolchain and tree. Elaboration is deterministic and the tool is
+idempotent, so a rerun reaches the same result. Its logs are `numproj-<commit>-{parent,commit}.log` in
+the task's log directory.
+
+- When every conflicting file merges cleanly and the tool rewrote C's versions completely (exit 0),
+  the merge is the resolution: the worker writes an explanation saying so and commits it with
+  `commit_resolution`, and it goes through every check below. The outcome's `conflicts` entry has
+  `numproj: true` and no agent runs. A resolution that fails a check is discarded and the agent gets
+  the conflict exactly as without the pre-pass.
+- When a file still conflicts, a file was not rewritten (not Lean, added or deleted, or no numeric
+  projection), or the tool left sites in C for the author (exit 1), the agent starts from the merged
+  files, clean or with markers between the clean prefix and the rewritten commit, and its prompt says
+  which files the worker merged, which still conflict and which sites the tool left.
+- Anything unexpected returns the conflict to the agent as before: an installed TauCetiTools without
+  numproj, a tool failure or timeout, a sandbox error, a symlink under `.lake/numproj`, a rewritten
+  copy that is a symlink or not a regular file, a failed write (the worker applies the conflict again),
+  nothing rewritten, or a rewritten copy that is not exactly what the tool writes. The elaborated
+  member code can write the tool's copies, so the worker checks each one on the host
+  (`repair_numproj.rewrites_only`): it reads off the findings the rewrite implies (numeric projections
+  after an identifier or bracket given field names, receivers of identifier characters parenthesized
+  just before their `.`, `repair_numproj.projection_edits`), requires each to be in code by the
+  installed tool's own lexer (not a comment or string literal), applies them to the original with the
+  installed tool's own `apply` (which also rewraps) and requires the identical text. The most the
+  sandbox can change is which name a numeric projection gets, which the later build verification
+  checks like any resolution.
+
+The controller's insertion probes of waiting PRs do not use the pre-pass: they are `git merge-tree`
+checks on the controller host within a twenty-second budget per pass, with no built tree to elaborate
+against and no sandbox. A waiting PR that conflicts only over projections is resolved when it reaches a
+rebase task, or by its author running `tauceti-tools numproj`.
+
 An accepted resolution is the new base for replaying the rest of the input chain (`chain.replay` from
 the conflicting commit onto the resolved one), which stops at the next conflict or reaches the end. A
 conflict that stays unresolved releases the task (`agent_failed`). When the replay reaches the end the
@@ -830,7 +872,12 @@ the same session, a terminal rejection, a superseded claim at submission, a loca
 retried with the local report, the local explanation follow-up turn, artifacts unavailable with and
 without a `release` route, inference unavailable after bounded retries, an ordinary agent failure
 and the worker's attempt cap released as `agent_failed`, a second claimant and a stale token refused,
-abandonment of a stopped task, the task record and prompt for a rebase conflict, the
+abandonment of a stopped task, the task record and prompt for a rebase conflict, the numproj
+pre-pass with a stand-in tool (`NumprojPrepass`: a projection-only conflict resolved without the agent
+in two sandboxed runs, a real conflict and sites left by the tool handed to the agent from the
+rewritten merge, and a tool failure, a missing tool, a rewrite that changes more than projections, an
+edit the tool would not make, a symlink planted under `.lake`, a failed write, an unacceptable mechanical
+resolution and a cold tree all leaving git's own conflict to the agent), the
 provider chain (the same stub installed as `codex`: chain order, a subscription over pace or
 unmeasurable skipped, a launch failure or a refusal before any work handed to the next provider, the
 `api` provider's key and credential-free config dir, the attempts in the outcome and the heartbeat, and
