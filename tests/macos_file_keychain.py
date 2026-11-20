@@ -2,9 +2,11 @@
 """Offline controls for the macOS configured-file route's metadata check."""
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import types
 import unittest
@@ -125,6 +127,53 @@ class FileKeychain(unittest.TestCase):
                 for cache_only in (False, True):
                     reader._cache_only = cache_only
                     self.assertIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", reader._claude_launch_credential_unusable())
+
+    def test_saved_console_keys_in_either_selected_config_refuse_before_launch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            cfg = types.SimpleNamespace(home=directory, quota_cache=directory / "cache")
+            for name in (".config.json", ".claude.json"):
+                saved = directory / name
+                saved.write_text(json.dumps({"primaryApiKey": "synthetic-console-key"}))
+                try:
+                    for platform in ("linux", "darwin"):
+                        with (
+                            self.subTest(name=name, platform=platform),
+                            patch.object(sys, "platform", platform),
+                            patch.dict(os.environ, CLAUDE_CONFIG_DIR=str(directory)),
+                            patch.object(
+                                quota, "claude_file_credential_problem", side_effect=AssertionError("file read")
+                            ),
+                            patch.object(quota.subprocess, "run", side_effect=AssertionError("Keychain or model read")),
+                            patch.object(quota, "_http_get_json", side_effect=AssertionError("usage read")),
+                        ):
+                            with self.assertRaisesRegex(NoProgress, "saved Console API key"):
+                                agents.host_agent_launch("do not launch", "claude")
+                            reader = quota.Quota(cfg)
+                            for cache_only in (False, True):
+                                reader._cache_only = cache_only
+                                self.assertIn("saved Console API key", reader._claude_launch_credential_unusable())
+                            agents.validate_host_agent_credentials(
+                                "claude", {"CLAUDE_CONFIG_DIR": str(directory), "TAUCETI_CLAUDE_BILLING": "api"}
+                            )
+                            agents.validate_host_agent_credentials(
+                                "claude", {"CLAUDE_CONFIG_DIR": str(directory), "CLAUDE_CODE_OAUTH_TOKEN": "selected"}
+                            )
+                finally:
+                    saved.unlink()
+
+    def test_saved_console_default_paths_and_unrelated_config_are_distinct(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary).resolve()
+            (home / ".claude").mkdir()
+            for name in (".claude/.config.json", ".claude.json"):
+                saved = home / name
+                saved.write_text(json.dumps({"primaryApiKey": "synthetic-console-key"}))
+                with patch.object(Path, "home", return_value=home):
+                    self.assertIn("saved Console API key", quota.claude_saved_api_key_problem(None))
+                saved.write_text(json.dumps({"theme": "dark", "primaryApiKey": ""}))
+                with patch.object(Path, "home", return_value=home):
+                    self.assertIsNone(quota.claude_saved_api_key_problem(None))
 
     def test_host_metadata_uses_child_environment_and_keeps_environment_token_exception(self):
         with (

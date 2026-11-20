@@ -211,7 +211,12 @@ or unlock. Claude Code 2.1.329 hashes the NFC-normalized exported config string,
 without resolving aliases. The token directory and isolated Worker copy must
 have neither item. `CLAUDE_SECURESTORAGE_CONFIG_DIR` (including an empty override)
 is unsupported for explicit host file routes on every platform because it can
-select a different credential store. Private copied reviewers drop that override and do not query
+select a different credential store. The selected host config directory must also
+have no saved Console `primaryApiKey` in `.config.json` or `.claude.json`; Worker
+refuses either candidate instead of risking a fallback to API billing. With no
+config directory set, the legacy global file is `~/.claude.json`. These checks
+support the production OAuth configuration; custom/staging OAuth stores are not
+covered by this route. Private copied reviewers drop that override and do not query
 the host Keychain; cache-only status reads also avoid metadata subprocesses.
 See [the native acceptance packet](macOS-setup-token-acceptance.md) for the tested
 versions and outstanding real replacement/usage-login limitations. Local

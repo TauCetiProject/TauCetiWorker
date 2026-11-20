@@ -983,9 +983,16 @@ def validate_host_agent_credentials(profile: AuthoringProfile | str, env: dict) 
         or env.get("TAUCETI_API_CONTEXT")
     ):
         return
-    from .quota import claude_file_credential_problem, claude_file_keychain_problem, claude_file_store_problem
+    from .quota import (
+        claude_file_credential_problem,
+        claude_file_keychain_problem,
+        claude_file_store_problem,
+        claude_saved_api_key_problem,
+    )
 
     if problem := claude_file_store_problem(env):
+        raise NoProgress(problem)
+    if problem := claude_saved_api_key_problem(env.get("CLAUDE_CONFIG_DIR")):
         raise NoProgress(problem)
     if sys.platform != "darwin":
         return

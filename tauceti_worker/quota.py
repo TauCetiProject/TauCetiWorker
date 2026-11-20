@@ -1069,6 +1069,21 @@ def claude_file_store_problem(env: dict) -> str | None:
     return None
 
 
+def claude_saved_api_key_problem(config_dir: str | None) -> str | None:
+    """An explicit host file route must not fall back to a saved Console login.
+
+    Production Claude Code 2.1.329 selects .config.json inside its config directory, or
+    the legacy .claude.json (under HOME when the config directory is unset). Refuse a
+    key in either candidate rather than duplicate the CLI's migration choice.
+    """
+    directory = Path(config_dir) if config_dir else Path.home() / ".claude"
+    legacy = directory / ".claude.json" if config_dir else Path.home() / ".claude.json"
+    for path in (directory / ".config.json", legacy):
+        if _as_dict(_read_json_file(path)).get("primaryApiKey"):
+            return f"saved Console API key in {path}; use an agent config directory without a Console login"
+    return None
+
+
 def claude_file_keychain_problem(config_dir: str | None, *, env: dict | None = None) -> str | None:
     """Refuse native OAuth or legacy API credentials that can replace the selected file.
 
@@ -2414,8 +2429,11 @@ class Quota:
             os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and route == "environment"
         ):
             return None
-        if route == "environment" and (problem := claude_file_store_problem(os.environ)):
-            return problem
+        if route == "environment":
+            if problem := claude_file_store_problem(os.environ):
+                return problem
+            if problem := claude_saved_api_key_problem(os.environ.get("CLAUDE_CONFIG_DIR")):
+                return problem
         if not claude_agent_file_route_supported():
             return "Claude agent file routes are unavailable on this platform"
         if problem := claude_file_credential_problem(
