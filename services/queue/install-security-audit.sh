@@ -91,6 +91,7 @@ release_build "$RELEASE" "$target"
 for name in github-app.json github-private-key.pem; do
   [ -f "$HOME/.config/tauceti-security-audit/$name" ] || die "$HOME/.config/tauceti-security-audit/$name is missing (the security-audit GitHub App)"
 done
+[ -f "$CONFIG_DIR/security-audit-anthropic-api-key" ] || die "$CONFIG_DIR/security-audit-anthropic-api-key is missing (mode 0600, the API key for Haiku reviews)"
 [ -f "$CONFIG_DIR/security-audit-zulip.json" ] || die "$CONFIG_DIR/security-audit-zulip.json is missing (README.md, private Zulip alerts)"
 mkdir -p "$HOME/TauCetiQueue-data/security-audit-pool/state/pool/security-audit"
 
