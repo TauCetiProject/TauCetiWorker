@@ -191,6 +191,61 @@ class Ordering(PoolFixture):
         self.assertTrue(blocked["pool_retries_exhausted"])
         self.assertEqual(blocked["from_sha"], self.shas[0])
 
+    def test_held_block_alert_is_offered_again_on_later_passes(self):
+        # A failed DM is retried from its receipts; the pool must keep offering the block.
+        def inspect(batch, attempt):
+            if self.index(batch) == 1:
+                return self.verdict(batch, "finding", ["unsafe IO in A.lean"])
+            return self.verdict(batch)
+
+        passes = {"n": 0}
+
+        def stop(p):
+            if not self.settled(p):
+                return False
+            passes["n"] += 1
+            return passes["n"] >= 3
+
+        self.serve(inspect, stop=stop)
+        offered = [c.args[1] for c in pool.notify_block.call_args_list]
+        blocked = [b for b in offered if b.get("from_sha") == self.shas[2]]
+        self.assertGreaterEqual(len(blocked), 3)
+        self.assertTrue(all("unsafe IO" in b["reason"] for b in blocked))
+
+    def test_every_pass_feeds_the_cursor_watchdog_after_advancing(self):
+        seen = []
+
+        def check(work, observe, *, min_commits):
+            seen.append(observe())
+
+        with patch.object(pool.audit_watchdog, "check", side_effect=check):
+            self.serve(lambda batch, attempt: self.verdict(batch))
+        self.assertTrue(seen)
+        self.assertTrue(all(isinstance(c, str) and isinstance(n, int) for c, n in seen))
+        # The last pass reports the cursor it advanced to, never the one it started from.
+        self.assertEqual(seen[-1], (self.shas[-1], 0))
+
+    def test_a_pass_failing_with_any_exception_still_reaches_the_watchdog(self):
+        errors = []
+
+        def check(work, observe, *, min_commits):
+            try:
+                observe()
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def failing(branch):
+            raise subprocess.TimeoutExpired(["git", "ls-remote"], 1)
+
+        with (
+            patch.object(pool.audit_watchdog, "check", side_effect=check),
+            patch.object(sa, "remote_sha", side_effect=failing),
+            self.assertRaises(subprocess.TimeoutExpired),
+        ):
+            self.serve(lambda batch, attempt: self.verdict(batch))
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], subprocess.TimeoutExpired)
+
     def test_non_operational_failure_blocks_without_retry(self):
         def inspect(batch, attempt):
             if self.index(batch) == 0:

@@ -1,0 +1,33 @@
+# The repair workers' slice: their builds, lints, audits, agents, git work and background
+# publications yield the CPU and disk to the CI and staging VMs on the same host.
+#
+# The name puts it under tauceti.slice, beside TauCetiFleet's tauceti-fleet.slice, which holds the
+# VMs. The cgroup CPU controller shares a busy host between siblings by weight, whatever the
+# processes' nice values: in app.slice (weight 100, beside tauceti.slice at 100) the workers were
+# never below the VMs, however reniced. Here the workers get roughly a tenth of what the VMs get
+# when both want more CPU than tauceti.slice has, and whatever the VMs leave otherwise (the weights
+# are work-conserving, so repairs are slowed, never stopped). IOWeight acts only where the block
+# layer weighs cgroups (BFQ, or io.cost configured for the device); on devices using the `none`
+# scheduler without io.cost, as on tauchonki2 in 2026-11, nothing here orders disk traffic.
+#
+# MemoryHigh is a reclaim threshold, meant to reduce how hard the repairs' memory, mostly file cache,
+# presses on the staging VM. On tauchonki2 (125 GiB) the staging VM has 64 GiB and the OS keeps
+# about 12 GiB, which leaves about 48 GiB, before the native PR runners (which reserve nothing);
+# repairs measured 36 GiB resident with two builds at once (2026-11-19). Above it the kernel reclaims
+# from the slice (file cache or, through swap, anonymous memory) and slows the slice's allocations.
+# Crossing it does not itself invoke the OOM killer (there is no MemoryMax), though host-wide
+# pressure still can. The repair builds' compiler wrapper ignores memory.high, so a working set above
+# it (compilers plus the .olean files they map) thrashes instead of waiting. If repairs slow down,
+# check the slice's memory.pressure, memory.events and swap activity, and raise the value or reduce
+# repair concurrency. systemctl --user daemon-reload applies a change to the running slice.
+#
+# install-repair.sh installs this file; never add a drop-in for it.
+
+[Unit]
+Description=Tau Ceti queue repair workers, below CI and staging builds
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/queue/operations.md
+
+[Slice]
+CPUWeight=10
+IOWeight=10
+MemoryHigh=48G

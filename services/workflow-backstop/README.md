@@ -8,8 +8,6 @@ branch. Existing GitHub schedules remain enabled.
 The default set is dependency updates (hourly), conflict checks (15 minutes),
 API docs (hourly), and website publication (three hours). Admission belongs to the
 continuously running queue service and has no workflow backstop.
-The alert reconciler is excluded by default: it edits and sends Zulip alerts.
-`--include-alerts` is an explicit opt-in for an operator authorized to run it.
 
 ```sh
 tauceti-workflow-backstop --repo TauCetiProject/TauCeti --state /path/to/state.json
@@ -26,6 +24,15 @@ token is limited to `actions: write` and `metadata: read`, and to the repository
 once state pins it, so the backstop spends the App's rate limit rather than a
 person's. If a token cannot be minted the cycle defers; it never falls back to the
 ambient account. Each read/dispatch command has a 45-second bound.
+
+A sandboxed user unit (`ProtectHome=`, `ProtectSystem=`, `PrivateTmp=`) runs in a
+user namespace where `/` and `/home` appear owned by the overflow UID, so the
+ancestor ownership checks refuse a key under `~/.config`. The example unit
+therefore passes both files with `LoadCredential=` and runs with
+`--github-app-dir %d`. When the option names `$CREDENTIALS_DIRECTORY`, which
+systemd creates for the unit, its ancestors are trusted; the directory must
+still be private to the user and each file must be a single-link `0400`/`0600`
+user-owned regular file. Any other directory keeps the full ownership walk.
 
 A recent attempt or any queued, waiting or running attempt suppresses another
 dispatch. An overdue workflow gets explicit active-status probes, so an older
@@ -45,7 +52,7 @@ The example systemd user unit and timer are **not installed or enabled by this
 package**. Review the policy, install a reviewed revision into an isolated venv,
 and point `~/.local/share/tauceti/workflow-backstop/current` to that venv. Confirm
 that `gh` authenticates as the intended operator in the user-service environment,
-or add `--github-app-dir` to `ExecStart`.
+or keep the example unit's `LoadCredential=` lines and `--github-app-dir %d`.
 Then copy the units into `~/.config/systemd/user/`, run `systemctl --user
 daemon-reload`, and enable the timer only when deployment is authorized.
 

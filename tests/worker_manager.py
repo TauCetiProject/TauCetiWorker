@@ -454,6 +454,9 @@ worker3 — backing off
                 # A bundle discoverable at runtime is deliberately not frozen into a persistent unit.
                 assert "SSL_CERT_FILE" not in unit and "NIX_SSL_CERT_FILE" not in unit
                 assert "ExecStart=" in unit and str(config.resolve()) in unit
+                # Workers move into scopes under the unit's slice, so a manager restart adopts them.
+                assert f"Slice={wm.WORKER_SLICE}" in unit
+                assert f'Environment="{wm.worker_scopes.SLICE_ENV}={wm.WORKER_SLICE}"' in unit
 
                 os.environ.pop("SSL_CERT_FILE", None)
                 worker_paths._ssl_cert_candidates = lambda env: (env.get("NIX_SSL_CERT_FILE"),)

@@ -8,7 +8,8 @@
 #
 # Inputs:
 #   TAUCETI_AUTHOR_CLAIM_KEY   the author/<area>/<target-id> claim acquired in shell before the agent ran
-#   TAUCETI_TARGET_MARKER      the exact <!--tauceti-target:v1 {...}--> string the PR body must contain
+#   TAUCETI_TARGET_MARKER      the exact <!--tauceti-target:v1 {...}--> string the PR body must contain,
+#                              or several such strings one per line, of which it must contain one
 #   TAUCETI_CLAIM_SH           path to claim.sh (default: alongside this script)
 # All `gh pr create` flags pass through unchanged.
 set -uo pipefail
@@ -44,9 +45,13 @@ fi
 #    or just SOME well-formed marker is required (TAUCETI_REQUIRE_TARGET_MARKER, agent-picked target).
 if [[ -n "$MARKER" ]]; then
     body="$(pr_body_from_args "$@")"
-    [[ "$body" == *"$MARKER"* ]] \
-        || die "PR body is missing the required target marker:
-  $MARKER
+    found=""
+    while IFS= read -r m; do
+        [[ -n "$m" && "$body" == *"$m"* ]] && found=1
+    done <<<"$MARKER"
+    [[ -n "$found" ]] \
+        || die "PR body is missing the required target marker (one of these lines when there are several):
+  ${MARKER//$'\n'/$'\n'  }
 Add it to the PR body (it lets other agents and the dup-sweeper recognize this target)."
 elif [[ "$REQUIRE_MARKER" == "1" ]]; then
     body="$(pr_body_from_args "$@")"

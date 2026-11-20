@@ -35,6 +35,9 @@ import tempfile
 from pathlib import Path
 
 DISABLE_VARIABLE = "TAUCETI_QUEUE_SANDBOX"
+# Set to 1 by the worker while it runs a background task (``repair_task.background_task``), and so
+# inherited by the agent and its build script: every sandboxed build then runs at niceness 19.
+BACKGROUND_VARIABLE = "TAUCETI_REPAIR_BACKGROUND"
 LOGGER = logging.getLogger("tauceti_queue.repair_sandbox")
 PRESSURE_WRAPPER = "/opt/tauceti/tauceti-lean"
 
@@ -241,24 +244,41 @@ def sandbox_argv(
     return args
 
 
+def prioritized(argv: list[str]) -> list[str]:
+    """``argv`` at niceness 19 during a background task (``BACKGROUND_VARIABLE``), else unchanged.
+
+    The repair units set no CPU weight of their own, so ``tauceti-repair.slice`` enables no CPU
+    controller for them and every repair process on the host shares the slice's CPU by niceness:
+    the head batch's builds, at the units' ``Nice=10``, get about seven times the CPU of a
+    background build at 19 when both are busy. ``nice -n 19`` saturates at 19 from any start."""
+    nice = shutil.which("nice") if os.environ.get(BACKGROUND_VARIABLE) == "1" else None
+    return [nice, "-n", "19", *argv] if nice else argv
+
+
 def sandboxed_lake(
     argv: list[str], worktree: Path, env: dict | None = None, *, extra_env: dict | None = None
 ) -> list[str]:
     """The command to run for ``argv`` (a ``lake build ...``) from ``worktree``: wrapped in the
     sandbox, or an environment wrapper with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0``
-    (the caller then passes ``extra_env`` in the process environment). Both paths gate compilation."""
+    (the caller then passes ``extra_env`` in the process environment). Both paths gate compilation
+    and run at the task's priority (:func:`prioritized`)."""
     if disabled():
         warn_disabled(argv)
         worktree = Path(worktree).resolve()
         (worktree / ".lake").mkdir(exist_ok=True)
-        return [
-            shutil.which("env") or "/usr/bin/env",
-            "-u",
-            "LEAN_SYSROOT",
-            *(f"{key}={value}" for key, value in _pressure_env(worktree, str(_pressure_executable(worktree))).items()),
-            *argv,
-        ]
-    return sandbox_argv(argv, worktree, env, extra_env=extra_env)
+        return prioritized(
+            [
+                shutil.which("env") or "/usr/bin/env",
+                "-u",
+                "LEAN_SYSROOT",
+                *(
+                    f"{key}={value}"
+                    for key, value in _pressure_env(worktree, str(_pressure_executable(worktree))).items()
+                ),
+                *argv,
+            ]
+        )
+    return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env))
 
 
 def check(scratch: Path | None = None, env: dict | None = None) -> tuple[bool, str]:

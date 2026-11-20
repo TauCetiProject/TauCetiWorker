@@ -3053,6 +3053,99 @@ class RepairOrReject(QueueFixture):
         self.assertEqual([(e["detail"]["number"], e["detail"]["truncated"]) for e in summary], [(102, False)])
         self.assertEqual(self.controller.status()["counters"]["edit_summaries"], 1)
 
+    def test_landing_git_work_runs_without_the_locks_and_once_per_member(self):
+        controller = self.controller
+        diffs, git_reads = [], []
+        real_diff, real_fact = controller._landed_diff, controller._landing_fact
+
+        def landed_diff(member):
+            diffs.append((member["number"], controller._lock.owned(), controller.store._depth))
+            return real_diff(member)
+
+        def landing_fact(*args, **kwargs):
+            git_reads.append((args[1]["number"], controller._lock.owned()))
+            return real_fact(*args, **kwargs)
+
+        with (
+            patch.object(controller, "_landed_diff", landed_diff),
+            patch.object(controller, "_landing_fact", landing_fact),
+        ):
+            head = self.edited_landing()
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertEqual(diffs, [(102, False, 0)], "one diff, with neither the controller nor the store lock")
+        self.assertEqual(sorted(git_reads), [(101, False), (102, False)])
+        self.assertIn("-broken\n+fixed", self.github.comments_for(102)[0]["body"])
+        self.assertIn(f"repaired-label:{head['id']}:102", [e["key"] for e in controller.store.rows("outbox")])
+
+    def test_a_landing_recorded_while_the_lock_was_free_is_not_recorded_again(self):
+        controller = self.controller
+        real_facts = controller._landing_facts
+        raced = []
+
+        def landing_facts(batch, members, ranges, **kwargs):
+            facts = real_facts(batch, members, ranges, **kwargs)
+            if kwargs.get("partial") and not raced:
+                raced.append(batch["id"])
+                with controller._lock:  # another path lands the same head meanwhile
+                    controller._landed(controller.store.row("batches", {"id": batch["id"]}), "promoted", 0)
+            return facts
+
+        with patch.object(controller, "_landing_facts", landing_facts):
+            head = self.edited_landing()
+        self.assertEqual(raced, [head["id"]])
+        landed = [e for e in controller.store.journal_entries("landed") if e["batch_id"] == head["id"]]
+        self.assertEqual(len(landed), 1)
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+
+    def test_a_revision_replaced_while_the_lock_was_free_is_not_recorded_as_landed(self):
+        controller = self.controller
+        real_facts = controller._landing_facts
+        replaced = []
+
+        def landing_facts(batch, members, ranges, **kwargs):
+            facts = real_facts(batch, members, ranges, **kwargs)
+            if kwargs.get("partial") and not replaced:
+                replaced.append(batch["id"])
+                # As a rebuild or repair submission would, meanwhile: a revision not on canonical.
+                tree = chain.tree_of(controller.clone, batch["base"])
+                ident = {
+                    f"GIT_{who}_{key}": value
+                    for who in ("AUTHOR", "COMMITTER")
+                    for key, value in (("NAME", "t"), ("EMAIL", "t@example.invalid"))
+                }
+                tip = chain.git(
+                    controller.clone, "commit-tree", tree, "-p", batch["base"], "-m", "rebuilt", env=ident
+                ).strip()
+                replaced.append(tip)
+                with controller._lock:
+                    controller.store.update("batches", {"id": batch["id"]}, version=batch["version"] + 1, tip=tip)
+            return facts
+
+        with patch.object(controller, "_landing_facts", landing_facts):
+            head = self.edited_landing()
+        (superseded,) = controller.store.journal_entries("landing-superseded")
+        self.assertEqual(superseded["batch_id"], head["id"])
+        self.assertEqual(superseded["detail"]["current_tip"], replaced[1])
+        landed = [e for e in controller.store.journal_entries("landed") if e["batch_id"] == head["id"]]
+        self.assertEqual(landed, [], "the replacement revision never reached canonical")
+        self.assertNotEqual(controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+
+    def test_a_member_changed_while_the_lock_was_free_is_read_again_under_it(self):
+        controller = self.controller
+        real_facts = controller._landing_facts
+
+        def landing_facts(batch, members, ranges, **kwargs):
+            facts = real_facts(batch, members, ranges, **kwargs)
+            if kwargs.get("partial"):
+                for fact in facts.values():
+                    fact["commit"] = "0" * 40  # as if each member's commit moved meanwhile
+            return facts
+
+        with patch.object(controller, "_landing_facts", landing_facts):
+            head = self.edited_landing()
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertIn("-broken\n+fixed", self.github.comments_for(102)[0]["body"])
+
     def test_edited_member_is_labelled_repaired_in_queue(self):
         head = self.edited_landing()
         keys = [e["key"] for e in self.controller.store.rows("outbox", {"kind": "labels"})]

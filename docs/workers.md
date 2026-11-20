@@ -50,7 +50,8 @@ and `fractional_percent` for a fractional slot. Designated workers select an
 area before their survey from the intersection of that list and their eligible
 live areas, then run the normal maintenance, review, and authoring cascade within
 that area. The fractional slot takes that draw with the supplied integer
-percentage each round. Other workers retain the full random draw. Explicit `--roadmap-only` and
+percentage each round. Other workers retain the full random draw, and a worker with a
+[target list](target-lists.md) draws from its list instead. Explicit `--roadmap-only` and
 `--roadmap-skip` settings retain precedence; the usual maintenance and review
 priorities apply within the chosen area. Stale/malformed focus or no remaining
 eligible focus areas falls back to ordinary selection. Fleet controls this live through
@@ -290,6 +291,7 @@ other top-level key is an error, as is any unrecognized field inside a
 | `auto_refresh` | bool | `false` | Renew this worker's Claude access token when it expires, instead of parking until a human runs `claude`. Only safe when nothing else uses the same credential file — the refresh token is single-use. See [quota and pacing](quota.md) |
 | `roadmap_only` | string | unset | The single roadmap area for roadmap rounds. `""` means all areas; unset means a fresh random area each round |
 | `roadmap_skip` | string list | `[]` | Roadmap areas to exclude. `roadmap_only` wins on overlap |
+| `roadmap_targets` | string | unset | Absolute path of an operator [target list](target-lists.md). Roadmap rounds author only its open items whose prerequisites have landed, one claimed item per round. Owned marked pull requests also take priority within each existing maintenance/review stage. Several workers may name the same file |
 | `roadmap_extra_identities` | string list | `[]` | Extra GitHub logins whose claimed intentions count as this worker's own |
 | `extra_roadmap_prompt` | string | unset | Operator guidance rendered into the roadmap prompt, steering target choice within the designated roadmap. Not blank, at most 4096 characters; other phases ignore it |
 | `respect_claims` | bool | `true` | Whether to avoid intentions others have claimed |
@@ -590,6 +592,7 @@ entry with `enabled = true`.
 | `--auto-refresh` | `auto_refresh` |
 | `--roadmap-only AREA` | `roadmap_only` |
 | `--roadmap-skip AREAS` | `roadmap_skip`, as a comma-separated list |
+| `--roadmap-targets FILE` | `roadmap_targets`, made absolute |
 | `--extra-roadmap-prompt TEXT` | `extra_roadmap_prompt` |
 | `--source PATH_OR_URL` | `source`; also requires `roadmap` in `--only` and a non-empty `--roadmap-only` |
 | `--author-model MODEL` | `author_model` |
@@ -701,6 +704,13 @@ action that names a different `--config` file reports the conflict instead of
 switching it.
 
 That is a systemd user service on Linux and NixOS, or a LaunchAgent on macOS.
+On Linux the service runs in `tauceti-workers.slice` and each worker moves itself
+into its own transient scope there, as Fleet workers do. Restarting the service (to
+adopt a new Worker runtime, for example) then adopts the running workers instead of
+stopping their rounds. A service installed before this change keeps its workers in the
+service itself: rerun `tauceti workers service install` and restart the service once,
+at a quiet moment, to move to scopes.
+
 Two platform caveats:
 
 - On Linux systems that stop the user manager after the last logout,

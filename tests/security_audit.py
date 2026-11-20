@@ -1218,6 +1218,20 @@ class MaintenanceScheduling(unittest.TestCase):
             self.assertEqual(wu.run_round(self.worker, self.opts), 0)
         maintenance.assert_not_called()
 
+    def test_watchdog_runs_on_audit_and_maintenance_turns_and_failures(self):
+        with (
+            patch.dict(os.environ, {"TAUCETI_SECURITY_AUDIT_MIN_COMMITS": "20"}),
+            patch.object(sa, "watch") as watch,
+            patch.object(sa, "run", side_effect=[0, Die("finding")]),
+            patch.object(wu, "mirror_creds", side_effect=RuntimeError("maintenance reached")),
+        ):
+            self.assertEqual(wu.run_round(self.worker, self.opts), 0)
+            for _ in range(2):  # The maintenance turn, then a failed audit falling through.
+                with self.assertRaisesRegex(RuntimeError, "maintenance reached"):
+                    wu.run_round(self.worker, self.opts)
+        self.assertEqual(watch.call_count, 3)
+        self.assertEqual(watch.call_args.kwargs, {"min_commits": 20})
+
     def test_audit_and_maintenance_take_turns(self):
         with (
             patch.object(sa, "run", return_value=0) as audit,
@@ -1278,55 +1292,31 @@ class PrivateAlerts(unittest.TestCase):
         timer = patch.object(alerts.time, "time", return_value=10000)
         self.clock = timer.start()
         self.addCleanup(timer.stop)
-        # Most delivery tests exercise a persistent stall already past its delay.
-        (self.work / "operational-alert.json").write_text(
-            json.dumps({"from_sha": self.block["from_sha"], "first_seen": 6400})
+        # Delivery tests exercise a recorded source concern; operational pauses belong to the watchdog.
+        sa.record(
+            self.work / "ledger.jsonl",
+            {
+                "from_sha": self.block["from_sha"],
+                "to_sha": self.block["to_sha"],
+                "verdict": {"verdict": "finding", "findings": ["TauCeti/A.lean:3 reads a file"]},
+            },
         )
         self.real_request = alerts.request
         self.request = patch.object(alerts, "request", return_value={"result": "success", "id": 456})
         self.http = self.request.start()
         self.addCleanup(self.request.stop)
 
-    def test_transient_pause_never_contacts_zulip_or_loads_credentials(self):
-        (self.work / "operational-alert.json").unlink()
-        self.config.unlink()
-        alerts.notify_block(self.work, self.block)
-        self.clock.return_value = 13599
-        alerts.notify_block(self.work, self.block)
+    def test_operational_block_is_left_to_the_cursor_watchdog(self):
+        (self.work / "ledger.jsonl").unlink()
+        self.config.unlink()  # Nothing is loaded or sent, however long the block is held.
+        for now in (10000, 10**9):
+            self.clock.return_value = now
+            alerts.notify_block(self.work, self.block)
         self.http.assert_not_called()
         self.assertFalse((self.work / "zulip-alerts.json").exists())
-        state = self.work / "operational-alert.json"
-        self.assertEqual(json.loads(state.read_text())["first_seen"], 10000)
-        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
-
-    def test_persistent_stall_timer_survives_restart_retry_and_target_changes(self):
-        (self.work / "operational-alert.json").unlink()
-        alerts.notify_block(self.work, self.block)
-        self.clock.return_value = 13599
-        retry = {**self.block, "reason": "inspection unfinished", "attempt": "new-attempt", "to_sha": "c" * 40}
-        alerts.notify_block(self.work, retry)
-        self.http.assert_not_called()
-        self.clock.return_value = 13600
-        alerts.notify_block(self.work, retry)
-        alerts.notify_block(self.work, retry)
-        self.http.assert_called_once()
-        self.assertEqual(json.loads((self.work / "operational-alert.json").read_text())["first_seen"], 10000)
-
-    def test_advancing_cursor_starts_a_new_operational_delay(self):
-        alerts.notify_block(self.work, self.block)
-        self.http.assert_called_once()
-        self.http.reset_mock()
-        next_block = {**self.block, "from_sha": "b" * 40, "to_sha": "c" * 40}
-        alerts.notify_block(self.work, next_block)
-        self.clock.return_value = 13599
-        alerts.notify_block(self.work, next_block)
-        self.http.assert_not_called()
-        self.clock.return_value = 13600
-        alerts.notify_block(self.work, next_block)
-        self.http.assert_called_once()
 
     def test_code_uncertainty_notifies_immediately_during_operational_delay(self):
-        (self.work / "operational-alert.json").unlink()
+        (self.work / "ledger.jsonl").unlink()
         alerts.notify_block(self.work, self.block)
         self.http.assert_not_called()
         sa.record(
@@ -1344,18 +1334,35 @@ class PrivateAlerts(unittest.TestCase):
         self.assertIn("Human review required", message)
         self.assertNotIn("operational stall", message)
 
-    def test_bad_operational_timer_does_not_mutate_audit_evidence_or_send_misleading_dm(self):
-        blocked = self.work / "blocked.json"
-        blocked.write_text(json.dumps(self.block))
-        for state in (
-            [],
-            {"from_sha": self.block["from_sha"], "first_seen": True},
-            {"from_sha": self.block["from_sha"], "first_seen": float("nan")},
+    def test_request_trusts_the_host_ca_bundle_without_ssl_cert_file(self):
+        self.request.stop()
+        self.addCleanup(self.request.start)
+        seen = {}
+
+        class Opener:
+            def open(self, req, timeout):
+                raise OSError("stop before network")
+
+        def build_opener(*handlers):
+            seen["handlers"] = handlers
+            return Opener()
+
+        context = unittest.mock.MagicMock()
+        with (
+            patch.dict(os.environ, {"SSL_CERT_FILE": ""}),
+            patch.object(alerts, "ensure_ssl_cert_file", return_value="/host/ca-bundle.crt") as bundle,
+            patch.object(alerts.ssl, "create_default_context", return_value=context) as default,
+            patch.object(alerts.urllib.request, "HTTPSHandler") as https,
+            patch.object(alerts.urllib.request, "build_opener", side_effect=build_opener),
         ):
-            (self.work / "operational-alert.json").write_text(json.dumps(state))
-            alerts.notify_block(self.work, self.block)
-            self.assertEqual(json.loads(blocked.read_text()), self.block)
-        self.http.assert_not_called()
+            with self.assertRaisesRegex(OSError, "stop before network"):
+                alerts.request(json.loads(self.config.read_text()), "POST", {"type": "direct"})
+        bundle.assert_called_once()
+        # The default stores (including SSL_CERT_DIR) stay loaded; the host bundle is added to them.
+        default.assert_called_once_with()
+        context.load_verify_locations.assert_called_once_with(cafile="/host/ca-bundle.crt")
+        https.assert_called_once_with(context=context)
+        self.assertIn(https.return_value, seen["handlers"])
 
     def test_alert_filter_never_clears_a_block_or_modifies_recovery_budget(self):
         blocked = self.work / "blocked.json"
@@ -1363,10 +1370,9 @@ class PrivateAlerts(unittest.TestCase):
         recovery = self.work / "operational-recovery.json"
         recovery.write_text('{"budget": "unchanged"}')
         before = blocked.read_bytes(), recovery.read_bytes()
-        (self.work / "operational-alert.json").unlink()
         alerts.notify_block(self.work, self.block)
         self.assertEqual((blocked.read_bytes(), recovery.read_bytes()), before)
-        self.http.assert_not_called()
+        self.http.assert_called_once()
 
     def test_private_recipient_and_durable_deduplication(self):
         alerts.notify_block(self.work, self.block)
@@ -1377,9 +1383,8 @@ class PrivateAlerts(unittest.TestCase):
         self.assertEqual(method, "POST")
         self.assertEqual(params["type"], "direct")
         self.assertEqual(json.loads(params["to"]), [123])
-        self.assertIn("Operational stall", params["content"])
-        self.assertIn("at least one hour", params["content"])
-        self.assertIn("Automatic recovery continues", params["content"])
+        self.assertIn("Source-safety finding", params["content"])
+        self.assertIn("Human review required", params["content"])
         self.assertNotIn("secret", params["content"])
 
     def test_source_finding_is_reported_as_data_with_evidence(self):
