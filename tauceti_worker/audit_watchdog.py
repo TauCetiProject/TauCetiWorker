@@ -33,7 +33,10 @@ def admitted(work: Path, cursor: str) -> bool:
     """
     if load(work / "blocked.json").get("from_sha") == cursor:
         return True
-    ranges = load(work / "pool" / "ranges.json").get("ranges")
+    path = work / "pool" / "ranges.json"
+    ranges = load(path).get("ranges")
+    if path.exists() and not isinstance(ranges, list):
+        return True  # The pool holds on a list it cannot read: that stall is due work too.
     return isinstance(ranges, list) and any(isinstance(r, dict) and r.get("from_sha") == cursor for r in ranges)
 
 

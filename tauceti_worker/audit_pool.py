@@ -319,7 +319,7 @@ class Pool:
                 return
             if slot.status != "planned" or slot.retry_at > now:
                 continue
-            recorded = evidence.recorded(self.work, slot.digest)
+            recorded = evidence.recorded(self.work, slot.batch)
             if recorded.concerns() or recorded.unreadable:
                 refused = "security-audit: this batch already has a binding judgment; it is never inspected again"
                 slot.status = "blocked"

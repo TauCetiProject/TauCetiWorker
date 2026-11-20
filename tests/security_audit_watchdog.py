@@ -99,6 +99,14 @@ class Watchdog(unittest.TestCase):
         self.check(13600)
         self.assertEqual(len(self.posts()), 1)
 
+    def test_an_unreadable_range_list_is_due_below_the_threshold(self):
+        self.seen = (A, 3)
+        (self.work / "pool").mkdir()
+        (self.work / "pool" / "ranges.json").write_text("{damaged")
+        self.check(10000)
+        self.check(13600)
+        self.assertEqual(len(self.posts()), 1)
+
     def test_newly_due_work_does_not_inherit_idle_time(self):
         self.seen = (A, 0)
         self.check(10000)

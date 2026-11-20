@@ -647,6 +647,17 @@ class DurableRanges(PoolFixture):
         self.assertEqual(len(self.advanced), 3)
         self.assertTrue(any("interrupted when the pool stopped" in r.get("reason", "") for r in self.ledger()))
 
+    def test_a_recorded_concern_binds_its_commits_whatever_the_new_plan(self):
+        # A legacy block from another plan of these commits (here, against an older main).
+        old = sa.build_batch(self.repo, self.shas[2], self.shas[-2], self.shas[3:5])
+        sa.record(
+            self.state / "ledger.jsonl", {"batch": old["input_digest"], "verdict": self.verdict(old, "finding", ["IO"])}
+        )
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+        self.assertNotIn(self.shas[2], self.calls_from)
+        self.assertIn("binding judgment", json.loads((self.state / "blocked.json").read_text())["reason"])
+
     def test_retry_state_and_reviewer_survive_a_restart(self):
         def first(batch, attempt):
             if self.index(batch) == 0:
