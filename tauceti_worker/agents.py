@@ -41,6 +41,7 @@ from .constants import (
     ROADMAP,
     TAUCETI,
 )
+from .excerpt import ends
 from .github import me
 from .paths import HERE, legacy_data_root
 from .processes import PARENT_BOUND_AGENT as _PARENT_BOUND_AGENT
@@ -281,7 +282,7 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
 
 def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -> NoProgress:
     status, message, _ = _codex_error_details(result.stdout or "")
-    detail = message or (result.stderr or "").strip()[-1000:] or f"exit {result.returncode}"
+    detail = message or ends(result.stderr, 1000) or f"exit {result.returncode}"
     status_text = f"HTTP {status}: " if status is not None else ""
     return NoProgress(
         f"codex model-access probe for {model} failed without confirming subscription unavailability "
@@ -430,7 +431,7 @@ def validate_kiro_model_access(cfg: Config, profile: AuthoringProfile) -> Author
     except subprocess.TimeoutExpired as e:
         raise NoProgress("Kiro model-access check timed out after 60s; not launching authoring") from e
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()[-1000:]
+        detail = ends(result.stderr or result.stdout or f"exit {result.returncode}", 1000)
         raise NoProgress(f"Kiro could not list this account's models: {detail}")
     try:
         payload = json.loads(result.stdout)
@@ -2265,7 +2266,7 @@ def ensure_fork_proxy_current() -> None:
         try:
             subprocess.run([*cmd, "gh", "proxy", "start"], capture_output=True, text=True, timeout=120, check=True)
         except subprocess.CalledProcessError as e:
-            detail = (e.stderr or e.stdout or "").strip()[-500:]
+            detail = ends(e.stderr or e.stdout, 500)
             suffix = f"\n  Bubble said: {detail}" if detail else ""
             raise Die(
                 "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
@@ -2344,7 +2345,7 @@ def ensure_bubble_home(cfg: Config) -> dict:
         except (OSError, subprocess.SubprocessError) as e:
             raise Die(f"could not configure Bubble's shared-cache overlay; refusing unsafe cache mounts: {e}") from e
         if p.returncode != 0 or not overlay_configured():
-            detail = (p.stderr or p.stdout or "Bubble did not persist security.shared-cache=overlay").strip()[-300:]
+            detail = ends(p.stderr or p.stdout or "Bubble did not persist security.shared-cache=overlay", 300)
             raise Die(
                 "could not configure Bubble's shared-cache overlay; refusing to expose persistent "
                 f"writable Lean caches to the agent. Bubble said: {detail}"
