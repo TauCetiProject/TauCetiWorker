@@ -1782,6 +1782,36 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(sh(clone, "show", f"{sha}:TauCeti/Two.lean"), "-- two, resolved on the target")
         self.assertEqual(sh(clone, "show", f"{sha}:TauCeti/Other.lean"), "-- elsewhere")
 
+    def test_the_lookahead_skips_a_member_an_earlier_run_resolved(self):
+        """After a restart a member resolved on its prefix by the earlier run is the replay's to reuse:
+        no helper resolves it again on ``onto``."""
+        from tauceti_queue import repair_lookahead
+
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        moved = commit(seed, "main moved again", {"TauCeti/Three.lean": "-- three, on main\n"})
+        sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        self.raw["onto"] = self.onto = moved
+        clone = self.content.clone
+        sh(clone, "fetch", "--quiet", str(self.content.bare), self.onto, self.content.tip)
+        task = repair_task.Task.from_json(
+            {**self.raw, "claim_token": "x", "expires_at": time.time() + 60, "extra": {"claim_id": 1}}
+        )
+        lookahead = types.SimpleNamespace(cfg=types.SimpleNamespace(clone=clone), task=task, stopped=lambda: False)
+        three = self.content.members[2]["commit"]
+
+        def candidates() -> list[str]:
+            return [c.sha for c in repair_lookahead.Lookahead.candidates(lookahead, self.content.members[1]["commit"])]
+
+        self.assertEqual(candidates(), [three])
+        sh(
+            clone,
+            "update-ref",
+            repair_task.resolution_ref("1", three, chain_tool.tree_of(clone, self.onto) + "x"),
+            three,
+        )
+        self.assertEqual(candidates(), [])
+
     def test_a_stopped_task_resumes_after_its_last_resolution(self):
         """The worker stops while the agent resolves member 3, after member 2's resolution was accepted.
         Another worker sharing the clone re-claims the task later, so its replay makes the same prefix

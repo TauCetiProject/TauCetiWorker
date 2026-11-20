@@ -111,8 +111,10 @@ class Lookahead:
             merged = chain_tool.merge_trees(clone, task.onto, commit.sha, merge_base=parent)
             if merged.clean or not changed.intersection(merged.conflict_paths):
                 continue
-            if repair_task.stored_resolution(clone, task.task_id, commit.sha, task.onto) is not None:
-                continue
+            if git(
+                clone, "for-each-ref", "--count=1", f"{repair_task.RESOLUTION_PREFIX}/{task.task_id}/{commit.sha}-*"
+            ):
+                continue  # resolved already, on ``onto`` or on its prefix by an earlier run of the task
             yield commit
 
     def _feed(self, after: str) -> None:
