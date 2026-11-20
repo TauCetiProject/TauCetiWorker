@@ -40,6 +40,9 @@ UMask=0077
 # claim lease, which renews from a thread of this process and touches the task root, must keep
 # renewing under a full staging build, so the lowest best-effort IO priority instead.
 Slice=tauceti-repair.slice
+# A repair process is the first OOM victim, ahead of every VM (QEMU runs at 200): the staging VM has
+# first claim on the host's memory, and OOMPolicy=kill then restarts this worker (decision 111).
+OOMScoreAdjust=1000
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
