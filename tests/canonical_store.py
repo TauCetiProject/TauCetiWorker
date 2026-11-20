@@ -469,6 +469,22 @@ class Canonical(unittest.TestCase):
         sweep(set())
         self.assertFalse((objects / name).exists())
 
+    def test_sweep_stops_at_its_deadline(self):
+        from tauceti_worker import retention
+
+        checkout = self.checkout("w", "TauCeti.A")
+        self.relink(checkout)
+        objects = canonical.store(self.pool) / "objects"
+        name = paths(checkout)[0][1]
+        shutil.rmtree(checkout)
+        for lease in (canonical.store(self.pool) / "uses").glob("*"):
+            lease.unlink()
+        report = retention.fresh_report(time.time())
+        freed = canonical.sweep(self.pool, report, lifetime=1, remove=retention.remove, deadline=time.monotonic() - 1)
+        self.assertEqual(freed, 0)
+        self.assertEqual(report["deferred"], ["canonical-objects"])
+        self.assertTrue((objects / name).exists())
+
     def test_hashing_that_outlasts_the_grace_still_makes_progress(self):
         modules = [f"TauCeti.M{i}" for i in range(8)]
         checkout = self.checkout("w", *modules)
@@ -1108,7 +1124,16 @@ class Canonical(unittest.TestCase):
         totals = cache_storage.inventory([self.pool, checkout / ".lake"], details=details)
         row = details[(legacy.stat().st_dev, legacy.stat().st_ino)]
         self.assertEqual(row[1], 3)  # objects/, artifacts/ and the checkout: counted once.
-        self.assertEqual(sum(r["managed_bytes"] for r in totals.values()), sum(r[0] for r in details.values()))
+        # details keeps only hard-linked inodes; single-link files are totalled without being kept.
+        singles = sum(
+            info.st_blocks * 512
+            for root in (self.pool, checkout / ".lake")
+            for path in root.rglob("*")
+            if not path.is_symlink() and path.is_file() and (info := path.stat()).st_nlink == 1
+        )
+        self.assertEqual(
+            sum(r["managed_bytes"] for r in totals.values()), sum(r[0] for r in details.values()) + singles
+        )
         shutil.rmtree(checkout)
         for lease in (canonical.store(self.pool) / "uses").glob("*"):
             lease.unlink()

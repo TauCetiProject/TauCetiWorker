@@ -42,6 +42,11 @@ EXPLICIT_WITHDRAWALS = frozenset(
 READMIT_REFUSED = frozenset({"closed", "draft", "review-unsafe"})
 CONTEXTS = ("build", "scope", "bump-guard")
 HUMAN_INFRASTRUCTURE_APPROVAL_VERSION = 1
+LARGE_REFACTOR_APPROVAL_VERSION = 1
+
+
+# The Lake pins a Mathlib bump changes; a waived large refactor may change them only with a passing bump check.
+LAKE_PINS = frozenset({"lake-manifest.json", "lean-toolchain"})
 
 
 def approval_binding(current):
@@ -84,7 +89,7 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
                 & (
                     KEEP
                     | {s.lower() for s in no_repair_labels}
-                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair", "large-refactor"}
                 )
             ),
             "comments": [
@@ -145,6 +150,7 @@ class AdmissionPolicy:
                 "prefix": prefix,
                 "allow_files": self.allow_files,
                 "human_infrastructure_approval": HUMAN_INFRASTRUCTURE_APPROVAL_VERSION,
+                "large_refactor_approval": LARGE_REFACTOR_APPROVAL_VERSION,
             }
         )
 
@@ -229,6 +235,9 @@ class AdmissionPolicy:
             "single": bool(set(snapshot.paths) & {"lean-toolchain", "lake-manifest.json"}),
             "command": result["reason"],
         }
+        if snapshot.large_refactor:
+            # Repair reads this from the input, so its review-size checks skip the same caps.
+            evidence["large_refactor"] = True
         return result, authorization, evidence, comment, meta
 
 
@@ -416,7 +425,7 @@ class AdmissionPoller:
                 relevant_labels = (
                     KEEP
                     | self.controller._no_repair_labels()
-                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair", "large-refactor"}
                 )
                 if isinstance(label, str) and label and label.lower() not in relevant_labels:
                     return  # membership and repair labels are queue output, not admission evidence
@@ -746,6 +755,25 @@ class AdmissionPoller:
                 log.warning("admission shadow #%s: %s", work["number"], error)
         current_input = self.controller.input_for(self.repo, work["number"])
         human_review = self._human_owned_approval(snapshot, current_input, comment)
+        large_refactor_review = not human_review and self._large_refactor_approval(snapshot, current_input)
+        if large_refactor_review:
+            # An admin-labelled large refactor that an admin approved in person: that approval stands
+            # in for machine review and PR CI, which cannot cover a diff this size. Staging still
+            # builds, audits and checks the bump of the batch before anything lands.
+            result = {**result, "review_safe": True, "reason": "large refactor approved by repository admin"}
+            approval = loads(current_input["evidence"], {})
+            evidence = {
+                **evidence,
+                "command": result["reason"],
+                "large_refactor_approval": {
+                    **{
+                        key: approval.get(key)
+                        for key in ("actor_id", "actor_login", "comment_id", "head_sha", "merge_base_sha")
+                    },
+                    "bump_guard": bool(set(snapshot.paths) & LAKE_PINS),
+                    "evaluated_at": self.clock(),
+                },
+            }
         if human_review:
             # Human-owned infrastructure does not receive an automatic scoreboard.
             # Preserve the operator's recorded intent; staging must still establish
@@ -778,9 +806,10 @@ class AdmissionPoller:
             disposition = "waiting"
             pull = snapshot.pull
             current = self.controller._input_for(work["number"])
-            if human_review and approval_binding(current) != approval_binding(current_input):
+            if (human_review or large_refactor_review) and approval_binding(current) != approval_binding(current_input):
                 self.state.dirty(work["number"], urgent=True)
                 return
+            self._sync_large_refactor(current, pull.head_sha, snapshot.large_refactor)
             if result.get("diff_guard") and pull.state == "open" and not pull.draft:
                 self._diff_guard_comment(pull, result["diff_guard"])
             requested = result["recovery_heads"]
@@ -895,7 +924,7 @@ class AdmissionPoller:
             return
         body = (
             "This PR cannot join the merge queue: it fails the PR-level diff guards that PR CI runs, "
-            "which admission checks itself because the PR skipped PR CI.\n\n"
+            "which admission checks itself because the PR skips PR CI or carries the large-refactor label.\n\n"
             + "\n".join(f"- {line}" for line in violations)
             + "\n\nRun `lake lint` locally to reproduce. Push a fix and admission will reconsider the new head."
         )
@@ -908,6 +937,63 @@ class AdmissionPoller:
                 "marker": f"<!-- {COMMENT_MARKER} diff-guard:{pull.head_sha} -->",
             },
         )
+
+    def _sync_large_refactor(self, current, head, exempt):
+        """Keep the input's `large_refactor` evidence (which repair reads) equal to this evaluation's,
+        for the same head: a label applied or removed after approval reaches the next repair task."""
+        if current is None or current["head_sha"] != head:
+            return
+        evidence = loads(current["evidence"], {})
+        if bool(evidence.get("large_refactor")) == bool(exempt):
+            return
+        if exempt:
+            evidence["large_refactor"] = True
+        else:
+            evidence.pop("large_refactor", None)
+        self.controller.store.update("inputs", {"id": current["id"]}, evidence=dumps(evidence))
+
+    def _admin_approval(self, snapshot, current):
+        """The live input's approval, when command intake recorded it as an admin's own command or
+        review bound to this exact head and merge base; otherwise None."""
+        if not current or current["state"] not in ("waiting", "reserved", "inserted"):
+            return None
+        pull = snapshot.pull
+        if pull.state != "open" or pull.draft or pull.base_ref != self.controller.canonical_branch:
+            return None
+        approval = loads(current["evidence"], {})
+        if (
+            approval.get("kind") not in ("issue_comment", "pull_request_review")
+            or approval.get("admin") is not True
+            or type(approval.get("actor_id")) is not int
+            or approval["actor_id"] <= 0
+            or not approval.get("actor_login")
+            or current["head_sha"] != pull.head_sha
+            or approval.get("head_sha") != pull.head_sha
+            or approval.get("merge_base_sha") != snapshot.merge_base_sha
+        ):
+            return None
+        return approval
+
+    def _large_refactor_approval(self, snapshot, current):
+        """Keep an admin's exact approval of an admin-labelled large refactor without machine review.
+
+        The waiver needs all of: the `large-refactor` label verified on this head (an admin applied it
+        after the head's commit, with no force push since); an approval that command intake recorded
+        as an admin's own, bound to this head and merge base; every changed path under the library
+        prefix or one of the two Lake pins; no failed diff guard (the label never lifts the new-file
+        cap); and, when a pin changes, a passing live Mathlib-bump check. Any scoreboard, even a
+        negative one, is ignored: an admin chose to approve this head in person. An unreadable bump
+        check leaves the evaluation pending.
+        """
+        if not getattr(self.policy, "human_owned_approvals", True) or not snapshot.large_refactor:
+            return False
+        if snapshot.diff_guard or not snapshot.paths:
+            return False
+        if not all(path.startswith(self.policy.prefix) or path in LAKE_PINS for path in snapshot.paths):
+            return False
+        if self._admin_approval(snapshot, current) is None:
+            return False
+        return not (set(snapshot.paths) & LAKE_PINS) or bool(self.adapter.bump_guard(self.repo, snapshot.pull.head_sha))
 
     def _human_owned_approval(self, snapshot, current, scoreboard):
         """Keep an exact, live admin approval only where machine review is absent.

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .config import Die, NoProgress, log, max_open_prs, positive_integer
 from .constants import CLAIMS, TAUCETI
+from .excerpt import ends
 from .github import GitHub, can_push, ensure_fork, me, shared_claims_granted
 from .overlap_state import Lease, State, environment, git
 from .overlap_support import atomic, locked, read_context, root, shared_read, snapshot
@@ -176,7 +177,7 @@ def issues(gh: GitHub, *, fresh=False) -> list[dict]:
             ["api", "--paginate", "--slurp", f"repos/{TAUCETI}/issues?labels={LABEL}&state=all&per_page=100"]
         )
         if result.returncode:
-            raise Die("overlap: issue inventory failed: " + result.stderr.strip()[-300:])
+            raise Die("overlap: issue inventory failed: " + ends(result.stderr, 300))
         pages = json.loads(result.stdout)
         if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
             raise Die("overlap: incomplete issue inventory")
@@ -198,7 +199,7 @@ def overlap_prs(gh, *, fresh=False):
                 return rows
         result = gh._gh(["api", "--paginate", "--slurp", f"repos/{TAUCETI}/pulls?state=open&per_page=100"])
         if result.returncode:
-            raise Die("overlap: open PR inventory failed: " + result.stderr.strip()[-300:])
+            raise Die("overlap: open PR inventory failed: " + ends(result.stderr, 300))
         pages = json.loads(result.stdout)
         if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
             raise Die("overlap: incomplete PR inventory")
@@ -308,7 +309,7 @@ def publish(gh, findings, lease):
         atomic(payload, {"title": finding["title"], "body": body, "labels": [LABEL]})
         result = gh._gh(["api", "--method", "POST", f"repos/{TAUCETI}/issues", "--input", str(payload)])
         if result.returncode:
-            raise Die("overlap: issue publication failed; cursor unchanged: " + result.stderr.strip()[-400:])
+            raise Die("overlap: issue publication failed; cursor unchanged: " + ends(result.stderr, 400))
         try:
             published = json.loads(result.stdout)
             number = published["number"]

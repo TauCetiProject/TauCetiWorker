@@ -49,8 +49,8 @@ worker"); the `api` provider's `ANTHROPIC_API_KEY` comes from the same environme
 below). Otherwise `--clone` defaults to the worker's content
 checkout (`Config.resolve().checkout`, the path `agents.prepare_checkout` maintains). `--root` defaults to `$TAUCETI_QUEUE_TASK_ROOT`, else
 `$TAUCETI_ACTIVITY_DIR/queue-repair`, else `~/.local/state/tauceti/queue-repair`; it holds the task
-checkpoints and logs (`tasks/<task_id>/`), the private worktrees (`worktrees/task-<task_id>`), the
-private Lake artifact pool (`lake-cache/`, `lake.toml`) and the agent's isolated Claude config.
+checkpoints and logs (`tasks/<task_id>/`), the private worktrees (`worktrees/task-<task_id>` while a
+task runs, `worktrees/batch-<batch_id>` between tasks), the private Lake artifact pool (`lake-cache/`, `lake.toml`) and the agent's isolated Claude config.
 
 ## Task protocol
 
@@ -98,8 +98,81 @@ head".
 adapter extracted them (`repair.findings_from_diagnostics`): `compiler`/`compiler_error` entries
 become compiler errors with the line and column parsed from a `path:line:col` message prefix,
 `lint`/`environment_linter` entries lint findings, and every other kind is listed as it is, each with
-the file-level owners computed from the chain. A rebase-conflict task carries one
-`{kind: "conflict", source_pr, paths, onto, message, pending, clean_prefix_tip}` entry.
+the file-level owners computed from the chain. A rebase-conflict or pre-rebase task carries one
+`{kind: "conflict", source_pr, commit, paths, onto, message, pending, clean_prefix_tip, landed_on_base}`
+entry: `commit` is the conflicting commit of the task's chain and `clean_prefix_tip` the commits before
+it replayed onto `onto`, published as `refs/tauceti-queue/batches/<id>/conflicts/<prefix>` and named
+in `retained_refs`. Such a task resolves that one commit (below, "Rebase conflicts: one commit at a
+time"); a worker releases a conflict task without `commit` (made by an older controller) as
+`agent_failed`, and the controller replays the head again and replaces the task.
+
+### Rebase conflicts: one commit at a time
+
+A `rebase_conflict` or `pre_rebase` task carries the chain `base..tip` and the target `onto`, and its
+`conflict` diagnostic names where the controller's replay stopped (`commit`, `paths`,
+`clean_prefix_tip`); the worker does not rely on that SHA and replays the chain itself
+(`repair_task.resolve_conflicts`) with the same `chain.replay`, so the whole task runs on one claim
+and one worktree and the controller keeps no state between conflicts.
+
+At each conflict the worker checks out the clean prefix and applies the conflicting commit onto it as
+the replay computed it (`repair.apply_conflict`: `git merge-tree` with the commit's parent as merge
+base, written to the working tree with `git read-tree -u --reset`), so the conflicting files carry
+git's markers, HEAD stays at the prefix and no rebase, cherry-pick or merge is in progress. When that
+checkout's `lean-toolchain` or `lake-manifest.json` differs from `onto`'s (a member bumps them), the
+worker fetches its Mathlib (`lake exe cache get`) before the agent's offline builds need it. The agent
+edits files and writes its explanation to `.tauceti-repair/explanation.md`; it gets no rebase recipe,
+no step script and no reference to the commits after the conflicting one: its findings are the
+conflict and a pre-rebase's predicted ripples from the head into the prefix and that commit, without
+the batch-wide admission predictions and preparation errors (`repair_task.conflict_findings`), and
+the ownership context is computed for those commits only.
+
+The worker then makes the commit itself (`repair.commit_resolution`): the tree is the worktree's files
+as `git add --all` stages them (without `.lake` and `.tauceti-repair`), read through a private index
+and the clone's own Git directory; the parent is the clean prefix; the message is the conflicting
+commit's own, trailers included, with the explanation appended; the author and author date are that
+commit's. The worktree's HEAD, index and refs, and any commit, rebase or reset the agent made, are
+never read, so the agent cannot replay or rewrite history. A missing explanation gets one explanation
+turn in the same session. These are problems that send the agent round again on the same conflict, up
+to `agent_attempts`, with the report as feedback:
+
+- leftover conflict markers in the conflicting files, or a review-size violation of the commit;
+- a no-repair or withdrawn member whose resolution changes the prefix (it may only be emptied);
+- `absorbed-later-member`: a later member of the input chain, replayed or still pending, that did not
+  land on the base, whose change applies onto the clean prefix and changes it, is already in the
+  resolved commit, and was not in the conflicting commit itself (`repair_task.absorbed_members`).
+  Taking a later member's content is replaying it by hand. A member that conflicts with the prefix is
+  not judged, and content moved between members in part is not detected mechanically, as for any
+  repair.
+
+An accepted resolution is the new base for replaying the rest of the input chain (`chain.replay` from
+the conflicting commit onto the resolved one), which stops at the next conflict or reaches the end. A
+conflict that stays unresolved releases the task (`agent_failed`). When the replay reaches the end the
+worktree is checked out at the whole chain on `onto`, which goes through the ordinary local checks,
+verification and full-chain submission, unchanged. The agent never saw the whole chain, so a failing
+verification is recorded and the chain submitted without another agent round, and a rejection by the
+controller is not sent back to the agent: the head's CI and repair tasks take a chain that does not
+build from there. A task with a retained repair checkpoint is already on the target and is repaired as
+a chain.
+
+**Resuming after a stop.** Each accepted resolution is recorded in the worker's clone as
+`refs/tauceti-queue/resolutions/<task_id>/<conflicting commit>-<clean prefix tree>`, naming the
+resolved commit (`repair_task.store_resolution`). The repair workers share one clone
+(`repair-clone`), so whichever worker claims the task next, after a stop (`worker-stopped`), a lost
+claim or a release such as `inference_unavailable`, finds them, and the ref keeps the objects. The
+key is the prefix's tree, not its SHA: the replay dates its commits when it runs, so a rerun reaches
+the same prefix tree under another SHA. At each conflict the worker looks the key up before running the
+agent; a stored resolution is committed again on the current prefix as `commit_resolution` would
+commit the same files and explanation (`repair.recommit_resolution`: its tree and message, the
+conflicting commit's author and date) and goes through every check above. When it passes, the replay
+continues from it and the agent is not run for that conflict (the outcome's `conflicts` entry has
+`reused: true`). An entry that is missing, names a commit that is not a resolution of this commit on a
+prefix with this tree, was not made exactly as the worker makes one (author, committer and dates, so
+not a commit an agent made with `git commit`), or fails a check is deleted and the conflict goes to the
+agent as before. The agent still sees one commit and never replays. A worker whose claim was lost
+records nothing. The task's entries are deleted once the service has
+answered its submission, and when the whole chain fails the worker's local checks (a rerun would
+rebuild the same chain without the agent). Entries of a task that is never claimed again stay in the
+clone like its `refs/tauceti-queue/task/<id>/...` refs; they are a few commit objects.
 
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
 `violations` (chain tool findings, `{code, detail, commit, source_pr}`), `provenance`. The runner
@@ -179,8 +252,12 @@ has a time budget holds because the service re-exposes the task.
    worker's clone, check that base, tip and `onto` are commits, retain the input tip under
    `refs/tauceti-queue/task/<id>/input`, and check out the tip detached in
    `<root>/worktrees/task-<id>` (`repair.checkout_worktree`; an existing worktree is re-pointed so
-   its `.lake` outputs stay warm). Checkpoint `sources_ready`.
-3. **Artifacts.** `repair.prepare_artifacts`, exactly the experiment's recipe: `lake exe cache get`
+   its `.lake` outputs stay warm). When this worker has a parked tree for the task's batch, it is
+   moved to `task-<id>` first (`repair_cleanup.adopt`, [One tree per batch](#one-tree-per-batch)).
+   Checkpoint `sources_ready`.
+3. **Artifacts.** On a warm batch tree (below) nothing is fetched: the tree's own `.lake` is the
+   warm state, the record carries `warm_tree`, and any build here or later compiles only what changed.
+   Otherwise `repair.prepare_artifacts`, exactly the experiment's recipe: `lake exe cache get`
    for Mathlib (or a shared extracted `.lake/packages` through `--seed-packages`, the experiment's
    stand-in for the shared Mathlib view), `lake cache get --service tauceti-public --repo <repository>
    --rev=<revision>` into the private pool, then `lake build --iofail` at the tip, which restores every
@@ -252,10 +329,11 @@ has a time budget holds because the service re-exposes the task.
    is missing the build fails closed; `TAUCETI_QUEUE_SANDBOX=0` runs builds unsandboxed, logging a
    warning for every build and reporting the sandbox as DISABLED in `--check`.
 4. **Agent.** The prompt (`repair.compose_prompt`) opens with the task's instruction verbatim, then
-   says what happened in plain words (for a rebase conflict: the queue replayed this batch of N squash
-   commits onto the current `main` commit with git, the replay stopped at PR N's commit with conflicts
-   in these files, the commits before it replayed cleanly and are at this commit, the job is to finish
-   the replay; for a repair: the batch was built on `main` with CI and the build failed), the evidence
+   says what happened in plain words (for a rebase conflict: the queue is replaying this batch onto the
+   current `main` commit with git, the replay stopped at PR N's commit with conflicts in these files,
+   the commits before it replayed cleanly and are at this commit, which is HEAD, and the job is to
+   resolve that one commit; its instruction is `repair.RESOLUTION_INSTRUCTION` rather than the
+   service's; for a repair: the batch was built on `main` with CI and the build failed), the evidence
    with the git refs the agent needs named once (base, target, the conflicting commit, the clean
    prefix, and for every file the owning commit: "PR N's commit `sha` modifies this file, and `main`
    has changed it since the batch's base"; for a repair the compiler, audit and lint findings with
@@ -263,25 +341,19 @@ has a time budget holds because the service re-exposes the task.
    PR in the same order, each keeping its `Source-PR:` and `Accepted-Head:` trailers and its ` (#N)`
    subject suffix; the queue reads it from the worktree, validates it and runs CI itself, so there is
    nothing to push or report and `gh` is not needed; no changes introduced to the build configuration,
-   `scripts/` or `.github/`, though a constituent commit that modifies such files keeps its change),
-   an "Already on main" section when members' PRs have landed on `main` outside the queue since the
-   batch's base (one line each with PR number, title and landing commit, up to `repair.LANDED_SHOWN`,
-   the rest by count; such a member becomes an empty commit and a conflict in one of them takes
-   `main`'s version; the list comes from the members' `landed_externally` flag when the service sends
-   one, else from the subjects ending in ` (#N)` between base and target), one editing instruction
-   (for a rebase conflict: `git rebase --keep-empty --empty=keep --reapply-cherry-picks --onto <target>
-   <base>`, where `--reapply-cherry-picks` keeps a member whose identical patch is already on `main`
-   as an empty commit instead of dropping it; resolve each stop inside the constituent commit with
-   `git add`, `git commit --allow-empty -C REBASE_HEAD` (the member's own message and author, kept
-   when the resolution leaves it empty) and `GIT_EDITOR=true git rebase --continue`; explanations
-   appended with `git commit --allow-empty --squash=<sha> -m <explanation>` and content changes with
+   `scripts/` or `.github/`, though a constituent commit that modifies such files keeps its change;
+   for a rebase conflict, the files in the worktree, which the worker commits itself), one editing
+   instruction (for a rebase conflict: remove the markers so the files hold the commit's change on
+   HEAD, then write the explanation file; for a repair: explanations appended with
+   `git commit --allow-empty --squash=<sha> -m <explanation>` and content changes with
    `git commit --fixup=<sha>`, folded in by an autosquash rebase that keeps each commit's message and
    author), and local verification. The member listings are not in the prompt (1,197 members once
    made a 291 KB prompt, about 75k tokens of noise): `repair.write_listings` writes
    `.tauceti-repair/members.jsonl` in the worktree, one JSON object per member in chain order with
    `position`, `commit`, `pr`, `title`, `accepted_head`, `provenance`, `landed_on_main` (the landing
-   commit, else null) and, for a rebase conflict, `state` (`replayed`, `conflicting` or `pending`),
-   and beside it `.tauceti-repair/check`, the agent's one validation command: a standalone Python
+   commit, else null) and, for a rebase conflict, `state` (`replayed` or `conflicting`: its listings
+   hold the clean prefix and the conflicting commit, never the commits after it), and beside it
+   (except for a rebase conflict) `.tauceti-repair/check`, the agent's one validation command: a standalone Python
    script that verifies the chain is linear on the target, has exactly one commit per member in the
    recorded order with the trailers and ` (#N)` subjects kept and every original message preserved as
    a prefix, that no rebase is in progress and that the working tree is clean, then runs staging's
@@ -290,15 +362,12 @@ has a time budget holds because the service re-exposes the task.
    and prints the first problem or `ok`; `check --size <commit>` prints one commit's measured sizes
    and violations as JSON. When the task's findings include a `policy` finding, the prompt explains
    the policy and its caps and says that splitting the member's change inside the batch (for example
-   a too-long new file into smaller files, in that member's own commit) is a valid repair. A rebase conflict also gets `.tauceti-repair/step`, a short shell script that
-   starts the rebase (or continues it), commits each stop whose member is already on `main` with
-   `main`'s version of the conflicted files as an empty commit, stops at the first real conflict
-   naming the commit and the files, and refuses to start when HEAD already sits on the target. The
+   a too-long new file into smaller files, in that member's own commit) is a valid repair. The
    directory is excluded from Git through the clone's `info/exclude`, so no recipe the agent runs can
    commit it, and `checkout_worktree` leaves it alone; a prompt composed without a worktree (the
    experiment's preview) carries the listings inline. The verification advice follows
    the artifacts outcome: a warm rebase fetches cached outputs without compiling the old chain and
-   asks the agent to finish the replay before building the resulting chain. Warm repair/prepare tasks
+   asks the agent to resolve the conflict before building the result. Warm repair/prepare tasks
    with worker verification enabled instead use `.tauceti-repair/check-findings`: scoped compilation
    of the reported modules and actual repair delta, then the named linters or ownership-only check.
    They return for the worker's full verification; their build helper requires module arguments.
@@ -322,8 +391,8 @@ has a time budget holds because the service re-exposes the task.
    `repair_tools.build_lock`, so exactly one `lake build` runs in a worktree at a time whoever
    started it. Long builds run in the foreground: the task
    sets `TAUCETI_SHELL_LIMIT_SECONDS` to `RunnerConfig.shell_limit` (two hours;
-   `repair.SHELL_LIMIT_SECONDS`) for the agent's shell limit, where the fleet's authoring rounds keep
-   ten minutes, and the prompt says so. The prompt states the aim (every constituent PR's mathematics
+   `repair.SHELL_LIMIT_SECONDS`) for the agent's shell limit, where the fleet's authoring rounds
+   default to an hour per command, and the prompt says so. The prompt states the aim (every constituent PR's mathematics
    lands as its author intended, compiled and checked) before the hard rules (no `sorry`, no
    `native_decide`, no new axioms, no `set_option`, no silenced linters), and asks for a closing
    summary of what changed in which PR's commit and the exit status of the final build. The
@@ -348,7 +417,7 @@ has a time budget holds because the service re-exposes the task.
    referenced, whole word, in another member's changed files at the chain tip or in the target's
    version of a file no member changed). Every collision and ripple is in
    `.tauceti-repair/collisions.jsonl` with line numbers; the prompt's "Likely collisions and
-   renames" section, next to "Already on main", lists them with member positions, PRs and files up
+   renames" section lists them with member positions, PRs and files up
    to `repair_context.SECTION_LINES` bullets and points at that file for the rest. One `git
    diff-tree` per member and `git cat-file --batch` for the changed blobs run over a thread pool, so
    a 1,197-member head takes about a second; a failure in this step is recorded in the outcome and
@@ -399,14 +468,46 @@ has a time budget holds because the service re-exposes the task.
    modules) the audit's import took 5 s warm and 27 s cold, the duplicate check 3 s and the axiom scan of a
    PR's few modules 4 s; the lint of five changed modules took 45 s and the two driver builds about 4 s.
 6. **Submit and publish.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
-   then `adopted` or `not_adopted`), then publish the build outputs (below). The worktree is removed
-   afterwards (by the background publisher when one runs) unless `--keep-worktree`;
-   the [lifecycle collector](operations.md#terminal-repair-worktree-cleanup) overrides that retention
-   once the task or batch is terminal, including trees left by errors or process kills;
+   then `adopted` or `not_adopted`), then publish the build outputs (below). The worktree is then
+   parked as the batch's tree (by the background publisher when one runs) unless `--keep-worktree`;
+   the [lifecycle collector](operations.md#terminal-repair-worktree-cleanup) removes it once the task
+   or batch is terminal, including trees left by errors or process kills;
    the artifact pool is kept, since the next task on the same base reuses it (prune it with the
    experiment CLI's `prune`). Every attempt's tip stays under
    `refs/tauceti-queue/task/<id>/attempt-<n>` in the clone, and `tasks/<id>/outcome.json` holds the
    outcome record.
+
+### One tree per batch
+
+A worker keeps one tree per batch, with its `.lake`, across the batch's tasks and across worker
+restarts (`tauceti_queue/repair_cleanup.py`). When a task ends, or a restarted worker abandons it,
+its tree is renamed to `<root>/worktrees/batch-<batch_id>` (`retire`, recording the task in
+`.lake/tauceti-batch-tree.json`, written before the rename so it moves with the tree). Only a tree whose artifacts were prepared (`available`), and whose
+`lean-toolchain` and `lake-manifest.json` are still the prepared ones (`onto`'s for a rebase, the
+starting tip's otherwise), is parked (`repair_task.parkable`); the tree is locked in Git while it is
+renamed, so a concurrent `git worktree prune` on the shared clone keeps it; any other is removed as before, and so is a tree whose batch already has a parked
+one. The batch's next task on this worker renames the parked tree to its own `task-<id>` path
+(`adopt`). Each worker has its own root, and a rename takes the tree whole and fails when its
+destination exists, so two tasks never share or nest one. Adoption, parking and the collector take
+the tree's lease (`worktree-leases/batch-<id>.lock`), so the collector never deletes a tree a task
+is taking. The background publisher parks the tree only when the task's artifacts were available. Adoption deletes the previous task's `.tauceti-repair/` (which `git clean` keeps, since the clone
+excludes it), `.lake/outputs.jsonl` and `.lake/publication-stage`, and quits any Git operation left in progress;
+the checkout then re-points the tree to the task's starting tip as for any reused tree.
+
+The adopted tree is warm when `lean-toolchain` and `lake-manifest.json` are unchanged between the
+commit it was parked at and every revision the task builds (its starting tip, and `onto` for a
+rebase). A warm tree fetches nothing: no Mathlib cache, no repair or public outputs, no ancestor
+walk. A miss means Lake compiles that module; it never releases the task. A tree whose toolchain or
+dependencies changed, or a batch's first task on this worker, prepares artifacts as described above.
+`outcome.sources.batch_tree` is `warm`, `adopted` (re-prepared) or `new`.
+
+The queue's agent rounds run with `host_caches=False` (`agents.run_agent_host`): the host's shared
+cache preparation and the canonical store's prepare and round-end relinking belong to the fleet's
+rounds, and the task has already prepared its own tree. A parked tree therefore holds its whole
+`.lake` (about 23 GiB of build outputs and 7 GiB of packages for TauCeti in November 2026). The
+lifecycle collector removes it once its batch has landed or been removed. Parked trees do not hold
+back the artifact pool's collection (`repair_cache`): Lake promotes a collected output back into the
+pool from the tree when it next needs it.
 
 **Known audit/lint findings.** When a repair task already carries located audit or lint
 findings for its frozen candidate, and no compiler errors, the worker fetches the warm artifacts
@@ -445,7 +546,7 @@ the build under `stream_build`. When worker verification is enabled, the agent r
 checks and the worker runs the final full verification. Other configurations retain the agent's
 whole-library `lake build --iofail` verdict. A build still running when the task ends or is interrupted is stopped and
 its lock removed. Rebase-conflict and pre-rebase tasks fetch caches and go directly to the agent,
-which finishes the replay before building the resulting chain. For repairs without known audit/lint findings, `--no-stream-repair` keeps the sequential
+which resolves the one conflicting commit before building the result. For repairs without known audit/lint findings, `--no-stream-repair` keeps the sequential
 flow: the preparation's own incremental build, then the agent.
 
 **Preparing an open batch** (`kind: "prepare"`; `docs/queue/controller.md`, "Background
@@ -455,7 +556,7 @@ batches: `base` and `tip` are the open batch's own (never the head's tip), `onto
 streaming build, always, even under `--no-stream-repair`, since that build is how it learns whether
 anything fails: a build that finishes with exit 0 and no error releases the task as `prepared_clean`
 without starting an agent and publishes its outputs to the repair cache under the batch tip. When
-the build reports errors the agent (or the parallel group agents) is launched as for a repair, with
+the build reports errors the agent is launched as for a repair, with
 the "What happened" section saying that the batch has not yet been tried, that it should fix what
 fails to build so the batch is ready when it becomes the head, and that nothing it does is a verdict;
 the result is validated, pushed and submitted the same way, and the controller adopts it into the
@@ -475,7 +576,7 @@ the head's tip, the controller hands out a second preparation of the replayed ch
 `refs/tauceti-queue/batches/<id>/pre-rebased/<tip>`), the members are the commits of that chain, and
 `extra.pre_rebased` names the batch tip it covers (`source`), the batch's own base (`batch_base`) and
 the head's base (`head_base`). The worker runs it exactly like an own-base preparation, so the
-streaming build, the parallel groups, the in-place repair with edits folded into the owning members'
+streaming build, the in-place repair with edits folded into the owning members'
 commits, the worker's audits (against the head's tip) and the submission are unchanged. Only the
 artifacts differ: the repair namespace is asked for the pre-rebased tip and then the head's tip
 (`repair_publish.preferred`), the outputs the head's repair published, and the public cache for the
@@ -543,14 +644,10 @@ unchanged in all three.
 ## Parallel agents within one task
 
 Before the agent of phase 4 runs, a repair task's findings are split into independent groups
-(`tauceti_queue/repair_parallel.py`, `plan_groups`). When the worker streamed the first build, the
-findings are the task's diagnostics merged with that build's complete error list
-(`.tauceti-repair/errors.jsonl`, each error with its file, line, column and message; `read_errors`,
-`merge_errors`): the path waits for the streaming build to finish first, since a group is independent
-only against the whole list, and the outcome's `parallel.source` names `errors.jsonl` with the time
-waited. (With `--parallel-agents 1` the agent is launched at the first error as the streaming
-section describes; with the default of 3 a repair trades that head start for concurrent agents on the
-complete list.) Two failing modules share a group when one
+(`tauceti_queue/repair_parallel.py`, `plan_groups`). The findings are the ones the task already has
+(its diagnostics); the path never waits for a streaming build, so the agents start at once. A
+preparation, which has no diagnostics, therefore repairs sequentially from the streaming build's error
+list. Two failing modules share a group when one
 member's commit changes both, when the owning members' commits change a common file, or when a file
 one member changes `import`s a file of the other's (read from the files at the tip; nothing deeper is
 inferred). A finding in a module no member changes (a ripple into `main`) cannot be assigned and keeps
@@ -659,14 +756,15 @@ and `worker.json` counts them per provider (`providers`) and repeats the last ta
 Tasks are all-or-nothing. The task record `tasks/<id>/task.json` (written with
 `runtime_status.atomic_json`) records the task, the claim token and expiry, the current phase and a
 history of phases; `session.json` records the provider session for follow-up turns within the same
-run (the explanation turn). Nothing continues a model session across runs.
+run (the explanation turn). Nothing continues a model session across runs; a rebase task's accepted
+conflict resolutions are the one thing a rerun reuses ([Resuming after a stop](#rebase-conflicts-one-commit-at-a-time)).
 
 A claim never outlives the worker that holds it. On SIGTERM, at any phase before the result is
 validated, the attempt is abandoned and the claim released with reason `worker-stopped` so the
-service re-exposes the task at once; the worktree is removed. On start (`retry_deliveries`), every
+service re-exposes the task at once; the worktree is parked or removed ([One tree per batch](#one-tree-per-batch)). On start (`retry_deliveries`), every
 record of this worker still in flight (`claimed`, `sources_ready`, `artifacts_ready`,
 `artifacts_unavailable`, `agent_running`, `validated`, and `interrupted` from older releases) has its
-claim renewed and then released as `worker-stopped`, its worktree removed. Only a validated result
+claim renewed and then released as `worker-stopped`, its worktree parked or removed. Only a validated result
 whose delivery was under way (`delivery_pending`, `pushed`, `submitted`) is delivered again: the push
 to the submission ref and the `result` call are retried while the claim is live, and a claim the
 service no longer recognises is recorded as `claim_lost`, so a lost claim never produces a late
@@ -746,12 +844,13 @@ green). For the build sandbox, a recording `bwrap` stub checks the composed bind
 and the cleared environment, the disabled fallback's warning, failing closed without `bwrap`, and the
 `--check` line. The parallel path, with members #2 and #3 both broken: two group agents running at the
 same time in their own worktrees and child processes (under the Claude and the Codex argv shapes) with
-fixups folded into a valid chain that is adopted, the groups taken from the streaming build's
-`errors.jsonl` once it has finished, every build serialized by the shared lock and run through the
+fixups folded into a valid chain that is adopted, the groups taken from the task's diagnostics without
+waiting for the streaming build, every build serialized by the shared lock and run through the
 sandbox wrapper, a group whose agent fails (or whose fixups stray outside its files) handed to the
 sequential agent, a lost claim stopping the group agents, the build lock serializing two concurrent
 scoped builds and taking over a stale lock, a provider-neutral group prompt, and dependent or
-unassignable failures staying sequential. A `prepare` task whose batch builds is released as
+unassignable failures staying sequential. A batch's second task adopts the first task's parked tree
+and starts warm without fetching. A `prepare` task whose batch builds is released as
 `prepared_clean` without an agent, and one whose batch fails is repaired with the not-yet-tried
 prompt and adopted. No real inference and no network.
 
@@ -759,7 +858,7 @@ prompt and adopted. No real inference and no network.
 
 When the next batch's intended parent is available, prepare directly on that parent rather than
 requiring an old-base full build. Already claimed preparations finish normally. Rebase agents resolve
-all conflicts and perform focused checks; the worker owns the combined whole-library verification.
+one conflicting commit and perform focused checks; the worker owns the whole-library verification.
 
 `checks-timing.json` records each check's wall time and sampled process-tree RSS. The checks always
 run at the same time, the compiled ones over read-only build outputs, and all are joined before task
@@ -780,7 +879,7 @@ Staging status intents persist for the existing retry workflow. A green build wa
 status delivery on its original run. The finalizer still requires the build and exact public map.
 Legacy missing-run grace is unchanged pending duplicate-safe dispatch evidence.
 
-For a repair or rebase that compiles and still fails audit or lint after local retries, the worker
+For a repair that compiles and still fails audit or lint after local retries, the worker
 can send a checkpoint using the current claim and its submission ref. The controller validates the
 chain and records it as a retained submission without adopting it. A new claim on the same task
 starts from that tip and receives the outstanding findings. It runs full verification before final

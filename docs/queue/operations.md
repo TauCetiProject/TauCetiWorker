@@ -222,7 +222,7 @@ names of the form `<sha>-<time>` are collected; hand-made worktrees in that dire
 own release directory.** Never use systemd drop-ins (`~/.config/systemd/user/tauceti-queue*.service.d/*.conf`)
 for queue units: they silently override the installed unit and each other, so the release
 directories, `release.sh status` and the installers stop describing what runs. `install.sh`,
-`install-repair.sh` and `install-monitoring.sh` ([monitoring.md](monitoring.md)) refuse to run while
+`install-repair.sh`, `install-monitoring.sh` ([monitoring.md](monitoring.md)) and `install-security-audit.sh` refuse to run while
 one exists for a unit they install. Settings belong in `~/.config/tauceti-queue/environment` (or
 `repair-environment*`, `monitoring-environment`) or in the unit files in this repository.
 
@@ -261,9 +261,9 @@ working tree, which the not yet migrated units still run, is not changed:
 git clone -q https://github.com/TauCetiProject/TauCetiWorker.git /tmp/tcq-bootstrap
 ~/TauCetiQueue/services/queue/backup.sh               # as before any controller install
 /tmp/tcq-bootstrap/services/queue/install.sh
-/tmp/tcq-bootstrap/services/queue/install-repair.sh                # each right after its worker.json reports idle
-/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 2
-/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 3
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --when-idle    # each once it is between tasks
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 2 --when-idle
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 3 --when-idle
 /tmp/tcq-bootstrap/services/queue/install-monitoring.sh
 /tmp/tcq-bootstrap/services/queue/install-repair-cleanup.sh --database ... --clone ... --root ...   # the arguments in "Terminal repair worktree cleanup"
 /tmp/tcq-bootstrap/services/queue/release.sh status
@@ -639,7 +639,10 @@ worker/publisher ownership leases:
 `tauceti-queue-repair-cleanup.timer` runs independently of the workers, on startup and every minute
 after the preceding collection ends. It reads the local authoritative SQLite database without
 writing it. Landed/removed batches and submitted/superseded tasks are eligible, including worktrees
-left by failed attempts and `task-<id>-group-*` parallel worktrees. The collector removes their Git
+left by failed attempts and `task-<id>-group-*` parallel worktrees. A parked batch tree
+(`worktrees/batch-<id>`, about 30 GiB with its `.lake`) is removed once its batch has landed or been
+removed; its identity comes from the task recorded in the tree's `.lake/tauceti-batch-tree.json`, and a
+tree without a known task is kept and reported as `unknown`. The collector removes their Git
 worktree registrations and build/dependency directories; task JSON, logs, retained refs and artifact
 caches remain. `--keep-worktree` does not exempt terminal work from this collector.
 
@@ -728,6 +731,7 @@ had 0.154.0, which failed this way; 0.166.0 answers normally on the same Pro acc
 ~/TauCetiQueue/services/queue/install-repair.sh                   # origin/main (clones ~/TauCetiQueue when absent)
 ~/TauCetiQueue/services/queue/install-repair.sh --revision <sha>  # a pinned revision
 ~/TauCetiQueue/services/queue/install-repair.sh --instance 2      # another worker
+~/TauCetiQueue/services/queue/install-repair.sh --instance 2 --when-idle   # restart once it holds no claim
 ```
 
 The rules in [Install and update](#install-and-update) apply here too: no drop-ins, and origin/main HEAD
@@ -746,6 +750,26 @@ itself serving at the release's revision in `<task root>/worker.json`. Exit 0 me
 running task. The queue service, its backup timer, the other workers and the fleet units are not
 touched.
 
+`--when-idle` waits for the worker to be between tasks before restarting it, so updating a worker
+needs no ad hoc waiter. The signal is the queue's own record: the installer opens the controller's
+database (`~/TauCetiQueue-data/queue.sqlite3`, read-only, so it runs on the controller's host) and
+waits while `claims` has a row for the running worker with `released_at` unset. An expired claim
+counts until the controller releases it (on its next tick), because a renewal waiting for the
+controller's lock keeps it. The worker's name (for example `repair-2@tauchonki2`) is the `TAUCETI_QUEUE_WORKER` of the
+unit's running process, read from its environment, so an environment file edited since the worker
+started does not misname it; a unit with no running process has nothing to wait for. It prints the
+claims it is waiting for, checks every 60 seconds, and waits for as long as it takes unless
+`--idle-timeout SECONDS` is given, after which it exits 3 without restarting. Anything it cannot read
+counts as busy. It waits before choosing the revision, so a long wait installs origin/main as it is
+when the wait ends, and checks once more right before the restart, without holding the releases lock.
+This is best effort: the worker has no switch to stop claiming, so a claim made between the last
+check and the restart is interrupted like any restart (below). Neither the unit's processes nor
+`worker.json` tell idle from busy: between rounds of a task the worker runs for minutes with no child
+process, and `worker.json` stays `claiming` while a claimed task runs. `--when-idle` is parsed by the
+copy of the installer you start, so start one that has it (fast-forward `~/TauCetiQueue` with
+`git -C ~/TauCetiQueue pull --ff-only` when its working tree is older); an older copy stops with
+`unknown argument`.
+
 An instance uses `tauceti-queue-repair@NAME.service` and `repair-environment-NAME`. When that file
 is absent, the installer copies the singleton's provider/cache configuration and supplies a distinct
 worker identity and task root. Both service forms execute the virtual environment's Python directly,
@@ -753,7 +777,8 @@ so `MainPID` matches `worker.json`. `Restart=always`, `OOMPolicy=kill` and disab
 keep worker-cgroup kills recoverable without an external restart loop or a new memory cap.
 
 A restart (or `systemctl --user stop`) sends SIGTERM: a running agent is stopped, the attempt
-abandoned, its claim released (`worker-stopped`) and its worktree removed. A task that has already
+abandoned, its claim released (`worker-stopped`) and its worktree parked as its batch's tree
+(repair-task.md, "One tree per batch"). A task that has already
 validated its chain finishes the push and submission first. `TimeoutStopSec=300`; a worker killed
 beyond that leaves the claim to expire (`claim_ttl_seconds`, 900) and the task is re-exposed.
 
@@ -941,12 +966,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `pre_rebase_enabled` | `true` | `true` or `false` |
 | `prepare_pre_rebased` | `true` | `true` or `false` |
 | `withdraw_emptied_at_adoption` | `true` | `true` or `false` ([reject-empty-commits.md](reject-empty-commits.md)) |
-| `failure_repeat_limit` | `2` | integer, at least 0; 0 disables ([escalation.md](escalation.md)) |
-| `repair_fruitless_claim_limit` | `3` | integer, at least 0; 0 disables |
-| `source_failure_round_limit` | `6` | integer, at least 0; 0 disables |
-| `policy_rejection_withdraw` | `true` | `true` or `false` |
-| `attribution_max_members` | `10` | integer, at least 0; 0: no bound |
-| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff |
+| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff ([escalation.md](escalation.md)) |
 | `automatic_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
 | `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
@@ -957,7 +977,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `forgejo_recheck_seconds` | `21600` | integer, at least 0; a settled Forgejo PR whose listed facts are unchanged is evaluated again this long after its last attempt ([mixed-sources.md](mixed-sources.md)) |
 | `control_lane_enabled` | `false` | `true` or `false`; stage GitHub control-file PRs in their own lane batch ([mixed-sources.md](mixed-sources.md), "The control-file lane") |
 
-Escalations (withdrawals, bisections, the start and end of an infrastructure backoff) are sent as Zulip direct messages when
+Escalations (the start and end of an infrastructure backoff) are sent as Zulip direct messages when
 `TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
 configuration file; see [escalation.md](escalation.md), "Alerts and notifications".
 
@@ -981,6 +1001,19 @@ evaluation pending and prevent insertion. The decision records the human approva
 and permission-check time, and the scope observation exposes its original evidence.
 All staging build, audit, pin and scope checks remain required before publication.
 An approval previously cancelled by policy needs a fresh operator command after repair.
+
+A large refactor that machine review and PR CI cannot cover (a Mathlib bump combined with a
+mechanical rewrite of thousands of files) may likewise be carried by a repository admin's own
+exact-head `bors r+`, in place of a green scoreboard and green PR statuses. Intake keeps that
+approval, whatever any scoreboard says, only while all of these hold: an admin's `large-refactor`
+label is verified on the head (applied after the head's commit, no force push since); command
+intake recorded the approval as an admin's own, and its head and merge base still match; every
+changed path is under the mathematics prefix or is `lake-manifest.json` or `lean-toolchain`; the
+diff guards the label does not lift (the new-file cap) pass; and, when a pin changes, the trusted
+`check-bump.sh` verdict, run live, passes. An unreadable bump check leaves evaluation pending.
+Apply the label after the final push, then post `bors r+`; any later push cancels the input. The
+decision records the approval as `large_refactor_approval`. Staging's build, audit, pin and scope
+checks still apply before anything lands.
 
 The existing approval-poll thread runs intake. Relevant authenticated webhooks persist dirty PRs
 in `admission_work` in the existing SQLite database before acknowledgment. Reads and git fetches

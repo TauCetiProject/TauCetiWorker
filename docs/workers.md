@@ -36,6 +36,13 @@ an already-started agent session runs to completion. Workers report
 `waiting-capacity` while draining instead of being terminated. Workers without
 the environment variable behave as before.
 
+Each round also records, in the worker's runtime status, the authoring
+backpressure it enforces: `authoring` holds the open non-draft PRs it counts as
+its own on every healthy source (`sources`, `count`), the `limit`, whether roadmap
+authoring is `blocked`, the roadmap `scope` the count covers and its `skip`
+list, and `observed_at`. The count comes from that round's own survey, so it is
+current on any forge. A starting loop clears the previous report.
+
 `TAUCETI_FLEET_MACHINE_ID` and `TAUCETI_FLEET_EVENTS` opt into a private JSONL
 provenance journal. Successful PR creation and GitHub mutations record machine,
 worker, repository and PR identity. Branch pushes record assistance when the PR
@@ -720,6 +727,19 @@ adopt a new Worker runtime, for example) then adopts the running workers instead
 stopping their rounds. A service installed before this change keeps its workers in the
 service itself: rerun `tauceti workers service install` and restart the service once,
 at a quiet moment, to move to scopes.
+
+The installer also writes `tauceti-workers.slice`. Limits set there cover the manager
+and every worker scope together, so set them on the slice rather than with
+`systemctl set-property` on the service, which worker scopes escape:
+
+```bash
+tauceti workers service install --cpu-quota 3200% --memory-high 48G
+```
+
+`--cpu-quota`, `--memory-high` and `--memory-max` take systemd's `CPUQuota=`,
+`MemoryHigh=` and `MemoryMax=` values. A later install without an option keeps the
+installed value, and an empty value (`--memory-high ''`) removes it. The install
+reloads systemd, which applies new limits to running workers without a restart.
 
 Two platform caveats:
 

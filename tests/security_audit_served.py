@@ -17,11 +17,9 @@ import security_audit as historical
 
 from tauceti_worker import audit_client_check as check
 from tauceti_worker import audit_clients as clients
-from tauceti_worker import audit_progress as progress
 from tauceti_worker import audit_reader as ar
-from tauceti_worker import audit_recovery as recovery
 from tauceti_worker import security_audit as sa
-from tauceti_worker.config import Die, NoProgress
+from tauceti_worker.config import Die
 
 
 def read_events(provider, pages, *, failed=False):
@@ -70,6 +68,21 @@ def read_events(provider, pages, *, failed=False):
                 ]
             )
     return events
+
+
+def read_all(reader, env):
+    """Serve every page; a Claude client also stores each result in its session, as the real one does."""
+    rows = []
+    for page in range(len(reader.pages)):
+        result = reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+        use = {"type": "tool_use", "id": f"read-{page}", "name": "mcp__audit__read_page", "input": {"page": page}}
+        back = {"type": "tool_result", "tool_use_id": f"read-{page}", "content": result["content"]}
+        rows += [{"type": "assistant", "message": {"content": [use]}}, {"type": "user", "message": {"content": [back]}}]
+    if "CLAUDE_CONFIG_DIR" in env:
+        session = Path(env["CLAUDE_CONFIG_DIR"]) / "projects" / "home" / "session.jsonl"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        with session.open("a") as stream:
+            stream.write("".join(sa.serialize(row) + "\n" for row in rows))
 
 
 def native_read_rows(pages, batch):
@@ -213,7 +226,7 @@ class NumberedReader(unittest.TestCase):
         expected = self.read(0)
         self.receipt.unlink()
         process = subprocess.run(
-            [sys.executable, "-I", str(sa.reader_path(4)), str(source), str(self.receipt)],
+            [sys.executable, "-I", str(sa.reader_path()), str(source), str(self.receipt)],
             input=ar.encode(request) + "\n",
             text=True,
             capture_output=True,
@@ -224,405 +237,30 @@ class NumberedReader(unittest.TestCase):
 
 
 class ServedJudgments(unittest.TestCase):
+    """Fresh protocol-5 inspections of a paged batch, through each reviewer's real launch path."""
+
     def setUp(self):
-        historical.WorkerBoundJudgments.setUp(self)
-        verified = patch.object(clients, "selected_protocol", return_value=4)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.work = Path(tmp.name) / "state" / sa.CURSOR
+        self.work.mkdir(parents=True)
+        self.thread = "11111111-2222-4333-8444-555555555555"
+        text = "-- mathematics\n" * 4000
+        self.batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "c" * 40,
+            "commits": [
+                {
+                    "sha": "b" * 40,
+                    "parent": "a" * 40,
+                    "files": [{"path": "TauCeti/A.lean", "before": "", "after": text, "diff": "+" + text}],
+                }
+            ],
+        }
+        self.batch["input_digest"] = hashlib.sha256(sa.serialize(self.batch).encode()).hexdigest()
+        verified = patch.object(clients, "selected_protocol", return_value=5)
         verified.start()
         self.addCleanup(verified.stop)
-
-    def replace_answer(self, value):
-        historical.WorkerBoundJudgments.replace_answer(self, value)
-        receipt = ar.Reader(self.batch, self.original / "read-receipt.json").coverage()
-        (self.original / "coverage-launch.json").write_text(sa.serialize({"before": receipt, "provider": "codex"}))
-
-    def evidence(self, *, verdict="unfinished", findings=None, original=None):
-        a = original or self.original
-        a.mkdir(exist_ok=True)
-        (a / "input.json").write_text(sa.serialize(self.batch))
-        r = ar.Reader(self.batch, a / "read-receipt.json")
-        r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0}})
-        home = a / "home"
-        prompt = sa.inspection_prompt(self.batch, True, protocol=4)
-        execution = {
-            **sa.inspection_profile(4),
-            "argv": sa.codex_launch(home, True, receipt=a / "read-receipt.json", protocol=4),
-            "environment": {"HOME": str(home), "CODEX_SQLITE_HOME": str(sa.goal_state(a, self.batch))},
-            "paged": True,
-            "protocol_version": 4,
-            "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
-            "batch_identity": {
-                "input_digest": self.batch["input_digest"],
-                "commits": [c["sha"] for c in self.batch["commits"]],
-            },
-        }
-        (a / "execution.json").write_text(sa.serialize(execution))
-        (a / "prompt.txt").write_text(prompt)
-        # replace_answer expects an existing native final.
-        (a / "model-rollout-0.jsonl").write_text(
-            sa.serialize({"type": "session_meta", "payload": {"id": self.thread}}) + "\n"
-        )
-        historical.append_native(a / "home", {"verdict": verdict, "findings": findings or []}, self.thread)
-        (a / "model-rollout-0.jsonl").write_bytes(next((home / ".codex/sessions").glob("*.jsonl")).read_bytes())
-        self.replace_answer({"verdict": verdict, "findings": findings or []})
-
-    def all_served(self, attempt=None):
-        attempt = attempt or self.original
-        r = ar.Reader(self.batch, attempt / "read-receipt.json")
-        for page in range(len(r.pages)):
-            r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-
-        native = attempt / "model-rollout-0.jsonl"
-        rows = native.read_text().splitlines()
-        rows[-1:-1] = list(map(sa.serialize, native_read_rows(range(len(r.pages)), self.batch)))
-        native.write_text("\n".join(rows) + "\n")
-        transcript = attempt / "model-transcript.jsonl"
-        transcript.write_text(
-            "\n".join(map(sa.serialize, read_events("codex", range(len(r.pages))))) + "\n" + transcript.read_text()
-        )
-
-    def test_prompt_schema_and_launcher_contain_no_copied_identifiers(self):
-        prompt = sa.inspection_prompt(self.batch, True, protocol=4)
-        for forbidden in ("read_token", "next_token", "reader_token", "latest reader token", "final token"):
-            self.assertNotIn(forbidden, prompt)
-            self.assertNotIn(forbidden, sa.serialize(sa.inspection_catalog(4)))
-        args = json.loads(
-            next(
-                v.split("=", 1)[1]
-                for v in sa.codex_launch(self.original, True, protocol=4)
-                if v.startswith("mcp_servers.audit.args=")
-            )
-        )
-        self.assertEqual(len(args), 4)
-        tool = ar.Reader(self.batch, self.original / "new.json").request("tools/list", {})["tools"][0]
-        self.assertEqual(tool["inputSchema"]["required"], ["page"])
-
-    def test_premature_pass_and_missing_receipt_cannot_approve(self):
-        verdict = sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch)
-        with self.assertRaisesRegex(Die, "not served"):
-            sa.validate_reads(verdict, self.batch, self.original / "read-receipt.json", True, protocol=4)
-        with self.assertRaisesRegex(Die, "not served"):
-            sa.validate_reads(verdict, self.batch, self.original / "absent.json", True, protocol=4)
-        self.replace_answer({"verdict": "pass", "findings": []})
-        a, batch, execution, _ = recovery.retained(self.work, self.block)
-        self.assertIsNone(recovery.completed_pass(a, batch, execution))
-        self.assertTrue(
-            progress.continuable(
-                (a / "model-transcript.jsonl").read_text(), batch, a / "read-receipt.json", a, protocol=4
-            )
-        )
-        self.all_served()
-        self.assertEqual(recovery.completed_pass(a, batch, execution), verdict)
-
-    def test_findings_and_uncertainty_before_compaction_still_block_later_pass(self):
-        for kind in ("finding", "incomplete"):
-            self.evidence(verdict=kind, findings=["Possible IO"])
-            path = self.original / "model-rollout-0.jsonl"
-            old = path.read_bytes()
-            self.replace_answer({"verdict": "pass", "findings": []})
-            rows = path.read_text().splitlines()
-            path.write_text(old.decode() + sa.serialize({"type": "compacted", "payload": {}}) + "\n" + rows[-1] + "\n")
-            with patch.object(sa, "inspect") as model:
-                self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
-            model.assert_not_called()
-
-    def test_retained_protocol_and_reader_cannot_be_changed(self):
-        p = self.original / "execution.json"
-        original = json.loads(p.read_text())
-        for change in ({"protocol_version": 3}, {"reader_digest": "wrong"}, {"batch_identity": {}}):
-            p.write_text(sa.serialize({**original, **change}))
-            with self.subTest(change=change), self.assertRaises(Die):
-                recovery.retained(self.work, self.block)
-        p.write_text(sa.serialize(original))
-        with self.assertRaisesRegex(Die, "cannot change"):
-            sa.inspect(self.batch, "codex", self.work / "attempt-next", resume_from=self.original, protocol=3)
-
-    def test_unverified_client_cannot_continue_protocol_four_or_repair_tokens(self):
-        with self.assertRaisesRegex(Die, "unavailable in protocol 4"):
-            sa.inspect(self.batch, "codex", self.work, protocol=4, repair_output=True)
-        with patch.object(clients, "selected_protocol", return_value=3), patch.object(sa, "run_process") as model:
-            with self.assertRaisesRegex(NoProgress, "delivery verification"):
-                sa.inspect(self.batch, "codex", self.work, resume_from=self.original)
-        model.assert_not_called()
-
-    def test_missing_verification_does_not_reserve_quota_or_a_recovery_attempt(self):
-        ledger = (self.work / "ledger.jsonl").read_bytes()
-        with (
-            patch.object(clients, "selected_protocol", return_value=3),
-            patch("tauceti_worker.loop.resolve_work_model") as quota,
-            patch.object(sa, "inspect") as model,
-            self.assertRaisesRegex(NoProgress, "awaiting client"),
-        ):
-            recovery.recover(self.cfg, self.opts, self.block)
-        quota.assert_not_called()
-        model.assert_not_called()
-        self.assertFalse((self.work / "operational-recovery.json").exists())
-        self.assertEqual((self.work / "ledger.jsonl").read_bytes(), ledger)
-
-    def test_crash_after_pipe_write_rolls_back_new_coverage_without_losing_findings(self):
-        before = ar.Reader(self.batch, self.original / "read-receipt.json").coverage()
-        self.all_served()
-        self.replace_answer({"verdict": "pass", "findings": []})
-        # The client died before its new tool result reached a completed turn.
-        (self.original / "coverage-launch.json").write_text(
-            sa.serialize(
-                {
-                    "before": before,
-                    "provider": "codex",
-                }
-            )
-        )
-        self.assertIsNone(recovery.completed_pass(self.original, self.batch, {"protocol_version": 4, "paged": True}))
-        self.assertEqual(ar.Reader(self.batch, self.original / "read-receipt.json").coverage(), before)
-        prompt = progress.snapshot(self.batch, self.original / "read-receipt.json", self.original, protocol=4)
-        self.assertIn("next_unserved_page=1", prompt)
-        self.assertNotIn("All chunks were served", prompt)
-        # Source judgments are retained even though coverage rolls back.
-        self.replace_answer({"verdict": "finding", "findings": ["Possible IO before interruption"]})
-        with patch.object(sa, "inspect") as model:
-            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
-        model.assert_not_called()
-
-    def test_interrupted_or_failed_client_reads_cannot_credit_fresh_chunks(self):
-        for kind in ("timeout", "nonzero", "failed-tool"):
-            attempt = self.work / ("attempt-" + kind)
-            attempt.mkdir()
-            home = attempt / "isolated"
-            home.mkdir()
-            receipt = attempt / "read-receipt.json"
-
-            def model(argv, *, kind=kind, receipt=receipt, home=home, **kwargs):
-                r = ar.Reader(self.batch, receipt)
-                for page in range(len(r.pages)):
-                    r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-                value = {"verdict": "pass", "findings": []}
-                historical.append_native(home, value, self.thread)
-                if kind == "timeout":
-                    raise subprocess.TimeoutExpired("codex", 1800, output=b"")
-                events = [
-                    {"type": "thread.started", "thread_id": self.thread},
-                    {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
-                    {"type": "turn.completed"},
-                ]
-                return SimpleNamespace(
-                    returncode=0 if kind == "failed-tool" else 1,
-                    stdout="\n".join(
-                        map(sa.serialize, read_events("codex", range(len(r.pages)), failed=True) + events)
-                    ),
-                    stderr="client failed",
-                )
-
-            with patch.object(sa, "run_process", side_effect=model), patch.object(sa.time, "sleep"):
-                kwargs = dict(
-                    home=home,
-                    env={"CODEX_SQLITE_HOME": str(home)},
-                    work=attempt,
-                    receipt=receipt,
-                    provider="codex",
-                    paged=True,
-                    batch=self.batch,
-                    protocol=4,
-                )
-                if kind == "timeout":
-                    with self.assertRaises(subprocess.TimeoutExpired):
-                        sa.run_client(["codex", "exec", "-"], "", **kwargs)
-                else:
-                    self.assertEqual(
-                        sa.run_client(["codex", "exec", "-"], "", **kwargs).returncode,
-                        0 if kind == "failed-tool" else 1,
-                    )
-            self.assertEqual(sa.reconcile_coverage(attempt, self.batch)["served"], [])
-            self.assertEqual(ar.Reader(self.batch, receipt).coverage()["served"], [])
-            self.assertIsNone(recovery.completed_pass(attempt, self.batch, {"protocol_version": 4, "paged": True}))
-
-    def test_timeout_does_not_credit_saved_error_for_unsaved_success(self):
-        attempt = self.work / "attempt-last-read"
-        attempt.mkdir()
-        home = attempt / "isolated"
-        home.mkdir()
-        receipt = attempt / "read-receipt.json"
-
-        def model(argv, **kwargs):
-            r = ar.Reader(self.batch, receipt)
-            for page in (0, 1):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-            append_native_reads(home, [0], self.thread, self.batch)
-            # The earlier skip-ahead error is saved, but the later successful
-            # page-1 result exists only in stdout when the client times out.
-            failed_rows = native_read_rows([1], self.batch)
-            failed_rows[-1]["payload"]["output"] = [{"type": "input_text", "text": "Error: skipped page"}]
-            with next((home / ".codex/sessions").glob("*.jsonl")).open("a") as native:
-                native.write("\n".join(map(sa.serialize, failed_rows)) + "\n")
-            events = read_events("codex", [0]) + read_events("codex", [1])
-            raise subprocess.TimeoutExpired("codex", 1800, output="\n".join(map(sa.serialize, events)).encode())
-
-        with patch.object(sa, "run_process", side_effect=model), self.assertRaises(subprocess.TimeoutExpired):
-            sa.run_client(
-                ["codex", "exec", "-"],
-                "",
-                home=home,
-                env={},
-                work=attempt,
-                receipt=receipt,
-                provider="codex",
-                paged=True,
-                batch=self.batch,
-                protocol=4,
-            )
-        self.assertEqual(ar.Reader(self.batch, receipt).coverage()["served"], [0])
-        prompt = progress.snapshot(self.batch, receipt, attempt, protocol=4)
-        self.assertIn("next_unserved_page=1", prompt)
-
-    def test_two_timeouts_preserve_cumulative_successful_reading(self):
-        attempt = self.work / "attempt-timeouts"
-        attempt.mkdir()
-        home = attempt / "isolated"
-        home.mkdir()
-        receipt = attempt / "read-receipt.json"
-        rounds = 0
-
-        def model(argv, **kwargs):
-            nonlocal rounds
-            r = ar.Reader(self.batch, receipt)
-            start = len(r.coverage()["served"])
-            self.assertEqual(start, rounds * 2)
-            pages = range(start, start + 2)
-            for page in pages:
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-            rounds += 1
-            append_native_reads(home, pages, self.thread, self.batch)
-            historical.append_native(home, {"verdict": "unfinished", "findings": []}, self.thread)
-            # Preserve complete tool success reports even if the final event is
-            # cut off when the subprocess times out.
-            transcript = "\n".join(map(sa.serialize, read_events("codex", pages))) + '\n{"type":'
-            raise subprocess.TimeoutExpired("codex", 1800, output=transcript.encode())
-
-        with patch.object(sa, "run_process", side_effect=model):
-            for expected in (2, 4):
-                with self.assertRaises(subprocess.TimeoutExpired):
-                    sa.run_client(
-                        ["codex", "exec", "-"],
-                        "",
-                        home=home,
-                        env={},
-                        work=attempt,
-                        receipt=receipt,
-                        provider="codex",
-                        paged=True,
-                        batch=self.batch,
-                        protocol=4,
-                    )
-                self.assertEqual(ar.Reader(self.batch, receipt).coverage()["served"], list(range(expected)))
-                self.assertIsNone(recovery.completed_pass(attempt, self.batch, {"protocol_version": 4, "paged": True}))
-
-    def test_automatic_recovery_accumulates_progress_across_timeouts(self):
-        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
-        calls = 0
-
-        def model(argv, **kwargs):
-            nonlocal calls
-            self.assertEqual(argv[-3:], ["resume", self.thread, "-"])
-            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
-            receipt = Path(args[3])
-            r = ar.Reader(self.batch, receipt)
-            start = len(r.coverage()["served"])
-            self.assertEqual(start, 1 + calls)
-            for page in range(start, start + 1):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-            calls += 1
-            append_native_reads(kwargs["cwd"], range(start, start + 1), self.thread, self.batch)
-            historical.append_native(kwargs["cwd"], {"verdict": "unfinished", "findings": []}, self.thread)
-            events = [{"type": "thread.started", "thread_id": self.thread}] + read_events(
-                "codex", range(start, start + 1)
-            )
-            raise subprocess.TimeoutExpired(
-                "codex",
-                1800,
-                # Killed while flushing a large page result: a partial row that cannot hold a judgment.
-                output=(
-                    "\n".join(map(sa.serialize, events))
-                    + '\n{"type":"item.completed","item":{"type":"mcp_tool_call","server":"audit","result":{"content'
-                ).encode(),
-            )
-
-        previous = self.block
-        with (
-            patch.object(sa, "codex_dir", return_value=self.work),
-            patch.object(sa, "run_process", side_effect=model),
-            patch.object(sa, "advance") as advance,
-        ):
-            for now, count in ((1000, 2), (10000, 3)):
-                with patch.object(recovery.time, "time", return_value=now), self.assertRaises(NoProgress) as stopped:
-                    recovery.recover(self.cfg, self.opts, previous)
-                previous = json.loads((self.work / "blocked.json").read_text())
-                receipt = Path(previous["attempt"]) / "read-receipt.json"
-                self.assertEqual(
-                    ar.Reader(self.batch, receipt).coverage()["served"], list(range(count)), str(stopped.exception)
-                )
-            advance.assert_not_called()
-        self.assertEqual(calls, 2)
-
-    def test_partial_tool_failure_keeps_only_the_successful_contiguous_prefix(self):
-        before = ar.Reader(self.batch, self.original / "read-receipt.json").coverage()
-        self.all_served()
-        (self.original / "coverage-launch.json").write_text(sa.serialize({"before": before, "provider": "codex"}))
-        events = read_events("codex", [1, 3]) + read_events("codex", [2], failed=True)
-        (self.original / "model-transcript.jsonl").write_text("\n".join(map(sa.serialize, events)))
-        self.assertEqual(sa.reconcile_coverage(self.original, self.batch)["served"], [0, 1])
-        self.assertEqual(sa.reconcile_coverage(self.original, self.batch)["served"], [0, 1])
-
-    def test_saved_read_requires_the_matching_native_tool_output(self):
-        path = self.work / "native-read.jsonl"
-        rows = native_read_rows([0], self.batch)
-        path.write_text(sa.serialize(rows[0]) + "\n")
-        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), set())
-        path.write_text("\n".join(map(sa.serialize, rows)) + '\ninvalid\n42\n{"type":')
-        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), {0})
-        original_output = rows[-1]["payload"]["output"]
-        rows[-1]["payload"]["output"] = [{"type": "input_text", "text": sa.serialize({"page": 0, "sections": []})}]
-        path.write_text("\n".join(map(sa.serialize, rows)))
-        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), set())
-        rows[-1]["payload"]["output"] = original_output
-        # A saved error for an earlier request of the same page is not source.
-        successful_output = rows[-1]["payload"]["output"]
-        rows[-1]["payload"]["output"] = [{"type": "input_text", "text": "Error: skipped page"}]
-        path.write_text("\n".join(map(sa.serialize, rows)))
-        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), set())
-        rows[-1]["payload"]["output"] = successful_output
-        # A function output belonging to a different call cannot vouch for this read.
-        rows[-1]["payload"]["call_id"] = "other-call"
-        path.write_text("\n".join(map(sa.serialize, rows)))
-        self.assertEqual(sa.saved_read_pages([path], ar.pages(self.batch)), set())
-
-    def test_client_reports_must_confirm_read_success(self):
-        for provider in ("codex", "claude"):
-            for failed in (False, True):
-                transcript = "\n".join(map(sa.serialize, read_events(provider, [0, 1], failed=failed)))
-                self.assertEqual(sa.successful_read_pages(transcript, provider), set() if failed else {0, 1})
-        # Both completion paths accept blank lines and an omitted legacy subtype.
-        transcript = '\n{"type":"result","structured_output":{"verdict":"pass","findings":[]}}\n\n'
-        self.assertEqual(sa.claude_result(transcript)["structured_output"]["verdict"], "pass")
-
-    def test_wrong_native_conversation_and_extra_final_fields_block_approval(self):
-        self.all_served()
-        a, batch, execution, _ = recovery.retained(self.work, self.block)
-        self.replace_answer({"verdict": "pass", "findings": [], "read_token": "obsolete"})
-        with self.assertRaises(Die):
-            recovery.retained(self.work, self.block)
-        self.replace_answer({"verdict": "pass", "findings": []})
-        p = a / "model-transcript.jsonl"
-        p.write_text(p.read_text().replace(self.thread, "22222222-2222-4333-8444-555555555555"))
-        self.assertIsNone(recovery.completed_pass(a, batch, execution))
-
-    def test_ordinary_recovery_continues_same_protocol_with_no_output_repair(self):
-        with (
-            patch.object(sa, "inspect", side_effect=OSError("service unavailable")) as model,
-            self.assertRaises(NoProgress),
-        ):
-            recovery.recover(self.cfg, self.opts, self.block)
-        self.assertEqual(model.call_args.kwargs["protocol"], 4)
-        self.assertEqual(model.call_args.kwargs["resume_from"], self.original)
-        self.assertTrue(model.call_args.kwargs["continue_reading"])
-        self.assertFalse(model.call_args.kwargs["repair_output"])
 
     def test_both_inspectors_accept_only_verdict_and_findings_with_complete_served_coverage(self):
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture"}}')
@@ -644,8 +282,7 @@ class ServedJudgments(unittest.TestCase):
                 self.assertEqual(set(schema["required"]), {"verdict", "findings"})
                 self.assertEqual(len(args), 4)
                 r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-                for page in range(len(r.pages)):
-                    r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+                read_all(r, kwargs["env"])
                 if provider == "codex":
                     append_native_reads(kwargs["cwd"], range(len(r.pages)), self.thread, self.batch)
                     historical.append_native(kwargs["cwd"], value, self.thread)
@@ -660,65 +297,71 @@ class ServedJudgments(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
             with (
+                patch.object(clients, "selected_protocol", return_value=5),
                 patch.object(sa, "codex_dir", return_value=self.work),
                 patch.object(sa, "claude_dir", return_value=self.work),
                 patch.object(sa, "run_process", side_effect=model),
             ):
                 self.assertEqual(sa.inspect(self.batch, provider, attempt), sa.bind_verdict(value, self.batch))
-            self.assertEqual(sa.attempt_protocol(attempt), 4)
+            self.assertEqual(json.loads((attempt / "execution.json").read_text())["protocol_version"], 5)
 
-    def test_three_turns_then_restart_preserve_original_inspection_and_judgment(self):
-        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
-        calls = 0
+    def test_protocol_five_luna_continues_its_session_and_inert_helper_calls_do_not_block_a_pass(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture"}}')
+        attempt = self.work / "attempt-five"
+        attempt.mkdir()
+        launches = []
 
         def model(argv, **kwargs):
-            nonlocal calls
-            calls += 1
-            self.assertEqual(argv[-3:], ["resume", self.thread, "-"])
-            self.assertNotIn("read_token", kwargs["input"])
+            launches.append(list(argv))
+            catalog = json.loads((kwargs["cwd"] / "model-catalog.json").read_text())
+            tools = catalog["models"][0]["model_messages"]["tools"]["mcp_resources"]
+            self.assertEqual(
+                {k: v["description"] for k, v in tools.items()}, dict.fromkeys(sa.INERT_TOOLS, sa.INERT_DESCRIPTION)
+            )
+            self.assertEqual(argv[argv.index("goals") - 1], "--disable")  # No goal tools in protocol 5.
+            self.assertNotIn("--enable", argv)
             args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
-            self.assertEqual(len(args), 4)
-            receipt = Path(args[3])
-            r = ar.Reader(self.batch, receipt)
-            r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": 0}})
-            if calls == 4:
-                for page in range(len(r.pages)):
-                    r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-            value = {"verdict": "pass" if calls == 4 else "unfinished", "findings": []}
-            append_native_reads(kwargs["cwd"], range(len(r.pages)) if calls == 4 else [0], self.thread, self.batch)
+            r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
+            first = len(launches) == 1
+            pages = [0] if first else range(1, len(r.pages))
+            for page in pages:
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            append_native_reads(kwargs["cwd"], pages, self.thread, self.batch)
+            sessions = kwargs["cwd"] / ".codex/sessions"
+            with next(sessions.glob("*.jsonl")).open("a") as native:
+                stray = {
+                    "type": "response_item",
+                    "payload": {"type": "function_call", "name": "read_mcp_resource", "arguments": "{}"},
+                }
+                native.write(sa.serialize(stray) + "\n")
+            value = {"verdict": "unfinished" if first else "pass", "findings": []}
             historical.append_native(kwargs["cwd"], value, self.thread)
             events = [
                 {"type": "thread.started", "thread_id": self.thread},
+                *read_events("codex", pages),
                 {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
                 {"type": "turn.completed"},
             ]
-            events = read_events("codex", range(len(r.pages)) if calls == 4 else [0]) + events
             return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.object(sa, "codex_dir", return_value=self.work),
             patch.object(sa, "run_process", side_effect=model),
-            patch.object(sa.time, "sleep"),
-            patch.object(sa, "advance", return_value="b" * 40) as advance,
         ):
-            with patch.object(recovery.time, "time", return_value=1000), self.assertRaises(NoProgress):
-                recovery.recover(self.cfg, self.opts, self.block)
-            self.assertEqual(calls, 3)
-            advance.assert_not_called()
-            previous = json.loads((self.work / "blocked.json").read_text())
-            with patch.object(recovery.time, "time", return_value=1301):
-                self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
-            self.assertEqual(calls, 4)
-            advance.assert_called_once()
-        self.assertFalse((self.work / "blocked.json").exists())
+            self.assertEqual(
+                sa.inspect(self.batch, "codex", attempt),
+                sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch),
+            )
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(launches[1][-3:], ["resume", self.thread, "-"])
+        self.assertEqual(json.loads((attempt / "execution.json").read_text())["protocol_version"], 5)
 
     def test_fresh_launch_carries_and_records_trusted_baseline_names(self):
-        prompt = sa.inspection_prompt(self.batch, True, protocol=4, trusted_names=True)
+        prompt = sa.judgment_prompt(self.batch, True)
         self.assertIn(sa.TRUSTED_ORIGIN_POLICY, prompt)
         self.assertIn("stacks", prompt.split("Trusted baseline names: ", 1)[1])
         self.assertIn("never makes safe", prompt)
-        with self.assertRaises(Die):
-            sa.inspection_prompt(self.batch, True, protocol=3, trusted_names=True)
         key_file = self.work / "anthropic-key"
         key_file.write_text("sk-ant-fixture\n")
         key_file.chmod(0o600)
@@ -732,14 +375,14 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
             return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
             patch.object(sa, "run_process", side_effect=model),
         ):
@@ -748,16 +391,6 @@ class ServedJudgments(unittest.TestCase):
         execution = json.loads((attempt / "execution.json").read_text())
         self.assertEqual(execution["trusted_names_digest"], sa.trusted_names_digest())
         self.assertIn("claude-haiku-5-5", execution["argv"])
-
-    def test_retained_attempts_keep_their_recorded_trusted_name_list(self):
-        self.evidence()
-        execution = json.loads((self.original / "execution.json").read_text())
-        self.assertNotIn("trusted_names_digest", execution)
-        recovery.retained(self.work, self.block)  # Older attempts validate against their original prompt.
-        execution["trusted_names_digest"] = "0" * 64
-        (self.original / "execution.json").write_text(sa.serialize(execution))
-        with self.assertRaisesRegex(Die, "trusted baseline name list"):
-            recovery.retained(self.work, self.block)
 
     def test_haiku_api_key_file_replaces_subscription_credentials_and_is_not_retained(self):
         key_file = self.work / "anthropic-key"
@@ -774,14 +407,14 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
             return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
             patch.object(sa, "claude_dir", return_value=self.work / "no-subscription"),
             patch.object(sa, "run_process", side_effect=model),
@@ -813,14 +446,14 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
             return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
             patch.object(sa, "claude_dir", return_value=self.work),
             patch.object(sa, "run_process", side_effect=model),
@@ -832,6 +465,7 @@ class ServedJudgments(unittest.TestCase):
                 self.assertEqual(verdict, sa.bind_verdict(value, self.batch))
         self.assertEqual(seen, [(None, True), ("sk-ant-fixture-secret", False)])
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: ""}),
             patch.object(sa, "run_process", side_effect=model),
             self.assertRaises(Die),
@@ -841,147 +475,8 @@ class ServedJudgments(unittest.TestCase):
             sa.inspect(self.batch, "claude", attempt, claude_credential="api-key")
         self.assertEqual(len(seen), 2)
 
-    def test_coverage_turns_serving_new_pages_continue_in_one_invocation(self):
-        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
-        calls = 0
-        pages = len(ar.Reader(self.batch, self.original / "read-receipt.json").pages)
-        # Two turns that only reread page 0 use two of the three charged launches;
-        # the remaining pages are then read one per turn in the same invocation.
-
-        def model(argv, **kwargs):
-            nonlocal calls
-            calls += 1
-            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
-            r = ar.Reader(self.batch, Path(args[3]))
-            start = len(r.coverage()["served"])
-            read = ([start] if start < len(r.pages) else []) if calls > 2 else [0]
-            for page in read:
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-            done = len(r.coverage()["served"]) == len(r.pages)
-            value = {"verdict": "pass" if done else "unfinished", "findings": []}
-            append_native_reads(kwargs["cwd"], read, self.thread, self.batch)
-            historical.append_native(kwargs["cwd"], value, self.thread)
-            events = [
-                {"type": "thread.started", "thread_id": self.thread},
-                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
-                {"type": "turn.completed"},
-            ]
-            events = read_events("codex", read) + events
-            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
-
-        with (
-            patch.object(sa, "codex_dir", return_value=self.work),
-            patch.object(sa, "run_process", side_effect=model),
-            patch.object(sa.time, "sleep"),
-            patch.object(sa, "advance", return_value="b" * 40) as advance,
-            patch.object(recovery.time, "time", return_value=1000),
-        ):
-            self.assertTrue(recovery.recover(self.cfg, self.opts, self.block))
-        self.assertEqual(calls, 2 + pages - 1)
-        advance.assert_called_once()
-        self.assertFalse((self.work / "blocked.json").exists())
-
-    def test_worker_killed_between_coverage_turns_resumes_the_retained_attempt(self):
-        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
-        calls = 0
-
-        class Killed(BaseException):
-            pass
-
-        def model(argv, **kwargs):
-            nonlocal calls
-            calls += 1
-            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
-            r = ar.Reader(self.batch, Path(args[3]))
-            pages = list(range(len(r.pages))) if calls == 3 else [len(r.coverage()["served"])]
-            for page in pages:
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
-            value = {"verdict": "pass" if calls == 3 else "unfinished", "findings": []}
-            append_native_reads(kwargs["cwd"], pages, self.thread, self.batch)
-            historical.append_native(kwargs["cwd"], value, self.thread)
-            events = [
-                {"type": "thread.started", "thread_id": self.thread},
-                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
-                {"type": "turn.completed"},
-            ]
-            events = read_events("codex", pages) + events
-            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
-
-        sleeps = 0
-
-        def sleep(_):
-            # The Worker is killed while waiting to launch the next coverage turn,
-            # after the continuation for that unlaunched turn has been prepared.
-            nonlocal sleeps
-            sleeps += 1
-            if sleeps == 2:
-                raise Killed
-
-        with (
-            patch.object(sa, "codex_dir", return_value=self.work),
-            patch.object(sa, "run_process", side_effect=model),
-            patch.object(sa.time, "sleep", side_effect=sleep),
-            patch.object(sa, "advance", return_value="b" * 40) as advance,
-        ):
-            with patch.object(recovery.time, "time", return_value=1000), self.assertRaises(Killed):
-                recovery.recover(self.cfg, self.opts, self.block)
-            self.assertEqual(calls, 2)
-            previous = json.loads((self.work / "blocked.json").read_text())
-            self.assertEqual(previous["reason"], "security-audit: operational recovery interrupted")
-            with patch.object(recovery.time, "time", return_value=1301):
-                self.assertTrue(recovery.recover(self.cfg, self.opts, previous))
-            self.assertEqual(calls, 3)
-            advance.assert_called_once()
-        self.assertFalse((self.work / "blocked.json").exists())
-
-
-class FreshRun(unittest.TestCase):
-    setUp = historical.Run.setUp
-
-    def test_verified_client_selects_protocol_four_and_records_matching_policy(self):
-        with (
-            patch.object(clients, "selected_protocol", return_value=4),
-            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
-            patch.object(sa, "advance", return_value=self.target),
-        ):
-            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
-        self.assertEqual(model.call_args.kwargs, {"protocol": 4})
-        rows = list(map(json.loads, (self.state / sa.CURSOR / "ledger.jsonl").read_text().splitlines()))
-        row = next(r for r in rows if "verdict" in r)
-        self.assertEqual(row["protocol_version"], 4)
-        self.assertEqual(row["reader_digest"], sa.inspection_profile(4)["reader_digest"])
-        self.assertEqual(row["prompt_digest"], hashlib.sha256(sa.SERVED_MODEL_PROMPT.encode()).hexdigest())
-
-    def test_fresh_claude_ledger_identifies_the_executed_prompt(self):
-        self.opts.work_model = "claude"
-        with (
-            patch.object(clients, "selected_protocol", return_value=4),
-            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}),
-            patch.object(sa, "advance", return_value=self.target),
-        ):
-            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
-        rows = list(map(json.loads, (self.state / sa.CURSOR / "ledger.jsonl").read_text().splitlines()))
-        row = next(r for r in rows if "verdict" in r)
-        self.assertEqual(row["prompt_digest"], hashlib.sha256(sa.SERVED_CLAUDE_PROMPT.encode()).hexdigest())
-
-    def test_protocol_selection_is_passed_once_even_if_verification_changes(self):
-        with (
-            patch.object(clients, "selected_protocol", side_effect=[3, 4]) as selected,
-            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
-            patch.object(sa, "advance", return_value=self.target),
-        ):
-            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
-        selected.assert_called_once()
-        self.assertEqual(model.call_args.kwargs, {"protocol": 3})
-
 
 class ClientCompatibility(unittest.TestCase):
-    def test_historical_reader_bytes_are_preserved(self):
-        self.assertEqual(
-            sa.inspection_profile(3)["reader_digest"],
-            "e11662a02ec797222b9626f34fcccd70fe98f454240b1fd1435dcc6ef3d65c36",
-        )
-
     def test_unrecognized_wrappers_do_not_claim_verified_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "wrapper"
@@ -992,20 +487,20 @@ class ClientCompatibility(unittest.TestCase):
             ):
                 clients.fingerprint("claude")
 
-    def test_missing_stale_and_changed_clients_use_token_protocol(self):
+    def test_missing_stale_and_changed_clients_are_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
             expected = {"client": "one"}
             with patch.object(clients, "fingerprint", return_value=expected):
-                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), None)
                 p = state / clients.RECORD
-                p.write_text(sa.serialize({"codex": {"protocol_version": 4, "fingerprint": expected, "intact": True}}))
-                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 4)
+                p.write_text(sa.serialize({"codex": {"protocol_version": 5, "fingerprint": expected, "intact": True}}))
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 5)
                 with patch.object(clients, "fingerprint", return_value={"client": "two"}):
-                    self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
-                self.assertEqual(clients.selected_protocol("claude", state, verify=False), 3)
+                    self.assertEqual(clients.selected_protocol("codex", state, verify=False), None)
+                self.assertEqual(clients.selected_protocol("claude", state, verify=False), None)
                 p.chmod(0o666)
-                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), None)
 
     def test_missing_and_changed_verification_refresh_automatically(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1014,18 +509,18 @@ class ClientCompatibility(unittest.TestCase):
 
             def verify(provider, state):
                 (state / clients.RECORD).write_text(
-                    sa.serialize({provider: {"protocol_version": 4, "fingerprint": dict(current), "intact": True}})
+                    sa.serialize({provider: {"protocol_version": 5, "fingerprint": dict(current), "intact": True}})
                 )
 
             with (
                 patch.object(clients, "fingerprint", side_effect=lambda _: dict(current)),
                 patch.object(check, "verify", side_effect=verify) as probe,
             ):
-                self.assertEqual(clients.selected_protocol("codex", state), 4)
-                self.assertEqual(clients.selected_protocol("codex", state), 4)
+                self.assertEqual(clients.selected_protocol("codex", state), 5)
+                self.assertEqual(clients.selected_protocol("codex", state), 5)
                 self.assertEqual(probe.call_count, 1)
                 current["client"] = "two"
-                self.assertEqual(clients.selected_protocol("codex", state), 4)
+                self.assertEqual(clients.selected_protocol("codex", state), 5)
                 self.assertEqual(probe.call_count, 2)
 
     def test_concurrent_selection_runs_only_one_probe(self):
@@ -1037,7 +532,7 @@ class ClientCompatibility(unittest.TestCase):
                 from tauceti_worker.audit_alerts import save
 
                 save(
-                    state / clients.RECORD, {provider: {"protocol_version": 4, "fingerprint": expected, "intact": True}}
+                    state / clients.RECORD, {provider: {"protocol_version": 5, "fingerprint": expected, "intact": True}}
                 )
 
             with (
@@ -1046,7 +541,7 @@ class ClientCompatibility(unittest.TestCase):
             ):
                 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                     self.assertEqual(
-                        list(pool.map(lambda _: clients.selected_protocol("codex", state), range(8))), [4] * 8
+                        list(pool.map(lambda _: clients.selected_protocol("codex", state), range(8))), [5] * 8
                     )
                 probe.assert_called_once()
 
@@ -1058,14 +553,14 @@ class ClientCompatibility(unittest.TestCase):
                 patch.object(check, "verify", side_effect=RuntimeError("unexpected client format")) as probe,
                 patch.object(clients.time, "time", return_value=1000) as now,
             ):
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(clients.selected_protocol("codex", state), None)
+                self.assertEqual(clients.selected_protocol("codex", state), None)
                 self.assertEqual(probe.call_count, 1)
                 now.return_value = 1301
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(clients.selected_protocol("codex", state), None)
                 self.assertEqual(probe.call_count, 2)
                 fingerprint.return_value = {"client": "two"}
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(clients.selected_protocol("codex", state), None)
                 self.assertEqual(probe.call_count, 3)
 
     def test_capture_rejects_missing_or_truncated_middle_even_if_tail_survives(self):

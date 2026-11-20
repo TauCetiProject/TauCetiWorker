@@ -1,0 +1,36 @@
+# Tau Ceti security-audit pool (README.md, "security audit"; TauCeti docs/security-audit.md).
+#
+# Reviews main's first-parent commits ahead of the audit cursor with several isolated reviewers at
+# once and advances the cursor past validated passes. The cursor update needs repository admin, so
+# the account's active gh credential must be a TauCeti admin. It never builds or runs candidate
+# code. `services/queue/install-security-audit.sh` installs it. The pool restores its ranges from
+# its state after a restart, so restarting it loses no judgment.
+#
+# WARNING: never add a systemd drop-in (*.service.d/*.conf) for this unit: drop-ins silently
+# override what install-security-audit.sh installs, and the installer refuses to run while one
+# exists. The installer renders this file with the code paths below pointing at the unit's own
+# release directory, ~/TauCetiQueue-releases/<sha>-<time> (services/queue/release.sh). It runs
+# origin/main HEAD; running any other revision requires explicit permission from a human operator
+# and must be undone as soon as the change lands on main.
+
+[Unit]
+Description=Tau Ceti security-audit pool
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/README.md
+
+[Service]
+WorkingDirectory=%h/TauCetiQueue
+Environment=PYTHONUNBUFFERED=1
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+# The pool's state must be a worker's audit state under the data root (worker ID `pool`).
+Environment=TAUCETI_LEGACY_DATA_ROOT=%h/TauCetiQueue-data/security-audit-pool
+# Cursor pushes and readiness dispatches use this GitHub App, not a personal account's quota.
+Environment=TAUCETI_SECURITY_AUDIT_GITHUB_APP=%h/.config/tauceti-security-audit
+Environment=TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG=%h/.config/tauceti-queue/security-audit-zulip.json
+ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_worker.security_audit pool --state %h/TauCetiQueue-data/security-audit-pool/state/pool/security-audit --parallel 16 --ignore-quota
+Restart=on-failure
+RestartSec=60
+UMask=0077
+
+[Install]
+WantedBy=default.target

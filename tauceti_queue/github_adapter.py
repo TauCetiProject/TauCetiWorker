@@ -62,7 +62,6 @@ DEFAULT_BACKGROUND_FLOOR = 1000
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
 STAGING_WORKFLOW = "pr-build.yml"
-MAIN_WORKFLOW = "ci.yml"
 BUILD_JOB = "sandboxed-build"
 SHA = re.compile(r"[0-9a-f]{40}")
 RUN_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
@@ -1011,21 +1010,6 @@ class GitHubAdapter:
             raise AmbiguousCandidateRun(f"{len(matches)} runs titled {expected!r}")
         return self.candidate_run(repo, matches[0], with_jobs=with_jobs, with_diagnostics=with_diagnostics)
 
-    def main_ci_run(self, repo: str, sha: str) -> CandidateRun | None:
-        """`GET repos/{repo}/actions/workflows/ci.yml/runs?head_sha=<sha>&event=push`, newest first: one
-        call that raises instead of retrying or waiting, so the controller never sleeps on it."""
-        with self.client.deferred_requests(urgent=True):
-            response = self.client.request(
-                "GET",
-                f"repos/{repo}/actions/workflows/{MAIN_WORKFLOW}/runs",
-                params={"head_sha": sha, "event": "push", "per_page": 1},
-                single_attempt=True,
-            )
-        runs = (response.json() or {}).get("workflow_runs") or []
-        if not runs or not isinstance(runs[0], dict) or not runs[0].get("id"):
-            return None
-        return self.candidate_run(repo, runs[0], with_jobs=False, with_diagnostics=False)
-
     def read_run(self, repo: str, run_id: str, *, with_jobs: bool = False) -> CandidateRun | None:
         """`GET repos/{repo}/actions/runs/{run_id}`: the run as GitHub reports it now, `None` on 404."""
         status, data = self.client.get_json(f"repos/{repo}/actions/runs/{run_id}", tolerate=(404,))
@@ -1349,8 +1333,9 @@ class GitHubAdapter:
         )
 
     def _self_tested(self, repo, number, pull, paths, merge_base):
-        """Inline self-tested eligibility (live membership and bump reads) and, for an eligible head,
-        the PR-level diff guards PR CI would have run."""
+        """Inline self-tested eligibility (live membership and bump reads), whether an admin's
+        `large-refactor` label lifts the size caps, and, for an eligible head, the PR-level diff
+        guards PR CI would have run."""
         from tauceti_tools.self_tested import eligible, requested
 
         local = False
@@ -1370,9 +1355,28 @@ class GitHubAdapter:
                 read=lambda path: self.client.get_json(path)[1],
                 member_read=self.team_member_read,
             )
-        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
-        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()
-        return local, guard
+        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here. A labelled
+        # large refactor is measured too: an admin's approval of one may stand in for PR CI and review
+        # (`AdmissionIntake._large_refactor_approval`), and the caps the label keeps still apply.
+        exempt = diff_guard.large_refactor(
+            self.clone_dir, pull.head_sha, lambda path: self.client.get_json(path)[1], repo, number, pull.labels
+        )
+        measured = local or exempt
+        guard = (
+            diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if measured else ()
+        )
+        return local, guard, exempt
+
+    def bump_guard(self, repo: str, head: str) -> bool:
+        """The trusted Mathlib-bump check (`check-bump.sh` on main's tip, the merge base and `head`),
+        as self-tested bump eligibility runs it. Raises `GitHubUnavailable` when its inputs could not
+        be read, so the evaluation stays pending rather than deciding either way."""
+        from tauceti_tools.self_tested import _bump_policy, _ReadAPI
+
+        verdict, output = _bump_policy().check_bump(_ReadAPI(lambda path: self.client.get_json(path)[1]), repo, head)
+        if verdict is None:
+            raise ports.GitHubUnavailable(f"bump-guard for {head[:12]}: {output}"[:300])
+        return bool(verdict)
 
     def admission_snapshot_single(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """The same snapshot as `admission_snapshot`, from one GraphQL read (decision 38 step 4, slice 5).
@@ -1438,7 +1442,7 @@ class GitHubAdapter:
             return self._full_snapshot(repo, number, generation)
         comments = tuple(_graphql_comment(comment) for comment in connection["nodes"])
         paths = self._admission_paths(merge_base, head)
-        local, guard = self._self_tested(repo, number, pull, paths, merge_base)
+        local, guard, exempt = self._self_tested(repo, number, pull, paths, merge_base)
         statuses = {
             s["context"]: str(s.get("state") or "").lower()
             for s in (commit.get("status") or {}).get("contexts", ())
@@ -1446,7 +1450,7 @@ class GitHubAdapter:
         }
         from tauceti_tools.self_tested import requested
 
-        if requested(pull.labels):
+        if requested(pull.labels) or exempt:
             # Membership and bump reads came after the response: fence them as the full read does.
             fresh, statuses = self._admission_fence(repo, number, pull)
             if (fresh.head_sha, fresh.base_sha, fresh.base_ref, fresh.state, fresh.draft, sorted(fresh.labels)) != (
@@ -1473,6 +1477,7 @@ class GitHubAdapter:
             self._diff_version(base, head),
             self_tested=local,
             diff_guard=guard,
+            large_refactor=exempt,
         )
 
     def _full_snapshot(self, repo, number, generation):
@@ -1521,7 +1526,7 @@ class GitHubAdapter:
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
-        local, guard = self._self_tested(repo, number, pull, paths, merge_base)
+        local, guard, exempt = self._self_tested(repo, number, pull, paths, merge_base)
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
@@ -1558,6 +1563,7 @@ class GitHubAdapter:
             self._diff_version(pull.base_sha, pull.head_sha),
             self_tested=local,
             diff_guard=guard,
+            large_refactor=exempt,
         )
 
     def _admission_fence(self, repo, number, pull, *, labels_progress=None):

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,7 +18,7 @@ from tauceti_worker import audit_clients as clients
 from tauceti_worker import audit_pool as pool
 from tauceti_worker import security_audit as sa
 from tauceti_worker.audit_evidence import NotJudged, Unreadable
-from tauceti_worker.config import NoProgress
+from tauceti_worker.config import Die, NoProgress
 
 
 class PoolFixture(unittest.TestCase):
@@ -38,6 +39,7 @@ class PoolFixture(unittest.TestCase):
         self.advanced = []
         self.lock = threading.Lock()
         self.calls = []
+        self.calls_from = []
 
         def advance(repo, batch):
             with self.lock:
@@ -120,13 +122,34 @@ class PoolFixture(unittest.TestCase):
         def fake(batch, provider, attempt, *, protocol=None, claude_credential=None, **kwargs):
             with self.lock:
                 self.calls.append(self.index(batch))
+                self.calls_from.append(batch["from_sha"])
                 self.launches.append((self.index(batch), provider, claude_credential, "resume_from" in kwargs))
             return inspect(batch, attempt)
 
+        stop = stop or self.settled
+        passes = [0]
+
+        def bounded(p):
+            # A pool that never settles is a failing test, never an unbounded run filling the disk.
+            passes[0] += 1
+            if passes[0] > 400:
+                raise AssertionError("the pool did not settle")
+            return stop(p)
+
         with patch.object(sa, "inspect", side_effect=fake):
             p = pool.Pool(self.state, parallel=parallel, chooser=pool.Chooser(None, pin=pin))
-            p.serve(stop=stop or self.settled)
+            p.serve(stop=bounded)
         return p
+
+    def not_judged(self, attempt, *, engaged=True):
+        """An attempt whose reviewer ran and returned no judgment; `engaged` if it answered at all."""
+        (attempt / "execution.json").write_text(sa.serialize({"argv": ["claude", "-p"], "paged": False}))
+        if engaged:
+            use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "unfinished", "findings": []}}
+            (attempt / "model-transcript.jsonl").write_text(
+                sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+            )
+        raise NotJudged("security-audit: inspection unfinished")
 
     def settled(self, p):
         """The pool no longer exits at a block: stop once nothing can run or advance."""
@@ -179,18 +202,64 @@ class Ordering(PoolFixture):
         self.assertEqual(self.calls.count(1), 1)
         self.assertEqual(len(self.advanced), 1)
 
-    def test_operational_failures_retry_fresh_twice_then_block(self):
+    def test_a_range_with_no_judgment_is_split_into_complete_halves(self):
         def inspect(batch, attempt):
-            if self.index(batch) == 0:
-                raise NotJudged("security-audit: codex failed; see model-stderr.txt")
+            if batch["from_sha"] == self.shas[0] and len(batch["commits"]) > 1:
+                self.not_judged(attempt)
             return self.verdict(batch)
 
-        self.serve(inspect, stop=self.settled)
-        self.assertEqual(self.calls.count(0), 1 + pool.MAX_RETRIES)
-        self.assertEqual(self.advanced, [])
-        blocked = json.loads((self.state / "blocked.json").read_text())
-        self.assertTrue(blocked["pool_retries_exhausted"])
-        self.assertEqual(blocked["from_sha"], self.shas[0])
+        self.serve(inspect)
+        splits = [r for r in self.ledger() if "split" in r]
+        self.assertEqual([(r["from_sha"], r["to_sha"]) for r in splits], [(self.shas[0], self.shas[2])])
+        self.assertEqual(
+            self.advanced,
+            [
+                (self.shas[0], self.shas[1]),
+                (self.shas[1], self.shas[2]),
+                (self.shas[2], self.shas[4]),
+                (self.shas[4], self.shas[6]),
+            ],
+        )
+        self.assertFalse((self.state / "blocked.json").exists())
+
+    def test_a_single_commit_with_no_judgment_is_retried_afresh_by_the_other_reviewer(self):
+        seen = []
+
+        def inspect(batch, attempt):
+            seen.append((batch["from_sha"], len(batch["commits"]), self.launches[-1][1]))
+            if batch["from_sha"] == self.shas[0] and len(seen) < 4:
+                self.not_judged(attempt)
+            return self.verdict(batch)
+
+        self.serve(inspect, parallel=1)
+        left = [provider for frm, n, provider in seen if frm == self.shas[0]]
+        # The whole range and its fresh left half on the default reviewer, then the half's retry on the other.
+        self.assertEqual(left[:3], ["codex", "codex", "claude"])
+        self.assertEqual(len(self.advanced), 4)
+        self.assertFalse((self.state / "blocked.json").exists())
+
+    def test_a_range_retried_many_times_keeps_only_its_last_attempts(self):
+        def inspect(batch, attempt):
+            if self.index(batch) == 0 and self.calls.count(0) <= 5:
+                self.not_judged(attempt, engaged=False)
+            return self.verdict(batch)
+
+        self.serve(inspect)
+        self.assertEqual(self.calls.count(0), 6)
+        attempts = sorted(self.state.glob("attempt-*"))
+        self.assertLessEqual(len(attempts), 2 + 2 + 2)  # Range 0's last two, plus the two other ranges.
+        self.assertEqual(sum(1 for r in self.ledger() if r.get("outcome") == "not-judged"), 5)
+
+    def test_a_launch_where_no_reviewer_engaged_retries_the_same_range(self):
+        def inspect(batch, attempt):
+            if self.index(batch) == 0 and self.calls.count(0) == 1:
+                self.not_judged(attempt, engaged=False)
+            return self.verdict(batch)
+
+        self.serve(inspect)
+        self.assertEqual(self.calls.count(0), 2)
+        self.assertFalse([r for r in self.ledger() if "split" in r])
+        self.assertEqual(len(self.advanced), 3)
 
     def test_held_block_alert_is_offered_again_on_later_passes(self):
         # A failed DM is retried from its receipts; the pool must keep offering the block.
@@ -325,49 +394,6 @@ class Providers(PoolFixture):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.advanced, [])
 
-    def test_a_batch_keeps_its_provider_and_claude_may_move_to_the_api_key(self):
-        self.pace["codex"] = False
-        failures = []
-
-        def inspect(batch, attempt):
-            if self.index(batch) == 0 and not failures:
-                failures.append(1)
-                # Codex comes back under pace and Claude's subscription goes over pace.
-                self.pace.update(codex=True, claude=False)
-                self.key = "sk-ant-fixture-secret"
-                raise NotJudged("security-audit: reviewer failed")
-            return self.verdict(batch)
-
-        self.serve(inspect, parallel=1)
-        first = [(p, c) for i, p, c, _ in self.launches if i == 0]
-        self.assertEqual(first, [("claude", "subscription"), ("claude", "api-key")])
-        self.assertIn(("codex", None), {(p, c) for i, p, c, _ in self.launches if i > 0})
-
-    def test_codex_retry_continues_the_retained_session_when_one_exists(self):
-        stopped = []
-
-        def inspect(batch, attempt):
-            if self.index(batch) == 0 and not stopped:
-                stopped.append(attempt)
-                raise NotJudged("security-audit: inspection unfinished")
-            return self.verdict(batch)
-
-        retained = []
-
-        def fake_retained(work, previous):
-            retained.append(previous["attempt"])
-            batch = json.loads(Path(previous["attempt"], "input.json").read_text())
-            return Path(previous["attempt"]), batch, {"paged": True}, False
-
-        with (
-            patch("tauceti_worker.audit_recovery.retained", side_effect=fake_retained),
-            patch("tauceti_worker.audit_progress.continuable", return_value=True),
-        ):
-            self.serve(inspect)
-        self.assertEqual(retained, [str(stopped[0])])
-        first = [(p, resumed) for i, p, _, resumed in self.launches if i == 0]
-        self.assertEqual(first, [("codex", False), ("codex", True)])
-
     def test_haiku_retry_is_refused_when_the_stopped_transcript_holds_a_finding(self):
         self.pace["codex"] = False
 
@@ -408,8 +434,10 @@ class Restart(PoolFixture):
             body = {k: v for k, v in batch.items() if k != "input_digest"}
             batch["input_digest"] = sa.hashlib.sha256(sa.serialize(body).encode()).hexdigest()
         p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
-        slot = pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex", credential="subscription")
-        p.persist(slot)
+        p.slots = [
+            pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex", credential="subscription")
+        ]
+        p.persist()
 
     def test_identical_persisted_pass_is_reused(self):
         self.persisted()
@@ -462,7 +490,7 @@ class Ownership(PoolFixture):
                 sa.run(type("C", (), {"state": self.state.parent})(), None)
         self.assertFalse(sa.pool_active(self.state))
 
-    def test_operational_worker_block_at_cursor_is_superseded(self):
+    def test_a_block_file_without_recorded_evidence_does_not_hold_the_cursor(self):
         (self.state / "blocked.json").write_text(
             sa.serialize(
                 {
@@ -473,41 +501,8 @@ class Ownership(PoolFixture):
                 }
             )
         )
+        # blocked.json only mirrors a block; binding comes from the ranges and the ledger.
         self.serve(lambda batch, attempt: self.verdict(batch))
-        self.assertEqual(len(self.advanced), 3)
-        self.assertTrue(list(self.state.glob("superseded-by-pool-block-*.json")))
-
-    def test_worker_codex_block_continues_in_its_session_even_over_pace(self):
-        # The Worker's batch was planned against an older main, so its input differs
-        # from what the pool would plan now; it must still be continued, on Codex.
-        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-2])
-        attempt = self.state / "attempt-1"
-        attempt.mkdir()
-        (attempt / "input.json").write_text(sa.serialize(batch))
-        block = {
-            "from_sha": self.shas[0],
-            "to_sha": batch["commits"][-1]["sha"],
-            "reason": "security-audit: inspection unfinished; retained for same-session continuation",
-            "attempt": str(attempt),
-        }
-        (self.state / "blocked.json").write_text(sa.serialize(block))
-        self.pace["codex"] = False
-        self.key = "sk-ant-fixture-secret"
-        retained = []
-
-        def fake_retained(work, previous):
-            retained.append(previous["attempt"])
-            return Path(previous["attempt"]), batch, {"argv": ["codex", "exec"], "paged": True}, False
-
-        with (
-            patch("tauceti_worker.audit_recovery.retained", side_effect=fake_retained),
-            patch("tauceti_worker.audit_progress.continuable", return_value=True),
-        ):
-            self.serve(lambda b, a: self.verdict(b))
-        self.assertIn(str(attempt), retained)
-        head = [(p, resumed) for i, p, _, resumed in self.launches if i == 0]
-        self.assertEqual(head, [("codex", True)])
-        self.assertTrue(all(p == "claude" for i, p, _, _ in self.launches if i != 0))
         self.assertEqual(len(self.advanced), 3)
 
 
@@ -565,60 +560,331 @@ class OwnJournal(PoolFixture):
         self.serve(inspect)
         self.assertEqual(len(self.advanced), 3)
 
-    def test_restart_with_an_earlier_pool_journal_at_the_cursor_inspects_afresh(self):
-        def first(batch, attempt):
-            if self.index(batch) == 0:
-                (self.state / "blocked.json").write_text(
-                    sa.serialize(
-                        {
-                            "from_sha": batch["from_sha"],
-                            "to_sha": batch["commits"][-1]["sha"],
-                            "attempt": str(attempt),
-                            "reason": "security-audit: operational recovery interrupted",
-                        }
-                    )
-                )
-                raise NotJudged("security-audit: reviewer failed")
-            return self.verdict(batch)
 
-        with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
-            self.serve(first, stop=lambda p: not p.running and p.slots[0].failures == 1)
-        self.launches.clear()
-        self.serve(lambda batch, attempt: self.verdict(batch))
-        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], ["codex"])
-        self.assertEqual(len(self.advanced), 3)
-        self.assertTrue(list(self.state.glob("superseded-by-pool-block-*.json")))
+class DurableRanges(PoolFixture):
+    """The ordered list of active ranges survives a restart, including ranges that were running."""
 
-    def test_restart_with_an_earlier_journal_whose_attempt_recorded_a_finding_holds(self):
-        def first(batch, attempt):
-            if self.index(batch) == 0:
-                (self.state / "blocked.json").write_text(
-                    sa.serialize(
-                        {
-                            "from_sha": batch["from_sha"],
-                            "to_sha": batch["commits"][-1]["sha"],
-                            "attempt": str(attempt),
-                            "reason": "security-audit: operational recovery interrupted",
-                        }
-                    )
-                )
-                use = {
-                    "type": "tool_use",
-                    "name": "StructuredOutput",
-                    "input": {"verdict": "finding", "findings": ["IO"]},
-                }
-                (attempt / "model-transcript.jsonl").write_text(
-                    sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
-                )
-                raise NotJudged("security-audit: killed before classification")
-            return self.verdict(batch)
+    def interrupted(self, evidence=()):
+        """Persist a window whose head was running when the pool stopped, with this evidence."""
+        p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
+        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
+        attempt = self.state / "attempt-1"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        if evidence:
+            (attempt / "execution.json").write_text(
+                sa.serialize({"argv": ["claude", "-p"], "paged": False, "protocol_version": 4})
+            )
+            (attempt / "model-transcript.jsonl").write_text("".join(sa.serialize(row) + "\n" for row in evidence))
+        p.slots = [pool.Slot(batch, status="running", attempts=[str(attempt)], provider="codex")]
+        p.persist()
+        return batch
 
-        with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
-            self.serve(first, stop=lambda p: not p.running and p.slots[0].failures == 1)
-        self.launches.clear()
-        self.serve(lambda batch, attempt: self.verdict(batch), stop=lambda p: not p.running)
-        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], [])
+    def test_a_finding_in_an_interrupted_attempt_binds_after_restart(self):
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        batch = self.interrupted([{"type": "assistant", "message": {"content": [use]}}])
+        self.serve(lambda b, a: self.verdict(b), stop=lambda p: not p.running and p.slots[0].status == "blocked")
+        self.assertNotIn(0, self.calls)
         self.assertEqual(self.advanced, [])
+        rows = [r for r in self.ledger() if r.get("batch") == batch["input_digest"] and "verdict" in r]
+        self.assertEqual([r["verdict"]["findings"] for r in rows], [["IO"]])
+        self.assertIn("IO", json.loads((self.state / "blocked.json").read_text())["reason"])
+
+    def test_an_interrupted_attempt_with_an_unreadable_input_is_still_classified(self):
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        self.interrupted([{"type": "assistant", "message": {"content": [use]}}])
+        (self.state / "attempt-1" / "input.json").write_text("{damaged")
+        self.serve(lambda b, a: self.verdict(b), stop=lambda p: not p.running and p.slots[0].status == "blocked")
+        self.assertNotIn(0, self.calls)
+        self.assertIn("IO", json.loads((self.state / "blocked.json").read_text())["reason"])
+
+    def test_an_attestation_inside_a_range_keeps_later_and_remaining_binding_ranges(self):
+        p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
+        head = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        later = sa.build_batch(self.repo, self.shas[2], self.shas[-1], self.shas[3:5])
+        block = {"from_sha": self.shas[2], "to_sha": self.shas[4], "reason": "security-audit: IO", "outcome": "finding"}
+        p.slots = [
+            pool.Slot(head, status="blocked", failure={**block, "from_sha": self.shas[0], "to_sha": self.shas[2]}),
+            pool.Slot(later, status="blocked", failure=block),
+        ]
+        p.persist()
+        self.cursor = self.shas[1]  # A human attested the first commit only.
+        self.serve(lambda b, a: self.verdict(b), stop=lambda p: not p.running and len(p.slots) >= 3)
+        # Both binding ranges hold, and nothing is re-planned over them; only the commits after them are new.
+        self.assertEqual([self.shas.index(c) for c in self.calls_from], [4])
+        saved = json.loads((self.state / "pool" / pool.RANGES).read_text())["ranges"]
+        self.assertEqual(
+            [(r["from_sha"], r["commits"], r["status"]) for r in saved[:2]],
+            [
+                (self.shas[1], self.shas[2:3], "blocked"),
+                (self.shas[2], self.shas[3:5], "blocked"),
+            ],
+        )
+
+    def test_a_passed_range_the_cursor_entered_is_inspected_again_for_its_rest(self):
+        p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
+        head = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        p.slots = [pool.Slot(head, status="pass", verdict=self.verdict(head), provider="codex")]
+        p.persist()
+        self.cursor = self.shas[1]
+        self.serve(lambda b, a: self.verdict(b))
+        self.assertEqual(self.advanced[0], (self.shas[1], self.shas[2]))
+        self.assertEqual(len(self.launches), 3)  # The rest of the entered range, then the two after it.
+
+    def test_an_interrupted_attempt_without_a_concern_is_retried(self):
+        self.interrupted()
+        self.serve(lambda b, a: self.verdict(b))
+        self.assertEqual(self.calls.count(0), 1)
+        self.assertEqual(len(self.advanced), 3)
+        self.assertTrue(any("interrupted when the pool stopped" in r.get("reason", "") for r in self.ledger()))
+
+    def test_a_recorded_concern_binds_its_commits_whatever_the_new_plan(self):
+        # A legacy block from another plan of these commits (here, against an older main).
+        old = sa.build_batch(self.repo, self.shas[2], self.shas[-2], self.shas[3:5])
+        sa.record(
+            self.state / "ledger.jsonl", {"batch": old["input_digest"], "verdict": self.verdict(old, "finding", ["IO"])}
+        )
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+        self.assertNotIn(self.shas[2], self.calls_from)
+        self.assertIn("binding judgment", json.loads((self.state / "blocked.json").read_text())["reason"])
+
+    def test_an_unreadable_hold_binds_its_commits_whatever_the_new_plan(self):
+        old = sa.build_batch(self.repo, self.shas[2], self.shas[-2], self.shas[3:5])
+        sa.record(
+            self.state / "ledger.jsonl",
+            {"outcome": "unreadable", "batch": old["input_digest"], "commits": self.shas[3:5], "reason": "x"},
+        )
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+        self.assertNotIn(self.shas[2], self.calls_from)
+
+    def test_retry_state_and_reviewer_survive_a_restart(self):
+        def first(batch, attempt):
+            if self.index(batch) == 0:
+                self.not_judged(attempt, engaged=False)
+            return self.verdict(batch)
+
+        with patch.object(pool, "RETRY_SECONDS", 1000):
+            self.serve(first, stop=lambda p: not p.running and p.slots[0].failures == 1)
+        path = self.state / "pool" / pool.RANGES
+        saved = json.loads(path.read_text())["ranges"]
+        self.assertEqual([r["status"] for r in saved], ["planned", "pass", "pass"])
+        self.assertEqual((saved[0]["failures"], saved[0]["avoid"]), (1, "codex"))
+        self.assertGreater(saved[0]["retry_at"], 0)
+        saved[0]["retry_at"] = 0  # The persisted backoff has elapsed.
+        path.write_text(json.dumps({"ranges": saved}))
+        self.launches.clear()
+        self.calls.clear()
+        self.serve(lambda batch, attempt: self.verdict(batch))
+        self.assertEqual(self.calls, [0])  # Only the unfinished range is inspected again.
+        self.assertEqual(len(self.advanced), 3)
+        self.assertEqual(json.loads((self.state / "pool" / pool.RANGES).read_text())["ranges"], [])
+
+    def test_unreadable_ranges_hold_rather_than_replan(self):
+        (self.state / "pool").mkdir()
+        (self.state / "pool" / pool.RANGES).write_text("{not json")
+        p = pool.Pool(self.state, parallel=1, chooser=pool.Chooser(None))
+        with self.assertRaisesRegex(NoProgress, "cannot be restored"):
+            p.sync(self.shas[0], self.shas[-1])
+        self.assertEqual(p.slots, [])
+
+    def test_build_batch_accepts_only_the_next_consecutive_commits(self):
+        whole = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        self.assertEqual(whole, sa.plan_batch(self.repo, self.shas[0], self.shas[-1]))
+        right = sa.build_batch(self.repo, self.shas[1], self.shas[-1], self.shas[2:3])
+        self.assertEqual(right["commits"], whole["commits"][1:])
+        for start, shas in ((self.shas[0], []), (self.shas[0], self.shas[2:3]), (self.shas[1], self.shas[1:2])):
+            with self.subTest(shas=shas), self.assertRaises(Die):
+                sa.build_batch(self.repo, start, self.shas[-1], shas)
+
+
+class StoppedSequentialRound(PoolFixture):
+    def test_a_finding_in_a_stopped_round_binds_its_commits_for_the_pool(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        attempt = self.state / "attempt-stopped"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        (self.state / "running.json").write_text(sa.serialize({"attempt": str(attempt)}))
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertNotIn(self.shas[0], self.calls_from)
+        self.assertEqual(self.advanced, [])
+        self.assertFalse((self.state / "running.json").exists())
+
+
+class RestoredPass(PoolFixture):
+    def test_a_restored_pass_does_not_advance_over_a_hold_recorded_after_it(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        p = pool.Pool(self.state, parallel=1, chooser=pool.Chooser(None))
+        p.slots = [pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex")]
+        p.persist()
+        sa.record(self.state / "ledger.jsonl", {"outcome": "unreadable", "commits": self.shas[1:2], "reason": "x"})
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertEqual(self.advanced, [])
+
+
+class WorkerRounds(PoolFixture):
+    """A Worker round runs one bounded quantum of the same scheduler, with its round's reviewer."""
+
+    def round(self, inspect, **kwargs):
+        def fake(batch, provider, attempt, *, claude_credential=None):
+            self.calls.append(self.index(batch))
+            self.launches.append((self.index(batch), provider, claude_credential, False))
+            return inspect(batch, attempt)
+
+        self.launches = getattr(self, "launches", [])
+        cfg = SimpleNamespace(state=self.state.parent)
+        opts = SimpleNamespace(dry_run=False, work_model=kwargs.pop("provider", "codex"))
+        with patch.object(sa, "inspect", side_effect=fake), patch("tauceti_worker.quota.Quota") as quota:
+            try:
+                return sa.run(cfg, opts, **kwargs)
+            finally:
+                quota.assert_not_called()
+
+    def test_each_round_inspects_at_most_one_range_and_advances_it(self):
+        for expected in (1, 2, 3):
+            self.assertEqual(self.round(lambda b, a: self.verdict(b)), 0)
+            self.assertEqual(len(self.advanced), expected)
+            self.assertEqual(len(self.calls), expected)
+        with self.assertRaises(sa.AuditNotDue):
+            self.round(lambda b, a: self.verdict(b))
+        self.assertEqual([p for _, p, _, _ in self.launches], ["codex"] * 3)
+
+    def test_the_admission_threshold_applies_only_to_new_work(self):
+        with self.assertRaises(sa.AuditNotDue):
+            self.round(lambda b, a: self.verdict(b), min_commits=7)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.round(lambda b, a: self.verdict(b), min_commits=6), 0)
+        # The window is admitted: its remaining ranges continue below the threshold.
+        self.assertEqual(self.round(lambda b, a: self.verdict(b), min_commits=6), 0)
+        self.assertEqual(len(self.advanced), 2)
+
+    def test_no_judgment_splits_and_waiting_yields_to_maintenance(self):
+        def inspect(batch, attempt):
+            if batch["from_sha"] == self.shas[0]:
+                self.not_judged(attempt)
+            return self.verdict(batch)
+
+        with patch.object(pool, "RETRY_SECONDS", 1000):
+            self.assertEqual(self.round(inspect), 0)  # The whole range: not judged, split.
+            self.assertEqual(self.round(inspect), 0)  # Its left half: not judged, retried later.
+            for _ in range(3):  # Meanwhile the ranges ahead are inspected; advancement waits in order.
+                self.assertEqual(self.round(inspect), 0)
+            with self.assertRaises(NoProgress):
+                self.round(inspect)  # Only the left half's backoff remains: wait.
+        self.assertEqual(self.advanced, [])
+        self.assertEqual(len(self.calls), 5)
+        self.assertFalse((self.state / "blocked.json").exists())
+
+    def test_a_legacy_block_whose_attempt_holds_a_concern_keeps_binding(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        attempt = self.state / "attempt-legacy"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        # The incident shape: an "unfinished" answer whose findings were not empty, never in the ledger.
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "unfinished", "findings": ["x"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        block = {
+            "from_sha": self.shas[0],
+            "to_sha": self.shas[2],
+            "attempt": str(attempt),
+            "reason": "malformed unfinished judgment",
+        }
+        (self.state / "blocked.json").write_text(sa.serialize(block))
+        with self.assertRaises(NoProgress):
+            for _ in range(4):
+                self.round(lambda b, a: self.verdict(b))
+        self.assertNotIn(0, self.calls)  # The held commits are never inspected afresh.
+        self.assertEqual(self.advanced, [])
+        self.assertEqual(json.loads((self.state / "blocked.json").read_text())["outcome"], "finding")
+
+    def test_a_stopped_sequential_round_whose_attempt_holds_a_concern_keeps_binding(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        attempt = self.state / "attempt-stopped"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        (self.state / "running.json").write_text(sa.serialize({"attempt": str(attempt)}))
+        with self.assertRaises(NoProgress):
+            for _ in range(4):
+                self.round(lambda b, a: self.verdict(b))
+        self.assertNotIn(0, self.calls)
+        self.assertFalse((self.state / "running.json").exists())
+
+    def test_a_persisted_pass_does_not_advance_over_an_imported_hold(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        p = pool.Pool(self.state, parallel=1, chooser=pool.Chooser(None))
+        p.slots = [pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex")]
+        p.persist()
+        attempt = self.state / "attempt-legacy"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        block = {"from_sha": self.shas[0], "to_sha": self.shas[2], "attempt": str(attempt), "reason": "finding"}
+        (self.state / "blocked.json").write_text(sa.serialize(block))
+        with self.assertRaises(NoProgress):
+            for _ in range(4):
+                self.round(lambda b, a: self.verdict(b))
+        self.assertEqual(self.advanced, [])
+
+    def test_an_unreadable_round_journal_holds(self):
+        (self.state / "running.json").write_text(sa.serialize({"attempt": str(self.state / "attempt-gone")}))
+        with self.assertRaisesRegex(NoProgress, "cannot be settled"):
+            self.round(lambda b, a: self.verdict(b))
+        self.assertTrue((self.state / "running.json").exists())
+        self.assertEqual(self.calls, [])
+
+    def test_a_blocked_batch_file_from_the_old_pool_keeps_binding(self):
+        batch = sa.build_batch(self.repo, self.shas[2], self.shas[-1], self.shas[3:5])
+        attempt = self.state / "attempt-old-pool"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "unfinished", "findings": ["x"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        (self.state / "pool").mkdir(exist_ok=True)
+        old = {"status": "blocked", "from_sha": self.shas[2], "to_sha": self.shas[4], "attempts": [str(attempt)]}
+        (self.state / "pool" / f"{batch['input_digest']}.json").write_text(sa.serialize(old))
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertNotIn(self.shas[2], self.calls_from)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+        self.assertTrue(json.loads((self.state / "pool" / f"{batch['input_digest']}.json").read_text())["imported"])
+
+    def test_a_legacy_block_without_a_concern_is_inspected_afresh(self):
+        block = {
+            "from_sha": self.shas[0],
+            "to_sha": self.shas[2],
+            "attempt": str(self.state / "attempt-gone"),
+            "reason": "model failed",
+        }
+        (self.state / "blocked.json").write_text(sa.serialize(block))
+        self.assertEqual(self.round(lambda b, a: self.verdict(b)), 0)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+
+    def test_a_planning_failure_holds_and_reports(self):
+        with patch.object(sa, "plan_batch", side_effect=Die("oversized")), self.assertRaises(NoProgress):
+            self.round(lambda b, a: self.verdict(b))
+        blocked = json.loads((self.state / "blocked.json").read_text())
+        self.assertEqual((blocked["from_sha"], blocked["manual_inspection_required"]), (self.shas[0], True))
+
+    def test_rounds_record_protocol_five(self):
+        self.assertEqual(self.round(lambda b, a: self.verdict(b), provider="claude"), 0)
+        row = next(r for r in self.ledger() if "verdict" in r)
+        self.assertEqual((row["protocol_version"], row["provider"]), (5, "claude"))
+        self.assertEqual(row["prompt_digest"], sa.hashlib.sha256(sa.JUDGMENT_PROMPT.encode()).hexdigest())
 
 
 class Lookahead(PoolFixture):

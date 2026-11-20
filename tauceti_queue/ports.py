@@ -88,6 +88,9 @@ class AdmissionSnapshot:
     self_tested: bool = False  # Inline trusted-author/scope eligibility, never a workflow receipt.
     # Failed PR-level diff guards (diff_guard.violations) for heads admission measured; empty passes.
     diff_guard: tuple[str, ...] = ()
+    # An admin's `large-refactor` label on this head (`ci_git.large_refactor_approved`): the
+    # review-size caps do not apply to it at admission, in repair or in staging.
+    large_refactor: bool = False
 
     def source(self) -> dict[str, Any]:
         return {
@@ -294,14 +297,6 @@ class ExecutionPort(Protocol):
 
     def commit_status(self, repo: str, sha: str, context: str) -> Status | None: ...
 
-    def main_ci_run(self, repo: str, sha: str) -> CandidateRun | None:
-        """The newest `ci.yml` push run for `sha` (one REST call, never retried or slept on), without jobs.
-
-        `None` when there is none: `ci.yml` coalesces bursts of pushes, so an intermediate SHA may have
-        no run. The controller reads it only to tell whether an escalated batch's base is broken.
-        """
-        ...
-
 
 class GitHubPort(SourcePort, ExecutionPort, Protocol):
     """Compatibility protocol for the existing combined GitHub adapter."""
@@ -317,6 +312,7 @@ class TaskMember:
     `no_repair`: the PR carries a `no_repair_labels` label, so the agent must not edit it; if its content
     needs a change the agent reduces it to an empty commit and names the interacting PR, file and finding
     in the appended message. `withdrawn`: the queue already withdrew it that way; it stays an empty commit.
+    `large_refactor`: an admin's label lifts the review-size caps for its commit, as in staging.
     """
 
     source_pr: str
@@ -332,6 +328,8 @@ class TaskMember:
     no_repair: bool = False
     withdrawn: bool = False
     declaration_names: dict[str, Any] = field(default_factory=dict)
+    # Admission found an admin's `large-refactor` label on the accepted head: no review-size caps.
+    large_refactor: bool = False
 
 
 @dataclass

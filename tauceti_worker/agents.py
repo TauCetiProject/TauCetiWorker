@@ -41,6 +41,7 @@ from .constants import (
     ROADMAP,
     TAUCETI,
 )
+from .excerpt import ends
 from .github import me
 from .paths import HERE, legacy_data_root
 from .processes import PARENT_BOUND_AGENT as _PARENT_BOUND_AGENT
@@ -291,7 +292,7 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
 
 def _codex_probe_failure(model: str, result: subprocess.CompletedProcess[str]) -> NoProgress:
     status, message, _ = _codex_error_details(result.stdout or "")
-    detail = message or (result.stderr or "").strip()[-1000:] or f"exit {result.returncode}"
+    detail = message or ends(result.stderr, 1000) or f"exit {result.returncode}"
     status_text = f"HTTP {status}: " if status is not None else ""
     return NoProgress(
         f"codex model-access probe for {model} failed without confirming subscription unavailability "
@@ -440,7 +441,7 @@ def validate_kiro_model_access(cfg: Config, profile: AuthoringProfile) -> Author
     except subprocess.TimeoutExpired as e:
         raise NoProgress("Kiro model-access check timed out after 60s; not launching authoring") from e
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout or f"exit {result.returncode}").strip()[-1000:]
+        detail = ends(result.stderr or result.stdout or f"exit {result.returncode}", 1000)
         raise NoProgress(f"Kiro could not list this account's models: {detail}")
     try:
         payload = json.loads(result.stdout)
@@ -644,7 +645,9 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
-        "Foreground verification may use the remaining round budget; do not impose a ten-minute timeout. "
+        "Each foreground command may run up to the worker's command limit (an hour by default, never past "
+        "the round); do not impose a ten-minute timeout. If one is stopped at the limit, rerun it: Lake keeps "
+        "what it built and phase receipts keep what passed. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
         "A failed/incomplete receipt is never green; do not spin on unchanged checks. "
@@ -929,18 +932,24 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
+# One agent shell command's default budget. Long enough for a cold build that waits for compiler
+# capacity, short enough that a hung process (seen: a deadlocked `lean` idle for hours) costs an
+# hour of the round rather than all of it. Launchers set TAUCETI_SHELL_LIMIT_SECONDS to choose
+# another budget; it never exceeds the round's remaining time.
+DEFAULT_SHELL_LIMIT_SECONDS = 3600
+
+
 def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
-    # Keep commands in the foreground, bounded by the round rather than an unrelated
-    # ten-minute ceiling: waiting for compiler capacity consumes wall time too.
-    # Launchers may still request a shorter command budget explicitly.
+    # Keep commands in the foreground, bounded by the round and a per-command budget rather than
+    # Claude Code's unrelated ten-minute ceiling: waiting for compiler capacity consumes wall time too.
     if limit_seconds is None:
         try:
             value = os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS")
-            limit_seconds = float(value) if value else None
+            limit_seconds = float(value) if value else DEFAULT_SHELL_LIMIT_SECONDS
         except ValueError:
-            limit_seconds = None
+            limit_seconds = DEFAULT_SHELL_LIMIT_SECONDS
     remaining_ms = max(1000, int((deadline - time.time()) * 1000))
-    timeout_ms = remaining_ms if limit_seconds is None else min(remaining_ms, max(1000, int(limit_seconds * 1000)))
+    timeout_ms = min(remaining_ms, max(1000, int(limit_seconds * 1000)))
     return {
         "BASH_DEFAULT_TIMEOUT_MS": str(timeout_ms),
         "BASH_MAX_TIMEOUT_MS": str(timeout_ms),
@@ -1071,15 +1080,16 @@ def run_agent_host(
     session_scope=None,
     quota_cfg=None,
     cache_note: bool = True,
-    queue_mathlib: bool = False,
+    host_caches: bool = True,
 ) -> int:
     """``cache_note=False`` leaves out the build-cache appendix (fetch commands and the
     ``TAUCETI_PR_CACHE_MISS`` stop rule): the queue's repair worker warms the tree itself and its own
     prompt tells the agent not to fetch, and a queue head's tip is never in the public cache.
 
-    ``queue_mathlib=True`` is only for the queue's repair service, whose own sandboxed builds run
-    outside any shared view on a Mathlib it prepares itself; moving that producer onto the shared
-    layout is a later step. Worker rounds never pass it."""
+    ``host_caches=False`` is only for the queue's repair service: its worker prepares the checkout
+    (Mathlib, the TauCeti outputs, or a batch tree already built) before the first round, and its
+    sandboxed builds use its own artifact pool. The round then runs with no host cache preparation
+    and no canonical-store passes. Worker rounds never pass it."""
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
     if (
@@ -1153,9 +1163,15 @@ def run_agent_host(
     _LAST_AGENT_FAILURE = None
     from . import round_storage
 
-    # Worker rounds wait for a cache with their dependencies; the queue's repair service builds its own.
-    cache_options = {"queue_mathlib": True} if queue_mathlib else {"cache_wait": True}
-    with host_build_cache_context(cwd, env, logdir, **cache_options) as prefix:
+    # Worker rounds wait for a cache with their dependencies; the queue's repair service prepares its own.
+    if host_caches:
+        caches = host_build_cache_context(cwd, env, logdir, cache_wait=True)
+    else:
+        from .build_resources import defaults
+
+        defaults(env)
+        caches = contextlib.nullcontext(None)
+    with caches as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
@@ -1178,9 +1194,9 @@ def run_agent_host(
             record_result(env, rc)
         # H2: the agent's process group has been reaped, so no Lake can be writing the checkout.
         # Exit 70 is the guardian's "child lifetime cleanup incomplete": no quiescent boundary.
-        if rc == 70:
+        if host_caches and rc == 70:
             log("canonical store (round-end): agent cleanup incomplete; relinking left for the next round")
-        else:
+        elif host_caches:
             relink_build_outputs(cwd, env, phase="round-end")
     if rc == 75:
         from .claude_api import blocked_reason
@@ -1653,9 +1669,7 @@ def lake_cache_max_revs(env: dict) -> str:
 
 
 @contextlib.contextmanager
-def host_build_cache_context(
-    cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False, cache_wait: bool = False
-):
+def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, cache_wait: bool = False):
     """Keep the public service available through repairs, merges and dependency changes.
 
     ``cache_wait=True`` (worker agent rounds) raises BuildCacheWait instead of starting on a
@@ -1670,22 +1684,16 @@ def host_build_cache_context(
     from . import shared_mathlib
 
     def mathlib_view():
-        if queue_mathlib:
-            # The queue repair service's checkout keeps the Mathlib it prepares (see run_agent_host).
-            return contextlib.nullcontext([])
         return shared_mathlib.view(cwd, env, logdir, _cache_fetch)
 
     from .build_cache_wait import ENABLE
 
-    if queue_mathlib:
-        env["TAUCETI_QUEUE_MATHLIB"] = "1"
     if cache_wait:
         env[ENABLE] = "1"
     try:
         with _host_build_cache_context(cwd, env, logdir, mathlib_view) as prefix:
             yield prefix
     finally:
-        env.pop("TAUCETI_QUEUE_MATHLIB", None)
         env.pop(ENABLE, None)
 
 
@@ -1966,11 +1974,9 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         # `lake exe cache get` inside the view re-extracts every archive, and each new file lands in
         # this checkout's private overlay upper: a full private copy under a "shared" round.
         log("host build caches: Mathlib and its dependencies come from the shared build; not fetching them")
-    elif env.get("TAUCETI_QUEUE_MATHLIB") != "1":
+    else:
         # Sharing is the only way a round gets Mathlib; a private `cache get` is a private copy.
         unavailable("this workspace needs Mathlib but has no shared Mathlib view")
-    elif fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
-        return  # the queue repair service's own Mathlib, until that producer shares too
     # Mathlib itself knows which compressed archives the selected dependency tree
     # needs. Prune stale private links daily so pool GC can actually release them;
     # otherwise the old promote/hydrate-all exchange resurrects dead archives forever.
@@ -2297,7 +2303,7 @@ def ensure_fork_proxy_current() -> None:
         try:
             subprocess.run([*cmd, "gh", "proxy", "start"], capture_output=True, text=True, timeout=120, check=True)
         except subprocess.CalledProcessError as e:
-            detail = (e.stderr or e.stdout or "").strip()[-500:]
+            detail = ends(e.stderr or e.stdout, 500)
             suffix = f"\n  Bubble said: {detail}" if detail else ""
             raise Die(
                 "preflight: bubble's git auth-proxy daemon lacks required GitHub capabilities and could not be "
@@ -2376,7 +2382,7 @@ def ensure_bubble_home(cfg: Config) -> dict:
         except (OSError, subprocess.SubprocessError) as e:
             raise Die(f"could not configure Bubble's shared-cache overlay; refusing unsafe cache mounts: {e}") from e
         if p.returncode != 0 or not overlay_configured():
-            detail = (p.stderr or p.stdout or "Bubble did not persist security.shared-cache=overlay").strip()[-300:]
+            detail = ends(p.stderr or p.stdout or "Bubble did not persist security.shared-cache=overlay", 300)
             raise Die(
                 "could not configure Bubble's shared-cache overlay; refusing to expose persistent "
                 f"writable Lean caches to the agent. Bubble said: {detail}"

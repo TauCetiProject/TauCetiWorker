@@ -234,8 +234,6 @@ class FakeGitHub:
         self.closed: dict[int, str] = {}
         self.statuses: dict[tuple[str, str], Status] = {}
         self.declaration_records: dict[str, dict] = {}
-        # `ci.yml`'s conclusion per pushed SHA of main (`main_ci_run`); no entry means no run.
-        self.main_ci: dict[str, str] = {}
         self.runs: list[FakeRun] = []
         # pr-build.yml's concurrency group with cancel-in-progress: a new dispatch for a candidate
         # cancels any queued or in-progress run for the same batch and head.
@@ -396,6 +394,10 @@ class FakeGitHub:
                     run.conclusion = "success"
                     post("build", "success", "Build succeeded")
                     policy = {}
+                elif run.verdict == "incomplete":
+                    # The `sandboxed-build` runner died before its report step: the finalizer posts this.
+                    run.conclusion = "failure"
+                    post("build", "failure", "sandboxed merge-group build did not complete")
                 elif run.verdict == "cancel":
                     run.conclusion = "cancelled"
                 elif run.verdict == "no-status":
@@ -593,26 +595,6 @@ class FakeGitHub:
             self._call("commit_status", sha, context)
             return self.statuses.get((sha, context))
 
-    def main_ci_run(self, repo: str, sha: str) -> CandidateRun | None:
-        with self.lock:
-            self._call("main_ci_run", sha)
-            if sha not in self.main_ci:
-                return None
-            conclusion = self.main_ci[sha]
-            return CandidateRun(
-                run_id=f"main-{sha[:12]}",
-                attempt=1,
-                status="in_progress" if conclusion == "in_progress" else "completed",
-                conclusion=None if conclusion == "in_progress" else conclusion,
-                created_at=None,
-                started_at=None,
-                completed_at=None,
-                runner_name=None,
-                runner_labels=(),
-                host=None,
-                html_url=f"https://github.invalid/actions/runs/main-{sha[:12]}",
-            )
-
     def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         return self.fast_forward(repo, branch, expected_parent, tip)
 
@@ -761,10 +743,31 @@ class FakeGitHub:
         ) and allowed_paths(paths)
         from . import diff_guard
 
-        guard = diff_guard.violations(self.repo.clone, base, pull.head_sha) if local else ()
-        return AdmissionSnapshot(
-            pull, base, paths, tuple(source["comments"]), source["statuses"], base, self_tested=local, diff_guard=guard
+        exempt = pull.head_sha in getattr(self, "large_refactor_heads", set())
+        guard = (
+            diff_guard.violations(self.repo.clone, base, pull.head_sha, large_refactor=exempt)
+            if local or exempt
+            else ()
         )
+        return AdmissionSnapshot(
+            pull,
+            base,
+            paths,
+            tuple(source["comments"]),
+            source["statuses"],
+            base,
+            self_tested=local,
+            diff_guard=guard,
+            large_refactor=exempt,
+        )
+
+    def bump_guard(self, repo, head):
+        """`bump_verdicts[head]`: True or False is the verdict, None an unreadable input."""
+        self._call("bump_guard", head)
+        verdict = getattr(self, "bump_verdicts", {}).get(head, False)
+        if verdict is None:
+            raise GitHubUnavailable("fake bump-guard inputs unavailable")
+        return verdict
 
     def list_open_pull_requests(
         self, repo: str, *, review_app_id: int, admission=False, on_page=None

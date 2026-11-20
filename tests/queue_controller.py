@@ -386,6 +386,43 @@ class Verdicts(ControllerCase):
         self.assertEqual(finding["kind"], "status")
         self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
 
+    def test_incomplete_sandboxed_build_with_failed_finalizer_is_infrastructure(self):
+        # The `sandboxed-build` runner was OOM-killed before its report step (attempt 278): the
+        # finalizer posts a bound failed `build` saying the build did not complete, then exits 1.
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("incomplete", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        attempt = self.attempt(head)
+        self.assertEqual(attempt["outcome"], "infrastructure")
+        self.assertIn("did not complete", attempt["outcome_detail"])
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        self.clock.advance(self.controller.setting("infrastructure_retry_backoff_seconds") + 1)
+        self.controller.tick()
+        self.assertEqual(len(self.github.dispatches), 2, "an incomplete build is re-dispatched")
+
+    def test_failed_build_verdict_with_compiler_finding_stays_source_failure(self):
+        # The same failed finalizer, but the build reported its own verdict: a source failure.
+        findings = diagnostics.parse_log(["TauCeti/A.lean:1:0: error: unknown identifier 'x'"])
+        self.assertEqual(findings[0]["kind"], "compiler")
+        findings += diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        self.assertEqual(self.controller.store.row("tasks", {"batch_id": head["id"]})["kind"], "repair")
+
     def test_dependency_audit_collision_with_failed_finalizer_creates_repair(self):
         findings = diagnostics.parse_log(
             [
