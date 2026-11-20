@@ -2801,7 +2801,9 @@ def _run_task(
                         verification["diagnostics"]
                     )
                     state.write("verification_failed", attempt=attempt, tip=tip, detail=detail)
-                    if verify_rounds < cfg.verify_retries:
+                    # A conflict task's tree is a prefix of the chain: a later member may fix what fails here,
+                    # so its failures do not send the agent round again.
+                    if verify_rounds < cfg.verify_retries and step is None:
                         verify_rounds += 1
                         findings = repair.findings_from_diagnostics(verification["diagnostics"])
                         feedback = (
@@ -2812,9 +2814,8 @@ def _run_task(
                         log(f"attempt {attempt}: verification failed; running the agent on its findings")
                         continue
                     if step is not None:
-                        # The tree is a prefix of the chain: a later member may fix what fails here. The
-                        # queue replays the rest and its CI judges the whole chain.
-                        log(f"task {task.task_id}: the resolved commit still fails verification; submitting it")
+                        # The queue replays the rest and its CI judges the whole chain.
+                        log(f"task {task.task_id}: the resolved commit fails verification; submitting it")
                     elif not (
                         task.extra.get("can_checkpoint_repair")
                         and verification.get("build", {}).get("rc") == 0

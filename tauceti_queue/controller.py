@@ -2506,27 +2506,29 @@ class Controller:
                 )
             if self._predicted_collisions(knowledge):
                 self._record_prediction_result(task, batch, comparison, tip_sha, worker_notes, now)
-            if task["kind"] == TASK_PRE_REBASE:
-                adoption = self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
-            elif self._pre_rebased_prepare(task):
+            if self._pre_rebased_prepare(task):
                 return self._adopt_prepared_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
-            elif self._prediction_task(task) and tip_sha == task["tip"]:
+            if self._prediction_task(task) and tip_sha == task["tip"]:
                 return self._adopt_prediction_noop(task, claim, batch, tip_sha, retained, worker_notes, now)
-            else:
-                adoption = self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
-            if step is not None and adoption.accepted:
-                # The receipt a worker resending the same resolved commit after a lost response finds.
-                self.store.insert(
-                    "submissions",
-                    task_id=task_id,
-                    claim_id=claim["id"],
-                    tip=resolved,
-                    retained_ref=retained,
-                    accepted=1,
-                    reason="resolved-commit",
-                    worker_notes="",
-                    created_at=now,
-                )
+            with self.store.transaction():
+                if task["kind"] == TASK_PRE_REBASE:
+                    adoption = self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
+                else:
+                    adoption = self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
+                if step is not None and adoption.accepted:
+                    # In the adoption's transaction: the receipt a worker resending the same resolved
+                    # commit after a lost response finds.
+                    self.store.insert(
+                        "submissions",
+                        task_id=task_id,
+                        claim_id=claim["id"],
+                        tip=resolved,
+                        retained_ref=retained,
+                        accepted=1,
+                        reason="resolved-commit",
+                        worker_notes="",
+                        created_at=now,
+                    )
             return adoption
 
     def _commit_empty(self, sha: str | None) -> bool:
@@ -5900,7 +5902,11 @@ class Controller:
     def _preserved_onto(self, task: dict[str, Any]) -> str | None:
         """The parent a preserved task may still submit onto, while it is open and claimed."""
         onto = (self._state("emergency_preserved") or {}).get(str(task["id"]))
-        if onto is None or task["state"] != TASK_OPEN or not self._active_claims(task["batch_id"], task_id=task["id"]):
+        if onto is None or task["state"] != TASK_OPEN:
+            return None
+        # The next task of a preserved conflict sequence holds accepted resolutions: kept until claimed.
+        continues = (self._conflict_step(task) or {}).get("continues_preserved")
+        if not continues and not self._active_claims(task["batch_id"], task_id=task["id"]):
             return None
         return onto
 
@@ -6421,9 +6427,10 @@ class Controller:
     def _absorbed_members(
         self, task: dict[str, Any], step: dict[str, Any], result: chain.ChainResult, resolved: str
     ) -> list[chain.Violation]:
-        """Later members a resolution took into itself: empty when replayed onto it, though their change
-        applies onto the clean prefix and they did not land on the base. Taking a later member's content
-        is replaying it by hand, which would leave that member an empty commit."""
+        """Later members a resolution took into itself: empty when replayed onto it, though they did not
+        land on the base and their change is not already in the clean prefix (applied there it changes
+        something, or conflicts). Taking a later member's content is replaying it by hand, which would
+        leave that member an empty commit."""
         emptied = {
             r.source_pr
             for r in result.commits
@@ -6437,7 +6444,7 @@ class Controller:
             if later.source_pr not in emptied or later.tree == chain.tree_of(self.clone, later.parents[0]):
                 continue
             outcome = chain.merge_trees(self.clone, step["clean_prefix_tip"], later.sha, merge_base=later.parents[0])
-            if outcome.clean and outcome.tree != prefix_tree:
+            if not outcome.clean or outcome.tree != prefix_tree:
                 found.append(
                     chain.Violation(
                         "absorbed-later-member",
@@ -6464,6 +6471,9 @@ class Controller:
         and a task of the same kind resolves the next conflicting commit on the new clean prefix, which
         already holds this resolution. Nothing is adopted into the batch until the replay finishes."""
         step = self._conflict_diagnostic(batch["id"], result, task["onto"], "continuing the replay onto")
+        preserved_onto = self._preserved_onto(task)
+        if preserved_onto is not None:
+            step["continues_preserved"] = True
         diagnostics = [step, *(d for d in loads(task["diagnostics"], []) if d.get("kind") != "conflict")]
         # One transaction with the successor's creation: an accepted resolution always has its next task.
         with self.store.transaction():
@@ -6506,6 +6516,10 @@ class Controller:
                 self._set_state(
                     f"emergency_evicted:{batch['id']}", dict(marker, task_ids=[*marker["task_ids"], successor])
                 )
+            if preserved_onto is not None:
+                # Like the task it continues, the successor may submit onto the head's earlier tip.
+                preserved = self._state("emergency_preserved") or {}
+                self._set_state("emergency_preserved", {**preserved, str(successor): preserved_onto})
         self.report_inference(claim["worker"], True)
         self._wake.set()
         return Adoption(True, "resolved-commit", task["id"], batch["id"], None, resolved, retained, [])

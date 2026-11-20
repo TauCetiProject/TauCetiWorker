@@ -398,6 +398,9 @@ elif mode == "repair":
 elif mode == "no-explanation":
     rebuild(explain=resume is not None)
     finish()
+elif mode == "explain-only":
+    (repair_dir / "explanation.md").write_text("Kept the commit as it applies.\n")
+    finish()
 elif mode == "move-history":
     # Resolve, then try to finish the replay by hand: commit, cherry-pick what follows, move HEAD.
     rebuild()
@@ -5684,6 +5687,20 @@ class HeadHandoff(Fixture):
         self.assertEqual(checks["lint"]["scope"], "full")
         notes = json.loads(self.service.results[0]["worker_notes"])
         self.assertEqual(notes["pre_rebase_verification"]["scope"], "full")
+
+    def test_a_resolution_that_fails_verification_is_submitted_without_another_round(self):
+        """The resolved commit's tree is only a prefix of the chain, so a later member may fix what fails
+        there: the worker submits it after one agent turn and the whole chain's CI judges."""
+        self.pre_rebase_task()
+        self.service.tasks[1]["extra"]["checks_owner"] = "worker"
+        os.environ["STUB_AGENT_MODE"] = "explain-only"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertFalse(outcome["verification"][-1]["ok"])
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Two.lean"))
 
     def run_check_handoff(self, check):
         self.pre_rebase_task()
