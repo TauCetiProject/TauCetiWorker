@@ -514,7 +514,10 @@ live to repair's use plus the free memory under that ceiling, minus about 20 GiB
 no memory limit of its own. As the staging VM grows, the kernel reclaims, swaps and slows repairs
 (VM memory cannot be swapped), and the repair builds' compiler wrapper, which measures the same
 ceiling, stops starting compilers. The repair units run at `OOMScoreAdjust=1000` (the background
-publisher too), so an OOM kill takes a repair process, never a VM, and the worker restarts. If repairs
+publisher too), so an OOM kill takes a repair process rather than a VM, and the worker restarts. The
+kernel adds adjustment/1000 of the OOM domain's RAM and swap to each process's memory, so this holds
+while no VM (at 200) holds over 80% of that; on tauchonki2, with 62 GiB of swap, no VM under the
+112 GiB ceiling can. If repairs
 slow down, read the slice's `memory.pressure`, `memory.events` (`high`) and swap activity: that is the
 intended priority while a staging build needs the memory. A `renice` by hand affects only the thread it names, not the other threads of a
 multithreaded process such as `lake` or the worker, nor their later children.

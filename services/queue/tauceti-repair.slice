@@ -17,7 +17,8 @@
 # use; as the staging VM grows it falls, and the kernel reclaims, swaps and slows the repairs rather
 # than the VM, whose memory cannot be swapped. The repair builds' compiler wrapper measures the same
 # ceiling (it reads every capped ancestor), so it stops starting compilers as the ceiling nears. If it
-# still comes to an OOM kill, the repair units' OOMScoreAdjust=1000 makes a repair process the victim.
+# still comes to an OOM kill, the repair units' OOMScoreAdjust=1000 makes a repair process the victim
+# (see tauceti-queue-repair.service for when that holds).
 # So this file sets no MemoryHigh or MemoryMax: either would fight TauCetiFleet's live value.
 #
 # install-repair.sh installs this file; never add a drop-in for it.

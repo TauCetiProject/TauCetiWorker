@@ -3531,6 +3531,7 @@ class PublishOutputs(Fixture):
         self.assertIn("--property=Nice=10", args)
         self.assertIn("--property=IOSchedulingClass=best-effort", args)
         self.assertIn("--property=IOSchedulingPriority=7", args)
+        self.assertIn("--property=OOMScoreAdjust=1000", args)
         self.assertIn(f"--setenv=LAKE_CACHE_DIR={env['LAKE_CACHE_DIR']}", args)
         self.assertFalse([a for a in args if "gh-secret" in a or "INVOCATION_ID" in a], args)
         self.assertEqual(args[-2:], ["tauceti_queue.repair_publish", str(logdir / repair_publish.SPEC)])
