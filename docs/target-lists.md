@@ -204,11 +204,12 @@ checks it out in a temporary worktree, computes the edits on the list there,
 commits the list alone as `Reconcile <file name>: N item(s)` with one line per
 item, and pushes that commit by its id. The worker publishes its ticks without
 running the clone's git hooks, so validation belongs in the forge's checks. A
-list the remote branch holds as a symbolic link, or under one, is not published. The look reads the pull requests a list names from that remote
+list the remote branch holds as a symbolic link, or under one, is not
+published. The look reads the pull requests a list names from that remote
 branch too, not from the clone's file, and reads them again if the list there
-changes before it is published. A commit a hook rejects, a
-push the remote refuses, or a fetch that fails publishes nothing and leaves
-nothing behind, and the next look computes again. The worktree is then removed
+changes before it is published. A commit that fails, a push the remote
+refuses, or a fetch that fails publishes nothing and leaves nothing behind, and
+the next look computes again. The worktree is then removed
 and the clone is fast-forwarded to the remote branch when it has no
 uncommitted changes and no commits of its own; otherwise it is left for the
 operator. That is how workers on several hosts share one list: their edits meet
