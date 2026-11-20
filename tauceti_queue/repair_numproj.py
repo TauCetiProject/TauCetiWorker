@@ -52,6 +52,7 @@ _NUMERIC = re.compile(r"\.\d+")
 _NAMED = re.compile(r"\.[^\W\d][\w'!?]*")
 _RECEIVER = re.compile(r"[\w'.$!?«»℘]+")
 _BEFORE_PROJECTION = ")]⟩»·℘"
+_RECEIVER_BOUNDARY = " \t\n([{⟨,;"
 
 
 @dataclasses.dataclass
@@ -144,8 +145,9 @@ def projection_edits(before: str, after: str) -> set[tuple[int, int, str, tuple[
         elif j < len(after) and after[j] == ")" and opened is not None and _NUMERIC.match(before, i):
             # An identifier chain, `$h` or `℘s`: never digits first, which would be a literal (`1.5`).
             receiver = _RECEIVER.fullmatch(before, opened, i)
-            # The whole receiver: `returnh.1` may not become `return(h).fst`.
-            joined = opened > 0 and _RECEIVER.fullmatch(before, opened - 1, opened) is not None
+            # The whole receiver: `returnh.1` may not become `return(h).fst`. Lean's identifier
+            # characters are many, so only an explicit boundary before the receiver counts.
+            joined = opened > 0 and before[opened - 1] not in _RECEIVER_BOUNDARY
             if not receiver or joined or before[opened].isdigit() or place(opened)[0] != place(i)[0]:
                 return None
             span = (place(opened)[1], place(i)[1])
