@@ -2603,6 +2603,19 @@ class AgentSessionContinuation(Fixture):
         self.assertEqual([a.get("continued", False) for a in attempts], [True, False])
         self.assertEqual(outcome["agent"][0]["status"], "ok")
 
+    def test_the_session_clock_starts_at_launch(self):
+        cancel = threading.Event()
+        session = repair_task._SessionCancel(cancel, 0.2)
+        time.sleep(0.3)  # the worker's preparation, before run_agent_proc's first poll
+        self.assertFalse(session.is_set(), "preparation is not timed")
+        time.sleep(0.3)
+        self.assertTrue(session.is_set())
+        self.assertTrue(session.expired)
+        lost = repair_task._SessionCancel(cancel, 60)
+        cancel.set()
+        self.assertTrue(lost.is_set())
+        self.assertFalse(lost.expired, "a lost claim is not the end of a session")
+
     def test_a_fresh_round_does_not_inherit_an_earlier_note(self):
         task = repair_task.Task.from_json(
             {**self.content.task(), "claim_token": "t", "expires_at": time.time() + 60, "renew_after": 1}

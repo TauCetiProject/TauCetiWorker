@@ -1917,10 +1917,7 @@ def run_repair_agent(
                 resume=session_resume,
             )
             # Only the agent session is timed; when it ends, a fresh session continues on this claim and tree.
-            expired = threading.Event()
-            timer = threading.Timer(cfg.agent_session_seconds, expired.set)
-            timer.daemon = True
-            timer.start()
+            session_cancel = _SessionCancel(cancel, cfg.agent_session_seconds)
             run = None
             prework = None
             try:
@@ -1930,7 +1927,7 @@ def run_repair_agent(
                         prompt,
                         profile,
                         logdir,
-                        cancel_event=_AnySet(cancel, expired),
+                        cancel_event=session_cancel,
                         resume=session_resume,
                         session_path=state.session_path,
                         session_actor="queue-repair-task",
@@ -1956,10 +1953,9 @@ def run_repair_agent(
                 reason = take_last_agent_infra_failure()
                 run = take_last_agent_run()
                 prework = prework_failure(provider, rc, run, reason)
-            finally:
-                timer.cancel()
             seconds = round(time.monotonic() - started, 1)
-            if prework is not None and not expired.is_set():
+            expired = session_cancel.expired
+            if prework is not None and not expired:
                 if prework.startswith(LAUNCH_FAILURE):
                     launch_failures += 1
                     reason = prework
@@ -1997,7 +1993,7 @@ def run_repair_agent(
             attempts.append(record)
             if cancel.is_set():
                 return result("cancelled", session=session)
-            if expired.is_set():
+            if expired:
                 # Not a failure: the work stays in the tree and a fresh session takes it up from the handoff note.
                 record["continued"] = True
                 continuations += 1
@@ -2032,14 +2028,26 @@ def run_repair_agent(
     return result("inference_unavailable", reason=reason)
 
 
-class _AnySet:
-    """Set while any of ``events`` is: the agent stops for a lost claim or for the end of its session."""
+class _SessionCancel:
+    """The agent's ``cancel_event``: set once the claim is lost (``cancel``) or the session has run for
+    ``seconds`` (then ``expired``). The clock starts at the first poll, which ``run_agent_proc`` makes just
+    before it launches the agent, so the worker's preparation in ``run_agent_host`` is not timed."""
 
-    def __init__(self, *events: threading.Event):
-        self.events = events
+    def __init__(self, cancel: threading.Event, seconds: float):
+        self.cancel = cancel
+        self.seconds = seconds
+        self.started: float | None = None
+        self.expired = False
 
     def is_set(self) -> bool:
-        return any(event.is_set() for event in self.events)
+        if self.cancel.is_set():
+            return True
+        now = time.monotonic()
+        if self.started is None:
+            self.started = now
+        elif now - self.started >= self.seconds:
+            self.expired = True
+        return self.expired
 
 
 def continuation_prompt(worktree: Path, prompt: str, seconds: float) -> str:
@@ -2987,6 +2995,8 @@ def _run_task(
                     return release_task(
                         cfg, client, task, state, follow["status"], follow.get("reason"), outcome, lease
                     )
+                if follow.get("session"):  # a later turn resumes the latest session, continued or not
+                    agent = {**agent, "session": follow["session"], "provider": follow["provider"]}
                 tip = git(worktree, "rev-parse", "HEAD").strip()
                 git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
                 report = repair.chain_report(
@@ -3208,6 +3218,8 @@ def _run_task(
                     return release_task(
                         cfg, client, task, state, follow["status"], follow.get("reason"), outcome, lease
                     )
+                if follow.get("session"):  # a later turn resumes the latest session, continued or not
+                    agent = {**agent, "session": follow["session"], "provider": follow["provider"]}
                 attempt -= 1  # the resubmission continues this attempt
                 feedback = None
                 resubmit = True
