@@ -285,7 +285,7 @@ class Cleanup(unittest.TestCase):
         parked = self.worker / "worktrees/batch-1"
         self.assertFalse(path.exists())
         self.assertTrue((parked / ".lake/build/M.olean").exists())
-        self.assertEqual(json.loads((self.worker / "batch-trees/batch-1.json").read_text()), {"task_id": "1"})
+        self.assertEqual(json.loads((parked / ".lake/tauceti-batch-tree.json").read_text()), {"task_id": "1"})
         target = self.worker / "worktrees/task-2"
         self.assertEqual(cleanup.adopt(self.clone, self.worker, "1", target), head)
         self.assertFalse(parked.exists())
@@ -316,7 +316,7 @@ class Cleanup(unittest.TestCase):
         with self.assertRaises(OSError):
             cleanup._move(self.clone, second, parked)  # what a racing second publisher would attempt
         self.assertTrue(second.is_dir())
-        self.assertEqual(sorted(p.name for p in parked.iterdir()), [".git"])
+        self.assertEqual(sorted(p.name for p in parked.iterdir()), [".git", ".lake"])
 
     def test_parked_trees_are_collected_when_their_batch_is_finished(self):
         for task_id, batch in ((1, "landed"), (2, "removed"), (3, "open")):
@@ -326,7 +326,6 @@ class Cleanup(unittest.TestCase):
         rows = {row["batch_id"]: row["state"] for row in self.collect()}
         self.assertEqual(rows, {1: "removed", 2: "removed", 3: "unfinished", 4: "unknown"})
         self.assertEqual(sorted(p.name for p in (self.worker / "worktrees").iterdir()), ["batch-3", "batch-4"])
-        self.assertFalse((self.worker / "batch-trees/batch-1.json").exists())
 
 
 if __name__ == "__main__":

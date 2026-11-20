@@ -641,7 +641,7 @@ after the preceding collection ends. It reads the local authoritative SQLite dat
 writing it. Landed/removed batches and submitted/superseded tasks are eligible, including worktrees
 left by failed attempts and `task-<id>-group-*` parallel worktrees. A parked batch tree
 (`worktrees/batch-<id>`, about 30 GiB with its `.lake`) is removed once its batch has landed or been
-removed; its identity comes from the task recorded in `<root>/batch-trees/batch-<id>.json`, and a
+removed; its identity comes from the task recorded in the tree's `.lake/tauceti-batch-tree.json`, and a
 tree without a known task is kept and reported as `unknown`. The collector removes their Git
 worktree registrations and build/dependency directories; task JSON, logs, retained refs and artifact
 caches remain. `--keep-worktree` does not exempt terminal work from this collector.
