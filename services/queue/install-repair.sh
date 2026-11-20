@@ -18,7 +18,8 @@
 # it comes back (SIGTERM handling in tauceti_queue/repair_task.py). Unused release directories are
 # then removed (services/queue/release.sh).
 #
-# Usage: services/queue/install-repair.sh [--revision REF | --release DIR] [--checkout DIR] [--instance NAME] [--no-restart] [--wait SECONDS]
+# Usage: services/queue/install-repair.sh [--revision REF | --release DIR] [--checkout DIR] [--instance NAME]
+#                                          [--no-restart | --when-idle [--idle-timeout SECONDS]] [--wait SECONDS]
 #
 #   --revision REF   commit, branch or tag to install (default: origin/main). A revision that does
 #                    not descend from the one the worker runs now fails rather than being forced.
@@ -27,6 +28,11 @@
 #   --instance NAME  another worker, using repair-environment-NAME and its own task root.
 #   --no-restart     install files and the unit but leave a running worker alone (the next
 #                    restart picks up the new release).
+#   --when-idle      restart only once the queue shows the worker holding no claim: no row in the
+#                    controller's claims table (~/TauCetiQueue-data/queue.sqlite3, read-only) for its
+#                    TAUCETI_QUEUE_WORKER with released_at unset and expires_at in the future. It
+#                    checks every 60s before installing anything, and again right before the restart.
+#   --idle-timeout SECONDS  give up waiting after SECONDS (default: wait for as long as it takes).
 #   --wait SECONDS   how long to wait for the restarted worker to report serving (default: 60).
 #
 # WARNING: repair workers run origin/main HEAD, each install in its own ~/TauCetiQueue-releases
@@ -38,7 +44,7 @@
 #
 # Exit status: 0 when the worker is active and serving; 1 on a setup or host-check failure;
 # 2 when the unit is not active, does not run from the release, or does not report serving within
-# --wait.
+# --wait; 3 when --idle-timeout passed with the worker still holding a claim (it was not restarted).
 set -euo pipefail
 
 REPO_URL="https://github.com/TauCetiProject/TauCetiWorker.git"
@@ -48,6 +54,10 @@ RELEASE_ARG=""
 RESTART=1
 WAIT=60
 INSTANCE=""
+WHEN_IDLE=0
+IDLE_TIMEOUT=""
+IDLE_POLL=60
+QUEUE_DB="$HOME/TauCetiQueue-data/queue.sqlite3"
 UNIT="tauceti-queue-repair.service"
 UNIT_SOURCE="tauceti-queue-repair.service"
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -63,7 +73,9 @@ while [ $# -gt 0 ]; do
     --instance) INSTANCE="$2"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     --wait) WAIT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+    --when-idle) WHEN_IDLE=1; shift ;;
+    --idle-timeout) IDLE_TIMEOUT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
     *) echo "install-repair.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
@@ -80,6 +92,68 @@ if [ -n "$INSTANCE" ]; then
   UNIT_SOURCE="tauceti-queue-repair@.service"
   ENV_FILE="$CONFIG_DIR/repair-environment-$INSTANCE"
 fi
+
+if [ -n "$IDLE_TIMEOUT" ]; then
+  [[ "$IDLE_TIMEOUT" =~ ^[0-9]+$ ]] || die "--idle-timeout takes a number of seconds"
+  [ "$WHEN_IDLE" = 1 ] || die "--idle-timeout needs --when-idle"
+fi
+if [ "$WHEN_IDLE" = 1 ]; then
+  [ "$RESTART" = 1 ] || die "--when-idle and --no-restart are exclusive"
+  [ -f "$QUEUE_DB" ] || die "--when-idle reads the queue's claims from $QUEUE_DB, which does not exist on this host"
+fi
+
+# --when-idle: the worker's identity as the unit sees it (the last assignment in its environment
+# file wins, as for systemd; the worker's own default otherwise), and its live claims in the queue.
+worker_identity() {
+  [ -f "$ENV_FILE" ] || return 0
+  # shellcheck disable=SC1090
+  (set -a; . "$ENV_FILE" >/dev/null 2>&1; printf '%s' "${TAUCETI_QUEUE_WORKER:-${TAUCETI_WORKER_ID:-default}@$(hostname)}")
+}
+live_claims() {
+  python3 - "$QUEUE_DB" "$1" <<'PY'
+import pathlib, sqlite3, sys, time
+db = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+now = time.time()
+rows = db.execute(
+    "SELECT id, task_id, operation, expires_at FROM claims"
+    " WHERE worker = ? AND released_at IS NULL AND expires_at > ? ORDER BY id",
+    (sys.argv[2], now),
+).fetchall()
+print("; ".join(f"claim {i} (task {t}, {op}, expires in {e - now:.0f}s)" for i, t, op, e in rows))
+PY
+}
+# wait_until_idle: return once the queue shows no live claim for this worker. Never returns early
+# on an unreadable database; exits 3 after --idle-timeout.
+wait_until_idle() {
+  local worker claims deadline="" left
+  worker="$(worker_identity)"
+  if [ -z "$worker" ]; then
+    log "no $ENV_FILE yet, so no worker to wait for"
+    return 0
+  fi
+  [ -z "$IDLE_TIMEOUT" ] || deadline=$(( $(date +%s) + IDLE_TIMEOUT ))
+  while :; do
+    if claims="$(live_claims "$worker")"; then
+      if [ -z "$claims" ]; then
+        log "$worker holds no claim in $QUEUE_DB"
+        return 0
+      fi
+      log "waiting for $worker to finish before restarting $UNIT: $claims"
+    else
+      log "cannot read claims from $QUEUE_DB; treating $worker as busy"
+    fi
+    if [ -n "$deadline" ]; then
+      left=$(( deadline - $(date +%s) ))
+      if [ "$left" -le 0 ]; then
+        log "$worker still holds a claim after ${IDLE_TIMEOUT}s; $UNIT was not restarted"
+        exit 3
+      fi
+      sleep $(( left < IDLE_POLL ? left : IDLE_POLL ))
+    else
+      sleep "$IDLE_POLL"
+    fi
+  done
+}
 
 override_warning() {
   log "WARNING: $1. Running a repair worker at anything other than origin/main HEAD requires explicit"
@@ -109,6 +183,8 @@ if [ -z "${TAUCETI_QUEUE_RELEASE:-}" ]; then
   command -v git >/dev/null || die "git is required"
   command -v uv >/dev/null || die "uv is required (https://docs.astral.sh/uv/)"
   command -v systemctl >/dev/null || die "systemd user services are required"
+  # Wait before choosing the revision, so a long wait installs origin/main as it is when it ends.
+  if [ "$WHEN_IDLE" = 1 ]; then wait_until_idle; fi
   RELEASE_UNIT="$UNIT" release_handoff "$CHECKOUT" "$REVISION" "$RELEASE_ARG" "$0" "${ARGS[@]}"
 fi
 release_enter "$0"
@@ -176,6 +252,9 @@ fragment="$(systemctl --user show -p FragmentPath --value "$UNIT")"
 systemctl --user reenable --quiet "$UNIT"
 
 if [ "$RESTART" = 1 ]; then
+  # The wait above ended before the build and the host checks; check again with nothing left
+  # between the check and the restart. (The worker has no switch to stop claiming meanwhile.)
+  if [ "$WHEN_IDLE" = 1 ]; then wait_until_idle; fi
   log "restarting $UNIT"
   systemctl --user restart "$UNIT"
 else

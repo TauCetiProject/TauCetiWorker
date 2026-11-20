@@ -360,6 +360,59 @@ class Releases(unittest.TestCase):
         self.assertIn("drop-in", log)
         self.assertFalse(self.releases.exists())
 
+    def claims(self, *rows):
+        """The controller's claims table with ROWS of (worker, expires_at, released_at)."""
+        import sqlite3
+
+        path = self.home / "TauCetiQueue-data/queue.sqlite3"
+        path.unlink()
+        with sqlite3.connect(path) as db:
+            db.execute(
+                "CREATE TABLE claims (id INTEGER PRIMARY KEY, operation TEXT, worker TEXT, task_id INTEGER,"
+                " expires_at REAL, released_at REAL)"
+            )
+            for worker, expires_at, released_at in rows:
+                db.execute(
+                    "INSERT INTO claims (operation, worker, task_id, expires_at, released_at) VALUES ('repair', ?, 7, ?, ?)",
+                    (worker, expires_at, released_at),
+                )
+
+    def test_when_idle_waits_while_the_worker_holds_a_claim(self):
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        pid = self.pid("tauceti-queue-repair@2.service")
+        self.commit("second")
+        self.claims(("repair-2@host", time.time() + 900, None))
+        log = self.run_script(
+            "install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "1", "--wait", "10", expect=3
+        )
+        self.assertIn("waiting for repair-2@host to finish", log)
+        self.assertIn("(task 7, repair, expires in", log)
+        self.assertIn("was not restarted", log)
+        self.assertEqual(self.pid("tauceti-queue-repair@2.service"), pid)
+        self.assertEqual(len(self.release_dirs()), 1)
+
+    def test_when_idle_ignores_released_expired_and_other_workers_claims(self):
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        pid = self.pid("tauceti-queue-repair@2.service")
+        second = self.commit("second")
+        now = time.time()
+        self.claims(
+            ("repair-2@host", now + 900, now - 5), ("repair-2@host", now - 5, None), ("repair@host", now + 900, None)
+        )
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--wait", "10")
+        self.assertEqual(log.count("repair-2@host holds no claim"), 2, log)  # before the install, before the restart
+        self.assertNotEqual(self.pid("tauceti-queue-repair@2.service"), pid)
+        [release] = self.release_dirs(second)
+        self.assertEqual(self.cwd("tauceti-queue-repair@2.service"), str(release))
+
+    def test_when_idle_needs_a_restart_and_a_readable_database(self):
+        log = self.run_script("install-repair.sh", "--when-idle", "--no-restart", expect=1)
+        self.assertIn("exclusive", log)
+        (self.home / "TauCetiQueue-data/queue.sqlite3").unlink()
+        log = self.run_script("install-repair.sh", "--when-idle", expect=1)
+        self.assertIn("does not exist", log)
+        self.assertFalse(self.releases.exists())
+
     def test_repair_workers_run_in_the_low_priority_slice(self):
         """Every repair unit the installer writes runs niced, at the lowest best-effort IO priority and in tauceti-repair.slice, below
         the fleet's VMs; the slice is installed as it is, naming no release."""
