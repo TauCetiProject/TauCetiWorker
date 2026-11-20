@@ -1090,7 +1090,8 @@ class RunnerConfig:
     # repair sequential.
     parallel_agents: int = dataclasses.field(default_factory=repair_parallel.parallel_agents_default)
     # Helpers resolving a rebase task's later conflicts on its target meanwhile (``repair_lookahead``,
-    # ``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 8); 0 resolves every conflict in turn.
+    # ``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 16, half for background work); 0 resolves every
+    # conflict in turn.
     lookahead_helpers: int = dataclasses.field(default_factory=repair_lookahead.helpers_default)
     poll_seconds: float = 60.0
     # A positive admin answer is cached on disk (``admin-check.json``) this long; a check that could not

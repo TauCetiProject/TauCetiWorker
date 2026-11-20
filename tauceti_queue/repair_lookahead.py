@@ -7,7 +7,8 @@ conflicts one after another. Most of those conflicts are between one member and 
 not depend on the prefix.
 
 When the replay first conflicts, the worker starts a ``Lookahead``: up to ``lookahead_helpers``
-helpers (``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 8), each resolving a later member's commit on ``onto`` alone, in a worktree of its own and a child
+helpers (``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 16, half that for background work such as an open
+batch's rebase onto ``main``, so the head's task comes first), each resolving a later member's commit on ``onto`` alone, in a worktree of its own and a child
 process (``python -m tauceti_queue.repair_lookahead run <job>``, as ``repair_parallel``'s group agents
 run, since the agent path keeps per-process state). A helper runs ``repair_task.resolve_one``, the
 serial path's own code for one conflict: the numproj pre-pass, then the agent with its attempts and
@@ -55,11 +56,11 @@ from tauceti_queue import repair, repair_audit, repair_parallel, repair_sandbox,
 from tauceti_queue.repair import git
 
 DEPENDENCY_FILES = ("lean-toolchain", "lake-manifest.json")
-DEFAULT_HELPERS = 8
+DEFAULT_HELPERS = 16
 
 
 def helpers_default() -> int:
-    """``TAUCETI_QUEUE_LOOKAHEAD_HELPERS`` (default 8); 0 turns the lookahead off."""
+    """``TAUCETI_QUEUE_LOOKAHEAD_HELPERS`` (default 16); 0 turns the lookahead off."""
     try:
         return max(0, int(os.environ.get("TAUCETI_QUEUE_LOOKAHEAD_HELPERS") or DEFAULT_HELPERS))
     except ValueError:
@@ -77,6 +78,15 @@ def changes_dependencies(clone: Path, task) -> bool:
     helpers share the task's packages, prepared at ``onto``, which the serial path re-fetches at such a
     member; a chain like that is resolved serially only."""
     return bool(git(clone, "log", "--format=%H", f"{task.base}..{task.tip}", "--", *DEPENDENCY_FILES).strip())
+
+
+def helper_count(cfg, task) -> int:
+    """The task's helpers: ``cfg.lookahead_helpers`` for the head's task, half that (at least one) for
+    background work, which leaves the head's task the larger share of agents."""
+    from tauceti_queue import repair_task
+
+    helpers = int(cfg.lookahead_helpers)
+    return max(1, helpers // 2 if repair_task.background_task(task) else helpers)
 
 
 class Lookahead:
@@ -100,7 +110,7 @@ class Lookahead:
 
         self.providers, _skipped = repair_task.select_providers(cfg)
         self.pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, int(cfg.lookahead_helpers)), thread_name_prefix="lookahead"
+            max_workers=helper_count(cfg, task), thread_name_prefix="lookahead"
         )
         if not cfg.seed_packages:
             self._cache_packages()
