@@ -6186,15 +6186,16 @@ class PreRebaseChecks(Fixture):
         notes = json.loads(self.service.results[0]["worker_notes"])
         self.assertEqual(notes["pre_rebase_verification"]["scope"], "full")
 
-    def test_a_resolution_that_fails_verification_is_submitted_without_another_round(self):
-        """The resolved commit's tree is only a prefix of the chain, so a later member may fix what fails
-        there: the worker submits it after one agent turn and the whole chain's CI judges."""
+    def test_a_resolution_that_fails_verification_is_repaired_then_submitted(self):
+        """The rebased chain fails verification: the agent gets a repair round on it, and when that leaves
+        the chain as it was, the chain is submitted and the whole chain's CI judges."""
         self.pre_rebase_task()
         os.environ["STUB_AGENT_MODE"] = "explain-only"
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertEqual(len(self.agent_calls()), 2)
+        self.assertNotIn("## Resolving the commit", self.agent_calls()[1]["prompt"])
         self.assertFalse(outcome["verification"][-1]["ok"])
         pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
         self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Two.lean"))
@@ -7682,6 +7683,43 @@ class NumprojRepairSharedFile(NumprojRepairBase):
             [line for line in patch_of(original[2]).splitlines() if line[:1] in ("+", "-")],
         )
         self.assertEqual(outcome["numproj"][0]["edited"], [original[1].sha])
+
+
+class RebasedChainRepair(Fixture):
+    """Member 3 is broken too, without conflicting: the rebased chain fails the worker's verification,
+    and the task then repairs it on ``onto`` as a repair task would."""
+
+    BROKEN = (2, 3)
+
+    def setUp(self):
+        super().setUp()
+        self.raw = self.content.rebase_task()
+        self.service.tasks = {1: self.raw}
+
+    def test_a_failed_verification_repairs_the_rebased_chain(self):
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("## Resolving the commit", calls[0]["prompt"])
+        self.assertNotIn("## Resolving the commit", calls[1]["prompt"])
+        self.assertIn("unknown identifier BROKEN", calls[1]["prompt"])
+        self.assertEqual([v["ok"] for v in outcome["verification"]], [False, True])
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertNotIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Three.lean"))
+
+    def test_a_chain_the_repair_does_not_change_is_submitted_for_ci(self):
+        """The agent leaves the rebased chain as it is: it is submitted for CI as before, without
+        verifying it again."""
+        os.environ["STUB_AGENT_MODES"] = "repair,noop"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.agent_calls()), 2)
+        self.assertEqual([v["ok"] for v in outcome["verification"]], [False])
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Three.lean"))
 
 
 if __name__ == "__main__":
