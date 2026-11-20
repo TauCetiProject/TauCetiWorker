@@ -57,6 +57,36 @@ class Isolation(unittest.TestCase):
             os.environ[USAGE_VAR] = "usage/login.json"
             self.assertEqual(quota.normalize_claude_usage_credentials(), self.usage)
 
+    def test_agent_directory_normalizes_for_default_workers_only_with_usage_enabled(self):
+        for configured, expected in (("~/agent", self.home / "agent"), ("agent", self.root / "agent")):
+            os.environ["CLAUDE_CONFIG_DIR"] = configured
+            with patch("os.getcwd", return_value=str(self.root)):
+                quota.normalize_claude_usage_credentials()
+            self.assertEqual(os.environ["CLAUDE_CONFIG_DIR"], str(expected))
+        os.environ.pop(USAGE_VAR)
+        os.environ["CLAUDE_CONFIG_DIR"] = "~/unchanged"
+        self.assertIsNone(quota.normalize_claude_usage_credentials())
+        self.assertEqual(os.environ["CLAUDE_CONFIG_DIR"], "~/unchanged")
+
+    def test_identity_is_checked_after_mirroring_an_account_switch(self):
+        original = self.root / "agent-source/.credentials.json"
+        credential(original, "new-agent-token", account="new-account")
+        (self.agent.parent / ".tauceti-creds-source").write_text(str(original.parent))
+        credential(self.agent, "old-agent-token", account="old-account")
+        credential(self.usage, "usage-token", account="old-account")
+        reader = quota.Quota(self.config())
+        with patch.object(reader, "_fetch_usage") as fetch:
+            result = reader.claude()
+        self.assertIn("different accounts", result.error)
+        fetch.assert_not_called()
+        credential(self.agent, "old-agent-token", account="old-account")
+        credential(self.usage, "usage-token", account="new-account")
+        with patch.object(reader, "_claude_creds", return_value=(None, False)) as read:
+            result = reader.claude()
+        read.assert_called_once()  # the stale mirror did not falsely reject the new matching login
+        self.assertNotIn("different accounts", result.error)
+        self.assertEqual(json.loads(self.agent.read_text())["claudeAiOauth"]["accountUuid"], "new-account")
+
     def test_already_isolated_old_loop_normalizes_before_early_return(self):
         isolated = self.root / "isolated"
         os.environ.update(HOME=str(isolated), TAUCETI_DATA_HOME=str(isolated))

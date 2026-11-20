@@ -883,6 +883,19 @@ def normalize_claude_usage_credentials() -> Path | None:
     else:
         anchor = home
     os.environ["TAUCETI_CLAUDE_USAGE_OPERATOR_HOME"] = anchor
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if configured:
+        agent_dir = (
+            Path(anchor) / configured.removeprefix("~").lstrip("/")
+            if configured == "~" or configured.startswith("~/")
+            else Path(configured).expanduser()
+        )
+        agent_dir = Path(os.path.abspath(agent_dir))
+        try:
+            agent_dir = agent_dir.resolve()
+        except (OSError, RuntimeError):
+            pass
+        os.environ["CLAUDE_CONFIG_DIR"] = str(agent_dir)
     if raw == "~" or raw.startswith("~/"):
         path = Path(anchor) / raw.removeprefix("~").lstrip("/")
     else:
@@ -982,7 +995,7 @@ def claude_usage_identity_verified(cfg) -> bool:
     return any(first[kind] & second[kind] for kind in first)
 
 
-def claude_usage_configuration_problem(cfg) -> str | None:
+def claude_usage_configuration_problem(cfg, *, check_identity: bool = True) -> str | None:
     """Reject usage/agent aliases or locally demonstrated account mismatch before reads or rotation."""
     usage = claude_usage_credentials()
     if usage is None:
@@ -1005,8 +1018,8 @@ def claude_usage_configuration_problem(cfg) -> str | None:
     environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if route == "environment" and environment_token and environment_token == measured.get("accessToken"):
         return "Claude usage login must be a separate login from the agents' environment token"
-    if sys.platform == "darwin":
-        return None  # macOS agent Keychain selection is unchanged by this usage-only feature.
+    if not check_identity or sys.platform == "darwin":
+        return None  # Identity follows mirroring; macOS agent selection changes separately.
     agent = _as_dict(_as_dict(_read_json_file(claude_agent_credentials(cfg)[0])).get("claudeAiOauth"))
     if route == "environment" and environment_token and environment_token != agent.get("accessToken"):
         return None  # Opaque setup tokens offer no account field to compare; operator asserts identity.
@@ -2257,13 +2270,19 @@ class Quota:
                                    unreadable quota constraint is not the same as no constraint.
           idle                   → ordinary work may start if the other limits and startup pace allow it.
         """
-        if claude_usage_credentials() is not None and (problem := claude_usage_configuration_problem(self.cfg)):
-            return Provider("claude", False, None, error=problem)
+        usage = claude_usage_credentials()
+        if usage is not None:
+            if problem := claude_usage_configuration_problem(self.cfg, check_identity=False):
+                return Provider("claude", False, None, error=problem)
+            if not getattr(self, "_cache_only", False):
+                mirror_creds(self.cfg)
+            if problem := claude_usage_configuration_problem(self.cfg):
+                return Provider("claude", False, None, error=problem)
         # Renew before reading, then mirror, so a rotation reaches an isolated worker's copy in the same
         # call that performed it.
         if renew and not getattr(self, "_cache_only", False):
             self._refresh_claude_credential()
-        if not getattr(self, "_cache_only", False):
+        if usage is None and not getattr(self, "_cache_only", False):
             mirror_creds(self.cfg)  # re-sync the isolated copy from the operator's fresh file
         oauth, _from_keychain = self._claude_creds()
         self._wait_identities = getattr(self, "_wait_identities", {}) | {"claude": oauth}
