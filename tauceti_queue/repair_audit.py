@@ -2,8 +2,9 @@
 
 Every repair, preparation and rebase verification runs the check set staging runs: the final
 build, then the compiled audit driver (import, duplicates, axioms), the module-system check, the
-full environment lint, the style lint and the dot-notation lint, all at once. Without frozen
-GitHub lint-scope policy, use staging's conservative full-library fallback. Every finding of one
+environment lint, the style lint and the dot-notation lint, all at once. The environment lint covers
+the changed closure since a tree this worker verified when that is sound, else the full library
+(``lint_scope``). Every finding of one
 round returns to the existing repair loop together; staging remains the authoritative landing
 verdict.
 
@@ -16,10 +17,12 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import functools
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -29,7 +32,7 @@ import time
 import tomllib
 from pathlib import Path
 
-from tauceti_queue import diagnostics, repair_sandbox, repair_tools
+from tauceti_queue import diagnostics, lint_scope, repair_sandbox, repair_tools
 
 WORK_DIR = Path(".lake") / "tauceti-repair-audit"
 SETTINGS_FILE = "audit.json"  # in .tauceti-repair: what the agent's build script needs to run the checks
@@ -344,12 +347,17 @@ def check(
     logdir: Path,
     lake: tuple[str, ...] = ("lake",),
     timeout: float | None = None,
+    verified_head: str | None = None,
 ) -> dict:
     """Staging's checks over the environment already built in ``worktree``, all at once; the caller
     holds the build lock. These are the audit driver (import, duplicates, axioms), the module-system
-    check, the full environment lint, the style lint and the dot-notation lint. ``status`` is
+    check, the environment lint, the style lint and the dot-notation lint. ``status`` is
     ``passed``, ``failed`` (``diagnostics`` lists every check's findings in the controller's shape) or
-    ``unavailable`` (``reason``)."""
+    ``unavailable`` (``reason``).
+
+    The environment lint covers ``lint_scope.choose``'s scope. ``verified_head`` is
+    ``lint_scope.snapshot`` taken before the build that produced these outputs: when it is given, still
+    current and the lint passes, the commit is recorded as a reference for later scoped lints."""
     started = time.monotonic()
     record: dict = {"status": "passed", "diagnostics": []}
     work = worktree / WORK_DIR
@@ -388,13 +396,22 @@ def check(
     record["audit_phases_file"] = str(phase_record)
     audit_argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s"]
     project = {"TAUCETI_PROJECT_ROOT": worktree, "TAUCETI_TRUSTED_SCRIPTS": scripts, "LINT_CHANGED_ONLY": "0"}
-    # The task has no frozen GitHub label/branch policy that could justify scoped
-    # lint. Use staging's conservative full-library fallback, including unchanged
-    # declarations affected by new simp lemmas or other global environment changes.
+    passes = tools_root / lint_scope.PASSES_FILE
+    head = lint_scope.snapshot(worktree)
+    try:
+        key = lint_scope.lint_key(_driver_key(worktree, ref), scripts)
+        scope = lint_scope.choose(worktree, head=head, passes=passes, key=key)
+    except Exception as error:  # a scope that cannot be chosen is the full lint, never a failed check
+        key, scope = None, lint_scope.full(f"choosing the scope failed: {error}")
+    only = ""
+    if scope["scope"] == "changed":
+        only = lint_scope.write_modules(work / "lint-modules.txt", scope["modules"])
+    # LINT_CHANGED_ONLY=0 is staging's batch mode: every module is imported, every linter runs on the
+    # listed modules and unusedArguments also on their importers. No list is the full library.
     lint_env = {
         **project,
         "LINT_DRIVER_EXE": drivers / "lint-env-driver",
-        "LINT_ONLY_MODULES": "",
+        "LINT_ONLY_MODULES": only,
         "TAUCETI_LINT_PROFILE": env.get("TAUCETI_LINT_PROFILE", "0"),
     }
     dot_notation = [
@@ -427,10 +444,22 @@ def check(
         ("style_lint", "lint", ["bash", scripts / "lint-style.sh"], project, "lint-style.log", False),
         ("dot_notation", "lint", dot_notation, None, "lint-dot-notation.log", False),
     ]
+    lint_job = functools.partial(
+        _lint, scope=scope, scripts=scripts, driver=drivers / "lint-env-driver", lake=lake, logdir=logdir
+    )
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         futures = [
-            pool.submit(_sandboxed, argv, worktree, env, extra, logdir / log, timeout, read_only_build=read_only)
-            for _, _, argv, extra, log, read_only in jobs
+            pool.submit(
+                lint_job if name == "lint" else _sandboxed,
+                argv,
+                worktree,
+                env,
+                extra,
+                logdir / log,
+                timeout,
+                read_only_build=read_only,
+            )
+            for name, _, argv, extra, log, read_only in jobs
         ]
         runs = {job[0]: future.result() for job, future in zip(jobs, futures, strict=True)}
     record["audit_phases"] = audit_phases(phases_path, runs["audit"])
@@ -443,7 +472,17 @@ def check(
         found = findings_of(kind, log.removesuffix(".log"), runs[name])
         record[name] = {k: v for k, v in runs[name].items() if k != "output"} | {"findings": len(found)}
         record["diagnostics"] += found
-    record["lint"]["scope"] = "full"
+    record["lint"]["scope"] = scope["scope"]
+    record["lint_scope"] = lint_scope.summary(scope)
+    if (
+        verified_head is not None
+        and key is not None
+        and runs["lint"]["rc"] == 0
+        and not record["lint"]["findings"]
+        and head == verified_head
+        and lint_scope.snapshot(worktree) == verified_head
+    ):
+        record["lint_scope"]["recorded"] = lint_scope.record_pass(passes, worktree, verified_head, key, scope["scope"])
     record["status"] = "failed" if record["diagnostics"] else "passed"
     record["seconds"] = round(time.monotonic() - started, 1)
     with contextlib.suppress(OSError):
@@ -451,6 +490,106 @@ def check(
             json.dumps({k: v for k, v in record.items() if k != "diagnostics"}, indent=2) + "\n"
         )
     return record
+
+
+def _lint(
+    argv: list,
+    worktree: Path,
+    env: dict,
+    extra: dict,
+    log: Path,
+    timeout: float | None,
+    *,
+    read_only_build: bool,
+    scope: dict,
+    scripts: Path,
+    driver: Path,
+    lake: tuple[str, ...],
+    logdir: Path,
+) -> dict:
+    """``lint-env.sh`` over ``scope``. A changed scope is followed by the environment-wide linters over the
+    whole library (``global_lint``); if that pass cannot be read, by the full ``lint-env.sh`` instead.
+    The result is one run record whose output carries every finding."""
+    run = _sandboxed(argv, worktree, env, extra, log, timeout, read_only_build=read_only_build)
+    if scope["scope"] != "changed":
+        return run
+    started = time.monotonic()
+    wide = global_lint(worktree, env, scripts=scripts, driver=driver, lake=lake, log=log, timeout=timeout)
+    if wide["status"] == "unavailable":
+        scope.update(scope="full", reason=f"the environment-wide linters' report: {wide['reason']}")
+        full = _sandboxed(
+            argv, worktree, env, extra | {"LINT_ONLY_MODULES": ""}, log, timeout, read_only_build=read_only_build
+        )
+        return full | {"seconds": round(run["seconds"] + full["seconds"] + time.monotonic() - started, 1)}
+    scope["global"] = {k: v for k, v in wide.items() if k != "output"}
+    return run | {
+        "rc": run["rc"] or (1 if wide["status"] == "failed" else 0),
+        "output": run["output"] + wide["output"],
+        "seconds": round(run["seconds"] + wide["seconds"], 1),
+        "finished_at": time.time(),
+        "sampled_peak_rss_bytes": max(run.get("sampled_peak_rss_bytes", 0), wide.get("sampled_peak_rss_bytes", 0)),
+    }
+
+
+def global_lint(
+    worktree: Path,
+    env: dict,
+    *,
+    scripts: Path,
+    driver: Path,
+    lake: tuple[str, ...],
+    log: Path,
+    timeout: float | None,
+) -> dict:
+    """The pinned driver's environment-wide linters (``lint_scope.GLOBAL_LINTERS``) over every library
+    module, judged against the grandfathered baseline. ``status`` is ``passed``, ``failed`` (``output``
+    then carries ``LINT-ENV-LOCATIONS`` and ``LINT-ENV: FAIL`` lines for ``diagnostics.parse_log``),
+    or ``unavailable`` (``reason``)."""
+    graph, why = lint_scope.import_graph(worktree)
+    if graph is None:
+        return {"status": "unavailable", "reason": why}
+    work = worktree / WORK_DIR / "global-lint"
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True)
+    nonce = secrets.token_hex(16)
+    marker = f"LINTENV-GLOBAL-COMPLETE-{nonce}"
+    (work / "marker.txt").write_text(marker + "\n")
+    lint_scope.write_modules(work / "modules.txt", sorted(graph))
+    tag = str(work / f"GlobalLint-{nonce}.lean")
+    threads = str(min(os.cpu_count() or 16, 16))
+    linters = list(lint_scope.GLOBAL_LINTERS)
+    # A pin whose Batteries lacks tacticAlt rejects it: that report does not parse, so the full lint runs.
+    argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s", driver]
+    argv += [tag, work / "marker.txt", work / "modules.txt", *linters]
+    run = _sandboxed(argv, worktree, env, {"LEAN_NUM_THREADS": threads}, log, timeout, read_only_build=True)
+    summary = {k: v for k, v in run.items() if k != "output"} | {"linters": linters}
+    try:
+        violations = lint_scope.parse_report(run["output"], tag=tag, marker=marker, linters=linters, rc=run["rc"])
+        baseline = set()
+        # Lines as comm(1) compares them in lint-env.sh: "\n"-separated, nothing stripped.
+        for line in (scripts / "lint-baseline.txt").read_bytes().decode("utf-8", "surrogateescape").split("\n"):
+            if line:
+                name, _, declaration = line.partition(" ")
+                baseline.add((name, declaration))
+    except (lint_scope.ReportError, OSError) as error:
+        return summary | {"status": "unavailable", "reason": str(error)}
+    new = violations - baseline
+    if not new:
+        return summary | {"status": "passed", "violations": len(violations), "output": ""}
+    lines = [
+        "LINT-ENV-LOCATIONS " + json.dumps(lint_scope.locations(run["output"], new)),
+        "lint-env: NEW violation(s) of the environment-wide linters over the whole library:",
+        *(f"  {linter} {declaration}" for linter, declaration in sorted(new)),
+        f"LINT-ENV: FAIL {len(new)} new environment-wide violation(s)",
+    ]
+    with contextlib.suppress(OSError), log.open("a") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return summary | {
+        "status": "failed",
+        "violations": len(violations),
+        "new": len(new),
+        "output": "\n".join(lines) + "\n",
+    }
 
 
 def audit_phases(path: Path, run: dict) -> list[dict]:
@@ -530,6 +669,8 @@ def verify(
     try:
         from tauceti_queue.repair_publish import build_flags
 
+        built_head = lint_scope.snapshot(worktree)
+
         build = _sandboxed(
             [*lake, "build", *build_flags(worktree)], worktree, env, None, logdir / "verify-build.log", timeout
         )
@@ -553,6 +694,7 @@ def verify(
                 logdir=logdir,
                 lake=lake,
                 timeout=timeout,
+                verified_head=built_head,
             )
             record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
             record["diagnostics"] = checks["diagnostics"]
