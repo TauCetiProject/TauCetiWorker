@@ -1108,7 +1108,16 @@ class Canonical(unittest.TestCase):
         totals = cache_storage.inventory([self.pool, checkout / ".lake"], details=details)
         row = details[(legacy.stat().st_dev, legacy.stat().st_ino)]
         self.assertEqual(row[1], 3)  # objects/, artifacts/ and the checkout: counted once.
-        self.assertEqual(sum(r["managed_bytes"] for r in totals.values()), sum(r[0] for r in details.values()))
+        # details keeps only hard-linked inodes; single-link files are totalled without being kept.
+        singles = sum(
+            info.st_blocks * 512
+            for root in (self.pool, checkout / ".lake")
+            for path in root.rglob("*")
+            if not path.is_symlink() and path.is_file() and (info := path.stat()).st_nlink == 1
+        )
+        self.assertEqual(
+            sum(r["managed_bytes"] for r in totals.values()), sum(r[0] for r in details.values()) + singles
+        )
         shutil.rmtree(checkout)
         for lease in (canonical.store(self.pool) / "uses").glob("*"):
             lease.unlink()

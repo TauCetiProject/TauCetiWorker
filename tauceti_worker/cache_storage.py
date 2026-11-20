@@ -5,8 +5,8 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import stat
 import time
-from pathlib import Path
 
 from . import expanded_cache
 from .runtime_status import atomic_json, read_json
@@ -64,51 +64,98 @@ def roots(configs, pool):
         yield cfg.checkout.with_name(cfg.checkout.name + ".lake-between-rounds")
 
 
-def inventory(paths, *, protected=(), owners=None, details=None):
+class InventoryDeferred(Exception):
+    """The run's deadline passed during the walk; nothing was decided from a partial inventory."""
+
+
+INVENTORY_CHECK_EVERY = 4096  # entries between deadline checks: cheap, yet well under a second
+
+
+def _scan(root, deadline):
+    """Every non-directory, non-symlink entry under ``root`` with its lstat, never following links.
+
+    One lstat per entry (scandir caches it). Unreadable or vanished directories are skipped, as
+    os.walk did. Raises InventoryDeferred once ``deadline`` (time.monotonic) has passed."""
+    pending, visited = [root], 0
+    while pending:
+        try:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    visited += 1
+                    if visited % INVENTORY_CHECK_EVERY == 0 and deadline is not None and time.monotonic() >= deadline:
+                        raise InventoryDeferred(str(root))
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(info.st_mode):
+                        continue
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(entry.path)
+                    else:
+                        yield info
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            continue
+
+
+def inventory(paths, *, protected=(), owners=None, details=None, private=None, deadline=None):
     """Allocated bytes, deduplicated by inode across both pool and private hard links.
 
     `named_bytes` counts every name, as `du --count-links` would: hard-linked files count once per
     link there, so it overstates what the disk holds. `managed_bytes` counts each inode once, and
-    `unique_inodes` is how many inodes that is."""
-    seen = {}
+    `unique_inodes` is how many inodes that is.
+
+    Memory stays bounded by the hard-linked inodes: a file with one link has one name, so it is
+    totalled at once and never remembered. ``details`` receives only inodes with several links,
+    as [bytes, names seen, links, protected, {owner: names}]. ``private`` receives, per
+    (device, owner), the bytes of that owner's unprotected single-link files. Raises
+    InventoryDeferred once ``deadline`` (time.monotonic) has passed."""
+    seen, result = {}, {}
     owners = owners or {}
-    for root in paths:
-        if not root.is_dir() or root.is_symlink():
-            continue
-        for base, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = [name for name in dirs if not (Path(base) / name).is_symlink()]
-            for name in files:
-                path = Path(base) / name
-                try:
-                    if path.is_symlink():
-                        continue
-                    info = path.stat()
-                    key = info.st_dev, info.st_ino
-                    if key in seen:
-                        seen[key][1] += 1
-                        seen[key][3] = seen[key][3] or root in protected
-                    else:
-                        seen[key] = [info.st_blocks * 512, 1, info.st_nlink, root in protected, {}]
-                    if root in owners:
-                        labels = seen[key][4]
-                        labels[owners[root]] = labels.get(owners[root], 0) + 1
-                except FileNotFoundError:
-                    continue
-    if details is not None:
-        details.update(seen)
-    result = {}
-    for (device, _), (size, count, links, busy, _) in seen.items():
-        row = result.setdefault(
+
+    def row(device):
+        return result.setdefault(
             device,
             dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0, named_bytes=0, unique_inodes=0),
         )
-        row["managed_bytes"] += size
-        row["named_bytes"] += size * count
-        row["unique_inodes"] += 1
+
+    for root in paths:
+        if not root.is_dir() or root.is_symlink():
+            continue
+        busy, owner = root in protected, owners.get(root)
+        for info in _scan(root, deadline):
+            size = info.st_blocks * 512
+            if info.st_nlink <= 1:
+                totals = row(info.st_dev)
+                totals["managed_bytes"] += size
+                totals["named_bytes"] += size
+                totals["unique_inodes"] += 1
+                if busy:
+                    totals["protected_bytes"] += size
+                elif owner is not None and private is not None:
+                    key = info.st_dev, owner
+                    private[key] = private.get(key, 0) + size
+                continue
+            key = info.st_dev, info.st_ino
+            if key in seen:
+                seen[key][1] += 1
+                seen[key][3] = seen[key][3] or busy
+            else:
+                seen[key] = [size, 1, info.st_nlink, busy, {}]
+            if owner is not None:
+                labels = seen[key][4]
+                labels[owner] = labels.get(owner, 0) + 1
+    if details is not None:
+        details.update(seen)
+    for (device, _), (size, count, links, busy, _) in seen.items():
+        totals = row(device)
+        totals["managed_bytes"] += size
+        totals["named_bytes"] += size * count
+        totals["unique_inodes"] += 1
         if busy:
-            row["protected_bytes"] += size
+            totals["protected_bytes"] += size
         if links > count:
-            row["externally_linked_bytes"] += size
+            totals["externally_linked_bytes"] += size
     return result
 
 
@@ -157,7 +204,7 @@ def admit(cfg):
                 marker.unlink(missing_ok=True)
 
 
-def collect(configs, *, dry=False, now=None, opened=...):
+def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
     from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, remove, workspace_idle
 
     now = time.time() if now is None else now
@@ -188,9 +235,15 @@ def collect(configs, *, dry=False, now=None, opened=...):
 
     # Pool copies are deleted only while no process holds them open (open fds add no link).
     guard = Guard(opened=opened or ())
-    details = {}
-    before = inventory(paths, protected=protected, owners=owners, details=details)
-    private_candidates = {}
+    details, private_candidates = {}, {}
+    try:
+        before = inventory(
+            paths, protected=protected, owners=owners, details=details, private=private_candidates, deadline=deadline
+        )
+    except InventoryDeferred:
+        # Nothing is deleted on a partial picture; the next run walks again from the start.
+        report.setdefault("deferred", []).append("shared-caches")
+        return report
     for (device, _), (size, _, _, busy, labels) in details.items():
         if not busy and labels:
             for worker in labels:

@@ -78,6 +78,49 @@ class Storage(unittest.TestCase):
         self.assertEqual(row["managed_bytes"], source.stat().st_blocks * 512)
         self.assertEqual(row["externally_linked_bytes"], 0)
 
+    def test_inventory_remembers_only_hard_linked_inodes(self):
+        mine, theirs, busy = (self.root / name for name in ("mine", "theirs", "busy"))
+        for directory in (mine, theirs, busy):
+            (directory / "deep" / "er").mkdir(parents=True)
+        single = mine / "deep" / "er" / "single"
+        single.write_bytes(b"s" * 12288)
+        shared = mine / "shared"
+        shared.write_bytes(b"h" * 8192)
+        os.link(shared, theirs / "deep" / "shared")
+        (busy / "deep" / "held").write_bytes(b"b" * 4096)
+        (mine / "deep" / "link").symlink_to(single)
+        (mine / "dirlink").symlink_to(busy)
+        details, private = {}, {}
+        totals = storage.inventory(
+            [mine, theirs, busy],
+            protected={busy},
+            owners={mine: "w1", theirs: "w2"},
+            details=details,
+            private=private,
+        )
+        device = single.stat().st_dev
+        size = lambda path: path.stat().st_blocks * 512  # noqa: E731
+        row = totals[device]
+        self.assertEqual(row["managed_bytes"], size(single) + size(shared) + size(busy / "deep" / "held"))
+        self.assertEqual(row["named_bytes"], size(single) + 2 * size(shared) + size(busy / "deep" / "held"))
+        self.assertEqual(row["unique_inodes"], 3)
+        self.assertEqual(row["protected_bytes"], size(busy / "deep" / "held"))
+        self.assertEqual(list(details), [(device, shared.stat().st_ino)])  # single links are not kept
+        self.assertEqual(details[(device, shared.stat().st_ino)][4], {"w1": 1, "w2": 1})
+        self.assertEqual(private, {(device, "w1"): size(single)})
+
+    def test_a_walk_past_the_deadline_defers_and_deletes_nothing(self):
+        old = self.entry(age=4 * 86400)
+        with patch.object(storage, "INVENTORY_CHECK_EVERY", 1):
+            with self.assertRaises(storage.InventoryDeferred):
+                storage.inventory([self.pool], deadline=time.monotonic() - 1)
+            result = storage.collect([], deadline=time.monotonic() - 1)
+        self.assertEqual(result["deferred"], ["shared-caches"])
+        self.assertEqual(result["removed"], [])
+        self.assertTrue(old.exists())
+        self.assertFalse(storage.collect([], deadline=time.monotonic() + 600).get("deferred"))
+        self.assertFalse(old.exists())
+
     def test_age_cleanup_keeps_recent_and_busy_entries(self):
         recent = self.entry()
         old = self.entry("b" * 16, age=4 * 86400)
