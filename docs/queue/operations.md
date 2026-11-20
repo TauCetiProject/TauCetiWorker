@@ -508,13 +508,18 @@ the agent's included, runs at niceness 19 (`repair_sandbox.prioritized`). Giving
 weight would make each unit a separate CPU group and end this ordering.
 Disk traffic is ordered only where the block layer honours cgroup weights or IO priorities (BFQ,
 mq-deadline, or io.cost configured for the device); tauchonki2's devices use `none`, so there
-nothing orders it. The slice's `MemoryHigh=48G` (with no `MemoryMax`) is a reclaim threshold that
-reduces how hard the repairs' memory, mostly file cache, presses on a staging build: above it the
-kernel reclaims from the slice and slows its allocations; crossing it does not itself invoke the OOM
-killer, though host-wide pressure still can. The compiler wrapper ignores `memory.high`, so a repair
-working set above it (compilers plus the `.olean` files they map) thrashes rather than waiting. If
-repairs slow down, read the slice's `memory.pressure`, `memory.events` (`high`) and swap activity,
-and raise the value or reduce repair concurrency. A `renice` by hand affects only the thread it names, not the other threads of a
+nothing orders it. Memory goes to the staging VM first (decision 111). TauCetiFleet puts one hard ceiling on
+`tauceti.slice`, over its VMs and the repair slice together, and sets the repair slice's `memory.high`
+live to repair's use plus the free memory under that ceiling, minus about 20 GiB; the slice unit sets
+no memory limit of its own. As the staging VM grows, the kernel reclaims, swaps and slows repairs
+(VM memory cannot be swapped), and the repair builds' compiler wrapper, which measures the same
+ceiling, stops starting compilers. The repair units run at `OOMScoreAdjust=1000` (the background
+publisher too), so an OOM kill takes a repair process rather than a VM, and the worker restarts. The
+kernel adds adjustment/1000 of the OOM domain's RAM and swap to each process's memory, so this holds
+while no VM (at 200) holds over 80% of that; on tauchonki2, with 62 GiB of swap, no VM under the
+112 GiB ceiling can. If repairs
+slow down, read the slice's `memory.pressure`, `memory.events` (`high`) and swap activity: that is the
+intended priority while a staging build needs the memory. A `renice` by hand affects only the thread it names, not the other threads of a
 multithreaded process such as `lake` or the worker, nor their later children.
 
 Queue repair sessions using Claude (subscription or API) give Bash EOF on its default stdin.

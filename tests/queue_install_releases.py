@@ -448,14 +448,14 @@ class Releases(unittest.TestCase):
             self.assertEqual(self.setting(unit, "Nice"), "10", unit)
             self.assertEqual(self.setting(unit, "IOSchedulingClass"), "best-effort", unit)
             self.assertEqual(self.setting(unit, "IOSchedulingPriority"), "7", unit)
+            self.assertEqual(self.setting(unit, "OOMScoreAdjust"), "1000", unit)
         slice_unit = (self.units / "tauceti-repair.slice").read_text()
         self.assertEqual(slice_unit, (REPO / "services/queue/tauceti-repair.slice").read_text())
         self.assertNotIn("TauCetiQueue-releases", slice_unit, "the slice must not keep a release alive")
         self.assertEqual(re.findall(r"^CPUWeight=(\d+)$", slice_unit, re.M), ["10"])
         self.assertEqual(re.findall(r"^IOWeight=(\d+)$", slice_unit, re.M), ["10"])
-        # A soft cap that throttles, never a hard one that kills.
-        self.assertEqual(re.findall(r"^MemoryHigh=(\S+)$", slice_unit, re.M), ["48G"])
-        self.assertNotRegex(slice_unit, r"(?m)^MemoryMax=")
+        # TauCetiFleet sets memory.high live under its shared ceiling; a unit value would fight it.
+        self.assertNotRegex(slice_unit, r"(?m)^Memory(High|Max)=")
 
     def test_repair_install_fails_when_the_worker_is_not_in_its_slice(self):
         self.env["FAKE_SYSTEMD_IGNORES_SLICE"] = "1"

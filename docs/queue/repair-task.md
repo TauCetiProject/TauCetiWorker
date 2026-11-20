@@ -864,7 +864,7 @@ one conflicting commit and perform focused checks; the worker owns the whole-lib
 run at the same time, the compiled ones over read-only build outputs, and all are joined before task
 cleanup with every failure collected. The audit and the environment lint each sampled 21 to 27 GB of
 RSS in 2026-11 (mostly the same mapped `.olean` files, counted in both), so together they take
-roughly the time of the environment lint alone; the repair slice's `MemoryHigh` bounds their memory. The pinned lint driver records import, docscan,
+roughly the time of the environment lint alone; the repair slice's live `memory.high` bounds their memory. The pinned lint driver records import, docscan,
 linters and report times; `TAUCETI_LINT_PROFILE=1` additionally profiles each linter separately.
 These timing observations never authorize a pass.
 
