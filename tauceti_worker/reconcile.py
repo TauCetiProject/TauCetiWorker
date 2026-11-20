@@ -91,7 +91,7 @@ _DECLARATION = (
     r"([^[:space:]]+\.)?(NAME)([^A-Za-z0-9_'.]|$)"
 )
 _FILE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*\.lean")
-_NAME = re.compile(r"[^\W\d][\w.']*")
+_NAME = re.compile(r"[^\W\d][\w']*(?:\.[^\W\d][\w']*)*")
 _COVERAGE_RE = re.compile(r"<!--\s*tauceti-coverage:v1\s*(\{.*?\})\s*-->", re.S)
 _STATUS_RE = re.compile(r"<!--\s*tauceti-status:v1\s*(\{.*?\})\s*-->", re.S)
 _LAYER_STATES = ("done", "partial", "untouched", "unassessed")
@@ -471,7 +471,7 @@ def _fingerprint(checkout: Path, item: TargetItem, hits: dict[str, list[str]], a
 
 _LEAN_DECLARATION = re.compile(
     r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:protected|private|noncomputable|scoped|unsafe|partial|nonrec)\s+)*"
-    r"(?:theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)\s+([^\s:({\[]+)"
+    r"(?:theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)\s+((?:[^\s:({\[.]|\.(?!\{))+)"
 )
 
 

@@ -85,6 +85,7 @@ class Tmp(unittest.TestCase):
             "noncomputable def TailSigma.measure := 0\n\n"
             "theorem strong_law_ae : True := trivial\n"
             "/-- theorem commented_out : True -/\n"
+            "def identityWithUniverse.{u} {α : Sort u} (x : α) : α := x\n"
         )
         git(self.tmp, "init", "-q", "-b", "main", str(checkout))
         git(checkout, "add", ".")
@@ -163,6 +164,8 @@ class Confirmed(Tmp):
         good = {"landed": True, "evidence": [one, two], "why": "(ignore this; needs: none)"}
         found = frozenset({f"{TAIL}#kolmogorov_zero_one", f"{TAIL}#measure"})
         self.assertEqual(reconcile.confirmed(checkout, good), found)
+        universe = {"landed": True, "evidence": [{"file": TAIL, "declaration": "Probability.identityWithUniverse"}]}
+        self.assertEqual(reconcile.confirmed(checkout, universe), frozenset({f"{TAIL}#identityWithUniverse"}))
         for bad in (
             {**good, "landed": "true"},
             {**good, "landed": False},
@@ -171,6 +174,7 @@ class Confirmed(Tmp):
             {**good, "evidence": [one, {**two, "declaration": "TailSigma.absent"}]},
             {**good, "evidence": [{**one, "declaration": "zero_one"}]},
             {**good, "evidence": [{**one, "declaration": "commented_out"}]},
+            {**good, "evidence": [{**one, "declaration": "CompletelyInvented."}]},
             {**good, "evidence": [{**one, "declaration": "x); needs: none (y"}]},
             {**good, "evidence": [{**one, "file": "TauCeti/Probability/Absent.lean"}]},
             {**good, "evidence": [{**one, "file": "../base/" + TAIL}]},
@@ -207,7 +211,10 @@ class Confirmed(Tmp):
             '-- theorem line_hidden : True\ndef s := "\ntheorem quoted : True" \n'
         )
         self.assertEqual(reconcile.names(text), {"x", "after", "y", "z", "s"})
+        self.assertEqual(reconcile.names("theorem Ns.rank_biproduct.{w} : True := trivial\n"), {"rank_biproduct"})
         self.assertEqual(reconcile.identity("./A//B.lean", "Ns.Deep.name"), "A/B.lean#name")
+        for bad in ("Invented.", "Ns..name", ".name"):
+            self.assertIsNone(reconcile.identity("A/B.lean", bad), bad)
         self.assertIsNone(reconcile.identity("../B.lean", "name"))
 
 
