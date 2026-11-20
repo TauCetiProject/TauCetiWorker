@@ -2565,6 +2565,30 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
     return seed_dir
 
 
+def resolved_mount(spec: str) -> str:
+    """Resolve Linux host sources in Bubble's `--mount SRC:DST[:MODE]` syntax.
+
+    A restricted Incus project opens a disk source beneath its allowed path and refuses one that
+    crosses an absolute symlink, wherever the link points. `shared_repositories.attach` publishes
+    the roadmap and review-engine checkouts as such links. Darwin spellings are
+    preserved because the VM may share /tmp without sharing /private/tmp."""
+    if not sys.platform.startswith("linux"):
+        return spec
+    parts = spec.split(":")
+    if (
+        len(parts) not in (2, 3)
+        or not parts[0].startswith("/")
+        or not parts[1].startswith("/")
+        or (len(parts) == 3 and parts[2] not in ("ro", "rw"))
+    ):
+        return spec
+    try:
+        source = str(Path(parts[0]).resolve())
+    except (OSError, RuntimeError) as error:
+        raise Die(f"cannot resolve Bubble mount source {parts[0]}: {error}") from None
+    return ":".join([source, *parts[1:]])
+
+
 def run_in_bubble(
     w: Worker,
     target: str,
@@ -2821,6 +2845,8 @@ def run_in_bubble(
         else []
     )
 
+    # All optional mounts, including resource-waits, have now been appended.
+    mount_flags = [arg if arg == "--mount" else resolved_mount(arg) for arg in mount_flags]
     argv = [
         *bubble_cmd(),
         "open",

@@ -23,11 +23,10 @@ EVENTS = ("schedule", "workflow_dispatch", "push", "repository_dispatch")
 
 @dataclass(frozen=True)
 class Workflow:
-    """Maintenance workflow filename, minimum attempt interval in seconds, and alert opt-in."""
+    """Maintenance workflow filename and minimum attempt interval in seconds."""
 
     name: str
     interval: int
-    alerts: bool = False
 
 
 WORKFLOWS = (
@@ -35,7 +34,6 @@ WORKFLOWS = (
     Workflow("merge-conflicts.yml", 900),
     Workflow("api-docs.yml", 3600),
     Workflow("pages.yml", 10800),
-    Workflow("stuck-alerts.yml", 3600, alerts=True),
 )
 
 
@@ -57,15 +55,20 @@ APP_PERMISSIONS = {"actions": "write", "metadata": "read"}
 def app_tokens(directory: Path, repository_id: int | None):
     """Installation tokens from App credentials in ``directory``, restricted to the backstop's needs.
 
-    The directory holds ``github-app.json`` and ``github-private-key.pem``. A pinned repository ID
+    The directory holds ``github-app.json`` and ``github-private-key.pem``. It is either a private
+    directory whose ancestors are owned by this user or root, or ``$CREDENTIALS_DIRECTORY`` (``%d``
+    in a unit), where systemd's ``LoadCredential=`` places them for a sandboxed service. A pinned repository ID
     narrows each token to that repository; before the first execution pins it, the token is limited
     only by APP_PERMISSIONS and the installation's repository selection.
     """
     from tauceti_queue import github_app
     from tauceti_queue.github_adapter import UrllibTransport
 
+    # systemd creates $CREDENTIALS_DIRECTORY for LoadCredential=; its ancestors are trusted.
+    loaded = os.environ.get("CREDENTIALS_DIRECTORY")
+    systemd = bool(loaded) and Path(loaded) == Path(directory)
     try:
-        credentials = github_app.load_execution_credentials(directory)
+        credentials = github_app.load_execution_credentials(directory, systemd_credentials=systemd)
         return github_app.InstallationTokenSource(
             credentials, UrllibTransport(timeout=45), repository_id=repository_id, permissions=APP_PERMISSIONS
         )
@@ -223,7 +226,6 @@ def reconcile(
     state: dict,
     *,
     execute: bool = False,
-    include_alerts: bool = False,
     clock=time.time,
     persist=lambda _state: None,
 ) -> list[dict]:
@@ -236,8 +238,7 @@ def reconcile(
     Unix seconds for policy intervals and cooldowns. Preview never mutates state.
 
     Recent attempts, uncertain cooldowns and any nonterminal run suppress dispatch.
-    Observation failures defer that workflow; unrelated workflows can continue. Alert
-    reconciliation requires include_alerts because it sends external messages.
+    Observation failures defer that workflow; unrelated workflows can continue.
     """
     repo = api.repository()
     repo_id, branch = repo.get("id"), repo.get("default_branch")
@@ -253,8 +254,6 @@ def reconcile(
 
     results = []
     for policy in WORKFLOWS:
-        if policy.alerts and not include_alerts:
-            continue
         result = {"workflow": policy.name, "branch": branch}
         try:
             workflow = api.workflow(policy.name)
@@ -333,7 +332,6 @@ def main(argv=None) -> int:
     parser.add_argument("--repo", required=True)
     parser.add_argument("--state", required=True, type=Path)
     parser.add_argument("--execute", action="store_true", help="dispatch overdue workflows; default is a preview")
-    parser.add_argument("--include-alerts", action="store_true", help="also permit the existing Zulip alert reconciler")
     parser.add_argument(
         "--github-app-dir",
         type=Path,
@@ -359,7 +357,6 @@ def main(argv=None) -> int:
                 GitHub(args.repo, tokens, state["repo_id"]),
                 state,
                 execute=args.execute,
-                include_alerts=args.include_alerts,
                 persist=lambda value: atomic(args.state, value),
             )
             print(json.dumps(rows, sort_keys=True))

@@ -71,6 +71,30 @@ def _snapshot(info):
     )
 
 
+def _read(parent: int, name: str, uid: int) -> bytes:
+    """Read one checked private file relative to an already checked parent descriptor."""
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent)
+    payload = stream = None
+    try:
+        before = os.fstat(descriptor)
+        _file(before, uid=uid)
+        # Check type before fdopen (FileIO can reject a directory
+        # without taking ownership). Always close the raw descriptor.
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            payload = stream.read(MAX_POLICY_BYTES + 1)
+        after = os.fstat(descriptor)
+        _file(after, uid=uid)
+        if _snapshot(before) != _snapshot(after) or len(payload) != before.st_size:
+            raise ControlPolicyError("queue control policy changed while it was read")
+        return payload
+    except BaseException:
+        # A traceback must not retain private bytes in this frame's locals.
+        payload = stream = None
+        raise
+    finally:
+        os.close(descriptor)
+
+
 def read_control_policy(path: Path) -> bytes:
     """Take one immutable startup snapshot, never reopen or cache by path.
 
@@ -85,25 +109,39 @@ def read_control_policy(path: Path) -> bytes:
     try:
         uid = os.geteuid()
         with _parent(Path(path), uid) as (parent, name):
-            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=parent)
-            try:
-                before = os.fstat(descriptor)
-                _file(before, uid=uid)
-                # Check type before fdopen (FileIO can reject a directory
-                # without taking ownership). Always close the raw descriptor.
-                with os.fdopen(descriptor, "rb", closefd=False) as stream:
-                    payload = stream.read(MAX_POLICY_BYTES + 1)
-                stream = None
-                after = os.fstat(descriptor)
-                _file(after, uid=uid)
-                if _snapshot(before) != _snapshot(after) or len(payload) != before.st_size:
-                    raise ControlPolicyError("queue control policy changed while it was read")
-            finally:
-                os.close(descriptor)
-        return payload
+            return _read(parent, name, uid)
     except ControlPolicyError:
-        payload = None
         raise
     except (OSError, TypeError, ValueError):
-        payload = None
         raise ControlPolicyError("private queue control policy could not be read safely") from None
+
+
+def read_systemd_credential(name: str) -> bytes:
+    """Read one credential that systemd's ``LoadCredential=`` placed in ``$CREDENTIALS_DIRECTORY``.
+
+    systemd creates that directory for this unit, so its ancestors are trusted without the
+    ownership walk; inside a sandboxed user unit they appear owned by the overflow UID. The
+    directory itself must still be private to this user, and the file must pass the same
+    checks as read_control_policy. This trusts the process environment: whoever sets both
+    ``CREDENTIALS_DIRECTORY`` and the matching caller path skips only the ancestor walk, which
+    in a unit is systemd itself.
+    """
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        raise ControlPolicyError("native control policy loading requires POSIX descriptor checks")
+    root = os.environ.get("CREDENTIALS_DIRECTORY", "")
+    if not os.path.isabs(root) or ".." in Path(root).parts:
+        raise ControlPolicyError("systemd credentials directory is unavailable")
+    if not name or name in (".", "..") or "/" in name:
+        raise ControlPolicyError("systemd credential name must be a plain file name")
+    try:
+        uid = os.geteuid()
+        directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            _directory(os.fstat(directory), uid=uid, private=True)
+            return _read(directory, name, uid)
+        finally:
+            os.close(directory)
+    except ControlPolicyError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise ControlPolicyError("systemd credential could not be read safely") from None

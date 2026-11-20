@@ -297,18 +297,31 @@ Use a bot credential and the recipient's numeric Zulip user ID. The credential
 and its configuration path are excluded from the isolated reviewer's environment.
 Alerts include the commit range, recorded findings and local evidence paths.
 Source findings and explained code-safety uncertainty send an immediate DM marked
-**Human review required**. Routine unfinished turns and provider errors stay in the
-logs while automatic recovery handles them. An operational pause sends a DM only
-when the same cursor has remained held for at least one hour after the first
-observed pause. Its separate **Operational stall** label explains that no source
-finding is recorded and eligible automatic recovery continues. This durable timer
-survives retries and Worker restarts; advancement starts a fresh delay. The timer
-changes notifications only, preserving all blocks, evidence and recovery checks.
+**Human review required**. Operational pauses (unfinished turns, provider errors,
+held operational blocks) send nothing themselves; the cursor watchdog below reports any
+cursor held for an hour, whatever the cause, so one pause never produces two DMs.
 Alerts are sent only as direct messages; no GitHub issue is created. A durable local
 receipt suppresses repeated alerts for the same blocked range and kind. Failed
-delivery is retried on a subsequent audit round after at least 15 minutes, checking
-the latest 100 messages in that private conversation for an earlier ambiguous delivery.
+delivery is retried on a subsequent audit round or pool pass after at least 15 minutes,
+checking the latest 100 messages in that private conversation for an earlier ambiguous delivery.
 Notification failure preserves the audit block and allows bump/progress work to continue.
+
+With alerts configured, one cursor watchdog guarantees that the cursor is advancing or the
+operator has a DM. Every audit round (including maintenance turns and failed audits), every
+pool pass and the standalone command below record the cursor in `security-audit/stall.json`.
+Once audit work is due at one cursor (at least the configured threshold pending, or work
+already started there: a held block or a pool range starting there) and that cursor has
+not moved for an hour, an **Operational stall** DM is sent, then again daily while it stays held. An unobservable cursor (GitHub or
+git failures) counts as held, and the DM names the error. While a pool holds the state, it
+alone runs the watchdog. Checks and deliveries are serialized by local locks, so concurrent
+callers never send the same DM twice. Run the command from a timer to cover a Worker or pool
+that is dead or busy for longer than an hour; it uses the admission threshold its owner last
+recorded:
+
+```bash
+python3 -m tauceti_worker.security_audit watchdog --state /path/to/worker/state/security-audit
+```
+
 Without this setting, reporting remains local to the worker's evidence and logs.
 
 Codex Luna has the native persistent goal tools enabled, with a goal to inspect

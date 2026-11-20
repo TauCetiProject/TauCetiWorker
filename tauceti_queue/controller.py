@@ -31,6 +31,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
+from datetime import datetime
 from typing import Any
 
 from . import admission_planning, attribution, chain, declaration_names, escalation, stuck_heads
@@ -64,8 +65,10 @@ BUILD_CONTEXT = "build"
 VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
 LOG_GRACE_SECONDS = 600  # publication grace for a completed run's bound verdicts and failed-build log
 # A source-candidate run's GitHub job and step phases are read at most this often while it runs, and
-# once more when it completes; observation itself stays on `polling_interval_seconds`.
-SOURCE_PHASES_INTERVAL_SECONDS = 300
+# once more when it completes; observation itself stays on `polling_interval_seconds`. Only the head's
+# run is observed, and one read is a single jobs listing (one REST call with the GitHub App's
+# installation token), so this costs at most one call a minute.
+SOURCE_PHASES_INTERVAL_SECONDS = 60
 DISPATCH_EVENT = "tauceti-bors-staging"
 # How many of a batch's previous tips a CI dispatch names in `repair_outputs_revs`.
 REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
@@ -376,6 +379,28 @@ def revision_map_published(url: str, *, timeout: float = 30.0) -> bool:
     return True
 
 
+LIVE_PROGRESS_SECONDS = 60
+LIVE_PROGRESS_SETTING = "live-progress"
+# A reporter clock further ahead than this is not believed at all.
+LIVE_PROGRESS_SKEW_SECONDS = 300
+
+
+def live_progress_at(report: dict[str, Any] | None, now: float) -> tuple[str | None, float | None]:
+    """A live build report's raw counter-change time and when it counts as progress: never after
+    the report itself or `now`. Counters come from candidate output: the stall report only."""
+    if not report or report.get("completed_tasks") is None:
+        return None, None
+    try:
+        raw = str(report["last_progress_at"])
+        observed = datetime.fromisoformat(str(report["observed_at"]).replace("Z", "+00:00")).timestamp()
+        advanced = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    if max(advanced, observed) > now + LIVE_PROGRESS_SKEW_SECONDS:
+        return None, None
+    return raw, min(advanced, observed, now)
+
+
 def current_step(phases: list[dict[str, Any]]) -> dict[str, Any] | None:
     """The last running step of the recorded GitHub phases: its job, name, 1-based position among
     that job's steps and start time. Phases list each job followed by its `"<job>: <step>"` steps."""
@@ -609,6 +634,7 @@ class Controller:
         logger: logging.Logger | None = None,
         notifier: escalation.Notifier | None = None,
         revision_map_probe: Callable[[str], bool] | None = None,
+        live_progress: Callable[[str, int], dict[str, Any] | None] | None = None,
     ) -> None:
         with store.transaction():
             if store.get_setting("queue:operating-mode") not in {None, "controller"}:
@@ -623,6 +649,15 @@ class Controller:
         self.mixed_ci = None
         self.execution = execution if execution is not None else github
         self.candidate_ci = candidate_ci
+        # The head run's public live build report (`build_progress.lookup`), read off the
+        # reconciliation thread at most every LIVE_PROGRESS_SECONDS. Observational only: its counts
+        # moving is progress for the stall report, never an input to a verdict.
+        self.live_progress = live_progress
+        # (run id, run attempt) -> {"checked_at", "raw", "progress_at"} for the head's run only.
+        self._live: dict[tuple[str, int], dict[str, Any]] = {}
+        self._live_reading = False
+        self._live_failure: str | None = None
+        self._live_lock = threading.Lock()
         # (attempt id, run id, run attempt) -> (time, run status) of the last phase read of a source run.
         self._source_phases_read: dict[tuple[Any, str, int], tuple[float, str]] = {}
         # The keys of `_source_phases_read` whose last read failed (`_eviction_observation` needs a fresh one).
@@ -1497,6 +1532,10 @@ class Controller:
             with self.store.transaction():
                 # Only the input is flagged: an ordinary batch never becomes an emergency batch.
                 self.store.update("inputs", {"id": current["id"]}, urgent=URGENT_EMERGENCY, evidence=dumps(evidence))
+                if self.admission is not None:
+                    # Its batch needs admission current at this head: evaluate it again now, ahead of
+                    # all other pending admission work (`AdmissionState.next_due`).
+                    self.admission.invalidate(number, head=current["head_sha"], urgent=True)
                 self.store.journal(
                     now,
                     "emergency-requested",
@@ -2101,53 +2140,6 @@ class Controller:
                 else:
                     del self._renewal_waiters[claim_token]
                     self._renewing.pop(claim_token, None)
-
-    def _task_checks_owner(self, task: dict[str, Any]) -> str:
-        if task["kind"] == TASK_REPAIR and any(
-            diagnostic.get("kind")
-            in {"audit", "duplicate_declaration", "import_collision", "lint", "environment_linter"}
-            for diagnostic in loads(task["diagnostics"], [])
-        ):
-            # A diagnosed check failure is required repair verification, not optional
-            # background work to hand off for another serial staging round.
-            return "worker"
-        if task["kind"] not in BACKGROUND_TASKS:
-            return "staging"
-        head = self._head()
-        if head is not None:
-            if head["id"] == task["batch_id"]:
-                return "staging"
-            if task["kind"] == TASK_PREPARE and not self._pre_rebased_prepare(task):
-                first = self._open_batch()
-                if (
-                    first is not None
-                    and first["id"] == task["batch_id"]
-                    and not self._state("inference_hold")
-                    and self._pre_rebase_blocked(head) is None
-                ):
-                    # Finish useful source work, then release the old-base owner so
-                    # the successor can rebase. Its rebased worker may run full checks.
-                    return "staging"
-            return "worker"
-        first = self._open_batch()
-        ready = (
-            first is not None
-            and first["id"] == task["batch_id"]
-            and not self._state("inference_hold")
-            and not self._external_head_blocks_sealing()
-        )
-        return "staging" if ready else "worker"
-
-    def task_check_policy(self, task_id: int) -> dict:
-        """Refresh optional check priority over the existing authenticated claim renewal."""
-        with self._lock.priority():
-            task = self.store.row("tasks", {"id": task_id})
-            if task is None:
-                return {}
-            policy = {"checks_owner": self._task_checks_owner(task)}
-            if task["kind"] in BACKGROUND_TASKS:
-                policy["renew_after"] = HANDOFF_RENEW_SECONDS
-            return policy
 
     def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
@@ -2915,7 +2907,6 @@ class Controller:
         extra: dict[str, Any] = {
             "canonical_branch": self.canonical_branch,
             "claim_id": claim_id,
-            "checks_owner": self._task_checks_owner(task),
         }
         if loads(task.get("task_binding"), {}).get("schema") == "tauceti-queue.mixed-task/v1":
             if self.mixed is None:
@@ -3643,6 +3634,11 @@ class Controller:
             try:
                 return self._tick()
             finally:
+                # Also after a failed pass: the build's own progress does not depend on GitHub.
+                try:
+                    self._read_live_progress(self.clock())
+                except Exception:  # noqa: BLE001 - observational; never disturbs reconciliation
+                    logging.getLogger(__name__).exception("live progress read not scheduled")
                 self._refresh_snapshot()
 
     def _tick(self) -> list[str]:
@@ -3695,6 +3691,107 @@ class Controller:
         self._drain_outbox(self.clock())
         self._set_state("last_tick_at", now)
         return list(self._reasons)
+
+    def _read_live_progress(self, now: float) -> None:
+        """Start a background read of the head run's live build report when one is due.
+
+        Runs on the reconciliation thread, which also persists the run's progress watermark (the
+        `live-progress` setting) so a restart does not report a stall the previous process had
+        seen progress against. The background thread only reads the public report."""
+        head = self._head()
+        attempt = self._current_attempt(head) if head is not None else None
+        if (
+            self.live_progress is None
+            or attempt is None
+            or attempt["outcome"] != OUTCOME_PENDING
+            or not attempt["run_id"]
+        ):
+            return
+        key = (str(attempt["run_id"]), int(attempt["run_attempt"] or 1))
+        saved = self.store.get_setting(LIVE_PROGRESS_SETTING)
+        with self._live_lock:
+            entry = self._live.get(key)
+            if entry is None and isinstance(saved, dict) and (saved.get("run_id"), saved.get("run_attempt")) == key:
+                entry = {"checked_at": 0, "raw": saved.get("raw"), "progress_at": saved.get("progress_at")}
+                self._live = {key: entry}
+            if (
+                entry is not None
+                and entry.get("progress_at") is not None
+                and (not isinstance(saved, dict) or saved.get("progress_at") != entry["progress_at"])
+            ):
+                persist = {
+                    "run_id": key[0],
+                    "run_attempt": key[1],
+                    "raw": entry.get("raw"),
+                    "progress_at": entry["progress_at"],
+                }
+            else:
+                persist = None
+            due = not self._live_reading and now - (entry or {}).get("checked_at", 0) >= LIVE_PROGRESS_SECONDS
+            if due:
+                self._live_reading = True
+        try:
+            if persist is not None:
+                self.store.set_setting(LIVE_PROGRESS_SETTING, persist)
+        except Exception:
+            # The read below still goes ahead; only a reserved reader that never starts would stop polling.
+            logging.getLogger(__name__).exception("live progress watermark not saved")
+        if not due:
+            return
+
+        def read() -> None:
+            try:
+                report = self.live_progress(*key)
+            except Exception as error:  # noqa: BLE001 - observational; a failed read leaves the step phases alone
+                report = None
+                failure = f"{type(error).__name__}: {str(error)[:200]}"
+            else:
+                failure = None if report is not None else "no live report for the run"
+            # One journal line when reads start failing and one when they recover, not one a minute.
+            if (failure is None) != (self._live_failure is None):
+                if failure is None:
+                    self.log.info("live build progress for run %s attempt %s readable again", *key)
+                else:
+                    self.log.warning(
+                        "live build progress for run %s attempt %s unavailable: %s", key[0], key[1], failure
+                    )
+                self._live_failure = failure
+            with self._live_lock:
+                try:
+                    current = self._live.get(key, {})
+                    raw, progress_at = live_progress_at(report, self.clock())
+                    if raw is not None and raw == current.get("raw"):
+                        # The same report again: its time was already capped when first seen.
+                        progress_at = current.get("progress_at")
+                    newest = max(
+                        filter(lambda value: value is not None, (current.get("progress_at"), progress_at)), default=None
+                    )
+                    # Only the head run's entry is kept, and its progress time never goes back.
+                    self._live = {
+                        key: {
+                            "checked_at": self.clock(),
+                            "raw": raw if progress_at is not None and progress_at == newest else current.get("raw"),
+                            "progress_at": newest,
+                        }
+                    }
+                finally:
+                    self._live_reading = False
+
+        try:
+            threading.Thread(target=read, name="live-progress", daemon=True).start()
+        except Exception:
+            with self._live_lock:
+                self._live_reading = False
+            raise
+
+    def _last_progress_at(self, attempt: dict[str, Any]) -> float:
+        """The attempt's last step-level progress, or its live build counts' last advance if later."""
+        last = attempt["last_progress_at"]
+        if attempt["run_id"]:
+            live = self._live.get((str(attempt["run_id"]), int(attempt["run_attempt"] or 1)), {}).get("progress_at")
+            if live is not None and live > last:
+                return live
+        return last
 
     def recover(self) -> dict[str, Any]:
         """Restart reconciliation: release in-process claims, return reservations, leave worker claims and the
@@ -9318,6 +9415,28 @@ class Controller:
         batch = self.store.row("batches", {"id": batch["id"]}) or batch
         if batch["state"] == BATCH_LANDED:
             return
+        # Reading every member's landed commit, and diffing each edited one, takes about a second per
+        # member: minutes for a large batch. Commits do not change, so that git work runs without the
+        # controller lock and before the store transaction; only its use below needs them.
+        publish = bool(self.setting("publication_enabled"))
+        candidates = [m for m in self._members(batch["id"]) if not self._displaced(batch, m)]
+        landed_ranges: dict[str, dict[str, str]] = {}
+        if getattr(self.store, "_depth", 0):
+            facts = self._landing_facts(batch, candidates, landed_ranges, publish=publish, partial=True)
+        else:
+            with self._lock.unlocked():
+                facts = self._landing_facts(batch, candidates, landed_ranges, publish=publish, partial=True)
+            current = self.store.row("batches", {"id": batch["id"]}) or batch
+            if current["state"] == BATCH_LANDED:
+                return  # another path recorded this landing while the lock was free
+            if (current["version"], current["tip"]) != (batch["version"], batch["tip"]):
+                # A rebuild or repair replaced the revision the caller saw land: the batch's current
+                # revision has not landed, so nothing is recorded; the next canonical observation decides.
+                self.store.journal(
+                    now, "landing-superseded", batch["id"], tip=batch["tip"], current_tip=current["tip"], how=how
+                )
+                return
+            batch = current
         # A withdrawn member's empty commit lands with the head but the PR does not: it is not marked
         # landed, commented on or closed (`_anticipate` or `_withdraw_member` told its author why). The
         # one exception is a member withdrawn as emptied whose PR has meanwhile landed on `main` by other
@@ -9327,7 +9446,6 @@ class Controller:
         rejected = []
         members = []
         external_members: set[int] = set()
-        landed_ranges: dict[str, dict[str, str]] = {}
         for member in everyone:
             if self._displaced(batch, member):
                 continue  # its input is the emergency batch's, which lands or returns it
@@ -9336,14 +9454,12 @@ class Controller:
                 if source.get("reason") != EMPTY_COMMIT or source.get("state") != INPUT_CANCELLED:
                     withdrawn.append(member["number"])
                     continue
-            commit = chain.read_commit(self.clone, member["commit_sha"])
-            empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
-            external = empty and chain.carries_landed_note(commit.message)
-            if empty and not external:
-                since = chain.git(self.clone, "merge-base", member["accepted_head"], batch["base"]).strip()
-                if since not in landed_ranges:
-                    landed_ranges[since] = chain.landed_prs(self.clone, since, batch["base"])
-                external = chain.landed_commit(landed_ranges[since], member["source_pr"]) is not None
+            fact = facts.get(member["id"])
+            if fact is None or fact["commit"] != member["commit_sha"]:
+                # The member changed while the lock was free: read it now, under the lock.
+                fact = self._landing_facts(batch, [member], landed_ranges, publish=publish)[member["id"]]
+                facts[member["id"]] = fact
+            empty, external = fact["empty"], fact["external"]
             if external:
                 external_members.add(member["id"])
             if member["withdrawn"] and not external:
@@ -9420,7 +9536,12 @@ class Controller:
             )
             if self.setting("publication_enabled"):
                 for member in members:
-                    self._enqueue_landing_effects(batch, member, landed_externally=member["id"] in external_members)
+                    fact = facts[member["id"]]
+                    if publish and fact["diff"] is None and member["provenance"] != "clean":
+                        fact.update(self._landing_facts(batch, [member], landed_ranges, publish=True)[member["id"]])
+                    self._enqueue_landing_effects(
+                        batch, member, landed_externally=member["id"] in external_members, fact=fact
+                    )
                 for member in rejected:
                     self._enqueue_rejection_effects(batch, member)
             self._interacting_landed({m["number"] for m in members}, now)
@@ -9433,6 +9554,50 @@ class Controller:
         else:
             self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
         self._wake.set()
+
+    def _landing_facts(
+        self,
+        batch: dict[str, Any],
+        members: list[dict[str, Any]],
+        landed_ranges: dict[str, dict[str, str]],
+        *,
+        publish: bool,
+        partial: bool = False,
+    ) -> dict[int, dict[str, Any]]:
+        """What the clone says about each member's landed commit, keyed by member id: whether it is
+        `empty`, whether its PR landed `external`ly, and for an edited member, when its landing is
+        published, its `diff` against the accepted head and whether it `outside_queue` landed. Git
+        only, on commits that never change, so the caller may run it without the controller lock.
+        `partial`: leave out a member git cannot read (one that may turn out not to need reading), for
+        the caller to read again under the lock if it does."""
+        facts: dict[int, dict[str, Any]] = {}
+        for member in members:
+            try:
+                facts[member["id"]] = self._landing_fact(batch, member, landed_ranges, publish=publish)
+            except chain.ChainError:
+                if not partial:
+                    raise
+        return facts
+
+    def _landing_fact(
+        self, batch: dict[str, Any], member: dict[str, Any], landed_ranges: dict[str, dict[str, str]], *, publish: bool
+    ) -> dict[str, Any]:
+        commit = chain.read_commit(self.clone, member["commit_sha"])
+        empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
+        external = empty and chain.carries_landed_note(commit.message)
+        if empty and not external:
+            since = chain.git(self.clone, "merge-base", member["accepted_head"], batch["base"]).strip()
+            if since not in landed_ranges:
+                landed_ranges[since] = chain.landed_prs(self.clone, since, batch["base"])
+            external = chain.landed_commit(landed_ranges[since], member["source_pr"]) is not None
+        edited = publish and member["provenance"] != "clean" and not member["withdrawn"]
+        return {
+            "commit": member["commit_sha"],
+            "empty": empty,
+            "external": external,
+            "diff": self._landed_diff(member) if edited else None,
+            "outside_queue": self._landed_outside_queue(member) if edited else None,
+        }
 
     def _enqueue_rejection_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
         number = member["number"]
@@ -9638,12 +9803,20 @@ class Controller:
         return "\n".join(lines)
 
     def _enqueue_landing_effects(
-        self, batch: dict[str, Any], member: dict[str, Any], *, landed_externally: bool = False
+        self,
+        batch: dict[str, Any],
+        member: dict[str, Any],
+        *,
+        landed_externally: bool = False,
+        fact: dict[str, Any] | None = None,
     ) -> None:
+        """`fact`: the member's `_landing_facts`, so the git work behind them is not repeated here."""
         number = member["number"]
-        body = self.member_comment(batch, member)
-        if member["provenance"] != "clean":
+        diff = (fact or {}).get("diff")
+        if diff is None and member["provenance"] != "clean":
             diff = self._landed_diff(member)
+        body = self.member_comment(batch, member, diff=diff)
+        if member["provenance"] != "clean":
             self._count("edit_summaries")
             self.store.journal(
                 self.clock(),
@@ -9657,7 +9830,10 @@ class Controller:
                 error=diff["error"],
             )
             label = self.setting("repaired_label")
-            if label and not landed_externally and not self._landed_outside_queue(member):
+            outside = (fact or {}).get("outside_queue")
+            if outside is None:
+                outside = self._landed_outside_queue(member)
+            if label and not landed_externally and not outside:
                 self._enqueue(
                     "labels",
                     f"repaired-label:{batch['id']}:{number}",
@@ -9687,8 +9863,9 @@ class Controller:
         except chain.ChainError:
             return False
 
-    def member_comment(self, batch: dict[str, Any], member: dict[str, Any]) -> str:
-        """The one consolidated landing comment for a member: Bors's notice, plus the agent's explanation when edited."""
+    def member_comment(self, batch: dict[str, Any], member: dict[str, Any], *, diff: dict | None = None) -> str:
+        """The one consolidated landing comment for a member: Bors's notice, plus the agent's explanation when edited.
+        `diff` is the member's `_landed_diff` when the caller already has it."""
         attempt = self.store.row(
             "ci_attempts",
             {"batch_id": batch["id"], "batch_version": batch["version"], "outcome": OUTCOME_PASS},
@@ -9711,7 +9888,7 @@ class Controller:
                 "",
             ]
             lines += [f"> {line}" if line else ">" for line in member["explanation"].splitlines()]
-            lines += self._diff_lines(member, commit_url)
+            lines += self._diff_lines(member, commit_url, diff=diff)
             edited = [sha for sha in loads(member["edited_shas"], []) if sha and sha != member["commit_sha"]]
             if edited:
                 lines += [
@@ -9754,9 +9931,9 @@ class Controller:
             "error": None,
         }
 
-    def _diff_lines(self, member: dict[str, Any], commit_url: str) -> list[str]:
+    def _diff_lines(self, member: dict[str, Any], commit_url: str, *, diff: dict | None = None) -> list[str]:
         """The landing comment's diff of the landed commit against the accepted head, in a collapsed block."""
-        diff = self._landed_diff(member)
+        diff = self._landed_diff(member) if diff is None else diff
         if diff["error"] is not None:
             return [
                 "",
@@ -11038,10 +11215,11 @@ class Controller:
                 and attempt["last_progress_at"]
                 and attempt["dispatch_state"] != "prepared"
             ):
-                silence = now - attempt["last_progress_at"]
+                last_progress = self._last_progress_at(attempt)
+                silence = now - last_progress
                 interval = int(settings["stall_interval_seconds"])
                 if silence >= interval:
-                    since = attempt["last_progress_at"] + interval
+                    since = last_progress + interval
                     info["stall"] = {
                         "since": since,
                         "silence_seconds": silence,

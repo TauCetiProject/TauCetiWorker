@@ -151,15 +151,19 @@ def verify_local_worker_bearer(credentials: AppCredentials, token: str, now: flo
     return hmac.compare_digest(mac.encode(), _local_worker_mac(credentials, issued).encode())
 
 
-def load_execution_credentials(directory):
+def load_execution_credentials(directory, *, systemd_credentials: bool = False):
+    """Execution App credentials from ``directory``, or from ``$CREDENTIALS_DIRECTORY`` if asked."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
     from tauceti_tools.ci_candidate import read_json
 
-    from .control_policy_file import read_control_policy
+    from .control_policy_file import read_control_policy, read_systemd_credential
+
+    def read(name):
+        return read_systemd_credential(name) if systemd_credentials else read_control_policy(directory / name)
 
     directory = pathlib.Path(directory)
-    metadata = read_json(read_control_policy(directory / "github-app.json"), max_bytes=128 * 1024)
+    metadata = read_json(read("github-app.json"), max_bytes=128 * 1024)
     if (
         not isinstance(metadata, dict)
         or any(type(metadata.get(key)) is not int or metadata[key] <= 0 for key in ("id", "installation_id"))
@@ -167,7 +171,7 @@ def load_execution_credentials(directory):
         or re.fullmatch(r"[A-Za-z0-9_-]{1,100}", metadata["slug"]) is None
     ):
         raise ValueError("invalid execution App metadata")
-    key = read_control_policy(directory / "github-private-key.pem")
+    key = read("github-private-key.pem")
     if not isinstance(serialization.load_pem_private_key(key, password=None), rsa.RSAPrivateKey):
         raise ValueError("invalid execution App key")
     # The execution App only dispatches CI. Native ingress uses its own secret.

@@ -658,6 +658,21 @@ def dispatch_members(members: Sequence) -> list[dict]:
     return out
 
 
+# Bounds for the adapter's resident git caches: a few discovery passes of every open PR.
+DIFF_VERSION_CACHE = 20_000
+PRESENT_COMMIT_CACHE = 64
+# `_refresh_git_caches`'s fingerprint of a clone whose ancestry is its own: no graft, replacement or
+# shallow-file environment, no shallow file, no grafts file and no replacement refs.
+PLAIN_ANCESTRY = ((), None, None, ())
+
+
+def _remember(cache: dict, key, value, limit: int) -> None:
+    """Insert into a bounded, insertion-ordered cache, forgetting the oldest entries first."""
+    cache[key] = value
+    while len(cache) > limit:
+        del cache[next(iter(cache))]
+
+
 def _batch_id(value):
     return int(value) if str(value).isdigit() else value
 
@@ -703,6 +718,16 @@ class GitHubAdapter:
         self.merge_base_sources = {"local": 0, "compare": 0}
         # Slice 5: which admission evaluations took the single GraphQL read, and which fell back.
         self.snapshot_sources = {"single": 0, "full": 0}
+        # `_diff_version` of two commits never changes while the clone's ancestry is its own (no
+        # shallow boundary, grafts or replacements), and discovery asks it of every open PR against
+        # the same canonical tip on every pass: one git process per PR, not per pass. Both caches
+        # are checked again at the start of each discovery pass (`_refresh_git_caches`).
+        self._diff_versions: dict[tuple[str, str], str] = {}
+        self._present_commits: dict[str, None] = {}
+        self._ancestry: tuple | None = None
+        self._cache_lock = threading.Lock()
+        # Seconds this thread spent in `fetch_refs`, for admission's per-evaluation timing.
+        self._fetch_timing = threading.local()
 
     # -- pull requests
 
@@ -751,7 +776,15 @@ class GitHubAdapter:
             raise GitHubError("fetch_refs needs a clone directory")
         if self._tokens is None:
             raise GitHubError("fetch_refs needs the installation token source")
-        self._git_with_token(repo, ["fetch", "--no-tags", "--quiet", f"https://github.com/{repo}.git", *refspecs])
+        started = time.monotonic()
+        try:
+            self._git_with_token(repo, ["fetch", "--no-tags", "--quiet", f"https://github.com/{repo}.git", *refspecs])
+        finally:
+            self._fetch_timing.seconds = self.fetch_seconds() + time.monotonic() - started
+
+    def fetch_seconds(self) -> float:
+        """Seconds this thread has spent fetching into the clone (see `fetch_refs`)."""
+        return getattr(self._fetch_timing, "seconds", 0.0)
 
     def _git_with_token(self, repo: str, args: Sequence[str], *, check=True) -> subprocess.CompletedProcess:
         """Run git in the clone with the installation token as an `http.extraheader` in the environment."""
@@ -1199,18 +1232,77 @@ class GitHubAdapter:
         )
 
     def _diff_version(self, base: str, head: str) -> str:
-        if (
-            not self.clone_dir
-            or not chain.object_exists(self.clone_dir, base)
-            or not chain.object_exists(self.clone_dir, head)
-        ):
+        """The PR's merge base with its target, or `unknown:<base>` while the clone lacks either.
+
+        Known results are kept (bounded) while the clone's ancestry is stable: the merge bases of
+        two commits are then fixed. One `git merge-base` answers the common case; only its failure
+        pays for the existence checks.
+        """
+        if not self.clone_dir:
             return "unknown:" + base
-        bases = sorted(chain.git(self.clone_dir, "merge-base", "--all", base, head).split())
+        key = (base, head)
+        with self._cache_lock:
+            known = self._diff_versions.get(key)
+            cacheable = self._ancestry == PLAIN_ANCESTRY
+        if known is not None:
+            return known
+        result = chain._git(self.clone_dir, "merge-base", "--all", base, head)
+        if result.returncode not in (0, 1) or result.returncode == 1 and result.stdout.strip():
+            if not chain.object_exists(self.clone_dir, base) or not chain.object_exists(self.clone_dir, head):
+                return "unknown:" + base
+            raise chain.ChainError(f"git merge-base --all failed ({result.returncode}): {result.stderr.strip()}")
+        bases = sorted(result.stdout.split())
         if not bases:
             raise GitHubError("PR and target have no merge base")
         # Advancing main normally leaves the reviewed diff unchanged. Multiple merge bases are
         # ambiguous: retain the target identity and let the compare API resolve a fresh decision.
-        return bases[0] if len(bases) == 1 else ",".join([*bases, base])
+        version = bases[0] if len(bases) == 1 else ",".join([*bases, base])
+        if cacheable:
+            with self._cache_lock:
+                _remember(self._diff_versions, key, version, DIFF_VERSION_CACHE)
+        return version
+
+    def _refresh_git_caches(self) -> None:
+        """At the start of a discovery pass: forget which commits the clone had (an unreferenced one
+        may since have been pruned), and every merge base if the clone's ancestry changed."""
+        ancestry = None
+        if self.clone_dir:
+            try:
+                paths = chain.git(self.clone_dir, "rev-parse", "--git-path", "shallow", "--git-path", "info/grafts")
+                marks = []
+                for path in paths.split():
+                    path = os.path.join(self.clone_dir, path)
+                    marks.append(os.stat(path).st_mtime_ns if os.path.exists(path) else None)
+                replaced = chain.git(
+                    self.clone_dir, "for-each-ref", "--format=%(refname) %(objectname)", "refs/replace/"
+                )
+                ancestry = (
+                    tuple(
+                        name
+                        for name in ("GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE")
+                        if os.environ.get(name)
+                    ),
+                    *marks,
+                    tuple(replaced.split()),
+                )
+            except (chain.ChainError, OSError):
+                ancestry = None  # unknown: nothing is kept
+        with self._cache_lock:
+            self._present_commits.clear()
+            if ancestry is None or ancestry != self._ancestry:
+                self._diff_versions.clear()
+            self._ancestry = ancestry
+
+    def _has_commit(self, sha: str) -> bool:
+        """Whether the clone has commit `sha`; a commit once seen is not asked again in this pass."""
+        with self._cache_lock:
+            if sha in self._present_commits:
+                return True
+        if not chain.object_exists(self.clone_dir, sha):
+            return False
+        with self._cache_lock:
+            _remember(self._present_commits, sha, None, PRESENT_COMMIT_CACHE)
+        return True
 
     def _local_merge_base(self, base: str, head: str) -> str | None:
         """The merge base compare would report, from the clone, or None when the clone cannot vouch
@@ -1515,6 +1607,8 @@ class GitHubAdapter:
 
     def _admission_pulls(self, repo, on_page):
         owner, name = repo.split("/", 1)
+        if repo not in self._admission_listing:
+            self._refresh_git_caches()
         progress = self._admission_listing.setdefault(
             repo, {"listed": [], "cursor": None, "connection": None, "index": 0, "batch": []}
         )
@@ -1565,7 +1659,7 @@ class GitHubAdapter:
         number, head, base = node["number"], node.get("headRefOid", ""), node.get("baseRefOid", "")
         # Fetch a new target once, so a normal canonical advance doesn't invalidate every
         # unchanged review. PR heads are fetched only when evaluating new/dirty work.
-        if self.clone_dir and SHA.fullmatch(base) and not chain.object_exists(self.clone_dir, base):
+        if self.clone_dir and SHA.fullmatch(base) and not self._has_commit(base):
             self.fetch_refs(repo, [base])
         comments = self._admission_comments(repo, number, node.get("comments"))
         label_connection = node.get("labels") or {}

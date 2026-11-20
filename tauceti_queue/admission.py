@@ -247,6 +247,7 @@ class AdmissionPoller:
         self._lock = threading.Lock()
         self._discovery_lock = threading.Lock()
         self._discovery_serial = 0
+        self._discovery_timing = None  # the current discovery pass's timing, see `_discover`
         self.wake = lambda: None
         self.last_summary = None
         self.stopping = threading.Event()
@@ -558,12 +559,22 @@ class AdmissionPoller:
             with self._discovery_lock:
                 serial = self._discovery_serial
             retry_at = 0
+            # Where a pass's time goes: pages read, and the urgent evaluations made between them.
+            # A pass resumed after a quota wait continues its listing, so it continues these too.
+            if self._discovery_timing is None:
+                self._discovery_timing = {"seconds": 0.0, "pages": 0, "evaluation_seconds": 0.0}
+            timing, started = self._discovery_timing, time.monotonic()
+
+            def on_page(pulls):
+                self._observe_page(pulls)
+                timing["pages"] += 1
+                evaluating = time.monotonic()
+                self._process_one(summary, urgent_only=True)
+                timing["evaluation_seconds"] += time.monotonic() - evaluating
+
             try:
                 listed = self.adapter.list_open_pull_requests(
-                    self.repo,
-                    review_app_id=0,
-                    admission=True,
-                    on_page=lambda pulls: (self._observe_page(pulls), self._process_one(summary, urgent_only=True)),
+                    self.repo, review_app_id=0, admission=True, on_page=on_page
                 )
                 numbers = {p.number for p in listed}
                 for row in self.controller.store.rows("admission_work", {"repository": self.repo}):
@@ -572,7 +583,19 @@ class AdmissionPoller:
                             row["number"], row["head_sha"], "absent:" + self.policy.revision, urgent=True
                         )
                 next_at = self.clock() + self.controller.setting("approval_poll_interval_seconds")
+                self._discovery_timing = None
+                self.controller.store.journal(
+                    self.clock(),
+                    "admission-discovered",
+                    prs=len(listed),
+                    pages=timing["pages"],
+                    seconds=round(timing["seconds"] + time.monotonic() - started, 1),
+                    evaluation_seconds=round(timing["evaluation_seconds"], 1),
+                )
             except Exception as error:
+                timing["seconds"] += time.monotonic() - started
+                if not isinstance(error, RequestDeferred):
+                    self._discovery_timing = None  # the listing starts again at page one
                 next_at = retry_at = self._retry_at(error)
                 if isinstance(error, RequestDeferred):
                     self.state.record_resource_wait(error.resource, error.retry_at)
@@ -602,7 +625,7 @@ class AdmissionPoller:
         self.state.attempted(work)
         try:
             client = getattr(self.adapter, "client", None)
-            revocation = bool(
+            revocation = bool(work.get("emergency")) or bool(
                 work["urgent"]
                 and self.controller.store.row(
                     "inputs", {"repository": self.repo, "number": work["number"], "state": ["waiting", "reserved"]}
@@ -708,9 +731,13 @@ class AdmissionPoller:
     def _evaluate(self, work, summary):
         epoch = self._source_epoch()
         started = self.clock()
+        began = time.monotonic()
+        fetch_seconds = getattr(self.adapter, "fetch_seconds", lambda: 0.0)
+        fetched = fetch_seconds()
         single = getattr(self.adapter, "admission_snapshot_single", None)
         read = single if self.evidence_mode() == "events" and single is not None else self.adapter.admission_snapshot
         snapshot = read(self.repo, work["number"], generation=work["generation"])
+        timing = {"read_seconds": time.monotonic() - began, "fetch_seconds": fetch_seconds() - fetched}
         result, authorization, evidence, comment, meta = self.policy.evaluate(snapshot)
         if self.evidence_mode() in ("shadow", "events"):
             try:
@@ -738,8 +765,10 @@ class AdmissionPoller:
                 },
             }
         version = self._version(snapshot.source())
+        locking = time.monotonic()
         # All reads/fetches, including the PR recheck inside the adapter, precede this lock.
         with self.controller._lock, self.controller.store.transaction():
+            timing["lock_seconds"] = time.monotonic() - locking
             current_work = self.state.get(work["number"])
             if current_work["generation"] != work["generation"]:
                 return
@@ -849,6 +878,10 @@ class AdmissionPoller:
                 disposition=disposition,
                 reason=result["reason"],
                 policy_digest=self.policy.revision,
+                # Where this evaluation's time went: the source read, the clone fetches within it,
+                # and the wait for the controller lock; `seconds` is the whole evaluation.
+                seconds=round(time.monotonic() - began, 2),
+                **{key: round(value, 2) for key, value in timing.items()},
             )
             self.controller._count("admission_evaluations")
             if disposition == "approved":
