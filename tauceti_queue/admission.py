@@ -369,7 +369,10 @@ class AdmissionPoller:
         checked = waiver.get("permission_checked_at")
         if isinstance(checked, (int, float)) and self.clock() - checked <= LARGE_REFACTOR_RECHECK_SECONDS:
             return None
-        self.invalidate(number, head=head, urgent=True)
+        if work["generation"] == work["evaluated_generation"]:
+            # Only a settled decision is invalidated: a check already pending keeps its generation and
+            # retry deadline, so repeated insertion attempts cannot restart it.
+            self.invalidate(number, head=head, urgent=True)
         return "large-refactor approval is due a fresh check"
 
     def interval(self):
@@ -1026,12 +1029,17 @@ class AdmissionPoller:
             return False
         if set(snapshot.paths) & LAKE_PINS and not self.adapter.bump_guard(self.repo, snapshot.pull.head_sha):
             return False
-        # The snapshot was fenced before these reads: confirm the head and label they vouched for.
-        fresh = self.adapter.fetch_pr(self.repo, snapshot.pull.number)
-        if fresh.head_sha != snapshot.pull.head_sha or ci_git.LARGE_REFACTOR_LABEL not in {
-            label.lower() for label in fresh.labels
-        }:
-            self.state.dirty(snapshot.pull.number, urgent=True)
+        # The snapshot was fenced before these reads: the PR they vouched for must be unchanged. A
+        # label removed and applied again also arrives as a `labeled` event, which evaluates it anew.
+        pull, fresh = snapshot.pull, self.adapter.fetch_pr(self.repo, snapshot.pull.number)
+        if (fresh.head_sha, fresh.base_ref, fresh.state, fresh.draft, sorted(label.lower() for label in fresh.labels)) != (
+            pull.head_sha,
+            pull.base_ref,
+            pull.state,
+            pull.draft,
+            sorted(label.lower() for label in pull.labels),
+        ) or ci_git.LARGE_REFACTOR_LABEL not in {label.lower() for label in fresh.labels}:
+            self.state.dirty(pull.number, urgent=True)
             return False
         return True
 

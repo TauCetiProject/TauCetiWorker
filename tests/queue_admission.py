@@ -858,6 +858,52 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn("large_refactor_approval", decision["evidence"])
         self.assertEqual(self.intake.state.get(1)["head_sha"], head)
 
+    def test_a_pr_changed_during_the_waiver_reads_is_evaluated_again(self):
+        for change in ("closed", "draft", "keep-label"):
+            with self.subTest(change=change):
+                if self.controller.input_for(REPO, 1):
+                    self.controller.cancel(REPO, 1, "fixture")
+                head = self.large_refactor_approval()
+                self.review(state="red")
+                original = self.github.bump_guard
+                seen = []
+
+                def change_pr(repo, sha, change=change):
+                    if not seen:
+                        if change == "keep-label":
+                            self.github.labels[1] = {"large-refactor", "keep"}
+                        else:
+                            self.github.prs[1]["state" if change == "closed" else "draft"] = (
+                                "closed" if change == "closed" else True
+                            )
+                    seen.append(sha)
+                    return original(repo, sha)
+
+                self.github.bump_guard = change_pr
+                self.intake.invalidate(1)
+                self.intake.run_once()
+                self.github.bump_guard = original
+                # The first verdict is discarded and the PR evaluated again from a fresh snapshot.
+                self.assertEqual(len(seen), 1 if change != "keep-label" else 2)
+                decision = json.loads(self.intake.state.get(1)["decision"])
+                if change == "keep-label":
+                    self.assertTrue(self.intake.is_current(1, head))  # `keep` itself holds insertion
+                else:
+                    self.assertNotEqual(decision["reason"], "large refactor approved by repository admin")
+                self.github.prs[1].update(state="open", draft=False)
+                self.github.labels[1] = set()
+
+    def test_a_pending_waiver_check_is_not_restarted_by_insertion_attempts(self):
+        head = self.large_refactor_approval()
+        self.review(state="red")
+        self.intake.run_once()
+        self.clock.advance(1801)
+        self.assertEqual(self.intake.insertion_check(1, head), "large-refactor approval is due a fresh check")
+        generation = self.intake.state.get(1)["generation"]
+        for _ in range(3):
+            self.assertEqual(self.intake.insertion_check(1, head), "large-refactor approval is due a fresh check")
+        self.assertEqual(self.intake.state.get(1)["generation"], generation)
+
     def test_an_old_large_refactor_waiver_is_checked_again_before_insertion(self):
         head = self.large_refactor_approval()
         self.review(state="red")

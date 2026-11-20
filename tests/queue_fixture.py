@@ -4062,6 +4062,29 @@ class EmergencyLane(QueueFixture):
             [c for c, _ in self.github.calls].count("fast_forward"), 3, "every landing went through the queue"
         )
 
+    def test_an_inserted_pr_leaves_its_batch_only_after_admission_checks_it_again(self):
+        head, successor = self.running_head_with_successor()
+        held = {"reason": "large-refactor approval is due a fresh check"}
+        admission = self.controller.admission = unittest.mock.Mock()
+        self.addCleanup(setattr, self.controller, "admission", None)
+        admission.is_current.return_value = True
+        admission.insertion_check.side_effect = lambda number, sha: held["reason"] if number == 103 else None
+        self.emergency(103)
+        self.tick()
+        self.assertEqual(self.emergency_batches(), [])
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["batch_id"], successor["id"])
+        self.assertIn(unittest.mock.call(103, self.controller.input_for(PROJECT, 103)["head_sha"]),
+                      admission.insertion_check.call_args_list)
+        # A check still pending (admission not current) also keeps it where it is.
+        held["reason"] = None
+        admission.is_current.side_effect = lambda number, sha: number != 103
+        self.tick()
+        self.assertEqual(self.emergency_batches(), [])
+        admission.is_current.side_effect = None
+        self.tick()
+        [batch] = self.emergency_batches()
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["batch_id"], batch["id"])
+
     def test_an_inserted_pr_is_built_alone_lands_once_and_its_old_slot_never_acts(self):
         head, successor = self.running_head_with_successor()
         self.emergency(103)
