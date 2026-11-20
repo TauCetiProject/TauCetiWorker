@@ -78,9 +78,9 @@ def tool_dir() -> Path | None:
     return scripts if all((scripts / name).is_file() for name in TOOL_FILES) else None
 
 
-def _blob(worktree: Path, rev: str, path: str) -> bytes | None:
+def _blob(worktree: Path, rev: str, path: str, limit: int | None = MAX_BYTES) -> bytes | None:
     """``path`` at ``rev`` when it is a regular file there (not a symlink or submodule) of at most
-    ``MAX_BYTES``, else None."""
+    ``limit`` bytes, else None."""
     listing = subprocess.run(
         ["git", "-C", str(worktree), "ls-tree", "-l", "-z", rev, "--", path],
         capture_output=True,
@@ -91,7 +91,7 @@ def _blob(worktree: Path, rev: str, path: str) -> bytes | None:
     fields = head.split()  # mode, type, object, size
     if listed != path or len(fields) != 4 or fields[0] not in ("100644", "100755") or not fields[3].isdigit():
         return None
-    if int(fields[3]) > MAX_BYTES:
+    if limit is not None and int(fields[3]) > limit:
         return None
     proc = subprocess.run(
         ["git", "-C", str(worktree), "cat-file", "blob", f"{rev}:{path}"], capture_output=True, check=False
@@ -317,7 +317,7 @@ def _build_imports(
     with repair_tools.build_lock(worktree, log=lambda *a, **k: None, lock=lock):
         try:
             for path in paths:  # rewritten or not, any of them may be imported
-                clean = _blob(worktree, prefix, path)
+                clean = _blob(worktree, prefix, path, limit=None)
                 if clean is not None and (worktree / path).is_file() and not (worktree / path).is_symlink():
                     _write(worktree / path, clean)
             return repair.run_logged(argv, worktree, log, env=env, timeout=timeout)["rc"] == 0
