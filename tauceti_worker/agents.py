@@ -645,7 +645,9 @@ def local_verification(policy: str, bubble: bool = False) -> str:
         "module-system, lint and shim-expiry phases. It prints `scope:`, phase exits and a durable receipt path. "
         "For diagnosis, use `--stage build|axioms|module-system|lint|shim-expiry`; final verification uses all stages. "
         "Exact-input phase receipts avoid repeated successful work; use `--no-reuse` only to investigate evidence. "
-        "Foreground verification may use the remaining round budget; do not impose a ten-minute timeout. "
+        "Each foreground command may run up to the worker's command limit (an hour by default, never past "
+        "the round); do not impose a ten-minute timeout. If one is stopped at the limit, rerun it: Lake keeps "
+        "what it built and phase receipts keep what passed. "
         "If Codex returns an execution session ID, keep waiting on that same session with write_stdin until it exits. "
         "Write diagnostic logs and module lists outside the checkout (the helper already keeps logs in worker state). "
         "A failed/incomplete receipt is never green; do not spin on unchanged checks. "
@@ -930,18 +932,24 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
+# One agent shell command's default budget. Long enough for a cold build that waits for compiler
+# capacity, short enough that a hung process (seen: a deadlocked `lean` idle for hours) costs an
+# hour of the round rather than all of it. Launchers set TAUCETI_SHELL_LIMIT_SECONDS to choose
+# another budget; it never exceeds the round's remaining time.
+DEFAULT_SHELL_LIMIT_SECONDS = 3600
+
+
 def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
-    # Keep commands in the foreground, bounded by the round rather than an unrelated
-    # ten-minute ceiling: waiting for compiler capacity consumes wall time too.
-    # Launchers may still request a shorter command budget explicitly.
+    # Keep commands in the foreground, bounded by the round and a per-command budget rather than
+    # Claude Code's unrelated ten-minute ceiling: waiting for compiler capacity consumes wall time too.
     if limit_seconds is None:
         try:
             value = os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS")
-            limit_seconds = float(value) if value else None
+            limit_seconds = float(value) if value else DEFAULT_SHELL_LIMIT_SECONDS
         except ValueError:
-            limit_seconds = None
+            limit_seconds = DEFAULT_SHELL_LIMIT_SECONDS
     remaining_ms = max(1000, int((deadline - time.time()) * 1000))
-    timeout_ms = remaining_ms if limit_seconds is None else min(remaining_ms, max(1000, int(limit_seconds * 1000)))
+    timeout_ms = min(remaining_ms, max(1000, int(limit_seconds * 1000)))
     return {
         "BASH_DEFAULT_TIMEOUT_MS": str(timeout_ms),
         "BASH_MAX_TIMEOUT_MS": str(timeout_ms),

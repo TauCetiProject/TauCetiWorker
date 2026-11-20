@@ -1163,7 +1163,7 @@ CHECK_FILE = "check"  # the agent's one validation command, written beside the l
 GUARDS_FILE = "ci_git.py"  # the shared PR-level diff guards the check script runs on each commit
 EXPLANATION_FILE = "explanation.md"  # a conflict resolution's explanation, appended to the commit by the worker
 BUILD_FILE = repair_tools.BUILD_FILE  # builds only the named modules, one Lake build at a time
-SHELL_LIMIT_SECONDS = 2 * 3600  # a repair agent's foreground shell limit (the fleet's rounds keep ten minutes)
+SHELL_LIMIT_SECONDS = 2 * 3600  # a repair agent's foreground shell limit (the fleet's rounds default to an hour)
 MEMBER_STATES = ("replayed", "conflicting", "pending")
 
 HARD_RULES = (
@@ -2362,7 +2362,8 @@ def agent_environment(
     from tauceti_worker.agents import host_agent_launch
     from tauceti_worker.config import environment
 
-    with environment(**isolation_env(root, env_lake)):
+    # The prompt states SHELL_LIMIT_SECONDS; the launch must grant it rather than the default hour.
+    with environment(**isolation_env(root, env_lake), TAUCETI_SHELL_LIMIT_SECONDS=str(SHELL_LIMIT_SECONDS)):
         argv, env, stdin_text = host_agent_launch(prompt, claude_profile())
     return argv, env, stdin_text
 

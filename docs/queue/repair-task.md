@@ -371,8 +371,8 @@ has a time budget holds because the service re-exposes the task.
    `repair_tools.build_lock`, so exactly one `lake build` runs in a worktree at a time whoever
    started it. Long builds run in the foreground: the task
    sets `TAUCETI_SHELL_LIMIT_SECONDS` to `RunnerConfig.shell_limit` (two hours;
-   `repair.SHELL_LIMIT_SECONDS`) for the agent's shell limit, where the fleet's authoring rounds keep
-   ten minutes, and the prompt says so. The prompt states the aim (every constituent PR's mathematics
+   `repair.SHELL_LIMIT_SECONDS`) for the agent's shell limit, where the fleet's authoring rounds
+   default to an hour per command, and the prompt says so. The prompt states the aim (every constituent PR's mathematics
    lands as its author intended, compiled and checked) before the hard rules (no `sorry`, no
    `native_decide`, no new axioms, no `set_option`, no silenced linters), and asks for a closing
    summary of what changed in which PR's commit and the exit status of the final build. The
