@@ -902,6 +902,45 @@ def claude_thread(work: Path) -> str:
         raise Die(f"security-audit: invalid retained Claude session: {exc}") from exc
 
 
+def claude_saved_read_pages(work: Path, expected_pages: list[list[dict]]) -> set[int]:
+    """Reads whose exact served chunk is stored in the Claude session a resume will load."""
+    sessions = claude_sessions(work)
+    if len(sessions) != 1:
+        return set()
+    calls, pages = {}, set()
+    try:
+        rows = jsonl_rows(sessions[0].read_text(encoding="utf-8", errors="replace"))
+    except ValueError:
+        return set()
+    for row in rows:
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        for item in content if isinstance(content, list) else ():
+            if not isinstance(item, dict):
+                continue
+            if (
+                row.get("type") == "assistant"
+                and item.get("type") == "tool_use"
+                and item.get("name") == "mcp__audit__read_page"
+                and isinstance(item.get("id"), str)
+                and isinstance(item.get("input"), dict)
+                and type(item["input"].get("page")) is int
+            ):
+                calls[item["id"]] = item["input"]["page"]
+            if row.get("type") == "user" and item.get("type") == "tool_result" and not item.get("is_error"):
+                page = calls.get(item.get("tool_use_id"))
+                if type(page) is not int or not 0 <= page < len(expected_pages):
+                    continue
+                for text in tool_texts(item.get("content")):
+                    try:
+                        delivered = json.loads(text)
+                        if delivered.get("page") == page and delivered.get("sections") == expected_pages[page]:
+                            pages.add(page)
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+    return pages
+
+
 def reconcile_coverage(work: Path, batch: dict) -> dict:
     """Keep the contiguous served prefix confirmed by ordinary client success reports.
 
