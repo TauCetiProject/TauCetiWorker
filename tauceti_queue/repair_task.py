@@ -2527,7 +2527,9 @@ def resolve_one(
     # Projection-only conflicts after `main` renamed numeric projections resolve without the agent
     # (`repair_numproj`); any other outcome leaves the agent the conflict as before, or what is left.
     prepass = (
-        repair_numproj.prepass(worktree, prefix, commit, paths, env_lake, logdir)
+        repair_numproj.prepass(
+            worktree, prefix, commit, paths, env_lake, logdir, lake=tuple(cfg.lake), build_lock=build_lock
+        )
         if (artifacts or {}).get("available")
         else None
     )

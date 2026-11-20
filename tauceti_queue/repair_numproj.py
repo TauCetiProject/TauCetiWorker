@@ -6,9 +6,11 @@ numproj``), a member written against the old ``main`` conflicts wherever its cha
 :func:`prepass`: for each conflicting Lean file it rewrites the conflicting commit's parent P and the
 commit C with the same tool, giving P' and C', and merges with ``git merge-file`` with base P', ours
 the clean prefix (already rewritten on the new ``main``) and theirs C'. The tool elaborates each file
-against the worktree's warm build, so it runs in the build sandbox like every other build of member
-code, on copies of the two versions under ``.lake``; the worktree's sources are not touched until the
-merges are done.
+against the worktree's build, so it runs in the build sandbox like every other build of member code,
+on copies of the two versions under ``.lake``; the worktree's sources are not touched until the merges
+are done. A rebase task's tree is not built when it is prepared (its artifacts are only in Lake's
+artifact cache), so the project modules the two versions import are built first (``lake build``,
+under the task's build lock), mostly restored from that cache.
 
 The result is mechanical only when every conflicting file merged cleanly and the tool rewrote C's
 versions completely (exit 0). Otherwise the merged files, clean or with conflict markers, are the
@@ -45,6 +47,8 @@ LOG_BYTES = 64_000  # of a tool log, for the sites it reports to the agent
 JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
+# An import in a Lean header, with the module system's modifiers.
+IMPORT = re.compile(r"^(?:(?:public|private|meta)\s+)*import\s+(?:all\s+)?([\w.'«»]+)", re.M)
 CANDIDATE = re.compile(r"[\w'!?\)\]⟩»·℘]\.\d")
 # For `projection_edits`: a numeric projection, the named field replacing it, and a receiver the
 # tool may parenthesize.
@@ -238,6 +242,38 @@ def _run_tool(worktree: Path, env: dict, tool: Path, files: list[Path], cache: P
     return repair.run_logged(wrapped, worktree, log, env=run_env, timeout=timeout)
 
 
+def imported_modules(worktree: Path, sides: dict, paths: list[str]) -> list[str]:
+    """The project modules the two versions of the conflicting files import: those with a source in the
+    worktree that is not itself conflicting."""
+    modules = set()
+    for _, base, theirs in sides.values():
+        for text in (base, theirs):
+            modules.update(IMPORT.findall(text.decode(errors="replace")))
+    return sorted(m for m in modules if (worktree / module_path(m)).is_file() and module_path(m) not in paths)
+
+
+def module_path(module: str) -> str:
+    return module.replace(".", "/") + ".lean"
+
+
+def _build_imports(
+    worktree: Path, sides: dict, paths: list[str], env: dict, log: Path, timeout: float, lake, lock
+) -> bool:
+    """Build the modules the tool needs to elaborate the files (``imported_modules``); False when the
+    build fails, since the tool cannot elaborate them then."""
+    from tauceti_queue import repair, repair_tools
+
+    modules = imported_modules(worktree, sides, paths)
+    if not modules:
+        return True
+    try:
+        argv = repair_sandbox.sandboxed_lake([*lake, "build", *modules], worktree, env)
+    except repair_sandbox.SandboxUnavailable:
+        return False
+    with repair_tools.build_lock(worktree, log=lambda *a, **k: None, lock=lock):
+        return repair.run_logged(argv, worktree, log, env=env, timeout=timeout)["rc"] == 0
+
+
 def _merge(ours: bytes, base: bytes, theirs: bytes, labels: tuple[str, str, str]) -> tuple[int, bytes] | None:
     """``git merge-file -p``: (conflict count, merged bytes), or None when git fails."""
     with tempfile.TemporaryDirectory(prefix="numproj-merge-") as scratch:
@@ -265,6 +301,8 @@ def prepass(
     logdir: Path,
     *,
     timeout: float = TIMEOUT_SECONDS,
+    lake: tuple[str, ...] = ("lake",),
+    build_lock: Path | None = None,
 ) -> Prepass | None:
     """Rewrite numeric projections in both sides of ``commit``'s conflicting Lean files and merge them
     onto the clean ``prefix``, writing the merged files into ``worktree`` (checked out by
@@ -299,6 +337,10 @@ def prepass(
         if any(CANDIDATE.search(t) for t in texts):
             sides[path] = (ours, base, theirs)
     if not sides:
+        return None
+    if not _build_imports(
+        worktree, sides, paths, env, logdir / f"numproj-{commit[:12]}-imports.log", timeout, lake, build_lock
+    ):
         return None
     scratch, directory = None, None
     try:

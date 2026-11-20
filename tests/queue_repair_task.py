@@ -7105,7 +7105,7 @@ REAL_NUMPROJ = (
 )
 
 
-class NumprojPrepass(Fixture):
+class NumprojBase(Fixture):
     """Main renamed the numeric projections of ``TauCeti/P.lean``; member 2 edits a line next to them
     with the old syntax, so replaying it conflicts. The pre-pass (``repair_numproj``) rewrites both
     sides with the tool (here a stand-in) and merges them before any agent runs."""
@@ -7157,6 +7157,25 @@ class NumprojPrepass(Fixture):
     def resolved_p(self, chain) -> str:
         return sh(self.content.bare, "show", f"{chain[1].sha}:TauCeti/P.lean") + "\n"
 
+
+class NumprojImports(NumprojBase):
+    """A rebase task's tree is not built when it is prepared: the project modules the conflicting file
+    imports are built before the tool runs, so it can elaborate the file; Mathlib's modules are not."""
+
+    IMPORTING = "public import Mathlib.Logic.Basic\nimport TauCeti.A\n"
+    BASE_FILES = {"TauCeti/P.lean": IMPORTING + OLD_P}
+    MEMBER_FILES = {2: {"TauCeti/P.lean": IMPORTING + OLD_P.replace("x.2", "x.2 + 1")}}
+
+    def test_the_imported_project_modules_are_built_before_the_tool_runs(self):
+        outcome, chain = self.run_task(self.IMPORTING + NEW_P)
+        self.assertEqual(outcome["conflicts"][0]["numproj"], True)
+        self.assertEqual(self.agent_calls(), [])
+        builds = [c for c in self.lake_calls() if c.startswith("build")]
+        self.assertIn("build TauCeti.A", builds)
+        self.assertFalse([b for b in builds if "Mathlib" in b], builds)
+
+
+class NumprojPrepass(NumprojBase):
     def test_a_projection_only_conflict_is_resolved_without_the_agent(self):
         outcome, chain = self.run_task()
         self.assertEqual(self.agent_calls(), [], "no agent ran")
