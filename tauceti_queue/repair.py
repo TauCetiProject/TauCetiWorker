@@ -477,11 +477,20 @@ def compare_chains(clone: Path, before: list[ChainCommit], after: list[ChainComm
 
 
 def owners_of(clone: Path, chain: list[ChainCommit], path: str) -> list[int]:
-    """Constituent PRs whose commit touches ``path`` (file-level ownership, as Bors attributes it)."""
+    """Constituent PRs whose commit touches ``path`` (file-level ownership, as Bors attributes it).
+
+    ``chain`` is usually linear; a conflict's chain is the replayed clean prefix followed by the input
+    chain's conflicting commit, so each commit is then judged against its own parent."""
     if not chain or not path:
         return []
-    shas = set(git(clone, "rev-list", f"{chain[0].parent}..{chain[-1].sha}", "--", path).split())
-    return [c.pr for c in chain if c.sha in shas and c.pr is not None]
+    if all(c.parent == p.sha for p, c in zip(chain, chain[1:], strict=False)):
+        shas = set(git(clone, "rev-list", f"{chain[0].parent}..{chain[-1].sha}", "--", path).split())
+        return [c.pr for c in chain if c.sha in shas and c.pr is not None]
+    return [
+        c.pr
+        for c in chain
+        if c.pr is not None and git(clone, "diff-tree", "--name-only", "-r", c.parent, c.sha, "--", path).strip()
+    ]
 
 
 def pr_number(source_pr: str) -> int:

@@ -2402,11 +2402,11 @@ def conflict_findings(task: Task, entry: dict, prs: set) -> dict:
             references = [r for r in item.get("references") or [] if r.get("pr") in prs]
             if references:
                 removed.append({**item, "references": references})
-        added = [
-            item
-            for item in ripples.get("added_by_both") or []
-            if any(n.get("pr") in prs for n in item.get("next") or [])
-        ]
+        added = []
+        for item in ripples.get("added_by_both") or []:
+            ours = [n for n in item.get("next") or [] if n.get("pr") in prs]
+            if ours:
+                added.append({**item, "next": ours})
         if removed or added:
             findings["cross_batch"] = {**ripples, "removed_used": removed, "added_by_both": added}
     return findings

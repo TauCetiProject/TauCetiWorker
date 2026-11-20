@@ -4816,7 +4816,7 @@ class Records(unittest.TestCase):
                     ],
                     "added_by_both": [
                         {"name": "baz", "head": [], "next": [{"pr": 3}]},
-                        {"name": "qux", "head": [], "next": [{"pr": 1}]},
+                        {"name": "qux", "head": [], "next": [{"pr": 1}, {"pr": 3}]},
                     ],
                 },
             ],
@@ -4833,9 +4833,34 @@ class Records(unittest.TestCase):
             [(i["name"], [r["pr"] for r in i["references"]]) for i in findings["cross_batch"]["removed_used"]],
             [("foo", [2])],
         )
-        self.assertEqual([i["name"] for i in findings["cross_batch"]["added_by_both"]], ["qux"])
+        self.assertEqual(
+            [(i["name"], i["next"]) for i in findings["cross_batch"]["added_by_both"]], [("qux", [{"pr": 1}])]
+        )
         repair_task.prompt_context(task, None, findings)
         self.assertIsNone(findings["admission_predictions"], "the task's predictions are not put back")
+
+    def test_ownership_spans_the_replayed_prefix_and_the_input_commit(self):
+        """A conflict's chain is the replayed prefix followed by the input chain's conflicting commit, which
+        are not one history: each commit is judged against its own parent."""
+        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        shared = "".join(f"line {i}\n" for i in range(10))
+        content = Content(
+            root,
+            base_files={"TauCeti/S.lean": shared},
+            member_files={
+                1: {"TauCeti/S.lean": shared.replace("line 0", "line zero")},
+                2: {"TauCeti/S.lean": shared.replace("line 9", "line nine")},
+            },
+        )
+        seed = root / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", content.base)
+        onto = commit(seed, "main moved", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+        prefix = chain_tool.replay(seed, content.base, content.members[0]["commit"], onto).tip
+        conflicting = content.members[1]["commit"]
+        chain = [*repair.read_chain(seed, onto, prefix), *repair.read_chain(seed, f"{conflicting}^", conflicting)]
+        self.assertEqual(repair.owners_of(seed, chain, "TauCeti/S.lean"), [1, 2])
+        self.assertEqual(repair.owners_of(seed, chain, "TauCeti/One.lean"), [1])
+        self.assertEqual(repair.owners_of(seed, chain, "TauCeti/A.lean"), [])
 
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
