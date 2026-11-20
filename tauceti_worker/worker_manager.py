@@ -2146,8 +2146,15 @@ def _systemd_quote(value: str) -> str:
 def _service_environment() -> dict[str, str]:
     from .paths import INSTALLED, legacy_data_root
 
+    # cli_main puts its own runtime's scripts/ first on PATH at every start. Freezing that entry into
+    # the unit would leave a path to one runtime revision behind after an update.
+    path = os.pathsep.join(
+        entry
+        for entry in os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin").split(os.pathsep)
+        if Path(entry).parts[-2:] != ("tauceti_worker", "scripts") and entry != str(HERE / "scripts")
+    )
     service_env = {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "PATH": path,
         # A source checkout needs its root on the path. An installed package is importable already,
         # and its directory belongs to one runtime revision, which an update may delete.
         "PYTHONPATH": "" if INSTALLED else self_env()["PYTHONPATH"],
@@ -2177,6 +2184,62 @@ def _service_environment() -> dict[str, str]:
 
 
 WORKER_SLICE = "tauceti-workers.slice"
+# Resource limits on the worker slice cover the manager and every worker scope, as the service's own
+# cgroup did before workers moved into scopes. Values use systemd's syntax.
+SLICE_LIMITS = {"cpu_quota": "CPUQuota", "memory_high": "MemoryHigh", "memory_max": "MemoryMax"}
+# A size in bytes or with a base-1024 suffix, a percentage of physical memory, or no limit.
+_MEMORY = r"(?:[0-9]+(?:\.[0-9]+)?[KMGTPE]?|100(?:\.0+)?%|[0-9]{1,2}(?:\.[0-9]+)?%|infinity)"
+_SLICE_LIMIT_SYNTAX = {
+    "CPUQuota": re.compile(r"[0-9]+(?:\.[0-9]+)?%"),
+    "MemoryHigh": re.compile(_MEMORY),
+    "MemoryMax": re.compile(_MEMORY),
+}
+
+
+def _slice_path() -> Path:
+    return _service_path().with_name(WORKER_SLICE)
+
+
+def _installed_slice_limits() -> dict[str, str]:
+    """The limits a previous install wrote, so a reinstall without options keeps them."""
+    try:
+        lines = _slice_path().read_text().splitlines()
+    except FileNotFoundError:
+        return {}
+    limits = {}
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key in _SLICE_LIMIT_SYNTAX and value.strip():
+            # Kept as written, including a value this check would not accept, rather than dropped.
+            limits[key] = value.strip()
+    return limits
+
+
+def slice_limits(requested: dict[str, str | None]) -> dict[str, str]:
+    """Merge requested limits over the installed ones; an empty value removes a limit."""
+    limits = _installed_slice_limits()
+    for option, key in SLICE_LIMITS.items():
+        value = requested.get(option)
+        if value is None:
+            continue
+        if value == "":
+            limits.pop(key, None)
+        elif _SLICE_LIMIT_SYNTAX[key].fullmatch(value) and (
+            value == "infinity" or float(value.rstrip("%KMGTPE")) > 0  # systemd ignores a zero limit
+        ):
+            limits[key] = value
+        else:
+            raise WorkersError(f"--{option.replace('_', '-')} {value!r} is not a systemd {key}= value")
+    return limits
+
+
+def _systemd_slice(limits: dict[str, str]) -> str:
+    settings = "".join(f"{key}={limits[key]}\n" for key in SLICE_LIMITS.values() if key in limits)
+    return f"""[Unit]
+Description=Tau Ceti workers and their manager
+
+[Slice]
+{settings}"""
 
 
 def _systemd_unit(config: Path) -> str:
@@ -2220,8 +2283,11 @@ def _service_path() -> Path:
     return base / "systemd" / "user" / "tauceti-workers.service"
 
 
-def service_action(action: str, config: Path) -> int:
+def service_action(action: str, config: Path, limits: dict[str, str | None] | None = None) -> int:
     path = _service_path()
+    requested = {key: value for key, value in (limits or {}).items() if value is not None}
+    if requested and (action != "install" or sys.platform == "darwin"):
+        raise WorkersError("worker slice limits apply only to `service install` on Linux")
     if sys.platform == "darwin":
         domain = f"gui/{os.getuid()}"
         service = f"{domain}/{_launchd_label()}"
@@ -2271,7 +2337,12 @@ def service_action(action: str, config: Path) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.is_symlink():
             path.unlink()
+        slice_text = _systemd_slice(slice_limits(requested))
+        if _slice_path().is_symlink():
+            _slice_path().unlink()
+        _slice_path().write_text(slice_text)
         path.write_text(_systemd_unit(config))
+        # A reload applies changed slice limits to the running slice; workers keep running.
         subprocess.run([systemctl, "--user", "daemon-reload"], check=True)
         subprocess.run([systemctl, "--user", "enable", "--now", path.name], check=True)
         from .config import Die
@@ -2285,10 +2356,11 @@ def service_action(action: str, config: Path) -> int:
         return 0
     if action == "uninstall":
         subprocess.run([systemctl, "--user", "disable", "--now", path.name], check=False)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        for unit in (path, _slice_path()):
+            try:
+                unit.unlink()
+            except FileNotFoundError:
+                pass
         subprocess.run([systemctl, "--user", "daemon-reload"], check=True)
         return 0
     return subprocess.run([systemctl, "--user", action, path.name]).returncode
@@ -2493,6 +2565,13 @@ def add_workers_parser(subparsers) -> None:
         choices=("install", "uninstall", "start", "stop", "restart", "status"),
         help="service operation",
     )
+    for option, key in SLICE_LIMITS.items():
+        service.add_argument(
+            f"--{option.replace('_', '-')}",
+            metavar=key.upper(),
+            help=f"set {key}= on {WORKER_SLICE} at install (Linux); an empty value removes it, "
+            "and an omitted option keeps the installed value",
+        )
     edit = actions.add_parser("edit", help="open workers.toml in $VISUAL or $EDITOR")
     edit.add_argument("--editor", help="editor command to use instead of $VISUAL or $EDITOR")
     imp = actions.add_parser("import", help="import legacy workers.conf commands")
@@ -2616,7 +2695,9 @@ def cmd_workers(args) -> int:
             return 0
         if action == "service":
             try:
-                return service_action(args.service_action, config)
+                return service_action(
+                    args.service_action, config, {option: getattr(args, option) for option in SLICE_LIMITS}
+                )
             except (OSError, subprocess.CalledProcessError) as exc:
                 raise WorkersError(f"service {args.service_action} failed: {exc}") from None
         if action == "edit":
