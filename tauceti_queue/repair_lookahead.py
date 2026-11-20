@@ -32,6 +32,9 @@ Builds: each helper's worktree has its own build lock, so the helpers' scoped bu
 unit running three agents peaked at about 4 GB of anonymous memory, against 55 to 64 GiB for the
 worker's whole-library verification build, and the worker refuses an agent's whole-library build.
 The repair slice's shared memory ceiling is the backstop for the rare large ``--dependents`` build.
+Helpers share the task's ``.lake/packages`` read-only, so before the first helper starts the task
+worktree replays the dependencies' build once (``_cache_packages``), the one step of a replay that
+writes there.
 """
 
 from __future__ import annotations
@@ -47,7 +50,7 @@ import threading
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
-from tauceti_queue import repair, repair_audit, repair_parallel
+from tauceti_queue import repair, repair_audit, repair_parallel, repair_sandbox, repair_tools
 from tauceti_queue.repair import git
 
 DEPENDENCY_FILES = ("lean-toolchain", "lake-manifest.json")
@@ -128,7 +131,23 @@ class Lookahead:
                 continue  # resolved already, on ``onto`` or on its prefix by an earlier run of the task
             yield commit
 
+    def _cache_packages(self) -> None:
+        """Replay the dependencies' build in the task worktree once (``lake build Mathlib``). Lake moves a
+        replayed artifact into its artifact cache, which writes in ``.lake/packages``; the helpers share
+        the task's packages read-only, so they replay nothing there themselves. Never fails."""
+        try:
+            argv = repair_sandbox.sandboxed_lake([*self.cfg.lake, "build", "Mathlib"], self.worktree, self.env_lake)
+            with repair_tools.build_lock(self.worktree, log=lambda *a, **k: None):
+                run = repair.run_logged(
+                    argv, self.worktree, self.logdir / "lookahead-packages.log", self.env_lake, self.cfg.build_timeout
+                )
+            log(f"task {self.task.task_id}: lookahead packages replayed, exit {run['rc']}")
+        except Exception as error:  # noqa: BLE001 - the helpers' builds report what is missing
+            log(f"task {self.task.task_id}: lookahead packages not replayed: {type(error).__name__}: {error}")
+
     def _feed(self, after: str) -> None:
+        if not self.cfg.seed_packages:
+            self._cache_packages()
         try:
             for commit in self.candidates(after):
                 with self.lock:

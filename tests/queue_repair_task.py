@@ -1736,6 +1736,7 @@ class RebaseArtifacts(Fixture):
             self.assertNotIn("<<<<<<<", sh(self.content.bare, "show", f"{three.sha}:{path}"))
         self.assertEqual(sh(self.content.clone, "for-each-ref", repair_task.RESOLUTION_PREFIX), "")
         self.assertEqual(list((cfg.root / "worktrees").glob("task-1-lookahead-*")), [])
+        self.assertIn("build Mathlib", self.lake_calls(), "the packages are replayed once for the helpers")
 
     def test_a_chain_that_changes_the_dependencies_gets_no_lookahead(self):
         """Helpers share packages prepared at ``onto``: a member changing ``lake-manifest.json`` turns them off."""
