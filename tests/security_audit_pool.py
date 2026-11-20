@@ -698,6 +698,23 @@ class DurableRanges(PoolFixture):
                 sa.build_batch(self.repo, start, self.shas[-1], shas)
 
 
+class StoppedSequentialRound(PoolFixture):
+    def test_a_finding_in_a_stopped_round_binds_its_commits_for_the_pool(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        attempt = self.state / "attempt-stopped"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        (self.state / "running.json").write_text(sa.serialize({"attempt": str(attempt)}))
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertNotIn(self.shas[0], self.calls_from)
+        self.assertEqual(self.advanced, [])
+        self.assertFalse((self.state / "running.json").exists())
+
+
 class Lookahead(PoolFixture):
     commits = 12
 

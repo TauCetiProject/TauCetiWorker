@@ -239,6 +239,36 @@ class Pool:
         return False
 
     # Window ----------------------------------------------------------------
+    def settle_journal(self) -> None:
+        """Classify a sequential round that stopped mid-inspection before the pool plans over it.
+
+        Any hold its attempt recorded is written to the ledger against its commits, where it binds
+        every range containing them; then the journal is removed."""
+        running = self.work / "running.json"
+        if not running.exists():
+            return
+        attempt = Path(json.loads(running.read_text())["attempt"])
+        stopped = json.loads((attempt / "input.json").read_text())
+        try:
+            hold = evidence.outcome_of(sa.judged(attempt, stopped, "security-audit: interrupted round"), None)
+        except NotJudged:
+            hold = None
+        except Unreadable as exc:
+            hold = {"outcome": "unreadable", "reason": str(exc)}
+        if hold is not None and hold["outcome"] != "not-judged":
+            sa.record(
+                self.work / "ledger.jsonl",
+                {
+                    "from_sha": stopped["from_sha"],
+                    "to_sha": stopped["commits"][-1]["sha"],
+                    "attempt": str(attempt),
+                    "batch": stopped["input_digest"],
+                    "commits": [c["sha"] for c in stopped["commits"]],
+                    **hold,
+                },
+            )
+        running.unlink()
+
     def sync(self, cursor: str, main: str) -> None:
         """Align the window with the remote cursor, restoring the durable list after a restart."""
         before = [slot.record() for slot in self.slots]
@@ -542,6 +572,7 @@ class Pool:
         except BaseException as exc:
             self.observation = exc
             raise
+        self.settle_journal()
         self.sync(cursor, main)
         blocked = self.work / "blocked.json"
         hold = False
