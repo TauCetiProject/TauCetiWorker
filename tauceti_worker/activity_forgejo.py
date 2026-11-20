@@ -102,8 +102,14 @@ def refresh(db, machine, now, errors, env):
                 )
                 db.execute(
                     "UPDATE prs SET state=?,landed=?,observed=?,checked=?,source='forgejo' WHERE repo=? AND number=?",
-                    ("OPEN" if issue["state"] == "open" else "MERGED" if merged else "CLOSED",
-                     _epoch(landed), now, now, key, number),
+                    (
+                        "OPEN" if issue["state"] == "open" else "MERGED" if merged else "CLOSED",
+                        _epoch(landed),
+                        now,
+                        now,
+                        key,
+                        number,
+                    ),
                 )
     except (OSError, ValueError, KeyError, TypeError):
         errors.append("Forgejo PR observations unavailable; retaining last-known data")

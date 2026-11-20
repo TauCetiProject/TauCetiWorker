@@ -584,8 +584,13 @@ class ActivityTests(unittest.TestCase):
         bors = activity_forgejo.BORS_MERGED_PREFIX
         issues = [
             dict(number=5, state="open", title="feat: a", closed_at=None, pull_request=dict(merged=False)),
-            dict(number=6, state="closed", title=bors + "feat: b", closed_at=iso(self.now - 1800),
-                 pull_request=dict(merged=False)),
+            dict(
+                number=6,
+                state="closed",
+                title=bors + "feat: b",
+                closed_at=iso(self.now - 1800),
+                pull_request=dict(merged=False),
+            ),
             dict(number=7, state="open", title="feat: c", closed_at=None, pull_request=dict(merged=False)),
         ]
         branches = {5: "roadmap/a-fleet-11e2756f-3", 6: "roadmap/b-fleet-11e2756f-4", 7: "roadmap/c-fleet-1752e85b-1"}
