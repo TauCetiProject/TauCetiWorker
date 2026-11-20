@@ -147,6 +147,13 @@ def pace_env(provider: str) -> str:
     return f"TAUCETI_PACE_{provider.upper()}"
 
 
+def effective_pace_specs(environ=None) -> dict[str, str]:
+    """Resolved provider curves for status, using the same specificity as the pacer."""
+    env = os.environ if environ is None else environ
+    fallback = (env.get("TAUCETI_PACE") or "").strip() or "60:40"
+    return {provider: (env.get(pace_env(provider)) or "").strip() or fallback for provider in PACE_PROVIDERS}
+
+
 def pace_curve(provider: str | None = None) -> list[tuple[float, float]]:
     """The active pacing curve from $TAUCETI_PACE (read live so --pace / the TUI and loop children all
     see it; parse cached per raw spec). With `provider`, that provider's own variable (see pace_env) is
@@ -2522,4 +2529,7 @@ def quota_line(snap: dict, *, markup: bool = True) -> str:
             soft, why = _unavail_reason(prov)
             glyph = _glyph("~", "yellow", markup) if soft else _glyph("✗", "red", markup)
             parts.append(f"{name} {glyph} ({why})")
+    if parts and any((os.environ.get(pace_env(provider)) or "").strip() for provider in PACE_PROVIDERS):
+        curves = effective_pace_specs()
+        parts.append("pace: " + ", ".join(f"{name} {curves[name]}" for name in PACE_PROVIDERS))
     return "   ".join(parts) if parts else "quota: (not checked)"

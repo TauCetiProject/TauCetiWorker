@@ -2316,6 +2316,7 @@ class Providers(Fixture):
         def claude(self_, *, refresh=False, renew=False):
             seen["pace"] = os.environ.get("TAUCETI_PACE")
             seen["own"] = os.environ.get("TAUCETI_PACE_CLAUDE")
+            seen["other"] = os.environ.get("TAUCETI_PACE_CODEX")
             seen["renew"] = renew
             window = quota.Window("session", 61.0, 70.0, time.time() + 3600, quota.STATUS_OVER_PACE, 55.0)
             return quota.Provider("claude", False, None, [window])
@@ -2330,19 +2331,20 @@ class Providers(Fixture):
             with (
                 patch.object(quota.Quota, "claude", claude),
                 patch.object(quota.Quota, "codex", codex),
-                patch.dict(os.environ, {"TAUCETI_PACE_CLAUDE": "0:100"}),
+                patch.dict(os.environ, {"TAUCETI_PACE_CLAUDE": "0:100", "TAUCETI_PACE_CODEX": "0:90"}),
             ):
                 self.assertEqual(
                     repair_task.subscription_status(cfg, "claude"),
                     (False, "session ahead of pace (70% elapsed: used 61% > 55% pace budget), 39% left"),
                 )
                 self.assertEqual(os.environ.get("TAUCETI_PACE_CLAUDE"), "0:100")
+                self.assertEqual(os.environ.get("TAUCETI_PACE_CODEX"), "0:90")
                 self.assertEqual(
                     repair_task.subscription_status(cfg, "codex"), (True, "under pace (weekly 10% used of 30% budget)")
                 )
             self.assertEqual(
                 seen,
-                {"pace": "0:10,50:70", "own": None, "renew": False},
+                {"pace": "0:10,50:70", "own": None, "other": None, "renew": False},
                 "the task's rate is the pacer's only curve; no token rotation",
             )
             self.assertIsNone(os.environ.get("TAUCETI_PACE"))
@@ -2350,6 +2352,38 @@ class Providers(Fixture):
             ok, reason = repair_task.subscription_status(cfg, "claude")
             self.assertFalse(ok)
             self.assertIn(".credentials.json", reason)
+
+    def test_pacing_environment_is_restored_when_usage_read_fails(self):
+        from tauceti_worker import quota
+
+        original = {
+            "TAUCETI_PACE": "0:80",
+            "TAUCETI_PACE_CLAUDE": "0:90",
+            "TAUCETI_PACE_CODEX": "0:100",
+            "CLAUDE_CONFIG_DIR": "/credentials/claude",
+            "CODEX_HOME": "/credentials/codex",
+        }
+
+        def fail(self_, **kwargs):
+            self.assertEqual(os.environ.get("TAUCETI_PACE"), "60:40")
+            for key in ("TAUCETI_PACE_CLAUDE", "TAUCETI_PACE_CODEX"):
+                self.assertNotIn(key, os.environ)
+            for key in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+                self.assertEqual(os.environ[key], original[key])
+            self.assertFalse(kwargs.get("renew", False))
+            raise RuntimeError("usage unavailable")
+
+        with (
+            patch.dict(os.environ, original),
+            patch.object(repair_task, "subscription_status", self._real_subscription_status),
+            patch.object(quota.Quota, "claude", fail),
+            patch.object(quota.Quota, "codex", fail),
+        ):
+            for provider in ("claude", "codex"):
+                ok, reason = repair_task.subscription_status(self.config(rate="60:40"), provider)
+                self.assertFalse(ok)
+                self.assertIn("usage unavailable", reason)
+                self.assertEqual({key: os.environ.get(key) for key in original}, original)
 
     def test_the_chain_spec(self):
         self.assertEqual(repair_task.parse_providers(None), ("claude", "codex", "api"))

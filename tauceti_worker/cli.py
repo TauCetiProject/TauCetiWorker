@@ -101,6 +101,7 @@ from .quota import (
     _safe_exists,
     claude_dir,
     codex_dir,
+    effective_pace_specs,
     pace_env,
     parse_pace_curve,
 )
@@ -154,7 +155,7 @@ multiple workers (share a host and coordinate through GitHub; a distinct id name
   tauceti work --loop --worker-id alice --only review
   tauceti work --loop --worker-id bob   --only roadmap
 
-environment (flags win; full reference linked below):
+environment (each flag overrides its matching variable; full reference linked below):
   TAUCETI_AGENT          default for --agent
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
   TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
@@ -1336,7 +1337,11 @@ def cmd_status(args) -> int:
     _, quota_snap = Quota(cfg).choose(None)
 
     if getattr(args, "json", False):
-        out = {"survey": dataclasses.asdict(sv), "quota": {k: dataclasses.asdict(v) for k, v in quota_snap.items()}}
+        out = {
+            "survey": dataclasses.asdict(sv),
+            "quota": {k: dataclasses.asdict(v) for k, v in quota_snap.items()},
+            "pace_curves": effective_pace_specs(),
+        }
         if sources is not None:
             out["sources"] = {name: dataclasses.asdict(value) for name, _, value in sources}
         print(json.dumps(out, indent=2, default=str))

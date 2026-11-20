@@ -745,7 +745,10 @@ current usage and why a provider is waiting.
 | `--quota-cmd CMD` | Your own pacer, run as `<cmd> <agent>`: the first stdout token is the model to run; empty output means wait |
 
 `TAUCETI_PACE`, `TAUCETI_PACE_CLAUDE`, `TAUCETI_PACE_CODEX` and
-`TAUCETI_QUOTA_CMD` set the corresponding controls by default. After a Claude
+`TAUCETI_QUOTA_CMD` set the corresponding controls by default. Each pacing flag
+overrides only its matching variable: an inherited provider curve still beats
+`--pace`. Use `--pace-claude=` or `--pace-codex=` to return that provider to the
+global curve. Status displays the effective curves. After a Claude
 window resets, `tauceti` may make one small request to start its usage clock,
 but only after it has found work and confirmed the other window has room.
 [The quota notes](docs/quota.md) cover credential sources, the macOS Keychain,
@@ -754,6 +757,8 @@ and that bootstrap in detail.
 ## Claude API grants
 
 Use explicit API billing with `--claude-billing api` and `--agent claude`.
+API mode rejects subscription pacing settings, including inherited `TAUCETI_PACE*`
+variables; unset them or pass the matching blank pacing flags to clear them.
 Enable `--budget` to share local grants across workers. The
 [budget design](docs/api-budget-plan.md) covers accounting and recovery.
 

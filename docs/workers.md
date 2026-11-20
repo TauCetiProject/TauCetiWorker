@@ -305,6 +305,16 @@ other top-level key is an error, as is any unrecognized field inside a
 | `restart` | string | `"always"` | `always` after any exit, `on-failure` after a nonzero exit, or `never`; explicit restart and re-enable still work |
 | `env` | table of strings | `{}` | Extra environment for this worker's process tree, for settings with no flag of their own. Values must be quoted strings, names POSIX-portable, and the table at most 16 KB. The variables the worker sets itself (`TAUCETI_MANAGED`, `TAUCETI_LOG_FILE`, `TAUCETI_PARENT_PIPE_FD`, `TAUCETI_DATA_HOME`, and the runtime-status path) are rejected. **Not a secret store** — see below |
 
+Each pacing field overrides only its matching environment variable. An inherited
+`TAUCETI_PACE_CLAUDE` still takes precedence over `pace`; use `pace_claude = ""`
+to clear that override and follow the global curve. The same rule applies to
+Codex. `workers status` shows the running worker's captured effective curves;
+stopped workers and pending definitions show configured curves before inheritance.
+API-billed workers reject subscription pacing from the `env` table and pacing
+fields during configuration validation. Inherited settings are rejected in the
+child before credentials are created, so the viewing shell's environment cannot
+invalidate other workers' configuration.
+
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
 without disturbing unchanged workers. Like `workers restart`, a changed

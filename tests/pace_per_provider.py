@@ -11,12 +11,15 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 from tauceti_worker.claude_api import BudgetError, configure_api
 from tauceti_worker.cli import build_parser
+from tauceti_worker.quota import effective_pace_specs
+from tauceti_worker.worker_manager import _pacing_environment, _worker_configuration_lines
 
 fails = 0
 VARS = ("TAUCETI_PACE", "TAUCETI_PACE_CLAUDE", "TAUCETI_PACE_CODEX")
@@ -88,6 +91,40 @@ env(pace="0:100", claude="0:50,100:50")
 check("the other way round: claude at 80% is over its own curve", not claude(80).available)
 check("...and codex at 80% is under $TAUCETI_PACE", codex(80).available)
 
+# Either window can independently stop the same provider; a sibling's curve cannot unblock it.
+for provider in ("claude", "codex"):
+    env(pace="0:100", **{provider: "0:50,100:50"})
+    for blocked in ("session", "weekly"):
+        usages = {"session": 20, "weekly": 20, blocked: 80}
+        if provider == "claude":
+            verdict = q._claude_from_payload(
+                {
+                    "five_hour": {"utilization": usages["session"], "resets_at": iso(2.5 * 3600)},
+                    "seven_day": {"utilization": usages["weekly"], "resets_at": iso(3.5 * 86400)},
+                }
+            )
+        else:
+            verdict = q._codex_from_payload(
+                {
+                    "rate_limit": {
+                        "primary_window": {
+                            "used_percent": usages["session"],
+                            "limit_window_seconds": 18000,
+                            "reset_after_seconds": 9000,
+                        },
+                        "secondary_window": {
+                            "used_percent": usages["weekly"],
+                            "limit_window_seconds": WEEK,
+                            "reset_after_seconds": WEEK // 2,
+                        },
+                    }
+                }
+            )
+        check(
+            f"{provider}: {blocked} independently gates on its own curve",
+            not verdict.available and [w.name for w in verdict.windows if w.status == "over-pace"] == [blocked],
+        )
+
 # --- the wake-up follows the same curve as the block ------------------------------------------------
 # Used 40% at 50% elapsed of a weekly window. Under 0:0,100:100 that is under pace; under 60:40 the
 # budget is 33.3% and reaches 40% at 60% elapsed, a tenth of the window away.
@@ -99,6 +136,11 @@ check("...and wakes where that curve frees it", abs(wake - (WEEK / 10 + tc.PACE_
 env(pace="0:50,100:50", codex="60:40")
 wake = codex(40).next_eligible - time.time()
 check("...whatever $TAUCETI_PACE says about the same window", abs(wake - (WEEK / 10 + tc.PACE_EASE_S)) < 5)
+env(pace="0:100", claude="60:40")
+wake = claude(40).next_eligible - time.time()
+check(
+    "Claude wakes when the first blocked window frees on its own curve", abs(wake - (18000 / 10 + tc.PACE_EASE_S)) < 5
+)
 
 # --- an idle Claude window reads Claude's curve -----------------------------------------------------
 IDLE = {"five_hour": None, "seven_day": {"utilization": 10, "resets_at": iso(3.5 * 86400)}}
@@ -142,6 +184,18 @@ check("a command that cannot override does not install", resolved("workers", pac
 env(pace="0:50,100:50", claude="0:100")
 check("a blank flag returns the provider to --pace", resolved("work", pace_claude="")[1] == "")
 check("...in the pacer's reading as well", tc.pace_curve("claude") == FLAT)
+for command in ("work", "_round"):
+    env(claude="0:100", codex="0:50,100:50")
+    resolved(command, pace="60:40")
+    check(
+        f"{command}: inherited provider curves beat a global flag",
+        tc.pace_curve("claude") == OPEN and tc.pace_curve("codex") == FLAT,
+    )
+    resolved(command, pace_claude="")
+    check(
+        f"{command}: a blank own flag restores fallback without touching its sibling",
+        tc.pace_curve("claude") == DEFAULT and tc.pace_curve("codex") == FLAT,
+    )
 env()
 
 # --- workers.toml ------------------------------------------------------------------------------------
@@ -163,6 +217,89 @@ check("a worker without them passes neither flag", not any(a.startswith("--pace"
 check(
     "a provider curve changes the fingerprint",
     tc.WorkerSpec.from_dict({"id": "w1", "pace_codex": "0:100"}, 0).fingerprint() != plain.fingerprint(),
+)
+reset = tc.WorkerSpec.from_dict({"id": "w1", "pace_claude": ""}, 0)
+check(
+    "an explicit blank survives serialization and argv",
+    reset.as_dict()["pace_claude"] == "" and build_parser().parse_args(reset.work_argv()[3:]).pace_claude == "",
+)
+check("an explicit blank changes the fingerprint", reset.fingerprint() != plain.fingerprint())
+env(claude="0:100", codex="0:50,100:50")
+configured = tc.WorkerSpec.from_dict(
+    {"id": "w1", "pace": "60:40", "pace_claude": "", "env": {"TAUCETI_PACE_CODEX": "0:90"}}, 0
+)
+check(
+    "manager resolves inherited, env-table and matching flags",
+    effective_pace_specs(_pacing_environment(configured.as_dict())) == {"claude": "60:40", "codex": "0:90"},
+)
+status = "\n".join(_worker_configuration_lines({"spec": configured.as_dict()}, 120))
+check(
+    "stopped manager status labels configuration-only curves", "configured curves: claude 60:40, codex 0:90" in status
+)
+live = {
+    "spec": configured.as_dict(),
+    "alive": True,
+    "spec_hash": "same",
+    "actual_spec_hash": "same",
+    "pace_curves": {"claude": "0:70", "codex": "0:80"},
+}
+status = "\n".join(_worker_configuration_lines(live, 120))
+check(
+    "live status uses the runner's captured environment, not the viewing shell",
+    "effective curves: claude 0:70, codex 0:80" in status,
+)
+status = "\n".join(_worker_configuration_lines({**live, "actual_spec_hash": "older"}, 120))
+check("pending definitions do not borrow old runtime curves", "configured curves: claude 60:40, codex 0:90" in status)
+summary = tc.quota_line({"claude": claude(10)}, markup=False)
+check("quota status shows inherited provider curves", "pace: claude 0:100, codex 0:50,100:50" in summary)
+env()
+for variable in VARS:
+    for inherited in (False, True):
+        env()
+        raw = {"id": "w1", "agent": "claude", "claude_billing": "api"}
+        if inherited:
+            os.environ[variable] = "0:100"
+        else:
+            raw["env"] = {variable: "0:100"}
+        try:
+            tc.WorkerSpec.from_dict(raw, 0)
+            check(
+                f"API config rejects owned pacing; inherited pacing waits for child validation ({variable}, {inherited=})",
+                inherited,
+            )
+        except tc.WorkersError as e:
+            check(
+                f"API config rejects owned pacing; inherited pacing waits for child validation ({variable}, {inherited=})",
+                not inherited and "subscription quota overrides" in str(e),
+            )
+    for command in ("work", "_round"):
+        env()
+        os.environ[variable] = "0:100"
+        args = build_parser().parse_args([command, "--agent", "claude", "--claude-billing", "api"])
+        tc.cli.resolve_pace(command, args)
+        with patch(
+            "tauceti_worker.claude_api.budget_dir", side_effect=AssertionError("must reject before credentials")
+        ):
+            try:
+                configure_api(args, "claude")
+                check(f"API {command} rejects inherited {variable}", False)
+            except BudgetError as e:
+                check(f"API {command} rejects inherited {variable}", "subscription pacing" in str(e))
+env(claude="0:100")
+check(
+    "an explicit blank can clear inherited API pacing",
+    tc.WorkerSpec.from_dict({"id": "w1", "agent": "claude", "claude_billing": "api", "pace_claude": ""}, 0).pace_claude
+    == "",
+)
+env()
+try:
+    tc.WorkerSpec.from_dict({"id": "w1", "env": {"TAUCETI_PACE_CODEX": "bad"}}, 0)
+    check("malformed env-table pacing fails at config boundary", False)
+except tc.WorkersError as e:
+    check("malformed env-table pacing fails at config boundary", "env.TAUCETI_PACE_CODEX" in str(e))
+check(
+    "its matching field overrides malformed env-table pacing",
+    tc.WorkerSpec.from_dict({"id": "w1", "env": {"TAUCETI_PACE_CODEX": "bad"}, "pace_codex": ""}, 0).pace_codex == "",
 )
 try:
     tc.WorkerSpec.from_dict({"id": "w1", "agent": "claude", "claude_billing": "api", "pace_claude": "0:100"}, 0)

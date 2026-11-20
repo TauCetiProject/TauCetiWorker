@@ -360,7 +360,11 @@ CODEX_HOME=~/.codex-tauceti tauceti work --agent codex --account you@example.com
 
 ## Environment variables
 
-Flags win over these. Most are tuning knobs with sane defaults.
+Each flag overrides its matching variable. A provider-specific pacing curve is
+more specific than the global curve even when inherited: `TAUCETI_PACE_CLAUDE`
+still applies beside `--pace`. Use `--pace-claude=` (or `pace_claude = ""` in
+workers.toml) to clear that override and return Claude to the global curve.
+Most variables are tuning knobs with sane defaults.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -438,6 +442,11 @@ of subscription quota pacing. Supply `ANTHROPIC_API_KEY` or
 `--anthropic-api-key-file PATH`. Add `--budget` to consult the user-level grant
 ledger immediately before each paid Claude invocation. These settings are
 propagated through loop children, managed workers, reviewers, and Bubble.
+
+API billing rejects subscription pacing controls, including nonempty inherited
+`TAUCETI_PACE`, `TAUCETI_PACE_CLAUDE` and `TAUCETI_PACE_CODEX`. Clear them in the
+environment or with their matching blank flags (`--pace=`, `--pace-claude=`,
+`--pace-codex=`) before starting an API worker.
 
 `tauceti budget --grant USD` adds credit; `--set-grant USD` sets the current
 balance through an adjustment; `--grant-rate USD_PER_HOUR` changes automatic
