@@ -13,6 +13,8 @@ defining module path):
 | `audit-driver: import TauCeti.X failed, environment already contains '...' from M` | `audit` (duplicate declaration) on `TauCeti.X`, and on `M` when it is a project module |
 | `duplicate-declarations: name is declared in both M and N` | `audit` on the project modules |
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON findings) | `lint` on the defining path, `unknown` kept when the linter could not locate it |
+| `TauCeti/A/B.lean:12:0: error: dot-notation namespace lint: D puts ...` | `lint` (`dot-notation`) on `TauCeti.A.B`, declaration `D` |
+| `error: TauCeti/A/B.lean:12: ...` (the style lint's text linters, which give no column) | `lint` (`style`) on `TauCeti.A.B` |
 | `Some required targets logged failures:` followed by `- TauCeti.A.B` lines | `compiler` on each target, only when no located finding exists |
 | `TauCeti/A.lean: missing project import ...` and other located import-header findings | `compiler` on the importing module |
 | `MEMBER-POLICY-REJECTED {...}` (the source member review-size policy's JSON record of one member) | `policy` naming that member by its accepted head and source identity |
@@ -36,6 +38,14 @@ PATH = r"TauCeti(?:/[A-Za-z0-9_\-]+)+\.lean"
 MODULE = r"TauCeti(?:\.[A-Za-z0-9_]+)+"
 SOURCE = re.compile(r"^(?:error: )?(" + PATH + r"):(\d+):(\d+):\s*(?:error:|error\b)")
 LAKE = re.compile(r"^error: (" + PATH + r"):(\d+):(\d+):")
+# The lint scripts print located findings in the compiler's shape; these are lint findings.
+DOT_NOTATION = re.compile(r"^(" + PATH + r"):(\d+):\d+: error: dot-notation namespace lint: (\S{1,1024}) ")
+STYLE = re.compile(r"^error: (?:\./)?(" + PATH + r"):(\d+): (.+)$")
+# Their `linter` names; the environment lint driver cannot check these.
+SOURCE_LINTERS = ("dot-notation", "style")
+# The style lint's header check (TauCetiTools `HeaderStyle.lean`) prints `path: message`. Other
+# scripts use that shape too (`check-imports.py`), so only the style lint's own output is read for it.
+HEADER_STYLE = re.compile(r"^(" + PATH + r"): (.+)$")
 ANY_MODULE = r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*"
 # The second module is the earlier definition: a project module, or a dependency's (a Mathlib bump can
 # add a declaration a project module already defines). Findings name only the project modules.
@@ -132,6 +142,36 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
                         _finding("audit", module, line, path=path_of(module), declaration=dup.group(1)),
                     )
             continue
+        if (dot := DOT_NOTATION.match(line)) and len(dot.group(1)) <= 512:
+            path = dot.group(1)
+            located.setdefault(
+                ("lint", path, dot.group(3)),
+                _finding(
+                    "lint",
+                    module_of(path),
+                    line,
+                    path=path,
+                    linter="dot-notation",
+                    declaration=dot.group(3),
+                    line_number=int(dot.group(2)),
+                ),
+            )
+            continue
+        if (style := STYLE.match(line)) and len(style.group(1)) <= 512:
+            path = style.group(1)
+            located.setdefault(
+                ("lint", path, style.group(2), style.group(3)[:MAX_MESSAGE]),
+                _finding(
+                    "lint",
+                    module_of(path),
+                    line,
+                    path=path,
+                    linter="style",
+                    declaration=style.group(3),
+                    line_number=int(style.group(2)),
+                ),
+            )
+            continue
         source = SOURCE.match(line) or LAKE.match(line)
         if source and len(source.group(1)) <= 512:
             path = source.group(1)
@@ -168,6 +208,18 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
     findings = list(located.values()) or list(fallback.values())
     if runner_lost is not None:
         findings.append(runner_lost)
+    return findings
+
+
+def header_style_findings(lines: Iterable[str]) -> list[dict]:
+    """The style lint's located copyright-header findings, from that script's output only."""
+    findings = []
+    for line in lines:
+        if (header := HEADER_STYLE.match(line.rstrip("\r\n"))) and len(header.group(1)) <= 512:
+            path = header.group(1)
+            findings.append(
+                _finding("lint", module_of(path), line, path=path, linter="style", declaration=header.group(2))
+            )
     return findings
 
 

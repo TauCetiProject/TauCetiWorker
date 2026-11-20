@@ -92,6 +92,7 @@ RUN_STDLIB=(
   native_self_tested.py
   authoring_profiles.py
   bubble_cache.py
+  bubble_mounts.py
   cache_probe_user_agent.py
   bubble_version.py
   branch_claim_repo.py
@@ -153,6 +154,7 @@ RUN_STDLIB=(
   open_pr_pages.py
   overlaps.py
   pace_curve.py
+  pace_per_provider.py
   pr_targeting.py
   preflight_review_lake.py
   prices.py
@@ -241,6 +243,7 @@ RUN_STDLIB=(
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
+  roadmap_claim_namespace.py
   round_crash_reasons.py
   round_file_changes.py
   round_group_sweep.py
@@ -253,6 +256,8 @@ RUN_STDLIB=(
   security_audit_served.py
   security_audit_pool.py
   security_audit_claude.py
+  security_audit_watchdog.py
+  security_audit_evidence.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py

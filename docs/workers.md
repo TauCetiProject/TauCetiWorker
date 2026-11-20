@@ -36,6 +36,13 @@ an already-started agent session runs to completion. Workers report
 `waiting-capacity` while draining instead of being terminated. Workers without
 the environment variable behave as before.
 
+Each round also records, in the worker's runtime status, the authoring
+backpressure it enforces: `authoring` holds the open non-draft PRs it counts as
+its own on every healthy source (`sources`, `count`), the `limit`, whether roadmap
+authoring is `blocked`, the roadmap `scope` the count covers and its `skip`
+list, and `observed_at`. The count comes from that round's own survey, so it is
+current on any forge. A starting loop clears the previous report.
+
 `TAUCETI_FLEET_MACHINE_ID` and `TAUCETI_FLEET_EVENTS` opt into a private JSONL
 provenance journal. Successful PR creation and GitHub mutations record machine,
 worker, repository and PR identity. Branch pushes record assistance when the PR
@@ -299,10 +306,21 @@ other top-level key is an error, as is any unrecognized field inside a
 | `author_model` | string | unset | Exact authoring model. Requires an `agent` other than `auto` |
 | `author_effort` | string | unset | Authoring reasoning effort for Codex, Claude, or Kiro. Requires an explicit `agent` |
 | `pace` | string | unset | Pacing curve as `time%:budget%` points, for example `0:10,50:70,90:90`; rejected by `apply --check` if malformed |
+| `pace_claude`, `pace_codex` | string | unset | Pacing curve for that provider's windows only, in the form `pace` takes and checked the same way. A provider without one follows `pace`; meant for an `auto` worker whose two subscriptions should be spent at different rates |
 | `stream` | bool | `false` | Keep the agent transcript in the console log instead of a separate file |
 | `isolate_home` | bool | `false` | Force credential isolation for the id `default`; every other id already enables it |
 | `restart` | string | `"always"` | `always` after any exit, `on-failure` after a nonzero exit, or `never`; explicit restart and re-enable still work |
 | `env` | table of strings | `{}` | Extra environment for this worker's process tree, for settings with no flag of their own. Values must be quoted strings, names POSIX-portable, and the table at most 16 KB. The variables the worker sets itself (`TAUCETI_MANAGED`, `TAUCETI_LOG_FILE`, `TAUCETI_PARENT_PIPE_FD`, `TAUCETI_DATA_HOME`, and the runtime-status path) are rejected. **Not a secret store** — see below |
+
+Each pacing field overrides only its matching environment variable. An inherited
+`TAUCETI_PACE_CLAUDE` still takes precedence over `pace`; use `pace_claude = ""`
+to clear that override and follow the global curve. The same rule applies to
+Codex. `workers status` shows the running worker's captured effective curves;
+stopped workers and pending definitions show configured curves before inheritance.
+API-billed workers reject subscription pacing from the `env` table and pacing
+fields during configuration validation. Inherited settings are rejected in the
+child before credentials are created, so the viewing shell's environment cannot
+invalidate other workers' configuration.
 
 The manager fingerprints each definition. It stops a worker when `enabled`
 becomes false and restarts an enabled worker when any other field changes,
@@ -597,6 +615,7 @@ entry with `enabled = true`.
 | `--author-model MODEL` | `author_model` |
 | `--author-effort EFFORT` | `author_effort`; Codex, Claude, or Kiro only |
 | `--pace CURVE` | `pace` |
+| `--pace-claude CURVE`, `--pace-codex CURVE` | `pace_claude`, `pace_codex` |
 | `--stream` | `stream` |
 | `--isolate-home` | `isolate_home`; useful when the id is `default` |
 
@@ -702,6 +721,26 @@ action that names a different `--config` file reports the conflict instead of
 switching it.
 
 That is a systemd user service on Linux and NixOS, or a LaunchAgent on macOS.
+On Linux the service runs in `tauceti-workers.slice` and each worker moves itself
+into its own transient scope there, as Fleet workers do. Restarting the service (to
+adopt a new Worker runtime, for example) then adopts the running workers instead of
+stopping their rounds. A service installed before this change keeps its workers in the
+service itself: rerun `tauceti workers service install` and restart the service once,
+at a quiet moment, to move to scopes.
+
+The installer also writes `tauceti-workers.slice`. Limits set there cover the manager
+and every worker scope together, so set them on the slice rather than with
+`systemctl set-property` on the service, which worker scopes escape:
+
+```bash
+tauceti workers service install --cpu-quota 3200% --memory-high 48G
+```
+
+`--cpu-quota`, `--memory-high` and `--memory-max` take systemd's `CPUQuota=`,
+`MemoryHigh=` and `MemoryMax=` values. A later install without an option keeps the
+installed value, and an empty value (`--memory-high ''`) removes it. The install
+reloads systemd, which applies new limits to running workers without a restart.
+
 Two platform caveats:
 
 - On Linux systems that stop the user manager after the last logout,

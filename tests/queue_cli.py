@@ -346,6 +346,25 @@ class StatusCommand(Base):
             build_progress.lookup("41934607574", 1, lambda *_a, **_k: next(documents))["completed_tasks"], 103917
         )
 
+    def test_requests_name_their_client_because_ci_data_refuses_urllibs_default(self):
+        seen = []
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        def urlopen(request, timeout=None):
+            seen.append(request.get_header("User-agent"))
+            return Response(b"{}")
+
+        with mock.patch.object(cli.urllib.request, "urlopen", urlopen):
+            self.assertEqual(cli.fetch_json(build_progress.MANIFEST, timeout=3), {})
+        self.assertEqual(seen, [cli.USER_AGENT])
+        self.assertNotIn("urllib", cli.USER_AGENT.lower())
+
     def test_unavailable_build_progress_leaves_the_running_step(self):
         for failure in (ConnectionRefusedError("down"), RuntimeError("HTTP 500"), {"schema": "other"}):
 

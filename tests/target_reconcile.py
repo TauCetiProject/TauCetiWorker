@@ -353,15 +353,26 @@ class Publish(Tmp):
         self.assertIsNone(reconcile.publish(first, tick("strong-law")))
         self.assertEqual(self.remote(), EXAMPLE)
 
-    def test_a_check_on_the_committed_list_refuses_what_a_hook_changed(self):
+    def test_a_hook_that_rewrites_the_list_stops_publication(self):
         first = self.clone("first")
         self.hook(
             first,
             "pre-commit",
             "sed 's/the strong law for/the weak law for/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
         )
-        self.assertIsNone(reconcile.publish(first, tick("strong-law"), check=lambda text: "the strong law for" in text))
+        self.assertIsNone(reconcile.publish(first, tick("strong-law")))
         self.assertEqual(self.remote(), EXAMPLE)
+
+    def test_a_list_the_remote_turned_into_a_symlink_is_not_followed(self):
+        first, second = self.clone("first"), self.clone("second")
+        outside = self.tmp / "outside.md"
+        outside.write_text(EXAMPLE)
+        second.unlink()
+        second.symlink_to(outside)
+        git(second.parent, "commit", "-q", "-am", "link")
+        git(second.parent, "push", "-q", "origin", "HEAD:main")
+        self.assertIsNone(reconcile.publish(first, tick("strong-law")))
+        self.assertEqual(outside.read_text(), EXAMPLE)
 
     def test_a_tracked_list_keeps_its_own_git_settings_inside_a_source_activation(self):
         from tauceti_worker.source_identity import SourceActor
@@ -485,6 +496,37 @@ class TrackedRound(Tmp):
         self.github(merged=[(7, marker("Probability", "strong-law"))])
         self.assertIsNone(self.look())
         self.assertEqual(self.remote(), EXAMPLE)
+
+    def test_a_relative_pre_push_hook_of_the_clone_still_runs(self):
+        git(self.first.parent, "config", "core.hooksPath", ".local-hooks")
+        directory = self.first.parent / ".local-hooks"
+        directory.mkdir()
+        (directory / "pre-push").write_text("#!/bin/sh\nexit 1\n")
+        (directory / "pre-push").chmod(0o755)
+        self.github(merged=[(7, marker("Probability", "strong-law"))])
+        self.assertIsNone(self.look())
+        self.assertEqual(self.remote(), EXAMPLE)
+
+    def test_a_hook_that_adds_a_partial_clause_stops_publication(self):
+        self.hook(
+            self.first.parent / ".git" / "hooks",
+            "sed 's/landed: #7)/landed: #7; partial: #7)/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
+        )
+        self.github(merged=[(7, marker("Probability", "strong-law"))])
+        self.assertIsNone(self.look())
+        self.assertEqual(self.remote(), EXAMPLE)
+
+    def test_extra_commits_a_post_commit_hook_makes_are_not_pushed(self):
+        hooks = self.first.parent / ".git" / "hooks"
+        (hooks / "post-commit").write_text(
+            "#!/bin/sh\ngrep -q 'generated' targets.md && exit 0\n"
+            "printf 'formatted notes\\n' > notes.md && git commit -q -m 'format notes' -- notes.md\n"
+            "echo '> generated' >> targets.md && git commit -q -m 'generated' -- targets.md\n"
+        )
+        (hooks / "post-commit").chmod(0o755)
+        self.github(merged=[(7, marker("Probability", "strong-law"))])
+        self.assertIsNone(self.look())
+        self.assertEqual((self.remote(), self.remote("notes.md")), (EXAMPLE, "notes\n"))
 
     def test_a_hook_that_stages_another_file_is_not_pushed(self):
         self.hook(self.first.parent / ".git" / "hooks", "printf 'formatted notes\\n' > notes.md\ngit add '*.md'\n")

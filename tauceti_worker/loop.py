@@ -94,6 +94,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         roadmap_focus=None,
         roadmap_target=None,
         next_action_at=None,
+        authoring=None,  # a new loop's sources or limits may differ; its first round reports afresh
     )
     streak = 0
     admission_streak = 0

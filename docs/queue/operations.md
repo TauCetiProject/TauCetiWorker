@@ -130,6 +130,7 @@ build and how long each phase took, and makes placement decisions from those mea
 | `~/.config/tauceti-queue/github-app.json`, `github-private-key.pem`, `github-webhook-secret` | the App credentials (GitHub App section) |
 | `~/.config/systemd/user/tauceti-queue.service` | the service unit, copied from `services/queue/` by the installer |
 | `~/.config/systemd/user/tauceti-queue-backup.{service,timer}` | the daily backup |
+| `~/.config/systemd/user/tauceti-queue-clone-maintenance.{service,timer}` | the hourly Git maintenance of the content clone |
 | `~/.config/systemd/user/tauceti-queue-repair.service`, `~/.config/tauceti-queue/repair-environment` | the repair worker unit and its environment file (Repair worker below), on the host that runs repair tasks |
 | `~/.local/state/tauceti-queue/queue.sqlite3` (+ `-wal`, `-shm`) | the database: approved inputs, batches, claims, CI attempts, pending side effects, settings |
 | `~/.local/state/tauceti-queue/backups/` | dated online backups |
@@ -500,9 +501,20 @@ included, and the background publisher's transient unit is started in the same s
 settings. The slice weight is what counts against the VMs: the cgroup CPU controller shares a busy
 host between sibling slices by weight, so a reniced process in `app.slice` competes as `app.slice`
 does. The weights are work-conserving, so repairs slow down under a staging build and never stop.
+Inside the slice the head batch's work comes first: the repair units set no CPU weight of their own, so
+the slice enables no CPU controller for them and all repair processes share its CPU by niceness, and
+during a background task (`prepare` or `pre_rebase`, work for a later batch) every sandboxed build,
+the agent's included, runs at niceness 19 (`repair_sandbox.prioritized`). Giving a repair unit a CPU
+weight would make each unit a separate CPU group and end this ordering.
 Disk traffic is ordered only where the block layer honours cgroup weights or IO priorities (BFQ,
 mq-deadline, or io.cost configured for the device); tauchonki2's devices use `none`, so there
-nothing orders it. A `renice` by hand affects only the thread it names, not the other threads of a
+nothing orders it. The slice's `MemoryHigh=48G` (with no `MemoryMax`) is a reclaim threshold that
+reduces how hard the repairs' memory, mostly file cache, presses on a staging build: above it the
+kernel reclaims from the slice and slows its allocations; crossing it does not itself invoke the OOM
+killer, though host-wide pressure still can. The compiler wrapper ignores `memory.high`, so a repair
+working set above it (compilers plus the `.olean` files they map) thrashes rather than waiting. If
+repairs slow down, read the slice's `memory.pressure`, `memory.events` (`high`) and swap activity,
+and raise the value or reduce repair concurrency. A `renice` by hand affects only the thread it names, not the other threads of a
 multithreaded process such as `lake` or the worker, nor their later children.
 
 Queue repair sessions using Claude (subscription or API) give Bash EOF on its default stdin.
@@ -831,6 +843,24 @@ chosen backup to `queue.sqlite3`, start the service, and check `/status` shows t
 approved inputs. Pending GitHub side effects are replayed by their idempotency keys; a restored store
 that is older than GitHub reconciles on restart, which is the same path as recovery from a crash.
 
+## Clone maintenance
+
+The controller fetches, writes refs and builds chains in its content clone constantly, so the clone
+needs Git maintenance, and Git's automatic maintenance does not suit it: it ran detached from the
+controller's fetches inside the service, where a restart could kill it and leave
+`objects/maintenance.lock` behind, after which Git silently skipped every later run. By 19 November
+loose refs, loose objects and thousands of packs had made each fetch of a new PR head take 20 to
+30 s. The installer therefore sets `maintenance.auto false` in the clone and enables
+`tauceti-queue-clone-maintenance.timer`, which runs `services/queue/clone-maintenance.sh` hourly at
+the lowest CPU and I/O priority. The script runs only tasks that are safe beside a live user of the
+repository (`pack-refs`, `loose-objects`, `incremental-repack`, `commit-graph`), never `gc` or a
+prune of unreachable objects the queue may still reference. A maintenance lock older than six hours
+that no running Git maintenance holds is removed first. To run it by hand:
+
+```sh
+nice -n 19 ionice -c3 ~/TauCetiQueue/services/queue/clone-maintenance.sh
+```
+
 ## Verification after a deploy
 
 After every `install.sh` (and after any restart), in this order:
@@ -911,12 +941,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `pre_rebase_enabled` | `true` | `true` or `false` |
 | `prepare_pre_rebased` | `true` | `true` or `false` |
 | `withdraw_emptied_at_adoption` | `true` | `true` or `false` ([reject-empty-commits.md](reject-empty-commits.md)) |
-| `failure_repeat_limit` | `2` | integer, at least 0; 0 disables ([escalation.md](escalation.md)) |
-| `repair_fruitless_claim_limit` | `3` | integer, at least 0; 0 disables |
-| `source_failure_round_limit` | `6` | integer, at least 0; 0 disables |
-| `policy_rejection_withdraw` | `true` | `true` or `false` |
-| `attribution_max_members` | `10` | integer, at least 0; 0: no bound |
-| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff |
+| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff ([escalation.md](escalation.md)) |
 | `automatic_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
 | `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
@@ -927,7 +952,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `forgejo_recheck_seconds` | `21600` | integer, at least 0; a settled Forgejo PR whose listed facts are unchanged is evaluated again this long after its last attempt ([mixed-sources.md](mixed-sources.md)) |
 | `control_lane_enabled` | `false` | `true` or `false`; stage GitHub control-file PRs in their own lane batch ([mixed-sources.md](mixed-sources.md), "The control-file lane") |
 
-Escalations (withdrawals, bisections, the start and end of an infrastructure backoff) are sent as Zulip direct messages when
+Escalations (the start and end of an infrastructure backoff) are sent as Zulip direct messages when
 `TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
 configuration file; see [escalation.md](escalation.md), "Alerts and notifications".
 
@@ -1041,8 +1066,12 @@ comment or explicit operator approval is required. Missing withdrawal history is
 `status.admission` reports the active source, policy digest, pending count, oldest pending time,
 and pending PRs with attempt time, retry deadline, resource and last error. The existing
 `approvals.last_poll` field carries the intake summary. Successful decisions are journaled as
-`admission-evaluated`, including their reason; `admission_evaluations` and `admission_approvals`
-count completed work. `tauceti-queue reconcile-approvals` wakes this same intake path for diagnosis;
+`admission-evaluated`, including their reason and where the evaluation's time went: `seconds` in
+all, `read_seconds` reading the source, `fetch_seconds` of that fetching into the clone, and
+`lock_seconds` waiting for the controller lock. Each completed discovery pass is journaled as
+`admission-discovered` with the open PRs it listed, its pages, its `seconds`, and the
+`evaluation_seconds` it spent on the urgent evaluations made between pages.
+`admission_evaluations` and `admission_approvals` count completed work. `tauceti-queue reconcile-approvals` wakes this same intake path for diagnosis;
 routine progress does not require that command.
 
 To switch an existing eligibility deployment, back up the database, verify its process supervisor,
