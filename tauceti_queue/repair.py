@@ -675,22 +675,27 @@ def recommit_resolution(
         parent_tree = chain_tool.tree_of(clone, resolved.parents[0]) if len(resolved.parents) == 1 else None
     except chain_tool.ChainError:
         return None
-    author = (original.author_name, original.author_email, original.author_date)
-    if (
-        parent_tree != chain_tool.tree_of(clone, prefix)
-        or not resolved.message.startswith(original.message.rstrip() + "\n")
-        or (resolved.author_name, resolved.author_email, resolved.author_date) != author
+    if parent_tree != chain_tool.tree_of(clone, prefix) or not resolved.message.startswith(
+        original.message.rstrip() + "\n"
     ):
         return None
-    sha = chain_tool.commit_tree(
-        clone,
-        resolved.tree,
-        prefix,
-        resolved.message,
-        (original.author_name, original.author_email),
-        author_date=original.author_date,
-        committer_date=original.author_date,
-    )
+
+    def recommit(parent: str) -> str:
+        return chain_tool.commit_tree(
+            clone,
+            resolved.tree,
+            parent,
+            resolved.message,
+            (original.author_name, original.author_email),
+            author_date=original.author_date,
+            committer_date=original.author_date,
+        )
+
+    # Only a commit made exactly as the worker makes one (author, committer and dates) is reused, not
+    # one an agent made with `git commit` and pointed a ref at.
+    if recommit(resolved.parents[0]) != stored:
+        return None
+    sha = recommit(prefix)
     explained = bool(chain_tool.appended_text(original.message, resolved.message).strip())
     return sha, resolution_report(clone, prefix, sha, original, paths, large_refactors, explained=explained)
 

@@ -1695,8 +1695,9 @@ class RebaseArtifacts(Fixture):
 
     def test_a_stopped_task_resumes_after_its_last_resolution(self):
         """The worker stops while the agent resolves member 3, after member 2's resolution was accepted.
-        Another worker sharing the clone re-claims the task: member 2's conflict is not given to the
-        agent again, and the submitted chain is the one an uninterrupted run builds."""
+        Another worker sharing the clone re-claims the task later, so its replay makes the same prefix
+        under another SHA: member 2's conflict is not given to the agent again, and the submitted chain
+        is the one an uninterrupted run builds."""
         seed = self.content.bare.parent / "seed"
         sh(seed, "checkout", "--quiet", "--detach", self.onto)
         moved = commit(seed, "main moved again", {"TauCeti/Three.lean": "-- three, on main\n"})
@@ -1706,6 +1707,13 @@ class RebaseArtifacts(Fixture):
         dates = patch.dict(os.environ, {"GIT_COMMITTER_DATE": "1700000000 +0000"})
         dates.start()
         self.addCleanup(dates.stop)
+
+        def contents(tip: str) -> list[tuple]:
+            return [
+                (c.tree, c.message, c.author_name, c.author_date)
+                for c in chain_tool.chain_commits(clone, self.onto, tip)
+            ]
+
         clone = self.content.clone
         stored = lambda: sh(clone, "for-each-ref", "--format=%(refname)", repair_task.RESOLUTION_PREFIX).split()  # noqa: E731
 
@@ -1736,8 +1744,11 @@ class RebaseArtifacts(Fixture):
         self.assertEqual((outcome["status"], outcome["reason"]), ("released", "worker-stopped"), outcome)
         self.assertIn("PR #3's commit", self.agent_calls()[3]["prompt"], "stopped in the second conflict")
         self.assertEqual(len(stored()), 1, "member 2's accepted resolution is recorded")
+        recorded = sh(clone, "rev-parse", stored()[0])
+        self.assertEqual(recorded, reference[1].sha, "the run before the stop made the reference's commit")
 
         os.environ.pop("STUB_AGENT_MODES")
+        os.environ["GIT_COMMITTER_DATE"] = "1700003600 +0000"  # the restart replays an hour later
         other = self.config(root=self.root / "state-b", worker="worker-b@test")
         outcome = repair_task.claim_and_run(other, self.client(other))
         self.assertEqual(outcome["status"], "adopted", outcome)
@@ -1747,7 +1758,8 @@ class RebaseArtifacts(Fixture):
         self.assertNotIn(f"PR #2's commit `{self.content.members[1]['commit'][:12]}`", calls[4]["prompt"])
         self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True, False])
         resumed = chain_tool.chain_commits(clone, self.onto, outcome["tip"])
-        self.assertEqual([c.sha for c in resumed], [c.sha for c in reference], "the same chain")
+        self.assertNotEqual(resumed[0].sha, reference[0].sha, "the prefix was replayed under another SHA")
+        self.assertEqual(contents(outcome["tip"]), contents(reference[-1].sha), "the same chain")
         self.assertEqual(stored(), [])
 
     def test_a_stored_resolution_that_does_not_match_is_not_used(self):

@@ -2472,7 +2472,8 @@ def resolve_conflicts(
                     "reason": f"{source_pr}: the conflict stays unresolved\n{format_report(report)}",
                     "resolved": resolved,
                 }
-            store_resolution(cfg.clone, task.task_id, commit, prefix, tip)
+            if not cancel.is_set():  # a worker that lost its claim records nothing for the next claimant
+                store_resolution(cfg.clone, task.task_id, commit, prefix, tip)
             resolved.append({"source_pr": source_pr, "commit": commit, "resolved": tip})
             result = rest
         git(worktree, "checkout", "--quiet", "--force", "--detach", result.tip)

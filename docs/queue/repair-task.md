@@ -165,9 +165,11 @@ agent; a stored resolution is committed again on the current prefix as `commit_r
 commit the same files and explanation (`repair.recommit_resolution`: its tree and message, the
 conflicting commit's author and date) and goes through every check above. When it passes, the replay
 continues from it and the agent is not run for that conflict (the outcome's `conflicts` entry has
-`reused: true`); an entry that is missing, names a commit that is not a resolution of this commit on a
-prefix with this tree, or fails a check is deleted and the conflict goes to the agent as before. The
-agent still sees one commit and never replays. The task's entries are deleted once the service has
+`reused: true`). An entry that is missing, names a commit that is not a resolution of this commit on a
+prefix with this tree, was not made exactly as the worker makes one (author, committer and dates, so
+not a commit an agent made with `git commit`), or fails a check is deleted and the conflict goes to the
+agent as before. The agent still sees one commit and never replays. A worker whose claim was lost
+records nothing. The task's entries are deleted once the service has
 answered its submission, and when the whole chain fails the worker's local checks (a rerun would
 rebuild the same chain without the agent). Entries of a task that is never claimed again stay in the
 clone like its `refs/tauceti-queue/task/<id>/...` refs; they are a few commit objects.
