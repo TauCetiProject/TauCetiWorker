@@ -39,9 +39,9 @@ WHEN = ("after", "before", "off")  # TAUCETI_REPAIR_PUBLISH: after the submissio
 NICE = 10  # the niceness of the rehash and the upload
 # A publisher in a transient unit starts from the user manager, not the worker, so it inherits none
 # of the worker unit's priority: it joins the workers' slice (services/queue/tauceti-repair.slice)
-# and takes the same niceness and IO class as services/queue/tauceti-queue-repair.service.
+# and takes the same niceness, IO class and OOM score as services/queue/tauceti-queue-repair.service.
 SLICE = "tauceti-repair.slice"
-UNIT_PRIORITY = ("Nice=10", "IOSchedulingClass=best-effort", "IOSchedulingPriority=7")
+UNIT_PRIORITY = ("Nice=10", "IOSchedulingClass=best-effort", "IOSchedulingPriority=7", "OOMScoreAdjust=1000")
 RECORD = "publish.json"  # the background publication's record, in the task's logs/
 BACKGROUND_LOG = "publish.log"
 SPEC = "publish-spec.json"
