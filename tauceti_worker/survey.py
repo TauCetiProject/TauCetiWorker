@@ -445,6 +445,10 @@ class Survey:
         # Qualified source records cannot fall back to a GitHub display login.
         return not hasattr(pr, "source_repository") and pr.author == self.me_login
 
+    def authored(self, pr: PRInfo) -> bool:
+        """PRs this identity opened itself: authoring pressure and "mine" counts use these."""
+        return self.owns(pr)
+
     def kind(self, name: str) -> WorkKind:
         return {
             "rebase": self.rebaseable,
@@ -990,7 +994,7 @@ def classify_survey(
     ]
     me_login = sv.me_login or me()
     sv.me_login = me_login
-    mine = [p for p in nondraft if sv.owns(p)]
+    mine = [p for p in nondraft if sv.authored(p)]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
     bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
@@ -1022,7 +1026,7 @@ def classify_survey(
     sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
     # total with the subset this identity authored, for the per-round "open PRs" line.
-    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.owns)
+    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.authored)
 
     # 1) rebase: tended (ours or bot-authored), conflicting or a sweep handoff for
     #    this exact head, under the per-PR budget since last verified progress.
@@ -1414,17 +1418,30 @@ def bump_prs(sv: Survey) -> set[int]:
     return {p.number for p in sv.open_prs if p.automatic_bump}
 
 
-def cascade(sv: Survey, stages) -> list[tuple[str, Candidate]]:
+def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate]]:
     """Actionable (stage, candidate) pairs in the order a round offers them.
 
     Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
     red build, review findings and pending reviews. Main moves faster than an ordinary queue
     position allows a bump round to start, so a bump that waits behind unrelated work goes stale
     again before it can be admitted. Everything else follows in the usual stage order.
+
+    Within each maintenance/review stage, prefer this account's listed PRs among its own
+    non-bump positions. Other authors and automatic bumps keep their positions; no candidate
+    moves across stages, so target priority cannot overtake lint repair or progress reports.
     """
     bumps = bump_prs(sv)
     pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
-    return [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+    pairs = [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+    if not listed:
+        return pairs
+    own = {p.number for p in sv.open_prs if sv.owns(p)} - bumps
+    for stage in ("rebase", "fix-ci", "fix", "review"):
+        slots = [i for i, (kind, c) in enumerate(pairs) if kind == stage and c.pr in own]
+        ranked = sorted((pairs[i] for i in slots), key=lambda pair: pair[1].pr not in listed)
+        for i, pair in zip(slots, ranked, strict=True):
+            pairs[i] = pair
+    return pairs
 
 
 def _next_auto_stage(sv: Survey) -> str | None:

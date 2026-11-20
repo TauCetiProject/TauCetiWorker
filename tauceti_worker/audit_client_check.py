@@ -54,6 +54,7 @@ class Capture:
         self.tool_name = "mcp__audit__read_page"
         self.tool_namespace = None
         self.calls = 0
+        self.inert = set()
 
     def consume(self, body, provider):
         if provider == "codex":
@@ -81,6 +82,11 @@ class Capture:
                 raise ValueError(f"client omitted or altered chunk {page}: {str(output)[:800]!r}")
             self.received.add(page)
         for tool in body.get("tools", []):
+            # Codex always offers its MCP resource helpers; the catalog must say they are unavailable.
+            if provider == "codex" and tool.get("name") in sa.INERT_TOOLS:
+                if sa.INERT_DESCRIPTION not in str(tool.get("description")):
+                    raise ValueError(f"client did not deliver the inert description for {tool.get('name')}")
+                self.inert.add(tool["name"])
             if "read_page" in tool.get("name", ""):
                 self.tool_name = tool["name"]
             for child in tool.get("tools", []):
@@ -211,8 +217,8 @@ def verify(provider: str, state: Path):
         (home / ".claude").mkdir()
         batch = test_batch()
         (home / "input.json").write_text(sa.serialize(batch))
-        (home / "verdict-schema.json").write_text(sa.serialize(sa.MODEL_SCHEMA))
-        (home / "model-catalog.json").write_text(sa.serialize(sa.inspection_catalog(4)))
+        (home / "verdict-schema.json").write_text(sa.serialize(sa.JUDGMENT_SCHEMA))
+        (home / "model-catalog.json").write_text(sa.serialize(sa.JUDGMENT_CATALOG))
         capture = Capture(batch, home)
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler(capture, provider))
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -233,9 +239,9 @@ def verify(provider: str, state: Path):
             ANTHROPIC_BASE_URL=url,
             ANTHROPIC_API_KEY="local-test-only",
         )
-        prompt = sa.inspection_prompt(batch, True, protocol=4, goals=provider == "codex")
+        prompt = sa.judgment_prompt(batch, True)
         if provider == "codex":
-            cmd = sa.codex_launch(home, True, protocol=4)
+            cmd = sa.codex_launch(home, True, home / "read-receipt.json")
             cmd[-1:-1] = [
                 "-c",
                 'model_provider="audit_test"',
@@ -245,7 +251,7 @@ def verify(provider: str, state: Path):
                 + ',wire_api="responses",requires_openai_auth=false,supports_websockets=false}',
             ]
         else:
-            cmd = sa.reviewer_argv(provider, protocol=4)
+            cmd = sa.reviewer_argv(provider)
             cmd.remove("--safe-mode")
             cmd[cmd.index("--mcp-config") + 1] = sa.serialize(
                 {
@@ -253,12 +259,17 @@ def verify(provider: str, state: Path):
                         "audit": {
                             "type": "stdio",
                             "command": sys.executable,
-                            "args": ["-I", str(sa.reader_path(4)), str(home / "input.json"), str(home / "served.json")],
+                            "args": [
+                                "-I",
+                                str(sa.reader_path()),
+                                str(home / "input.json"),
+                                str(home / "served.json"),
+                            ],
                         }
                     }
                 }
             )
-            cmd += ["--allowedTools", "mcp__audit__read_page", "--json-schema", sa.serialize(sa.MODEL_SCHEMA)]
+            cmd += ["--allowedTools", "mcp__audit__read_page", "--json-schema", sa.serialize(sa.JUDGMENT_SCHEMA)]
         try:
             result = sa.run_process(cmd, input=prompt, cwd=home, env=env, capture_output=True, text=True, timeout=180)
         finally:
@@ -312,7 +323,7 @@ def verify(provider: str, state: Path):
                 value = {}
         except (OSError, ValueError):
             value = {}
-        value[provider] = {"protocol_version": 4, "fingerprint": after, "intact": True}
+        value[provider] = {"protocol_version": clients.PROTOCOL, "fingerprint": after, "intact": True}
         save(path, value)
     print(
         f"{provider}: complete source of all {len(capture.expected)} chunks captured at the test endpoint; saved {path}"

@@ -61,6 +61,7 @@ from .config import (
     roadmap_areas,
     roadmap_only,
     roadmap_skip,
+    roadmap_targets,
     warn_red,
 )
 from .constants import (
@@ -127,6 +128,21 @@ from .survey import (
     progress_argv,
     spread_candidates,
     survey,
+)
+from .targets import (
+    GitHubMarkerReads,
+    TargetItem,
+    Targets,
+    candidates,
+    github_history_enabled,
+    inventory_keys,
+    landed_pr,
+    live_targets,
+    load_targets,
+    open_pr,
+    overlay_live,
+    render_assignment,
+    target_markers,
 )
 from .worker_sources import pull_url as source_pull_url
 from .worker_sources import repository_url as source_repository_url
@@ -412,6 +428,63 @@ def focus_prs(sv: Survey, opts) -> None:
             log(f"  --pr #{pr}: {pr_focus_reason(sv, opts, pr)}")
 
 
+def target_list_prs(w, sv, stages) -> set[int]:
+    """Listed owned PRs in stages where priority can matter; never adds discovery authority.
+
+    Ordinary/native inventories already carry parsed markers. A compact GitHub survey omits
+    bodies, so only its optional mirror inventory may fill those in, joined to the same head.
+    Missing mirror coverage keeps the usual order instead of falling back to direct GitHub.
+    """
+    path = roadmap_targets()
+    if path is None:
+        return set()
+    own = {p.number: p for p in sv.open_prs if sv.owns(p) and not p.automatic_bump}
+    competing = set()
+    for stage in stages:
+        if stage not in ("rebase", "fix-ci", "fix", "review"):
+            continue
+        numbers = {c.pr for c in sv.kind(stage).actionable} & own.keys()
+        if len(numbers) > 1:
+            competing.update(numbers)
+    if not competing:
+        return set()
+    from .targets import load_targets
+
+    try:
+        targets = load_targets(path)
+    except Die as error:
+        log(f"target list: maintenance keeps its usual order ({error})")
+        return set()
+    keys = {json.dumps([item.area, item.slug], separators=(",", ":")) for item in targets.items()}
+    markers = {number: own[number].work_targets for number in competing}
+    if (
+        not hasattr(sv, "source_actor")
+        and not getattr(sv, "target_inventory_available", False)
+        and github_state_enabled()
+    ):
+        from .github_state import read
+        from .github_transport import read_context
+        from .survey import work_target_keys
+
+        try:
+            with read_context(retry=False):
+                available, rows = read(w.gh.repo, "open_prs", _optional=True)
+        except (Die, ForgeError, OSError):
+            available, rows = False, None
+        if available:
+            for row in rows or ():
+                if (
+                    isinstance(row, dict)
+                    and type(row.get("number")) is int
+                    and row["number"] in competing
+                    and row.get("headRefOid") == own[row["number"]].head_oid
+                    and isinstance(row.get("body"), str)
+                ):
+                    number = row["number"]
+                    markers[number] = tuple(set(markers[number]) | set(work_target_keys(row["body"])))
+    return {number for number, values in markers.items() if keys.intersection(values)}
+
+
 class NoEligibleWork(NoProgress):
     """Selection exhausted its candidates without launching a paid unit."""
 
@@ -422,7 +495,8 @@ def round_scope(w, opts, use_fleet_focus=True):
     if getattr(opts, "prs", ()):
         scope = "any"  # explicit targets override the ambient roadmap
     else:
-        if use_fleet_focus and scope in (None, "auto"):
+        # A target list names its own areas, so its worker takes no fleet focus.
+        if use_fleet_focus and scope in (None, "auto") and roadmap_targets() is None:
             from .fleet_capacity import roadmap_focus
 
             focus = roadmap_focus(w.cfg.wid)
@@ -448,16 +522,23 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         return run_sources(w, opts, use_fleet_focus=use_fleet_focus)
     if "security-audit" in opts.only:
         from .activity import select
-        from .security_audit import run
+        from .security_audit import run, watch
 
         other_tasks = [task for task in opts.only if task != "security-audit"]
         if not other_tasks:
             select("security-audit")
-            return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+            try:
+                return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+            finally:
+                if not opts.dry_run:
+                    watch(w.cfg, min_commits=1)
         try:
             minimum = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS", "20"))
         except ValueError:
             raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
+        # Every round, including maintenance turns and failed audits: the cursor moves or the operator hears.
+        if not opts.dry_run:
+            watch(w.cfg, min_commits=minimum)
         # The audit and the maintenance tasks sharing this worker take turns: after a round that ran
         # the audit, the next round goes to maintenance, so a long audit backlog cannot starve bumps.
         # Any audit failure, even an unexpected one, also falls through to maintenance.
@@ -653,7 +734,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     claim_collision = False
     from .state_repair import retry_key
 
-    for stage, c in cascade(sv, [stage for stage in round_stages(opts) if want(opts.only, stage)]):
+    stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
+    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages)):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue
@@ -704,7 +786,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             )
         if global_pick:
             log("No available maintenance or reviews; proceeding to roadmap authoring")
-            if scope in (None, "auto") and not opts.dry_run:
+            if scope in (None, "auto") and not opts.dry_run and roadmap_targets() is None:
                 sv.roadmap_only = random_roadmap_area(w, focus=[])
                 log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
         rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
@@ -2132,7 +2214,9 @@ def _do_fixlike(
         PR=pr,
         HEAD=head,
         CLOSE_AUTHORITY=(
-            "You may close this PR only while its live author is the authenticated account on this source forge."
+            "You may close this PR only while its live author is the authenticated account on this source forge"
+            + _adopted_authors_note(sv)
+            + "."
             if may_close
             else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
         ),
@@ -2278,6 +2362,20 @@ FINAL_ATTEMPT_INSTRUCTION = (
     "`quality-pass` report: there, update the description and reply on the finding's thread, "
     "and that completes the attempt.\n"
 )
+
+
+def _adopted_authors_note(sv) -> str:
+    """Name adopted Forgejo authors in a close authority, so the agent's live check matches `owns`."""
+    repository = getattr(sv, "source_repository", None)
+    if repository is None or repository.forge.kind != "forgejo":
+        return ""
+    from .source_identity import adopted_author_ids
+
+    ids = sorted(adopted_author_ids())
+    if not ids:
+        return ""
+    listed = ", ".join(str(i) for i in ids)
+    return f", or a PR from a branch of this repository whose live author has Forgejo user ID {listed}"
 
 
 def _budget_spent(stage, w, c) -> bool:
@@ -3124,11 +3222,115 @@ def random_roadmap_area(w, *, focus=None, fallback=True) -> str | None:
     return random.choice(areas) if areas else "any"
 
 
+MAX_TARGET_TRIES = 8  # per round; each one is a search and a push to the claim repository
+
+
+class _SharedGitHubReads:
+    """A GitHub client's target-list reads from inside a Forgejo round, whose `gh` on PATH is the
+    source-bound wrapper."""
+
+    def __init__(self, gh):
+        self.gh = gh
+
+    def open_prs(self):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.open_prs()
+
+    def merged_prs(self, search, *, limit):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.merged_prs(search, limit=limit)
+
+    def target_queue_landed(self, number, branch):
+        from .worker_sources import shared_github_environment
+
+        with shared_github_environment():
+            return self.gh.target_queue_landed(number, branch)
+
+
+def _target_reads(source):
+    from .worker_sources import current
+
+    native = getattr(source, "direct_source", False)
+    return source if native or current() is None else _SharedGitHubReads(source)
+
+
+def _pull_link(source, number: int | None) -> str | None:
+    if number is None:
+        return None
+    return source.repository.pull_url(number) if getattr(source, "direct_source", False) else f"#{number}"
+
+
+def _landed_link(item, source) -> str | None:
+    return _pull_link(source, landed_pr(item, source))
+
+
+def _open_link(item, source) -> str | None:
+    return _pull_link(source, open_pr(item, source))
+
+
+def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, TargetItem]:
+    """Choose and claim this round's item of the operator's target list (docs/target-lists.md).
+    Returns the list under its live statuses and the item; NoProgress when there is none to take."""
+    from .config import SourceUnavailable
+
+    listed = load_targets(path)
+    claims = getattr(w, "claims", None)
+    seen = (w.gh, *getattr(w, "target_sources", ()))
+    sources = [_target_reads(source) for source in seen]
+    if all(getattr(source, "direct_source", False) for source in seen) and github_history_enabled():
+        sources.append(GitHubMarkerReads())
+    try:
+        live = live_targets(listed, sources[0], sources[1:])
+        # A multi-source round's inventory also names the other forge's open pull requests.
+        live = overlay_live(live, inventory_keys(getattr(w, "cross_source_targets", None) or ()), set())
+        offered = candidates(live, only, skip)
+        for item in offered[:MAX_TARGET_TRIES]:
+            name = f"{item.area}/{item.slug}"
+            merged = next((link for source in sources if (link := _landed_link(item, source)) is not None), None)
+            if merged is not None:
+                log(f"target {name} landed in {merged}; mark it `[x]` in {path.name} — trying the next")
+                continue
+            opened = next((link for source in sources if (link := _open_link(item, source)) is not None), None)
+            if opened is not None:
+                log(f"target {name} is open in {opened} — trying the next")
+                continue
+            rc = claims.begin_target_work(item.area, item.slug) if claims is not None else 2
+            if rc == 1:
+                log(f"target {name} is claimed by another worker — trying the next")
+                continue
+            if rc != 0:
+                log(
+                    f"claim acquire author/{name} errored (rc={rc}) against {claims_repo()} — proceeding "
+                    f"unclaimed. If this repeats, this account cannot push there; set CLAIM_REPO=<a repo your "
+                    f"whole fleet can push to> to pick the namespace yourself."
+                )
+            log(f"→ ROADMAP target: {name} ({len(offered)} eligible in {path.name})")
+            return live, item
+    except (GitHubError, SourceUnavailable) as e:
+        raise NoProgress(f"roadmap: cannot read pull requests for the target list ({e})") from None
+    raise NoProgress(
+        f"roadmap: none of the {min(len(offered), MAX_TARGET_TRIES)} eligible target(s) of {path.name} tried this "
+        f"round can be taken ({len(offered)} eligible; each is claimed by another worker or has landed)"
+    )
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     os.environ["TAUCETI_VERIFY_POLICY"] = "ordinary"
     only = c.reason or "any"
     skip = roadmap_skip()
-    if only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
+    assignment = ""
+    targets_path = roadmap_targets()
+    if targets_path is not None:
+        live, item = assign_target(w, targets_path, only, skip)
+        only = item.area
+        assignment = render_assignment(live, item)
+        os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))
+        report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
+    elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         only = random_roadmap_area(w, focus=[])
         log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")
     elif only not in ("any", "") and only in skip:  # --roadmap-only wins over an overlapping skip
@@ -3235,6 +3437,7 @@ other contributors' claims, or the hard rules of the repo.
                 ),
                 SOURCE_GUIDANCE=source_guidance,
                 EXTRA_ROADMAP_PROMPT=extra_guidance,
+                TARGET_LIST=assignment,
                 LOCAL_VERIFICATION=local_verification("ordinary", bubble),
                 QUALITY_SCOPE=quality_scope(),
                 BIN=wrapper_bin(bubble=True),
@@ -3258,6 +3461,7 @@ other contributors' claims, or the hard rules of the repo.
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
         EXTRA_ROADMAP_PROMPT=extra_guidance,
+        TARGET_LIST=assignment,
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         QUALITY_SCOPE=quality_scope(),
         BIN=wrapper_bin(),
@@ -3267,7 +3471,21 @@ other contributors' claims, or the hard rules of the repo.
     # Scope git-safe-push's publication records to this round so its pushes can be labelled.
     push_scope = current_round_id() or os.urandom(16).hex()
     try:
-        with environment(TAUCETI_PUSH_SCOPE=push_scope):
+        claim_env = {}
+        # List assignments already hold a host-side claim; native agents use their source
+        # claim wrapper, whose GitHub namespace must be resolved outside native activation.
+        from .worker_sources import current
+
+        if targets_path is None and current() is None:
+            try:
+                namespace = claims_repo()
+            except (Die, GitHubError, ForgeError, NoProgress, OSError) as error:
+                # This fork is already needed for publication. A failed optional namespace
+                # lookup must not prevent authoring, and canonical is never the fallback.
+                log(f"roadmap: claim namespace lookup failed ({type(error).__name__}); using the authoring fork")
+                namespace = fork
+            claim_env["CLAIM_REPO"] = namespace
+        with environment(TAUCETI_PUSH_SCOPE=push_scope, **claim_env):
             return run_agent_host(
                 w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg
             )

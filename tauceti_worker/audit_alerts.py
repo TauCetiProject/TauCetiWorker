@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import fcntl
 import hashlib
 import json
-import math
 import os
+import ssl
 import tempfile
 import time
 import urllib.parse
@@ -15,8 +17,7 @@ from pathlib import Path
 
 from .config import log
 from .constants import TAUCETI
-
-OPERATIONAL_STALL_SECONDS = 3600
+from .paths import ensure_ssl_cert_file
 
 
 def request(config: dict, method: str, params: dict) -> dict:
@@ -49,7 +50,15 @@ def request(config: dict, method: str, params: dict) -> dict:
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             return None
 
-    with urllib.request.build_opener(NoRedirect).open(req, timeout=20) as response:
+    # Entry points other than the Worker CLI (the pool, attest) never repaired SSL_CERT_FILE, and uv's
+    # standalone CPython cannot find the NixOS bundle by default: every DM then failed verification.
+    # Trust the host bundle explicitly, so delivery does not depend on how this process was started.
+    context = ssl.create_default_context()  # Keeps SSL_CERT_DIR and other operator trust stores.
+    bundle = ensure_ssl_cert_file(dict(os.environ))
+    if bundle:
+        context.load_verify_locations(cafile=bundle)
+    opener = urllib.request.build_opener(NoRedirect, urllib.request.HTTPSHandler(context=context))
+    with opener.open(req, timeout=20) as response:
         result = json.load(response)
     if result.get("result") != "success":
         raise ValueError("Zulip request was not successful")
@@ -64,54 +73,48 @@ def save(path: Path, value: dict) -> None:
     try:
         with os.fdopen(fd, "w") as stream:
             stream.write(json.dumps(value, sort_keys=True))
+            stream.flush()
+            os.fsync(stream.fileno())  # Durable before it replaces the old state, not only atomic.
         temporary.chmod(0o600)
         temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)  # The rename itself survives a host crash.
+        finally:
+            os.close(directory)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
 
 
 def report(work: Path, block: dict) -> dict:
-    verdict = None
-    ledger = work / "ledger.jsonl"
-    if ledger.exists():
-        for line in ledger.read_text().splitlines():
-            row = json.loads(line)
-            if (row.get("from_sha"), row.get("to_sha")) == (block.get("from_sha"), block.get("to_sha")):
-                if "verdict" in row:
-                    verdict = row["verdict"]
-    kind = "Operational stall"
-    if verdict and verdict["verdict"] != "pass":
-        kind = "Source-safety finding" if verdict["verdict"] == "finding" else "Inspection incomplete"
-    return {
-        "kind": kind,
-        "from_sha": block.get("from_sha"),
-        "to_sha": block.get("to_sha"),
-        "details": verdict["findings"] if verdict else [block.get("reason", "Unknown audit failure")],
-    }
+    """The alert for a block, from the outcome its writer classified; never a second reading of evidence.
 
-
-def actionable(work: Path, value: dict) -> bool:
-    """Source concerns notify now; operational pauses notify after an hour held.
-
-    The cursor, rather than an attempt ID or failure text, identifies the stall.
-    Retries and Worker restarts cannot reset the delay. A new cursor resets it.
-    This timer controls notifications only; audit blocks/recovery are untouched.
-    """
-    if value["kind"] != "Operational stall":
-        return True
-    path = work / "operational-alert.json"
-    now = time.time()
-    state = json.loads(path.read_text()) if path.exists() else {}
-    if not isinstance(state, dict):
-        raise ValueError("invalid operational alert state")
-    if state.get("from_sha") != value["from_sha"]:
-        state = {"from_sha": value["from_sha"], "first_seen": now}
-        save(path, state)
-    started = state.get("first_seen")
-    if type(started) not in (int, float) or not math.isfinite(started):
-        raise ValueError("invalid operational alert timestamp")
-    return now - started >= OPERATIONAL_STALL_SECONDS
+    `outcome` is `finding` (with its bound `verdict`), `unreadable` or `not-judged`. Blocks written
+    before blocks carried their outcome fall back to the latest ledger verdict for the same range."""
+    outcome, verdict = block.get("outcome"), block.get("verdict")
+    if outcome is None:
+        verdict = None
+        ledger = work / "ledger.jsonl"
+        for line in ledger.read_text().splitlines() if ledger.exists() else ():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue  # A damaged row never stops the alert for the block that is in force.
+            if isinstance(row, dict) and (row.get("from_sha"), row.get("to_sha")) == (
+                block.get("from_sha"),
+                block.get("to_sha"),
+            ):
+                verdict = row.get("verdict", verdict)
+        outcome = "finding" if isinstance(verdict, dict) and verdict.get("verdict") != "pass" else "not-judged"
+    if outcome == "finding":
+        kind = "Inspection incomplete" if verdict.get("verdict") == "incomplete" else "Source-safety finding"
+        details = verdict.get("findings") or [block.get("reason", "Unexplained finding")]
+    elif outcome == "unreadable":
+        kind, details = "Unreadable evidence", [block.get("reason", "Unreadable audit evidence")]
+    else:
+        kind, details = "Operational stall", [block.get("reason", "Unknown audit failure")]
+    return {"kind": kind, "from_sha": block.get("from_sha"), "to_sha": block.get("to_sha"), "details": details}
 
 
 def content(value: dict, work: Path, marker: str) -> str:
@@ -124,10 +127,9 @@ def content(value: dict, work: Path, marker: str) -> str:
         else f"https://github.com/{TAUCETI}/commits/main"
     )
     attention = (
-        "**Attention: the audit cursor has remained held for at least one hour.** "
-        "This is an operational stall, with no recorded source-safety finding for this range. "
-        "Automatic recovery continues where eligible; investigate if the stall persists."
-        if value["kind"] == "Operational stall"
+        "**Human review required:** the inspection's evidence cannot be read, so it does not establish "
+        "that no source concern was recorded. The range will not be inspected again automatically."
+        if value["kind"] == "Unreadable evidence"
         else "**Human review required:** the inspection recorded a source concern or unresolved "
         "code-safety uncertainty. Automatic recovery will not discard this judgment."
     )
@@ -141,59 +143,102 @@ def content(value: dict, work: Path, marker: str) -> str:
     )
 
 
-def notify_block(work: Path, block: dict) -> None:
-    """Notification failure never clears a block or stops maintenance; retry after 15 minutes."""
+@contextlib.contextmanager
+def locked(path: Path):
+    """Serialize a read-modify-write of shared audit state across the Worker, pool and timer."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def deliver(work: Path, identity: dict, render) -> bool:
+    """Send one private DM per identity, durably deduplicated; True once it is known delivered.
+
+    `render(marker)` builds the message; the marker lets an ambiguous earlier POST be reconciled.
+    Raises on delivery failure after recording a 15-minute backoff; callers decide how to log.
+    The whole receipt/reconcile/send transaction holds a lock, so concurrent callers never both send.
+    """
     configured = os.environ.get("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG")
     if not configured:
+        return False
+    with locked(work / "zulip-alerts.lock"):
+        return _deliver(work, identity, render, configured)
+
+
+def _deliver(work: Path, identity: dict, render, configured: str) -> bool:
+    config = json.loads(Path(configured).read_text())
+    key = hashlib.sha256(
+        json.dumps([config["site"], config["recipient_id"], identity], sort_keys=True).encode()
+    ).hexdigest()
+    marker = "tauceti-audit-" + key
+    path = work / "zulip-alerts.json"
+    state = json.loads(path.read_text()) if path.exists() else {}
+    previous = state.get(key, {})
+    if previous.get("message_id"):
+        return True
+    if previous.get("retry_at", 0) > time.time():
+        return False
+    state[key] = {"retry_at": time.time() + 900}
+    save(path, state)  # Back off even if reconciliation fails.
+    # A previous POST may have succeeded before its response or local receipt was lost.
+    # Reconcile only this bot's configured private conversation before re-sending.
+    if previous:
+        recent = request(
+            config,
+            "GET",
+            {
+                "narrow": json.dumps([{"operator": "dm", "operand": [config["recipient_id"]]}]),
+                "anchor": "newest",
+                "num_before": 100,
+                "num_after": 0,
+                "apply_markdown": "false",
+            },
+        )
+        found = next((m for m in recent["messages"] if marker in m["content"]), None)
+        if found:
+            state[key] = {"message_id": found["id"]}
+            save(path, state)
+            return True
+    result = request(
+        config,
+        "POST",
+        {"type": "direct", "to": json.dumps([config["recipient_id"]]), "content": render(marker)},
+    )
+    state[key] = {"message_id": result["id"]}
+    save(path, state)
+    log(f"security-audit: sent private Zulip alert {result['id']}")
+    return True
+
+
+ALERT_ERRORS = (OSError, ValueError, KeyError, TypeError, AttributeError)
+
+
+def delivery_pending(exc: BaseException) -> None:
+    # The cause, never the request (which carries the bot credential), so a persistent delivery
+    # failure such as TLS verification is visible in the log rather than retried blindly.
+    log(
+        f"security-audit: private Zulip alert delivery pending ({type(exc).__name__}: {str(exc)[:200]}); "
+        "retained block remains in force"
+    )
+
+
+def notify_block(work: Path, block: dict) -> None:
+    """Source concerns notify now. Notification failure never clears a block or stops maintenance.
+
+    Operational pauses send nothing here: the cursor watchdog (audit_watchdog) alone reports a
+    cursor held for an hour, whatever the cause, so one pause never produces two DMs.
+    """
+    if not os.environ.get("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG"):
         return
     try:
         value = report(work, block)
-        if not actionable(work, value):
-            log("security-audit: transient operational pause retained in logs; no private alert before one hour")
+        if value["kind"] == "Operational stall":
             return
-        config = json.loads(Path(configured).read_text())
         identity = {key: value[key] for key in ("kind", "from_sha", "to_sha")}
-        key = hashlib.sha256(
-            json.dumps([config["site"], config["recipient_id"], identity], sort_keys=True).encode()
-        ).hexdigest()
-        marker = "tauceti-audit-" + key
-        path = work / "zulip-alerts.json"
-        state = json.loads(path.read_text()) if path.exists() else {}
-        previous = state.get(key, {})
-        if previous.get("message_id") or previous.get("retry_at", 0) > time.time():
-            return
-        state[key] = {"retry_at": time.time() + 900}
-        save(path, state)  # Back off even if reconciliation fails.
-        # A previous POST may have succeeded before its response or local receipt was lost.
-        # Reconcile only this bot's configured private conversation before re-sending.
-        if previous:
-            recent = request(
-                config,
-                "GET",
-                {
-                    "narrow": json.dumps([{"operator": "dm", "operand": [config["recipient_id"]]}]),
-                    "anchor": "newest",
-                    "num_before": 100,
-                    "num_after": 0,
-                    "apply_markdown": "false",
-                },
-            )
-            found = next((m for m in recent["messages"] if marker in m["content"]), None)
-            if found:
-                state[key] = {"message_id": found["id"]}
-                save(path, state)
-                return
-        result = request(
-            config,
-            "POST",
-            {
-                "type": "direct",
-                "to": json.dumps([config["recipient_id"]]),
-                "content": content(value, work, marker),
-            },
-        )
-        state[key] = {"message_id": result["id"]}
-        save(path, state)
-        log(f"security-audit: sent private Zulip alert {result['id']}")
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        log("security-audit: private Zulip alert delivery pending; retained block remains in force")
+        deliver(work, identity, lambda marker: content(value, work, marker))
+    except ALERT_ERRORS as exc:
+        delivery_pending(exc)
