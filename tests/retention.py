@@ -819,6 +819,48 @@ class Retention(unittest.TestCase):
             self.assertEqual(worker_manager.service_action("install", self.root / "workers.toml"), 0)
         self.assertEqual(service.read_text(), "fixture unit")
 
+    def test_worker_service_install_writes_and_keeps_slice_limits(self):
+        from tauceti_worker import worker_manager
+
+        service = self.root / "config/systemd/user/tauceti-workers.service"
+        unit = service.with_name("tauceti-workers.slice")
+
+        def install(**limits):
+            return worker_manager.service_action("install", self.root / "workers.toml", limits)
+
+        with (
+            patch.object(sys, "platform", "linux"),
+            patch.object(worker_manager, "_service_path", return_value=service),
+            patch.object(worker_manager, "_systemd_unit", return_value="fixture unit"),
+            patch.object(shutil, "which", return_value="systemctl"),
+            patch.object(subprocess, "run"),
+            patch.object(retention, "install_timer"),
+        ):
+            self.assertEqual(install(), 0)
+            self.assertNotIn("CPUQuota", unit.read_text())
+            self.assertEqual(install(cpu_quota="3200%", memory_high="48G"), 0)
+            self.assertIn("[Slice]\nCPUQuota=3200%\nMemoryHigh=48G\n", unit.read_text())
+            # A reinstall without options keeps the installed limits; an empty value removes one.
+            self.assertEqual(install(), 0)
+            self.assertIn("CPUQuota=3200%\nMemoryHigh=48G\n", unit.read_text())
+            self.assertEqual(install(memory_high="", memory_max="64G"), 0)
+            self.assertIn("[Slice]\nCPUQuota=3200%\nMemoryMax=64G\n", unit.read_text())
+            self.assertNotIn("MemoryHigh", unit.read_text())
+            with self.assertRaisesRegex(worker_manager.WorkersError, "CPUQuota"):
+                install(cpu_quota="32 cores")
+            with self.assertRaisesRegex(worker_manager.WorkersError, "only to `service install`"):
+                worker_manager.service_action("restart", self.root / "workers.toml", {"cpu_quota": "100%"})
+            self.assertEqual(worker_manager.service_action("uninstall", self.root / "workers.toml"), 0)
+        self.assertFalse(unit.exists())
+
+    def test_worker_service_path_omits_runtime_scripts(self):
+        from tauceti_worker import worker_manager
+
+        runtime_scripts = "/fleet/worker-runtimes/old/lib/python3.14/site-packages/tauceti_worker/scripts"
+        current = str(worker_manager.HERE / "scripts")
+        with patch.dict(os.environ, {"PATH": os.pathsep.join([current, runtime_scripts, "/usr/bin", "/bin"])}):
+            self.assertEqual(worker_manager._service_environment()["PATH"], os.pathsep.join(["/usr/bin", "/bin"]))
+
     def test_macos_boundary_recycles_only_the_managed_private_home(self):
         from tauceti_worker.agents import _worker_iso_home
 
