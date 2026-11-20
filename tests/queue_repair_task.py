@@ -1189,6 +1189,7 @@ class Fixture(unittest.TestCase):
             providers=("claude",),
             publish=repair_publish.Settings(),
             parallel_agents=1,  # the parallel path has its own scenarios
+            lookahead_helpers=0,  # the lookahead has its own scenarios
         )
         values.update(overrides)
         return repair_task.RunnerConfig(**values)
@@ -1710,7 +1711,7 @@ class RebaseArtifacts(Fixture):
             self.assertNotIn("<<<<<<<", sh(self.content.bare, "show", f"{three.sha}:{path}"))
 
     def test_a_later_conflict_is_resolved_ahead_on_the_target(self):
-        """With a second agent, member 3's conflict with main is resolved on ``onto`` alone while member 2's
+        """With a lookahead helper, member 3's conflict with main is resolved on ``onto`` alone while member 2's
         is resolved on the clean prefix; at member 3 the replay merges that resolution onto its real
         prefix and checks it like any other, and the agent is not run a third time."""
         seed = self.content.bare.parent / "seed"
@@ -1718,7 +1719,7 @@ class RebaseArtifacts(Fixture):
         moved = commit(seed, "main moved again", {"TauCeti/Three.lean": "-- three, on main\n"})
         sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
         self.raw["onto"] = self.onto = moved
-        cfg = self.config(parallel_agents=2)
+        cfg = self.config(lookahead_helpers=1)
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2", f"{PROJECT}#3"])

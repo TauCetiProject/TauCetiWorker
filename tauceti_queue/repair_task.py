@@ -75,12 +75,12 @@ from tauceti_queue import (
     repair,
     repair_audit,
     repair_context,
+    repair_lookahead,
     repair_numproj,
     repair_parallel,
     repair_publish,
     repair_sandbox,
     repair_stream,
-    repair_tools,
     runtime,
     task_transport,
 )
@@ -1089,6 +1089,9 @@ class RunnerConfig:
     # each in its own worktree (``TAUCETI_QUEUE_PARALLEL_AGENTS``, default 3); 0 or 1 keeps every
     # repair sequential.
     parallel_agents: int = dataclasses.field(default_factory=repair_parallel.parallel_agents_default)
+    # Helpers resolving a rebase task's later conflicts on its target meanwhile (``repair_lookahead``,
+    # ``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 8); 0 resolves every conflict in turn.
+    lookahead_helpers: int = dataclasses.field(default_factory=repair_lookahead.helpers_default)
     poll_seconds: float = 60.0
     # A positive admin answer is cached on disk (``admin-check.json``) this long; a check that could not
     # be made is retried after ``admin_retry_seconds``, not on every poll.
@@ -2334,7 +2337,7 @@ def resolve_conflicts(
     onto it; and repeats at the next conflict, on the same claim and worktree. Nothing is submitted
     until the replay reaches the end, so the queue keeps no state between conflicts.
 
-    With ``cfg.parallel_agents`` above 1, later conflicting members are resolved meanwhile on ``onto``
+    With ``cfg.lookahead_helpers`` above 0, later conflicting members are resolved meanwhile on ``onto``
     itself by ``repair_lookahead``; at its conflict a member's lookahead resolution is merged onto the
     real prefix and checked like any other, and the agent resolves the member here only when there is
     none, it does not merge cleanly or it is not acceptable.
@@ -2343,8 +2346,6 @@ def resolve_conflicts(
     chain, ``{"status": "cancelled"}``, or a release status with its ``reason``: an agent status in
     ``RELEASED_AGENT_STATUSES``, or ``agent_failed`` when a conflict stays unresolved after
     ``cfg.agent_attempts`` attempts."""
-    from tauceti_queue import repair_lookahead
-
     chain_ids: list[str] = []
     resolved: list[dict] = []
     agent: dict = {"status": "ok"}
@@ -2380,7 +2381,7 @@ def resolve_conflicts(
             prefix, commit, source_pr = result.tip, conflict.replayed, conflict.source_pr
             if (
                 lookahead is None
-                and cfg.parallel_agents > 1
+                and cfg.lookahead_helpers > 0
                 and not repair_lookahead.changes_dependencies(cfg.clone, task)
             ):
                 lookahead = repair_lookahead.Lookahead(
@@ -2489,14 +2490,12 @@ def resolve_one(
     agent_records: list[dict],
     accept,
     label: str,
-    build_lock: Path | None = None,
     providers: list[str] | None = None,
 ) -> dict:
     """Resolve the one conflicting ``commit`` onto ``prefix`` in ``worktree``: the numproj pre-pass, then
     the agent for up to ``cfg.agent_attempts`` attempts. ``accept(tip, report)`` is not None for an
-    acceptable resolution (and adds its problems to ``report`` otherwise). ``build_lock`` is a lock the
-    agent's build script shares with other worktrees, and ``providers`` the provider chain the worker
-    chose (``repair_lookahead``).
+    acceptable resolution (and adds its problems to ``report`` otherwise). ``providers`` is the
+    provider chain the worker chose (``repair_lookahead``).
 
     Returns ``{"status": "ok", "tip", "accepted", "agent"}`` (``numproj`` when the pre-pass resolved
     it), or ``{"status", "reason"}``: an agent status that ends the task, or ``agent_failed``."""
@@ -2529,9 +2528,7 @@ def resolve_one(
     # Projection-only conflicts after `main` renamed numeric projections resolve without the agent
     # (`repair_numproj`); any other outcome leaves the agent the conflict as before, or what is left.
     prepass = (
-        repair_numproj.prepass(
-            worktree, prefix, commit, paths, env_lake, logdir, lake=tuple(cfg.lake), build_lock=build_lock
-        )
+        repair_numproj.prepass(worktree, prefix, commit, paths, env_lake, logdir, lake=tuple(cfg.lake))
         if (artifacts or {}).get("available")
         else None
     )
@@ -2572,10 +2569,6 @@ def resolve_one(
         context.repair_context = ownership
         context.prepass = prepass.note if prepass is not None else None
         prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
-        if build_lock is not None:
-            repair_tools.write_build_script(
-                repair.listings_path(worktree).parent, lock=build_lock, worker_verifies=context.worker_verifies
-            )
         agent = run_repair_agent(
             cfg,
             task,

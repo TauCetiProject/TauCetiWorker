@@ -625,6 +625,9 @@ succeeds before then continues the claim.
   upload credential; publication uses the existing worker configuration.
 - **Parallel agents.** `TAUCETI_QUEUE_PARALLEL_AGENTS` (default 3) bounds the concurrent agents within
   one task ([repair-task.md](repair-task.md), "Parallel agents within one task").
+- **Lookahead helpers.** `TAUCETI_QUEUE_LOOKAHEAD_HELPERS` (default 8; 0 turns it off) is the number of
+  helper agents resolving a rebase task's later conflicts on its target while the replay works on the
+  current one (`tauceti_queue/repair_lookahead.py`). Each helper builds in its own worktree.
 - The content clone named by `TAUCETI_QUEUE_CLONE` (the installer creates it).
 
 ### Terminal repair worktree cleanup
