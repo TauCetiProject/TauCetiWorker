@@ -1004,9 +1004,6 @@ def resolve_pace(cmd: str | None, args) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .shared_mathlib import raise_stack_limit
-
-    raise_stack_limit()
     parser = build_parser()
     from tauceti_tools.project import conf_argument
 
