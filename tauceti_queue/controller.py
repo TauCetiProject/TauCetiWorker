@@ -277,6 +277,8 @@ TASK_PRIORITY = {TASK_REBASE_CONFLICT: 0, TASK_REPAIR: 0, TASK_PRE_REBASE: 1, TA
 # The kinds of an open batch's background tasks: at most one of them is open or claimed per batch.
 BACKGROUND_TASKS = (TASK_PRE_REBASE, TASK_PREPARE)
 BACKGROUND_OPERATIONS = tuple(f"task:{kind}" for kind in BACKGROUND_TASKS)
+# Claims that rewrite a whole open batch, which insertion goes around.
+BATCH_TASK_OPERATIONS = (f"task:{TASK_PREPARE}", f"task:{TASK_REBASE_CONFLICT}")
 # How often a worker holding a `prepare` claim renews it (`Task.extra.renew_after`): a refused renewal
 # is how the worker learns that the controller took the batch back (it sealed, or the head needs the
 # worker), so the interval bounds how long a superseded preparation keeps running.
@@ -1897,10 +1899,14 @@ class Controller:
         if self._pre_rebased_prepare(task):
             return self._pre_rebased_prepare_current(task, batch)
         return (
-            task["state"] == TASK_OPEN
-            and batch["version"] == task["batch_version"]
-            and batch["state"] == (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
-        ) or (task["kind"] != TASK_PREPARE and self._evicted_task_current(task, batch))
+            (
+                task["state"] == TASK_OPEN
+                and batch["version"] == task["batch_version"]
+                and batch["state"] == (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
+            )
+            or (task["kind"] != TASK_PREPARE and self._evicted_task_current(task, batch))
+            or self._open_rebase_current(task, batch)
+        )
 
     def claim_task(
         self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None, mixed_capable=False
@@ -2054,6 +2060,9 @@ class Controller:
             if self._stale_prepare(task):
                 continue  # superseded on the next pass; never started on a base `main` has moved past
             if task["kind"] != TASK_PREPARE and self._evicted_task_current(task, batch):
+                found.append((task, batch))
+                continue
+            if self._open_rebase_current(task, batch):
                 found.append((task, batch))
                 continue
             if batch["version"] != task["batch_version"]:
@@ -2567,8 +2576,11 @@ class Controller:
             # An adopted preparation keeps its batch open: the repaired members are what it seals with.
             # So does a retained task of a batch the emergency batch took the head from (`_evict`):
             # its chain was validated as the head, and own-base preparation is not repeated.
+            # An open batch's own rebase onto `main` is not a preparation: one on `main` follows it.
             prepared = (
-                {"prepared_version": version} if task["kind"] == TASK_PREPARE or batch["state"] == BATCH_OPEN else {}
+                {"prepared_version": version}
+                if task["kind"] == TASK_PREPARE or self._eviction(batch) is not None
+                else {}
             )
             self.store.update(
                 "batches",
@@ -2908,8 +2920,9 @@ class Controller:
                 }
                 refs.append(checkpoint["retained_ref"])
                 warm_revs = list(dict.fromkeys([tip, *warm_revs]))
-        if task["kind"] in BACKGROUND_TASKS:
+        if task["kind"] in BACKGROUND_TASKS or batch["state"] == BATCH_OPEN:
             extra["renew_after"] = HANDOFF_RENEW_SECONDS
+            extra["background"] = True  # work for a later batch: its builds yield the CPU to the head's
         if self._pre_rebased_prepare(task):
             # The pre-rebased chain exists only in the controller's clone until `_prepare_pre_rebased`
             # retains it on GitHub; the worker builds on the head's tip and falls back to the public
@@ -4124,9 +4137,9 @@ class Controller:
             target: dict[str, Any] | None = None
             eligible: list[dict[str, Any]] = []
             for batch in batches:
-                if any(c["operation"] == f"task:{TASK_PREPARE}" for c in self._active_claims(batch["id"])):
-                    # A `prepare` task holds this batch: insertion goes on to the next open batch
-                    # (created on the canonical commit when the limit allows) instead of waiting.
+                if any(c["operation"] in BATCH_TASK_OPERATIONS for c in self._active_claims(batch["id"])):
+                    # A `prepare` task, or the batch's rebase onto `main`, holds this batch: insertion goes
+                    # on to the next open batch (created on the canonical commit when the limit allows).
                     self._note_reason(f"open batch {batch['id']} is being prepared; insertion uses the next one")
                     continue
                 eligible = [
@@ -4324,7 +4337,7 @@ class Controller:
                 self._release_claim(claim, "placement-paused", now)
             return False
         current = self.store.row("batches", {"id": batch["id"]})
-        prepared = any(c["operation"] == f"task:{TASK_PREPARE}" for c in self._active_claims(batch["id"]))
+        prepared = any(c["operation"] in BATCH_TASK_OPERATIONS for c in self._active_claims(batch["id"]))
         if (
             current is None
             or current["version"] != batch["version"]
@@ -5509,6 +5522,23 @@ class Controller:
             and batch["version"] == marker["version"] == task["batch_version"]
         )
 
+    def _open_rebase_current(self, task: dict[str, Any], batch: dict[str, Any]) -> bool:
+        """An open batch's own `rebase_conflict` task onto `main` (`_onto_canonical`), not an evicted
+        head's retained one: current, claimable and adoptable while the batch is open at its version."""
+        return (
+            task["kind"] == TASK_REBASE_CONFLICT
+            and task["state"] == TASK_OPEN
+            and batch["state"] == BATCH_OPEN
+            and batch["version"] == task["batch_version"]
+            and self._eviction(batch) is None
+        )
+
+    def _open_rebase_task(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        """The open batch's own open `rebase_conflict` task onto `main`, if any."""
+        if batch["state"] != BATCH_OPEN or self._eviction(batch) is not None:
+            return None
+        return self.store.row("tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_REBASE_CONFLICT})
+
     def _retained_tasks(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
         """The evicted batch's open retained tasks: while there are any, nothing else is created for it."""
         if self._eviction(batch) is None:
@@ -6066,7 +6096,8 @@ class Controller:
             batch = batches[0]
             size = len(self._members(batch["id"]))
             if size < minimum or any(
-                c["operation"] not in BACKGROUND_OPERATIONS for c in self._active_claims(batch["id"])
+                c["operation"] not in (*BACKGROUND_OPERATIONS, f"task:{TASK_REBASE_CONFLICT}")
+                for c in self._active_claims(batch["id"])
             ):
                 return
             with self.store.transaction():
@@ -6194,22 +6225,7 @@ class Controller:
                 )
             return True
         conflict = result.conflict
-        diagnostics = [
-            {
-                "kind": "conflict",
-                "source_pr": conflict.source_pr if conflict else None,
-                # The input chain's conflicting commit, which the worker's own replay stops at.
-                "commit": conflict.replayed if conflict else None,
-                "paths": list(conflict.conflict_paths) if conflict else [],
-                "onto": canonical,
-                "message": f"replaying the chain onto {canonical[:12]} conflicts at {conflict.source_pr if conflict else '?'}",
-                "pending": [r.source_pr for r in result.commits if r.status == chain.PENDING],
-                "clean_prefix_tip": result.tip,
-                # Members the new base already carries (landed outside the queue): empty commits in the
-                # clean prefix, or still pending; the agent keeps them empty rather than replaying them.
-                "landed_on_base": result.landed_on_base,
-            }
-        ]
+        diagnostics = self._conflict_diagnostics(result, canonical)
         with self.store.transaction():
             self._release_claim(claim, "conflict", now)
             self.store.journal(
@@ -6223,6 +6239,27 @@ class Controller:
         self._create_task(head, "rebase_conflict", canonical, diagnostics, now)
         self._reasons.append(f"head {head['id']} needs an agent to resolve the rebase conflict")
         return False
+
+    @staticmethod
+    def _conflict_diagnostics(result: chain.ChainResult, onto: str) -> list[dict[str, Any]]:
+        """A `rebase_conflict` task's diagnostics for a replay onto `onto` that conflicted."""
+        conflict = result.conflict
+        return [
+            {
+                "kind": "conflict",
+                "source_pr": conflict.source_pr if conflict else None,
+                # The input chain's conflicting commit, which the worker's own replay stops at.
+                "commit": conflict.replayed if conflict else None,
+                "paths": list(conflict.conflict_paths) if conflict else [],
+                "onto": onto,
+                "message": f"replaying the chain onto {onto[:12]} conflicts at {conflict.source_pr if conflict else '?'}",
+                "pending": [r.source_pr for r in result.commits if r.status == chain.PENDING],
+                "clean_prefix_tip": result.tip,
+                # Members the new base already carries (landed outside the queue): empty commits in the
+                # clean prefix, or still pending; the agent keeps them empty rather than replaying them.
+                "landed_on_base": result.landed_on_base,
+            }
+        ]
 
     # --- background preparation of open batches ----------------------------------------------------
 
@@ -6252,6 +6289,22 @@ class Controller:
             elif self._stale_prepare(task) and not self._active_claims(batch["id"], task_id=task["id"]):
                 # Built on a base `main` has moved past: `_onto_canonical` replays the batch first.
                 self._supersede_prepare(task["batch_id"], "base-behind", now, own_base_only=True)
+        for task in self.store.rows(
+            "tasks", {"repository": self.repository, "state": TASK_OPEN, "kind": TASK_REBASE_CONFLICT}
+        ):
+            batch = self.store.row("batches", {"id": task["batch_id"]})
+            if (
+                batch is not None
+                and batch["state"] == BATCH_OPEN
+                and self._eviction(batch) is None
+                and batch["version"] != task["batch_version"]
+                and not self._active_claims(batch["id"], task_id=task["id"])
+            ):
+                # The batch changed under an unclaimed rebase onto `main`: `_onto_canonical` replays anew.
+                with self.store.transaction():
+                    self.store.update(
+                        "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="batch-changed"
+                    )
         if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
         staging = self._staging_batches()
@@ -6277,6 +6330,10 @@ class Controller:
                 # evicted batch returns; an own-base preparation would rewrite the chain under it.
                 continue
             if not self._prepare_due(batch, now):
+                if batch["prepared_version"] == batch["version"]:
+                    # Prepared on a base `main` has moved past: kept when its replay onto `main` is clean,
+                    # rebased onto `main` in the background (and then prepared again) when it conflicts.
+                    self._onto_canonical(batch, now, rebase_clean=False)
                 continue
             pre_rebase = self._open_pre_rebase_task(batch)
             if pre_rebase is not None and self._active_claims(batch["id"], task_id=pre_rebase["id"]):
@@ -6312,29 +6369,30 @@ class Controller:
             and task["base"] != self._canonical
         )
 
-    def _onto_canonical(self, batch: dict[str, Any], now: float) -> bool:
+    def _onto_canonical(self, batch: dict[str, Any], now: float, *, rebase_clean: bool = True) -> bool:
         """Whether the open batch is based on the canonical commit, replaying it there first when it is
         not: it lands on top of `main`, so a preparation on an older base builds a tree that never
         lands. The replay runs without the controller lock, under a `rebase` claim on the batch that
         holds insertion off, and is applied only if neither the batch nor the canonical commit moved
         meanwhile. A clean replay re-bases the batch (members' commits, base, tip, a new version). A
-        conflicting one is recorded per batch version and canonical commit, so it is not repeated each
-        pass, and the batch gets no own-base preparation; its conflicts are resolved when it is
-        pre-rebased. A batch with a pre-rebase is left as it is: its preparation is that of the
-        pre-rebased chain, which names its own chain."""
+        conflicting one creates the batch's `rebase_conflict` task onto `main`, which a worker
+        resolves in the background; while it is open the replay is not repeated and the batch gets no
+        own-base preparation. A batch with a pre-rebase is left as it is: its preparation is that of the
+        pre-rebased chain, which names its own chain. Without `rebase_clean` (a batch already prepared)
+        a clean replay leaves the batch and its preparation as they are, and is recorded per batch
+        version and canonical commit so it is not repeated."""
         canonical = self._canonical
         if not canonical or batch["base"] == canonical:
             return True
         if batch["pre_rebase_state"]:
             return False
-        key = f"open_rebase_conflict:{batch['id']}"
+        if self._open_rebase_task(batch) is not None:
+            self._note_reason(f"open batch {batch['id']} waits for a worker to resolve its rebase onto main")
+            return False
+        key = f"open_rebase_clean:{batch['id']}"
         recorded = self._state(key) or {}
         if recorded.get("version") == batch["version"] and recorded.get("onto") == canonical:
-            self._note_reason(
-                f"open batch {batch['id']}: its replay onto {canonical[:12]} conflicts at {recorded.get('source_pr')}; "
-                "it is prepared once pre-rebased"
-            )
-            return False
+            return True  # a clean replay of a prepared batch, left as it is
         if self._active_claims(batch["id"]):
             return False
         with self.store.transaction():
@@ -6358,13 +6416,24 @@ class Controller:
             or self._canonical != canonical
             or [c for c in self._active_claims(batch["id"]) if c["id"] != claim["id"]]
         )
+        if not moved and result.status == chain.CLEAN and not rebase_clean:
+            with self.store.transaction():
+                self._release_claim(claim, "clean", now)
+                self._set_state(key, {"version": batch["version"], "onto": canonical})
+            return True
         if moved or result.status != chain.CLEAN:
             with self.store.transaction():
                 self._release_claim(claim, "batch-moved" if moved else "conflict", now)
                 if not moved:
                     source_pr = result.conflict.source_pr if result.conflict else None
-                    self._set_state(key, {"version": batch["version"], "onto": canonical, "source_pr": source_pr})
                     self.store.journal(now, "open-rebase-conflict", batch["id"], onto=canonical, source_pr=source_pr)
+            if not moved:
+                # A worker resolves the conflicts onto `main` in the background, as for the head; the
+                # open task is what keeps the replay from repeating. Adopting the result re-bases the
+                # batch, which is then prepared on `main`.
+                self._create_task(
+                    batch, TASK_REBASE_CONFLICT, canonical, self._conflict_diagnostics(result, canonical), now
+                )
             return False
         version = batch["version"] + 1
         by_pr = {record.source_pr: record for record in result.commits}
@@ -6678,6 +6747,9 @@ class Controller:
             return
         if self._retained_tasks(batch):
             self._note_reason(f"open batch {batch['id']} waits for its retained work as the evicted head")
+            return
+        if self._open_rebase_task(batch) is not None:
+            self._note_reason(f"open batch {batch['id']} waits for its rebase onto main")
             return
         head = self._head()
         if self._pre_rebase_blocked(head) is not None:

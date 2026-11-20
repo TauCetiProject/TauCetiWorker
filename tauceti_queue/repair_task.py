@@ -1553,10 +1553,11 @@ HEAD_KINDS = ("repair", "rebase_conflict")  # the head's own tasks, which warm f
 
 
 def background_task(task: Task) -> bool:
-    """Work for a later batch (``prepare``, ``pre_rebase``), whose builds yield the CPU to the head's
-    (``repair_sandbox.prioritized``). A proactive prediction repair is the head's own: when the head's
-    CI fails the controller turns that same task into its required repair."""
-    return task.kind in ("prepare", "pre_rebase")
+    """Work for a later batch (``prepare``, ``pre_rebase``, or any task the controller marks
+    ``background``, such as an open batch's rebase onto ``main``), whose builds yield the CPU to the
+    head's (``repair_sandbox.prioritized``). A proactive prediction repair is the head's own: when the
+    head's CI fails the controller turns that same task into its required repair."""
+    return task.kind in ("prepare", "pre_rebase") or bool(task.extra.get("background"))
 
 
 def describe_cache_revision(task: Task, artifacts: dict) -> str:
