@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_clients as clients
 from tauceti_worker import audit_pool as pool
 from tauceti_worker import security_audit as sa
-from tauceti_worker.config import Die, NoProgress
+from tauceti_worker.audit_evidence import NotJudged, Unreadable
+from tauceti_worker.config import NoProgress
 
 
 class PoolFixture(unittest.TestCase):
@@ -181,7 +182,7 @@ class Ordering(PoolFixture):
     def test_operational_failures_retry_fresh_twice_then_block(self):
         def inspect(batch, attempt):
             if self.index(batch) == 0:
-                raise Die("security-audit: codex failed; see model-stderr.txt")
+                raise NotJudged("security-audit: codex failed; see model-stderr.txt")
             return self.verdict(batch)
 
         self.serve(inspect, stop=self.settled)
@@ -246,28 +247,47 @@ class Ordering(PoolFixture):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], subprocess.TimeoutExpired)
 
-    def test_non_operational_failure_blocks_without_retry(self):
+    def test_unreadable_evidence_blocks_without_retry(self):
         def inspect(batch, attempt):
             if self.index(batch) == 0:
-                raise Die("security-audit: reviewer attempted an unauthorized tool call")
+                raise Unreadable("security-audit: unreadable evidence: reviewer text cannot be read")
             return self.verdict(batch)
 
         self.serve(inspect, stop=self.settled)
         self.assertEqual(self.calls.count(0), 1)
         self.assertEqual(self.advanced, [])
 
-    def test_operational_block_with_native_judgment_is_not_retried(self):
+    def test_failed_attempt_with_a_native_finding_binds_and_is_not_retried(self):
         def inspect(batch, attempt):
             if self.index(batch) == 0:
-                (attempt / "model-rollout-0.jsonl").write_text("{}\n")
-                raise Die("security-audit: inspection unfinished; retained for same-session continuation")
+                (attempt / "model-rollout-0.jsonl").write_text(
+                    "\n".join(
+                        sa.serialize(
+                            {
+                                "type": "response_item",
+                                "payload": {
+                                    "type": "message",
+                                    "role": "assistant",
+                                    "phase": "final_answer",
+                                    "content": [{"type": "output_text", "text": sa.serialize(value)}],
+                                },
+                            }
+                        )
+                        for value in (
+                            {"verdict": "finding", "findings": ["x"]},
+                            {"verdict": "unfinished", "findings": []},
+                        )
+                    )
+                    + "\n"
+                )
+                return sa.judged(attempt, batch, "security-audit: inspection unfinished")
             return self.verdict(batch)
 
-        with patch(
-            "tauceti_worker.audit_recovery.native_finals", return_value=[{"verdict": "finding", "findings": ["x"]}]
-        ):
-            self.serve(inspect, stop=self.settled)
+        self.serve(inspect, stop=self.settled)
         self.assertEqual(self.calls.count(0), 1)
+        self.assertEqual(self.advanced, [])
+        blocked = json.loads((self.state / "blocked.json").read_text())
+        self.assertEqual(blocked["reason"], "security-audit: x")
 
 
 class Providers(PoolFixture):
@@ -315,7 +335,7 @@ class Providers(PoolFixture):
                 # Codex comes back under pace and Claude's subscription goes over pace.
                 self.pace.update(codex=True, claude=False)
                 self.key = "sk-ant-fixture-secret"
-                raise Die("security-audit: reviewer failed")
+                raise NotJudged("security-audit: reviewer failed")
             return self.verdict(batch)
 
         self.serve(inspect, parallel=1)
@@ -329,7 +349,7 @@ class Providers(PoolFixture):
         def inspect(batch, attempt):
             if self.index(batch) == 0 and not stopped:
                 stopped.append(attempt)
-                raise Die("security-audit: inspection unfinished; retained for same-session continuation")
+                raise NotJudged("security-audit: inspection unfinished")
             return self.verdict(batch)
 
         retained = []
@@ -362,7 +382,7 @@ class Providers(PoolFixture):
                 (attempt / "model-transcript.jsonl").write_text(
                     sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
                 )
-                raise Die("security-audit: reviewer failed")
+                return sa.judged(attempt, batch, "security-audit: reviewer failed")
             return self.verdict(batch)
 
         self.serve(inspect, stop=lambda p: not p.running and any(s.status == "blocked" for s in p.slots))
@@ -491,69 +511,20 @@ class Ownership(PoolFixture):
         self.assertEqual(len(self.advanced), 3)
 
 
-class Escalation(PoolFixture):
-    def test_haiku_incomplete_escalates_to_one_fresh_luna_review_even_over_pace(self):
-        self.pace["codex"] = False
-        self.key = "sk-ant-fixture-secret"
-
+class BindingJudgments(PoolFixture):
+    def test_haiku_incomplete_with_a_concern_binds_without_another_review(self):
         def inspect(batch, attempt):
-            provider = self.launches[-1][1]
-            if self.index(batch) == 1 and provider == "claude":
+            if self.index(batch) == 1:
                 return self.verdict(batch, "incomplete", ["origin of `stacks` is uncertain"])
             return self.verdict(batch)
 
-        self.serve(inspect)
-        self.assertEqual(len(self.advanced), 3)
-        second = [(p, resumed) for i, p, _, resumed in self.launches if i == 1]
-        self.assertEqual(second, [("claude", False), ("codex", False)])
-        rows = self.ledger()
-        self.assertEqual(sum(1 for r in rows if r.get("escalation") == "luna"), 1)
-        kinds = [(r.get("provider"), r["verdict"]["verdict"]) for r in rows if isinstance(r.get("verdict"), dict)]
-        self.assertIn(("claude", "incomplete"), kinds)
-        self.assertIn(("codex", "pass"), kinds)
-
-    def test_luna_incomplete_after_escalation_blocks_without_further_review(self):
-        def inspect(batch, attempt):
-            if self.index(batch) == 0:
-                return self.verdict(batch, "incomplete", ["unclear"])
-            return self.verdict(batch)
-
         self.pace["codex"] = False
         self.key = "sk-ant-fixture-secret"
         self.serve(inspect)
-        self.assertEqual(self.advanced, [])
-        head = [p for i, p, _, _ in self.launches if i == 0]
-        self.assertEqual(head, ["claude", "codex"])
-
-    def test_haiku_finding_never_escalates(self):
-        def inspect(batch, attempt):
-            if self.index(batch) == 0:
-                return self.verdict(batch, "finding", ["runs IO at elaboration"])
-            return self.verdict(batch)
-
-        self.pace["codex"] = False
-        self.key = "sk-ant-fixture-secret"
-        self.serve(inspect)
-        self.assertEqual(self.advanced, [])
-        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], ["claude"])
-
-    def test_restart_during_escalation_resumes_on_luna_never_haiku(self):
-        self.pace["codex"] = False
-        self.key = "sk-ant-fixture-secret"
-
-        def first(batch, attempt):
-            if self.index(batch) == 0:
-                return self.verdict(batch, "incomplete", ["unclear"])
-            return self.verdict(batch)
-
-        # Luna is unavailable in the first run, so the escalation is still pending when it stops.
-        with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
-            self.serve(first, stop=lambda p: any(s.escalation == "pending" for s in p.slots) and not p.running)
-        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], ["claude"])
-        self.launches.clear()
-        self.serve(lambda batch, attempt: self.verdict(batch))
-        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], ["codex"])
-        self.assertEqual(len(self.advanced), 3)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+        self.assertEqual([p for i, p, _, _ in self.launches if i == 1], ["claude"])
+        blocked = json.loads((self.state / "blocked.json").read_text())
+        self.assertIn("stacks", blocked["reason"])
 
     def test_recorded_binding_verdict_is_never_inspected_again_even_if_pool_state_is_lost(self):
         self.pace["codex"] = False
@@ -576,12 +547,9 @@ class Escalation(PoolFixture):
 
 class OwnJournal(PoolFixture):
     def test_a_running_launch_journal_at_the_cursor_does_not_idle_the_pool(self):
-        self.pace["codex"] = False
-        self.key = "sk-ant-fixture-secret"
-
         def inspect(batch, attempt):
             if self.index(batch) == 0:
-                # Launches journal their attempt; this one is escalated and still running.
+                # Launches journal their attempt in blocked.json while they run.
                 (self.state / "blocked.json").write_text(
                     sa.serialize(
                         {
@@ -592,19 +560,12 @@ class OwnJournal(PoolFixture):
                         }
                     )
                 )
-                if self.launches[-1][1] == "claude":
-                    return self.verdict(batch, "incomplete", ["unclear"])
             return self.verdict(batch)
 
         self.serve(inspect)
         self.assertEqual(len(self.advanced), 3)
 
-
-class OwnJournalRestart(PoolFixture):
-    def test_restart_with_own_journal_at_cursor_still_runs_the_escalation(self):
-        self.pace["codex"] = False
-        self.key = "sk-ant-fixture-secret"
-
+    def test_restart_with_an_earlier_pool_journal_at_the_cursor_inspects_afresh(self):
         def first(batch, attempt):
             if self.index(batch) == 0:
                 (self.state / "blocked.json").write_text(
@@ -617,15 +578,47 @@ class OwnJournalRestart(PoolFixture):
                         }
                     )
                 )
-                return self.verdict(batch, "incomplete", ["unclear"])
+                raise NotJudged("security-audit: reviewer failed")
             return self.verdict(batch)
 
         with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
-            self.serve(first, stop=lambda p: any(s.escalation == "pending" for s in p.slots) and not p.running)
+            self.serve(first, stop=lambda p: not p.running and p.slots[0].failures == 1)
         self.launches.clear()
         self.serve(lambda batch, attempt: self.verdict(batch))
         self.assertEqual([p for i, p, _, _ in self.launches if i == 0], ["codex"])
         self.assertEqual(len(self.advanced), 3)
+        self.assertTrue(list(self.state.glob("superseded-by-pool-block-*.json")))
+
+    def test_restart_with_an_earlier_journal_whose_attempt_recorded_a_finding_holds(self):
+        def first(batch, attempt):
+            if self.index(batch) == 0:
+                (self.state / "blocked.json").write_text(
+                    sa.serialize(
+                        {
+                            "from_sha": batch["from_sha"],
+                            "to_sha": batch["commits"][-1]["sha"],
+                            "attempt": str(attempt),
+                            "reason": "security-audit: operational recovery interrupted",
+                        }
+                    )
+                )
+                use = {
+                    "type": "tool_use",
+                    "name": "StructuredOutput",
+                    "input": {"verdict": "finding", "findings": ["IO"]},
+                }
+                (attempt / "model-transcript.jsonl").write_text(
+                    sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+                )
+                raise NotJudged("security-audit: killed before classification")
+            return self.verdict(batch)
+
+        with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
+            self.serve(first, stop=lambda p: not p.running and p.slots[0].failures == 1)
+        self.launches.clear()
+        self.serve(lambda batch, attempt: self.verdict(batch), stop=lambda p: not p.running)
+        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], [])
+        self.assertEqual(self.advanced, [])
 
 
 class Lookahead(PoolFixture):
