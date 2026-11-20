@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tauceti_worker import audit_client_check as check
 from tauceti_worker import audit_clients as clients
+from tauceti_worker import audit_evidence as evidence
 from tauceti_worker import audit_pool as pool
 from tauceti_worker import audit_reader as ar
 from tauceti_worker import audit_recovery as recovery
@@ -197,18 +198,18 @@ class HaikuContinuation(unittest.TestCase):
         with patch.object(sa, "run_process", side_effect=fake):
             verdict = sa.inspect(self.batch, "claude", attempt)
         self.assertEqual(verdict, sa.bind_verdict(uncertain, self.batch))
-        self.assertFalse(pool.clean_history(attempt))
+        self.assertTrue(evidence.holds(self.work, attempt))
 
     def test_earlier_finding_in_a_continued_attempt_binds_its_pass(self):
         finding = {"verdict": "finding", "findings": ["commit 1 TauCeti/ascii.lean: #eval reads the environment"]}
         first = self.attempt("1")
         fake = FakeHaiku(self.batch, [{"pages": [0, 1], "outputs": [finding, UNFINISHED]}])
         with patch.object(sa, "run_process", side_effect=fake), patch.object(sa, "MAX_INVOCATION_LAUNCHES", 1):
-            with self.assertRaisesRegex(Die, "inspection unfinished"):
-                sa.inspect(self.batch, "claude", first)
+            # The later unfinished turn does not hide the finding: it binds at once.
+            self.assertEqual(sa.inspect(self.batch, "claude", first), sa.bind_verdict(finding, self.batch))
         with self.assertRaisesRegex(Die, "forbid automatic recovery"):
             recovery.retained_claude(self.work, self.block(first))
-        self.assertFalse(pool.clean_history(first))
+        self.assertTrue(evidence.holds(self.work, first))
         # Even forced, the continued session cannot discard the earlier finding.
         second = self.attempt("2")
         resumed = FakeHaiku(self.batch, [{"pages": range(2, self.pages), "outputs": [PASS]}])
@@ -228,43 +229,44 @@ class HaikuContinuation(unittest.TestCase):
             },
         ]
         (attempt / "model-transcript.jsonl").write_text("".join(sa.serialize(e) + "\n" for e in events))
-        self.assertFalse(pool.clean_history(attempt))
+        self.assertTrue(evidence.holds(self.work, attempt))
         events[1] = {"type": "result", "subtype": "success", "structured_output": UNFINISHED}
         (attempt / "model-transcript.jsonl").write_text("".join(sa.serialize(e) + "\n" for e in events))
-        self.assertTrue(pool.clean_history(attempt))
+        self.assertFalse(evidence.holds(self.work, attempt))
         # A judgment written as an assistant note counts as one.
         events[0]["message"]["content"][0]["text"] = "```json\n" + sa.serialize(uncertain) + "\n```"
         (attempt / "model-transcript.jsonl").write_text("".join(sa.serialize(e) + "\n" for e in events))
-        self.assertFalse(pool.clean_history(attempt))
+        self.assertTrue(evidence.holds(self.work, attempt))
         # An interrupted line that might hold a judgment is unreadable, never ignored.
         (attempt / "model-transcript.jsonl").write_text(
             sa.serialize(events[1])
             + '\n{"type":"assistant","message":{"content":[{"name":"StructuredOutput","input":{"verdict":"fin'
         )
-        self.assertFalse(pool.clean_history(attempt))
+        self.assertTrue(evidence.holds(self.work, attempt))
         (attempt / "model-transcript.jsonl").write_text(
             sa.serialize(events[1])
             + '\n{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"{\\"page\\":3,'
         )
-        self.assertTrue(pool.clean_history(attempt))
+        self.assertFalse(evidence.holds(self.work, attempt))
         # Truncated before its kind is visible: it could have been an answer.
         (attempt / "model-transcript.jsonl").write_text(
             sa.serialize(events[1]) + '\n{"type":"assistant","message":{"con'
         )
-        self.assertFalse(pool.clean_history(attempt))
+        self.assertTrue(evidence.holds(self.work, attempt))
 
     def test_timeout_mid_session_continues_in_the_pool_rather_than_restarting(self):
         first = self.attempt("1")
         fake = FakeHaiku(self.batch, [{"pages": [0, 1, 2], "timeout": True}])
-        with patch.object(sa, "run_process", side_effect=fake), self.assertRaises(subprocess.TimeoutExpired):
+        with patch.object(sa, "run_process", side_effect=fake), self.assertRaises(evidence.NotJudged) as stopped:
             sa.inspect(self.batch, "claude", first)
+        self.assertIsInstance(stopped.exception.__cause__, subprocess.TimeoutExpired)
         self.assertEqual(ar.Reader(self.batch, first / "read-receipt.json").coverage()["served"], [0, 1, 2])
         # The client reported page 2, but its result never reached the stored session:
         # the resumed session must be served that page again.
         session = sa.claude_sessions(first)[0]
         session.write_text("".join(session.read_text().splitlines(keepends=True)[:-1]))
         block = self.block(first, reason="Command timed out", failure_kind="provider-timeout")
-        self.assertTrue(pool.operational(subprocess.TimeoutExpired(["claude"], 1800), first, "claude"))
+        self.assertTrue(pool.operational(stopped.exception))
         p = pool.Pool(self.work, parallel=1, chooser=None)
         second = self.attempt("2")
         resumed = FakeHaiku(self.batch, [{"pages": range(2, self.pages), "outputs": [PASS]}])
@@ -277,21 +279,17 @@ class HaikuContinuation(unittest.TestCase):
         self.assertTrue(call.prompt.startswith(sa.SERVED_CONTINUE_PROMPT) or "next_unserved_page=2" in call.prompt)
         self.assertEqual(json.loads((second / "previous-block.json").read_text()), block)
 
-    def test_pool_refuses_a_fresh_attempt_when_the_stopped_transcript_holds_a_finding(self):
+    def test_a_finding_before_a_timeout_binds_and_survives_a_lost_session(self):
         first = self.attempt("1")
         finding = {"verdict": "finding", "findings": ["commit 1: run_cmd executes a process"]}
         fake = FakeHaiku(self.batch, [{"pages": [0], "outputs": [finding], "timeout": True}])
-        with patch.object(sa, "run_process", side_effect=fake), self.assertRaises(subprocess.TimeoutExpired):
-            sa.inspect(self.batch, "claude", first)
-        # Without the retained session, continuation is impossible; the transcript still binds.
+        with patch.object(sa, "run_process", side_effect=fake):
+            self.assertEqual(sa.inspect(self.batch, "claude", first), sa.bind_verdict(finding, self.batch))
+        # Without the retained session, the captured transcript still binds.
         for path in sa.claude_sessions(first):
             path.unlink()
-        self.assertFalse(pool.operational(subprocess.TimeoutExpired(["claude"], 1800), first, "claude"))
-        p = pool.Pool(self.work, parallel=1, chooser=None)
-        second = self.attempt("2")
-        with patch.object(sa, "run_process", side_effect=AssertionError("no fresh launch")):
-            with self.assertRaisesRegex(Die, "fresh attempt would discard"):
-                p.inspect(self.batch, second, "claude", "subscription", 4, self.block(first))
+        self.assertTrue(evidence.holds(self.work, first))
+        self.assertEqual(sa.judged(first, self.batch, "timed out"), sa.bind_verdict(finding, self.batch))
 
     def test_pool_starts_fresh_only_when_nothing_valid_is_retained_and_the_output_is_clean(self):
         first = self.attempt("1")

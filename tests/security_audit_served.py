@@ -535,7 +535,13 @@ class ServedJudgments(unittest.TestCase):
                 "codex", range(start, start + 1)
             )
             raise subprocess.TimeoutExpired(
-                "codex", 1800, output=("\n".join(map(sa.serialize, events)) + '\n{"type":').encode()
+                "codex",
+                1800,
+                # Killed while flushing a large page result: a partial row that cannot hold a judgment.
+                output=(
+                    "\n".join(map(sa.serialize, events))
+                    + '\n{"type":"item.completed","item":{"type":"mcp_tool_call","server":"audit","result":{"content'
+                ).encode(),
             )
 
         previous = self.block
