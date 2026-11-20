@@ -95,7 +95,7 @@ from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_
 from .github_state import enabled as github_state_enabled
 from .intentions import avoid_list
 from .paths import CLAIM_SH, HERE
-from .quota import Quota, mirror_creds
+from .quota import Quota, claude_usage_credentials, mirror_creds
 from .review_diagnostics import (
     clear_review_failure,
     public_review_failure,
@@ -1786,6 +1786,12 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                         str(w.cfg.store_dir),
                         "--post",
                         "--no-sync",
+                        *(
+                            ["--require-claude-config-file"]
+                            if claude_usage_credentials() is not None
+                            and os.environ.get("TAUCETI_CLAUDE_BILLING") != "api"
+                            else []
+                        ),
                         "--reviewer",
                         reviewers,
                         *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
