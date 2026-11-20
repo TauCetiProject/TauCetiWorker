@@ -1281,6 +1281,15 @@ class PrivateAlerts(unittest.TestCase):
         self.assertEqual(alerts.report(self.work, finding)["details"], ["run_cmd"])
         self.assertEqual(alerts.report(self.work, {**self.block, "outcome": "not-judged"})["kind"], "Operational stall")
 
+    def test_every_block_writer_records_its_outcome(self):
+        from tauceti_worker.audit_evidence import NotJudged, Unreadable, outcome_of
+
+        finding = {"verdict": "finding", "findings": ["IO"]}
+        self.assertEqual(outcome_of(finding, Die("x")), {"outcome": "finding", "verdict": finding})
+        self.assertEqual(outcome_of(None, Unreadable("x")), {"outcome": "unreadable"})
+        self.assertEqual(outcome_of(None, NotJudged("x")), {"outcome": "not-judged"})
+        self.assertEqual(outcome_of({"verdict": "pass", "findings": []}, Die("ref")), {"outcome": "not-judged"})
+
     def test_code_uncertainty_notifies_immediately_during_operational_delay(self):
         (self.work / "ledger.jsonl").unlink()
         alerts.notify_block(self.work, self.block)

@@ -26,7 +26,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
-from .audit_evidence import FINDING, PASS, UNREADABLE, NotJudged, Unreadable, classify
+from .audit_evidence import FINDING, PASS, UNREADABLE, NotJudged, Unreadable, classify, outcome_of
 from .audit_progress import (
     GOAL_REQUEST,
     INLINE_CONTINUE_PROMPT,
@@ -2241,10 +2241,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         return 0
     except (Die, ValueError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired) as exc:
         failure = {"from_sha": cursor, "to_sha": target, "reason": str(exc), "attempt": str(attempt)}
-        if verdict is not None and verdict["verdict"] != "pass":
-            failure.update(outcome="finding", verdict=verdict)
-        else:
-            failure["outcome"] = "unreadable" if isinstance(exc, Unreadable) else "not-judged"
+        failure.update(outcome_of(verdict, exc))
         if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
             failure["failure_kind"] = "provider-timeout"
         blocked.write_text(serialize(failure))
@@ -2450,6 +2447,7 @@ def resume_incomplete(
         },
     )
     log(f"security-audit: continuing retained inspection {cursor[:12]}..{target[:12]}")
+    verdict = None
     try:
         verdict = inspect(
             batch,
@@ -2497,6 +2495,7 @@ def resume_incomplete(
             "reason": str(exc),
             "attempt": str(attempt),
             "continuation_of": str(original),
+            **outcome_of(verdict, exc),
         }
         blocked.write_text(serialize(failure), encoding="utf-8")
         record(work / "ledger.jsonl", failure)

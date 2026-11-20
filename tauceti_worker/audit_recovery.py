@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
-from .audit_evidence import NotJudged
+from .audit_evidence import NotJudged, outcome_of
 from .audit_progress import continuable, coverage
 from .config import Die, NoProgress, log
 
@@ -639,6 +639,7 @@ def recover(cfg, opts, previous: dict) -> bool:
         before_read = coverage(batch, original / "read-receipt.json", protocol=protocol)["read"] if paged else None
     except Exception:
         before_read = None  # Advisory scheduling must not change recovery eligibility.
+    verdict = None
     try:
         verdict = sa.inspect(
             batch,
@@ -662,6 +663,7 @@ def recover(cfg, opts, previous: dict) -> bool:
             "attempt": str(attempt),
             "continuation_of": str(original),
             "reason": str(exc),
+            **outcome_of(verdict, exc),
         }
         if isinstance(exc, sa.subprocess.TimeoutExpired) or isinstance(exc.__cause__, sa.subprocess.TimeoutExpired):
             failure["failure_kind"] = "provider-timeout"

@@ -391,3 +391,10 @@ def holds(state: Path, attempt: Path) -> bool:
         return True
     evidence = recorded(state, digest, collect(attempt))
     return bool(evidence.concerns() or evidence.unreadable)
+
+
+def outcome_of(verdict, exc: BaseException | None) -> dict:
+    """What a block records about how its attempt ended, so alerts never re-read the evidence."""
+    if isinstance(verdict, dict) and verdict.get("verdict") != "pass":
+        return {"outcome": FINDING, "verdict": verdict}
+    return {"outcome": UNREADABLE if isinstance(exc, Unreadable) else NOT_JUDGED}
