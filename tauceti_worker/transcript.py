@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from typing import Any
 
 TOOL_INPUT_LIMIT = 4 * 1024
@@ -174,8 +175,11 @@ class AgentTranscriptRenderer:
     Bubble command whose plain-text bootstrap output precedes the inner agent's JSONL stream.
     """
 
-    def __init__(self, provider: str):
+    def __init__(self, provider: str, on_rate_limit: Callable[[dict[str, Any]], object] | None = None):
         self.provider = provider
+        # Called with each Claude `rate_limit_info.unifiedWindows` object (per window: `utilization`
+        # as a 0-1 fraction and `resetsAt` in unix seconds). Its failure never affects rendering.
+        self._on_rate_limit = on_rate_limit
         self.active = False
         self._tools: dict[str, str] = {}
         self._started: set[str] = set()
@@ -432,6 +436,12 @@ class AgentTranscriptRenderer:
             info = event.get("rate_limit_info") if isinstance(event.get("rate_limit_info"), dict) else {}
             if info.get("status") is not None:
                 self.rate_limit_status = str(info["status"])
+            windows = info.get("unifiedWindows")
+            if self._on_rate_limit is not None and isinstance(windows, dict):
+                try:
+                    self._on_rate_limit(windows)
+                except Exception:
+                    pass  # usage sharing is an optimization, never a transcript failure
             details = [
                 f"{label}={info[key]}"
                 for key, label in (("status", "status"), ("rateLimitType", "type"), ("resetsAt", "resets"))
