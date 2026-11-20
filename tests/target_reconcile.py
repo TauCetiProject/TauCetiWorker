@@ -221,12 +221,6 @@ class Publish(Tmp):
     def remote(self):
         return git(self.tmp / "remote.git", "show", "main:targets.md") + "\n"
 
-    def hook(self, clone, name, body):
-        hook = clone.parent / ".git" / "hooks" / name
-        hook.write_text("#!/bin/sh\n" + body)
-        hook.chmod(0o755)
-        return hook
-
     def test_an_untracked_list_is_edited_in_place_and_recomputed_on_a_hand_edit(self):
         path = self.tmp / "targets.md"
         path.write_text(EXAMPLE)
@@ -282,39 +276,6 @@ class Publish(Tmp):
         self.assertNotIn("landed: #42", self.remote())
         self.assertEqual(first.read_text(), self.remote())
 
-    def test_a_rejected_commit_leaves_nothing_and_a_later_look_publishes(self):
-        first = self.clone("first")
-        hook = self.hook(
-            first,
-            "pre-commit",
-            "sed 's/the strong law (/the strong law. (/' targets.md > t.tmp && mv t.tmp targets.md\nexit 1\n",
-        )
-        self.assertIsNone(reconcile.publish(first, tick("strong-law")))
-        self.assertEqual((first.read_text(), self.remote()), (EXAMPLE, EXAMPLE))
-        self.assertEqual(git(first.parent, "status", "--porcelain"), "")
-        hook.unlink()
-        self.assertEqual(len(reconcile.publish(first, tick("strong-law"))), 1)
-        self.assertIn("- [x] `strong-law`", self.remote())
-
-    def test_a_partial_history_survives_a_rejected_commit_and_its_retry(self):
-        listed = EXAMPLE.replace("in flight: #1234", "partial: #7; in flight: #1234")
-        first = self.clone("first")
-        first.write_text(listed)
-        git(first.parent, "commit", "-q", "-am", "partial")
-        git(first.parent, "push", "-q", "origin", "HEAD:main")
-        observed = seen(
-            pulls={1234: {"state": "MERGED", "body": marker("Probability", "truncation-bounds", partial=True)}}
-        )
-
-        def compute(listed):
-            return reconcile.settle(listed, observed)
-
-        hook = self.hook(first, "pre-commit", "exit 1\n")
-        self.assertIsNone(reconcile.publish(first, compute))
-        hook.unlink()
-        self.assertEqual(len(reconcile.publish(first, compute)), 1)
-        self.assertIn("(needs: none; partial: #7, #1234)", self.remote())
-
     def test_an_operators_uncommitted_edit_is_left_alone(self):
         first = self.clone("first")
         by_hand = EXAMPLE.replace("- [ ] `strong-law`", "- [~] `strong-law`")
@@ -347,22 +308,6 @@ class Publish(Tmp):
         self.assertEqual(len(reconcile.publish(named, tick("strong-law"))), 1)
         self.assertIn("- [x] `strong-law`", git(self.tmp / "remote.git", "show", "main:cibles é.md"))
 
-    def test_a_commit_hook_keeps_its_own_glob_matching(self):
-        first = self.clone("first")
-        self.hook(first, "pre-commit", "[ -z \"$(git diff --cached --name-only -- '*.md')\" ] || exit 1\n")
-        self.assertIsNone(reconcile.publish(first, tick("strong-law")))
-        self.assertEqual(self.remote(), EXAMPLE)
-
-    def test_a_hook_that_rewrites_the_list_stops_publication(self):
-        first = self.clone("first")
-        self.hook(
-            first,
-            "pre-commit",
-            "sed 's/the strong law for/the weak law for/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
-        )
-        self.assertIsNone(reconcile.publish(first, tick("strong-law")))
-        self.assertEqual(self.remote(), EXAMPLE)
-
     def test_a_list_the_remote_turned_into_a_symlink_is_not_followed(self):
         first, second = self.clone("first"), self.clone("second")
         outside = self.tmp / "outside.md"
@@ -379,7 +324,6 @@ class Publish(Tmp):
         from tauceti_worker.worker_sources import activate
 
         first = self.clone("first")
-        hook = self.hook(first, "pre-commit", "exit 1\n")
         token = self.tmp / "native-token"
         token.write_text("synthetic\n")
         token.chmod(0o600)
@@ -391,8 +335,6 @@ class Publish(Tmp):
         source.api.request.return_value = {"id": 3, "email": "bot@example.invalid"}
         source.identity.record.return_value = {}
         with activate(source, SimpleNamespace(state=self.tmp / "native-state")):
-            self.assertIsNone(reconcile.publish(first, tick("strong-law")))
-            hook.unlink()
             self.assertEqual(len(reconcile.publish(first, tick("strong-law"))), 1)
         self.assertEqual(git(self.tmp / "remote.git", "log", "-1", "--format=%an", "main"), "curator")
 
@@ -467,11 +409,6 @@ class TrackedRound(Tmp):
     def remote(self, name="targets.md"):
         return git(self.tmp / "remote.git", "show", f"main:{name}") + "\n"
 
-    def hook(self, directory, body):
-        directory.mkdir(exist_ok=True)
-        (directory / "pre-commit").write_text("#!/bin/sh\n" + body)
-        (directory / "pre-commit").chmod(0o755)
-
     def test_a_look_observes_the_published_list_not_a_stale_clone(self):
         self.first.write_text(EXAMPLE.replace("Goal: the strong law", "Goal (draft): the strong law"))
         self.second.write_text(EXAMPLE.replace("in flight: #1234", "in flight: #43"))
@@ -481,58 +418,22 @@ class TrackedRound(Tmp):
         self.assertEqual(self.look(), 0)
         self.assertIn("(needs: none; closed: #43)", self.remote())
 
-    def test_a_relative_hook_directory_of_the_clone_still_runs(self):
+    def test_the_clones_hooks_do_not_run(self):
+        for directory in (self.first.parent / ".git" / "hooks", self.first.parent / ".local-hooks"):
+            directory.mkdir(exist_ok=True)
+            for name in ("pre-commit", "pre-push", "post-commit"):
+                (directory / name).write_text('#!/bin/sh\ntouch "$0.ran"\nexit 1\n')
+                (directory / name).chmod(0o755)
+        self.github(merged=[(7, marker("Probability", "strong-law"))])
+        self.assertEqual(self.look(), 0)
         git(self.first.parent, "config", "core.hooksPath", ".local-hooks")
-        self.hook(self.first.parent / ".local-hooks", "exit 1\n")
-        self.github(merged=[(7, marker("Probability", "strong-law"))])
-        self.assertIsNone(self.look())
-        self.assertEqual(self.remote(), EXAMPLE)
-
-    def test_a_hook_that_moves_the_item_to_another_area_is_not_pushed(self):
-        self.hook(
-            self.first.parent / ".git" / "hooks",
-            "sed 's/^## Probability$/## Statistics/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
-        )
-        self.github(merged=[(7, marker("Probability", "strong-law"))])
-        self.assertIsNone(self.look())
-        self.assertEqual(self.remote(), EXAMPLE)
-
-    def test_a_relative_pre_push_hook_of_the_clone_still_runs(self):
-        git(self.first.parent, "config", "core.hooksPath", ".local-hooks")
-        directory = self.first.parent / ".local-hooks"
-        directory.mkdir()
-        (directory / "pre-push").write_text("#!/bin/sh\nexit 1\n")
-        (directory / "pre-push").chmod(0o755)
-        self.github(merged=[(7, marker("Probability", "strong-law"))])
-        self.assertIsNone(self.look())
-        self.assertEqual(self.remote(), EXAMPLE)
-
-    def test_a_hook_that_adds_a_partial_clause_stops_publication(self):
-        self.hook(
-            self.first.parent / ".git" / "hooks",
-            "sed 's/landed: #7)/landed: #7; partial: #7)/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
-        )
-        self.github(merged=[(7, marker("Probability", "strong-law"))])
-        self.assertIsNone(self.look())
-        self.assertEqual(self.remote(), EXAMPLE)
-
-    def test_extra_commits_a_post_commit_hook_makes_are_not_pushed(self):
-        hooks = self.first.parent / ".git" / "hooks"
-        (hooks / "post-commit").write_text(
-            "#!/bin/sh\ngrep -q 'generated' targets.md && exit 0\n"
-            "printf 'formatted notes\\n' > notes.md && git commit -q -m 'format notes' -- notes.md\n"
-            "echo '> generated' >> targets.md && git commit -q -m 'generated' -- targets.md\n"
-        )
-        (hooks / "post-commit").chmod(0o755)
-        self.github(merged=[(7, marker("Probability", "strong-law"))])
-        self.assertIsNone(self.look())
-        self.assertEqual((self.remote(), self.remote("notes.md")), (EXAMPLE, "notes\n"))
-
-    def test_a_hook_that_stages_another_file_is_not_pushed(self):
-        self.hook(self.first.parent / ".git" / "hooks", "printf 'formatted notes\\n' > notes.md\ngit add '*.md'\n")
-        self.github(merged=[(7, marker("Probability", "strong-law"))])
-        self.assertIsNone(self.look())
-        self.assertEqual((self.remote(), self.remote("notes.md")), (EXAMPLE, "notes\n"))
+        self.github(merged=[(8, marker("MeasureTheory", "kolmogorov-zero-one"))])
+        self.assertEqual(self.look(), 0)
+        remote = self.remote()
+        self.assertIn("(serves: G1; needs: `borel-cantelli`, `truncation-bounds`; landed: #7)", remote)
+        self.assertIn("landed: #8)", remote)
+        ran = list(self.first.parent.glob(".git/hooks/*.ran")) + list(self.first.parent.glob(".local-hooks/*.ran"))
+        self.assertEqual(ran, [])
 
 
 class Round(Tmp):
