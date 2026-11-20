@@ -1065,7 +1065,7 @@ class RunnerConfig:
     token: str | None = None
     agent_timeout: float = 3 * 3600
     # The agent's foreground shell limit (``TAUCETI_SHELL_LIMIT_SECONDS``): a repair runs whole-library
-    # builds in the foreground, so it gets two hours where the fleet's authoring rounds keep ten minutes.
+    # builds in the foreground, so it gets two hours where the fleet's authoring rounds default to an hour per command.
     shell_limit: float = repair.SHELL_LIMIT_SECONDS
     build_timeout: float = 3 * 3600
     agent_attempts: int = 2  # ordinary agent failures or locally invalid chains
