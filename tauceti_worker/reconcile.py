@@ -19,6 +19,7 @@ import fcntl
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -343,25 +344,6 @@ def _notes(changes: list[Change]) -> list[str]:
     return [f"`{change.item.slug}`: {change.note}" for change in changes]
 
 
-def _carries(text: str, changes: list[Change]) -> bool:
-    """Whether `text` holds each change as planned: the item under its area, with its status, the
-    clauses it added, and none it dropped and did not add back."""
-    try:
-        listed = parse_targets(text)
-    except Die:
-        return False
-    for change in changes:
-        it = listed.find(change.item.slug)
-        dropped = {key.strip().lower() for key in change.drop}
-        if it is None or (it.area, it.status) != (change.item.area, change.status):
-            return False
-        if not set(change.add) <= set(it.meta) or any(
-            m.partition(":")[0].strip().lower() in dropped and m not in change.add for m in it.meta
-        ):
-            return False
-    return True
-
-
 def _in_place(path: Path, plan) -> list[str] | None:
     """`publish` for a list that is not tracked on a remote: planned on the file as it is and
     written by a rename, planned again if the file changed meanwhile."""
@@ -394,18 +376,17 @@ def _snapshot(path: Path) -> str:
     return path.read_text()
 
 
-def publish(path: Path, plan, *, check=None) -> list[str] | None:
+def publish(path: Path, plan) -> list[str] | None:
     """Apply `plan` to the list where it is published and return one note per edit, `[]` when it
     changes nothing, or None when nothing could be published. Call with the lock held.
 
     `plan(listed)` gives the edits for the parsed list it is handed; it is run on the text it will
     replace, so every edit is made against the list as it is there, never merged into it. A list
     tracked on a remote is published from a throwaway worktree of the branch it tracks, as fetched
-    now, committed through the clone's own hooks and pushed only if the commit changes the list
-    alone and the list as committed still carries every planned edit (`_carries`) and, when given,
-    satisfies `check`; the worktree is then removed. A rejected commit, check or push leaves nothing
-    behind, and a later look plans again. The clone around the list is then fast-forwarded when it
-    is clean (`_sync`). Any other list is edited in place."""
+    now, through the clone's own hooks. Hooks may refuse a publication but not change it: exactly
+    one new commit, changing only the list, to exactly the text the worker wrote, is pushed by its
+    id, or nothing is. The worktree is then removed, and the clone around the list fast-forwarded
+    when it is clean (`_sync`). Any other list is edited in place."""
     upstream = _upstream(path) if _tracked(path) else None
     if upstream is None:
         return _in_place(path, plan)
@@ -418,49 +399,65 @@ def publish(path: Path, plan, *, check=None) -> list[str] | None:
     top = Path(_git(path, "rev-parse", "--show-toplevel").stdout.strip())
     # The clone's hooks, wherever `core.hooksPath` puts them; a relative one would otherwise be
     # looked for inside the temporary worktree.
-    hooks = top / _git(path, "rev-parse", "--git-path", "hooks", cwd=top).stdout.strip()
+    hooks = f"core.hooksPath={top / _git(path, 'rev-parse', '--git-path', 'hooks', cwd=top).stdout.strip()}"
     # A tracked branch the remote does not have yet starts from the clone's own commit.
     base = tracking if _git(path, "rev-parse", "-q", "--verify", tracking).returncode == 0 else "HEAD"
     with tempfile.TemporaryDirectory(prefix="reconcile-") as tmp:
         tree = Path(tmp) / "tree"
-        if _git(path, "worktree", "add", "-q", "--detach", str(tree), base).returncode != 0:
+        if _git(path, "-c", hooks, "worktree", "add", "-q", "--detach", str(tree), base).returncode != 0:
             log(f"reconcile: no worktree of {base} could be made; nothing published")
             return None
         try:
-            return _publish_from(path, tree, name, hooks, plan, check, remote, ref)
+            return _publish_from(
+                path, tree, name, plan, remote, ref, lambda *a, **k: _git(path, "-c", hooks, *a, cwd=tree, **k)
+            )
         finally:
             _git(path, "worktree", "remove", "--force", str(tree))
             _git(path, "worktree", "prune")
             _sync(path)
 
 
-def _publish_from(path, tree: Path, name: str, hooks: Path, plan, check, remote: str, ref: str) -> list[str] | None:
+def _regular(tree: Path, name: str) -> Path | None:
+    """`tree / name` when it is a regular file reached without a symbolic link on the way."""
+    target = tree
+    for part in Path(name).parts:
+        target = target / part
+        if part in ("", ".", "..") or target.is_symlink():
+            return None
     try:
-        text = (tree / name).read_text()
+        return target if stat.S_ISREG(os.lstat(target).st_mode) else None
+    except OSError:
+        return None
+
+
+def _publish_from(path, tree: Path, name: str, plan, remote: str, ref: str, git) -> list[str] | None:
+    target = _regular(tree, name)
+    try:
+        text = target.read_text() if target is not None else None
     except (OSError, UnicodeDecodeError):
-        log(f"reconcile: {remote} has no readable {name}; nothing published")
+        text = None
+    if text is None:
+        log(f"reconcile: {name} on {remote} is not a readable regular file; nothing published")
         return None
     ours, changes = _edits(text, plan)
     if ours == text:
         return []
-    (tree / name).write_text(ours)
+    start = git("rev-parse", "HEAD").stdout.strip()
+    target.write_text(ours)
+    written = git("hash-object", "--no-filters", "--", name).stdout.strip()
     notes = _notes(changes)
     message = f"Reconcile {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
-    committed = _git(
-        path, "-c", f"core.hooksPath={hooks}", "commit", "-q", "-m", message, "--", f":(literal){name}", cwd=tree
-    )
+    committed = git("commit", "-q", "-m", message, "--", f":(literal){name}")
     if committed.returncode != 0:
         log(f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); a later look tries again")
         return None
-    touched = _git(path, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD", cwd=tree)
-    if [p for p in touched.stdout.split("\0") if p] != [name]:
-        log(f"reconcile: the commit changes more than {name}; not pushed")
+    head = git("rev-parse", "HEAD").stdout.strip()
+    parents = git("rev-list", "--parents", "-n", "1", head).stdout.split()[1:]
+    touched = [p for p in git("diff-tree", "--no-commit-id", "--name-only", "-r", "-z", head).stdout.split("\0") if p]
+    if parents != [start] or touched != [name] or git("rev-parse", f"{head}:{name}").stdout.strip() != written:
+        log("reconcile: a hook changed the commit; nothing published")
         return None
-    shown = _git(path, "show", f"HEAD:{name}", cwd=tree)
-    if shown.returncode != 0 or not _carries(shown.stdout, changes) or (check is not None and not check(shown.stdout)):
-        log("reconcile: the list as committed is not what this look's edits were made for; not pushed")
-        return None
-    pushed = _git(path, "push", "-q", remote, f"HEAD:{ref}", timeout=300, cwd=tree)
+    pushed = git("push", "-q", remote, f"{head}:{ref}", timeout=300)
     if pushed.returncode != 0:
         log(f"reconcile: push to {remote} failed ({one_line(pushed.stderr)}); a later look tries again")
         return None
