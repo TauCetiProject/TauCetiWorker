@@ -6186,15 +6186,16 @@ class PreRebaseChecks(Fixture):
         notes = json.loads(self.service.results[0]["worker_notes"])
         self.assertEqual(notes["pre_rebase_verification"]["scope"], "full")
 
-    def test_a_resolution_that_fails_verification_is_submitted_without_another_round(self):
-        """The resolved commit's tree is only a prefix of the chain, so a later member may fix what fails
-        there: the worker submits it after one agent turn and the whole chain's CI judges."""
+    def test_a_resolution_that_fails_verification_is_repaired_then_submitted(self):
+        """The rebased chain fails verification: the agent gets a repair round on it, and when that leaves
+        the chain as it was, the chain is submitted and the whole chain's CI judges."""
         self.pre_rebase_task()
         os.environ["STUB_AGENT_MODE"] = "explain-only"
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertEqual(len(self.agent_calls()), 2)
+        self.assertNotIn("## Resolving the commit", self.agent_calls()[1]["prompt"])
         self.assertFalse(outcome["verification"][-1]["ok"])
         pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
         self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Two.lean"))
