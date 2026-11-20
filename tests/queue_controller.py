@@ -367,6 +367,42 @@ class Verdicts(ControllerCase):
         self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
         self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
 
+    def oom_findings(self, *located):
+        return diagnostics.parse_log(
+            [
+                *located,
+                "error: Lean process for /work/pr/TauCeti/A/B.lean was killed by signal 9 after 712s, likely out of memory",
+                "Some required targets logged failures:",
+                "- TauCeti.A.B",
+                "error: build failed",
+            ]
+        )
+
+    def test_lean_killed_out_of_memory_is_an_infrastructure_failure(self):
+        self.github.ci_policy = lambda *_: ("fail", self.oom_findings())
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+
+    def test_lean_killed_out_of_memory_beside_a_compiler_error_creates_repair(self):
+        findings = self.oom_findings("TauCeti/C.lean:3:4: error: unknown identifier 'x'")
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "repair")
+        self.assertEqual(
+            [(f["kind"], f["module"]) for f in json.loads(task["diagnostics"])], [("compiler", "TauCeti.C")]
+        )
+
     def test_bound_failure_with_failed_finalizer_and_no_parsed_finding_creates_repair(self):
         # The finalizer exits 1 after posting build=failure; a bound failed status is a source verdict
         # even when no log line parses into a finding.
