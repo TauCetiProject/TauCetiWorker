@@ -818,6 +818,26 @@ ci="one/project"
             {k: authoring[k] for k in ("count", "limit", "blocked", "scope", "skip")},
             dict(count=7, limit=7, blocked=True, scope="any", skip="A,B"),
         )
+        for _, _, result in observations:  # a Fleet-focused round counts every roadmap
+            result.roadmap_only, result._automatic_open_count = "Algebra", result.n_mine_open
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            self.assertRaises(NoEligibleWork),
+        ):
+            run_round(None, options)
+        self.assertEqual(report.call_args.kwargs["authoring"]["scope"], "any")
+        for _, _, result in observations:  # an explicit area counts only that area
+            del result._automatic_open_count
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            self.assertRaises(NoEligibleWork),
+        ):
+            run_round(None, options)
+        self.assertEqual(report.call_args.kwargs["authoring"]["scope"], "Algebra")
 
     def test_native_execution_failure_does_not_invalidate_github_authoring_inventory(self):
         import contextlib

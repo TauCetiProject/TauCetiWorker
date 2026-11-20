@@ -168,6 +168,9 @@ def report_authoring(healthy):
 
     first = healthy[0][2]
     count = sum(result.n_mine_open for _, _, result in healthy)
+    # A Fleet-focused round counts every roadmap while it works in one area: report the scope the
+    # count covers, not the area selected for work.
+    counted_all = getattr(first, "_automatic_open_count", None) is not None
     report_runtime(
         authoring=dict(
             observed_at=time.time(),
@@ -175,7 +178,7 @@ def report_authoring(healthy):
             count=count,
             limit=first.max_open_prs,
             blocked=count >= first.max_open_prs,
-            scope=first.roadmap_only or "any",
+            scope="any" if counted_all else first.roadmap_only or "any",
             skip=",".join(sorted(set(filter(None, first.roadmap_skip)))),
         )
     )
