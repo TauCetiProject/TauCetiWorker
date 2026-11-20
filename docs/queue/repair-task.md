@@ -462,8 +462,10 @@ has a time budget holds because the service re-exposes the task.
 A worker keeps one tree per batch, with its `.lake`, across the batch's tasks and across worker
 restarts (`tauceti_queue/repair_cleanup.py`). When a task ends, or a restarted worker abandons it,
 its tree is renamed to `<root>/worktrees/batch-<batch_id>` (`retire`, recording the task in
-`.lake/tauceti-batch-tree.json`, written before the rename so it moves with the tree). Only a tree whose artifacts were prepared (`available`) is
-parked; any other is removed as before, and so is a tree whose batch already has a parked
+`.lake/tauceti-batch-tree.json`, written before the rename so it moves with the tree). Only a tree whose artifacts were prepared (`available`), and whose
+`lean-toolchain` and `lake-manifest.json` are still the prepared ones (`onto`'s for a rebase, the
+starting tip's otherwise), is parked (`repair_task.parkable`); the tree is locked in Git while it is
+renamed, so a concurrent `git worktree prune` on the shared clone keeps it; any other is removed as before, and so is a tree whose batch already has a parked
 one. The batch's next task on this worker renames the parked tree to its own `task-<id>` path
 (`adopt`). Each worker has its own root, and a rename takes the tree whole and fails when its
 destination exists, so two tasks never share or nest one. Adoption, parking and the collector take

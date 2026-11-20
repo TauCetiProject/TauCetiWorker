@@ -46,10 +46,18 @@ def batch_tree(root: Path, batch_id: str | int) -> Path | None:
 
 def _move(clone: Path, source: Path, destination: Path) -> None:
     """Rename a worktree and repoint Git at it. ``rename`` fails when the destination exists, so two
-    movers can never nest one tree inside another, as ``git worktree move`` into a directory would."""
+    movers can never nest one tree inside another, as ``git worktree move`` into a directory would.
+    The tree is locked in Git meanwhile, so another worker's ``git worktree prune`` on the shared
+    clone keeps its registration while the recorded path is briefly missing."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    os.rename(source, destination)
+    repair.git(clone, "worktree", "lock", "--reason", "moving", str(source))
+    try:
+        os.rename(source, destination)
+    except OSError:
+        repair.git(clone, "worktree", "unlock", str(source), check=False)
+        raise
     repair.git(clone, "worktree", "repair", str(destination))
+    repair.git(clone, "worktree", "unlock", str(destination))
 
 
 def adopt(clone: Path, root: Path, batch_id: str | int, worktree: Path) -> str | None:

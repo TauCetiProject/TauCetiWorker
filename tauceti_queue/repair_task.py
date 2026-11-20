@@ -1481,9 +1481,20 @@ def dependencies_differ(worktree: Path, revision: str) -> bool:
     )
 
 
+def parkable(cfg: RunnerConfig, task: Task, artifacts: dict | None) -> bool:
+    """Whether the task's tree may be parked as warm: its artifacts were prepared, and its dependency
+    files are still those prepared (``onto``'s for a rebase, the starting tip's otherwise). A cold
+    tree, or one whose chain changed its dependencies after preparation, is removed instead."""
+    if not (artifacts or {}).get("available"):
+        return False
+    worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
+    continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits else None
+    prepared = task.onto if task.kind in repair.REBASE_KINDS else (continuation or {}).get("tip") or task.tip
+    return worktree.is_dir() and not dependencies_differ(worktree, prepared)
+
+
 def retire_worktree(cfg: RunnerConfig, task: Task, artifacts: dict | None) -> str:
-    """Park the task's tree as its batch's tree when its artifacts were prepared, else remove it. A
-    cold tree (a failed fetch, its dependencies perhaps among them) is removed: a parked tree is warm."""
+    """Park the task's tree as its batch's tree when it is ``parkable``, else remove it."""
     from tauceti_queue import repair_cleanup
 
     return repair_cleanup.retire(
@@ -1492,7 +1503,7 @@ def retire_worktree(cfg: RunnerConfig, task: Task, artifacts: dict | None) -> st
         task.batch_id,
         task.task_id,
         cfg.root / "worktrees" / f"task-{task.task_id}",
-        keep=bool((artifacts or {}).get("available")),
+        keep=parkable(cfg, task, artifacts),
     )
 
 
@@ -2584,7 +2595,7 @@ def _run_task(
             clone=cfg.clone,
             remove_worktree=not cfg.keep_worktree,
             batch_id=task.batch_id,
-            park=bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("available")),
+            park=parkable(cfg, task, outcome.get("artifacts") or state.record.get("artifacts")),
         )
         outcome["publish"] = record
         if record.get("launched"):
