@@ -199,15 +199,12 @@ changed meanwhile gets the edit that list calls for, or none.
 
 When the list is tracked in a git repository on a branch that tracks a remote
 branch, the worker publishes it from a throwaway worktree, running git with the
-clone's own identity, credentials and hooks: it fetches that remote branch,
+clone's own identity and credentials: it fetches that remote branch,
 checks it out in a temporary worktree, computes the edits on the list there,
 commits the list alone as `Reconcile <file name>: N item(s)` with one line per
-item (through the clone's hooks, wherever `core.hooksPath` puts them, for the
-commit and the push alike), and pushes that commit by its id. Hooks may refuse
-a publication but may not change it: a hook that rewrites the list, stages
-another file or adds commits stops publication, so formatting the list is the
-worker's output's job, not a hook's. A list the remote branch holds as a
-symbolic link, or under one, is not published. The look reads the pull requests a list names from that remote
+item, and pushes that commit by its id. The worker publishes its ticks without
+running the clone's git hooks, so validation belongs in the forge's checks. A
+list the remote branch holds as a symbolic link, or under one, is not published. The look reads the pull requests a list names from that remote
 branch too, not from the clone's file, and reads them again if the list there
 changes before it is published. A commit a hook rejects, a
 push the remote refuses, or a fetch that fails publishes nothing and leaves

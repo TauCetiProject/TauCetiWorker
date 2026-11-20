@@ -272,8 +272,8 @@ def observe(targets: Targets, read: list[Source]) -> Seen:
 
 
 def _git(path: Path, *args: str, timeout: int = 120, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    """Git in the list's clone (or in `cwd`, a worktree of it), with the operator's identity,
-    credentials and hooks even inside a source's activation."""
+    """Git in the list's clone (or in `cwd`, a worktree of it), with the operator's identity
+    and credentials even inside a source's activation."""
     from .worker_sources import operator_environment
 
     argv = ["git", "-C", str(cwd or path.parent), *args]
@@ -376,6 +376,9 @@ def _snapshot(path: Path) -> str:
     return path.read_text()
 
 
+_NO_HOOKS = ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false")
+
+
 def publish(path: Path, plan) -> list[str] | None:
     """Apply `plan` to the list where it is published and return one note per edit, `[]` when it
     changes nothing, or None when nothing could be published. Call with the lock held.
@@ -383,10 +386,9 @@ def publish(path: Path, plan) -> list[str] | None:
     `plan(listed)` gives the edits for the parsed list it is handed; it is run on the text it will
     replace, so every edit is made against the list as it is there, never merged into it. A list
     tracked on a remote is published from a throwaway worktree of the branch it tracks, as fetched
-    now, through the clone's own hooks. Hooks may refuse a publication but not change it: exactly
-    one new commit, changing only the list, to exactly the text the worker wrote, is pushed by its
-    id, or nothing is. The worktree is then removed, and the clone around the list fast-forwarded
-    when it is clean (`_sync`). Any other list is edited in place."""
+    now, with git hooks disabled: exactly one new commit, changing only the list, to exactly the
+    text the worker wrote, is pushed by its id, or nothing is. The worktree is then removed, and
+    the clone around the list fast-forwarded when it is clean (`_sync`). Any other list is edited in place."""
     upstream = _upstream(path) if _tracked(path) else None
     if upstream is None:
         return _in_place(path, plan)
@@ -396,20 +398,16 @@ def publish(path: Path, plan) -> list[str] | None:
         log(f"reconcile: fetch from {remote} failed ({one_line(fetched.stderr)}); nothing published")
         return None
     name = _git(path, "ls-files", "-z", "--full-name", "--", _spec(path)).stdout.split("\0")[0]
-    top = Path(_git(path, "rev-parse", "--show-toplevel").stdout.strip())
-    # The clone's hooks, wherever `core.hooksPath` puts them; a relative one would otherwise be
-    # looked for inside the temporary worktree.
-    hooks = f"core.hooksPath={top / _git(path, 'rev-parse', '--git-path', 'hooks', cwd=top).stdout.strip()}"
     # A tracked branch the remote does not have yet starts from the clone's own commit.
     base = tracking if _git(path, "rev-parse", "-q", "--verify", tracking).returncode == 0 else "HEAD"
     with tempfile.TemporaryDirectory(prefix="reconcile-") as tmp:
         tree = Path(tmp) / "tree"
-        if _git(path, "-c", hooks, "worktree", "add", "-q", "--detach", str(tree), base).returncode != 0:
+        if _git(path, *_NO_HOOKS, "worktree", "add", "-q", "--detach", str(tree), base).returncode != 0:
             log(f"reconcile: no worktree of {base} could be made; nothing published")
             return None
         try:
             return _publish_from(
-                path, tree, name, plan, remote, ref, lambda *a, **k: _git(path, "-c", hooks, *a, cwd=tree, **k)
+                path, tree, name, plan, remote, ref, lambda *a, **k: _git(path, *_NO_HOOKS, *a, cwd=tree, **k)
             )
         finally:
             _git(path, "worktree", "remove", "--force", str(tree))
@@ -455,7 +453,7 @@ def _publish_from(path, tree: Path, name: str, plan, remote: str, ref: str, git)
     parents = git("rev-list", "--parents", "-n", "1", head).stdout.split()[1:]
     touched = [p for p in git("diff-tree", "--no-commit-id", "--name-only", "-r", "-z", head).stdout.split("\0") if p]
     if parents != [start] or touched != [name] or git("rev-parse", f"{head}:{name}").stdout.strip() != written:
-        log("reconcile: a hook changed the commit; nothing published")
+        log("reconcile: the commit is not the list as written; nothing published")
         return None
     pushed = git("push", "-q", remote, f"{head}:{ref}", timeout=300)
     if pushed.returncode != 0:
