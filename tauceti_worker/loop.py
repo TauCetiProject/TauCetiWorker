@@ -74,7 +74,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
     then settle (short pause if productive, escalating back-off otherwise). Ctrl-C stops the current
     round and exits. Keeps the escalating back-off that stopped ~700 no-op rounds hammering a
     rate-limited GitHub."""
-    unpaced = agent in OPENROUTER_MODELS or agent == "kiro" or api_mode()
+    from .work_units import model_free_selection
+
+    model_free = model_free_selection(only)
+    unpaced = agent in OPENROUTER_MODELS or agent == "kiro" or api_mode() or model_free
     ignore_quota = getattr(args, "ignore_quota", False)
     bubble = getattr(args, "bubble", False)
     quota_cmd = getattr(args, "quota_cmd", None)
@@ -129,7 +132,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 report_runtime("waiting-capacity", detail=reason, next_action_at=time.time() + 5)
                 time.sleep(5)
                 continue
-            if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1":
+            if api_mode() and os.environ.get("TAUCETI_USE_BUDGET") == "1" and not model_free:
                 snapshot = Budget().runtime_snapshot(worker=cfg.wid)
                 reason = admission_pause(snapshot, worker=cfg.wid) if snapshot else None
                 blocked = reason is not None
@@ -266,7 +269,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                     tail.append("--ignore-quota")  # only the operator grants outage permission
             # Audit-capable workers use a fixed Luna/Haiku inspection profile and reject
             # authoring overrides. Their maintenance fallback resolves its normal defaults.
-            if model and "security-audit" not in only:
+            if model and "security-audit" not in only and not model_free:
                 profile = resolve_authoring_profile(
                     model,
                     cli_model=getattr(args, "author_model", None),

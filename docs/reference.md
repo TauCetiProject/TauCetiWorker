@@ -9,7 +9,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | Flag | What it does |
 | --- | --- |
 | `--loop` | Run the driver: keep doing rounds, pacing against quota between them, instead of one. |
-| `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap,lint-repair` (default: the whole cascade). |
+| `--only TASKS` | Restrict the round to a comma list of `rebase,bump,progress,fix-ci,fix,review,roadmap,lint-repair` (default: the whole cascade). `reconcile`, which writes back what a [target list](target-lists.md#reconciliation)'s pull requests settled, is never part of the whole cascade and runs only when named here. |
 | `--skip TASKS` | Drop a comma list of tasks from the cascade. Combines with `--only` by subtraction. |
 | `--pr N[,N...]` | Work only on these pull requests (comma list or repeated flag; a leading `#` is accepted). A filter over what the round would already have done: it can never make a PR actionable that the survey passed over, and never bypasses branch claims, attempt budgets or a peer's in-progress review. Intersects with `--only`; `progress` and `roadmap` name no existing PR, so a targeted round drops them rather than falling through to unrelated work, and it makes no GitHub writes about PRs you did not name. When none of the named PRs are actionable the round reports why for each one and exits without progress. An empty or unreadable value (`--pr ""`, `--pr ,,`) is an error rather than silently no targeting. |
 | `--agent AGENT` | `auto` (default), `codex`, `claude`, `kiro`, `deepseek`, or `minimax`. Kiro and OpenRouter providers are explicit-only and unpaced. |
@@ -429,6 +429,7 @@ Most variables are tuning knobs with sane defaults.
 | `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |
+| `TAUCETI_RECONCILE_GAP` | `21600` | Seconds between looks at the target list by the [`reconcile` phase](target-lists.md#reconciliation), shared by the workers that reconcile one file on a host. |
 | `CLAIM_REPO` | automatic | The repository holding this worker's cooperative claim leases. Without an override it is the shared namespace `TauCetiProject/tauceti-claims` once your account can push there, and your own fork until then. See [the claim namespace](#the-claim-namespace). |
 | `CLAIM_TTL` / `CLAIM_HEARTBEAT` | `1500` / `300` | Branch-claim lease TTL and heartbeat interval (seconds). |
 

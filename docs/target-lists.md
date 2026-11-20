@@ -58,14 +58,18 @@ first `## ` heading is shown to the agent with the items of its area.
   This keeps them valid both in Git claim refs and in target markers.
 - A trailing parenthesised group holds `key: value` clauses separated by `;`,
   with no parentheses inside. `needs:` is a comma list of slugs from any area,
-  or `none`. `partial: #N, #M` names merged GitHub pull requests that did not
-  complete the item; a Forgejo pull request is named by its URL, in any case. Every other clause is passed to the agent as written.
+  or `none`. `partial: #N, #M` names merged pull requests that did not complete
+  the item. `in flight: #N` on a `[~]` item names the pull request it waits on,
+  which is how [reconciliation](#reconciliation) follows it. A GitHub pull
+  request is named `#N` in these clauses and a Forgejo one by its URL, in any
+  case. Every other clause is passed to the agent as written.
 - Malformed item lines, empty/invalid or duplicate slugs, undefined `needs:`
   references and dependency cycles reject the list before any model starts.
   Prerequisites may appear later in the file or in another area.
 
 The file is read at the start of each roadmap round, so an edit takes effect on
-the next round. The worker never writes to it.
+the next round. A worker writes to it only in the `reconcile` phase, which is
+off unless a worker's `only` names it (see [Reconciliation](#reconciliation)).
 
 ## Live statuses
 
@@ -100,7 +104,8 @@ window. Candidate items are also checked before assignment. These reads preserve
 partial-marker, explicit `partial:` and base-branch checks. Complete recent
 listings avoid these per-item reads, and completed/in-flight items do not trigger
 searches for their own prerequisites. Ticking `[x]` in the
-file records an operator completion and avoids repeated historical lookups.
+file, by hand or by [reconciliation](#reconciliation), records a completion and
+avoids repeated historical lookups.
 
 ## Selection
 
@@ -132,6 +137,90 @@ open pull requests, one search for recent landings, and one search per candidate
 tried, plus one item search per unresolved prerequisite missing from the recent
 landings, and one claim push per candidate. The GitHub searches are shared
 between workers of one account on a host for two minutes.
+
+## Reconciliation
+
+The overlay above only moves an item forward and forgets landings older than
+its window. `reconcile` is a phase that writes into the file what the list's own
+pull requests have settled, so the file stays true without hand edits. It starts
+no model and judges no content: every edit follows from the state of a pull
+request that carries the item's marker or that its `in flight:` clause names.
+
+It is explicit: a round considers it only when the worker's `only` names it,
+for example `only = ["roadmap", "reconcile"]`, and only with a target list set.
+Such a round looks at the list first when a look is due, which is once every
+`TAUCETI_RECONCILE_GAP` seconds (six hours by default) for all the workers that
+share the file on one host. A look that changes the file is the round's work;
+after one that changes nothing the round goes on to its other phases. A round
+given `--pr` does not reconcile. One worker per list is enough. In a round over
+several sources the look runs once, ahead of either source's work, and reads
+every source surveyed that round: in GitHub's round when GitHub was surveyed,
+otherwise in the round of the forge new pull requests go to; a pause the look
+meets (admission, an unavailable forge) ends the round as such when no other
+work runs. A round with no GitHub source reads GitHub's marked pull requests as
+the roadmap round does (above): the same single listing of 200, the same
+fallback when GitHub cannot be read, and the same
+`TAUCETI_ROADMAP_TARGETS_GITHUB=0` to stop it. A `#N` clause there is settled
+only from that listing, so one naming a pull request outside it (older, or
+without a marker) is left as it is; so is a clause naming a pull request of a
+source the round did not read.
+
+A look makes these edits to items not yet `[x]`, each to one item line; every
+other line stays as it was:
+
+| What it finds | The item becomes |
+| --- | --- |
+| A merged pull request completes the item by its marker, under the rules of [Live statuses](#live-statuses) | `[x]`, with `landed: #N` (on Forgejo, its URL; likewise below) |
+| The pull request a `[~]` item names in `in flight: #N` merged into the content base (`TAUCETI_BASE_BRANCH`, `main` by default) | `[x]`, with `landed: #N` |
+| That pull request merged, but its marker for the item says `"partial":true` or the item's `partial:` clause names it | `[ ]`, with `#N` added to `partial:` |
+| That pull request closed unmerged | `[ ]`, with `#N` added to `closed:` |
+| That pull request is open, merged into another branch, or was not read | unchanged |
+
+A pull request the merge queue closed counts as merged only with the landing
+proof [Live statuses](#live-statuses) describes, read from its own forge; one
+whose proof is refused counts as closed unmerged, and one without proof leaves
+the item as it is. A round that selects only `reconcile` chooses no model and
+does not wait for one under pace.
+
+An `in flight:` clause is removed when its item is settled. The `closed:` clause
+is passed to the next agent given the item, like any other clause. The merged
+side reads, on each forge, the 1000 most recent merged pull requests that carry
+a marker (on GitHub the most recently updated, on Forgejo the most recently
+created).
+
+**Writing.** A look holds `.<file name>.lock` beside the list from start to
+end, so two workers on a host never reconcile one file at once; the lock file's
+modification time is what shares the gap between them, and it is read again
+once the lock is held, so a worker that was due when its round began does not
+look again just after another one did. Every edit is computed on the very text
+it replaces, never merged into it: the look's observations are applied again to
+the list as it is where it is published, so an item whose line, area or status
+changed meanwhile gets the edit that list calls for, or none.
+
+When the list is tracked in a git repository on a branch that tracks a remote
+branch, the worker publishes it from a throwaway worktree, running git with the
+clone's own identity and credentials: it fetches that remote branch,
+checks it out in a temporary worktree, computes the edits on the list there,
+commits the list alone as `Reconcile <file name>: N item(s)` with one line per
+item, and pushes that commit by its id. The worker publishes its ticks without
+running the clone's git hooks, so validation belongs in the forge's checks. A
+list the remote branch holds as a symbolic link, or under one, is not
+published. The look reads the pull requests a list names from that remote
+branch too, not from the clone's file, and reads them again if the list there
+changes before it is published. A commit that fails, a push the remote
+refuses, or a fetch that fails publishes nothing and leaves nothing behind, and
+the next look computes again. The worktree is then removed
+and the clone is fast-forwarded to the remote branch when it has no
+uncommitted changes and no commits of its own; otherwise it is left for the
+operator. That is how workers on several hosts share one list: their edits meet
+on the remote. Neither the operator's working file nor their branch is ever
+written by a look, and their own commits are never pushed by it. Any other
+list, untracked or on a branch that tracks nothing, is edited in place and
+replaced by a rename, computed again if it changed while the look ran. Add the
+lock file to `.gitignore`.
+
+A look costs, on each forge it reads, one search for merged markers, plus one
+read per `in flight:` clause. It starts no model.
 
 ## What the agent sees
 
