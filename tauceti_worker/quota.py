@@ -963,6 +963,11 @@ def claude_agent_credentials(cfg) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def claude_agent_file_route_supported() -> bool:
+    """Whether separate-usage agent file routes are implemented on this platform."""
+    return True  # Includes the explicit macOS file route and its native-host launch checks.
+
+
 def claude_file_credential_problem(path: Path, *, renewable: bool) -> str | None:
     """Validate a file handed to an agent; copies must already hold a live access token."""
     oauth = _as_dict(_as_dict(_read_json_file(path)).get("claudeAiOauth"))
@@ -1040,7 +1045,7 @@ def claude_usage_configuration_problem(cfg, *, check_identity: bool = True) -> s
             return "Claude usage login must be a separate login, not a copy of the agents' credential"
     route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
     environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-    if route == "environment" and environment_token and environment_token == measured.get("accessToken"):
+    if environment_token and environment_token == measured.get("accessToken"):
         return "Claude usage login must be a separate login from the agents' environment token"
     if not check_identity:
         return None  # Identity follows mirroring of the selected file route.
@@ -2394,6 +2399,8 @@ class Quota:
             os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and route == "environment"
         ):
             return None
+        if not claude_agent_file_route_supported():
+            return "Claude agent file routes are unavailable on this platform"
         if problem := claude_file_credential_problem(
             claude_dir(self.cfg.home) / ".credentials.json",
             renewable=route == "environment" and sys.platform != "darwin",

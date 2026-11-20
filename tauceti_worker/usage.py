@@ -123,6 +123,8 @@ def kiro_process_env(
         env["KIRO_API_KEY"] = kiro_key
     else:
         env.pop("KIRO_API_KEY", None)
+    for key in ("TAUCETI_CLAUDE_USAGE_CREDENTIALS", "TAUCETI_CLAUDE_USAGE_OPERATOR_HOME"):
+        env.pop(key, None)
     for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "OPENROUTER_MANAGEMENT_KEY"):
         env.pop(key, None)
     if env.get("TAUCETI_KIRO_HOME"):

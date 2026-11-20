@@ -214,7 +214,7 @@ workers sharing a credential source do. Model-limit refusals are recorded agains
 the usage login too, so the two credentials must belong to one account.
 
 The variable must also be set in the environment running `status`, `doctor` or
-the dashboard; these commands do not load a worker's `env` table. Review phases
+the dashboard; these commands do not load a worker's `env` table. Claude subscription Review phases
 pass `--require-claude-config-file` to the Review runtime, which validates the
 agent file and uses an access-only copy in a private reviewer home. An older
 explicitly pinned `TAUCETI_REVIEW_REF` or `TAUCETI_REVIEW_ENGINE_DIR` refuses the
