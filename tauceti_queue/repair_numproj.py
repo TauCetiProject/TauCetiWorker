@@ -40,14 +40,13 @@ TIMEOUT_SECONDS = 1800.0
 JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
-CANDIDATE = re.compile(r"[\w'\)\]⟩»·]\.\d")
-# For `projection_edits`: a numeric projection, the named field replacing it, an identifier's last
-# characters (to tell `h1.1` from the literal `1.5`), and a receiver the tool may parenthesize.
+CANDIDATE = re.compile(r"[\w'!?\)\]⟩»·℘]\.\d")
+# For `projection_edits`: a numeric projection, the named field replacing it, and a receiver the
+# tool may parenthesize.
 _NUMERIC = re.compile(r"\.\d+")
 _NAMED = re.compile(r"\.[^\W\d][\w'!?]*")
-_IDENT_END = re.compile(r"[\w']+$")
 _RECEIVER = re.compile(r"[\w'.$!?«»℘]+")
-_BEFORE_PROJECTION = ")]⟩»·"
+_BEFORE_PROJECTION = ")]⟩»·℘"
 
 
 @dataclasses.dataclass
@@ -98,10 +97,11 @@ def projection_edits(before: str, after: str) -> set[tuple[int, int, str, tuple[
             # A projection follows a bracket or an identifier, as rewritten so far (`x.1.2` is
             # `x.fst.2` by now); digits alone before the `.` are a literal (`1.5`), unless they are
             # themselves a projection the tool kept (`x.1.2` to `x.1.snd`).
-            ident = _IDENT_END.search(after, 0, j)
-            if after[j - 1] not in _BEFORE_PROJECTION and (
-                ident is None or (ident.group().isdigit() and after[ident.start() - 1 : ident.start()] != ".")
-            ):
+            k = j  # back over the identifier just before the `.`, if any (linear: no regex search)
+            while k > 0 and (after[k - 1].isalnum() or after[k - 1] in "_'!?"):
+                k -= 1
+            ident = after[k:j]
+            if after[j - 1] not in _BEFORE_PROJECTION and (not ident or (ident.isdigit() and after[k - 1 : k] != ".")):
                 return None
             line, col = place(i)
             edits.add((line, col + 1, named.group()[1:], span))

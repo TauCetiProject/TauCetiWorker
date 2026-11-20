@@ -7234,6 +7234,13 @@ class NumprojPrepass(Fixture):
         self.assertTrue(repair_numproj.CANDIDATE.search("h.1"))
         self.assertTrue(repair_numproj.CANDIDATE.search("(f x).2"))
         self.assertTrue(repair_numproj.CANDIDATE.search("(·.1)"))
+        self.assertEqual(
+            edits("x!.1 x?.2 ℘.1", "x!.fst x?.snd ℘.val"),
+            {(1, 3, "fst", None), (1, 8, "snd", None), (1, 12, "val", None)},
+        )
+        started = time.monotonic()
+        edits("x.1\ny.2\n", "x." + "a" * 200_000 + "\ny.val\n")
+        self.assertLess(time.monotonic() - started, 5, "linear in the rewritten copy, whatever is in it")
         self.assertFalse(repair_numproj.CANDIDATE.search("theorem a : True := trivial\n"))
 
     def test_a_rewrite_must_be_what_the_tool_writes(self):
