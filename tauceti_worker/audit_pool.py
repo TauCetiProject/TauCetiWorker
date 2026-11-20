@@ -5,8 +5,9 @@ audit rounds defer to it. Each batch is the exact `plan_batch` input that a
 sequential run would build from that batch's `from_sha`. Every batch is
 inspected by its own isolated reviewer in its own attempt directory. The cursor
 moves only through `advance`, one batch at a time, and only past batches with a
-validated pass. A finding, an incomplete verdict or any non-operational failure
-is binding: it is never re-inspected, and nothing beyond it can advance.
+validated pass. Each attempt's outcome is the shared evidence classification: a
+recorded concern or unreadable evidence is binding (it is never re-inspected, and
+nothing beyond it can advance), and only an attempt with no judgment is retried.
 """
 
 from __future__ import annotations
@@ -15,31 +16,18 @@ import concurrent.futures
 import fcntl
 import json
 import os
-import re
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import audit_evidence as evidence
 from . import audit_watchdog
 from . import security_audit as sa
 from .audit_alerts import notify_block, save
+from .audit_evidence import NotJudged, Unreadable, concern, holds
 from .config import Die, NoProgress, log
 
-# Only these failures, with no recorded judgment, may be retried with a fresh
-# attempt. Everything else (unauthorized tools, malformed or inconsistent
-# judgments, retained-history conflicts) blocks for human review.
-OPERATIONAL = (
-    re.compile(r"security-audit: (codex|claude) failed; see .*"),
-    re.compile(r"security-audit: inspection unfinished; retained for same-session continuation"),
-    re.compile(r"security-audit: reader has not served the complete input"),
-    re.compile(r"security-audit: reviewer did not read the complete input"),
-    re.compile(r"security-audit: incomplete model response"),
-    re.compile(r"security-audit: missing final reviewer result"),
-    re.compile(r"security-audit: reviewer failed"),
-    re.compile(r"security-audit: model failed"),
-    re.compile(r"security-audit: awaiting client delivery verification"),
-)
 MAX_RETRIES = 2
 RETRY_SECONDS = 60
 ADMIN_TTL = 300
@@ -62,8 +50,6 @@ class Slot:
     resume: dict | None = None  # The stopped attempt to continue in the same session.
     # Inherited from the Worker's sequential audit, which already ran it without soft pacing.
     inherited: bool = False
-    # "pending" once a clean Haiku incomplete is handed to one fresh Luna review.
-    escalation: str | None = None
 
     @property
     def digest(self) -> str:
@@ -74,47 +60,9 @@ class Slot:
         return self.batch["commits"][-1]["sha"]
 
 
-def operational(exc: BaseException, attempt: Path, provider: str) -> bool:
-    if isinstance(exc, (subprocess.TimeoutExpired, OSError)):
-        clean = True
-    elif isinstance(exc, (Die, NoProgress)):
-        clean = any(p.fullmatch(str(exc)) for p in OPERATIONAL)
-    else:
-        return False
-    return clean and clean_history(attempt)
-
-
-def claude_attempt(attempt: Path) -> bool:
-    if (attempt / sa.CLAUDE_SESSIONS).exists():
-        return True
-    if (attempt / "native-sessions").exists() or any(attempt.glob("model-rollout-*.jsonl")):
-        return False  # A Codex attempt: its native rollout is checked as before.
-    try:
-        return json.loads((attempt / "execution.json").read_text())["argv"][0] == "claude"
-    except FileNotFoundError:
-        return False  # Never launched: no reviewer output exists.
-    except (OSError, ValueError, KeyError, TypeError, IndexError):
-        return True  # Unreadable launch record: check it as Haiku output, which fails closed.
-
-
-def clean_history(attempt: Path) -> bool:
-    if not attempt.is_dir():
-        return True
-    # A fresh attempt must never discard a judgment already in the reviewer's history:
-    # Luna's native rollout, or Haiku's retained session and captured stream-json output.
-    from .audit_recovery import claude_clean, native_finals
-
-    if claude_attempt(attempt) and not claude_clean(attempt):
-        return False
-    if not sa.native_rollouts(attempt):
-        return True
-    try:
-        finals = native_finals(attempt)
-    except (Die, OSError, ValueError, TypeError, AttributeError):
-        return False
-    return all(
-        isinstance(f, dict) and f.get("findings") == [] and f.get("verdict") in ("unfinished", "pass") for f in finals
-    )
+def operational(exc: BaseException) -> bool:
+    """An attempt with no judgment, or a failure before any reviewer ran. Never a recorded concern."""
+    return isinstance(exc, (NotJudged, NoProgress, OSError, subprocess.TimeoutExpired))
 
 
 class Pool:
@@ -164,7 +112,6 @@ class Pool:
                 "provider": slot.provider,
                 "model": sa.reviewer_model(slot.provider) if slot.provider else None,
                 "credential": slot.credential,
-                "escalation": slot.escalation,
             },
         )
 
@@ -184,11 +131,7 @@ class Pool:
         pending = sa.validate_history(self.repo, cursor, main)
         offset = 0
         while frm in by_from and len(chain) < self.window:
-            candidates = [
-                (b, m)
-                for b, m in by_from[frm]
-                if m.get("status") in ("pass", "blocked") or m.get("escalation") == "pending"
-            ]
+            candidates = [(b, m) for b, m in by_from[frm] if m.get("status") in ("pass", "blocked")]
             if len(candidates) != 1:
                 break
             batch, meta = candidates[0]
@@ -203,16 +146,14 @@ class Pool:
             rebuilt["input_digest"] = sa.hashlib.sha256(sa.serialize(rebuilt).encode()).hexdigest()
             if rebuilt != batch or sa.serialize(rebuilt) != sa.serialize(batch):
                 break
-            pending_escalation = meta.get("escalation") == "pending" and meta.get("status") not in ("pass", "blocked")
             slot = Slot(
                 batch,
-                status="planned" if pending_escalation else meta["status"],
+                status=meta["status"],
                 failures=meta.get("failures", 0),
                 verdict=meta.get("verdict"),
                 failure=meta.get("failure"),
-                provider="codex" if pending_escalation else meta.get("provider"),
-                credential="subscription" if pending_escalation else meta.get("credential"),
-                escalation=meta.get("escalation"),
+                provider=meta.get("provider"),
+                credential=meta.get("credential"),
                 attempts=list(meta.get("attempts") or []),
             )
             if slot.status == "pass" and (not slot.verdict or slot.verdict.get("verdict") != "pass"):
@@ -339,30 +280,6 @@ class Pool:
             self.protocols[provider] = selected_protocol(provider, self.work)
         return self.protocols[provider]
 
-    def recorded_verdicts(self, slot: Slot) -> list[dict]:
-        """Every model verdict the ledger holds for exactly this batch input."""
-        ledger = self.work / "ledger.jsonl"
-        rows = []
-        for line in ledger.read_text().splitlines() if ledger.exists() else ():
-            row = json.loads(line)
-            if row.get("batch") == slot.digest and isinstance(row.get("verdict"), dict):
-                rows.append(row)
-        return rows
-
-    def launch_allowed(self, slot: Slot) -> str | None:
-        """None if this launch may run; otherwise why it would re-roll a recorded judgment."""
-        verdicts = self.recorded_verdicts(slot)
-        binding = [r for r in verdicts if r["verdict"].get("verdict") != "pass"]
-        if slot.escalation == "pending":
-            if any(r.get("provider") == "codex" for r in verdicts):
-                return "security-audit: this batch already has its one escalated Luna judgment"
-            if any(r.get("provider") != "claude" or r["verdict"].get("verdict") != "incomplete" for r in binding):
-                return "security-audit: only a Haiku incomplete judgment may be escalated"
-            return None
-        if binding:
-            return "security-audit: this batch already has a binding judgment; it is never inspected again"
-        return None
-
     def submit(self, executor) -> None:
         busy = len(self.running)
         now = time.time()
@@ -371,10 +288,18 @@ class Pool:
                 return
             if slot.status != "planned" or slot.retry_at > now:
                 continue
-            refused = self.launch_allowed(slot)
-            if refused is not None:
+            recorded = evidence.recorded(self.work, slot.digest)
+            if recorded.concerns() or recorded.unreadable:
+                refused = "security-audit: this batch already has a binding judgment; it is never inspected again"
                 slot.status = "blocked"
-                failure = {"from_sha": slot.batch["from_sha"], "to_sha": slot.target, "reason": refused}
+                verdict = evidence.finding(slot.batch, recorded)
+                failure = {
+                    "from_sha": slot.batch["from_sha"],
+                    "to_sha": slot.target,
+                    "reason": refused,
+                    "outcome": "finding" if verdict else "unreadable",
+                    "verdict": verdict,
+                }
                 sa.record(self.work / "ledger.jsonl", failure)
                 self.block(slot, failure, head=slot.batch["from_sha"] == self.slots[0].batch["from_sha"])
                 log(f"security-audit pool: {slot.batch['from_sha'][:12]}..{slot.target[:12]} {refused}")
@@ -468,19 +393,15 @@ class Pool:
     def continue_claude(self, batch, attempt, protocol, credential, resume) -> dict | None:
         """Continue a stopped Haiku attempt in its own retained Claude session.
 
-        Without a valid retained session, a fresh attempt is allowed only when the
-        stopped attempt's session and captured output show no finding or uncertainty."""
+        Without a valid retained session, the attempt starts fresh: only an attempt
+        whose evidence holds no concern is ever retried."""
         from .audit_progress import claude_continuable
         from .audit_recovery import retained_claude
 
         try:
             original, retained_batch, execution = retained_claude(self.work, resume)
-        except (Die, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-            stopped = Path(resume["attempt"])
-            if not clean_history(stopped):
-                raise Die(
-                    "security-audit: the stopped Haiku attempt holds a judgment that a fresh attempt would discard"
-                ) from exc
+        except (Die, OSError, ValueError, KeyError, TypeError, AttributeError):
+            # Its classification found no concern, so a fresh attempt discards none.
             return None
         if retained_batch != batch:
             raise Die("security-audit: retained pool attempt belongs to another batch")
@@ -515,12 +436,13 @@ class Pool:
                 "to_sha": slot.target,
                 "reason": str(exc) or type(exc).__name__,
                 "attempt": str(attempt),
+                "outcome": "unreadable" if isinstance(exc, Unreadable) else "not-judged",
                 **self.reviewer(slot),
             }
-            if isinstance(exc, subprocess.TimeoutExpired):
+            if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
                 failure["failure_kind"] = "provider-timeout"
             sa.record(self.work / "ledger.jsonl", failure)
-            if operational(exc, attempt, slot.provider) and slot.failures < MAX_RETRIES:
+            if operational(exc) and slot.failures < MAX_RETRIES:
                 slot.failures += 1
                 slot.status = "planned"
                 # Both reviewers continue the same retained session when it is valid.
@@ -532,7 +454,7 @@ class Pool:
                     f"retry {slot.failures}/{MAX_RETRIES}"
                 )
                 return
-            if operational(exc, attempt, slot.provider):
+            if operational(exc):
                 failure["pool_retries_exhausted"] = True
             slot.status = "blocked"
             self.block(slot, failure, head=slot.batch["from_sha"] == cursor)
@@ -556,32 +478,14 @@ class Pool:
             self.persist(slot)
             log(f"security-audit pool: {span} pass")
             return
-        if verdict["verdict"] == "incomplete" and slot.provider == "claude" and slot.escalation is None:
-            # One fresh Luna review of an incomplete Haiku judgment; the Haiku
-            # verdict stays on record and a Luna finding or incomplete binds.
-            sa.record(
-                self.work / "ledger.jsonl",
-                {
-                    "escalation": "luna",
-                    "from_sha": slot.batch["from_sha"],
-                    "to_sha": slot.target,
-                    "batch": slot.digest,
-                    "after_attempt": str(attempt),
-                    "after_verdict": verdict,
-                },
-            )
-            slot.escalation = "pending"
-            slot.provider, slot.credential = "codex", "subscription"
-            slot.status, slot.failures, slot.resume, slot.retry_at = "planned", 0, None, 0.0
-            self.persist(slot)
-            log(f"security-audit pool: {span} incomplete on haiku; escalating to one fresh luna review")
-            return
         slot.status = "blocked"
         failure = {
             "from_sha": slot.batch["from_sha"],
             "to_sha": slot.target,
             "reason": "security-audit: " + "; ".join(verdict["findings"]),
             "attempt": str(attempt),
+            "outcome": "finding",
+            "verdict": verdict,
             **self.reviewer(slot),
         }
         sa.record(self.work / "ledger.jsonl", failure)
@@ -629,37 +533,25 @@ class Pool:
         return cursor
 
     def supersede(self, previous: dict) -> bool:
-        """Archive an operational-only block so a fresh isolated attempt can inspect the batch.
+        """Archive a block whose evidence binds nothing, so a fresh isolated attempt can inspect the batch.
 
-        Findings, incomplete verdicts, planning blocks, exhausted pool retries and any
-        attempt whose native history holds a judgment remain binding."""
-        reason = previous.get("reason", "")
-        if (
-            previous.get("manual_inspection_required")
-            or previous.get("pool_retries_exhausted")
-            or not (
-                any(p.fullmatch(reason) for p in OPERATIONAL)
-                or reason == "security-audit: operational recovery interrupted"
-                or reason.startswith("security-audit: GitHub request failed:")
-            )
-        ):
+        A recorded concern or unreadable evidence (in the attempt, its lineage or the ledger),
+        a planning block and exhausted pool retries remain binding."""
+        if previous.get("manual_inspection_required") or previous.get("pool_retries_exhausted"):
             return False
         span = (previous.get("from_sha"), previous.get("to_sha"))
         ledger = self.work / "ledger.jsonl"
         for line in ledger.read_text().splitlines() if ledger.exists() else ():
             row = json.loads(line)
-            if (row.get("from_sha"), row.get("to_sha")) == span and row.get("verdict", {}).get("verdict") not in (
-                None,
-                "pass",
-            ):
+            if (row.get("from_sha"), row.get("to_sha")) == span and concern(row.get("verdict")):
                 return False
         for key in ("attempt", "continuation_of"):
-            if previous.get(key) and not clean_history(Path(previous[key])):
+            if previous.get(key) and holds(self.work, Path(previous[key])):
                 return False
         try:
             from .audit_recovery import retained, retained_claude
 
-            if claude_attempt(Path(previous["attempt"])):
+            if (Path(previous["attempt"]) / sa.CLAUDE_SESSIONS).exists():
                 _, batch, execution = retained_claude(self.work, previous)
                 credential = "api-key" if "ANTHROPIC_API_KEY" in execution.get("environment", {}) else "subscription"
                 # A batch keeps its reviewer for life: continue this Haiku session in the pool.
@@ -841,5 +733,5 @@ class Chooser:
     def retry(self, slot: Slot):
         """Same provider for life; Claude may move from subscription to the API key."""
         if slot.provider == "codex":
-            return ("codex", "subscription") if slot.inherited or slot.escalation or self.under_pace("codex") else None
+            return ("codex", "subscription") if slot.inherited or self.under_pace("codex") else None
         return self.claude(prefer=slot.credential)

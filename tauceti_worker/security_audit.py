@@ -26,6 +26,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
+from .audit_evidence import FINDING, PASS, UNREADABLE, NotJudged, Unreadable, classify, outcome_of
 from .audit_progress import (
     GOAL_REQUEST,
     INLINE_CONTINUE_PROMPT,
@@ -37,7 +38,7 @@ from .audit_progress import (
     snapshot,
 )
 from .audit_reader_v3 import pages
-from .audit_recovery import claude_judgments, claude_safe_history, mechanical_output, recover, safe_history
+from .audit_recovery import mechanical_output, recover, safe_history
 from .config import Die, NoProgress, log
 from .constants import TAUCETI
 from .github_transport import execute
@@ -1956,90 +1957,44 @@ def inspect(
             prompt = OUTPUT_REPAIR_PROMPT + prompt
         if continue_reading:
             prompt = (snapshot(batch, receipt, work, protocol=protocol) if paged else INLINE_CONTINUE_PROMPT) + prompt
-        p = run_client(
-            cmd,
-            prompt,
-            home=home,
-            env=env,
-            work=work,
-            receipt=receipt,
-            provider=provider,
-            paged=paged,
-            batch=batch,
-            legacy_history=legacy_history,
-            allowed_history=allowed_history,
-            protocol=protocol,
-            trusted_names=names,
-        )
-        if p.returncode:
-            raise Die(f"security-audit: {provider} failed; see {work / 'model-stderr.txt'}")
-        if provider == "claude":
-            events = [json.loads(line) for line in p.stdout.splitlines() if line.strip()]
-            if not paged and any(e.get("type") == "system" and e.get("subtype") == "compact_boundary" for e in events):
-                raise Die("security-audit: inline source was compacted without a reader")
-            for event in events:
-                if event.get("type") == "assistant":
-                    for item in event.get("message", {}).get("content", []):
-                        if item.get("type") == "tool_use" and item.get("name") not in (
-                            {"StructuredOutput", "mcp__audit__read_page"} if paged else {"StructuredOutput"}
-                        ):
-                            raise Die("security-audit: reviewer attempted an unauthorized tool call")
-            value = claude_result(p.stdout).get("structured_output")
-        else:
-            value = codex_final(p.stdout, paged)
-        if paged and isinstance(value, dict) and value.get("verdict") == "unfinished":
-            if not (
-                set(value) == ({"verdict", "findings"} | ({"read_token"} if protocol < 4 else set()))
-                and value["findings"] == []
-            ):
-                raise Die("security-audit: malformed unfinished judgment")
-            raise Die("security-audit: inspection unfinished; retained for same-session continuation")
-        read_token = value.pop("read_token", None) if protocol < 4 and paged and isinstance(value, dict) else None
-        verdict = bind_verdict(value, batch)
-        if (
-            provider == "claude"
-            and verdict["verdict"] == "pass"
-            and not claude_safe_history(work, batch, paged, protocol=protocol)
-        ):
-            # As for Luna: an earlier Haiku judgment in this session or its captured
-            # output is binding, and a later pass can never discard it.
-            for prior in claude_judgments(work):
-                if (
-                    isinstance(prior, dict)
-                    and prior.get("verdict") in ("finding", "incomplete")
-                    and prior.get("findings")
-                ):
-                    prior = {k: v for k, v in prior.items() if k != "read_token"}
-                    return bind_verdict(prior, batch)
-            raise Die("security-audit: retained native history is missing or contains an unresolved judgment")
-        if (
-            provider == "codex"
-            and verdict["verdict"] == "pass"
-            and not safe_history(
-                work,
-                batch,
-                paged,
-                legacy=legacy_history,
-                allowed=allowed_history,
-                allow_empty=(work / "output-repairs.jsonl").exists(),
+        try:
+            p = run_client(
+                cmd,
+                prompt,
+                home=home,
+                env=env,
+                work=work,
+                receipt=receipt,
+                provider=provider,
+                paged=paged,
+                batch=batch,
+                legacy_history=legacy_history,
+                allowed_history=allowed_history,
                 protocol=protocol,
+                trusted_names=names,
             )
-        ):
-            # An earlier source judgment is binding even if a later answer says
-            # pass. Return it for normal ledger/alert reporting, never erase it.
-            from .audit_recovery import native_finals
+        except Exception as exc:
+            if not (work / "execution.json").exists():
+                raise  # No reviewer ran: an operation failure, never a judgment.
+            failure = exc
+        else:
+            failure = f"{provider} failed; see {work / 'model-stderr.txt'}" if p.returncode else None
+    return judged(work, batch, failure)
 
-            for prior in native_finals(work):
-                if (
-                    serialize(prior) not in allowed_history
-                    and prior.get("verdict") in ("finding", "incomplete")
-                    and prior.get("findings")
-                ):
-                    prior = {k: v for k, v in prior.items() if k != "read_token"}
-                    return validate_verdict(prior, batch) if "input_digest" in prior else bind_verdict(prior, batch)
-            raise Die("security-audit: retained native history is missing or contains an unresolved judgment")
-        validate_reads(verdict, batch, receipt, paged, read_token, protocol=protocol)
-        return verdict
+
+def judged(work: Path, batch: dict, failure=None) -> dict:
+    """Return a binding verdict (pass, or every recorded concern); raise otherwise.
+
+    The one shared classification decides, whatever the last launch did: a concern recorded
+    anywhere binds, unreadable evidence holds, and anything else is not a judgment.
+    """
+    outcome = classify(work.parent, work, batch, failure)
+    if outcome.kind in (PASS, FINDING):
+        return outcome.verdict
+    cause = failure if isinstance(failure, BaseException) else None
+    if outcome.kind == UNREADABLE:
+        raise Unreadable(outcome.reason) from cause
+    raise NotJudged(outcome.reason) from cause
 
 
 def validate_reads(
@@ -2269,6 +2224,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     protocol = selected_protocol(provider, work)
     model = reviewer_model(provider)
     log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
+    verdict = None
     try:
         if any(c["files"] for c in batch["commits"]):
             verdict = inspect(batch, provider, attempt, protocol=protocol)
@@ -2294,7 +2250,8 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         return 0
     except (Die, ValueError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired) as exc:
         failure = {"from_sha": cursor, "to_sha": target, "reason": str(exc), "attempt": str(attempt)}
-        if isinstance(exc, subprocess.TimeoutExpired):
+        failure.update(outcome_of(verdict, exc))
+        if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
             failure["failure_kind"] = "provider-timeout"
         blocked.write_text(serialize(failure))
         record(work / "ledger.jsonl", failure)
@@ -2499,6 +2456,7 @@ def resume_incomplete(
         },
     )
     log(f"security-audit: continuing retained inspection {cursor[:12]}..{target[:12]}")
+    verdict = None
     try:
         verdict = inspect(
             batch,
@@ -2546,6 +2504,7 @@ def resume_incomplete(
             "reason": str(exc),
             "attempt": str(attempt),
             "continuation_of": str(original),
+            **outcome_of(verdict, exc),
         }
         blocked.write_text(serialize(failure), encoding="utf-8")
         record(work / "ledger.jsonl", failure)

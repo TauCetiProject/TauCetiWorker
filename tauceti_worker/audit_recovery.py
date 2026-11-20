@@ -9,7 +9,8 @@ from collections import Counter
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
-from .audit_progress import continuable, coverage, legacy_coverage_only
+from .audit_evidence import NotJudged, holds, outcome_of
+from .audit_progress import continuable, coverage
 from .config import Die, NoProgress, log
 
 # The reviewed version-1 launcher deployed before worker-bound judgments. This
@@ -400,26 +401,6 @@ def retained(work: Path, previous: dict, *, seen: set[Path] | None = None) -> tu
     if version == 4:
         sa.reconcile_coverage(original, batch)
     paged = len(sa.serialize(batch).encode()) > sa.INLINE_BYTES
-    if version == 2 and paged and (original / "model-transcript.jsonl").exists():
-        transcript = (original / "model-transcript.jsonl").read_text()
-        # Service errors have no final answer and remain eligible for ordinary
-        # service recovery; only inspect a final when the stream supplies one.
-        messages = [
-            e
-            for e in map(json.loads, transcript.splitlines())
-            if e.get("type") == "item.completed" and e.get("item", {}).get("type") == "agent_message"
-        ]
-        value = (
-            sa.codex_final(transcript, True)
-            if messages
-            and any(e.get("type") == "turn.completed" for e in map(json.loads, transcript.splitlines()))
-            and not any(e.get("type") in ("turn.failed", "error") for e in map(json.loads, transcript.splitlines()))
-            else None
-        )
-        if legacy_coverage_only(value, batch, original / "read-receipt.json"):
-            if not native_finals(original) or native_finals(original)[-1] != value:
-                raise Die("security-audit: retained coverage answer differs from the native final")
-            allowed.append(sa.serialize(value))
     if not safe_history(original, batch, paged, legacy=legacy, allowed=allowed, goals=version >= 3, protocol=version):
         raise Die("security-audit: previous findings or uncertainty forbid automatic recovery")
     allowed_verdicts = {
@@ -527,6 +508,10 @@ def recover(cfg, opts, previous: dict) -> bool:
     from . import security_audit as sa
 
     work = cfg.state / sa.CURSOR
+    # The shared classification decides first: evidence holding a concern, or evidence that
+    # cannot be read, is never continued or revalidated as a pass.
+    if previous.get("outcome") in ("finding", "unreadable") or holds(work, Path(previous.get("attempt", ""))):
+        return False
     try:
         original, batch, execution, legacy = retained(work, previous)
         protocol = execution.get("protocol_version", 1)
@@ -658,6 +643,7 @@ def recover(cfg, opts, previous: dict) -> bool:
         before_read = coverage(batch, original / "read-receipt.json", protocol=protocol)["read"] if paged else None
     except Exception:
         before_read = None  # Advisory scheduling must not change recovery eligibility.
+    verdict = None
     try:
         verdict = sa.inspect(
             batch,
@@ -681,19 +667,16 @@ def recover(cfg, opts, previous: dict) -> bool:
             "attempt": str(attempt),
             "continuation_of": str(original),
             "reason": str(exc),
+            **outcome_of(verdict, exc),
         }
-        if isinstance(exc, sa.subprocess.TimeoutExpired):
+        if isinstance(exc, sa.subprocess.TimeoutExpired) or isinstance(exc.__cause__, sa.subprocess.TimeoutExpired):
             failure["failure_kind"] = "provider-timeout"
         if not (attempt / "execution.json").exists():
             failure["setup_attempt"] = str(attempt)
             failure["attempt"] = str(original)
         save(work / "blocked.json", failure)
         sa.record(work / "ledger.jsonl", failure)
-        if (
-            isinstance(exc, Die)
-            and str(exc) == "security-audit: inspection unfinished; retained for same-session continuation"
-            and before_read is not None
-        ):
+        if isinstance(exc, NotJudged) and before_read is not None:
             try:
                 # Reading more of the same immutable input is useful work. Shorten
                 # only the scheduling delay; preserve the reserved attempt count and

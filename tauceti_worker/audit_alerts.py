@@ -81,23 +81,33 @@ def save(path: Path, value: dict) -> None:
 
 
 def report(work: Path, block: dict) -> dict:
-    verdict = None
-    ledger = work / "ledger.jsonl"
-    if ledger.exists():
-        for line in ledger.read_text().splitlines():
-            row = json.loads(line)
-            if (row.get("from_sha"), row.get("to_sha")) == (block.get("from_sha"), block.get("to_sha")):
-                if "verdict" in row:
-                    verdict = row["verdict"]
-    kind = "Operational stall"
-    if verdict and verdict["verdict"] != "pass":
-        kind = "Source-safety finding" if verdict["verdict"] == "finding" else "Inspection incomplete"
-    return {
-        "kind": kind,
-        "from_sha": block.get("from_sha"),
-        "to_sha": block.get("to_sha"),
-        "details": verdict["findings"] if verdict else [block.get("reason", "Unknown audit failure")],
-    }
+    """The alert for a block, from the outcome its writer classified; never a second reading of evidence.
+
+    `outcome` is `finding` (with its bound `verdict`), `unreadable` or `not-judged`. Blocks written
+    before blocks carried their outcome fall back to the latest ledger verdict for the same range."""
+    outcome, verdict = block.get("outcome"), block.get("verdict")
+    if outcome is None:
+        verdict = None
+        ledger = work / "ledger.jsonl"
+        for line in ledger.read_text().splitlines() if ledger.exists() else ():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue  # A damaged row never stops the alert for the block that is in force.
+            if isinstance(row, dict) and (row.get("from_sha"), row.get("to_sha")) == (
+                block.get("from_sha"),
+                block.get("to_sha"),
+            ):
+                verdict = row.get("verdict", verdict)
+        outcome = "finding" if isinstance(verdict, dict) and verdict.get("verdict") != "pass" else "not-judged"
+    if outcome == "finding":
+        kind = "Inspection incomplete" if verdict.get("verdict") == "incomplete" else "Source-safety finding"
+        details = verdict.get("findings") or [block.get("reason", "Unexplained finding")]
+    elif outcome == "unreadable":
+        kind, details = "Unreadable evidence", [block.get("reason", "Unreadable audit evidence")]
+    else:
+        kind, details = "Operational stall", [block.get("reason", "Unknown audit failure")]
+    return {"kind": kind, "from_sha": block.get("from_sha"), "to_sha": block.get("to_sha"), "details": details}
 
 
 def content(value: dict, work: Path, marker: str) -> str:
@@ -110,7 +120,10 @@ def content(value: dict, work: Path, marker: str) -> str:
         else f"https://github.com/{TAUCETI}/commits/main"
     )
     attention = (
-        "**Human review required:** the inspection recorded a source concern or unresolved "
+        "**Human review required:** the inspection's evidence cannot be read, so it does not establish "
+        "that no source concern was recorded. The range will not be inspected again automatically."
+        if value["kind"] == "Unreadable evidence"
+        else "**Human review required:** the inspection recorded a source concern or unresolved "
         "code-safety uncertainty. Automatic recovery will not discard this judgment."
     )
     return (
