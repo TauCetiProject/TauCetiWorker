@@ -202,7 +202,12 @@ branch, the worker publishes it from a throwaway worktree, running git with the
 clone's own identity, credentials and hooks: it fetches that remote branch,
 checks it out in a temporary worktree, computes the edits on the list there,
 commits the list alone as `Reconcile <file name>: N item(s)` with one line per
-item, and pushes the commit to the remote branch. A commit a hook rejects, a
+item (through the clone's hooks, wherever `core.hooksPath` puts them), and
+pushes the commit to the remote branch only if it changes the list alone and
+the list as committed still holds every planned edit on the same item under
+the same area. The look reads the pull requests a list names from that remote
+branch too, not from the clone's file, and reads them again if the list there
+changes before it is published. A commit a hook rejects, a
 push the remote refuses, or a fetch that fails publishes nothing and leaves
 nothing behind, and the next look computes again. The worktree is then removed
 and the clone is fast-forwarded to the remote branch when it has no
