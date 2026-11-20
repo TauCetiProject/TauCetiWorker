@@ -2363,6 +2363,17 @@ def ensure_bubble_home(cfg: Config) -> dict:
     return env
 
 
+def claude_review_file_flags(reviewers: str) -> list[str]:
+    """Require a compatible private-file reviewer only for separate-usage Claude subscriptions."""
+    if (
+        claude_usage_credentials() is not None
+        and _uses_claude_credentials(reviewers)
+        and os.environ.get("TAUCETI_CLAUDE_BILLING") != "api"
+    ):
+        return ["--auth", "subscription", "--require-claude-config-file"]
+    return []
+
+
 def _uses_claude_credentials(work_model: str) -> bool:
     """Keep Bubble's Claude credential flag and macOS private-seed decision on one predicate."""
     models = {m.strip() for m in work_model.split(",")}
@@ -3257,8 +3268,8 @@ def _review_in_bubble_with(
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
     )
-    if claude_usage_credentials() is not None and os.environ.get("TAUCETI_CLAUDE_BILLING") != "api":
-        inner += " --require-claude-config-file"
+    if strict_file_flags := claude_review_file_flags(reviewers):
+        inner += " " + " ".join(strict_file_flags)
     if result_file is not None:
         inner = f"env TAUCETI_REVIEW_RESULT_FILE=/opt/review-result/{shlex.quote(result_file.name)} " + inner
     if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api":

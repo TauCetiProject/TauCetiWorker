@@ -11,8 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker import agents, quota
-from tauceti_worker.config import Config
+from tauceti_worker import agents, quota, usage, work_units
+from tauceti_worker.config import Config, NoProgress
 
 USAGE_VAR = "TAUCETI_CLAUDE_USAGE_CREDENTIALS"
 
@@ -177,6 +177,8 @@ class Isolation(unittest.TestCase):
         credential(self.usage, "usage-token", refresh="usage-refresh")
         os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "usage-token"
         self.assertIn("environment token", quota.claude_usage_configuration_problem(self.cfg))
+        os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"] = "file"
+        self.assertIn("environment token", quota.claude_usage_configuration_problem(self.cfg))
 
     def test_usage_symlink_is_pinned_to_its_real_filename(self):
         link = self.root / "usage-link.json"
@@ -231,13 +233,48 @@ class Isolation(unittest.TestCase):
         with patch.object(sys, "platform", "darwin"), patch.object(quota, "_claude_keychain_creds") as keychain:
             self.assertIsNone(reader._claude_launch_credential_unusable())
             self.assertIsNone(quota.claude_usage_configuration_problem(self.cfg))
+            with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "file"}):
+                self.assertIn("#682", reader._claude_launch_credential_unusable())
         keychain.assert_not_called()
+
+    def test_unsupported_review_file_flag_does_not_charge_the_pr(self):
+        values = {"review-err-1": 2}
+        w = SimpleNamespace(
+            cfg=self.config(),
+            gh=SimpleNamespace(repo="org/project"),
+            rs=SimpleNamespace(review_rounds=lambda *_: 0),
+            counters=SimpleNamespace(incr=lambda key: values.update({key: values.get(key, 0) + 1})),
+        )
+        candidate = SimpleNamespace(pr=1, head="a" * 40, contest=None)
+        with (
+            patch(
+                "tauceti_worker.review_runtime.resolve", return_value=SimpleNamespace(command=lambda: ["old-engine"])
+            ),
+            patch.object(work_units, "run_to_logfile", return_value=2),
+            patch.object(work_units, "record_review_failure") as record,
+        ):
+            with self.assertRaisesRegex(NoProgress, "not charged to the PR"):
+                work_units.do_review(w, None, candidate, SimpleNamespace(work_model="claude"), False)
+        self.assertEqual(values["review-err-1"], 2)
+        record.assert_not_called()
+
+    def test_strict_review_file_flag_targets_only_claude_subscriptions(self):
+        os.environ["TAUCETI_REVIEW_AUTH"] = "api"
+        for models in ("claude", "sonnet", "claude,codex"):
+            self.assertEqual(
+                agents.claude_review_file_flags(models), ["--auth", "subscription", "--require-claude-config-file"]
+            )
+        for models in ("codex", "kiro", "codex,kiro"):
+            self.assertEqual(agents.claude_review_file_flags(models), [])
+        os.environ["TAUCETI_CLAUDE_BILLING"] = "api"
+        self.assertEqual(agents.claude_review_file_flags("claude"), [])
 
     def test_usage_path_is_not_forwarded_to_host_agents(self):
         _, env = agents.host_agent_argv("test", "claude")
         self.assertNotIn(USAGE_VAR, env)
         self.assertNotIn("TAUCETI_CLAUDE_USAGE_OPERATOR_HOME", env)
         self.assertEqual(os.environ[USAGE_VAR], str(self.usage))
+        self.assertNotIn(USAGE_VAR, usage.kiro_process_env())
 
     def test_inspection_scope_and_work_scope_are_reported_honestly(self):
         reader = quota.Quota(self.config())

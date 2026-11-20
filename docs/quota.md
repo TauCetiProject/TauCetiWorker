@@ -166,10 +166,10 @@ dashboard read Claude usage with that login, and `tauceti doctor` shows it as
 `$CLAUDE_CONFIG_DIR`, whose `.credentials.json` holds the setup-token as
 `claudeAiOauth.accessToken` (with its `expiresAt` and `scopes`, and no
 `refreshToken`), and off macOS that file is mirrored into isolated workers as
-before. On macOS the variable changes only which login usage is read with: the
-agents' credential is handled as [below](#macos-and-the-login-keychain), so a
-`--bubble` round is seeded from the login Keychain when it holds a Claude
-sign-in, and an isolated worker's copy of the token file is not re-mirrored.
+before. On macOS the native host environment route keeps the existing Keychain
+behavior. Separate-usage file-only phases (Review, Bubble and security audit)
+remain unavailable until macOS file-route support (#682) is present; they do not
+fall back to the usage login or repeatedly charge a PR for missing support.
 
 ```toml
 [[workers]]
@@ -210,7 +210,7 @@ workers sharing a credential source do. Model-limit refusals are recorded agains
 the usage login too, so the two credentials must belong to one account.
 
 The variable must also be set in the environment running `status`, `doctor` or
-the dashboard; these commands do not load a worker's `env` table. Review phases
+the dashboard; these commands do not load a worker's `env` table. Claude subscription Review phases
 pass `--require-claude-config-file` to the Review runtime, which validates the
 agent file and uses an access-only copy in a private reviewer home. An older
 explicitly pinned `TAUCETI_REVIEW_REF` or `TAUCETI_REVIEW_ENGINE_DIR` refuses the

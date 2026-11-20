@@ -939,6 +939,11 @@ def claude_agent_credentials(cfg) -> tuple[Path, ...]:
     return tuple(dict.fromkeys(paths))
 
 
+def claude_agent_file_route_supported() -> bool:
+    """Whether separate-usage agent file routes are implemented on this platform."""
+    return sys.platform != "darwin"  # macOS file selection is implemented separately in #682.
+
+
 def claude_file_credential_problem(path: Path, *, renewable: bool) -> str | None:
     """Validate a file handed to an agent; copies must already hold a live access token."""
     oauth = _as_dict(_as_dict(_read_json_file(path)).get("claudeAiOauth"))
@@ -1016,7 +1021,7 @@ def claude_usage_configuration_problem(cfg, *, check_identity: bool = True) -> s
             return "Claude usage login must be a separate login, not a copy of the agents' credential"
     route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
     environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-    if route == "environment" and environment_token and environment_token == measured.get("accessToken"):
+    if environment_token and environment_token == measured.get("accessToken"):
         return "Claude usage login must be a separate login from the agents' environment token"
     if not check_identity or sys.platform == "darwin":
         return None  # Identity follows mirroring; macOS agent selection changes separately.
@@ -2331,12 +2336,14 @@ class Quota:
         (cli.claude_agent_credential_route). Only an "environment" launch uses the file in place and keeps
         a renewal; the other routes hand the agent a copy, so their file needs a live access token."""
         route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
-        if (
-            claude_usage_credentials() is None
-            or sys.platform == "darwin"
-            or (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and route == "environment")
+        if claude_usage_credentials() is None or (
+            os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and route == "environment"
         ):
             return None
+        if not claude_agent_file_route_supported():
+            if route == "environment":
+                return None  # Preserve the native macOS Keychain agent route.
+            return "Claude file-only agent routes with a separate usage login need macOS file-route support (#682)"
         return claude_file_credential_problem(
             claude_dir(self.cfg.home) / ".credentials.json", renewable=route == "environment"
         )
