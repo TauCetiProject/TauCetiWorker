@@ -73,7 +73,7 @@ class Keychain:
         return types.SimpleNamespace(returncode=0, stdout=json.dumps(OPERATOR), stderr="")
 
 
-tmp = Path(tempfile.mkdtemp(prefix="macos-token-"))
+tmp = Path(tempfile.mkdtemp(prefix="macos-token-")).resolve()
 real, token_dir, usage_dir, iso = tmp / "real", tmp / "token", tmp / "usage", tmp / "iso"
 for d in (real, token_dir, usage_dir):
     d.mkdir()

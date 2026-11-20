@@ -95,7 +95,7 @@ class HaikuContinuation(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
+        self.root = Path(tmp.name).resolve()
         self.work = self.root / "security-audit"
         self.work.mkdir()
         (self.root / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"fixture"}}')
@@ -198,6 +198,7 @@ class HaikuContinuation(unittest.TestCase):
                 os.environ,
                 TAUCETI_CLAUDE_USAGE_CREDENTIALS=str(self.root / "usage.json"),
                 CLAUDE_CODE_OAUTH_TOKEN="parent-token",
+                CLAUDE_SECURESTORAGE_CONFIG_DIR="parent-keychain-store",
             ),
             patch.object(sys, "platform", "darwin"),
             patch.object(
@@ -209,6 +210,7 @@ class HaikuContinuation(unittest.TestCase):
         self.assertEqual(copied["accessToken"], "agent-file")
         self.assertNotIn("refreshToken", copied)
         self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+        self.assertNotIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", env)
         self.assertNotIn("TAUCETI_CLAUDE_USAGE_CREDENTIALS", env)
         self.assertEqual(source.read_bytes(), before)
         keychain.assert_not_called()

@@ -9,7 +9,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tauceti_worker import agents, quota
@@ -33,11 +33,17 @@ class FileKeychain(unittest.TestCase):
         with patch.object(quota.subprocess, "run", return_value=types.SimpleNamespace(returncode=44)) as run:
             self.assertIsNone(quota.claude_file_keychain_problem(os.environ.get("CLAUDE_CONFIG_DIR")))
         service = "Claude Code-credentials-" + hashlib.sha256(b"/tmp/worker agent").hexdigest()[:8]
-        run.assert_called_once_with(
-            ["/usr/bin/security", "find-generic-password", "-s", service],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
+        self.assertEqual(
+            run.call_args_list,
+            [
+                call(
+                    ["/usr/bin/security", "find-generic-password", "-s", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+                for name in (service, service.replace("-credentials", ""))
+            ],
         )
 
     def test_existing_item_refuses_without_reading_secret(self):
@@ -59,6 +65,62 @@ class FileKeychain(unittest.TestCase):
                     self.assertIn(
                         "cannot verify", quota.claude_file_keychain_problem(os.environ.get("CLAUDE_CONFIG_DIR"))
                     )
+
+    def test_legacy_api_item_also_refuses_the_claimed_subscription_file_route(self):
+        with patch.object(
+            quota.subprocess,
+            "run",
+            side_effect=[types.SimpleNamespace(returncode=44), types.SimpleNamespace(returncode=0)],
+        ) as run:
+            self.assertIn("shadows", quota.claude_file_keychain_problem(os.environ["CLAUDE_CONFIG_DIR"]))
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(run.call_args.args[0][-1].startswith("Claude Code-"))
+        self.assertNotIn("credentials", run.call_args.args[0][-1])
+        self.assertNotIn("-w", run.call_args.args[0])
+
+    def test_second_service_unknown_and_timeout_are_not_absence(self):
+        for outcome in (types.SimpleNamespace(returncode=36), subprocess.TimeoutExpired("security", 5)):
+            with (
+                self.subTest(outcome=outcome),
+                patch.object(quota.subprocess, "run", side_effect=[types.SimpleNamespace(returncode=44), outcome]),
+            ):
+                self.assertIn("cannot verify", quota.claude_file_keychain_problem(os.environ["CLAUDE_CONFIG_DIR"]))
+
+    def test_service_hash_normalizes_unicode_without_resolving_the_exported_path(self):
+        directory = "/tmp/../tmp/cafe\u0301"
+        with patch.object(quota.subprocess, "run", return_value=types.SimpleNamespace(returncode=44)) as run:
+            self.assertIsNone(quota.claude_file_keychain_problem(directory))
+        suffix = hashlib.sha256("/tmp/../tmp/caf\u00e9".encode()).hexdigest()[:8]
+        self.assertEqual(
+            [entry.args[0][-1] for entry in run.call_args_list],
+            ["Claude Code-credentials-" + suffix, "Claude Code-" + suffix],
+        )
+
+    def test_secure_storage_override_refuses_before_metadata_or_native_launch(self):
+        for override in ("", "/tmp/operator"):
+            with (
+                self.subTest(override=override),
+                patch.dict(os.environ, CLAUDE_SECURESTORAGE_CONFIG_DIR=override),
+                patch.object(quota.subprocess, "run", side_effect=AssertionError("override must refuse before query")),
+                patch.object(quota, "claude_file_credential_problem", return_value=None),
+            ):
+                self.assertIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", quota.claude_file_keychain_problem("/tmp/agent"))
+                with self.assertRaisesRegex(NoProgress, "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+                    agents.host_agent_launch("do not launch", "claude")
+
+    def test_host_metadata_uses_child_environment_and_keeps_environment_token_exception(self):
+        with (
+            patch.object(quota, "claude_file_credential_problem", return_value=None),
+            patch.object(quota.subprocess, "run", side_effect=AssertionError("override must refuse before query")),
+        ):
+            with self.assertRaisesRegex(NoProgress, "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+                agents.validate_host_agent_credentials("claude", {"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""})
+            agents.validate_host_agent_credentials(
+                "claude", {"CLAUDE_SECURESTORAGE_CONFIG_DIR": "", "CLAUDE_CODE_OAUTH_TOKEN": "selected-token"}
+            )
+            agents.validate_host_agent_credentials(
+                "claude", {"CLAUDE_SECURESTORAGE_CONFIG_DIR": "", "TAUCETI_CLAUDE_BILLING": "api"}
+            )
 
     def test_unset_feature_and_linux_do_not_query_keychain(self):
         for platform, usage in (("linux", "/tmp/usage.json"), ("darwin", "")):
@@ -130,7 +192,7 @@ class FileKeychain(unittest.TestCase):
         with patch.object(quota.subprocess, "run", return_value=types.SimpleNamespace(returncode=44)) as run:
             self.assertIsNone(quota.claude_file_keychain_problem(None))
         self.assertEqual(
-            run.call_args.args[0], ["/usr/bin/security", "find-generic-password", "-s", "Claude Code-credentials"]
+            [entry.args[0][-1] for entry in run.call_args_list], ["Claude Code-credentials", "Claude Code"]
         )
 
     def test_mac_file_cannot_rely_on_renewal(self):
@@ -143,7 +205,7 @@ class FileKeychain(unittest.TestCase):
         cfg = types.SimpleNamespace(home=Path("/tmp/home"), quota_cache=Path("/tmp/cache"))
 
         def read(path):
-            name = "usage-account" if Path(path) == Path("/tmp/usage.json") else "agent-account"
+            name = "usage-account" if Path(path).resolve() == Path("/tmp/usage.json").resolve() else "agent-account"
             return {"claudeAiOauth": {"accessToken": name, "account": {"uuid": name}}}
 
         with patch.object(quota, "_read_json_file", side_effect=read):

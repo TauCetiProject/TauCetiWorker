@@ -989,7 +989,7 @@ def validate_host_agent_credentials(profile: AuthoringProfile | str, env: dict) 
     directory = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
     if problem := claude_file_credential_problem(directory / ".credentials.json", renewable=False):
         raise NoProgress(problem)
-    if problem := claude_file_keychain_problem(env.get("CLAUDE_CONFIG_DIR")):
+    if problem := claude_file_keychain_problem(env.get("CLAUDE_CONFIG_DIR"), env=env):
         raise NoProgress(problem)
 
 

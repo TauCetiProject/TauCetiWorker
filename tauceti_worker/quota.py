@@ -16,6 +16,7 @@ import sys
 import textwrap
 import time
 import tomllib
+import unicodedata
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -1058,35 +1059,43 @@ def claude_usage_configuration_problem(cfg, *, check_identity: bool = True) -> s
     return None
 
 
-def claude_file_keychain_problem(config_dir: str | None) -> str | None:
-    """Refuse a macOS file route shadowed by a directory-specific Claude Keychain item.
+def claude_file_keychain_problem(config_dir: str | None, *, env: dict | None = None) -> str | None:
+    """Refuse native OAuth or legacy API credentials that can replace the selected file.
 
-    Query metadata only: never retrieve a password, unlock the Keychain, or mutate it. The
-    native acceptance check must verify the CLI version's directory-service convention.
+    Claude Code 2.1.329 hashes the NFC-normalized config string, without resolving aliases.
+    Read metadata only: never retrieve a password, unlock the Keychain, or mutate it.
     """
     if sys.platform != "darwin" or claude_usage_credentials() is None:
         return None
-    directory = config_dir
-    service = "Claude Code-credentials"
-    if directory:
-        service += "-" + hashlib.sha256(directory.encode()).hexdigest()[:8]
-    try:
-        result = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-s", service],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "cannot verify the Claude file route against the macOS Keychain; no agent was launched"
-    if result.returncode == 44:  # errSecItemNotFound; the configured file can supply the credential.
-        return None
-    if result.returncode == 0:
+    environment = os.environ if env is None else env
+    if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in environment:
         return (
-            "a Claude Keychain entry shadows the configured agent credential file; use a dedicated "
-            "CLAUDE_CONFIG_DIR with no sign-in entry (the worker does not remove Keychain items)"
+            "Claude agent file routes do not support CLAUDE_SECURESTORAGE_CONFIG_DIR; "
+            "unset it so the CLI uses the configured agent file"
         )
-    return "cannot verify the Claude file route against the macOS Keychain; no agent was launched"
+    suffix = (
+        "-" + hashlib.sha256(unicodedata.normalize("NFC", config_dir).encode()).hexdigest()[:8] if config_dir else ""
+    )
+    # Both the OAuth JSON store and the /login managed API-key store are read by the native CLI.
+    for service in ("Claude Code-credentials" + suffix, "Claude Code" + suffix):
+        try:
+            result = subprocess.run(
+                ["/usr/bin/security", "find-generic-password", "-s", service],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "cannot verify the Claude file route against the macOS Keychain; no agent was launched"
+        if result.returncode == 44:  # errSecItemNotFound; check the other credential store too.
+            continue
+        if result.returncode == 0:
+            return (
+                "a Claude Keychain entry shadows the configured agent credential file; use a dedicated "
+                "CLAUDE_CONFIG_DIR with no sign-in entry (the worker does not remove Keychain items)"
+            )
+        return "cannot verify the Claude file route against the macOS Keychain; no agent was launched"
+    return None
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:

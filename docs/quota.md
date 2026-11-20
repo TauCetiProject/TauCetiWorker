@@ -203,10 +203,20 @@ plain file on every platform: on macOS the Keychain is not consulted for it and
 On macOS the variable also makes the token file the agents' credential for the
 worker, as it is elsewhere: the file is mirrored into isolated workers, and a
 bubble round is seeded from it, so the worker reads no Claude credential from the
-Keychain. Claude Code itself still looks first for a Keychain item belonging to
-the config directory it is given and reads the file when there is none, so the
-token directory, and an isolated worker's copy of it, must be directories nobody
-has signed in to with `claude`.
+Keychain. The native CLI can also consult directory-specific OAuth and legacy
+managed API-key items. Before a host file launch, Worker checks metadata for both
+`Claude Code-credentials-<hash>` and `Claude Code-<hash>` and refuses a found or
+unknown result; each read is bounded to five seconds and never asks for a password
+or unlock. Claude Code 2.1.329 hashes the NFC-normalized exported config string,
+without resolving aliases. The token directory and isolated Worker copy must
+have neither item. `CLAUDE_SECURESTORAGE_CONFIG_DIR` (including an empty override)
+is unsupported for this explicit host file route because it can select a different
+credential store. Private copied reviewers drop that override and do not query
+the host Keychain; cache-only status reads also avoid metadata subprocesses.
+See [the native acceptance packet](macOS-setup-token-acceptance.md) for the tested
+versions and outstanding real replacement/usage-login limitations. Local
+`claude auth status` reports source presence even for a garbage token; it does
+not establish authentication or same-account identity.
 
 Workers naming the same usage login share its observations, fetch lock and
 cooldowns under `<usage login directory>/.tauceti-quota/usage/`, exactly as

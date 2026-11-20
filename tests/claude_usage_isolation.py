@@ -35,7 +35,7 @@ class Isolation(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="usage-isolation-")
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
+        self.root = Path(tmp.name).resolve()
         self.home = self.root / "operator"
         self.home.mkdir()
         self.agent = self.home / ".claude/.credentials.json"

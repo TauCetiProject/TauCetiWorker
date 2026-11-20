@@ -108,7 +108,7 @@ def on(platform):
 
 
 # 0) Unset, nothing changes: the pacer measures the credential source the agents launch from.
-tmp = Path(tempfile.mkdtemp())
+tmp = Path(tempfile.mkdtemp()).resolve()
 try:
     quota, usage_file, agent_files = setup(tmp)
     os.environ.pop(VARIABLE)
@@ -123,7 +123,7 @@ finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
 # 0b) A `~/…` value means the operator's home, also after isolation moves $HOME off macOS.
-tmp = Path(tempfile.mkdtemp())
+tmp = Path(tempfile.mkdtemp()).resolve()
 saved_env = dict(os.environ)
 try:
     real = tmp / "real"
@@ -153,7 +153,7 @@ finally:
 def cases():
     # 1) Usage is read with the login, shared beside it, and the agents' token is neither sent to
     #    the usage endpoint nor rewritten.
-    tmp = Path(tempfile.mkdtemp())
+    tmp = Path(tempfile.mkdtemp()).resolve()
     try:
         quota, usage_file, agent_files = setup(tmp)
         before = [f.read_bytes() for f in agent_files]
@@ -185,7 +185,7 @@ def cases():
         shutil.rmtree(tmp, ignore_errors=True)
 
     # 2) --auto-refresh rotates the usage login in place and publishes it nowhere else.
-    tmp = Path(tempfile.mkdtemp())
+    tmp = Path(tempfile.mkdtemp()).resolve()
     try:
         quota, usage_file, agent_files = setup(tmp, opt_in=True, expires_in_s=-60)
         agent_mirror = tmp / "published.json"
@@ -209,7 +209,7 @@ def cases():
 
     # 3) A 401 because a sibling rotated the shared login after this worker read it: the token now
     #    in the file answers, and no refresh token is spent.
-    tmp = Path(tempfile.mkdtemp())
+    tmp = Path(tempfile.mkdtemp()).resolve()
     try:
         quota, usage_file, agent_files = setup(tmp, opt_in=True)
         seen = []
@@ -233,7 +233,7 @@ def cases():
         shutil.rmtree(tmp, ignore_errors=True)
 
     # 4) A 401 with the file unchanged is this login being refused: rotate it once and re-read.
-    tmp = Path(tempfile.mkdtemp())
+    tmp = Path(tempfile.mkdtemp()).resolve()
     try:
         quota, usage_file, agent_files = setup(tmp, opt_in=True)
         seen, usage = usage_seen([(401, {}, None), (200, USAGE_OK, None)])
@@ -247,7 +247,7 @@ def cases():
 
     # 5) A named login that is missing blocks, by name. The agents' token is not tried in its place,
     #    because the endpoint's refusal of it would read as a credential problem it is not.
-    tmp = Path(tempfile.mkdtemp())
+    tmp = Path(tempfile.mkdtemp()).resolve()
     try:
         quota, usage_file, agent_files = setup(tmp)
         usage_file.unlink()
@@ -265,7 +265,7 @@ def cases():
 
     # 5b) Two usage logins kept as files in one directory are two accounts to the cooldowns, unless the
     #     OAuth block names the account.
-    tmp = Path(tempfile.mkdtemp())
+    tmp = Path(tempfile.mkdtemp()).resolve()
     try:
         logins = tmp / "logins"
         logins.mkdir()
@@ -289,7 +289,7 @@ def cases():
 
     # 5c) A usage login behind a directory this worker cannot enter reads as a missing login, and the
     #     selection still reaches its other providers.
-    tmp = Path(tempfile.mkdtemp())
+    tmp = Path(tempfile.mkdtemp()).resolve()
     locked = tmp / "locked"
     try:
         quota, usage_file, agent_files = setup(tmp)
@@ -324,7 +324,7 @@ for platform in ("linux", "darwin"):
 
 # 7) During a quota wait on macOS the pacer pins the Keychain identity it last read, so that local
 #    checks do not poll the Keychain. A usage login is a file its siblings rotate: it is re-read.
-tmp = Path(tempfile.mkdtemp())
+tmp = Path(tempfile.mkdtemp()).resolve()
 try:
     quota, usage_file, agent_files = setup(tmp)
     wait = quota_wait.QuotaWait(quota.cfg, "claude")
@@ -341,7 +341,7 @@ finally:
 
 # 8) Off macOS the agents launch from the file in $CLAUDE_CONFIG_DIR, so a healthy usage login does not
 #    admit work while that file is missing or holds a setup-token past its expiry.
-tmp = Path(tempfile.mkdtemp())
+tmp = Path(tempfile.mkdtemp()).resolve()
 try:
     quota, usage_file, agent_files = setup(tmp)
     seen, usage = usage_seen()
@@ -393,7 +393,7 @@ finally:
 # its custom-CLAUDE_CONFIG_DIR contract is verified with the companion Review implementation.
 from runner import reviewers  # noqa: E402
 
-tmp = Path(tempfile.mkdtemp())
+tmp = Path(tempfile.mkdtemp()).resolve()
 try:
     (tmp / ".claude").mkdir()
     (tmp / ".claude" / ".credentials.json").write_text(login("setup-token", 365 * 86400, None))
