@@ -51,7 +51,17 @@ ANSWERS = frozenset({"assistant", "agent_message", "result"})
 # Text that mentions a judgment key must contain a readable judgment.
 KEYS = ("verdict", "findings")  # Either key makes a decoded object a judgment.
 VALUE_START = re.compile(r'[{\["]')
-MAX_DEPTH = 4  # JSON carried inside JSON strings, decoded this many levels deep.
+
+
+def unique_pairs(pairs: list) -> dict:
+    """An object that repeats a key could say two things; it is not readable as either."""
+    keys = [key for key, _ in pairs]
+    if len(set(keys)) != len(keys):
+        raise ValueError("duplicate key")
+    return dict(pairs)
+
+
+DECODER = json.JSONDecoder(object_pairs_hook=unique_pairs)
 READ_PAGE = "read_page"
 GOAL_TOOLS = frozenset({"get_goal", "create_goal", "update_goal"})
 
@@ -99,37 +109,39 @@ def concern(value) -> list[str]:
     return texts
 
 
-def walk(value, found: list, loose: list, depth: int = 0) -> None:
-    """Collect judgment-shaped objects anywhere in a decoded value, decoding JSON carried in strings."""
+def walk(value, found: list, loose: list) -> None:
+    """Collect judgment-shaped objects anywhere in a decoded value, decoding JSON carried in strings.
+
+    Every level of JSON-in-a-string is decoded: each is strictly shorter than its encoding."""
     if isinstance(value, dict):
         if any(key in value for key in KEYS):
             found.append(value)
         for item in value.values():
-            walk(item, found, loose, depth)
+            walk(item, found, loose)
     elif isinstance(value, list):
         for item in value:
-            walk(item, found, loose, depth)
-    elif isinstance(value, str) and depth < MAX_DEPTH:
-        scan(value, found, loose, depth + 1)
+            walk(item, found, loose)
+    elif isinstance(value, str):
+        scan(value, found, loose)
 
 
-def scan(text: str, found: list, loose: list, depth: int = 0) -> None:
+def scan(text: str, found: list, loose: list) -> None:
     """Decode every JSON value in text, never pattern-match it.
 
     Keys are compared after decoding, so escapes cannot hide them. A judgment key that is not
     inside any decodable object (malformed JSON, or prose quoting the key) is `loose`: the text
     may hold a concern that cannot be read, whatever else it holds."""
-    decoder, i = json.JSONDecoder(), 0
+    i = 0
     while match := VALUE_START.search(text, i):
         try:
-            value, i = decoder.raw_decode(text, match.start())
+            value, i = DECODER.raw_decode(text, match.start())
         except ValueError:
             i = match.start() + 1
             continue
         if match.group() == '"' and value in KEYS:
             loose.append(value)
         else:
-            walk(value, found, loose, depth)
+            walk(value, found, loose)
 
 
 def judgments_in(value, evidence: Evidence, where: str, *, answer: bool = False) -> None:

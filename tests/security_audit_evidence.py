@@ -228,6 +228,17 @@ class Classification(unittest.TestCase):
         self.codex([native_message(note, phase="commentary"), native_message(PASS)], exec_answer(PASS))
         self.assertEqual(self.outcome().kind, ev.UNREADABLE)
 
+    def test_duplicate_keys_and_deep_encodings_cannot_hide_a_concern(self):
+        duplicate = '{"verdict":"finding","findings":["unsafe IO"],"verdict":"pass","findings":[]}'
+        self.codex([native_message(duplicate, phase="commentary"), native_message(PASS)], exec_answer(PASS))
+        self.assertEqual(self.outcome().kind, ev.UNREADABLE)
+        self.setUp()
+        deep = sa.serialize(FINDING)
+        for _ in range(8):
+            deep = json.dumps(deep)
+        self.codex([native_message(deep, phase="commentary"), native_message(PASS)], exec_answer(PASS))
+        self.assertFinding(self.outcome())
+
     def test_an_answer_that_is_not_a_judgment_is_unreadable(self):
         self.codex([native_message("I found unsafe IO in A.lean."), native_message(PASS)], exec_answer(PASS))
         self.assertEqual(self.outcome().kind, ev.UNREADABLE)
