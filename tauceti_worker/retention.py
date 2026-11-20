@@ -644,7 +644,11 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
 
             try:
                 storage = collect(
-                    configs if shared_configs is None else shared_configs, dry=dry, now=now, opened=opened
+                    configs if shared_configs is None else shared_configs,
+                    dry=dry,
+                    now=now,
+                    opened=opened,
+                    deadline=deadline,
                 )
                 merge_report(report, storage)
                 report.update(
@@ -660,9 +664,11 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                             "removed_count",
                             "protected_count",
                             "errors_count",
+                            "deferred",
                         )
                     }
                 )
+                report.setdefault("deferred", []).extend(storage.get("deferred", []))
             except (OSError, ValueError) as error:
                 note(report, "errors", f"shared cache cleanup: {error}")
 

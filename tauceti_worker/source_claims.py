@@ -38,7 +38,12 @@ class SourceClaims(Claims):
         actor = self.source.authenticated_actor()
         if current is None or actor is None or current["head"]["sha"] != head:
             return False
-        if current["user"]["id"] != int(actor.principal.native_id):
+        from .source_identity import maintains_author
+
+        if current["user"]["id"] != int(actor.principal.native_id) and not (
+            (current["head"].get("repo") or {}).get("id") == self.source.identity.native_id
+            and maintains_author(actor, self.source.repository.forge, current["user"]["id"])
+        ):
             return False
         repository = RepositoryRef(self.source.repository.forge, owner + "/" + repo)
         if current["head"]["repo"]["full_name"].casefold() != repository.name.casefold():
@@ -63,11 +68,30 @@ class SourceClaims(Claims):
         )
         return True
 
+    def begin_target_work(self, area, slug):
+        # Author leases stay in the shared GitHub claim namespace on every source.
+        from .worker_sources import shared_github_environment
+
+        if self.held:
+            self.release()  # outside the shared environment, which restores the claim variables on exit
+        self.lease = None  # one left by a branch collision was never acquired
+        with shared_github_environment():
+            return super().begin_target_work(area, slug)
+
     def release(self):
         self.stop_heartbeat()
-        if self.lease is not None:
-            self.lease.release()
-            self.lease = None
+        lease, self.lease = self.lease, None
+        if self.held and self.held[0].startswith("author/"):
+            from .config import log
+            from .worker_sources import shared_github_environment
+
+            try:
+                with shared_github_environment():
+                    super().release()
+            except SourceUnavailable:
+                log(f"claim {self.held[0]}: not released (shared GitHub credentials unavailable); it expires")
+        elif lease is not None:
+            lease.release()
         self.held = None
         for key in ("TAUCETI_CLAIM_KEY", "TAUCETI_CLAIM_REPO"):
             os.environ.pop(key, None)

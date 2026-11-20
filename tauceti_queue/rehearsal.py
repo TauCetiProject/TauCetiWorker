@@ -631,6 +631,29 @@ if resume is not None:
     record(outcome="resume-noop")
     finish("explanations are already in the commit messages")
 
+conflicting = re.search(r"- conflicting commit: `([0-9a-f]{12})`", prompt)
+if conflicting:
+    # A rebase conflict: the worker commits the working tree, so resolve the files and explain.
+    message = git("log", "-1", "--format=%B", conflicting.group(1))
+    source = re.search(r"^Source-PR: (\S+)$", message, re.M)
+    edit = plan.get("edits", {}).get(source.group(1) if source else "")
+    if edit is None:
+        record(outcome="no-resolution", commit=conflicting.group(1))
+        finish("the plan has no resolution for the conflicting commit", rc=2)
+    if edit.get("empty"):
+        git("checkout", "--quiet", "--force", "HEAD", "--", ".")
+    for path, content in (edit.get("files") or {}).items():
+        target = Path(path)
+        if content is None:
+            if target.exists():
+                target.unlink()
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+    Path(".tauceti-repair/explanation.md").write_text((edit.get("explanation") or "Edited by the rehearsal agent.").strip() + "\n")
+    build = subprocess.run(["lake", "build", "--iofail"], text=True, capture_output=True)
+    record(outcome="plan-applied", edited=[source.group(1)], build_rc=build.returncode)
+    finish(f"resolved {source.group(1)}; lake build exited {build.returncode}")
 match = re.search(r"linear chain on `([0-9a-f]{12})`", prompt)
 if not match:
     record(outcome="no-base-in-prompt")

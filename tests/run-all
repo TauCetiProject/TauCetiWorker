@@ -92,6 +92,7 @@ RUN_STDLIB=(
   native_self_tested.py
   authoring_profiles.py
   bubble_cache.py
+  bubble_mounts.py
   cache_probe_user_agent.py
   bubble_version.py
   branch_claim_repo.py
@@ -153,6 +154,7 @@ RUN_STDLIB=(
   open_pr_pages.py
   overlaps.py
   pace_curve.py
+  pace_per_provider.py
   pr_targeting.py
   preflight_review_lake.py
   prices.py
@@ -241,6 +243,7 @@ RUN_STDLIB=(
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
+  roadmap_claim_namespace.py
   round_crash_reasons.py
   round_file_changes.py
   round_group_sweep.py
@@ -253,6 +256,8 @@ RUN_STDLIB=(
   security_audit_served.py
   security_audit_pool.py
   security_audit_claude.py
+  security_audit_watchdog.py
+  security_audit_evidence.py
   shared_build_caches.py
   shared_repositories.py
   source_argument.py
@@ -264,6 +269,9 @@ RUN_STDLIB=(
   ssl_cert_file.py
   staging_journal_report.py
   status_labels.py
+  target_list.py
+  target_landings.py
+  target_maintenance.py
   tend_bot_permissions.py
   worker_claude_config.py
   worker_manager.py
@@ -289,7 +297,7 @@ NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py retention.py
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.
-DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py)
+DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py target_list.py)
 
 pass=0; fail=0; failed=()
 
