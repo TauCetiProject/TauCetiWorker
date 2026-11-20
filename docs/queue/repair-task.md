@@ -412,18 +412,22 @@ has a time budget holds because the service re-exposes the task.
    audit phase on a duplicate declaration the agent's text scan had listed and set aside, so the checks are
    the worker's, not the agent's. After every green whole-library `lake build --iofail` it runs (the
    streaming build, the parallel path's verification build, the verification below and, in configurations
-   where the worker does not own final verification, the agent's full-library helper) it runs what CI's `sandbox-build.sh` runs after its
-   build: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti module, duplicate
-   declarations, axioms) and `lint-env.sh` with the `lint-env-driver` over the full library. Without a frozen
+   where the worker does not own final verification, the agent's full-library helper) it runs every check
+   staging runs, all at once: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti
+   module, duplicate declarations, axioms), the module-system check (`ModuleSystem.lean`), `lint-env.sh`
+   with the `lint-env-driver` over the full library, `lint-style.sh` (Mathlib's text linters and the
+   header check) and `lint-dot-notation.py` against its baseline. Every task, head or background, gets
+   the same set; there is no check owner and nothing is deferred to staging. Without a frozen
    GitHub scope-policy snapshot the worker uses staging's conservative full-lint fallback. The sources are the TauCetiTools pin
    the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into
    `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and the worktree's
    `scripts/` as policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
    pinned `build-lint-driver.sh` and `build-audit-driver.sh` inside the sandbox (reused while pin, toolchain
-   and manifest are unchanged); the audit and the lint run in the sandbox too. Their output is read by
+   and manifest are unchanged); the checks run in the sandbox too. Their output is read by
    `diagnostics.parse_log`, so each finding is the diagnostic the controller would create from CI
    (`{"kind": "audit", "module", "path", "message": "duplicate-declarations: ..."}` once per TauCeti module,
-   `lint` with its location), and it is appended to `.tauceti-repair/errors.jsonl` beside the compiler errors.
+   `lint` with its location; the dot-notation and style lints' compiler-shaped lines are `lint` too), and it
+   is appended to `.tauceti-repair/errors.jsonl` beside the compiler errors.
    `repair.findings_from_diagnostics` turns a duplicate into one entry naming both modules, and the parallel
    path keeps both owners in one group. When the checks cannot run at all (no pin, a failed fetch,
    materialization or driver build) they are recorded as `unavailable` and logged, and CI remains the only
@@ -433,8 +437,8 @@ has a time budget holds because the service re-exposes the task.
    up to `verify_retries` (2) times, then the task is released as `agent_failed`. Each verification is in the
    outcome's `verification` list. For warm repair/prepare/rebase tasks the prompt gives the agent focused
    feedback checks and assigns the complete verification to the worker, avoiding a duplicate agent
-   pass. The task cannot be submitted while the worker's checks report failures. CI's module-system check and
-   source style lint are not run on the worker. In CI runs of 2026-11-05 on the full library (24,455 TauCeti
+   pass. The task cannot be submitted while the worker's checks report failures, and one round's findings
+   from every check reach the agent together. In CI runs of 2026-11-05 on the full library (24,455 TauCeti
    modules) the audit's import took 5 s warm and 27 s cold, the duplicate check 3 s and the axiom scan of a
    PR's few modules 4 s; the lint of five changed modules took 45 s and the two driver builds about 4 s.
 6. **Submit and publish.** Push, `result`, record the response (checkpoints `pushed`, `submitted`,
@@ -472,6 +476,12 @@ error list are at those paths and grow, modules that have already failed may be 
 build` of its own may start while the lock exists, and `.tauceti-repair/build <Module> ...` (the scoped
 build script of `tauceti_queue/repair_tools.py`, whose lock the streaming build takes through
 `take_lock` so the two never overlap) waits for the lock and builds only the named modules.
+Lake from v4.37.0-rc1 fails a module whose source changed while Lean compiled it ("module source
+file: ... changed since build began; rerun the build", https://github.com/leanprover/lean4/pull/16457),
+which here means the agent edited it under the running build. The worker records that as a `kind`
+`rerun` entry (`module`, `file`, `message`, no member) rather than a compiler error, counts it in the
+`build finished` line and the outcome's `stream_build.reruns`, leaves it out of the parallel path's
+findings, and the prompt tells the agent to rebuild the module and its dependents with the scoped build.
 When the build ends the worker appends a `build finished, exit N, M errors total` line to the error
 list, removes the lock and copies the log to `tasks/<id>/logs/stream-build.log`; the outcome records
 the build under `stream_build`. When worker verification is enabled, the agent returns after focused
@@ -794,10 +804,11 @@ When the next batch's intended parent is available, prepare directly on that par
 requiring an old-base full build. Already claimed preparations finish normally. Rebase agents resolve
 one conflicting commit and perform focused checks; the worker owns the whole-library verification.
 
-`checks-timing.json` records wall times and sampled process-tree RSS. Matching previous measurements
-and at least twice their summed peak RSS plus 8 GiB of available host/cgroup memory permit audit and
-lint to overlap over read-only compiled outputs. Otherwise checks remain serial. Both are joined
-before task cleanup, and both failures are collected. The pinned lint driver records import, docscan,
+`checks-timing.json` records each check's wall time and sampled process-tree RSS. The checks always
+run at the same time, the compiled ones over read-only build outputs, and all are joined before task
+cleanup with every failure collected. The audit and the environment lint each sampled 21 to 27 GB of
+RSS in 2026-11 (mostly the same mapped `.olean` files, counted in both), so together they take
+roughly the time of the environment lint alone; the repair slice's `MemoryHigh` bounds their memory. The pinned lint driver records import, docscan,
 linters and report times; `TAUCETI_LINT_PROFILE=1` additionally profiles each linter separately.
 These timing observations never authorize a pass.
 

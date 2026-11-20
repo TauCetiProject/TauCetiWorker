@@ -684,7 +684,7 @@ class WorkerBoundJudgments(unittest.TestCase):
         ]
         (self.original / "model-transcript.jsonl").write_text("\n".join(map(sa.serialize, events)))
 
-    def unfinished_evidence(self, *, version2=False, large=False):
+    def unfinished_evidence(self, *, large=False):
         if large:
             file = self.batch["commits"][0]["files"][0]
             file.update(before="", diff="", after="x" * (4 * 1024 * 1024))
@@ -701,45 +701,36 @@ class WorkerBoundJudgments(unittest.TestCase):
             self.batch["input_digest"] = hashlib.sha256(
                 sa.serialize({k: v for k, v in self.batch.items() if k != "input_digest"}).encode()
             ).hexdigest()
-        self.evidence(version2=version2)
+        self.evidence()
         receipt = self.original / "read-receipt.json"
         proof = json.loads(receipt.read_text())
         proof["read"] = [0, 1, 2, 3, 4, 5, 6, 41, 42] if large else [0]
         proof["last_page"] = 6 if large else 0
         receipt.write_text(sa.serialize(proof))
-        missing = progress.coverage(self.batch, receipt)["missing"]
         value = {"verdict": "unfinished", "findings": [], "read_token": proof["last_token"]}
-        if version2:
-            value.update(
-                verdict="incomplete",
-                findings=[
-                    f"Commit 1: inspection is incomplete. Pages {missing[0]}–{missing[-1]} have not been reviewed, "
-                    "so the safety of all changed source files cannot be established."
-                ],
-            )
         self.replace_answer(value)
-        if version2:
-            verdict = sa.bind_verdict({k: v for k, v in value.items() if k != "read_token"}, self.batch)
-            sa.record(self.work / "ledger.jsonl", {"batch": self.batch["input_digest"], "verdict": verdict})
         return value
 
-    def test_43_page_legacy_coverage_stop_migrates_without_approval_or_lost_evidence(self):
-        value = self.unfinished_evidence(version2=True, large=True)
-        a, batch, execution, legacy = recovery.retained(self.work, self.block)
-        self.assertFalse(legacy)
-        self.assertEqual(execution["_allowed_history"], [sa.serialize(value)])
-        old = (a / "model-transcript.jsonl").read_bytes()
-        with (
-            patch.object(sa, "inspect", side_effect=OSError("network failure")) as model,
-            patch.object(sa, "advance") as advance,
-            self.assertRaises(NoProgress),
-        ):
-            recovery.recover(self.cfg, self.opts, self.block)
-        self.assertTrue(model.call_args.kwargs["continue_reading"])
-        self.assertEqual(model.call_args.kwargs["resume_from"], a)
-        self.assertEqual(model.call_args.kwargs["allowed_history"], [sa.serialize(value)])
+    def test_recovery_never_continues_or_revalidates_evidence_that_holds(self):
+        value = self.unfinished_evidence()
+        value["verdict"] = "pass"
+        self.replace_answer(value)
+        # A malformed concern beside the pass cannot be read, so the block holds.
+        with (self.original / "model-rollout-0.jsonl").open("a") as f:
+            note = {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": '{"findings":["unsafe IO"],}'}],
+                },
+            }
+            f.write(json.dumps(note) + "\n")
+        with patch.object(sa, "inspect") as model, patch.object(sa, "advance") as advance:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
         advance.assert_not_called()
-        self.assertEqual((a / "model-transcript.jsonl").read_bytes(), old)
 
     def test_unfinished_and_premature_pass_continue_but_never_bind_as_approval(self):
         value = self.unfinished_evidence()
@@ -804,19 +795,6 @@ class WorkerBoundJudgments(unittest.TestCase):
             with patch.object(sa, "inspect") as model:
                 self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
             model.assert_not_called()
-
-    def test_coverage_diagnostic_requires_matching_gaps_token_native_and_known_profile(self):
-        value = self.unfinished_evidence(version2=True)
-        original_receipt = (self.original / "read-receipt.json").read_bytes()
-        for change in ({"read": []}, {"input_digest": "other"}, {"last_token": "other"}):
-            (self.original / "read-receipt.json").write_text(sa.serialize({**json.loads(original_receipt), **change}))
-            with self.assertRaises(Die):
-                recovery.retained(self.work, self.block)
-        (self.original / "read-receipt.json").write_bytes(original_receipt)
-        value["findings"].append("Uncertain initializer")
-        self.replace_answer(value)
-        with self.assertRaises(Die):
-            recovery.retained(self.work, self.block)
 
     def test_stopped_turn_without_final_answer_continues_with_preserved_native_history(self):
         self.unfinished_evidence()
@@ -929,13 +907,10 @@ class WorkerBoundJudgments(unittest.TestCase):
         self.assertLess(out.index('"sections"'), out.index('"next_token"'))
 
     def test_real_inspector_continues_three_turns_then_recovers_after_restart(self):
-        self.run_three_turns_then_recover_after_restart(version2=False)
-
-    def test_migrated_coverage_diagnostic_remains_verified_after_another_restart(self):
-        self.run_three_turns_then_recover_after_restart(version2=True)
+        self.run_three_turns_then_recover_after_restart()
 
     def test_new_reading_progress_shortens_cooldown_without_approval_or_resetting_attempts(self):
-        self.run_three_turns_then_recover_after_restart(version2=False, read_more=True)
+        self.run_three_turns_then_recover_after_restart(read_more=True)
 
     def test_new_pages_with_findings_or_damaged_receipts_keep_original_backoff(self):
         for damage in ("finding", "uncertainty", "receipt", "thread", "exit", "timeout"):
@@ -988,8 +963,8 @@ class WorkerBoundJudgments(unittest.TestCase):
             recovery.recover(self.cfg, self.opts, self.block)
         model.assert_called_once()
 
-    def run_three_turns_then_recover_after_restart(self, *, version2, read_more=False):
-        self.unfinished_evidence(version2=version2, large=read_more)
+    def run_three_turns_then_recover_after_restart(self, *, read_more=False):
+        self.unfinished_evidence(large=read_more)
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"provider-only","refresh_token":"fixture"}}')
         calls = 0
         states = []
@@ -1054,7 +1029,7 @@ class WorkerBoundJudgments(unittest.TestCase):
             for r in map(json.loads, (self.work / "ledger.jsonl").read_text().splitlines())
             if "verdict" in r
         ]
-        self.assertEqual([v["verdict"] for v in verdicts], ["incomplete", "pass"] if version2 else ["pass"])
+        self.assertEqual([v["verdict"] for v in verdicts], ["pass"])
 
 
 class History(unittest.TestCase):
@@ -1218,6 +1193,20 @@ class MaintenanceScheduling(unittest.TestCase):
             self.assertEqual(wu.run_round(self.worker, self.opts), 0)
         maintenance.assert_not_called()
 
+    def test_watchdog_runs_on_audit_and_maintenance_turns_and_failures(self):
+        with (
+            patch.dict(os.environ, {"TAUCETI_SECURITY_AUDIT_MIN_COMMITS": "20"}),
+            patch.object(sa, "watch") as watch,
+            patch.object(sa, "run", side_effect=[0, Die("finding")]),
+            patch.object(wu, "mirror_creds", side_effect=RuntimeError("maintenance reached")),
+        ):
+            self.assertEqual(wu.run_round(self.worker, self.opts), 0)
+            for _ in range(2):  # The maintenance turn, then a failed audit falling through.
+                with self.assertRaisesRegex(RuntimeError, "maintenance reached"):
+                    wu.run_round(self.worker, self.opts)
+        self.assertEqual(watch.call_count, 3)
+        self.assertEqual(watch.call_args.kwargs, {"min_commits": 20})
+
     def test_audit_and_maintenance_take_turns(self):
         with (
             patch.object(sa, "run", return_value=0) as audit,
@@ -1278,55 +1267,52 @@ class PrivateAlerts(unittest.TestCase):
         timer = patch.object(alerts.time, "time", return_value=10000)
         self.clock = timer.start()
         self.addCleanup(timer.stop)
-        # Most delivery tests exercise a persistent stall already past its delay.
-        (self.work / "operational-alert.json").write_text(
-            json.dumps({"from_sha": self.block["from_sha"], "first_seen": 6400})
+        # Delivery tests exercise a recorded source concern; operational pauses belong to the watchdog.
+        sa.record(
+            self.work / "ledger.jsonl",
+            {
+                "from_sha": self.block["from_sha"],
+                "to_sha": self.block["to_sha"],
+                "verdict": {"verdict": "finding", "findings": ["TauCeti/A.lean:3 reads a file"]},
+            },
         )
         self.real_request = alerts.request
         self.request = patch.object(alerts, "request", return_value={"result": "success", "id": 456})
         self.http = self.request.start()
         self.addCleanup(self.request.stop)
 
-    def test_transient_pause_never_contacts_zulip_or_loads_credentials(self):
-        (self.work / "operational-alert.json").unlink()
-        self.config.unlink()
-        alerts.notify_block(self.work, self.block)
-        self.clock.return_value = 13599
-        alerts.notify_block(self.work, self.block)
+    def test_operational_block_is_left_to_the_cursor_watchdog(self):
+        (self.work / "ledger.jsonl").unlink()
+        self.config.unlink()  # Nothing is loaded or sent, however long the block is held.
+        for now in (10000, 10**9):
+            self.clock.return_value = now
+            alerts.notify_block(self.work, self.block)
         self.http.assert_not_called()
         self.assertFalse((self.work / "zulip-alerts.json").exists())
-        state = self.work / "operational-alert.json"
-        self.assertEqual(json.loads(state.read_text())["first_seen"], 10000)
-        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
 
-    def test_persistent_stall_timer_survives_restart_retry_and_target_changes(self):
-        (self.work / "operational-alert.json").unlink()
-        alerts.notify_block(self.work, self.block)
-        self.clock.return_value = 13599
-        retry = {**self.block, "reason": "inspection unfinished", "attempt": "new-attempt", "to_sha": "c" * 40}
-        alerts.notify_block(self.work, retry)
-        self.http.assert_not_called()
-        self.clock.return_value = 13600
-        alerts.notify_block(self.work, retry)
-        alerts.notify_block(self.work, retry)
-        self.http.assert_called_once()
-        self.assertEqual(json.loads((self.work / "operational-alert.json").read_text())["first_seen"], 10000)
+    def test_alerts_use_the_outcome_the_block_records(self):
+        (self.work / "ledger.jsonl").write_text('{"from_sha": "' + "a" * 40 + '", "verdict": {"verd\n')
+        unreadable = {**self.block, "reason": "security-audit: unreadable evidence: x", "outcome": "unreadable"}
+        alerts.notify_block(self.work, unreadable)
+        self.assertEqual(self.http.call_count, 1)  # Immediately, despite a damaged ledger row.
+        sent = self.http.call_args.args[2]["content"]
+        self.assertIn("Unreadable evidence", sent)
+        self.assertIn("unreadable evidence: x", sent)
+        finding = {**self.block, "outcome": "finding", "verdict": {"verdict": "finding", "findings": ["run_cmd"]}}
+        self.assertEqual(alerts.report(self.work, finding)["details"], ["run_cmd"])
+        self.assertEqual(alerts.report(self.work, {**self.block, "outcome": "not-judged"})["kind"], "Operational stall")
 
-    def test_advancing_cursor_starts_a_new_operational_delay(self):
-        alerts.notify_block(self.work, self.block)
-        self.http.assert_called_once()
-        self.http.reset_mock()
-        next_block = {**self.block, "from_sha": "b" * 40, "to_sha": "c" * 40}
-        alerts.notify_block(self.work, next_block)
-        self.clock.return_value = 13599
-        alerts.notify_block(self.work, next_block)
-        self.http.assert_not_called()
-        self.clock.return_value = 13600
-        alerts.notify_block(self.work, next_block)
-        self.http.assert_called_once()
+    def test_every_block_writer_records_its_outcome(self):
+        from tauceti_worker.audit_evidence import NotJudged, Unreadable, outcome_of
+
+        finding = {"verdict": "finding", "findings": ["IO"]}
+        self.assertEqual(outcome_of(finding, Die("x")), {"outcome": "finding", "verdict": finding})
+        self.assertEqual(outcome_of(None, Unreadable("x")), {"outcome": "unreadable"})
+        self.assertEqual(outcome_of(None, NotJudged("x")), {"outcome": "not-judged"})
+        self.assertEqual(outcome_of({"verdict": "pass", "findings": []}, Die("ref")), {"outcome": "not-judged"})
 
     def test_code_uncertainty_notifies_immediately_during_operational_delay(self):
-        (self.work / "operational-alert.json").unlink()
+        (self.work / "ledger.jsonl").unlink()
         alerts.notify_block(self.work, self.block)
         self.http.assert_not_called()
         sa.record(
@@ -1344,18 +1330,35 @@ class PrivateAlerts(unittest.TestCase):
         self.assertIn("Human review required", message)
         self.assertNotIn("operational stall", message)
 
-    def test_bad_operational_timer_does_not_mutate_audit_evidence_or_send_misleading_dm(self):
-        blocked = self.work / "blocked.json"
-        blocked.write_text(json.dumps(self.block))
-        for state in (
-            [],
-            {"from_sha": self.block["from_sha"], "first_seen": True},
-            {"from_sha": self.block["from_sha"], "first_seen": float("nan")},
+    def test_request_trusts_the_host_ca_bundle_without_ssl_cert_file(self):
+        self.request.stop()
+        self.addCleanup(self.request.start)
+        seen = {}
+
+        class Opener:
+            def open(self, req, timeout):
+                raise OSError("stop before network")
+
+        def build_opener(*handlers):
+            seen["handlers"] = handlers
+            return Opener()
+
+        context = unittest.mock.MagicMock()
+        with (
+            patch.dict(os.environ, {"SSL_CERT_FILE": ""}),
+            patch.object(alerts, "ensure_ssl_cert_file", return_value="/host/ca-bundle.crt") as bundle,
+            patch.object(alerts.ssl, "create_default_context", return_value=context) as default,
+            patch.object(alerts.urllib.request, "HTTPSHandler") as https,
+            patch.object(alerts.urllib.request, "build_opener", side_effect=build_opener),
         ):
-            (self.work / "operational-alert.json").write_text(json.dumps(state))
-            alerts.notify_block(self.work, self.block)
-            self.assertEqual(json.loads(blocked.read_text()), self.block)
-        self.http.assert_not_called()
+            with self.assertRaisesRegex(OSError, "stop before network"):
+                alerts.request(json.loads(self.config.read_text()), "POST", {"type": "direct"})
+        bundle.assert_called_once()
+        # The default stores (including SSL_CERT_DIR) stay loaded; the host bundle is added to them.
+        default.assert_called_once_with()
+        context.load_verify_locations.assert_called_once_with(cafile="/host/ca-bundle.crt")
+        https.assert_called_once_with(context=context)
+        self.assertIn(https.return_value, seen["handlers"])
 
     def test_alert_filter_never_clears_a_block_or_modifies_recovery_budget(self):
         blocked = self.work / "blocked.json"
@@ -1363,10 +1366,9 @@ class PrivateAlerts(unittest.TestCase):
         recovery = self.work / "operational-recovery.json"
         recovery.write_text('{"budget": "unchanged"}')
         before = blocked.read_bytes(), recovery.read_bytes()
-        (self.work / "operational-alert.json").unlink()
         alerts.notify_block(self.work, self.block)
         self.assertEqual((blocked.read_bytes(), recovery.read_bytes()), before)
-        self.http.assert_not_called()
+        self.http.assert_called_once()
 
     def test_private_recipient_and_durable_deduplication(self):
         alerts.notify_block(self.work, self.block)
@@ -1377,9 +1379,8 @@ class PrivateAlerts(unittest.TestCase):
         self.assertEqual(method, "POST")
         self.assertEqual(params["type"], "direct")
         self.assertEqual(json.loads(params["to"]), [123])
-        self.assertIn("Operational stall", params["content"])
-        self.assertIn("at least one hour", params["content"])
-        self.assertIn("Automatic recovery continues", params["content"])
+        self.assertIn("Source-safety finding", params["content"])
+        self.assertIn("Human review required", params["content"])
         self.assertNotIn("secret", params["content"])
 
     def test_source_finding_is_reported_as_data_with_evidence(self):

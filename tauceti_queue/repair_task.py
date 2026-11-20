@@ -194,6 +194,7 @@ class TaskMember:
     withdrawn: bool = False  # already withdrawn that way: it stays an empty commit
     declaration_names: dict = dataclasses.field(default_factory=dict)
     source_identity: str | dict = ""
+    large_refactor: bool = False  # an admin's label lifts the review-size caps for its commit
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -315,6 +316,7 @@ class Task:
                     source_identity=raw.get("source_identity", "")
                     if binding is not None or mixed_binding is not None
                     else "",
+                    large_refactor=raw.get("large_refactor") is True,
                 )
             )
         extra = dict(data.get("extra") or {})
@@ -392,6 +394,11 @@ class Task:
     @property
     def member_keys(self) -> list[str]:
         return [m.source_pr for m in self.members]
+
+    @property
+    def large_refactor_heads(self) -> frozenset[tuple]:
+        """``(number, accepted_head)`` of the members whose review-size caps an admin's label lifts."""
+        return frozenset((m.number, m.accepted_head) for m in self.members if m.large_refactor)
 
     @property
     def validation_base(self) -> str:
@@ -563,9 +570,6 @@ class TaskClient:
         if not isinstance(value, (int, float)):
             raise ServiceError("renew: no expires_at in the response")
         if isinstance(payload, dict):
-            owner = payload.get("checks_owner")
-            if owner in ("worker", "staging"):
-                task.extra["checks_owner"] = owner
             interval = payload.get("renew_after")
             if type(interval) in (int, float) and 0 < interval <= 300:
                 task.renew_after = float(interval)
@@ -679,7 +683,6 @@ class ClaimLease(threading.Thread):
         *,
         retry_interval: float = 15.0,
         clock=time.time,
-        check_settings: Path | None = None,
     ):
         super().__init__(name=f"claim-lease-{task.task_id}", daemon=True)
         self.client = client
@@ -697,7 +700,6 @@ class ClaimLease(threading.Thread):
         self.renewals = 0
         self.errors = 0
         self.lost_reason: str | None = None
-        self.check_settings = check_settings
 
     def run(self) -> None:
         interval = max(0.05, float(self.task.renew_after))
@@ -705,8 +707,6 @@ class ClaimLease(threading.Thread):
             try:
                 self.expires_at = self.client.renew(self.task)
                 self.task.expires_at = self.expires_at
-                if self.check_settings is not None:
-                    repair_audit.update_checks_owner(self.check_settings, self.task.extra.get("checks_owner"))
                 self.renewals += 1
                 interval = max(0.05, float(self.task.renew_after))
             except ClaimRefused as error:
@@ -727,8 +727,6 @@ class ClaimLease(threading.Thread):
         self.lost_reason = reason
         self.lost.set()
         self.cancel.set()
-        if self.check_settings is not None:
-            repair_audit.update_checks_owner(self.check_settings, "staging")
         log(f"claim lost: {reason}")
 
     def stop(self) -> None:
@@ -1493,6 +1491,13 @@ def artifact_checkout(worktree: Path, task: Task, start_tip: str):
 HEAD_KINDS = ("repair", "rebase_conflict")  # the head's own tasks, which warm from the head's tips
 
 
+def background_task(task: Task) -> bool:
+    """Work for a later batch (``prepare``, ``pre_rebase``), whose builds yield the CPU to the head's
+    (``repair_sandbox.prioritized``). A proactive prediction repair is the head's own: when the head's
+    CI fails the controller turns that same task into its required repair."""
+    return task.kind in ("prepare", "pre_rebase")
+
+
 def describe_cache_revision(task: Task, artifacts: dict) -> str:
     """The restored revision and its relation to the task, for the worker log: ``85f3eb5579df (the rebase
     target)``, ``5f78b5307b93 (the batch base)``, ``67aa17161ba1 (3 commits behind the rebase target
@@ -1589,6 +1594,7 @@ def prompt_context(
                 "landed_externally": getattr(m, "landed_externally", None),
                 "no_repair": m.no_repair,
                 "withdrawn": m.withdrawn,
+                "large_refactor": m.large_refactor,
             }
             for m in task.members
         ],
@@ -1596,7 +1602,6 @@ def prompt_context(
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
         check_findings_known=known_check_failures(task),
         worker_verifies=worker_verifies and not cold,
-        staging_checks=repair_audit.staging_checks(task),
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
@@ -2095,7 +2100,6 @@ def delivery_identity(cfg: RunnerConfig, task: Task, tip: str) -> dict:
         "tip": tip,
         "base": task.validation_base,
         "audits": cfg.worker_audits,
-        "full_checks": cfg.worker_audits and not repair_audit.staging_checks(task),
         "lake": list(cfg.lake),
         "checker": hashlib.sha256(
             Path(repair_audit.__file__).read_bytes() + Path(repair_sandbox.__file__).read_bytes()
@@ -2233,6 +2237,10 @@ def run_task(
     from tauceti_queue.repair_cleanup import worktree_lease
 
     require_task_execution(cfg=cfg, task=task)
+    if background_task(task):
+        os.environ[repair_sandbox.BACKGROUND_VARIABLE] = "1"
+    else:
+        os.environ.pop(repair_sandbox.BACKGROUND_VARIABLE, None)
     cache_root = task_cache(cfg.root, task.task_id)
     cache_cleanup = before_task(cache_root)
     if cache_cleanup["state"] != "busy":
@@ -2467,10 +2475,6 @@ def _run_task(
     """
     require_task_execution(cfg=cfg, task=task)
     state_dir = cfg.tasks_dir / task.task_id
-    staging_checks = functools.partial(repair_audit.staging_checks, task)
-    if task.extra.get("checks_owner") in ("worker", "staging") and cfg.publish.when == "before":
-        # Reuse the existing asynchronous publisher so staging setup overlaps the upload.
-        cfg = dataclasses.replace(cfg, publish=dataclasses.replace(cfg.publish, when="after"))
     logdir = state_dir / "logs"
     state = resume_state or TaskState(state_dir, task)
     pending_delivery = state.record.get("delivery") if state.state in IN_FLIGHT_STATES else None
@@ -2478,17 +2482,7 @@ def _run_task(
     cancel = threading.Event()
     if stop is not None:
         stop.attach(cancel)
-    lease = ClaimLease(
-        client,
-        task,
-        cancel,
-        retry_interval=cfg.lease_retry_interval,
-        check_settings=cfg.root
-        / "worktrees"
-        / f"task-{task.task_id}"
-        / repair.LISTINGS_DIR
-        / repair_audit.SETTINGS_FILE,
-    )
+    lease = ClaimLease(client, task, cancel, retry_interval=cfg.lease_retry_interval)
     lease.start()
     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
     outcome: dict = dict(state.record.get("outcome") or {}) if pending_delivery else {}
@@ -2524,7 +2518,7 @@ def _run_task(
         """``TAUCETI_REPAIR_PUBLISH=after``: publish ``revision``'s outputs in the background now that the
         result is in; the publisher removes the worktree when done. Never fails the task. Under ``off``
         the record says so and nothing starts."""
-        if cfg.publish.when == "before" and not staging_checks():
+        if cfg.publish.when == "before":
             return
         early = repair_publish.early_record(logdir, revision, cfg.publish)
         if early:
@@ -2533,7 +2527,7 @@ def _run_task(
         record = repair_publish.start_background(
             worktree,
             revision,
-            settings=dataclasses.replace(cfg.publish, when="after") if cfg.publish.when == "before" else cfg.publish,
+            settings=cfg.publish,
             env=env_lake,
             logdir=logdir,
             task_id=task.task_id,
@@ -2708,7 +2702,6 @@ def _run_task(
                 tools_root=tools_root,
                 lake=tuple(cfg.lake),
                 logdir=logdir,
-                checks_owner="staging" if staging_checks() else "worker",
             )
         if streaming and (outcome.get("artifacts") or {}).get("available"):
             stream = repair_stream.start_build(
@@ -2729,7 +2722,6 @@ def _run_task(
                     logdir=logdir,
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
-                    defer_when=staging_checks,
                 )
                 if cfg.worker_audits
                 else None,
@@ -2746,7 +2738,7 @@ def _run_task(
             ):
                 # The batch builds on its base as assembled: give the task back as prepared, without an
                 # agent, and publish the outputs for the head's later rounds.
-                if cfg.publish.when == "before" and not staging_checks():
+                if cfg.publish.when == "before":
                     outcome["publish"] = repair_publish.publish_outputs(
                         worktree,
                         task.tip,
@@ -2893,7 +2885,13 @@ def _run_task(
             tip = git(worktree, "rev-parse", "HEAD").strip()
             git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
             report = repair.chain_report(
-                cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                cfg.clone,
+                task.validation_base,
+                task.tip,
+                tip,
+                task.member_keys,
+                prior_base=task.base,
+                large_refactors=task.large_refactor_heads,
             )
             if report["ok"] and report["unexplained"] and not cancel.is_set() and not rebasing:
                 follow = run_repair_agent(
@@ -2923,7 +2921,13 @@ def _run_task(
                 tip = git(worktree, "rev-parse", "HEAD").strip()
                 git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
                 report = repair.chain_report(
-                    cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                    cfg.clone,
+                    task.validation_base,
+                    task.tip,
+                    tip,
+                    task.member_keys,
+                    prior_base=task.base,
+                    large_refactors=task.large_refactor_heads,
                 )
             report["dirty"] = bool(git(worktree, "status", "--porcelain", "--untracked-files=no").strip())
             report["unchanged"] = tip == task.tip
@@ -2953,13 +2957,12 @@ def _run_task(
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             parallel = outcome.get("parallel") or {}
             verified = (
-                parallel.get("verified_tip") == tip and (staging_checks() or "checks" in parallel)
+                parallel.get("verified_tip") == tip and "checks" in parallel
             ) or pending_delivery == delivery_identity(cfg, task, tip)
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
             if cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
                 outcome.pop("repair_checkpoint", None)
-                # Compile the final chain and capture its native output map. New tasks
-                # leave full checks to staging; older tasks retain their assigned checks.
+                # Compile the final chain, capture its native output map and run every check.
                 state.write("verifying", attempt=attempt, tip=tip)
                 verification = repair_audit.verify(
                     worktree,
@@ -2970,7 +2973,6 @@ def _run_task(
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
                     audits=True,
-                    defer_when=staging_checks,
                 )
                 outcome.setdefault("verification", []).append(
                     {k: v for k, v in verification.items() if k != "diagnostics"}
@@ -3028,11 +3030,7 @@ def _run_task(
                         }
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
-            if (
-                cfg.publish.when == "before"
-                and not staging_checks()
-                and (outcome.get("publish") or {}).get("revision") != tip
-            ):
+            if cfg.publish.when == "before" and (outcome.get("publish") or {}).get("revision") != tip:
                 outcome["publish"] = repair_publish.publish_outputs(
                     worktree,
                     tip,
@@ -3070,26 +3068,12 @@ def _run_task(
             if task.kind == "pre_rebase":
                 for result in reversed(outcome.get("verification", [])):
                     checks = result.get("checks") or {}
-                    build_only = (
-                        staging_checks() and checks.get("status") != "passed" and result.get("build", {}).get("rc") == 0
-                    )
-                    if (
-                        result.get("tip") == tip
-                        and result.get("ok") is True
-                        and (build_only or checks.get("status") == "passed")
-                    ):
-                        tools = checks.get("tools")
-                        if build_only:
-                            try:
-                                repo, ref = repair_audit.tools_pin(worktree)
-                                tools = f"{repo}@{ref}"
-                            except repair_audit.Unavailable:
-                                break
+                    if result.get("tip") == tip and result.get("ok") is True and checks.get("status") == "passed":
                         notes["pre_rebase_verification"] = {
                             "tip": tip,
                             "base": task.validation_base,
-                            "tools": tools,
-                            "scope": "build" if build_only else "full",
+                            "tools": checks.get("tools"),
+                            "scope": "full",
                         }
                         break
             if task.kind == "prepare":

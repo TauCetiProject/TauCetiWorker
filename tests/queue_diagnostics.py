@@ -77,6 +77,25 @@ class ParseLog(unittest.TestCase):
         self.assertNotIn("\x1b", findings[0]["message"])
         self.assertFalse(findings[0]["message"].startswith("2026-"))
 
+    def test_lint_script_lines_in_the_compiler_shape_are_lint(self):
+        lines = [
+            "2026-11-19T04:20:00.1Z TauCeti/Topology/Covering/Quotient.lean:186:0: error: dot-notation namespace lint: "
+            "TauCeti.IsQuotientCoveringMap.foo puts a Mathlib type's namespace inside `namespace TauCeti`",
+            "2026-11-19T04:20:01.1Z error: TauCeti/Algebra/Basic.lean:12: Line has more than 100 characters",
+            "2026-11-19T04:20:02.1Z TauCeti/Algebra/Basic.lean:14:3: error: unknown identifier",
+        ]
+        findings = d.parse_log(lines)
+        self.assertEqual(
+            [(f["kind"], f["module"], f.get("linter")) for f in findings],
+            [
+                ("lint", "TauCeti.Topology.Covering.Quotient", "dot-notation"),
+                ("lint", "TauCeti.Algebra.Basic", "style"),
+                ("compiler", "TauCeti.Algebra.Basic", None),
+            ],
+        )
+        self.assertEqual(findings[0]["declaration"], "TauCeti.IsQuotientCoveringMap.foo")
+        self.assertEqual((findings[1]["path"], findings[1]["line_number"]), ("TauCeti/Algebra/Basic.lean", 12))
+
     def test_audits(self):
         lines = [
             "audit-driver: import TauCeti.A.B failed, environment already contains 'Foo.bar' from TauCeti.C.D",

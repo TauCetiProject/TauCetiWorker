@@ -2119,19 +2119,26 @@ def _service_environment() -> dict[str, str]:
     return service_env
 
 
+WORKER_SLICE = "tauceti-workers.slice"
+
+
 def _systemd_unit(config: Path) -> str:
     command = " ".join(_systemd_quote(part) for part in _service_command(config))
     # Assignment values are not shell syntax: quotes become literal in WorkingDirectory=. Escape the
     # small set systemd treats specially while keeping the path absolute after parsing.
     working_directory = str(HERE).replace("\\", "\\\\").replace(" ", "\\x20").replace("%", "%%")
+    # Each worker moves itself into a transient scope under this slice, so restarting the manager
+    # (an update, a crash) adopts running workers instead of stopping them mid-round, as Fleet does.
+    service_environment = {**_service_environment(), worker_scopes.SLICE_ENV: WORKER_SLICE}
     environment = "\n".join(
-        f"Environment={_systemd_quote(name + '=' + value)}" for name, value in _service_environment().items()
+        f"Environment={_systemd_quote(name + '=' + value)}" for name, value in service_environment.items()
     )
     return f"""[Unit]
 Description=Keep configured Tau Ceti workers running
 
 [Service]
 Type=simple
+Slice={WORKER_SLICE}
 WorkingDirectory={working_directory}
 ExecStart={command}
 {environment}
