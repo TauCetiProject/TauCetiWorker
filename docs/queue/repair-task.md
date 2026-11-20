@@ -125,17 +125,25 @@ are never read, so the agent cannot replay or rewrite history. Leftover conflict
 conflicting files and a review-size violation of the commit are problems that send the agent round
 again; a missing explanation gets the usual explanation turn. The worker then verifies the resolved
 commit's tree as it verifies a chain (whole-library incremental build, checks as the task's policy
-says) and submits the commit.
+says) and submits the commit. That tree is only a prefix of the chain, and a later member may fix
+what fails there, so a failing verification is recorded and the commit submitted without another
+agent round; CI of the whole chain judges it.
 
 The controller's dedicated acceptance path (`Controller._continue_replay`) requires the commit's only
-parent to be the clean prefix and its message to be the conflicting commit's with text appended, then
-replays the commits after the conflicting one onto it with `chain.replay`. A clean replay is the whole
+parent to be the clean prefix, its message to be the conflicting commit's with text appended and no
+other `Source-PR` or `Accepted-Head`, and a no-repair member to be left alone or emptied. It then
+replays the commits after the conflicting one onto it with `chain.replay`, and refuses the resolution
+(`absorbed-later-member`) when a later member becomes empty although it did not land on the base and
+its change is not already in the clean prefix: a resolution that writes a later member's result is a
+replay by hand. These are checked before the replay advances because a later task cannot undo them. A clean replay is the whole
 chain on `onto`: it goes through the ordinary validation and comparison and is adopted (the head's
 next version, or the batch's pre-rebase) as a submitted chain is, and the resolved commit is recorded
 as a receipt for a resend after a lost response. A replay that stops at a later conflict is accepted
 as `resolved-commit` (`Controller._next_conflict`): nothing is adopted, and a task of the same kind on
 the same chain resolves the next conflicting commit on the new clean prefix, which holds the earlier
-resolutions. Conflict tasks take no repair checkpoints.
+resolutions; it is created in the same transaction, and inherits an evicted batch's retained-task
+marker and a preserved pre-rebase task's preservation (kept until it is claimed). Conflict tasks take
+no repair checkpoints.
 
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
 `violations` (chain tool findings, `{code, detail, commit, source_pr}`), `provenance`. The runner
