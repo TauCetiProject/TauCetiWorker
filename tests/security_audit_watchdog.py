@@ -79,8 +79,7 @@ class Watchdog(unittest.TestCase):
         self.assertEqual(self.posts(), [])
         # A pool range launched at this cursor (status persisted at launch) stays due.
         (self.work / "pool").mkdir()
-        (self.work / "pool" / "d.json").write_text(json.dumps({"from_sha": A, "status": "running"}))
-        (self.work / "pool" / "d.input.json").write_text(json.dumps({"from_sha": A}))
+        (self.work / "pool" / "ranges.json").write_text(json.dumps({"ranges": [{"from_sha": A, "status": "running"}]}))
         self.check(10**6 + 1)
         self.check(10**6 + 3601)
         self.assertEqual(len(self.posts()), 1)
@@ -95,7 +94,7 @@ class Watchdog(unittest.TestCase):
     def test_passed_range_whose_cursor_update_keeps_failing_is_still_due(self):
         self.seen = (A, 3)
         (self.work / "pool").mkdir()
-        (self.work / "pool" / "d.json").write_text(json.dumps({"from_sha": A, "status": "pass"}))
+        (self.work / "pool" / "ranges.json").write_text(json.dumps({"ranges": [{"from_sha": A, "status": "pass"}]}))
         self.check(10000)
         self.check(13600)
         self.assertEqual(len(self.posts()), 1)
