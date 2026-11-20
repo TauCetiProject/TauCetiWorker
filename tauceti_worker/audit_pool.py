@@ -474,6 +474,8 @@ class Pool:
             "reason": str(exc) or type(exc).__name__,
             "attempt": str(attempt),
             "outcome": "unreadable" if isinstance(exc, Unreadable) else "not-judged",
+            "batch": slot.digest,
+            "commits": [c["sha"] for c in slot.batch["commits"]],
             **self.reviewer(slot),
         }
         if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):

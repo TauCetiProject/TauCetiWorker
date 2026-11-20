@@ -309,6 +309,9 @@ def recorded(state: Path, batch: dict, evidence: Evidence | None = None) -> Evid
                 evidence.unreadable.append(f"{ledger}:{number}: unreadable row")
         elif "verdict" in row and (row.get("batch") == digest or commits & judged_commits(row["verdict"])):
             evidence.judgments.append(row["verdict"])
+        elif row.get("outcome") == UNREADABLE and (row.get("batch") == digest or commits & judged_commits(row)):
+            # A hold on evidence that could not be read binds its commits exactly like a concern.
+            evidence.unreadable.append(f"{ledger}:{number}: unreadable evidence holds these commits")
     return evidence
 
 

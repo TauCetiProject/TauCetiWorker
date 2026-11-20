@@ -658,6 +658,16 @@ class DurableRanges(PoolFixture):
         self.assertNotIn(self.shas[2], self.calls_from)
         self.assertIn("binding judgment", json.loads((self.state / "blocked.json").read_text())["reason"])
 
+    def test_an_unreadable_hold_binds_its_commits_whatever_the_new_plan(self):
+        old = sa.build_batch(self.repo, self.shas[2], self.shas[-2], self.shas[3:5])
+        sa.record(
+            self.state / "ledger.jsonl",
+            {"outcome": "unreadable", "batch": old["input_digest"], "commits": self.shas[3:5], "reason": "x"},
+        )
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+        self.assertNotIn(self.shas[2], self.calls_from)
+
     def test_retry_state_and_reviewer_survive_a_restart(self):
         def first(batch, attempt):
             if self.index(batch) == 0:
