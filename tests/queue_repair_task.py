@@ -1738,6 +1738,17 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(list((cfg.root / "worktrees").glob("task-1-lookahead-*")), [])
         self.assertIn("build Mathlib", self.lake_calls(), "the packages are replayed once for the helpers")
 
+    def test_the_head_task_gets_all_the_helpers_and_background_work_half(self):
+        from tauceti_queue import repair_lookahead
+
+        self.assertEqual(repair_lookahead.DEFAULT_HELPERS, 16)
+        cfg = self.config(lookahead_helpers=16)
+        head = types.SimpleNamespace(kind="rebase_conflict", extra={})
+        background = types.SimpleNamespace(kind="rebase_conflict", extra={"background": True})
+        self.assertEqual(repair_lookahead.helper_count(cfg, head), 16)
+        self.assertEqual(repair_lookahead.helper_count(cfg, background), 8)
+        self.assertEqual(repair_lookahead.helper_count(self.config(lookahead_helpers=1), background), 1)
+
     def test_a_chain_that_changes_the_dependencies_gets_no_lookahead(self):
         """Helpers share packages prepared at ``onto``: a member changing ``lake-manifest.json`` turns them off."""
         from tauceti_queue import repair_lookahead
