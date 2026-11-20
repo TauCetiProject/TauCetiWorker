@@ -84,7 +84,7 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
                 & (
                     KEEP
                     | {s.lower() for s in no_repair_labels}
-                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair", "large-refactor"}
                 )
             ),
             "comments": [
@@ -229,6 +229,9 @@ class AdmissionPolicy:
             "single": bool(set(snapshot.paths) & {"lean-toolchain", "lake-manifest.json"}),
             "command": result["reason"],
         }
+        if snapshot.large_refactor:
+            # Repair reads this from the input, so its review-size checks skip the same caps.
+            evidence["large_refactor"] = True
         return result, authorization, evidence, comment, meta
 
 
@@ -247,6 +250,7 @@ class AdmissionPoller:
         self._lock = threading.Lock()
         self._discovery_lock = threading.Lock()
         self._discovery_serial = 0
+        self._discovery_timing = None  # the current discovery pass's timing, see `_discover`
         self.wake = lambda: None
         self.last_summary = None
         self.stopping = threading.Event()
@@ -415,7 +419,7 @@ class AdmissionPoller:
                 relevant_labels = (
                     KEEP
                     | self.controller._no_repair_labels()
-                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair", "large-refactor"}
                 )
                 if isinstance(label, str) and label and label.lower() not in relevant_labels:
                     return  # membership and repair labels are queue output, not admission evidence
@@ -558,12 +562,22 @@ class AdmissionPoller:
             with self._discovery_lock:
                 serial = self._discovery_serial
             retry_at = 0
+            # Where a pass's time goes: pages read, and the urgent evaluations made between them.
+            # A pass resumed after a quota wait continues its listing, so it continues these too.
+            if self._discovery_timing is None:
+                self._discovery_timing = {"seconds": 0.0, "pages": 0, "evaluation_seconds": 0.0}
+            timing, started = self._discovery_timing, time.monotonic()
+
+            def on_page(pulls):
+                self._observe_page(pulls)
+                timing["pages"] += 1
+                evaluating = time.monotonic()
+                self._process_one(summary, urgent_only=True)
+                timing["evaluation_seconds"] += time.monotonic() - evaluating
+
             try:
                 listed = self.adapter.list_open_pull_requests(
-                    self.repo,
-                    review_app_id=0,
-                    admission=True,
-                    on_page=lambda pulls: (self._observe_page(pulls), self._process_one(summary, urgent_only=True)),
+                    self.repo, review_app_id=0, admission=True, on_page=on_page
                 )
                 numbers = {p.number for p in listed}
                 for row in self.controller.store.rows("admission_work", {"repository": self.repo}):
@@ -572,7 +586,19 @@ class AdmissionPoller:
                             row["number"], row["head_sha"], "absent:" + self.policy.revision, urgent=True
                         )
                 next_at = self.clock() + self.controller.setting("approval_poll_interval_seconds")
+                self._discovery_timing = None
+                self.controller.store.journal(
+                    self.clock(),
+                    "admission-discovered",
+                    prs=len(listed),
+                    pages=timing["pages"],
+                    seconds=round(timing["seconds"] + time.monotonic() - started, 1),
+                    evaluation_seconds=round(timing["evaluation_seconds"], 1),
+                )
             except Exception as error:
+                timing["seconds"] += time.monotonic() - started
+                if not isinstance(error, RequestDeferred):
+                    self._discovery_timing = None  # the listing starts again at page one
                 next_at = retry_at = self._retry_at(error)
                 if isinstance(error, RequestDeferred):
                     self.state.record_resource_wait(error.resource, error.retry_at)
@@ -708,9 +734,13 @@ class AdmissionPoller:
     def _evaluate(self, work, summary):
         epoch = self._source_epoch()
         started = self.clock()
+        began = time.monotonic()
+        fetch_seconds = getattr(self.adapter, "fetch_seconds", lambda: 0.0)
+        fetched = fetch_seconds()
         single = getattr(self.adapter, "admission_snapshot_single", None)
         read = single if self.evidence_mode() == "events" and single is not None else self.adapter.admission_snapshot
         snapshot = read(self.repo, work["number"], generation=work["generation"])
+        timing = {"read_seconds": time.monotonic() - began, "fetch_seconds": fetch_seconds() - fetched}
         result, authorization, evidence, comment, meta = self.policy.evaluate(snapshot)
         if self.evidence_mode() in ("shadow", "events"):
             try:
@@ -738,8 +768,10 @@ class AdmissionPoller:
                 },
             }
         version = self._version(snapshot.source())
+        locking = time.monotonic()
         # All reads/fetches, including the PR recheck inside the adapter, precede this lock.
         with self.controller._lock, self.controller.store.transaction():
+            timing["lock_seconds"] = time.monotonic() - locking
             current_work = self.state.get(work["number"])
             if current_work["generation"] != work["generation"]:
                 return
@@ -752,6 +784,7 @@ class AdmissionPoller:
             if human_review and approval_binding(current) != approval_binding(current_input):
                 self.state.dirty(work["number"], urgent=True)
                 return
+            self._sync_large_refactor(current, pull.head_sha, snapshot.large_refactor)
             if result.get("diff_guard") and pull.state == "open" and not pull.draft:
                 self._diff_guard_comment(pull, result["diff_guard"])
             requested = result["recovery_heads"]
@@ -849,6 +882,10 @@ class AdmissionPoller:
                 disposition=disposition,
                 reason=result["reason"],
                 policy_digest=self.policy.revision,
+                # Where this evaluation's time went: the source read, the clone fetches within it,
+                # and the wait for the controller lock; `seconds` is the whole evaluation.
+                seconds=round(time.monotonic() - began, 2),
+                **{key: round(value, 2) for key, value in timing.items()},
             )
             self.controller._count("admission_evaluations")
             if disposition == "approved":
@@ -875,6 +912,20 @@ class AdmissionPoller:
                 "marker": f"<!-- {COMMENT_MARKER} diff-guard:{pull.head_sha} -->",
             },
         )
+
+    def _sync_large_refactor(self, current, head, exempt):
+        """Keep the input's `large_refactor` evidence (which repair reads) equal to this evaluation's,
+        for the same head: a label applied or removed after approval reaches the next repair task."""
+        if current is None or current["head_sha"] != head:
+            return
+        evidence = loads(current["evidence"], {})
+        if bool(evidence.get("large_refactor")) == bool(exempt):
+            return
+        if exempt:
+            evidence["large_refactor"] = True
+        else:
+            evidence.pop("large_refactor", None)
+        self.controller.store.update("inputs", {"id": current["id"]}, evidence=dumps(evidence))
 
     def _human_owned_approval(self, snapshot, current, scoreboard):
         """Keep an exact, live admin approval only where machine review is absent.

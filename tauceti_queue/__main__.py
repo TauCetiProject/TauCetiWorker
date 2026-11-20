@@ -435,6 +435,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
 # --- status ----------------------------------------------------------------------------------------
 
 
+USER_AGENT = "tauceti-queue/1"
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -452,6 +455,9 @@ def fetch_json(
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, method=method)
     request.add_header("Accept", "application/json")
+    # Cloudflare in front of the public CI data (ci-data.taucetiproject.org) refuses urllib's default
+    # User-Agent with HTTP 403 ("blocked access based on your browser's signature").
+    request.add_header("User-Agent", USER_AGENT)
     if data is not None:
         request.add_header("Content-Type", "application/json")
     if token:

@@ -914,9 +914,7 @@ class Handler(BaseHTTPRequestHandler):
         controller = self.server.controller
         if action == "renew":
             self._call(
-                lambda: _renewal(
-                    tid, controller.renew_task(tid, token, **self._source_task_kwargs(refresh=True)), controller
-                )
+                lambda: _renewal(tid, controller.renew_task(tid, token, **self._source_task_kwargs(refresh=True)))
             )
         elif action == "release":
             self._call(
@@ -1160,12 +1158,8 @@ class Handler(BaseHTTPRequestHandler):
         self._call(revoke)
 
 
-def _renewal(task_id, result, controller=None) -> dict:  # noqa: E302
-    result = dict(result) if isinstance(result, dict) else {"task_id": task_id, "expires_at": result}
-    policy = getattr(controller, "task_check_policy", None)
-    if callable(policy):
-        result.update(policy(task_id))
-    return result
+def _renewal(task_id, result) -> dict:  # noqa: E302
+    return dict(result) if isinstance(result, dict) else {"task_id": task_id, "expires_at": result}
 
 
 def server_config(config, *, adapter=None, app=None, controller=None) -> ServerConfig:

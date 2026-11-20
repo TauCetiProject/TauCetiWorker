@@ -39,10 +39,9 @@ Tables:
   (`cancelled_by`, empty otherwise), why (`cancel_reason`) and GitHub's answer (`cancel_result`).
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
-- `failures`: one row per failed CI attempt of a head (`attempt_id` unique): its fingerprint
-  (`tauceti_queue/escalation.py`: verdict class, attributed members, digest of the finding lines),
-  the lines themselves, and what the controller did about it (`action`: `repair`, `withdraw`,
-  `bisect`, `dissolve`, `hold`), so the same failure on the same batch is recognised however often it recurs.
+- `failures`: history only, no longer written: one row per failed CI attempt of a head from when
+  a recurring failure could withdraw members or bisect the head, with its fingerprint, finding lines
+  and what the controller did about it (`action`: `repair`, `withdraw`, `bisect`, `dissolve`, `hold`).
 - `journal`: an append-only log of what the controller did, for status and tests.
 - `identity_cache`: answers GitHub gave about workers and operators, kept across restarts so a
   restart during a quota outage does not lock them out: per `namespace` (`bearer`, a token's

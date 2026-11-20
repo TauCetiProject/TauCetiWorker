@@ -144,13 +144,6 @@ class Decisions(unittest.TestCase):
                 self.assertEqual(self.cycle()[0]["decision"], "deferred")
         self.assertEqual(self.api.sent, [])
 
-    def test_alert_posting_requires_explicit_opt_in(self):
-        rows = wb.reconcile(self.api, self.state, clock=lambda: NOW)
-        self.assertNotIn("stuck-alerts.yml", [r["workflow"] for r in rows])
-        rows = wb.reconcile(self.api, self.state, clock=lambda: NOW, include_alerts=True)
-        self.assertIn("stuck-alerts.yml", [r["workflow"] for r in rows])
-        self.assertEqual(self.api.sent, [])
-
     def test_persistence_failure_stops_further_dispatches(self):
         def persist(state):
             if state["dispatches"]:

@@ -516,16 +516,23 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         return run_sources(w, opts, use_fleet_focus=use_fleet_focus)
     if "security-audit" in opts.only:
         from .activity import select
-        from .security_audit import run
+        from .security_audit import run, watch
 
         other_tasks = [task for task in opts.only if task != "security-audit"]
         if not other_tasks:
             select("security-audit")
-            return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+            try:
+                return run(w.cfg, opts)  # No PR survey or general-purpose agent launcher.
+            finally:
+                if not opts.dry_run:
+                    watch(w.cfg, min_commits=1)
         try:
             minimum = int(os.environ.get("TAUCETI_SECURITY_AUDIT_MIN_COMMITS", "20"))
         except ValueError:
             raise Die("TAUCETI_SECURITY_AUDIT_MIN_COMMITS must be a positive integer") from None
+        # Every round, including maintenance turns and failed audits: the cursor moves or the operator hears.
+        if not opts.dry_run:
+            watch(w.cfg, min_commits=minimum)
         # The audit and the maintenance tasks sharing this worker take turns: after a round that ran
         # the audit, the next round goes to maintenance, so a long audit backlog cannot starve bumps.
         # Any audit failure, even an unexpected one, also falls through to maintenance.
@@ -2199,7 +2206,9 @@ def _do_fixlike(
         PR=pr,
         HEAD=head,
         CLOSE_AUTHORITY=(
-            "You may close this PR only while its live author is the authenticated account on this source forge."
+            "You may close this PR only while its live author is the authenticated account on this source forge"
+            + _adopted_authors_note(sv)
+            + "."
             if may_close
             else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
         ),
@@ -2345,6 +2354,20 @@ FINAL_ATTEMPT_INSTRUCTION = (
     "`quality-pass` report: there, update the description and reply on the finding's thread, "
     "and that completes the attempt.\n"
 )
+
+
+def _adopted_authors_note(sv) -> str:
+    """Name adopted Forgejo authors in a close authority, so the agent's live check matches `owns`."""
+    repository = getattr(sv, "source_repository", None)
+    if repository is None or repository.forge.kind != "forgejo":
+        return ""
+    from .source_identity import adopted_author_ids
+
+    ids = sorted(adopted_author_ids())
+    if not ids:
+        return ""
+    listed = ", ".join(str(i) for i in ids)
+    return f", or a PR from a branch of this repository whose live author has Forgejo user ID {listed}"
 
 
 def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:
@@ -3389,7 +3412,21 @@ other contributors' claims, or the hard rules of the repo.
     # Scope git-safe-push's publication records to this round so its pushes can be labelled.
     push_scope = current_round_id() or os.urandom(16).hex()
     try:
-        with environment(TAUCETI_PUSH_SCOPE=push_scope):
+        claim_env = {}
+        # List assignments already hold a host-side claim; native agents use their source
+        # claim wrapper, whose GitHub namespace must be resolved outside native activation.
+        from .worker_sources import current
+
+        if targets_path is None and current() is None:
+            try:
+                namespace = claims_repo()
+            except (Die, GitHubError, ForgeError, NoProgress, OSError) as error:
+                # This fork is already needed for publication. A failed optional namespace
+                # lookup must not prevent authoring, and canonical is never the fallback.
+                log(f"roadmap: claim namespace lookup failed ({type(error).__name__}); using the authoring fork")
+                namespace = fork
+            claim_env["CLAIM_REPO"] = namespace
+        with environment(TAUCETI_PUSH_SCOPE=push_scope, **claim_env):
             return run_agent_host(
                 w.cfg.checkout, prompt, _effective_authoring_profile(opts), w.cfg.logdir, quota_cfg=w.cfg
             )

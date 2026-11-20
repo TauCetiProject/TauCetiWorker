@@ -324,6 +324,12 @@ class Releases(unittest.TestCase):
         )
         self.assertEqual(self.cwd("tauceti-queue-repair.service"), str(self.checkout))
         self.assertIn("--upgrade-package tauceti-tools", (self.state / "uv-calls").read_text())
+        self.assertEqual(
+            self.setting("tauceti-queue-clone-maintenance.service", "ExecStart"),
+            f"/usr/bin/env bash {release}/services/queue/clone-maintenance.sh",
+        )
+        calls = (self.state / "calls").read_text()
+        self.assertIn("tauceti-queue-clone-maintenance.timer", re.findall(r"^.*enable.*$", calls, re.M)[-1])
 
     def test_override_warns_and_rollback_reuses_an_existing_release(self):
         self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
@@ -369,6 +375,9 @@ class Releases(unittest.TestCase):
         self.assertNotIn("TauCetiQueue-releases", slice_unit, "the slice must not keep a release alive")
         self.assertEqual(re.findall(r"^CPUWeight=(\d+)$", slice_unit, re.M), ["10"])
         self.assertEqual(re.findall(r"^IOWeight=(\d+)$", slice_unit, re.M), ["10"])
+        # A soft cap that throttles, never a hard one that kills.
+        self.assertEqual(re.findall(r"^MemoryHigh=(\S+)$", slice_unit, re.M), ["48G"])
+        self.assertNotRegex(slice_unit, r"(?m)^MemoryMax=")
 
     def test_repair_install_fails_when_the_worker_is_not_in_its_slice(self):
         self.env["FAKE_SYSTEMD_IGNORES_SLICE"] = "1"
@@ -487,6 +496,122 @@ class Releases(unittest.TestCase):
         [release] = self.release_dirs(self.first)
         self.assertEqual(self.setting("tauceti-queue-repair-cleanup.service", "WorkingDirectory"), str(release))
         self.assertTrue((self.units / "tauceti-queue-repair-cleanup.timer").exists())
+
+
+def _kill_group(pid):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+class CloneMaintenance(unittest.TestCase):
+    """`clone-maintenance.sh` runs only concurrency-safe tasks and clears a lock nothing holds."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.clone = Path(self.tmp.name) / "clone"
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid"}
+        env.update(GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        self.env = env
+        subprocess.run(["git", "init", "-q", str(self.clone)], check=True, env=env)
+        for index in range(3):
+            (self.clone / f"f{index}").write_text(f"{index}\n")
+            subprocess.run(["git", "-C", str(self.clone), "add", "-A"], check=True, env=env)
+            subprocess.run(["git", "-C", str(self.clone), "commit", "-qm", str(index)], check=True, env=env)
+            subprocess.run(["git", "-C", str(self.clone), "update-ref", f"refs/x/{index}", "HEAD"], check=True)
+        self.lock = self.clone / ".git/objects/maintenance.lock"
+
+    def run_script(self, *args):
+        return subprocess.run(
+            ["bash", str(REPO / "services/queue/clone-maintenance.sh"), "--clone", str(self.clone), *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.clone), *args], check=True, capture_output=True, text=True).stdout
+
+    def test_maintains_the_clone_and_turns_automatic_maintenance_off(self):
+        for _ in range(2):  # loose-objects packs them, and deletes the packed copies the next time
+            result = self.run_script()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("config", "maintenance.auto").strip(), "false")
+        self.assertIn("refs/x/2", (self.clone / ".git/packed-refs").read_text(), "pack-refs ran")
+        self.assertEqual(self.git("count-objects", "-v").split("count: ")[1].split("\n")[0], "0", "loose-objects ran")
+        self.assertFalse(self.lock.exists())
+
+    def test_a_stale_unheld_lock_is_removed_and_a_recent_one_is_left(self):
+        self.lock.write_text("")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running", result.stderr)
+        self.assertTrue(self.lock.exists(), "a recent lock may belong to a live run")
+        old = time.time() - 7 * 3600
+        os.utime(self.lock, (old, old))
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removing a stale maintenance lock", result.stderr)
+        self.assertFalse(self.lock.exists())
+        self.assertIn("refs/x/2", (self.clone / ".git/packed-refs").read_text())
+
+    def test_an_old_lock_is_kept_while_any_git_maintenance_runs(self):
+        self.lock.write_text("")
+        old = time.time() - 7 * 3600
+        os.utime(self.lock, (old, old))
+        # A maintenance run elsewhere (a linked worktree's, say) that names no path of this clone.
+        fake = Path(self.tmp.name) / "bin/git"
+        fake.parent.mkdir()
+        fake.write_text("#!/bin/sh\nsleep 30\n")
+        fake.chmod(0o755)
+        direct = fake.with_name("git-maintenance")
+        shutil.copy(fake, direct)
+        for argv in ([str(fake), "maintenance", "run"], [str(direct), "run"]):
+            holder = subprocess.Popen(argv, start_new_session=True)
+            self.addCleanup(_kill_group, holder.pid)
+            time.sleep(0.2)
+            result = self.run_script()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("already running", result.stderr, argv)
+            self.assertTrue(self.lock.exists())
+            _kill_group(holder.pid)
+            holder.wait()
+
+    def test_a_second_run_waits_for_none_and_touches_nothing(self):
+        git_dir = self.clone / ".git"
+        holder = subprocess.Popen(
+            ["flock", str(git_dir / "tauceti-clone-maintenance.lock"), "sleep", "30"], start_new_session=True
+        )
+        self.addCleanup(_kill_group, holder.pid)
+        time.sleep(0.2)
+        self.lock.write_text("")
+        old = time.time() - 7 * 3600
+        os.utime(self.lock, (old, old))
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("another clone maintenance is running", result.stderr)
+        self.assertTrue(self.lock.exists(), "the running script's run owns what happens to it")
+
+    def test_the_unit_reads_the_controllers_environment(self):
+        unit = (REPO / "services/queue/tauceti-queue-clone-maintenance.service").read_text()
+        controller = (REPO / "services/queue/tauceti-queue.service").read_text()
+        environment = re.findall(r"^EnvironmentFile=.*$", controller, re.M)
+        self.assertTrue(environment)
+        for line in environment:
+            self.assertIn(line, unit)
+
+    def test_no_clone_yet_is_not_an_error(self):
+        result = subprocess.run(
+            ["bash", str(REPO / "services/queue/clone-maintenance.sh"), "--clone", str(self.clone / "missing")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("nothing to maintain yet", result.stderr)
 
 
 class Revision(unittest.TestCase):

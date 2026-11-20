@@ -197,13 +197,16 @@ tauceti work --only security-audit --agent claude --loop
 ```
 
 An admin's worker can combine the audit with any other phases, for example
-`--only security-audit,bump,progress,overlap-scan`. It inspects a bounded batch
-before its other work when at least 20 commits are pending. Below that threshold
-it continues with its other phases without launching an audit model. Set
-`TAUCETI_SECURITY_AUDIT_MIN_COMMITS` to a positive integer to change the
-threshold. Audit-only runs inspect any nonempty backlog. Findings, unresolved
-inspections and operational failures stop audit advancement and preserve their
-blocks and evidence. The combined worker continues with its other phases; this
+`--only security-audit,bump,progress,overlap-scan`. Each round runs one bounded
+quantum of the same scheduler as the parallel pool below, with that round's reviewer:
+it advances passed ranges, inspects at most one range, and returns. New work is
+admitted when at least 20 commits are pending; below that threshold the round continues
+with its other phases without launching an audit model. Admitted ranges, including the
+halves of a split range, continue below the threshold. Set
+`TAUCETI_SECURITY_AUDIT_MIN_COMMITS` to a positive integer to change the threshold.
+Audit-only runs inspect any nonempty backlog. While a range waits (its retry backoff, or a
+binding range at the cursor), the round yields at once. Findings and unreadable evidence
+stop audit advancement and preserve their blocks and evidence. The combined worker continues with its other phases; this
 never clears a block or bypasses release gating. `--pr` cannot be combined with
 the audit phase. Its isolated Luna/Haiku reviewer is unchanged, and the worker's
 other phases use their default authoring profile.
@@ -217,7 +220,7 @@ alone without an aggregate byte cap, through the same compacting session. Each
 source blob remains limited to 4 MiB, and each model launch to 30 minutes.
 The batching target is separate from the model's live context window. Small
 inputs are supplied inline; larger inputs use one read-only `audit.read_page` tool.
-In protocol 4 it accepts only a numbered chunk, with no paths, commands or copied
+It accepts only a numbered chunk, with no paths, commands or copied
 identifiers. The reader serves the next unserved chunk or an earlier reread and
 rejects skipping ahead. The complete encoded tool response is capped at 64 KiB,
 with headroom under the configured 120k output allowance. It validates size and
@@ -225,24 +228,33 @@ flushes the response before atomically recording served coverage. Failed writes
 receive no credit; a crash before the receipt is committed can require a reread.
 The Worker saves coverage before each client call and reconciles it with the
 client's successful tool-call reports afterwards, including on timeout or failure.
-For Codex recovery, each successful read must also have its matching complete
-source sections in the saved native conversation that will be resumed. The Worker
+For Codex, each successful read must also have its matching complete source
+sections in the saved native conversation that a continuation resumes. The Worker
 keeps the contiguous confirmed prefix and rereads only the unconfirmed remainder in the
 same conversation. This works independently of parallel tool-call ordering.
 If the Worker dies without saving a transcript, the launch's new reads are replayed.
 Earlier findings and uncertainty are preserved;
 partial progress never substitutes for a final safety judgment.
 
-Protocol 4 trusts the verified client to deliver successful tool responses intact.
-Served coverage proves neither model receipt nor understanding. The same isolated
-Luna/Haiku conversation may compact and reread source, then returns only `verdict`
-and `findings` for the entire batch. The Worker supplies the immutable digest and
-ordered commit list. Missing chunks, earlier source concerns and malformed final
-answers block approval. There are no independent partial approvals. The prompt
-requires retaining findings and uncertainty across compaction and returning
-incomplete if the inspection cannot be completed.
+New inspections use judgment protocol 5 (the same served reader as protocol 4). The
+reviewer returns exactly `pass`, `finding` or `unfinished`; there is no `incomplete`.
+Genuine uncertainty about whether a construct is safe, or where it comes from, is a
+`finding`: a concern for human review, not necessarily a demonstrated vulnerability.
+Unread pages, lost context or running out of time are never findings: the reviewer
+returns `unfinished` with no findings. A fresh attempt continues its own session while
+it has no judgment, within one budget: three charged launches, where a launch that
+served new pages is not charged; a timeout ends it. Native goal tools are not offered.
+Codex registers its MCP resource helpers (`list_mcp_resources`,
+`list_mcp_resource_templates`, `read_mcp_resource`) whenever any MCP server is
+configured, and nothing turns them off: the model catalog describes them as unavailable,
+and calls to them are inert (the only server, the audit reader, serves no resources, so
+they read nothing and count as no coverage). New inspections never fall back to
+protocol 3 or 4: until a client is verified for protocol 5 they wait, and the cursor
+watchdog reports a long stall. The delivery check also confirms that Codex receives the
+helpers' unavailable descriptions. Evidence retained from protocols 1 to 4 is only
+classified; it is never continued.
 
-New inspections use protocol 4 only after the installed client passes an intact
+New inspections run only after the installed client passes an intact
 response check for this Worker release. The Worker runs this check automatically
 when verification is missing or stale, serializes concurrent checks, and caches
 failures for five minutes before retrying. A changed client bypasses that failure
@@ -262,29 +274,21 @@ saved native conversation, including Unicode and escaped text. It writes a priva
 `client-coverage.json` compatibility record.
 The record is tied to client paths, file hashes, version and the reader, launcher,
 catalog and verification code. A client or Worker upgrade requires verification
-again, which the Worker performs automatically. A failed verification leaves new
-inspections on historical protocol 3 until a later check succeeds. Verification
-supports native executables and the managed
-Codex launcher; other wrappers keep protocol 3 because their underlying code
-cannot be identified reliably. Retained protocol-4 inspections retry verification
-automatically while keeping their original protocol. Existing protocol-3 inspections keep their exact
-reader, page layout, prompts and token checks; they are never reinterpreted as
-protocol-4 approvals. `audit_reader_v3.py` preserves that historical reader.
+again, which the Worker performs automatically. A failed verification makes new inspections
+wait until a later check succeeds. Verification supports native executables and the
+managed Codex launcher; other wrappers cannot be identified reliably, so inspections
+with them wait.
 
 Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
 Worker code alone verifies ancestry and moves the ref. Host-owned identity and
 served coverage do not establish source safety.
-No Lean builds or candidate scripts run. A finding, incomplete inspection, unsupported
-source blob or unrecoverable model error stops advancement. Read the retained `security-audit/blocked.json`
+No Lean builds or candidate scripts run. A finding, unreadable evidence or an
+unsupported source blob stops advancement; an attempt with no judgment is retried. Read the retained `security-audit/blocked.json`
 in that worker's state directory. Resolve findings by explicit human attestation,
 not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
 The input, actual launcher/environment/prompt, transcript, native Codex
 compaction/usage records, read receipt (for larger inputs), and durable ledger are
-retained in the same directory. A pre-inspection commit-budget block from an older
-planner can be archived automatically and its exact next commit replanned under
-the current limits. This does not attest that commit or retry a model verdict: findings,
-incomplete inspections, unauthorized tools and other planning errors remain blocked.
-Only the operational failures described below can resume automatically.
+retained in the same directory.
 
 For private Zulip alerts, set `TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG` in the trusted
 worker's environment to an absolute path to a mode-0600 JSON file:
@@ -297,111 +301,52 @@ Use a bot credential and the recipient's numeric Zulip user ID. The credential
 and its configuration path are excluded from the isolated reviewer's environment.
 Alerts include the commit range, recorded findings and local evidence paths.
 Source findings and explained code-safety uncertainty send an immediate DM marked
-**Human review required**. Routine unfinished turns and provider errors stay in the
-logs while automatic recovery handles them. An operational pause sends a DM only
-when the same cursor has remained held for at least one hour after the first
-observed pause. Its separate **Operational stall** label explains that no source
-finding is recorded and eligible automatic recovery continues. This durable timer
-survives retries and Worker restarts; advancement starts a fresh delay. The timer
-changes notifications only, preserving all blocks, evidence and recovery checks.
+**Human review required**. Operational pauses (unfinished turns, provider errors,
+held operational blocks) send nothing themselves; the cursor watchdog below reports any
+cursor held for an hour, whatever the cause, so one pause never produces two DMs.
 Alerts are sent only as direct messages; no GitHub issue is created. A durable local
 receipt suppresses repeated alerts for the same blocked range and kind. Failed
-delivery is retried on a subsequent audit round after at least 15 minutes, checking
-the latest 100 messages in that private conversation for an earlier ambiguous delivery.
+delivery is retried on a subsequent audit round or pool pass after at least 15 minutes,
+checking the latest 100 messages in that private conversation for an earlier ambiguous delivery.
 Notification failure preserves the audit block and allows bump/progress work to continue.
-Without this setting, reporting remains local to the worker's evidence and logs.
 
-Codex Luna has the native persistent goal tools enabled, with a goal to inspect
-the entire immutable bundle and preserve all findings and unresolved questions.
-The noninteractive `codex exec` command exits at the end of a turn, so the Worker
-owns continuation. Native goal databases are copied with SQLite backup into each
-successor attempt, including committed WAL contents; session indexes with temporary
-rollout paths are rebuilt. The native continuation-deferral marker prevents an
-active goal from starting a competing turn before `exec resume` submits the Worker's
-structured-output request. Objective, status and accounting are preserved separately
-from temporary provider credentials. A model's goal status never approves source or
-changes the cursor.
-
-The protocol-4 reader rejects skipping unserved chunks and reports
-`next_unserved_page` and `remaining_pages`. The historical protocol-3 reader uses
-`next_unread_page` and a final delivery token. When only
-reading work remains, the reviewer returns `unfinished` with no findings. That is
-progress, not a source verdict. The Worker also detects a premature empty-finding
-pass with missing coverage, or a cleanly ended turn without a final answer. It
-resumes the SAME native conversation with receipt-derived progress and retains
-all notes. There are no independent partial approvals. A later passing answer
-cannot discard an earlier source finding or explained code uncertainty, including
-one retained only in native history.
-
-Coverage continuations, recognized provider failures and mechanical output repairs
-share at most three charged launches per invocation, with 5- and 10-second delays.
-A protocol-4 coverage turn that serves new pages is not charged, so reading continues
-in the same invocation, up to 60 launches in total. Failed
-launches and partial turns are archived under `service-error-N/`, `output-error-N/`
-or `coverage-turn-N/`. Native history, reader receipts and goal bookkeeping are
-durable while the subprocess runs, so a restart retains evidence written before
-stdout capture finishes.
-
-After those immediate requests, ordinary `work` recovers operational and unfinished
-coverage blocks without human intervention. Failed or stalled invocations use a
-durable budget that waits 5, 10, 20, 40, then 60 minutes between recoveries, capped
-at one per hour thereafter. Reservation precedes launch and survives restarts.
-When a validated continuation delivers new pages and returns clear
-coverage-only progress, its next recovery is eligible after one minute instead
-of the failure backoff. The reserved attempt count is preserved. Rereading old
-pages, provider failures, source findings and damaged evidence never earn this
-shorter delay. Actual launches also follow the worker loop's cadence and quota
-scheduling. Reading progress changes scheduling only; it cannot approve source.
-Every invocation rechecks hard quota limits, admin authority, the current cursor,
-exact next main prefix,
-immutable input, original UUID, launch policy, reader, catalog, exact prompt and
-all prior judgments. Complete coverage, a complete passing judgment and a
-confirmed ref update remain mandatory for advancement. Protocol 3 additionally
-requires its final copied delivery token.
-
-Known Codex capacity and request-processing retry notices are nonterminal progress
-when followed by a completed turn and its answer. Unknown errors and failed turns
-remain failures. If a current-protocol inspection already finished successfully
-but was blocked during result handling, the Worker can revalidate its retained
-answer without another model request or model quota check. The public answer must
-match the native final, all prior judgments must remain clear, and complete reader
-coverage must validate under the original protocol, including its final token
-when that protocol requires one. Fresh admin, cursor and exact main-prefix
-checks still precede advancement; the ledger records reuse of the original attempt,
-and its evidence and block remain preserved until the ref update is confirmed.
-
-Reviewed version-1 and version-2 launcher profiles can migrate in their original
-native session. Version-2 coverage-only incompletes are recognized only by a closed
-diagnostic grammar whose claimed unread range and final token match the retained
-receipt. Their original native final and ledger record must agree; findings and
-unknown prose remain blocked. This migration is a protocol rule, with no exception
-for a particular commit SHA. Original evidence stays on record. Source findings,
-explained uncertainty about code, unauthorized tools, unknown profiles and
-mismatched evidence remain blocked. Private alerts retain their usual deduplication.
-
-The `retry-service` and `repair-output` administrative commands remain for their
-restricted historical recovery profiles; automatic protocol-v3 recovery uses the
-ordinary worker loop and does not need those commands or a human attestation.
-Protocol 4 uses the same recovery loop with no token-output repair path.
-
-For the recorded legacy Luna failure where the final two pages were inaccessible
-because the reader token was lost, an admin may explicitly continue the **same
-retained native conversation** after repairing the reader:
+With alerts configured, one cursor watchdog guarantees that the cursor is advancing or the
+operator has a DM. Every audit round (including maintenance turns and failed audits), every
+pool pass and the standalone command below record the cursor in `security-audit/stall.json`.
+Once audit work is due at one cursor (at least the configured threshold pending, or work
+already started there: a held block or a pool range starting there) and that cursor has
+not moved for an hour, an **Operational stall** DM is sent, then again daily while it stays held. An unobservable cursor (GitHub or
+git failures) counts as held, and the DM names the error. While a pool holds the state, it
+alone runs the watchdog. Checks and deliveries are serialized by local locks, so concurrent
+callers never send the same DM twice. Run the command from a timer to cover a Worker or pool
+that is dead or busy for longer than an hour; it uses the admission threshold its owner last
+recorded:
 
 ```bash
-python3 -m tauceti_worker.security_audit resume --state /path/to/worker/state/security-audit \
-  --reason 'Reader-token transport repair; continue the retained inspection'
+python3 -m tauceti_worker.security_audit watchdog --state /path/to/worker/state/security-audit
 ```
 
-This command allows one administrative continuation, restricted to the exact
-original recorded token-failure block. A failed continuation cannot be retried. It checks the
-unchanged input digest, original commit order, current cursor and admin authority,
-then restores the native conversation and read receipt. It keeps the incomplete
-verdict and block on record; only a complete passing continuation and confirmed
-reference update resolve the block. It cannot start a new reviewer, resume a source
-finding or other incomplete review, or provide human attestation. This historical
-exception does not widen ordinary automatic operational recovery eligibility. `--ignore-quota` overrides
-pacing only when explicitly selected; hard limits still apply.
+Without this setting, reporting remains local to the worker's evidence and logs.
+
+The reader rejects skipping unserved chunks and reports `next_unserved_page` and
+`remaining_pages`. Served coverage drives continuation and splitting, never approval.
+
+Every attempt, however it ends, gets one shared classification of its evidence
+(`audit_evidence.classify`). It reads the retained session, every captured client
+output (including archived earlier launches), the attempts it continued and the
+ledger's verdicts for the same input. A concern recorded anywhere is a **finding**
+and binds, even when the final answer is `unfinished` or `pass`, or the client timed
+out or failed: a concern is a judgment's nonempty findings, or a `finding` label. An
+`incomplete` label with no findings names no concern. Otherwise, evidence that
+cannot be read (a row cut off where an answer could have been, or text mentioning a
+judgment that cannot be parsed, or an answer that is not a judgment) holds the range
+for a human like a finding, with an immediate **Unreadable evidence** DM. Judgments
+are found by decoding JSON, including JSON carried in strings, never by matching text.
+Each block records its classified outcome, and alerts read it from there. Otherwise
+the attempt is a **pass** only when its last launch ended normally with a valid
+complete pass and only the inspection's tools were used. Everything else
+(unfinished, malformed output, a provider failure, an unexpected tool) is **not a
+judgment** and never binds.
 
 This phase can run alone or alongside bump/progress maintenance. It cannot use `--pr` or authoring-model overrides,
 and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
@@ -427,13 +372,33 @@ The pool plans a window of consecutive batches ahead of the cursor, each exactly
 `work` would plan it from that batch's start, and inspects them concurrently in
 separate attempt directories. The cursor advances only through the ordinary admin
 update, one batch at a time and only past validated passes, so a later batch that
-finishes first waits for its predecessors. A finding or incomplete verdict is
-binding: it is never inspected again, nothing beyond it advances, and the usual
-block and alert are recorded. Operational failures with no recorded judgment get
-at most two more attempts before blocking. An operational block left at the cursor
-by an ordinary round is archived and inspected afresh; source findings never are.
-Passing results persist under `pool/` and are reused after a restart only when the
-rebuilt input is byte-identical and still the next main prefix. While the pool
+finishes first waits for its predecessors. Each attempt's outcome is the shared
+classification above. A finding or unreadable evidence is binding: the batch is never
+inspected again, nothing beyond it advances, and the usual block and alert are
+recorded. An attempt that is not a judgment never binds; it is retried autonomously by
+bisection. If the reviewer engaged with the range (it answered or was served input) and
+the range has several commits, the range is replaced, in one durable update, by its two
+halves: consecutive slices of its exact commit list, the second starting at the first's
+last commit, each a complete fresh inspection with full per-commit input. Pages or
+partial approvals from different attempts are never combined. A single commit, or a
+range whose reviewer never engaged (a provider or setup failure), is inspected afresh,
+preferring the other reviewer when one is available, with a persisted backoff of up to
+an hour that never gives up; the cursor watchdog reports a long stall. A recorded concern
+about any commit binds every range containing it, however the commits are later split
+or planned. A block left at the cursor by an ordinary round whose evidence binds nothing
+is archived and inspected afresh; source findings never are.
+The pool's whole scheduling state is one ordered list of active ranges,
+`pool/ranges.json`, replaced atomically on every change: each range's exact commits,
+status, verdict or block, attempts, reviewer, retry count and next retry time. Every
+batch input is built by one function (`build_batch`) from a range's exact consecutive
+first-parent commits, with complete per-commit images and diffs. After a restart the
+list is restored while it is still the next main prefix; a pass is reused only when its
+rebuilt input is byte-identical, and a block stays binding. When a human attestation moves
+the cursor, ranges after it are kept, and a range it entered keeps only its remaining
+commits: still binding if blocked or in flight, otherwise inspected afresh. A range that was running
+when the pool stopped is first classified from its attempt's own evidence: a recorded
+concern binds, and only an attempt with no judgment is retried. An unreadable list
+holds the pool rather than replanning over a block. While the pool
 holds `pool.lock`, ordinary audit rounds for that state defer to it. A GitHub rate
 limit defers admin checks and cursor updates until reset without failing reviews.
 
@@ -441,15 +406,11 @@ Each new batch gets the first available reviewer: Codex `gpt-6-luna` while the C
 subscription is under pace, then Haiku on the Claude subscription while that is under
 pace, then Haiku billed to the API key in `TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE`
 regardless of pace. With none available, new batches wait. Pacing is the ordinary
-`work` verdict, and `--ignore-quota` overrides soft pacing only. A batch keeps its
-provider for life, and retries continue the reviewer's own session: Codex resumes its
-native rollout, and protocol-4 Haiku resumes its Claude session (`claude -p --resume`),
-which the Worker retains under the attempt's `claude-projects/`. Haiku may return
-`unfinished` with no findings to continue reading, exactly as Luna does. Any earlier
-finding or uncertainty in the session or the captured stream-json output binds the
-batch, and a fresh Haiku attempt starts only when no valid session is retained and
-that output holds none. Claude retries prefer the same credential, moving from the
-subscription to the API key when the subscription goes over pace. `--agent codex` or
+`work` verdict, and `--ignore-quota` overrides soft pacing only. Within one attempt,
+Codex continues its native rollout and Haiku its Claude session (`claude -p --resume`),
+which the Worker retains under the attempt's `claude-projects/`. Every retry is a fresh
+attempt, and only an attempt classified as no judgment is retried, so a retry never
+discards a concern. `--agent codex` or
 `--agent claude` pins one provider. The ledger and `pool/` result files record each
 review's provider, model and credential kind, never the key.
 
@@ -727,19 +688,25 @@ current usage and why a provider is waiting.
 | _(default)_ | The curve `60:40`: 40% of the quota by 60% of the window, then a ramp to the full quota by the reset. Holds a reserve for work that arrives late in a window |
 | `--pace 0:10,50:70,90:90` | Use a different piecewise-linear `time%:budget%` curve: 10% allowed immediately, ramping to 70% by halfway and 90% at 90% of the window, interpolated between points. Usage must remain strictly below the current budget. Budgets ≥ 100 mean no soft cap; a window at 100% used still backs off |
 | `--pace 0:0,100:100` | Spend at clock rate: the plain `used% < elapsed%` rule, which was the default before |
+| `--pace-codex 0:0,100:100` | Give one provider's windows a curve of their own (`--pace-claude` likewise); the other keeps `--pace`. For an `auto` worker whose two subscriptions should be spent at different rates |
 | `--ignore-quota` | Ignore pacing and transient usage-telemetry outages for an explicit `--agent codex` or `--agent claude`; known hard limits still apply |
 | `--quota-cmd CMD` | Your own pacer, run as `<cmd> <agent>`: the first stdout token is the model to run; empty output means wait |
 
-`TAUCETI_PACE` and `TAUCETI_QUOTA_CMD` set the corresponding controls by
-default. After a Claude window resets, `tauceti` may make one small request to
-start its usage clock, but only after it has found work and confirmed the other
-window has room.
+`TAUCETI_PACE`, `TAUCETI_PACE_CLAUDE`, `TAUCETI_PACE_CODEX` and
+`TAUCETI_QUOTA_CMD` set the corresponding controls by default. Each pacing flag
+overrides only its matching variable: an inherited provider curve still beats
+`--pace`. Use `--pace-claude=` or `--pace-codex=` to return that provider to the
+global curve. Status displays the effective curves. After a Claude
+window resets, `tauceti` may make one small request to start its usage clock,
+but only after it has found work and confirmed the other window has room.
 [The quota notes](docs/quota.md) cover credential sources, the macOS Keychain,
 and that bootstrap in detail.
 
 ## Claude API grants
 
 Use explicit API billing with `--claude-billing api` and `--agent claude`.
+API mode rejects subscription pacing settings, including inherited `TAUCETI_PACE*`
+variables; unset them or pass the matching blank pacing flags to clear them.
 Enable `--budget` to share local grants across workers. The
 [budget design](docs/api-budget-plan.md) covers accounting and recovery.
 

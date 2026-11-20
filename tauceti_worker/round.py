@@ -308,7 +308,7 @@ class Claims:
         os.environ["TAUCETI_CLAIM_SH"] = CLAIM_SH
         if rc == 0:
             self.held = (key, claim_repo)
-            # Keep this scoped to the push arbiter: unrelated agent-invoked claims remain canonical.
+            # The push arbiter keeps this branch lease namespace independently of an agent's target claim.
             os.environ["TAUCETI_CLAIM_REPO"] = claim_repo
             os.environ["TAUCETI_CLAIM_KEY"] = key
             self.ctx.add_cleanup(self.release)

@@ -13,10 +13,15 @@ is free. When the build ends the worker appends a ``build finished, exit N, M er
 the error list and removes the lock. With worker-owned verification, the agent returns after
 scoped checks and the worker runs the final full suite; other callers retain the agent's final
 whole-library build advice. When the build is green and the worker gave it an ``audit`` callable
-(``repair_audit.check``), CI's audits and the changed-module environment lint run before the lock is
+(``repair_audit.check``), staging's audits and lints run before the lock is
 released, and their findings are appended to the error list like compiler errors (``kind`` ``audit`` or
 ``lint``, ``module``, ``file``, ``message``, ``member``, ``commit``). The lock is ``repair_tools``'s, the one the agent's build script takes, and
 the build runs in ``repair_sandbox``'s offline sandbox like every build of the worker.
+
+Lake from v4.37.0-rc1 (https://github.com/leanprover/lean4/pull/16457) fails a module whose source
+file changed while Lean compiled it, which here means the agent edited it under the running build.
+That is no compile error: the list gets a ``kind`` ``rerun`` entry (``module``, ``file``, ``message``,
+no member), kept out of the errors, and the agent is told to rebuild the module with the scoped build.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from tauceti_queue import repair_sandbox, repair_tools
-from tauceti_queue.diagnostics import ANSI, LAKE, SOURCE, STAMP, module_of
+from tauceti_queue.diagnostics import ANSI, LAKE, PATH, SOURCE, STAMP, module_of
 
 BUILD_LOG = "build.log"
 ERRORS_FILE = "errors.jsonl"
@@ -44,20 +49,45 @@ JOB_LINE = re.compile(r"^(?:[✔✖⚠ℹ✓×!]\s*)?\[\d+/\d+\] ")
 LOCATED = re.compile(r"^(?:(?:error|warning|info|trace): )?\S+\.lean:\d+:\d+:")
 PREFIXED = re.compile(r"^(?:error|warning|info|trace|Error|Warning):")
 SUMMARY = ("Some required targets logged failures:", "Build completed", "Build failed", "$ ", "- TauCeti.")
+# Lake's error for a module whose source changed while Lean compiled it (lean4 #16457, in
+# v4.37.0-rc1's ``Module.buildLean``), three lines with the absolute source path in the middle:
+#   error: module source file:
+#      /path/to/worktree/TauCeti/A.lean
+#   changed since build began; rerun the build
+CHANGED_HEAD = "error: module source file:"
+CHANGED_TAIL = "changed since build began; rerun the build"
+RERUN = "rerun"
 
 
 class ErrorParser:
     """Compiler errors of a ``lake build`` log, fed line by line. ``feed`` returns the errors the line
     completes (an error is complete when the next line is not part of its message); ``finish`` closes
-    the last one at the end of the log."""
+    the last one at the end of the log. Lake's "changed since build began" errors are returned as
+    ``kind`` ``rerun`` entries and collected in ``reruns``, not ``errors``; ``root`` (the worktree the
+    build ran in) makes their absolute paths relative."""
 
-    def __init__(self) -> None:
+    def __init__(self, root: Path | None = None) -> None:
         self.errors: list[dict] = []
+        self.reruns: list[dict] = []
         self._open: dict | None = None
         self._seen: set[tuple] = set()
+        self._roots = [] if root is None else list(dict.fromkeys([Path(root), Path(root).resolve()]))
+        self._changed: list[str] | None = None  # the lines after CHANGED_HEAD, while one is being read
 
     def feed(self, raw: str) -> list[dict]:
         line = STAMP.sub("", ANSI.sub("", raw.rstrip("\r\n").lstrip("﻿")))
+        if self._changed is not None:
+            if not self._changed and line.strip():
+                self._changed.append(line.strip())
+                return []
+            path, self._changed = (self._changed or [None])[0], None
+            if path is not None and line.strip() == CHANGED_TAIL:
+                return self._rerun(path)
+            # Not the expected shape: read the line as any other.
+        if line.rstrip() == CHANGED_HEAD:
+            closed = self._close()
+            self._changed = []
+            return closed
         source = SOURCE.match(line) or LAKE.match(line)
         if source and len(source.group(1)) <= 512:
             closed = self._close()
@@ -86,6 +116,27 @@ class ErrorParser:
 
     def finish(self) -> list[dict]:
         return self._close()
+
+    def _rerun(self, printed: str) -> list[dict]:
+        path = printed
+        for root in self._roots:
+            try:
+                path = Path(printed).relative_to(root).as_posix()
+                break
+            except ValueError:
+                continue
+        path = path.removeprefix("./")
+        if ("rerun", path) in self._seen:
+            return []
+        self._seen.add(("rerun", path))
+        entry = {
+            "kind": RERUN,
+            "module": module_of(path) if re.fullmatch(PATH, path) else None,
+            "file": path,
+            "message": f"module source file {path} {CHANGED_TAIL}",
+        }
+        self.reruns.append(entry)
+        return [entry]
 
     def _close(self) -> list[dict]:
         error, self._open = self._open, None
@@ -145,6 +196,7 @@ class StreamingBuild:
         self.ready = threading.Event()
         self.finished = threading.Event()
         self.errors: list[dict] = []
+        self.reruns: list[dict] = []  # modules Lake did not build because their source changed meanwhile
         self.rc: int | None = None
         self.timed_out = False
         self.started_at: float | None = None
@@ -222,6 +274,7 @@ class StreamingBuild:
             "errors_file": str(self.errors_path),
             "errors": len(self.errors),
             "failed_modules": self.failed_modules,
+            "reruns": [e["module"] or e["file"] for e in self.reruns],
             "findings": len(self.findings),
             "audit": self.audit_record,
             "rc": self.rc,
@@ -260,6 +313,11 @@ class StreamingBuild:
                 else "Full audits and lint run in staging."
             ),
             "",
+            f"An entry with `kind` `{RERUN}` is not a compile error: Lake did not build that module because its file "
+            "changed while it was compiling it (an edit made during the build), so its result is unknown; once the "
+            f"lock is free, check it with `{directory}/{repair_tools.BUILD_FILE} --dependents <Module>`, since the "
+            "build also skipped the modules importing it.",
+            "",
             "Start on the modules that have already failed while the build goes on; they are in the error list, and "
             "the running build will not revisit them. Edit only modules that have already failed: a module the build "
             "has not reached yet would be compiled with a half-made edit. Exactly one `lake build` runs at a time: do "
@@ -287,7 +345,7 @@ class StreamingBuild:
     # -- the tail ---------------------------------------------------------------------------------
 
     def _tail(self) -> None:
-        parser = ErrorParser()
+        parser = ErrorParser(root=self.worktree)
         process = self._process
         assert process is not None
         deadline = None if self.timeout is None else time.monotonic() + self.timeout
@@ -342,8 +400,11 @@ class StreamingBuild:
         with self._lock:
             with self.errors_path.open("a") as handle:
                 for error in errors:
-                    error.update(self._owner(error["file"]))
-                    self.errors.append(error)
+                    if error.get("kind") == RERUN:  # an edit during the build, not a member's error
+                        self.reruns.append(error)
+                    else:
+                        error.update(self._owner(error["file"]))
+                        self.errors.append(error)
                     handle.write(json.dumps(error) + "\n")
         self.ready.set()
 
@@ -405,6 +466,9 @@ class StreamingBuild:
             count = len(self.errors)
             found = len(self.findings)
             suffix = f", {found} audit or lint finding{'s' if found != 1 else ''}" if found else ""
+            reruns = len(self.reruns)
+            if reruns:
+                suffix += f", {reruns} module{'s' if reruns != 1 else ''} to rerun (changed during the build)"
             try:
                 with self.errors_path.open("a") as handle:
                     handle.write(
@@ -414,6 +478,7 @@ class StreamingBuild:
                                 "exit": rc,
                                 "errors": count,
                                 **({"findings": found} if found else {}),
+                                **({"reruns": reruns} if reruns else {}),
                                 "timed_out": self.timed_out,
                                 "message": f"build finished, exit {rc}, {count} error{'s' if count != 1 else ''} total"
                                 + suffix,
