@@ -2122,7 +2122,10 @@ class LongPrompt(Fixture):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["prompt_via"], "stdin")
         self.assertGreater(calls[0]["prompt_chars"], PROMPT_ARGV_LIMIT)
-        self.assertTrue(calls[0]["prompt"].endswith("x" * 99 + "\n"), "the whole prompt arrived, in order")
+        self.assertTrue(
+            calls[0]["prompt"].endswith("x" * 99 + "\n" + repair_task.HANDOFF_INSTRUCTION),
+            "the whole prompt arrived, in order",
+        )
         self.assertIn(repair.AGENT_INSTRUCTION, calls[0]["prompt"])
         self.assertEqual(calls[0]["argv"][:3], ["-p", "--output-format", "stream-json"])
         self.assertEqual(len(self.service.results), 1)
@@ -2250,7 +2253,10 @@ class Providers(Fixture):
         self.assertEqual([c["agent"] for c in calls], ["codex"])
         self.assertEqual(calls[0]["prompt_via"], "stdin")
         self.assertEqual(calls[0]["argv"][-2:], ["--skip-git-repo-check", "-"])
-        self.assertTrue(calls[0]["prompt"].endswith("x" * 99 + "\n"), "the whole prompt arrived, in order")
+        self.assertTrue(
+            calls[0]["prompt"].endswith("x" * 99 + "\n" + repair_task.HANDOFF_INSTRUCTION),
+            "the whole prompt arrived, in order",
+        )
 
     def test_a_rate_limited_subscription_is_skipped(self):
         self.statuses["claude"] = (False, "session ahead of pace (70% elapsed: used 61% > 55% pace budget), 39% left")
