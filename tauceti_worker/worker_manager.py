@@ -2186,7 +2186,9 @@ def slice_limits(requested: dict[str, str | None]) -> dict[str, str]:
             continue
         if value == "":
             limits.pop(key, None)
-        elif _SLICE_LIMIT_SYNTAX[key].fullmatch(value):
+        elif _SLICE_LIMIT_SYNTAX[key].fullmatch(value) and (
+            value == "infinity" or float(value.rstrip("%KMGTPE")) > 0  # systemd ignores a zero limit
+        ):
             limits[key] = value
         else:
             raise WorkersError(f"--{option.replace('_', '-')} {value!r} is not a systemd {key}= value")

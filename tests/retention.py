@@ -850,6 +850,10 @@ class Retention(unittest.TestCase):
                 install(cpu_quota="32 cores")
             with self.assertRaisesRegex(worker_manager.WorkersError, "MemoryMax"):
                 install(memory_max="101%")
+            for option in ("cpu_quota", "memory_high", "memory_max"):
+                for zero in ("0%", "0", "0.0%"):
+                    with self.assertRaises(worker_manager.WorkersError):
+                        install(**{option: zero})
             self.assertEqual(install(cpu_quota="12.5%", memory_high="1.5G", memory_max="12.5%"), 0)
             self.assertIn("CPUQuota=12.5%\nMemoryHigh=1.5G\nMemoryMax=12.5%\n", unit.read_text())
             # An installed value is kept as written, never silently dropped.
