@@ -417,7 +417,22 @@ def serialize(data) -> str:
     return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def build_batch(repo: Path, from_sha: str, main: str, shas: list[str]) -> dict:
+    """The exact inspection input for the next consecutive first-parent commits after `from_sha`.
+
+    Every batch is built here, whether planned from the cursor or split from a larger range:
+    a nonempty run of exactly the next commits on main's first-parent history, each with its
+    complete before/after file images and diff. Inputs from different attempts are never combined.
+    """
+    if not shas or validate_history(repo, from_sha, main)[: len(shas)] != list(shas):
+        raise Die("security-audit: a batch must be the next consecutive first-parent commits")
+    data = {"from_sha": from_sha, "main_sha": main, "commits": [commit_input(repo, sha) for sha in shas]}
+    data["input_digest"] = hashlib.sha256(serialize(data).encode()).hexdigest()
+    return data
+
+
 def plan_batch(repo: Path, cursor: str, main: str) -> dict:
+    """The next batch from `cursor`: at most MAX_COMMITS commits within the MAX_BYTES workload target."""
     commits = []
     for sha in validate_history(repo, cursor, main)[:MAX_COMMITS]:
         try:
@@ -436,9 +451,7 @@ def plan_batch(repo: Path, cursor: str, main: str) -> dict:
         commits.append(item)
     if not commits:
         raise NoProgress("security-audit: cursor is caught up with main")
-    data = {"from_sha": cursor, "main_sha": main, "commits": commits}
-    data["input_digest"] = hashlib.sha256(serialize(data).encode()).hexdigest()
-    return data
+    return build_batch(repo, cursor, main, [c["sha"] for c in commits])
 
 
 def validate_verdict(value, batch: dict) -> dict:

@@ -17,7 +17,7 @@ from tauceti_worker import audit_clients as clients
 from tauceti_worker import audit_pool as pool
 from tauceti_worker import security_audit as sa
 from tauceti_worker.audit_evidence import NotJudged, Unreadable
-from tauceti_worker.config import NoProgress
+from tauceti_worker.config import Die, NoProgress
 
 
 class PoolFixture(unittest.TestCase):
@@ -408,8 +408,10 @@ class Restart(PoolFixture):
             body = {k: v for k, v in batch.items() if k != "input_digest"}
             batch["input_digest"] = sa.hashlib.sha256(sa.serialize(body).encode()).hexdigest()
         p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
-        slot = pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex", credential="subscription")
-        p.persist(slot)
+        p.slots = [
+            pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex", credential="subscription")
+        ]
+        p.persist()
 
     def test_identical_persisted_pass_is_reused(self):
         self.persisted()
@@ -565,60 +567,77 @@ class OwnJournal(PoolFixture):
         self.serve(inspect)
         self.assertEqual(len(self.advanced), 3)
 
-    def test_restart_with_an_earlier_pool_journal_at_the_cursor_inspects_afresh(self):
+
+class DurableRanges(PoolFixture):
+    """The ordered list of active ranges survives a restart, including ranges that were running."""
+
+    def interrupted(self, evidence=()):
+        """Persist a window whose head was running when the pool stopped, with this evidence."""
+        p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
+        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
+        attempt = self.state / "attempt-1"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        if evidence:
+            (attempt / "execution.json").write_text(
+                sa.serialize({"argv": ["claude", "-p"], "paged": False, "protocol_version": 4})
+            )
+            (attempt / "model-transcript.jsonl").write_text("".join(sa.serialize(row) + "\n" for row in evidence))
+        p.slots = [pool.Slot(batch, status="running", attempts=[str(attempt)], provider="codex")]
+        p.persist()
+        return batch
+
+    def test_a_finding_in_an_interrupted_attempt_binds_after_restart(self):
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        batch = self.interrupted([{"type": "assistant", "message": {"content": [use]}}])
+        self.serve(lambda b, a: self.verdict(b), stop=lambda p: not p.running and p.slots[0].status == "blocked")
+        self.assertNotIn(0, self.calls)
+        self.assertEqual(self.advanced, [])
+        rows = [r for r in self.ledger() if r.get("batch") == batch["input_digest"] and "verdict" in r]
+        self.assertEqual([r["verdict"]["findings"] for r in rows], [["IO"]])
+        self.assertIn("IO", json.loads((self.state / "blocked.json").read_text())["reason"])
+
+    def test_an_interrupted_attempt_without_a_concern_is_retried(self):
+        self.interrupted()
+        self.serve(lambda b, a: self.verdict(b))
+        self.assertEqual(self.calls.count(0), 1)
+        self.assertEqual(len(self.advanced), 3)
+        self.assertTrue(any("interrupted when the pool stopped" in r.get("reason", "") for r in self.ledger()))
+
+    def test_retry_state_and_reviewer_survive_a_restart(self):
         def first(batch, attempt):
             if self.index(batch) == 0:
-                (self.state / "blocked.json").write_text(
-                    sa.serialize(
-                        {
-                            "from_sha": batch["from_sha"],
-                            "to_sha": batch["commits"][-1]["sha"],
-                            "attempt": str(attempt),
-                            "reason": "security-audit: operational recovery interrupted",
-                        }
-                    )
-                )
                 raise NotJudged("security-audit: reviewer failed")
             return self.verdict(batch)
 
         with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
             self.serve(first, stop=lambda p: not p.running and p.slots[0].failures == 1)
+        saved = json.loads((self.state / "pool" / pool.RANGES).read_text())["ranges"]
+        self.assertEqual([r["status"] for r in saved], ["planned", "pass", "pass"])
+        self.assertEqual((saved[0]["failures"], saved[0]["provider"]), (1, "codex"))
         self.launches.clear()
+        self.calls.clear()
         self.serve(lambda batch, attempt: self.verdict(batch))
-        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], ["codex"])
+        self.assertEqual(self.calls, [0])  # Only the unfinished range is inspected again.
         self.assertEqual(len(self.advanced), 3)
-        self.assertTrue(list(self.state.glob("superseded-by-pool-block-*.json")))
+        self.assertEqual(json.loads((self.state / "pool" / pool.RANGES).read_text())["ranges"], [])
 
-    def test_restart_with_an_earlier_journal_whose_attempt_recorded_a_finding_holds(self):
-        def first(batch, attempt):
-            if self.index(batch) == 0:
-                (self.state / "blocked.json").write_text(
-                    sa.serialize(
-                        {
-                            "from_sha": batch["from_sha"],
-                            "to_sha": batch["commits"][-1]["sha"],
-                            "attempt": str(attempt),
-                            "reason": "security-audit: operational recovery interrupted",
-                        }
-                    )
-                )
-                use = {
-                    "type": "tool_use",
-                    "name": "StructuredOutput",
-                    "input": {"verdict": "finding", "findings": ["IO"]},
-                }
-                (attempt / "model-transcript.jsonl").write_text(
-                    sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
-                )
-                raise NotJudged("security-audit: killed before classification")
-            return self.verdict(batch)
+    def test_unreadable_ranges_hold_rather_than_replan(self):
+        (self.state / "pool").mkdir()
+        (self.state / "pool" / pool.RANGES).write_text("{not json")
+        p = pool.Pool(self.state, parallel=1, chooser=pool.Chooser(None))
+        with self.assertRaisesRegex(NoProgress, "cannot be restored"):
+            p.sync(self.shas[0], self.shas[-1])
+        self.assertEqual(p.slots, [])
 
-        with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
-            self.serve(first, stop=lambda p: not p.running and p.slots[0].failures == 1)
-        self.launches.clear()
-        self.serve(lambda batch, attempt: self.verdict(batch), stop=lambda p: not p.running)
-        self.assertEqual([p for i, p, _, _ in self.launches if i == 0], [])
-        self.assertEqual(self.advanced, [])
+    def test_build_batch_accepts_only_the_next_consecutive_commits(self):
+        whole = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        self.assertEqual(whole, sa.plan_batch(self.repo, self.shas[0], self.shas[-1]))
+        right = sa.build_batch(self.repo, self.shas[1], self.shas[-1], self.shas[2:3])
+        self.assertEqual(right["commits"], whole["commits"][1:])
+        for start, shas in ((self.shas[0], []), (self.shas[0], self.shas[2:3]), (self.shas[1], self.shas[1:2])):
+            with self.subTest(shas=shas), self.assertRaises(Die):
+                sa.build_batch(self.repo, start, self.shas[-1], shas)
 
 
 class Lookahead(PoolFixture):

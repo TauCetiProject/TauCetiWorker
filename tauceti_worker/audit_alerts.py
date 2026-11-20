@@ -73,6 +73,8 @@ def save(path: Path, value: dict) -> None:
     try:
         with os.fdopen(fd, "w") as stream:
             stream.write(json.dumps(value, sort_keys=True))
+            stream.flush()
+            os.fsync(stream.fileno())  # Durable before it replaces the old state, not only atomic.
         temporary.chmod(0o600)
         temporary.replace(path)
     except BaseException:
