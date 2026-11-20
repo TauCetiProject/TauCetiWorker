@@ -111,15 +111,45 @@ class Storage(unittest.TestCase):
 
     def test_a_walk_past_the_deadline_defers_and_deletes_nothing(self):
         old = self.entry(age=4 * 86400)
-        with patch.object(storage, "INVENTORY_CHECK_EVERY", 1):
-            with self.assertRaises(storage.InventoryDeferred):
-                storage.inventory([self.pool], deadline=time.monotonic() - 1)
-            result = storage.collect([], deadline=time.monotonic() - 1)
+        with self.assertRaises(storage.InventoryDeferred):
+            storage.inventory([self.pool], deadline=time.monotonic() - 1)
+        result = storage.collect([], deadline=time.monotonic() - 1)  # a small pool, default interval
         self.assertEqual(result["deferred"], ["shared-caches"])
         self.assertEqual(result["removed"], [])
         self.assertTrue(old.exists())
         self.assertFalse(storage.collect([], deadline=time.monotonic() + 600).get("deferred"))
         self.assertFalse(old.exists())
+
+    def test_overlapping_roots_still_count_each_file_once(self):
+        outer = self.root / "outer"
+        inner = outer / "inner"
+        inner.mkdir(parents=True)
+        (inner / "single").write_bytes(b"s" * 8192)
+        details, private = {}, {}
+        totals = storage.inventory(
+            [outer, inner], protected={inner}, owners={outer: "w1"}, details=details, private=private
+        )
+        info = (inner / "single").stat()
+        row = totals[info.st_dev]
+        self.assertEqual(row["managed_bytes"], info.st_blocks * 512)
+        self.assertEqual(row["unique_inodes"], 1)
+        self.assertEqual(row["named_bytes"], 2 * info.st_blocks * 512)
+        self.assertEqual(row["protected_bytes"], info.st_blocks * 512)
+        self.assertTrue(details[(info.st_dev, info.st_ino)][3])  # protected through the inner root
+        self.assertEqual(private, {})
+
+    def test_a_directory_swapped_for_a_link_mid_walk_is_not_followed(self):
+        root, outside = self.root / "walked", self.root / "outside"
+        (root / "sub").mkdir(parents=True)
+        (root / "file").write_bytes(b"f" * 4096)
+        outside.mkdir()
+        (outside / "foreign").write_bytes(b"x" * 4096)
+        walk = storage._scan(root, storage._Clock(None))
+        first = next(walk)  # the root's own listing; sub/ is opened only afterwards
+        (root / "sub").rmdir()
+        (root / "sub").symlink_to(outside)
+        rest = list(walk)
+        self.assertEqual([info.st_ino for info in [first, *rest]], [(root / "file").stat().st_ino])
 
     def test_age_cleanup_keeps_recent_and_busy_entries(self):
         recent = self.entry()

@@ -71,31 +71,80 @@ class InventoryDeferred(Exception):
 INVENTORY_CHECK_EVERY = 4096  # entries between deadline checks: cheap, yet well under a second
 
 
-def _scan(root, deadline):
+class _Clock:
+    """One deadline counter for a whole inventory, across every root it walks."""
+
+    def __init__(self, deadline):
+        self.deadline, self.entries = deadline, 0
+
+    def check(self, *, now=False):
+        self.entries += 1
+        if (now or self.entries % INVENTORY_CHECK_EVERY == 0) and self.deadline is not None:
+            if time.monotonic() >= self.deadline:
+                raise InventoryDeferred("inventory deadline")
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _scan(root, clock):
     """Every non-directory, non-symlink entry under ``root`` with its lstat, never following links.
 
-    One lstat per entry (scandir caches it). Unreadable or vanished directories are skipped, as
-    os.walk did. Raises InventoryDeferred once ``deadline`` (time.monotonic) has passed."""
-    pending, visited = [root], 0
+    One lstat per entry (scandir caches it). A directory is opened without following a final
+    symbolic link and must still be the inode that was queued, so one swapped for a link meanwhile
+    is skipped. A directory that cannot be opened or listed is skipped, as os.walk does; a failing
+    stat of an entry other than a vanished one propagates rather than leave a silent gap."""
+    try:
+        info = os.lstat(root)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    pending = [(str(root), info.st_dev, info.st_ino)]
     while pending:
+        path, device, inode = pending.pop()
         try:
-            with os.scandir(pending.pop()) as entries:
-                for entry in entries:
-                    visited += 1
-                    if visited % INVENTORY_CHECK_EVERY == 0 and deadline is not None and time.monotonic() >= deadline:
-                        raise InventoryDeferred(str(root))
+            descriptor = os.open(path, _DIRECTORY_FLAGS)
+        except OSError:
+            continue
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (device, inode):
+                continue  # replaced since it was queued
+            try:
+                entries = os.scandir(descriptor)
+            except OSError:
+                continue
+            with entries:
+                while True:
                     try:
-                        info = entry.stat(follow_symlinks=False)
+                        entry = next(entries)
+                    except StopIteration:
+                        break
+                    except OSError:
+                        break  # an unreadable listing: skip the rest of it, as os.walk does
+                    clock.check()
+                    try:
+                        found = entry.stat(follow_symlinks=False)
                     except FileNotFoundError:
                         continue
-                    if stat.S_ISLNK(info.st_mode):
+                    if stat.S_ISLNK(found.st_mode):
                         continue
-                    if stat.S_ISDIR(info.st_mode):
-                        pending.append(entry.path)
+                    if stat.S_ISDIR(found.st_mode):
+                        pending.append((os.path.join(path, entry.name), found.st_dev, found.st_ino))
                     else:
-                        yield info
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
-            continue
+                        yield found
+        finally:
+            os.close(descriptor)
+
+
+def _overlapping(roots):
+    """Whether any walked root lies inside another, so one name can be reached twice."""
+    resolved = sorted({os.path.realpath(root) for root in roots})
+    return any(
+        later == earlier or later.startswith(earlier.rstrip(os.sep) + os.sep)
+        for earlier, later in zip(resolved, resolved[1:], strict=False)
+    )
 
 
 def inventory(paths, *, protected=(), owners=None, details=None, private=None, deadline=None):
@@ -106,12 +155,18 @@ def inventory(paths, *, protected=(), owners=None, details=None, private=None, d
     `unique_inodes` is how many inodes that is.
 
     Memory stays bounded by the hard-linked inodes: a file with one link has one name, so it is
-    totalled at once and never remembered. ``details`` receives only inodes with several links,
-    as [bytes, names seen, links, protected, {owner: names}]. ``private`` receives, per
-    (device, owner), the bytes of that owner's unprotected single-link files. Raises
-    InventoryDeferred once ``deadline`` (time.monotonic) has passed."""
+    totalled at once and never remembered, unless the roots overlap and that name can be reached
+    twice. ``details`` receives the remembered inodes as
+    [bytes, names seen, links, protected, {owner: names}]. ``private`` receives, per
+    (device, owner), the bytes of that owner's unprotected single-link files that were not
+    remembered. Raises InventoryDeferred once ``deadline`` (time.monotonic) has passed, checked
+    before, during and after the walk."""
     seen, result = {}, {}
     owners = owners or {}
+    clock = _Clock(deadline)
+    clock.check(now=True)
+    roots = [root for root in paths if root.is_dir() and not root.is_symlink()]
+    remember_all = _overlapping(roots)
 
     def row(device):
         return result.setdefault(
@@ -119,13 +174,11 @@ def inventory(paths, *, protected=(), owners=None, details=None, private=None, d
             dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0, named_bytes=0, unique_inodes=0),
         )
 
-    for root in paths:
-        if not root.is_dir() or root.is_symlink():
-            continue
+    for root in roots:
         busy, owner = root in protected, owners.get(root)
-        for info in _scan(root, deadline):
+        for info in _scan(root, clock):
             size = info.st_blocks * 512
-            if info.st_nlink <= 1:
+            if info.st_nlink <= 1 and not remember_all:
                 totals = row(info.st_dev)
                 totals["managed_bytes"] += size
                 totals["named_bytes"] += size
@@ -145,6 +198,7 @@ def inventory(paths, *, protected=(), owners=None, details=None, private=None, d
             if owner is not None:
                 labels = seen[key][4]
                 labels[owner] = labels.get(owner, 0) + 1
+    clock.check(now=True)
     if details is not None:
         details.update(seen)
     for (device, _), (size, count, links, busy, _) in seen.items():
@@ -293,6 +347,15 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
         if path.is_file() and not path.is_symlink():
             candidates.append((path, path, "mathlib-" + path.name))
     remaining = before.get(pool_device, {}).get("managed_bytes", 0)
+    protected_roots = [os.path.realpath(path) + os.sep for path in protected]
+
+    def held(path, info):
+        """Protected: in a protected root by any name. A single-link file has only this name."""
+        row = details.get((info.st_dev, info.st_ino))
+        if row is not None:
+            return row[3]
+        return (os.path.realpath(path) + os.sep).startswith(tuple(protected_roots))
+
     removed_bytes = {device: 0 for device in devices}
 
     def stamp(candidate):
@@ -321,7 +384,7 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
                 )
                 payload = [p for p in names if p.is_file() and p.name != "entry.json"]
                 infos = [p.stat() for p in payload]
-                if not disposable_stage and any(details.get((i.st_dev, i.st_ino), [0, 0, 0, False])[3] for i in infos):
+                if not disposable_stage and any(held(p, i) for p, i in zip(payload, infos, strict=True)):
                     note(report, "protected", str(entry))
                     continue
                 # Pool-only bundles are linked only by pool names: the entry alias, the legacy
