@@ -191,6 +191,7 @@ class TaskMember:
     withdrawn: bool = False  # already withdrawn that way: it stays an empty commit
     declaration_names: dict = dataclasses.field(default_factory=dict)
     source_identity: str | dict = ""
+    large_refactor: bool = False  # an admin's label lifts the review-size caps for its commit
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -312,6 +313,7 @@ class Task:
                     source_identity=raw.get("source_identity", "")
                     if binding is not None or mixed_binding is not None
                     else "",
+                    large_refactor=raw.get("large_refactor") is True,
                 )
             )
         extra = dict(data.get("extra") or {})
@@ -389,6 +391,11 @@ class Task:
     @property
     def member_keys(self) -> list[str]:
         return [m.source_pr for m in self.members]
+
+    @property
+    def large_refactor_heads(self) -> frozenset[tuple]:
+        """``(number, accepted_head)`` of the members whose review-size caps an admin's label lifts."""
+        return frozenset((m.number, m.accepted_head) for m in self.members if m.large_refactor)
 
     @property
     def validation_base(self) -> str:
@@ -1584,6 +1591,7 @@ def prompt_context(
                 "landed_externally": getattr(m, "landed_externally", None),
                 "no_repair": m.no_repair,
                 "withdrawn": m.withdrawn,
+                "large_refactor": m.large_refactor,
             }
             for m in task.members
         ],
@@ -2634,7 +2642,13 @@ def _run_task(
             tip = git(worktree, "rev-parse", "HEAD").strip()
             git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
             report = repair.chain_report(
-                cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                cfg.clone,
+                task.validation_base,
+                task.tip,
+                tip,
+                task.member_keys,
+                prior_base=task.base,
+                large_refactors=task.large_refactor_heads,
             )
             if report["ok"] and report["unexplained"] and not cancel.is_set():
                 follow = run_repair_agent(
@@ -2664,7 +2678,13 @@ def _run_task(
                 tip = git(worktree, "rev-parse", "HEAD").strip()
                 git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
                 report = repair.chain_report(
-                    cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                    cfg.clone,
+                    task.validation_base,
+                    task.tip,
+                    tip,
+                    task.member_keys,
+                    prior_base=task.base,
+                    large_refactors=task.large_refactor_heads,
                 )
             report["dirty"] = bool(git(worktree, "status", "--porcelain", "--untracked-files=no").strip())
             report["unchanged"] = tip == task.tip

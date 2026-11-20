@@ -5252,6 +5252,54 @@ class Records(unittest.TestCase):
         self.assertFalse(short["ok"])
         self.assertTrue(any("unknown-member" in p for p in short["problems"]))
 
+    def test_an_admin_labelled_large_refactor_member_is_measured_without_the_size_caps(self):
+        root = Path(tempfile.mkdtemp(prefix="large-refactor-", dir=TMP))
+        content = Content(root)
+        seed = root / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", content.base)
+        chain = repair.read_chain(seed, content.base, content.tip)
+        for commit_ in chain:
+            sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
+            if commit_.pr == 2:
+                for index in range(3):
+                    lines = "".join(f"theorem r{index}_{i} : True := trivial\n" for i in range(700))
+                    (seed / "TauCeti" / f"Refactor{index}.lean").write_text(lines)
+                sh(seed, "add", "-A")
+                sh(seed, "commit", "--quiet", "--amend", "--no-edit")
+        tip = sh(seed, "rev-parse", "HEAD")
+        members = [m["source_pr"] for m in content.members]
+        capped = repair.chain_report(seed, content.base, content.tip, tip, members)
+        [entry] = capped["review_size"]
+        self.assertIn("too large to review", entry["violations"][0])
+        head = content.members[1]["accepted_head"]
+        exempt = repair.chain_report(seed, content.base, content.tip, tip, members, large_refactors={(2, head)})
+        self.assertEqual(exempt["review_size"], [])
+        other = repair.chain_report(seed, content.base, content.tip, tip, members, large_refactors={(3, head)})
+        self.assertEqual(len(other["review_size"]), 1)
+
+        # The task member's flag reaches the agent's check script through the listings.
+        raw = content.task(1)
+        raw["members"][1]["large_refactor"] = True
+        task = repair_task.Task.from_json({**raw, "claim_token": "x", "expires_at": time.time() + 60})
+        self.assertEqual(task.large_refactor_heads, frozenset({(2, head)}))
+        listings = repair.listings_path(seed)
+        repair.compose_prompt(
+            repair_task.prompt_context(task, None, listings=listings),
+            repair_task.task_findings(task),
+            repair.read_chain(seed, content.base, tip),
+            seed,
+        )
+        check = listings.parent / "check"
+
+        def run(*args: str) -> tuple[int, str]:
+            result = subprocess.run([sys.executable, str(check), *args], cwd=seed, text=True, capture_output=True)
+            return result.returncode, result.stdout.strip()
+
+        self.assertEqual(run(), (0, "ok"))
+        second = sh(seed, "rev-list", "--reverse", f"{content.base}..HEAD").split()[1]
+        rc, measured = run("--size", second)
+        self.assertEqual((rc, json.loads(measured)["large_refactor"]), (0, True))
+
     def test_the_review_size_policy_measures_each_commit_against_its_parent_and_accepts_a_split(self):
         root = Path(tempfile.mkdtemp(prefix="review-size-", dir=TMP))
         content = Content(root)
