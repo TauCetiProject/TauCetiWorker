@@ -1,7 +1,9 @@
 """Bound idle repair pools to recent, reusable Lake snapshots.
 
-The root lease covers attempts and background publishers. Collection never runs with a
-worktree present, including attempts started before cache leases were introduced.
+The root lease covers attempts and background publishers. Collection never runs with a task
+worktree present, including attempts started before cache leases were introduced. Parked batch
+trees do not hold it back: they keep their own links to (or copies of) their outputs, and Lake
+promotes a collected output back into the pool from the tree.
 """
 
 from __future__ import annotations
@@ -149,6 +151,10 @@ def _busy(store, root: Path, now: float, *, cache_root: Path | None = None) -> b
     if trees.is_symlink():
         return True
     for tree in trees.iterdir() if trees.exists() else ():
+        if re.fullmatch(r"batch-[1-9][0-9]*", tree.name):
+            # A parked batch tree (repair_cleanup) runs nothing; a task moves it to its own path, under
+            # the cache lease, before using it.
+            continue
         match = re.fullmatch(r"task-([1-9][0-9]*)(?:-[A-Za-z0-9_.-]+)?", tree.name)
         if not match or _uses_cache(root, match[1], cache_root):
             return True

@@ -1051,15 +1051,16 @@ def run_agent_host(
     session_scope=None,
     quota_cfg=None,
     cache_note: bool = True,
-    queue_mathlib: bool = False,
+    host_caches: bool = True,
 ) -> int:
     """``cache_note=False`` leaves out the build-cache appendix (fetch commands and the
     ``TAUCETI_PR_CACHE_MISS`` stop rule): the queue's repair worker warms the tree itself and its own
     prompt tells the agent not to fetch, and a queue head's tip is never in the public cache.
 
-    ``queue_mathlib=True`` is only for the queue's repair service, whose own sandboxed builds run
-    outside any shared view on a Mathlib it prepares itself; moving that producer onto the shared
-    layout is a later step. Worker rounds never pass it."""
+    ``host_caches=False`` is only for the queue's repair service: its worker prepares the checkout
+    (Mathlib, the TauCeti outputs, or a batch tree already built) before the first round, and its
+    sandboxed builds use its own artifact pool. The round then runs with no host cache preparation
+    and no canonical-store passes. Worker rounds never pass it."""
     global _LAST_AGENT_FAILURE
     profile = _authoring_profile(profile)
     if (
@@ -1133,9 +1134,15 @@ def run_agent_host(
     _LAST_AGENT_FAILURE = None
     from . import round_storage
 
-    # Worker rounds wait for a cache with their dependencies; the queue's repair service builds its own.
-    cache_options = {"queue_mathlib": True} if queue_mathlib else {"cache_wait": True}
-    with host_build_cache_context(cwd, env, logdir, **cache_options) as prefix:
+    # Worker rounds wait for a cache with their dependencies; the queue's repair service prepares its own.
+    if host_caches:
+        caches = host_build_cache_context(cwd, env, logdir, cache_wait=True)
+    else:
+        from .build_resources import defaults
+
+        defaults(env)
+        caches = contextlib.nullcontext(None)
+    with caches as prefix:
         if not cache_note:
             env.pop("TAUCETI_PR_CACHE_MISS", None)  # the convention belongs to the appendix left out
         rc = run_agent_proc(
@@ -1158,9 +1165,9 @@ def run_agent_host(
             record_result(env, rc)
         # H2: the agent's process group has been reaped, so no Lake can be writing the checkout.
         # Exit 70 is the guardian's "child lifetime cleanup incomplete": no quiescent boundary.
-        if rc == 70:
+        if host_caches and rc == 70:
             log("canonical store (round-end): agent cleanup incomplete; relinking left for the next round")
-        else:
+        elif host_caches:
             relink_build_outputs(cwd, env, phase="round-end")
     if rc == 75:
         from .claude_api import blocked_reason
@@ -1633,9 +1640,7 @@ def lake_cache_max_revs(env: dict) -> str:
 
 
 @contextlib.contextmanager
-def host_build_cache_context(
-    cwd: Path, env: dict, logdir: Path, *, queue_mathlib: bool = False, cache_wait: bool = False
-):
+def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, cache_wait: bool = False):
     """Keep the public service available through repairs, merges and dependency changes.
 
     ``cache_wait=True`` (worker agent rounds) raises BuildCacheWait instead of starting on a
@@ -1650,22 +1655,16 @@ def host_build_cache_context(
     from . import shared_mathlib
 
     def mathlib_view():
-        if queue_mathlib:
-            # The queue repair service's checkout keeps the Mathlib it prepares (see run_agent_host).
-            return contextlib.nullcontext([])
         return shared_mathlib.view(cwd, env, logdir, _cache_fetch)
 
     from .build_cache_wait import ENABLE
 
-    if queue_mathlib:
-        env["TAUCETI_QUEUE_MATHLIB"] = "1"
     if cache_wait:
         env[ENABLE] = "1"
     try:
         with _host_build_cache_context(cwd, env, logdir, mathlib_view) as prefix:
             yield prefix
     finally:
-        env.pop("TAUCETI_QUEUE_MATHLIB", None)
         env.pop(ENABLE, None)
 
 
@@ -1946,11 +1945,9 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
         # `lake exe cache get` inside the view re-extracts every archive, and each new file lands in
         # this checkout's private overlay upper: a full private copy under a "shared" round.
         log("host build caches: Mathlib and its dependencies come from the shared build; not fetching them")
-    elif env.get("TAUCETI_QUEUE_MATHLIB") != "1":
+    else:
         # Sharing is the only way a round gets Mathlib; a private `cache get` is a private copy.
         unavailable("this workspace needs Mathlib but has no shared Mathlib view")
-    elif fetch("Mathlib", ["lake", "exe", "cache", "get"]) == "workspace-error":
-        return  # the queue repair service's own Mathlib, until that producer shares too
     # Mathlib itself knows which compressed archives the selected dependency tree
     # needs. Prune stale private links daily so pool GC can actually release them;
     # otherwise the old promote/hydrate-all exchange resurrects dead archives forever.

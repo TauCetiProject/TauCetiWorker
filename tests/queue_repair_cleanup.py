@@ -271,6 +271,62 @@ class Cleanup(unittest.TestCase):
             self.assertEqual(self.collect()[0]["state"], "error")
         self.assertEqual(self.collect()[0]["state"], "removed")
 
+    # A task's tree is parked as its batch's tree and the batch's next task takes it whole.
+    def test_park_then_adopt_keeps_lake_and_resets_worker_state(self):
+        path = self.tree(1, batch="head")
+        (path / ".lake/build").mkdir(parents=True)
+        (path / ".lake/build/M.olean").write_text("built")
+        (path / ".lake/outputs.jsonl").write_text("previous map")
+        (path / ".tauceti-repair").mkdir()
+        (path / ".tauceti-repair/build.lock").mkdir()
+        (path / ".tauceti-repair/errors.jsonl").write_text("{}")
+        head = self.git("rev-parse", "HEAD").strip()
+        self.assertEqual(cleanup.retire(self.clone, self.worker, "1", 1, path, keep=True), "parked")
+        parked = self.worker / "worktrees/batch-1"
+        self.assertFalse(path.exists())
+        self.assertTrue((parked / ".lake/build/M.olean").exists())
+        self.assertEqual(json.loads((parked / ".lake/tauceti-batch-tree.json").read_text()), {"task_id": "1"})
+        target = self.worker / "worktrees/task-2"
+        self.assertEqual(cleanup.adopt(self.clone, self.worker, "1", target), head)
+        self.assertFalse(parked.exists())
+        self.assertEqual((target / ".lake/build/M.olean").read_text(), "built")
+        self.assertFalse((target / ".lake/outputs.jsonl").exists())
+        self.assertFalse((target / ".tauceti-repair").exists())
+        self.assertIn(str(target), self.git("worktree", "list", "--porcelain"))
+        self.assertIsNone(cleanup.adopt(self.clone, self.worker, "1", self.worker / "worktrees/task-3"))
+
+    def test_unprepared_trees_and_second_trees_of_a_batch_are_removed(self):
+        first, second, third = (self.tree(n) for n in (1, 2, 3))
+        self.assertEqual(cleanup.retire(self.clone, self.worker, "9", 1, first, keep=False), "removed")
+        self.assertEqual(cleanup.retire(self.clone, self.worker, "9", 2, second, keep=True), "parked")
+        self.assertEqual(cleanup.retire(self.clone, self.worker, "9", 3, third, keep=True), "removed")
+        self.assertEqual(cleanup.retire(self.clone, self.worker, "", 3, third, keep=True), "removed")
+        self.assertEqual(sorted(p.name for p in (self.worker / "worktrees").iterdir()), ["batch-9"])
+
+    def test_a_parked_tree_being_adopted_is_not_collected(self):
+        cleanup.retire(self.clone, self.worker, "1", 1, self.tree(1, batch="landed"), keep=True)
+        with cleanup.worktree_lease(self.worker, "batch-1"):  # what adoption holds while it renames
+            self.assertEqual(self.collect()[0]["state"], "busy")
+        self.assertEqual(self.collect()[0]["state"], "removed")
+
+    def test_a_tree_is_never_moved_into_an_existing_parked_tree(self):
+        first, second = self.tree(1), self.tree(2)
+        cleanup.retire(self.clone, self.worker, "9", 1, first, keep=True)
+        parked = self.worker / "worktrees/batch-9"
+        with self.assertRaises(OSError):
+            cleanup._move(self.clone, second, parked)  # what a racing second publisher would attempt
+        self.assertTrue(second.is_dir())
+        self.assertEqual(sorted(p.name for p in parked.iterdir()), [".git", ".lake"])
+
+    def test_parked_trees_are_collected_when_their_batch_is_finished(self):
+        for task_id, batch in ((1, "landed"), (2, "removed"), (3, "open")):
+            cleanup.retire(self.clone, self.worker, str(task_id), task_id, self.tree(task_id, batch=batch), keep=True)
+        unrecorded = self.worker / "worktrees/batch-4"
+        self.git("worktree", "add", "--detach", str(unrecorded), "HEAD")
+        rows = {row["batch_id"]: row["state"] for row in self.collect()}
+        self.assertEqual(rows, {1: "removed", 2: "removed", 3: "unfinished", 4: "unknown"})
+        self.assertEqual(sorted(p.name for p in (self.worker / "worktrees").iterdir()), ["batch-3", "batch-4"])
+
 
 if __name__ == "__main__":
     unittest.main()

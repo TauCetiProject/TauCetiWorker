@@ -1342,6 +1342,32 @@ class HappyPath(Fixture):
         self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
         self.assertIsNone(repair_task.claim_and_run(cfg, self.client(cfg)), "the adopted task is not claimable again")
 
+    def test_the_batch_tree_is_parked_and_the_next_task_starts_warm_without_fetching(self):
+        """One tree per batch: the first task restores from the caches and parks its tree; the batch's
+        next task adopts it, fetches nothing and builds only incrementally."""
+        cfg = self.config()
+        self.service.tasks = {1: self.content.task()}
+        first = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(first["status"], "adopted", first)
+        self.assertEqual(first["sources"]["batch_tree"], "new")
+        self.assertEqual(first["worktree"], "parked")
+        parked = cfg.root / "worktrees" / "batch-7"
+        self.assertTrue(parked.is_dir())
+        self.assertFalse((cfg.root / "worktrees" / "task-1").exists())
+        fetched = len(self.lake_calls())
+        self.assertTrue(any("cache get" in call for call in self.lake_calls()))
+        self.service.tasks = {2: self.content.task(task_id=2)}
+        second = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(second["status"], "adopted", second)
+        self.assertEqual(second["sources"]["batch_tree"], "warm")
+        self.assertTrue(second["artifacts"]["warm_tree"])
+        self.assertTrue(second["artifacts"]["available"])
+        later = self.lake_calls()[fetched:]
+        self.assertFalse([call for call in later if "cache get" in call], later)
+        self.assertTrue(any(call.startswith("build --iofail") for call in later))
+        self.assertEqual(self.agent_calls()[-1]["cwd"], str(cfg.root / "worktrees" / "task-2"))
+        self.assertTrue(parked.is_dir(), "parked again for the batch's next task")
+
     def test_second_claimant_and_stale_token_are_refused(self):
         cfg = self.config()
         first = self.client(cfg, "worker-a@test").claim()
@@ -2517,11 +2543,8 @@ class QueueCacheNote(Fixture):
         cache, and Codex followed the appendix's stop rule and aborted the replay."""
         from tauceti_worker import agents
 
-        @contextlib.contextmanager
-        def missed(cwd, env, logdir, *, queue_mathlib=False):
-            self.assertTrue(queue_mathlib)  # the queue keeps its own Mathlib until it shares too
-            env["TAUCETI_PR_CACHE_MISS"] = "1"  # what the host preparation does on that miss
-            yield None
+        def host_preparation(*args, **kwargs):
+            raise AssertionError("the queue prepares its own tree: no host cache preparation or relinking")
 
         raw = self.content.rebase_task()
         raw["kind"] = "pre_rebase"
@@ -2529,7 +2552,9 @@ class QueueCacheNote(Fixture):
         cfg = self.config(providers=("codex",))
         with (
             patch.object(agents, "TAUCETI_CACHE_SERVICE", "tauceti-public"),
-            patch.object(agents, "host_build_cache_context", missed),
+            patch.object(agents, "host_build_cache_context", host_preparation),
+            patch.object(agents, "relink_build_outputs", host_preparation),
+            patch.dict(os.environ, {"TAUCETI_PR_CACHE_MISS": "1"}),
         ):
             outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
@@ -3598,10 +3623,10 @@ class ParallelRepair(Fixture):
         self.assertFalse(self.group_worktree(2).exists())
         self.assertFalse((self.root / "state" / "worktrees" / "task-1").exists())
         self.assertEqual(self.state()["parallel"]["status"], "ok")
-        # The groups came from the streaming build's complete error list, after that build had finished;
+        # The groups came from the task's own diagnostics, without waiting for the streaming build;
         # the verification build ran in the sandbox like the rest.
-        self.assertEqual(outcome["parallel"]["source"], "errors.jsonl")
-        self.assertEqual(outcome["parallel"]["stream_errors"], 2)
+        self.assertEqual(outcome["parallel"]["source"], "diagnostics")
+        self.assertNotIn("stream_wait_seconds", outcome["parallel"])
         self.assertTrue(outcome["stream_build"]["finished"])
         self.assertEqual(outcome["stream_build"]["failed_modules"], ["TauCeti.Three", "TauCeti.Two"])
         sandboxed = [c["argv"][c["argv"].index("--") + 1 :] for c in self.bwrap_calls()]
@@ -3614,18 +3639,20 @@ class ParallelRepair(Fixture):
             self.assertEqual(json.loads((group_dir / "group.json").read_text())["state"], "agent_running")
             self.assertTrue((group_dir / "prompt.md").exists())
 
-    def test_groups_come_from_the_streaming_build_when_the_diagnostics_under_report(self):
-        # CI's --fail-fast reported only the first broken module; the worker's own build finds both.
+    def test_under_reported_diagnostics_go_sequential_at_once_without_waiting_for_the_stream(self):
+        # CI's --fail-fast reported only the first broken module. Planning never waits for the worker's
+        # streaming build to find the rest: one owner means the sequential agent starts at once, with
+        # the build's growing error list.
         task = self.service.tasks[1]
         task["diagnostics"] = [d for d in task["diagnostics"] if d["module"] == "TauCeti/Two.lean"]
         cfg = self.config(parallel_agents=2)
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
-        self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assert_two_groups_folded(outcome)
-        self.assertEqual(outcome["parallel"]["source"], "errors.jsonl")
-        three = next(c["prompt"] for c in self.agent_calls() if c["cwd"] == str(self.group_worktree(2)))
-        self.assertIn("`TauCeti/Three.lean:1:1` (PR #3's commit `", three, "the streamed error, with its owner")
-        self.assertIn("unknown identifier BROKEN", three)
+        self.assertEqual(outcome["parallel"]["status"], "sequential", outcome["parallel"])
+        self.assertEqual(outcome["parallel"]["source"], "diagnostics")
+        self.assertNotIn("stream_wait_seconds", outcome["parallel"])
+        calls = self.agent_calls()
+        self.assertEqual(calls[0]["cwd"], str(self.root / "state" / "worktrees" / "task-1"))
+        self.assertIn(".tauceti-repair/errors.jsonl", calls[0]["prompt"])
 
     def test_group_agents_run_under_the_codex_argv_shape_too(self):
         cfg = self.config(parallel_agents=2, providers=("codex",))
