@@ -591,13 +591,14 @@ def start_background(
     frozen: dict | None = None,
     python: str | None = None,
     batch_id: str = "",
+    park: bool = False,
 ) -> dict:
     """Publish the worktree's outputs for ``revision`` in a process of its own and return at once.
 
     The publisher runs ``publish_outputs``, writes its record to ``logs/publish.json`` (``state``
     ``published``, ``skipped`` or ``failed``) and its output to ``logs/publish.log``, and then, when
     ``remove_worktree`` (the caller leaves it in place for it), parks the worktree as the tree of
-    ``batch_id`` or removes it (``repair_cleanup.retire``). Under systemd
+    ``batch_id`` when ``park`` (its artifacts were prepared) or removes it (``repair_cleanup.retire``). Under systemd
     (``systemd``, by default when the worker runs in a unit) it is a transient unit of its own, so a
     stop or restart of the worker does not kill it. The returned record says whether it was
     ``launched``; when it was not, the worktree is still the caller's. Never raises.
@@ -633,6 +634,7 @@ def start_background(
         "clone": str(clone) if clone else None,
         "remove_worktree": bool(remove_worktree and clone),
         "batch_id": str(batch_id),
+        "park": bool(park),
         "nice": nice,
         "record": dict(record, state="running", launched=True),
     }
@@ -753,7 +755,7 @@ def _run_spec(spec_path: Path) -> int:
                 spec.get("batch_id", ""),
                 spec["task_id"],
                 worktree,
-                keep=True,
+                keep=bool(spec.get("park")),
             )
         except Exception as error:
             log(f"could not park or remove {worktree}: {type(error).__name__}: {error}")

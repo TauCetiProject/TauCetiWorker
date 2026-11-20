@@ -117,7 +117,9 @@ and one worktree and the controller keeps no state between conflicts.
 At each conflict the worker checks out the clean prefix and applies the conflicting commit onto it as
 the replay computed it (`repair.apply_conflict`: `git merge-tree` with the commit's parent as merge
 base, written to the working tree with `git read-tree -u --reset`), so the conflicting files carry
-git's markers, HEAD stays at the prefix and no rebase, cherry-pick or merge is in progress. The agent
+git's markers, HEAD stays at the prefix and no rebase, cherry-pick or merge is in progress. When that
+checkout's `lean-toolchain` or `lake-manifest.json` differs from `onto`'s (a member bumps them), the
+worker fetches its Mathlib (`lake exe cache get`) before the agent's offline builds need it. The agent
 edits files and writes its explanation to `.tauceti-repair/explanation.md`; it gets no rebase recipe,
 no step script and no reference to the commits after the conflicting one: its findings are the
 conflict and a pre-rebase's predicted ripples from the head into the prefix and that commit, without
@@ -464,7 +466,9 @@ its tree is renamed to `<root>/worktrees/batch-<batch_id>` (`retire`, recording 
 parked; any other is removed as before, and so is a tree whose batch already has a parked
 one. The batch's next task on this worker renames the parked tree to its own `task-<id>` path
 (`adopt`). Each worker has its own root, and a rename takes the tree whole and fails when its
-destination exists, so two tasks never share or nest one. Adoption deletes the previous task's `.tauceti-repair/` (which `git clean` keeps, since the clone
+destination exists, so two tasks never share or nest one. Adoption, parking and the collector take
+the tree's lease (`worktree-leases/batch-<id>.lock`), so the collector never deletes a tree a task
+is taking. The background publisher parks the tree only when the task's artifacts were available. Adoption deletes the previous task's `.tauceti-repair/` (which `git clean` keeps, since the clone
 excludes it), `.lake/outputs.jsonl` and `.lake/publication-stage`, and quits any Git operation left in progress;
 the checkout then re-points the tree to the task's starting tip as for any reused tree.
 

@@ -59,15 +59,18 @@ def adopt(clone: Path, root: Path, batch_id: str | int, worktree: Path) -> str |
     restores from the caches as a new tree does). A tree that cannot be moved is removed.
     """
     parked = batch_tree(root, batch_id)
-    if parked is None or worktree.exists() or parked.is_symlink() or not parked.is_dir():
+    if parked is None or worktree.exists():
         return None
-    try:
-        head = repair.git(parked, "rev-parse", "HEAD").strip()
-        _move(clone, parked, worktree)
-    except (OSError, RuntimeError) as error:
-        print(f"[repair-cleanup] removing unusable batch tree {parked}: {error}", flush=True)
-        repair.remove_worktree(clone, parked)
-        return None
+    with worktree_lease(root, parked.name):  # waits for a collection of this tree to finish
+        if parked.is_symlink() or not parked.is_dir():
+            return None
+        try:
+            head = repair.git(parked, "rev-parse", "HEAD").strip()
+            _move(clone, parked, worktree)
+        except (OSError, RuntimeError) as error:
+            print(f"[repair-cleanup] removing unusable batch tree {parked}: {error}", flush=True)
+            repair.remove_worktree(clone, parked)
+            return None
     for name in STALE:
         path = worktree / name
         if path.is_dir() and not path.is_symlink():
@@ -87,24 +90,26 @@ def retire(clone: Path, root: Path, batch_id: str | int, task_id: str | int, wor
     The record is written after the rename, so only the tree's owner writes it.
     """
     parked = batch_tree(root, batch_id) if keep else None
-    if parked is not None and worktree.is_dir() and not worktree.is_symlink() and not parked.exists():
-        try:
-            _move(clone, worktree, parked)
-            record = root / BATCH_RECORDS / f"{parked.name}.json"
-            record.parent.mkdir(parents=True, exist_ok=True)
-            atomic_json(record, {"task_id": str(task_id)})
-            return "parked"
-        except (OSError, RuntimeError) as error:
-            print(f"[repair-cleanup] could not park {worktree} as {parked}: {error}", flush=True)
+    if parked is not None and worktree.is_dir() and not worktree.is_symlink():
+        with worktree_lease(root, parked.name):
+            try:
+                _move(clone, worktree, parked)
+                record = root / BATCH_RECORDS / f"{parked.name}.json"
+                record.parent.mkdir(parents=True, exist_ok=True)
+                atomic_json(record, {"task_id": str(task_id)})
+                return "parked"
+            except (OSError, RuntimeError) as error:
+                print(f"[repair-cleanup] could not park {worktree} as {parked}: {error}", flush=True)
     repair.remove_worktree(clone, worktree)
     return "removed"
 
 
 @contextlib.contextmanager
 def worktree_lease(root: Path, task_id: str | int, *, exclusive: bool = False):
-    """Shared ownership for an attempt/publisher; nonblocking exclusive ownership for collection."""
+    """Shared ownership for an attempt/publisher; nonblocking exclusive ownership for collection.
+    ``batch-<id>`` names a parked batch tree's lease, taken by adoption, parking and collection."""
     task_id = str(task_id)
-    if not re.fullmatch(r"[1-9][0-9]*", task_id):
+    if not re.fullmatch(r"(?:batch-)?[1-9][0-9]*", task_id):
         raise ValueError("worktree leases require a controller task ID")
     directory = root / "worktree-leases"
     directory.mkdir(parents=True, exist_ok=True)
@@ -148,7 +153,11 @@ def collect(database: Path, clone: Path, roots: list[Path], *, apply: bool = Fal
                 if parked and not tree.is_symlink() and tree.is_dir():
                     result = {"path": str(tree), "batch_id": int(parked[1])}
                     try:
-                        _collect_batch(store, clone, root, tree, parked[1], result, apply=apply)
+                        with worktree_lease(root, tree.name, exclusive=True) as acquired:
+                            if not acquired:
+                                result["state"] = "busy"
+                            else:
+                                _collect_batch(store, clone, root, tree, parked[1], result, apply=apply)
                     except (OSError, ValueError, KeyError, sqlite3.Error, RuntimeError) as error:
                         result.update(state="error", error=str(error))
                     results.append(result)
@@ -201,7 +210,10 @@ def _known_task(store, root: Path, task_id: int):
 
 def _collect_batch(store, clone, root, tree, batch_id, result, *, apply):
     """A parked batch tree is removed once its batch has landed or been removed. Nothing uses a
-    parked tree in place: a task moves it to its own path first."""
+    parked tree in place: a task moves it to its own path first, under the same lease."""
+    if not tree.is_dir():
+        result["state"] = "adopted"  # a task took it between the listing and the lease
+        return
     record = root / BATCH_RECORDS / f"{tree.name}.json"
     task_id = str(_record(record).get("task_id", "")) if record.is_file() and not record.is_symlink() else ""
     task = _known_task(store, root, int(task_id)) if re.fullmatch(r"[1-9][0-9]*", task_id) else None

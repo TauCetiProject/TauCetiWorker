@@ -303,6 +303,12 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(cleanup.retire(self.clone, self.worker, "", 3, third, keep=True), "removed")
         self.assertEqual(sorted(p.name for p in (self.worker / "worktrees").iterdir()), ["batch-9"])
 
+    def test_a_parked_tree_being_adopted_is_not_collected(self):
+        cleanup.retire(self.clone, self.worker, "1", 1, self.tree(1, batch="landed"), keep=True)
+        with cleanup.worktree_lease(self.worker, "batch-1"):  # what adoption holds while it renames
+            self.assertEqual(self.collect()[0]["state"], "busy")
+        self.assertEqual(self.collect()[0]["state"], "removed")
+
     def test_a_tree_is_never_moved_into_an_existing_parked_tree(self):
         first, second = self.tree(1), self.tree(2)
         cleanup.retire(self.clone, self.worker, "9", 1, first, keep=True)

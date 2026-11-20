@@ -1472,6 +1472,15 @@ def warm_tree(worktree: Path, task: Task, parked_at: str | None, start_tip: str)
         return False
 
 
+def dependencies_differ(worktree: Path, revision: str) -> bool:
+    """Whether the worktree's files change ``lean-toolchain`` or ``lake-manifest.json`` from ``revision``."""
+    return bool(
+        git(
+            worktree, "diff", "--name-only", revision, "--", "lean-toolchain", "lake-manifest.json", check=False
+        ).strip()
+    )
+
+
 def retire_worktree(cfg: RunnerConfig, task: Task, artifacts: dict | None) -> str:
     """Park the task's tree as its batch's tree when its artifacts were prepared, else remove it. A
     cold tree (a failed fetch, its dependencies perhaps among them) is removed: a parked tree is warm."""
@@ -2337,6 +2346,19 @@ def resolve_conflicts(
                 edited_prs={m.number for m in task.members if m.provenance == "edited"},
             )
             paths = repair.apply_conflict(worktree, prefix, commit)
+            if cfg.mathlib_cache and cfg.seed_packages is None and dependencies_differ(worktree, task.onto):
+                # A member before or at this conflict changes the dependencies prepared at `onto`; the
+                # agent's offline builds need this checkout's. A failed fetch leaves Lake to report it.
+                from tauceti_queue.repair_cache import downloads
+
+                with downloads(env_lake) as fetch_env:
+                    repair.run_logged(
+                        [*cfg.lake, "exe", "cache", "get"],
+                        worktree,
+                        logdir / f"cache-get-mathlib-{commit[:12]}.log",
+                        fetch_env,
+                        1800,
+                    )
             log(f"task {task.task_id}: resolving {source_pr}'s commit {commit[:12]} onto {prefix[:12]}")
             feedback: str | None = None
             label = f"conflict-{len(resolved) + 1}"
@@ -2562,6 +2584,7 @@ def _run_task(
             clone=cfg.clone,
             remove_worktree=not cfg.keep_worktree,
             batch_id=task.batch_id,
+            park=bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("available")),
         )
         outcome["publish"] = record
         if record.get("launched"):
