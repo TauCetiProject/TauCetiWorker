@@ -173,6 +173,20 @@ class HaikuContinuation(unittest.TestCase):
             ["execution.json", "model-stderr.txt", "model-transcript.jsonl", "prompt.txt"],
         )
 
+    def test_reads_missing_from_the_saved_session_are_served_again(self):
+        fake = FakeHaiku(
+            self.batch,
+            [{"pages": [0, 1], "outputs": [UNFINISHED]}, {"pages": range(self.pages), "outputs": [PASS]}],
+        )
+        attempt = self.attempt("1")
+        saved = iter([set(), set(range(self.pages))])
+        with (
+            patch.object(sa, "run_process", side_effect=fake),
+            patch.object(sa, "claude_saved_read_pages", side_effect=lambda *a: next(saved)),
+        ):
+            self.assertEqual(sa.inspect(self.batch, "claude", attempt), sa.bind_verdict(PASS, self.batch))
+        self.assertIn("next_unserved_page=0", fake.calls[1].prompt)
+
     def test_an_earlier_concern_in_the_session_binds_a_later_pass_or_unfinished(self):
         uncertain = {"verdict": "finding", "findings": ["commit 1 TauCeti/ascii.lean: unclear elaborator origin"]}
         for later in (PASS, UNFINISHED):

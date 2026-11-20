@@ -1272,8 +1272,11 @@ def reconcile_coverage(work: Path, batch: dict) -> dict:
         if transcript.exists()
         else set()
     )
+    # A read counts only once its result is in the saved session that a continuation resumes.
     if value["provider"] == "codex":
         successful &= saved_read_pages(native_rollouts(work), before_reader.pages)
+    else:
+        successful &= claude_saved_read_pages(work, before_reader.pages)
     receipt = work / "read-receipt.json"
     with receipt.with_suffix(".lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

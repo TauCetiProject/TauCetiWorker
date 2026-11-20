@@ -72,6 +72,21 @@ def read_events(provider, pages, *, failed=False):
     return events
 
 
+def read_all(reader, env):
+    """Serve every page; a Claude client also stores each result in its session, as the real one does."""
+    rows = []
+    for page in range(len(reader.pages)):
+        result = reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+        use = {"type": "tool_use", "id": f"read-{page}", "name": "mcp__audit__read_page", "input": {"page": page}}
+        back = {"type": "tool_result", "tool_use_id": f"read-{page}", "content": result["content"]}
+        rows += [{"type": "assistant", "message": {"content": [use]}}, {"type": "user", "message": {"content": [back]}}]
+    if "CLAUDE_CONFIG_DIR" in env:
+        session = Path(env["CLAUDE_CONFIG_DIR"]) / "projects" / "home" / "session.jsonl"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        with session.open("a") as stream:
+            stream.write("".join(sa.serialize(row) + "\n" for row in rows))
+
+
 def native_read_rows(pages, batch):
     expected = ar.pages(batch)
     rows = []
@@ -644,8 +659,7 @@ class ServedJudgments(unittest.TestCase):
                 self.assertEqual(set(schema["required"]), {"verdict", "findings"})
                 self.assertEqual(len(args), 4)
                 r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-                for page in range(len(r.pages)):
-                    r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+                read_all(r, kwargs["env"])
                 if provider == "codex":
                     append_native_reads(kwargs["cwd"], range(len(r.pages)), self.thread, self.batch)
                     historical.append_native(kwargs["cwd"], value, self.thread)
@@ -785,8 +799,7 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
@@ -828,8 +841,7 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
@@ -868,8 +880,7 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
