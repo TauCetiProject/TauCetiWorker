@@ -42,7 +42,7 @@ UNIT_DIR="$HOME/.config/systemd/user"
 CONFIG_DIR="$HOME/.config/tauceti-queue"
 LONG_RUNNING=(tauceti-queue-monitoring.service tauceti-queue-task-activity.service)
 UNITS=("${LONG_RUNNING[@]}" tauceti-queue-monitoring-history.service tauceti-queue-monitoring-history.timer
-       tauceti-forgejo-team-sync.service tauceti-forgejo-team-sync.timer)
+       tauceti-queue-forgejo-team-sync.service tauceti-queue-forgejo-team-sync.timer)
 
 ARGS=("$@")
 while [ $# -gt 0 ]; do
@@ -109,8 +109,8 @@ for unit in "${UNITS[@]}"; do
   release_render_unit "$unit"
 done
 systemctl --user daemon-reload
-systemctl --user enable --quiet "${LONG_RUNNING[@]}" tauceti-queue-monitoring-history.timer tauceti-forgejo-team-sync.timer
-systemctl --user start tauceti-queue-monitoring-history.timer tauceti-forgejo-team-sync.timer
+systemctl --user enable --quiet "${LONG_RUNNING[@]}" tauceti-queue-monitoring-history.timer tauceti-queue-forgejo-team-sync.timer
+systemctl --user start tauceti-queue-monitoring-history.timer tauceti-queue-forgejo-team-sync.timer
 
 if [ "$RESTART" = 1 ]; then
   log "restarting ${LONG_RUNNING[*]}"

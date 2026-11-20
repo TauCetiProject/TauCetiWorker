@@ -1,4 +1,4 @@
-# Every ten minutes, run tauceti-forgejo-team-sync.service (docs/forgejo-worker.md).
+# Every ten minutes, run tauceti-queue-forgejo-team-sync.service (docs/forgejo-worker.md).
 
 [Unit]
 Description=Mirror Tau Ceti claim access to Forgejo every ten minutes
@@ -7,7 +7,7 @@ Description=Mirror Tau Ceti claim access to Forgejo every ten minutes
 OnBootSec=2min
 OnUnitActiveSec=10min
 RandomizedDelaySec=30
-Unit=tauceti-forgejo-team-sync.service
+Unit=tauceti-queue-forgejo-team-sync.service
 
 [Install]
 WantedBy=timers.target

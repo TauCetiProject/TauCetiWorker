@@ -75,7 +75,7 @@ directly. Contributors get it from the `contributor-fleets` team, which grants c
 that repository only (issues and pull requests stay read-only). `main`, `tauceti-ci/**` and
 `migration/github/**` stay protected against it.
 
-Nobody edits that team by hand. On the queue host, `tauceti-forgejo-team-sync.timer` runs
+Nobody edits that team by hand. On the queue host, `tauceti-queue-forgejo-team-sync.timer` runs
 `python -m tauceti_queue.forgejo_team_sync` every ten minutes, which makes the team's members
 exactly the Forgejo accounts whose GitHub sign-in belongs to a direct collaborator of
 `TauCetiProject/tauceti-claims`: the people TauCeti's `claims-access` workflow admitted to
@@ -88,7 +88,7 @@ see what it would change.
 `gh auth token --user tauceti-ai-for-science`, and Forgejo with
 `~/.config/tauceti-queue/forgejo-team-sync-token`, a token of the dedicated site-admin account
 `tauceti-team-sync` limited to the `read:admin` and `write:organization` scopes. See its log with
-`journalctl --user -u tauceti-forgejo-team-sync`.
+`journalctl --user -u tauceti-queue-forgejo-team-sync`.
 
 ## Scheduling and recovery
 

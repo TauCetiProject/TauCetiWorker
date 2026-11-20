@@ -55,15 +55,21 @@ def user(login, github_id=None):
     return {"login": login, "source_id": 1 if github_id else 0, "login_name": str(github_id or "")}
 
 
+FILLERS = [user(f"filler{i}", 1000 + i) for i in range(60)]
+
+
 class TeamSync(unittest.TestCase):
     def setUp(self):
-        users = [user("CBirkbeck", 56166236), user("gone", 7), user("joscha"), user("kim-em", 477956)]
+        # The accounts that matter sit on the second page of every listing, so a listing that stops
+        # after one page adds or removes the wrong people.
+        users = FILLERS + [user("CBirkbeck", 56166236), user("gone", 7), user("joscha"), user("kim-em", 477956)]
         # a lookalike: a local account named like a collaborator is never matched by name
-        users += [user("mo271")] + [user(f"filler{i}", 1000 + i) for i in range(60)]
+        users.append(user("mo271"))
         self.fake = Fake(
-            collaborators=[{"id": 56166236, "login": "CBirkbeck"}, {"id": 3491627, "login": "mo271"}],
+            collaborators=[{"id": 3491627, "login": "mo271"}, {"id": 56166236, "login": "CBirkbeck"}]
+            + [{"id": 1000 + i} for i in range(60)],
             users=users,
-            members=[{"login": "gone"}, {"login": "joscha"}],
+            members=[{"login": f"filler{i}"} for i in range(55)] + [{"login": "gone"}, {"login": "joscha"}],
         )
 
     def test_adds_linked_collaborators_and_removes_everyone_else(self):
@@ -71,14 +77,17 @@ class TeamSync(unittest.TestCase):
         self.assertEqual(
             self.fake.writes,
             [
-                ("PUT", f"{BASE}/teams/2/members/CBirkbeck"),
+                ("PUT", f"{BASE}/teams/2/members/{name}")
+                for name in ["CBirkbeck"] + [f"filler{i}" for i in range(55, 60)]
+            ]
+            + [
                 ("DELETE", f"{BASE}/teams/2/members/gone"),
                 ("DELETE", f"{BASE}/teams/2/members/joscha"),
             ],
         )
 
     def test_rerun_changes_nothing(self):
-        self.fake.members = [{"login": "CBirkbeck"}]
+        self.fake.members = [{"login": f"filler{i}"} for i in range(60)] + [{"login": "CBirkbeck"}]
         sync(args(), self.fake)
         self.assertEqual(self.fake.writes, [])
 
@@ -91,6 +100,19 @@ class TeamSync(unittest.TestCase):
         with self.assertRaises(SystemExit):
             sync(args(), self.fake)
         self.assertEqual(self.fake.writes, [])
+
+    def test_a_failed_later_page_changes_nothing(self):
+        for broken in ("api.github.com/x?page=2", "admin/users?limit=50&page=2", "members?limit=50&page=2"):
+            self.fake.writes = []
+
+            def get(method, url, token, scheme="token", broken=broken):
+                if url.endswith(broken):
+                    raise OSError("unavailable")
+                return self.fake(method, url, token, scheme)
+
+            with self.assertRaises(OSError):
+                sync(args(), get)
+            self.assertEqual(self.fake.writes, [], broken)
 
 
 if __name__ == "__main__":
