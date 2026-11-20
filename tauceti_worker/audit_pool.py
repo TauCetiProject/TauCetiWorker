@@ -260,6 +260,29 @@ class Pool:
                 ) from exc
             self.import_block(block, main)
             running.unlink()
+        # The pool's batch files from before ranges.json: a blocked batch's attempts may hold a
+        # concern that no ledger verdict records.
+        for path in sorted(self.store.glob("*.json")):
+            if path.name == RANGES or path.name.endswith(".input.json"):
+                continue
+            try:
+                old = json.loads(path.read_text())
+            except (OSError, ValueError) as exc:
+                raise NoProgress(f"security-audit pool: {path} cannot be read; preserve it for review: {exc}") from exc
+            if not isinstance(old, dict) or old.get("status") != "blocked" or old.get("imported"):
+                continue
+            span = {"from_sha": old.get("from_sha"), "to_sha": old.get("to_sha")}
+            if isinstance(old.get("verdict"), dict):
+                self.import_block({**span, "verdict": old["verdict"]}, main, verdict=old["verdict"])
+            attempts = old.get("attempts") or []
+            for attempt in attempts:
+                self.import_block({**span, "attempt": attempt}, main)
+            if not attempts and not isinstance(old.get("verdict"), dict):
+                # A block with no evidence to classify: hold its commits rather than forget it.
+                self.import_block(
+                    {**span, "reason": "security-audit: legacy pool block without evidence"}, main, hold=True
+                )
+            save(path, {**old, "imported": True})
         path = self.work / "blocked.json"
         try:
             block = json.loads(path.read_text()) if path.exists() else {}
@@ -269,10 +292,16 @@ class Pool:
             return
         save(path, {**block, **self.import_block(block, main)})
 
-    def import_block(self, block: dict, main: str) -> dict:
+    def import_block(self, block: dict, main: str, *, verdict: dict | None = None, hold: bool = False) -> dict:
         """Record in the ledger what one legacy record's attempt holds; return its outcome."""
         outcome = {"outcome": "not-judged"}
-        if block.get("manual_inspection_required"):
+        if verdict is not None:
+            if not (verdict.get("findings") or verdict.get("verdict") == "finding"):
+                return outcome  # Names no concern: the range is inspected afresh.
+            outcome = {"outcome": "finding", "verdict": verdict}
+        elif hold:
+            outcome = {"outcome": "unreadable", "reason": block["reason"]}
+        elif block.get("manual_inspection_required"):
             outcome = {}  # A planning block is planned again, and blocks again if it still cannot be.
         elif block.get("attempt") and Path(block["attempt"]).exists():  # A missing attempt recorded nothing.
             attempt = Path(block["attempt"])

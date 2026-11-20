@@ -846,6 +846,23 @@ class WorkerRounds(PoolFixture):
         self.assertTrue((self.state / "running.json").exists())
         self.assertEqual(self.calls, [])
 
+    def test_a_blocked_batch_file_from_the_old_pool_keeps_binding(self):
+        batch = sa.build_batch(self.repo, self.shas[2], self.shas[-1], self.shas[3:5])
+        attempt = self.state / "attempt-old-pool"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "unfinished", "findings": ["x"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        (self.state / "pool").mkdir(exist_ok=True)
+        old = {"status": "blocked", "from_sha": self.shas[2], "to_sha": self.shas[4], "attempts": [str(attempt)]}
+        (self.state / "pool" / f"{batch['input_digest']}.json").write_text(sa.serialize(old))
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertNotIn(self.shas[2], self.calls_from)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+        self.assertTrue(json.loads((self.state / "pool" / f"{batch['input_digest']}.json").read_text())["imported"])
+
     def test_a_legacy_block_without_a_concern_is_inspected_afresh(self):
         block = {
             "from_sha": self.shas[0],
