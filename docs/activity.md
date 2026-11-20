@@ -42,6 +42,19 @@ approved PR head and constructed batch commit. Titles, reviews, CI success and
 staging pushes are not landing evidence. Ordinary closed PRs do not produce a
 missing-landing warning.
 
+Forgejo PRs count too, and the report shows them beneath the totals (`on Forgejo`,
+`from Forgejo`). Forgejo publishes no creation receipt, so when a worker in the
+configuration has Forgejo enabled, the collector reads that Forgejo repository's PR
+list. A PR belongs to this host when its branch ends in one of this host's worker
+IDs (`roadmap/<slug>-fleet-<machine8>-<n>`). The first pass reads every PR, which
+backfills earlier Forgejo work; later passes, at most every five minutes, read only
+PRs updated since the previous complete pass. A Forgejo PR lands when it merges or
+when the queue closes it under the `[Merged by Bors] - ` title. Forgejo PRs and
+their contributions are keyed by the forge-qualified repository
+(`forgejo:https://git.taucetiproject.org/taucetiproject/tauceti`), so their numbers
+never mix with GitHub's. Their landed LOC is not measured yet; it counts as
+missing and the LOC rates estimate it.
+
 ## Costs and landed PR output
 
 Average API spending has **1h**, **3h**, **24h**, **7d** and **All time** columns in
