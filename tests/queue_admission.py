@@ -821,7 +821,8 @@ class AdmissionTests(unittest.TestCase):
                 elif case == "root-file":
                     files = {"TauCeti/P1.lean": "-- x\n", "TauCeti.lean": "import TauCeti.P1\n"}
                 elif case == "new-file-cap":
-                    files = {"TauCeti/Big.lean": "".join(f"-- {i}\n" for i in range(1200))}
+                    lines = diff_guard.ci_git.NEW_FILE_LINE_CAP + 50  # the one cap the label never lifts
+                    files = {"TauCeti/Big.lean": "".join(f"-- {i}\n" for i in range(lines))}
                 self.large_refactor_approval(
                     files=files, labelled=case != "unlabelled", bump=case != "bump-fails", admin=case != "not-admin"
                 )
