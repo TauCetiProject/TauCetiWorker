@@ -222,7 +222,11 @@ the head's tip) and its internal failures are repaired by an agent, so that it i
 seals. When `prepare_open_batches` is on, every open batch with at least `prepare_min_members`
 members, no insertion for `prepare_quiet_seconds`, a `prepared_version` other than its version, and
 no `prepare` task open or settled (adopted, clean or failed) at that version gets one `prepare`
-task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty. A sealed successor
+task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty. The batch lands on
+`main`, so one based elsewhere is first replayed onto the canonical commit: a clean replay re-bases
+it (a new version) and it is prepared there; a conflicting one is recorded per version and canonical
+commit and the batch gets no own-base preparation until it is pre-rebased. An unclaimed own-base
+preparation on a base other than the canonical commit is neither offered nor kept (`base-behind`). A sealed successor
 bypasses both size and quiet gates; its preparation is preferred over other own-base preparations. This happens whether
 or not the head has a task of its own, since the long head repairs are when the batch would
 otherwise sit idle. `claim_task` offers it after every head task nobody holds, one claim per batch,

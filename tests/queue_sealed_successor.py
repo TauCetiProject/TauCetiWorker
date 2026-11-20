@@ -174,7 +174,10 @@ class SealedSuccessor(ControllerCase):
         self.controller.tick()
         self.assertIsNone(self.controller._head())
         self.assertEqual([self.row(b)["sealed"] for b in (first, later, third)], [1, 1, 0])
-        self.assertEqual(self.row(later)["version"], later["version"])
+        members = sorted(m["source_pr"] for m in self.controller.members(later["id"]))
+        self.assertEqual(
+            self.row(later)["base"], self.repo.main_sha(), "re-based onto main, not prepared on its old base"
+        )
         self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
         self.controller.renew_task(task.task_id, task.claim_token)
         active = self.controller._active_claims(first["id"], task_id=task.task_id)
@@ -182,7 +185,7 @@ class SealedSuccessor(ControllerCase):
         self.assertIsNotNone(self.controller._open_own_base_prepare(self.row(later)))
         self.approve(501, {"P501.lean": "501\n"})
         self.controller.tick()
-        self.assertEqual(self.row(later)["version"], later["version"])
+        self.assertEqual(sorted(m["source_pr"] for m in self.controller.members(later["id"])), members)
         self.assertNotIn(self.controller.input_for(PROJECT, 501)["batch_id"], (first["id"], later["id"]))
         sealed_at = self.row(later)["sealed_at"]
         self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
