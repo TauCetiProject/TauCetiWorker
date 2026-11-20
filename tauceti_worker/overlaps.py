@@ -459,7 +459,7 @@ def make_packet(repo, tauceti, tc_sha, pin, cursor, commits, work):
 
 
 def do_scan(w, sv, c, opts, bubble):
-    from .agents import fill_prompt, host_agent_argv, run_agent_proc
+    from .agents import fill_prompt, host_agent_argv, run_agent_proc, validate_host_agent_credentials
     from .work_units import _effective_authoring_profile
 
     require_shared()
@@ -515,6 +515,7 @@ def do_scan(w, sv, c, opts, bubble):
         (work / "prompt.md").write_text(prompt)
         profile = _effective_authoring_profile(opts)
         argv, env = host_agent_argv(prompt, profile)
+        validate_host_agent_credentials(profile, env)
         log(
             f"overlap-scan: {len(commits)} commits, {packet['changed_bytes']} patch bytes, {cursor[:12]}..{commits[-1][:12]}"
         )

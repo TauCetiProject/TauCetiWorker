@@ -964,11 +964,32 @@ def prompt_on_stdin(prompt: str, profile: AuthoringProfile | str) -> bool:
     return provider in _STDIN_PROMPT_PROVIDERS and len(prompt.encode("utf-8", errors="replace")) > PROMPT_ARGV_LIMIT
 
 
+def validate_host_agent_credentials(profile: AuthoringProfile | str, env: dict) -> None:
+    """Recheck the selected native Claude file at launch; argv inspection remains side-effect free."""
+    if (
+        _authoring_profile(profile).provider != "claude"
+        or sys.platform != "darwin"
+        or claude_usage_credentials() is None
+        or env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        or env.get("TAUCETI_CLAUDE_BILLING") == "api"
+        or env.get("TAUCETI_API_CONTEXT")
+    ):
+        return
+    from .quota import claude_file_credential_problem, claude_file_keychain_problem
+
+    directory = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
+    if problem := claude_file_credential_problem(directory / ".credentials.json", renewable=False):
+        raise NoProgress(problem)
+    if problem := claude_file_keychain_problem(env.get("CLAUDE_CONFIG_DIR")):
+        raise NoProgress(problem)
+
+
 def host_agent_launch(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict, str | None]:
     """``host_agent_argv`` plus the text to write on the agent's stdin: the prompt itself when it is
     too long for one argv string (``PROMPT_ARGV_LIMIT``), else None and the prompt stays in argv."""
     on_stdin = prompt_on_stdin(prompt, profile)
     argv, env = host_agent_argv(prompt, profile, prompt_on_stdin=on_stdin)
+    validate_host_agent_credentials(profile, env)
     return argv, env, prompt if on_stdin else None
 
 
@@ -1015,22 +1036,6 @@ def host_agent_argv(
     elif profile.provider in OPENROUTER_MODELS:
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
-        if (
-            sys.platform == "darwin"
-            and claude_usage_credentials() is not None
-            and not env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-            and env.get("TAUCETI_CLAUDE_BILLING") != "api"
-            and not env.get("TAUCETI_API_CONTEXT")
-        ):
-            from .quota import claude_file_credential_problem, claude_file_keychain_problem
-
-            agent_directory = (
-                Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
-            )
-            if problem := claude_file_credential_problem(agent_directory / ".credentials.json", renewable=False):
-                raise Die(problem)
-            if problem := claude_file_keychain_problem(env.get("CLAUDE_CONFIG_DIR")):
-                raise Die(problem)
         # The one exception is a launcher that bills the API with the key in its own environment and
         # no accounting shim (the queue's repair task, `TAUCETI_CLAUDE_BILLING=api` without
         # `TAUCETI_API_CONTEXT`); the fleet's API mode routes the key through the shim instead and has
