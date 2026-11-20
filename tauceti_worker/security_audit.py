@@ -1480,6 +1480,9 @@ if __name__ == "__main__":
         from .audit_pool import Chooser, Pool
         from .config import Config
 
+        # Reviewers receive an access-only file copy, never the parent's setup token
+        # or a renewable credential. Pace against the route they actually launch.
+        os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"] = "access-only"
         cfg = Config.resolve(args.state.parent.name)
         if (cfg.state / CURSOR).resolve() != args.state.resolve():
             parser.error("pool --state must identify this checkout's existing worker audit state")
