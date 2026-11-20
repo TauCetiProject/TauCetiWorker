@@ -21,10 +21,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import audit_evidence as evidence
 from . import audit_watchdog
 from . import security_audit as sa
 from .audit_alerts import notify_block, save
-from .audit_evidence import NotJudged, concern, concerns_recorded, holds
+from .audit_evidence import NotJudged, Unreadable, concern, holds
 from .config import Die, NoProgress, log
 
 MAX_RETRIES = 2
@@ -287,10 +288,18 @@ class Pool:
                 return
             if slot.status != "planned" or slot.retry_at > now:
                 continue
-            if concerns_recorded(self.work, slot.digest):
+            recorded = evidence.recorded(self.work, slot.digest)
+            if recorded.concerns() or recorded.unreadable:
                 refused = "security-audit: this batch already has a binding judgment; it is never inspected again"
                 slot.status = "blocked"
-                failure = {"from_sha": slot.batch["from_sha"], "to_sha": slot.target, "reason": refused}
+                verdict = evidence.finding(slot.batch, recorded)
+                failure = {
+                    "from_sha": slot.batch["from_sha"],
+                    "to_sha": slot.target,
+                    "reason": refused,
+                    "outcome": "finding" if verdict else "unreadable",
+                    "verdict": verdict,
+                }
                 sa.record(self.work / "ledger.jsonl", failure)
                 self.block(slot, failure, head=slot.batch["from_sha"] == self.slots[0].batch["from_sha"])
                 log(f"security-audit pool: {slot.batch['from_sha'][:12]}..{slot.target[:12]} {refused}")
@@ -427,6 +436,7 @@ class Pool:
                 "to_sha": slot.target,
                 "reason": str(exc) or type(exc).__name__,
                 "attempt": str(attempt),
+                "outcome": "unreadable" if isinstance(exc, Unreadable) else "not-judged",
                 **self.reviewer(slot),
             }
             if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
@@ -474,6 +484,8 @@ class Pool:
             "to_sha": slot.target,
             "reason": "security-audit: " + "; ".join(verdict["findings"]),
             "attempt": str(attempt),
+            "outcome": "finding",
+            "verdict": verdict,
             **self.reviewer(slot),
         }
         sa.record(self.work / "ledger.jsonl", failure)

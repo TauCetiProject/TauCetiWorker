@@ -2215,6 +2215,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     protocol = selected_protocol(provider, work)
     model = reviewer_model(provider)
     log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
+    verdict = None
     try:
         if any(c["files"] for c in batch["commits"]):
             verdict = inspect(batch, provider, attempt, protocol=protocol)
@@ -2240,6 +2241,10 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         return 0
     except (Die, ValueError, TypeError, AttributeError, OSError, subprocess.TimeoutExpired) as exc:
         failure = {"from_sha": cursor, "to_sha": target, "reason": str(exc), "attempt": str(attempt)}
+        if verdict is not None and verdict["verdict"] != "pass":
+            failure.update(outcome="finding", verdict=verdict)
+        else:
+            failure["outcome"] = "unreadable" if isinstance(exc, Unreadable) else "not-judged"
         if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
             failure["failure_kind"] = "provider-timeout"
         blocked.write_text(serialize(failure))

@@ -49,7 +49,9 @@ HARMLESS = frozenset(
 )
 ANSWERS = frozenset({"assistant", "agent_message", "result"})
 # Text that mentions a judgment key must contain a readable judgment.
-TEXT_MARKERS = ('"verdict"', '"findings"')
+KEYS = ("verdict", "findings")  # Either key makes a decoded object a judgment.
+VALUE_START = re.compile(r'[{\["]')
+MAX_DEPTH = 4  # JSON carried inside JSON strings, decoded this many levels deep.
 READ_PAGE = "read_page"
 GOAL_TOOLS = frozenset({"get_goal", "create_goal", "update_goal"})
 
@@ -97,26 +99,51 @@ def concern(value) -> list[str]:
     return texts
 
 
-def judgments_in(text: str, evidence: Evidence, where: str) -> list:
-    """Every judgment-shaped JSON object in a reviewer's text, wherever it appears."""
-    if not isinstance(text, str):
-        evidence.unreadable.append(f"{where}: unreadable reviewer text")
-        return []
-    if not any(marker in text for marker in TEXT_MARKERS):
-        return []
-    decoder, found, i = json.JSONDecoder(), [], text.find("{")
-    while i != -1:
-        try:
-            value, _ = decoder.raw_decode(text, i)
-        except ValueError:
-            value = None
-        if isinstance(value, dict) and ("verdict" in value or "findings" in value):
+def walk(value, found: list, loose: list, depth: int = 0) -> None:
+    """Collect judgment-shaped objects anywhere in a decoded value, decoding JSON carried in strings."""
+    if isinstance(value, dict):
+        if any(key in value for key in KEYS):
             found.append(value)
-        i = text.find("{", i + 1)
-    if not found:
-        evidence.unreadable.append(f"{where}: reviewer text mentions a judgment that cannot be read")
+        for item in value.values():
+            walk(item, found, loose, depth)
+    elif isinstance(value, list):
+        for item in value:
+            walk(item, found, loose, depth)
+    elif isinstance(value, str) and depth < MAX_DEPTH:
+        scan(value, found, loose, depth + 1)
+
+
+def scan(text: str, found: list, loose: list, depth: int = 0) -> None:
+    """Decode every JSON value in text, never pattern-match it.
+
+    Keys are compared after decoding, so escapes cannot hide them. A judgment key that is not
+    inside any decodable object (malformed JSON, or prose quoting the key) is `loose`: the text
+    may hold a concern that cannot be read, whatever else it holds."""
+    decoder, i = json.JSONDecoder(), 0
+    while match := VALUE_START.search(text, i):
+        try:
+            value, i = decoder.raw_decode(text, match.start())
+        except ValueError:
+            i = match.start() + 1
+            continue
+        if match.group() == '"' and value in KEYS:
+            loose.append(value)
+        else:
+            walk(value, found, loose, depth)
+
+
+def judgments_in(value, evidence: Evidence, where: str, *, answer: bool = False) -> None:
+    """Record the judgments in one reviewer output: text, or an answer payload already decoded.
+
+    An answer (a final message or structured output) must be a readable judgment; any output
+    with a judgment key that cannot be read is unreadable evidence."""
+    found, loose = [], []
+    (scan if isinstance(value, str) else walk)(value, found, loose)
     evidence.judgments.extend(found)
-    return found
+    if loose:
+        evidence.unreadable.append(f"{where}: reviewer output mentions a judgment that cannot be read")
+    elif answer and not found:
+        evidence.unreadable.append(f"{where}: reviewer answer is not a judgment")
 
 
 def tool_name(name) -> str:
@@ -146,7 +173,7 @@ def rows(path: Path, evidence: Evidence):
         yield f"{path}:{number}", row
 
 
-def read_row(row: dict, evidence: Evidence, where: str) -> None:
+def read_row(row: dict, evidence: Evidence, where: str, messages: dict) -> None:
     """One row of a Codex native rollout, a Codex exec stream, or a Claude session or stream."""
     kind = row.get("type")
     if kind == "response_item":  # Codex native rollout: what a resume loads.
@@ -158,18 +185,29 @@ def read_row(row: dict, evidence: Evidence, where: str) -> None:
             if not isinstance(parts, list) or any(not isinstance(p, dict) for p in parts):
                 evidence.unreadable.append(f"{where}: unreadable native message")
                 return
-            judgments_in(
-                "".join(str(p.get("text", "")) for p in parts if p.get("type") == "output_text"), evidence, where
-            )
+            text = "".join(str(p.get("text", "")) for p in parts if p.get("type") == "output_text")
+            # Any phase but commentary is the answer itself, and must be a readable judgment.
+            judgments_in(text, evidence, where, answer=item.get("phase") != "commentary")
         elif str(item.get("type", "")).endswith("_call"):
             evidence.tools.append(tool_name(item.get("name") or item.get("type")))
+    elif kind == "event_msg":  # Codex native copies of the same messages; read them too.
+        item = row.get("payload")
+        if not isinstance(item, dict):
+            evidence.unreadable.append(f"{where}: unreadable native event")
+        elif item.get("type") == "agent_message":
+            judgments_in(item.get("message"), evidence, where)
+        elif item.get("type") == "task_complete" and item.get("last_agent_message") is not None:
+            judgments_in(item["last_agent_message"], evidence, where)
     elif kind in ("item.started", "item.updated", "item.completed"):  # Codex exec stream.
         item = row.get("item")
         if not isinstance(item, dict):
             evidence.unreadable.append(f"{where}: unreadable client item")
         elif item.get("type") == "agent_message":
-            if kind == "item.completed":  # Earlier updates hold partial text of the same message.
-                judgments_in(item.get("text", ""), evidence, where)
+            # A message's updates hold partial text: read only its latest version, at the end of
+            # the stream (`messages`), so an interrupted message is still read.
+            key = item.get("id") or where
+            if kind == "item.completed" or key not in messages or not messages[key][2]:
+                messages[key] = (where, item.get("text"), kind == "item.completed")
         elif item.get("type") == "mcp_tool_call":
             server, tool = item.get("server"), item.get("tool")
             evidence.tools.append(tool_name(tool) if server == "audit" else f"{server}.{tool}")
@@ -185,13 +223,16 @@ def read_row(row: dict, evidence: Evidence, where: str) -> None:
             return
         for item in content:
             if item.get("type") == "tool_use" and item.get("name") == "StructuredOutput":
-                evidence.judgments.append(item.get("input"))
+                judgments_in(item.get("input"), evidence, where, answer=True)
             elif item.get("type") == "tool_use":
                 evidence.tools.append(tool_name(item.get("name")))
             elif item.get("type") == "text":
                 judgments_in(item.get("text", ""), evidence, where)
-    elif kind == "result" and row.get("structured_output") is not None:  # Claude's final result.
-        evidence.judgments.append(row["structured_output"])
+    elif kind == "result":  # Claude's final result: its structured answer and its text.
+        if row.get("structured_output") is not None:
+            judgments_in(row["structured_output"], evidence, where, answer=True)
+        if row.get("result") is not None:
+            judgments_in(row["result"], evidence, where)
 
 
 def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] | None = None) -> Evidence:
@@ -213,8 +254,11 @@ def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] 
     ]
     for path in sources:
         if path.is_file():
+            messages = {}
             for where, row in rows(path, evidence):
-                read_row(row, evidence, where)
+                read_row(row, evidence, where, messages)
+            for where, text, _ in messages.values():
+                judgments_in(text, evidence, where)
     previous = attempt / "previous-block.json"
     if previous.exists():
         try:
@@ -323,12 +367,6 @@ def failure_reason(failure: BaseException | str) -> str:
         return "security-audit: reviewer timed out"
     text = str(failure) or type(failure).__name__
     return text if text.startswith("security-audit: ") else "security-audit: " + text
-
-
-def concerns_recorded(state: Path, digest: str) -> bool:
-    """Whether the ledger already holds a concern, or unreadable rows, for this exact input."""
-    evidence = recorded(state, digest)
-    return bool(evidence.concerns() or evidence.unreadable)
 
 
 def holds(state: Path, attempt: Path) -> bool:

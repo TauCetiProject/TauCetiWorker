@@ -179,11 +179,67 @@ class Classification(unittest.TestCase):
         self.assertEqual(self.outcome().kind, ev.PASS)
         sa.record(self.state / "ledger.jsonl", {"batch": self.batch["input_digest"], "verdict": FINDING})
         self.assertFinding(self.outcome())
-        self.assertTrue(ev.concerns_recorded(self.state, self.batch["input_digest"]))
+        self.assertTrue(ev.recorded(self.state, self.batch["input_digest"]).concerns())
 
     def test_an_empty_incomplete_names_no_concern(self):
         self.assertEqual(ev.concern({"verdict": "incomplete", "findings": []}), [])
         self.assertEqual(ev.concern({"verdict": "unfinished", "findings": [" "]}), [])
+
+    def test_escaped_keys_and_json_carried_in_strings_still_bind(self):
+        escaped = '{"\\u0076erdict":"finding","\\u0066indings":["unsafe IO"]}'
+        self.assertEqual(json.loads(escaped), {"verdict": "finding", "findings": ["unsafe IO"]})
+        self.codex([native_message(escaped), native_message(PASS)], exec_answer(PASS))
+        self.assertFinding(self.outcome(), ["unsafe IO"])
+        self.setUp()
+        encoded = json.dumps(sa.serialize(FINDING))  # A JSON string whose content is the judgment.
+        self.codex([native_message(encoded), native_message(PASS)], exec_answer(PASS))
+        self.assertFinding(self.outcome())
+        self.setUp()
+        self.claude([*claude_answer(sa.serialize(FINDING))[:1], *claude_answer(PASS)[:1]], claude_answer(PASS))
+        self.assertFinding(self.outcome())
+        self.setUp()
+        nested = {"answer": FINDING}
+        self.claude(claude_answer(nested)[:1], claude_answer(PASS))
+        self.assertFinding(self.outcome())
+
+    def test_claude_result_text_and_codex_native_events_are_read(self):
+        result = {"type": "result", "subtype": "success", "result": sa.serialize(FINDING)}
+        self.claude(claude_answer(PASS)[:1], [*claude_answer(PASS), result])
+        self.assertFinding(self.outcome())
+        self.setUp()
+        event = {"type": "event_msg", "payload": {"type": "agent_message", "message": sa.serialize(FINDING)}}
+        self.codex([event, native_message(PASS)], exec_answer(PASS))
+        self.assertFinding(self.outcome())
+
+    def test_an_interrupted_exec_message_is_read_from_its_latest_update(self):
+        updated = {"type": "item.updated", "item": {"id": "m1", "type": "agent_message", "text": sa.serialize(FINDING)}}
+        self.codex([native_message(UNFINISHED)], [updated])
+        self.assertFinding(self.outcome("security-audit: reviewer timed out"))
+        self.setUp()
+        # A completed message replaces its partial updates, which are never read as text.
+        partial = {"type": "item.updated", "item": {"id": "m1", "type": "agent_message", "text": '{"verdict":"pa'}}
+        done = {"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": sa.serialize(PASS)}}
+        self.codex([native_message(PASS)], [partial, done, {"type": "turn.completed"}])
+        self.assertEqual(self.outcome().kind, ev.PASS)
+
+    # UNREADABLE --------------------------------------------------------------------
+    def test_a_malformed_judgment_beside_a_readable_one_is_unreadable(self):
+        note = sa.serialize(PASS) + ' then {"verdict":"finding","findings":["unsafe IO"],}'
+        self.codex([native_message(note, phase="commentary"), native_message(PASS)], exec_answer(PASS))
+        self.assertEqual(self.outcome().kind, ev.UNREADABLE)
+
+    def test_an_answer_that_is_not_a_judgment_is_unreadable(self):
+        self.codex([native_message("I found unsafe IO in A.lean."), native_message(PASS)], exec_answer(PASS))
+        self.assertEqual(self.outcome().kind, ev.UNREADABLE)
+        self.setUp()
+        self.claude([*claude_answer("unsafe IO in A.lean")[:1], *claude_answer(PASS)[:1]], claude_answer(PASS))
+        self.assertEqual(self.outcome().kind, ev.UNREADABLE)
+        self.setUp()
+        # Commentary prose is not an answer, so it never holds by itself.
+        self.codex(
+            [native_message("Reading page 6 next.", phase="commentary"), native_message(PASS)], exec_answer(PASS)
+        )
+        self.assertEqual(self.outcome().kind, ev.PASS)
 
     # UNREADABLE --------------------------------------------------------------------
     def test_a_partial_row_that_could_hold_an_answer_is_unreadable(self):

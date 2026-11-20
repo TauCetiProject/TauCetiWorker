@@ -1269,6 +1269,18 @@ class PrivateAlerts(unittest.TestCase):
         self.http.assert_not_called()
         self.assertFalse((self.work / "zulip-alerts.json").exists())
 
+    def test_alerts_use_the_outcome_the_block_records(self):
+        (self.work / "ledger.jsonl").write_text('{"from_sha": "' + "a" * 40 + '", "verdict": {"verd\n')
+        unreadable = {**self.block, "reason": "security-audit: unreadable evidence: x", "outcome": "unreadable"}
+        alerts.notify_block(self.work, unreadable)
+        self.assertEqual(self.http.call_count, 1)  # Immediately, despite a damaged ledger row.
+        sent = self.http.call_args.args[2]["content"]
+        self.assertIn("Unreadable evidence", sent)
+        self.assertIn("unreadable evidence: x", sent)
+        finding = {**self.block, "outcome": "finding", "verdict": {"verdict": "finding", "findings": ["run_cmd"]}}
+        self.assertEqual(alerts.report(self.work, finding)["details"], ["run_cmd"])
+        self.assertEqual(alerts.report(self.work, {**self.block, "outcome": "not-judged"})["kind"], "Operational stall")
+
     def test_code_uncertainty_notifies_immediately_during_operational_delay(self):
         (self.work / "ledger.jsonl").unlink()
         alerts.notify_block(self.work, self.block)

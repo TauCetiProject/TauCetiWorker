@@ -354,7 +354,10 @@ and binds, even when the final answer is `unfinished` or `pass`, or the client t
 out or failed: a concern is a judgment's nonempty findings, or a `finding` label. An
 `incomplete` label with no findings names no concern. Otherwise, evidence that
 cannot be read (a row cut off where an answer could have been, or text mentioning a
-judgment that cannot be parsed) holds the range for a human like a finding. Otherwise
+judgment that cannot be parsed, or an answer that is not a judgment) holds the range
+for a human like a finding, with an immediate **Unreadable evidence** DM. Judgments
+are found by decoding JSON, including JSON carried in strings, never by matching text.
+Each block records its classified outcome, and alerts read it from there. Otherwise
 the attempt is a **pass** only when its last launch ended normally with a valid
 complete pass and only the inspection's tools were used. Everything else
 (unfinished, malformed output, a provider failure, an unexpected tool) is **not a
