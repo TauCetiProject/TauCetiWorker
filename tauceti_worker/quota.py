@@ -1059,6 +1059,16 @@ def claude_usage_configuration_problem(cfg, *, check_identity: bool = True) -> s
     return None
 
 
+def claude_file_store_problem(env: dict) -> str | None:
+    """A file launch must not inherit an override selecting another credential store."""
+    if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in env:
+        return (
+            "Claude agent file routes do not support CLAUDE_SECURESTORAGE_CONFIG_DIR; "
+            "unset it so the CLI uses the configured agent file"
+        )
+    return None
+
+
 def claude_file_keychain_problem(config_dir: str | None, *, env: dict | None = None) -> str | None:
     """Refuse native OAuth or legacy API credentials that can replace the selected file.
 
@@ -1067,12 +1077,8 @@ def claude_file_keychain_problem(config_dir: str | None, *, env: dict | None = N
     """
     if sys.platform != "darwin" or claude_usage_credentials() is None:
         return None
-    environment = os.environ if env is None else env
-    if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in environment:
-        return (
-            "Claude agent file routes do not support CLAUDE_SECURESTORAGE_CONFIG_DIR; "
-            "unset it so the CLI uses the configured agent file"
-        )
+    if problem := claude_file_store_problem(os.environ if env is None else env):
+        return problem
     suffix = (
         "-" + hashlib.sha256(unicodedata.normalize("NFC", config_dir).encode()).hexdigest()[:8] if config_dir else ""
     )
@@ -2408,6 +2414,8 @@ class Quota:
             os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and route == "environment"
         ):
             return None
+        if route == "environment" and (problem := claude_file_store_problem(os.environ)):
+            return problem
         if not claude_agent_file_route_supported():
             return "Claude agent file routes are unavailable on this platform"
         if problem := claude_file_credential_problem(

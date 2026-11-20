@@ -108,6 +108,24 @@ class FileKeychain(unittest.TestCase):
                 with self.assertRaisesRegex(NoProgress, "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
                     agents.host_agent_launch("do not launch", "claude")
 
+    def test_host_store_override_refuses_on_both_platforms_before_other_io(self):
+        cfg = types.SimpleNamespace(home=Path("/tmp/home"), quota_cache=Path("/tmp/cache"))
+        for platform in ("linux", "darwin"):
+            with (
+                self.subTest(platform=platform),
+                patch.object(sys, "platform", platform),
+                patch.dict(os.environ, CLAUDE_SECURESTORAGE_CONFIG_DIR="/tmp/operator"),
+                patch.object(quota, "claude_file_credential_problem", side_effect=AssertionError("file read")),
+                patch.object(quota.subprocess, "run", side_effect=AssertionError("Keychain or model read")),
+                patch.object(quota, "_http_get_json", side_effect=AssertionError("usage read")),
+            ):
+                with self.assertRaisesRegex(NoProgress, "CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+                    agents.host_agent_launch("do not launch", "claude")
+                reader = quota.Quota(cfg)
+                for cache_only in (False, True):
+                    reader._cache_only = cache_only
+                    self.assertIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", reader._claude_launch_credential_unusable())
+
     def test_host_metadata_uses_child_environment_and_keeps_environment_token_exception(self):
         with (
             patch.object(quota, "claude_file_credential_problem", return_value=None),
@@ -136,7 +154,12 @@ class FileKeychain(unittest.TestCase):
         cfg = types.SimpleNamespace(home=Path("/tmp/home"), quota_cache=Path("/tmp/cache"))
         blob = {"claudeAiOauth": {"accessToken": "synthetic-agent", "expiresAt": (time.time() + 3600) * 1000}}
         with (
-            patch.dict(os.environ, TAUCETI_CLAUDE_AGENT_CREDENTIAL="file", CLAUDE_CODE_OAUTH_TOKEN="host-only"),
+            patch.dict(
+                os.environ,
+                TAUCETI_CLAUDE_AGENT_CREDENTIAL="file",
+                CLAUDE_CODE_OAUTH_TOKEN="host-only",
+                CLAUDE_SECURESTORAGE_CONFIG_DIR="/tmp/operator",
+            ),
             patch.object(quota, "_read_json_file", return_value=blob),
             patch.object(quota.subprocess, "run", side_effect=AssertionError("private route queried host Keychain")),
         ):

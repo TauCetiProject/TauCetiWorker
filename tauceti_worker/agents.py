@@ -977,15 +977,18 @@ def validate_host_agent_credentials(profile: AuthoringProfile | str, env: dict) 
     """Recheck the selected native Claude file at launch; argv inspection remains side-effect free."""
     if (
         _authoring_profile(profile).provider != "claude"
-        or sys.platform != "darwin"
         or claude_usage_credentials() is None
         or env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
         or env.get("TAUCETI_CLAUDE_BILLING") == "api"
         or env.get("TAUCETI_API_CONTEXT")
     ):
         return
-    from .quota import claude_file_credential_problem, claude_file_keychain_problem
+    from .quota import claude_file_credential_problem, claude_file_keychain_problem, claude_file_store_problem
 
+    if problem := claude_file_store_problem(env):
+        raise NoProgress(problem)
+    if sys.platform != "darwin":
+        return
     directory = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
     if problem := claude_file_credential_problem(directory / ".credentials.json", renewable=False):
         raise NoProgress(problem)
