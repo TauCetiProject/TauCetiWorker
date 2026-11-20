@@ -202,7 +202,7 @@ class Cleanup(unittest.TestCase):
 
         self.tree(state="submitted")
         cfg = SimpleNamespace(root=self.worker, binding=None)
-        task = SimpleNamespace(task_id="1", binding=None)
+        task = SimpleNamespace(task_id="1", kind="repair", binding=None)
 
         def attempt(*args, **kwargs):
             with cache_lease(self.worker, exclusive=True) as acquired:

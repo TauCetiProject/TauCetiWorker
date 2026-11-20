@@ -377,6 +377,28 @@ ci="one/project"
         result = self.native_survey([self.row(1), self.row(2, author=4)], blocking=True)
         self.assertEqual([candidate.pr for candidate in result.needs_fix.actionable], [1])
 
+    def test_adopted_native_author_is_repaired_without_counting_as_authored(self):
+        fork = {**self.row(3, author=4), "headRepository": {"nameWithOwner": "kim/project", "name": "project"}}
+        with patch.dict(os.environ, {"TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS": "4"}):
+            result = self.native_survey([self.row(1), self.row(2, author=4), fork], blocking=True)
+        self.assertEqual([candidate.pr for candidate in result.needs_fix.actionable], [1, 2])
+        self.assertEqual([p.number for p in result._mine_open_prs], [1])
+
+    def test_adopted_native_author_authorizes_only_same_repository_repairs(self):
+        w = self.native_worker()
+        w.gh.authenticated_actor = Mock(return_value=self.actor)
+        w.gh.validate_binding = Mock()
+        candidate = Candidate(1, "a" * 40, source_repository=self.repo, source_repository_id=7)
+        same = {"user": {"id": 4}, "head": {"repo": {"id": 7}}}
+        fork = {"user": {"id": 4}, "head": {"repo": {"id": 8}}}
+        with patch.dict(os.environ, {"TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS": "4"}):
+            w.gh.live_pull = Mock(return_value=same)
+            self.assertTrue(w.gh.authorize_candidate(candidate, require_writer=True))
+            w.gh.live_pull = Mock(return_value=fork)
+            self.assertFalse(w.gh.authorize_candidate(candidate, require_writer=True))
+        w.gh.live_pull = Mock(return_value=same)
+        self.assertFalse(w.gh.authorize_candidate(candidate, require_writer=True))
+
     def test_unavailable_history_never_becomes_unreviewed_work(self):
         result = self.native_survey([self.row()], metadata=Meta({}, "fetch_failed"))
         self.assertFalse(result.reviewable.actionable)
@@ -771,6 +793,51 @@ ci="one/project"
             self.source.anonymous_discovery = False
             self.assertTrue(publish_native_reviews(self.cfg))
             pending.assert_called_once()
+
+    def test_a_round_publishes_the_authoring_backpressure_it_enforces(self):
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import NoEligibleWork, RoundOpts
+
+        observations = self.observations([], [])
+        observations[0][2].n_mine_open, observations[1][2].n_mine_open = 3, 4
+        for _, _, result in observations:
+            result.max_open_prs = 7
+            result.roadmap_skip = ["B", "A", ""]
+        options = RoundOpts(only=["review"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True)
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            self.assertRaises(NoEligibleWork),  # nothing actionable: reported all the same
+        ):
+            run_round(None, options)
+        authoring = report.call_args.kwargs["authoring"]
+        names = [name for name, _, _ in observations]
+        self.assertEqual(authoring["sources"], {names[0]: 3, names[1]: 4})
+        self.assertEqual(
+            {k: authoring[k] for k in ("count", "limit", "blocked", "scope", "skip")},
+            dict(count=7, limit=7, blocked=True, scope="any", skip="A,B"),
+        )
+        for _, _, result in observations:  # a Fleet-focused round counts every roadmap
+            result.roadmap_only, result._automatic_open_count = "Algebra", result.n_mine_open
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            self.assertRaises(NoEligibleWork),
+        ):
+            run_round(None, options)
+        self.assertEqual(report.call_args.kwargs["authoring"]["scope"], "any")
+        for _, _, result in observations:  # an explicit area counts only that area
+            del result._automatic_open_count
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            self.assertRaises(NoEligibleWork),
+        ):
+            run_round(None, options)
+        self.assertEqual(report.call_args.kwargs["authoring"]["scope"], "Algebra")
 
     def test_native_execution_failure_does_not_invalidate_github_authoring_inventory(self):
         import contextlib

@@ -170,6 +170,33 @@ def _keeping(pause, call, *args, **kwargs):
         raise
 
 
+def report_authoring(healthy):
+    """Publish the authoring backpressure this round enforces, for supervisors such as Fleet.
+
+    The count is this round's own survey of every healthy source: what roadmap authoring is
+    actually checked against, whichever forge it runs on."""
+    import time
+
+    from .runtime_status import report_runtime
+
+    first = healthy[0][2]
+    count = sum(result.n_mine_open for _, _, result in healthy)
+    # A Fleet-focused round counts every roadmap while it works in one area: report the scope the
+    # count covers, not the area selected for work.
+    counted_all = getattr(first, "_automatic_open_count", None) is not None
+    report_runtime(
+        authoring=dict(
+            observed_at=time.time(),
+            sources={name: result.n_mine_open for name, _, result in healthy},
+            count=count,
+            limit=first.max_open_prs,
+            blocked=count >= first.max_open_prs,
+            scope="any" if counted_all else first.roadmap_only or "any",
+            skip=",".join(sorted(set(filter(None, first.roadmap_skip)))),
+        )
+    )
+
+
 def run_round(w, opts, *, use_fleet_focus=True):
     import os
 
@@ -210,6 +237,7 @@ def run_round(w, opts, *, use_fleet_focus=True):
         if waits:
             raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
+    report_authoring(healthy)
     pause = None
     if want(opts.only, "reconcile") and not getattr(opts, "prs", ()):
         # Once a round and ahead of any source's work, reconciliation reads every healthy source. It

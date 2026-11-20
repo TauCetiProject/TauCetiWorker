@@ -66,7 +66,8 @@ override_warning() {
 }
 # Drop-ins silently override the installed unit (and each other), so the running code stops being
 # the checkout's. Refuse before touching anything.
-for dropin in "$UNIT_DIR"/tauceti-queue.service.d/*.conf "$UNIT_DIR"/tauceti-queue-backup.service.d/*.conf; do
+for dropin in "$UNIT_DIR"/tauceti-queue.service.d/*.conf "$UNIT_DIR"/tauceti-queue-backup.service.d/*.conf \
+  "$UNIT_DIR"/tauceti-queue-clone-maintenance.service.d/*.conf; do
   if [ -e "$dropin" ]; then
     die "systemd drop-in $dropin overrides the installed unit; queue units must not use drop-ins. Move it out of $(dirname "$dropin"), then rerun"
   fi
@@ -116,15 +117,21 @@ if [ ! -e "$content_clone/HEAD" ] && [ ! -e "$content_clone/.git" ]; then
 else
   log "content clone present at $content_clone"
 fi
+# Git's automatic maintenance would run detached inside the service, where a restart can kill it and
+# strand its lock; tauceti-queue-clone-maintenance.timer maintains the clone instead.
+if git -C "$content_clone" rev-parse --git-dir >/dev/null 2>&1; then
+  git -C "$content_clone" config maintenance.auto false
+fi
 
 # --- units ----------------------------------------------------------------------------------------
 mkdir -p "$UNIT_DIR"
-for unit in tauceti-queue.service tauceti-queue-backup.service tauceti-queue-backup.timer; do
+for unit in tauceti-queue.service tauceti-queue-backup.service tauceti-queue-backup.timer \
+  tauceti-queue-clone-maintenance.service tauceti-queue-clone-maintenance.timer; do
   release_render_unit "$unit"
 done
 systemctl --user daemon-reload
-systemctl --user enable --quiet tauceti-queue.service tauceti-queue-backup.timer
-systemctl --user start tauceti-queue-backup.timer
+systemctl --user enable --quiet tauceti-queue.service tauceti-queue-backup.timer tauceti-queue-clone-maintenance.timer
+systemctl --user start tauceti-queue-backup.timer tauceti-queue-clone-maintenance.timer
 
 if [ "$RESTART" = 1 ]; then
   log "restarting tauceti-queue.service"

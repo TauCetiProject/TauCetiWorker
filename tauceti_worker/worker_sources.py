@@ -96,6 +96,12 @@ def configure(args):
         == "https://git.taucetiproject.org"
     ):
         os.environ["TAUCETI_FORGEJO_TOKEN_FILE"] = str(Path.home() / ".config/tauceti-forgejo/worker-token")
+    from .source_identity import adopted_author_ids
+
+    try:
+        adopted_author_ids()
+    except ValueError as error:
+        raise Die(str(error)) from None
     os.environ["TAUCETI_WORKER_FORGES"] = requested
     os.environ["TAUCETI_NEW_PR_FORGE"] = destination
 

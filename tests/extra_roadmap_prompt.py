@@ -71,6 +71,7 @@ try:
     os.environ["TAUCETI_RESPECT_CLAIMS"] = "false"  # no intentions-board call
     os.environ["TAUCETI_ROADMAP_SKIP"] = "Algebra"
     tc.work_units.ensure_fork = lambda: "alice/TauCeti"
+    tc.work_units.claims_repo = lambda: "alice/TauCeti"
     tc.work_units.avoid_list = lambda *_args: "none"
     tc.work_units.fetch_ref = lambda repo, dest: Path(dest).mkdir(parents=True, exist_ok=True) or True
     tc.work_units.prepare_checkout = lambda cfg, **_: True
