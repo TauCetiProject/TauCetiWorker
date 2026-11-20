@@ -253,8 +253,11 @@ class Pool:
                 attempt = json.loads(running.read_text())["attempt"]
                 stopped = json.loads((Path(attempt) / "input.json").read_text())
                 block = {"from_sha": stopped["from_sha"], "to_sha": stopped["commits"][-1]["sha"], "attempt": attempt}
-            except (OSError, ValueError, KeyError, TypeError, IndexError):
-                block = {"reason": "security-audit: unreadable running.json"}
+            except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
+                # Its range is unknown, so nothing can bind it: hold the pool for review (the watchdog DMs).
+                raise NoProgress(
+                    f"security-audit pool: {running} cannot be settled; preserve it for review: {exc}"
+                ) from exc
             self.import_block(block, main)
             running.unlink()
         path = self.work / "blocked.json"

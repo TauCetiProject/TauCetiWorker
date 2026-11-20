@@ -839,6 +839,13 @@ class WorkerRounds(PoolFixture):
                 self.round(lambda b, a: self.verdict(b))
         self.assertEqual(self.advanced, [])
 
+    def test_an_unreadable_round_journal_holds(self):
+        (self.state / "running.json").write_text(sa.serialize({"attempt": str(self.state / "attempt-gone")}))
+        with self.assertRaisesRegex(NoProgress, "cannot be settled"):
+            self.round(lambda b, a: self.verdict(b))
+        self.assertTrue((self.state / "running.json").exists())
+        self.assertEqual(self.calls, [])
+
     def test_a_legacy_block_without_a_concern_is_inspected_afresh(self):
         block = {
             "from_sha": self.shas[0],
