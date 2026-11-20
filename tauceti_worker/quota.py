@@ -1001,7 +1001,7 @@ def claude_usage_configuration_problem(cfg) -> str | None:
     return None
 
 
-def claude_file_keychain_problem(home: Path) -> str | None:
+def claude_file_keychain_problem(config_dir: str | None) -> str | None:
     """Refuse a macOS file route shadowed by a directory-specific Claude Keychain item.
 
     Query metadata only: never retrieve a password, unlock the Keychain, or mutate it. The
@@ -1009,13 +1009,13 @@ def claude_file_keychain_problem(home: Path) -> str | None:
     """
     if sys.platform != "darwin" or claude_usage_credentials() is None:
         return None
-    directory = os.environ.get("CLAUDE_CONFIG_DIR")
+    directory = config_dir
     service = "Claude Code-credentials"
     if directory:
         service += "-" + hashlib.sha256(directory.encode()).hexdigest()[:8]
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-s", service],
+            ["/usr/bin/security", "find-generic-password", "-s", service],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=5,
@@ -2337,10 +2337,13 @@ class Quota:
         ):
             return None
         if problem := claude_file_credential_problem(
-            claude_dir(self.cfg.home) / ".credentials.json", renewable=route == "environment"
+            claude_dir(self.cfg.home) / ".credentials.json",
+            renewable=route == "environment" and sys.platform != "darwin",
         ):
             return problem
-        return claude_file_keychain_problem(self.cfg.home)
+        if route == "environment" and not getattr(self, "_cache_only", False):
+            return claude_file_keychain_problem(os.environ.get("CLAUDE_CONFIG_DIR"))
+        return None
 
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None

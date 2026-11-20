@@ -1007,6 +1007,21 @@ def host_agent_argv(
     elif profile.provider in OPENROUTER_MODELS:
         argv = [PI_RUN, "openrouter", profile.model, "--prompt", prompt]
     else:  # claude (Opus); ANTHROPIC_API_KEY unset so it bills the Max plan
+        if (
+            sys.platform == "darwin"
+            and claude_usage_credentials() is not None
+            and not env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+            and env.get("TAUCETI_CLAUDE_BILLING") != "api"
+            and not env.get("TAUCETI_API_CONTEXT")
+        ):
+            from .quota import claude_file_credential_problem, claude_file_keychain_problem
+
+            if problem := claude_file_credential_problem(
+                claude_dir(Path.home()) / ".credentials.json", renewable=False
+            ):
+                raise Die(problem)
+            if problem := claude_file_keychain_problem(env.get("CLAUDE_CONFIG_DIR")):
+                raise Die(problem)
         # The one exception is a launcher that bills the API with the key in its own environment and
         # no accounting shim (the queue's repair task, `TAUCETI_CLAUDE_BILLING=api` without
         # `TAUCETI_API_CONTEXT`); the fleet's API mode routes the key through the shim instead and has
@@ -2519,7 +2534,7 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
     the private directory as the same fallback the old in-place handoff provided.
 
     With a usage login (claude_usage_credentials) the configured file is the agents' credential and is
-    staged without a Keychain password read or unlock; metadata can reject a shadowing item.
+    staged without a Keychain password read or unlock.
 
     The caller owns and must remove the returned directory."""
     if sys.platform != "darwin":
@@ -2532,10 +2547,8 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
 
     source = claude_dir(cfg.home) / ".credentials.json"
     if claude_usage_credentials() is not None:
-        from .quota import claude_file_credential_problem, claude_file_keychain_problem
+        from .quota import claude_file_credential_problem
 
-        if problem := claude_file_keychain_problem(cfg.home):
-            raise Die(problem)
         if problem := claude_file_credential_problem(source, renewable=False):
             raise Die(problem)
         # The configured file is the agents' credential here; the Keychain item for the default config

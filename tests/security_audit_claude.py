@@ -138,6 +138,34 @@ class HaikuContinuation(unittest.TestCase):
         schema = json.loads(argv[argv.index("--json-schema") + 1])
         self.assertIn("unfinished", schema["properties"]["verdict"]["enum"])
 
+    def test_separate_usage_login_missing_agent_file_never_uses_keychain(self):
+        (self.root / ".credentials.json").unlink()
+        from tauceti_worker import quota
+
+        with (
+            patch.dict(os.environ, TAUCETI_CLAUDE_USAGE_CREDENTIALS=str(self.root / "usage.json")),
+            patch.object(
+                quota, "_claude_keychain_creds", side_effect=AssertionError("wrong account fallback")
+            ) as keychain,
+            patch.object(sa.subprocess, "run") as launch,
+        ):
+            with self.assertRaisesRegex(Die, "refusing Keychain fallback"):
+                sa.inspect(self.batch, "claude", self.attempt("missing-credential"), claude_credential="subscription")
+        keychain.assert_not_called()
+        launch.assert_not_called()
+
+    def test_separate_usage_login_expired_agent_is_refused_before_launch(self):
+        (self.root / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "expired", "expiresAt": 1, "refreshToken": "source-owned"}})
+        )
+        with (
+            patch.dict(os.environ, TAUCETI_CLAUDE_USAGE_CREDENTIALS=str(self.root / "usage.json")),
+            patch.object(sa.subprocess, "run") as launch,
+        ):
+            with self.assertRaisesRegex(Die, "expired"):
+                sa.inspect(self.batch, "claude", self.attempt("expired-credential"), claude_credential="subscription")
+        launch.assert_not_called()
+
     def test_policy_has_luna_continuation_semantics(self):
         self.assertEqual(sa.SERVED_CLAUDE_PROMPT, sa.V2_MODEL_PROMPT + sa.SERVED_READING_POLICY)
         self.assertEqual(sa.SERVED_CLAUDE_PROMPT, sa.SERVED_MODEL_PROMPT)

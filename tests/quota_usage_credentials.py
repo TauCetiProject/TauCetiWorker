@@ -319,7 +319,7 @@ def cases():
 for platform in ("linux", "darwin"):
     print(f"--- {platform}")
     plat, keychain = on(platform)
-    with plat, keychain:
+    with plat, keychain, patch.object(tc.quota, "claude_file_keychain_problem", return_value=None):
         cases()
 
 # 7) During a quota wait on macOS the pacer pins the Keychain identity it last read, so that local

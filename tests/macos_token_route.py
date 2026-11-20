@@ -65,7 +65,7 @@ class Keychain:
         self.calls = []
 
     def __call__(self, cmd, *a, **k):
-        if cmd[0] != "security":
+        if Path(cmd[0]).name != "security":
             raise AssertionError(f"unexpected subprocess: {cmd}")
         self.calls.append(cmd)
         if "-w" not in cmd:
@@ -128,6 +128,15 @@ try:
     check("the seed file is 0600", oct(os.stat(seed / ".credentials.json").st_mode & 0o777), "0o600")
     shutil.rmtree(seed)
 
+    # Disposable launches cannot preserve renewal ownership of a copied ordinary login.
+    ordinary = {"claudeAiOauth": {"accessToken": "TOKEN-3", "expiresAt": YEAR_MS, "refreshToken": "DO-NOT-COPY"}}
+    worker_file.write_text(json.dumps(ordinary))
+    seed = agents._stage_claude_creds_for_bubble(cfg)
+    check("the private seed has no renewable token", "refreshToken" in oauth(seed / ".credentials.json"), False)
+    check("the source keeps its renewal owner", oauth(worker_file)["refreshToken"], "DO-NOT-COPY")
+    shutil.rmtree(seed)
+    worker_file.write_text(json.dumps(setup_token("TOKEN-3")))
+
     # 6. A missing token file stops the launch and names the file, not a Keychain to unlock.
     worker_file.unlink()
     message = ""
@@ -154,6 +163,12 @@ try:
     check("an expired token file blocks Claude work", blocked.available, False)
     check("the error names the worker's token file", str(worker_file) in (blocked.error or ""), True)
     check("no usage request is made for it", requests, [])
+    message = ""
+    try:
+        agents._stage_claude_creds_for_bubble(cfg)
+    except tc.Die as error:
+        message = str(error)
+    check("an expired credential cannot be staged after admission", "expired" in message, True)
 
     check(
         "no Keychain password or unlock was requested",

@@ -162,11 +162,11 @@ class Isolation(unittest.TestCase):
             with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "file"}):
                 self.assertIn("no ", reader._claude_launch_credential_unusable())
 
-    def test_mac_agent_behavior_stays_with_keychain_until_the_separate_mac_route_change(self):
+    def test_mac_expired_file_is_blocked_without_a_keychain_password_read(self):
         credential(self.agent, expires=-60)
         reader = quota.Quota(self.config())
         with patch.object(sys, "platform", "darwin"), patch.object(quota, "_claude_keychain_creds") as keychain:
-            self.assertIsNone(reader._claude_launch_credential_unusable())
+            self.assertIn("expired", reader._claude_launch_credential_unusable())
             self.assertIsNone(quota.claude_usage_configuration_problem(self.cfg))
         keychain.assert_not_called()
 

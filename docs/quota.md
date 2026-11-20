@@ -199,7 +199,7 @@ plain file on every platform: on macOS the Keychain is not consulted for it and
 
 On macOS the variable also makes the token file the agents' credential for the
 worker, as it is elsewhere: the file is mirrored into isolated workers, and a
-bubble round is seeded from it, so the worker reads no Claude item from the
+bubble round is seeded from it, so the worker reads no Claude credential from the
 Keychain. Claude Code itself still looks first for a Keychain item belonging to
 the config directory it is given and reads the file when there is none, so the
 token directory, and an isolated worker's copy of it, must be directories nobody
@@ -304,8 +304,9 @@ than assumed free.
 ### macOS file-route checks
 
 With a separate usage login, use a dedicated agent `CLAUDE_CONFIG_DIR` with no Claude sign-in
-Keychain entry for that directory. The worker checks item metadata without retrieving the
-password or unlocking/deleting any Keychain item. A matching entry or an unavailable check
+Keychain entry for that directory. Before a host CLI launch that uses the file, the worker checks item metadata without retrieving the
+password or unlocking/deleting any Keychain item. Cache-only observations do not poll the Keychain;
+private reviewer/container launches validate the access-only copy rather than querying the host login. A matching entry or an unavailable check
 blocks the file route; choose a fresh dedicated directory rather than deleting an operator's
 login. Native CLI acceptance must verify the directory-service convention for the tested
 Claude version. The usage login is never a fallback inference credential.
