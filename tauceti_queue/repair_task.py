@@ -2077,22 +2077,23 @@ def rewrite_projections(
 ) -> tuple[dict, dict] | None:
     """Rewrite the numeric projections the findings report, in the members that wrote them
     (``repair_numproj.rewrite_chain``), before an agent sees them. ``stream`` is the task's streaming
-    build when its error list counts too: this waits for that build to end, so that the projections it
-    reports late are rewritten too and the rewrite's own build can take the build lock (since rc1 the
-    lint is in nearly every repair, so the agent would rarely start before that anyway). Returns the findings with those files' errors replaced by
+    build when its error list counts too: when the lint is among the errors it has reported so far, this
+    waits for that build to end, so that its later projections are rewritten too and the rewrite's own
+    build can take the build lock. Otherwise the agent starts at the stream's first error as before, and
+    projections the stream reports later are rewritten after a failed verification. Returns the findings with those files' errors replaced by
     what a scoped build of them still reports (the error list is updated the same way) and the record
     for the outcome; None when there is nothing to rewrite or the rewrite does not apply, with the
     worktree and findings as they were."""
     directory = repair.listings_path(worktree).parent
-    errors = None
+    errors = repair_parallel.read_errors(directory) if stream is not None else None
+    if not repair_numproj.lint_files(findings, errors):
+        return None
     if stream is not None:
         while not stream.finished.wait(0.5):
             if cancel.is_set():
                 return None
         errors = repair_parallel.read_errors(directory)
     files = repair_numproj.lint_files(findings, errors)
-    if not files:
-        return None
     tip = git(worktree, "rev-parse", "HEAD").strip()
     never_edited = {m.number for m in task.members if m.no_repair or m.withdrawn}
     frozen = frozenset(c.sha for c in read_chain(cfg.clone, task.validation_base, tip) if c.pr in never_edited)
