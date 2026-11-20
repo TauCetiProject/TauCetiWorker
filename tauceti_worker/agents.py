@@ -919,18 +919,24 @@ def fetch_git_source(url: str, dir: Path) -> bool:
     return _fetch_shallow(url, dir)
 
 
+# One agent shell command's default budget. Long enough for a cold build that waits for compiler
+# capacity, short enough that a hung process (seen: a deadlocked `lean` idle for hours) costs an
+# hour of the round rather than all of it. Launchers set TAUCETI_SHELL_LIMIT_SECONDS to choose
+# another budget; it never exceeds the round's remaining time.
+DEFAULT_SHELL_LIMIT_SECONDS = 3600
+
+
 def _foreground_shell_env(deadline: float, limit_seconds: float | None = None) -> dict[str, str]:
-    # Keep commands in the foreground, bounded by the round rather than an unrelated
-    # ten-minute ceiling: waiting for compiler capacity consumes wall time too.
-    # Launchers may still request a shorter command budget explicitly.
+    # Keep commands in the foreground, bounded by the round and a per-command budget rather than
+    # Claude Code's unrelated ten-minute ceiling: waiting for compiler capacity consumes wall time too.
     if limit_seconds is None:
         try:
             value = os.environ.get("TAUCETI_SHELL_LIMIT_SECONDS")
-            limit_seconds = float(value) if value else None
+            limit_seconds = float(value) if value else DEFAULT_SHELL_LIMIT_SECONDS
         except ValueError:
-            limit_seconds = None
+            limit_seconds = DEFAULT_SHELL_LIMIT_SECONDS
     remaining_ms = max(1000, int((deadline - time.time()) * 1000))
-    timeout_ms = remaining_ms if limit_seconds is None else min(remaining_ms, max(1000, int(limit_seconds * 1000)))
+    timeout_ms = min(remaining_ms, max(1000, int(limit_seconds * 1000)))
     return {
         "BASH_DEFAULT_TIMEOUT_MS": str(timeout_ms),
         "BASH_MAX_TIMEOUT_MS": str(timeout_ms),

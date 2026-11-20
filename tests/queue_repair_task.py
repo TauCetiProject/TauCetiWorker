@@ -5338,8 +5338,10 @@ class Records(unittest.TestCase):
             env = agents._foreground_shell_env(deadline)
         self.assertEqual(env["BASH_MAX_TIMEOUT_MS"], "7200000")
         self.assertEqual(env["BASH_DEFAULT_TIMEOUT_MS"], "7200000")
-        with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": ""}):
-            self.assertEqual(agents._foreground_shell_env(deadline)["BASH_MAX_TIMEOUT_MS"], "10800000")
+        with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": ""}):  # the default: an hour
+            self.assertEqual(agents._foreground_shell_env(deadline)["BASH_MAX_TIMEOUT_MS"], "3600000")
+        with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": "not a number"}):
+            self.assertEqual(agents._foreground_shell_env(deadline)["BASH_MAX_TIMEOUT_MS"], "3600000")
         with patch.dict(os.environ, {"TAUCETI_SHELL_LIMIT_SECONDS": "7200"}):
             self.assertEqual(agents._foreground_shell_env(time.time() + 30)["BASH_MAX_TIMEOUT_MS"], "30000")
 
