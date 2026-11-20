@@ -2031,16 +2031,14 @@ class Controller:
                     return task, batch
             return None
         # Pre-rebase first: the next head's pre-rebase is on the way to staging, a later batch's
-        # own-base preparation is not (and the next landing supersedes it anyway, `_stale_prepare`).
-        # When the background slots are full, the newest such preparation gives its slot to the
-        # pre-rebase: the claims do not grow, so the slot kept for head work stays free.
+        # own-base preparation is not. When the background slots are full, the newest such
+        # preparation gives its slot to the pre-rebase: the claims do not grow, so the capacity kept
+        # for head work stays available.
         successor = self._open_batch()
+        if successor is None:
+            return None
         pre_rebase = next(
-            (
-                pair
-                for pair in unheld
-                if successor is not None and pair[1]["id"] == successor["id"] and pair[0]["kind"] == TASK_PRE_REBASE
-            ),
+            (pair for pair in unheld if pair[1]["id"] == successor["id"] and pair[0]["kind"] == TASK_PRE_REBASE),
             None,
         )
         if pre_rebase is None:
