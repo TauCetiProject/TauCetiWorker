@@ -49,11 +49,12 @@ export TAUCETI_FORGEJO_TOKEN_FILE="$HOME/.config/tauceti-forgejo/worker-token"
 
 When the fleet's Forgejo account changes, set
 `TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS` to the previous account's numeric user ID
-(comma-separated for several). The worker then fixes, rebases and repairs CI on
-those authors' open same-repository PRs as if they were its own. Authoring
-pressure (`max_open_prs`) still counts only PRs the current account opened. PRs
-from the previous account's fork stay unmaintained unless the fork allows
-maintainer edits.
+(comma-separated for several). The worker then maintains those authors' open
+PRs whose branches are in this repository as if they were its own: fixes,
+review responses, rebases and closing superseded work. Authoring pressure
+(`max_open_prs`) and the "mine" status counts still cover only PRs the current
+account opened. PRs from the previous account's fork are not adopted. A
+malformed value stops the worker at startup.
 
 The canonical instance defaults to those values. Other instances require
 explicit bindings. Token files must be private. A missing canonical credential

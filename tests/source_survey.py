@@ -130,9 +130,19 @@ class SourceSurveys(unittest.TestCase):
             self.assertFalse(result.owns(result.open_prs[2]))
             self.assertTrue(owns_author(result, {"id": self.forge.key + "/users/3", "login": "kim"}))
             self.assertFalse(owns_author(result, {"id": "forgejo:https://other.example.org/users/3", "login": "kim"}))
-            # Authoring pressure still counts only the worker's own PRs.
+            # Authoring pressure and "mine" counts still cover only the worker's own PRs.
             self.assertEqual(result.n_mine_open, 1)
             self.assertEqual([p.number for p in result._mine_open_prs], [1])
+            awaiting = next(bucket for bucket in result.status_labels if bucket[0] == "awaiting-author")
+            self.assertEqual(awaiting, ("awaiting-author", 3, 1))
+            # An adopted author's fork PR is not maintained: the account cannot push its branch.
+            fork = dataclasses.replace(
+                result.open_prs[1], source_head_repository=RepositoryRef(self.forge, "kim/project")
+            )
+            self.assertFalse(result.owns(fork))
+            self.assertTrue(
+                result.owns(dataclasses.replace(result.open_prs[0], source_head_repository=fork.source_head_repository))
+            )
 
     def test_adopted_author_ids_are_validated_and_forgejo_only(self):
         from tauceti_worker.source_identity import adopted_author_ids, maintains_author

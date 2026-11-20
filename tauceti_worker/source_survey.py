@@ -53,10 +53,14 @@ class SourceSurvey(Survey):
         )
 
     def owns(self, pr: PRInfo) -> bool:
-        """PRs this worker maintains: its own, plus those of adopted Forgejo authors."""
+        """PRs this worker maintains: its own, plus adopted Forgejo authors' same-repository PRs."""
+        if self.authored(pr):
+            return True
         return bool(
             isinstance(pr, SourcePRInfo)
             and pr.source_repository.key == self.source_repository.key
+            and pr.source_head_repository is not None
+            and pr.source_head_repository.key == self.source_repository.key
             and pr.source_author is not None
             and maintains_author(
                 self.source_actor, pr.source_author.principal.forge, int(pr.source_author.principal.native_id)
@@ -189,7 +193,9 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
     result.n_open_nondraft = len(nondraft)
     result._mine_open_prs = [p for p in nondraft if result.authored(p)]
     result.rescope_roadmap()
-    result.status_labels, result.n_status_unlabeled = bucket_status_labels(nondraft, result.me_login, owns=result.owns)
+    result.status_labels, result.n_status_unlabeled = bucket_status_labels(
+        nondraft, result.me_login, owns=result.authored
+    )
     # rescope_roadmap also chooses authoring for legacy surveys. This inventory
     # supplies no source write, claim or execution authority, including authoring.
     result.next_auto_stage = None

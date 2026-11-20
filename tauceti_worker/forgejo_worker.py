@@ -57,7 +57,13 @@ class ForgejoWorkerSource(ForgejoReadSource):
             return None
         from .source_identity import maintains_author
 
-        return maintains_author(actor, self.repository.forge, row["user"]["id"])
+        if actor is not None and row["user"]["id"] == int(actor.principal.native_id):
+            return True
+        # An adopted author's PR is maintained only on a branch in this repository.
+        head = (row.get("head") or {}).get("repo") or {}
+        return head.get("id") == self.identity.native_id and maintains_author(
+            actor, self.repository.forge, row["user"]["id"]
+        )
 
     def writable_repository(self):
         """Use an explicit writable fork, or authorized same-repository branches."""
