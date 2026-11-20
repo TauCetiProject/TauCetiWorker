@@ -2398,6 +2398,47 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         )
         else None
     )
+    running = work / "running.json"
+    if running.exists() and not opts.dry_run:
+        # A round stopped mid-inspection: classify what its attempt recorded before anything else.
+        attempt = Path(json.loads(running.read_text())["attempt"])
+        stopped = json.loads((attempt / "input.json").read_text())
+        verdict = None
+        try:
+            verdict = judged(attempt, stopped, "security-audit: interrupted when the Worker stopped")
+        except NotJudged:
+            pass  # Nothing binds: this round inspects afresh.
+        except Unreadable as exc:
+            failure = {"from_sha": stopped["from_sha"], "to_sha": stopped["commits"][-1]["sha"], "reason": str(exc)}
+            failure.update(outcome_of(None, exc), attempt=str(attempt), batch=stopped["input_digest"])
+            failure["commits"] = [c["sha"] for c in stopped["commits"]]
+            blocked.write_text(serialize(failure))
+            record(work / "ledger.jsonl", failure)
+            notify_block(work, failure)
+        if verdict is not None:
+            record(
+                work / "ledger.jsonl",
+                review_record(
+                    admin_login(),
+                    opts.work_model,
+                    PROTOCOL,
+                    stopped,
+                    attempt,
+                    verdict,
+                    credential_kind(opts.work_model),
+                ),
+            )
+            failure = {
+                "from_sha": stopped["from_sha"],
+                "to_sha": stopped["commits"][-1]["sha"],
+                "attempt": str(attempt),
+            }
+            failure.update(outcome_of(verdict, None), reason="security-audit: " + "; ".join(verdict["findings"]))
+            blocked.write_text(serialize(failure))
+            record(work / "ledger.jsonl", failure)
+            notify_block(work, failure)
+        running.unlink()
+        previous = json.loads(blocked.read_text()) if blocked.exists() else {}
     if not opts.dry_run and previous.get("from_sha") == cursor and not size_failure:
         notify_block(work, previous)
         if recover(cfg, opts, previous):
@@ -2444,6 +2485,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     model = reviewer_model(provider)
     log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
     verdict = None
+    save(running, {"attempt": str(attempt)})  # Until classified, a stopped round's attempt is settled next.
     try:
         if any(c["files"] for c in batch["commits"]):
             verdict = inspect(batch, provider, attempt)
@@ -2458,6 +2500,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
             work / "ledger.jsonl",
             review_record(actor, provider, protocol, batch, attempt, verdict, credential_kind(provider)),
         )
+        running.unlink(missing_ok=True)
         if verdict["verdict"] != "pass":
             raise Die("security-audit: " + "; ".join(verdict["findings"]))
         landed = advance(repo, batch)
@@ -2474,6 +2517,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         )
         if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
             failure["failure_kind"] = "provider-timeout"
+        running.unlink(missing_ok=True)  # Classified: the failure below records it.
         if isinstance(exc, NotJudged):
             # Not a judgment: nothing binds, and the next round inspects this range afresh.
             record(work / "ledger.jsonl", failure)

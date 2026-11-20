@@ -1014,6 +1014,43 @@ class FreshRun(unittest.TestCase):
             )
 
 
+class StoppedRound(unittest.TestCase):
+    setUp = historical.Run.setUp
+
+    def stopped(self, outputs):
+        work = self.state / sa.CURSOR
+        attempt = work / "attempt-1"
+        attempt.mkdir(parents=True)
+        batch = {"from_sha": self.old, "main_sha": self.old, "commits": [{"sha": self.target, "files": []}]}
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        uses = [{"type": "tool_use", "name": "StructuredOutput", "input": value} for value in outputs]
+        (attempt / "model-transcript.jsonl").write_text(
+            "".join(sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n" for use in uses)
+        )
+        (work / "running.json").write_text(sa.serialize({"attempt": str(attempt)}))
+        return work
+
+    def test_a_finding_in_a_stopped_round_binds_before_any_new_inspection(self):
+        work = self.stopped([{"verdict": "finding", "findings": ["IO"]}])
+        with patch.object(sa, "inspect") as model, self.assertRaises(NoProgress):
+            sa.run(SimpleNamespace(state=self.state), self.opts)
+        model.assert_not_called()
+        blocked = json.loads((work / "blocked.json").read_text())
+        self.assertEqual((blocked["outcome"], blocked["verdict"]["findings"]), ("finding", ["IO"]))
+        self.assertFalse((work / "running.json").exists())
+
+    def test_a_stopped_round_without_a_judgment_is_inspected_afresh(self):
+        work = self.stopped([{"verdict": "unfinished", "findings": []}])
+        with (
+            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
+            patch.object(sa, "advance", return_value=self.target),
+        ):
+            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
+        model.assert_called_once()
+        self.assertFalse((work / "running.json").exists())
+
+
 class ClientCompatibility(unittest.TestCase):
     def test_historical_reader_bytes_are_preserved(self):
         self.assertEqual(
