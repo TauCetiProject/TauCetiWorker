@@ -885,7 +885,8 @@ class Controller:
         `_retain` pushes through the outbox only while `publication_enabled` is true, so a ref retained
         in shadow mode exists in the clone alone, and a repair task or CI fetching it from GitHub finds
         nothing. For the head and every open batch, the refs the controller would have pushed (the
-        batch's tip under its current version and each non-removed member's accepted head) are
+        batch's tip under its current version, each non-removed member's accepted head and the clean
+        prefix of each open conflict task) are
         enqueued when the clone still holds them under that name and the outbox has no entry for the
         ref and SHA. Done entries stay in the outbox, so the check is one indexed lookup per ref and no
         GitHub call: a pass over a fully published queue enqueues nothing. Runs at restart, when
@@ -898,6 +899,10 @@ class Controller:
             wanted = [(self.batch_ref(batch["id"], batch["version"]), batch["tip"])]
             for member in self._members(batch["id"]):
                 wanted.append((self.input_ref(member["number"], member["accepted_head"]), member["accepted_head"]))
+            for task in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
+                if (step := self._conflict_step(task)) is not None:
+                    prefix = step["clean_prefix_tip"]
+                    wanted.append((self.conflict_ref(batch["id"], prefix), prefix))
             for ref, sha in wanted:
                 key = f"retain:{ref}:{sha}"
                 if self.store.row("outbox", {"key": key}) is not None or self._local_ref(ref) != sha:
@@ -5904,9 +5909,8 @@ class Controller:
         onto = (self._state("emergency_preserved") or {}).get(str(task["id"]))
         if onto is None or task["state"] != TASK_OPEN:
             return None
-        # The next task of a preserved conflict sequence holds accepted resolutions: kept until claimed.
-        continues = (self._conflict_step(task) or {}).get("continues_preserved")
-        if not continues and not self._active_claims(task["batch_id"], task_id=task["id"]):
+        # A task continuing a conflict sequence holds accepted resolutions: kept while unclaimed too.
+        if not self._continues(task) and not self._active_claims(task["batch_id"], task_id=task["id"]):
             return None
         return onto
 
@@ -6342,6 +6346,10 @@ class Controller:
             "landed_on_base": result.landed_on_base,
         }
 
+    def _continues(self, task: dict[str, Any]) -> bool:
+        """Whether a conflict task continues an accepted resolution (`_next_conflict`)."""
+        return bool((self._conflict_step(task) or {}).get("continues"))
+
     @staticmethod
     def _conflict_step(task: dict[str, Any]) -> dict[str, Any] | None:
         """A rebase task's conflict diagnostic when it names the one commit to resolve, else None."""
@@ -6428,9 +6436,10 @@ class Controller:
         self, task: dict[str, Any], step: dict[str, Any], result: chain.ChainResult, resolved: str
     ) -> list[chain.Violation]:
         """Later members a resolution took into itself: empty when replayed onto it, though they did not
-        land on the base and their change is not already in the clean prefix (applied there it changes
-        something, or conflicts). Taking a later member's content is replaying it by hand, which would
-        leave that member an empty commit."""
+        land on the base and their change applies onto the clean prefix and changes it. Taking a later
+        member's content is replaying it by hand, which would leave that member an empty commit. A
+        member that conflicts with the prefix is not judged: commits between may legitimately empty it,
+        and refusing such a resolution would leave the task nothing it could submit."""
         emptied = {
             r.source_pr
             for r in result.commits
@@ -6444,7 +6453,7 @@ class Controller:
             if later.source_pr not in emptied or later.tree == chain.tree_of(self.clone, later.parents[0]):
                 continue
             outcome = chain.merge_trees(self.clone, step["clean_prefix_tip"], later.sha, merge_base=later.parents[0])
-            if not outcome.clean or outcome.tree != prefix_tree:
+            if outcome.clean and outcome.tree != prefix_tree:
                 found.append(
                     chain.Violation(
                         "absorbed-later-member",
@@ -6472,8 +6481,7 @@ class Controller:
         already holds this resolution. Nothing is adopted into the batch until the replay finishes."""
         step = self._conflict_diagnostic(batch["id"], result, task["onto"], "continuing the replay onto")
         preserved_onto = self._preserved_onto(task)
-        if preserved_onto is not None:
-            step["continues_preserved"] = True
+        step["continues"] = task["id"]  # it holds accepted resolutions: preserved across head rounds unclaimed
         diagnostics = [step, *(d for d in loads(task["diagnostics"], []) if d.get("kind") != "conflict")]
         # One transaction with the successor's creation: an accepted resolution always has its next task.
         with self.store.transaction():
@@ -6855,7 +6863,7 @@ class Controller:
         head = self._head()
         if (
             head is None
-            or not self._active_claims(batch["id"], task_id=task["id"])
+            or not (self._active_claims(batch["id"], task_id=task["id"]) or self._continues(task))
             or not chain.is_ancestor(self.clone, task["tip"], batch["tip"])
             or self.store.row("batch_tips", {"batch_id": head["id"], "tip": task["onto"]}) is None
         ):

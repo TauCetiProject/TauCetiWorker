@@ -134,15 +134,18 @@ parent to be the clean prefix, its message to be the conflicting commit's with t
 other `Source-PR` or `Accepted-Head`, and a no-repair member to be left alone or emptied. It then
 replays the commits after the conflicting one onto it with `chain.replay`, and refuses the resolution
 (`absorbed-later-member`) when a later member becomes empty although it did not land on the base and
-its change is not already in the clean prefix: a resolution that writes a later member's result is a
-replay by hand. These are checked before the replay advances because a later task cannot undo them. A clean replay is the whole
+its change applies onto the clean prefix and changes it: a resolution that took in a later member's
+change is a replay by hand. A member that conflicts with the prefix is not judged, since commits between
+may legitimately empty it and refusing would leave the task nothing to submit; content moved between
+members in part is not detected mechanically, as for any repair. These are checked before the replay advances because a later task cannot undo them. A clean replay is the whole
 chain on `onto`: it goes through the ordinary validation and comparison and is adopted (the head's
 next version, or the batch's pre-rebase) as a submitted chain is, and the resolved commit is recorded
 as a receipt for a resend after a lost response. A replay that stops at a later conflict is accepted
 as `resolved-commit` (`Controller._next_conflict`): nothing is adopted, and a task of the same kind on
 the same chain resolves the next conflicting commit on the new clean prefix, which holds the earlier
 resolutions; it is created in the same transaction, and inherits an evicted batch's retained-task
-marker and a preserved pre-rebase task's preservation (kept until it is claimed). Conflict tasks take
+marker and a preserved pre-rebase task's preservation. Because it holds accepted resolutions
+(`continues` in its diagnostic), it is preserved across a head round even while unclaimed. Conflict tasks take
 no repair checkpoints.
 
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
