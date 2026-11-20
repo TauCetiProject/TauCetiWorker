@@ -36,7 +36,7 @@ Tables:
 | `submissions` | every submitted chain with its retained ref, accepted flag and reason |
 | `ci_attempts` | every dispatch: head and base SHA, dispatch id, bound run id and attempt, status, conclusion, runner, labels, host, phases, progress timestamps, outcome (`pending`, `pass`, `source-failure`, `infrastructure`, `superseded`), diagnostics and the `repair_outputs_revs` the dispatch sent |
 | `outbox` | pending side effects (`promote`, `comment`, `close_pr`, `labels`, `retain_ref`, `notify`) with an idempotency key, attempt count, history and next attempt time |
-| `failures` | one row per failed head CI attempt: its fingerprint, the members it names, its finding lines and what the controller did (`repair`, `withdraw`, `bisect`, `dissolve`, `hold`); see [escalation.md](escalation.md) |
+| `failures` | history only, no longer written: one row per failed head CI attempt from when a recurring failure could withdraw members or bisect the head; see [escalation.md](escalation.md) |
 | `journal` | append-only log of what the controller did (`approved`, `inserted`, `sealed`, `rebased`, `dispatched`, `ci-pass`, `task`, `claimed`, `adopted`, `landed`, ...) for status and tests |
 
 Retained refs in the clone and, when publication is enabled, on GitHub through the outbox:
@@ -58,9 +58,9 @@ dispatch pushes the head's batch ref itself only when the outbox has not already
 Inputs: `waiting` -> `reserved` (during a probe) -> `inserted` (a member) -> `landed`; or
 `cancelled` with a reason (`unapproved`, `cancelled`, `closed`, `head-changed`, `draft`,
 `merged-externally`, `landed-externally`, `conflicts-with-main`, `superseded-by-new-approval`,
-`problem-anticipated`, `empty-commit`, `queue-withdrawn`). A head failure that repair does not
-resolve is escalated, each time with an alert and a Zulip direct message: withdrawal of the members
-it names or that attribution finds, else bisection as the last resort; see [`escalation.md`](escalation.md). An ordinary member an adopted repair reduces to an empty commit
+`problem-anticipated`, `empty-commit`, and `queue-withdrawn` from before the escalation ladder was
+removed). A failing head goes to repair however often it fails; the queue never withdraws, bisects or
+evicts a member on its own (see [`escalation.md`](escalation.md)). An ordinary member an adopted repair reduces to an empty commit
 is withdrawn at adoption with reason `empty-commit` (`_withdraw_member`; see
 [`reject-empty-commits.md`](reject-empty-commits.md)).
 A member is never withdrawn by its author or reviewers: `unapprove`, `cancel`, a closing or
@@ -521,8 +521,8 @@ source-candidate run in progress also has its phases read afresh, and a failed r
 eviction this pass), P2 again, a completed run with conclusion `success` whose verdicts are being
 bound (P3), and a run publishing its final oleans (P4, `publishing`). Everything else is evicted: a
 building or queued run, a publisher still waiting for a runner, a pending or uncertain dispatch, an
-infrastructure backoff, a source failure waiting for or under repair, a rebase conflict, an
-escalation hold. An observation that fails means no eviction this pass; a head found protected by an
+infrastructure backoff, a source failure waiting for or under repair, a rebase conflict. An
+observation that fails means no eviction this pass; a head found protected by an
 observation within `polling_interval_seconds` is not read again until that interval passes. After
 the observation everything read is revalidated (same head, version, tip and attempt, no controller
 claim on H, still not protected, E still sealable or the prospective singleton still current), then
@@ -562,7 +562,7 @@ cache, above) and lands only on a pass of its own run through the normal promoti
 
 A displaced slot in B never acts for the input (`_displaced`): its withdrawal, anticipation or
 return only marks the slot, and B's landing skips it. Every way E's member leaves E goes through
-`_emergency_exit` (escalation, adoption emptying or anticipation, return, cancellation, and a
+`_emergency_exit` (adoption emptying or anticipation, return, cancellation, and a
 rejection when E lands with `withdraw_emptied_at_adoption` off): when B's slot is still live the
 input is `inserted` in B again with one comment to the author; otherwise the caller's own behaviour
 applies (withdrawal cancels, return waits at the original age). Every way E ends without landing goes
