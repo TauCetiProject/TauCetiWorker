@@ -39,6 +39,7 @@ from pathlib import Path
 
 from . import expanded_cache
 from .config import log
+from .excerpt import ends
 from .runtime_status import read_json
 
 NAMESPACE = "canonical-v1"
@@ -488,7 +489,7 @@ def probe(checkout, private_store, directory, *, prefix=(), env=None):
         middle.unlink(missing_ok=True)
         final.unlink(missing_ok=True)
     if result.returncode:
-        detail = (result.stdout + result.stderr).strip()[-400:]
+        detail = ends(result.stdout + result.stderr, 400)
         raise Unavailable(f"hard links unavailable in the agent namespace: {detail}")
 
 

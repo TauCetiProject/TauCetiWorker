@@ -91,6 +91,7 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
+from .excerpt import ends
 from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_run, me, review_publisher
 from .github_state import enabled as github_state_enabled
 from .intentions import avoid_list
@@ -2273,7 +2274,7 @@ def _do_fixlike(
         # whichever gh happens to be first on PATH.
         chk = gh_run(["gh", "pr", "checkout", str(pr), "--force", *unique], cwd=co)
         if chk.returncode:
-            detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
+            detail = ends((chk.stderr or "") + (chk.stdout or ""), 200)
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
             report_failure(f"{label} #{pr}: gh pr checkout failed: {detail or 'no diagnostic'}", code=1)
             return 1
