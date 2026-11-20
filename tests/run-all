@@ -187,6 +187,7 @@ RUN_STDLIB=(
   queue_execution.py
   queue_ci_requests.py
   queue_forgejo_git.py
+  queue_forgejo_team_sync.py
   queue_forgejo_source.py
   queue_ci_execution.py
   queue_workflow_token.py
