@@ -12,14 +12,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# CI uses GitHub-hosted runners.
+# Linux jobs run on the fleet's TauCetiInfra runners (native-disk slots on our own
+# machines) when the repository variable FLEET_INFRA_CI is 'true', and on GitHub-hosted
+# ubuntu-24.04 otherwise: unset or change that variable to fall back. Fork pull requests
+# always run hosted. test (portable), docker (needs a Docker daemon) and macOS stay GitHub-hosted.
 jobs:
   # Classify the change so documentation-only pull requests skip the jobs that cannot observe them.
   # Only tests/run-all's DOCS_CONTRACT modules read README.md, docs/ or workers.toml.example, so a
   # change confined to docs/ and Markdown (outside prompts/ and tests/, which the suite and the
   # wheel bundle) runs just those; pushes and the schedule always run everything.
   changes:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
     steps:
@@ -43,11 +46,16 @@ jobs:
           echo "docs_only=$docs_only" >>"$GITHUB_OUTPUT"
 
   # The suite is split by filesystem needs, not size: tests/run-all --group portable runs every
-  # module whose fixtures do not depend on native inode/device metadata, in parallel on GitHub-hosted Linux, while --group native runs the few that
-  # do on GitHub's ubuntu-24.04 image. The `test` job below folds both into the one required check.
+  # module whose fixtures do not depend on native inode/device metadata, in parallel, while --group native runs the few that
+  # do on the same Linux runner image. Branch protection requires `changes`, `test (portable)` and `test (native)`
+  # directly; `test (native)` is skipped, which satisfies it, only when `changes` succeeded and
+  # classified the change as documentation-only.
   test-portable:
     name: test (portable)
     needs: changes
+    # Stays GitHub-hosted for now: on the fleet's native-disk runners two modules fail for
+    # environment reasons (Ubuntu 24.04's Git 2.43 refuses incremental-repack on a clone without
+    # packs in queue_install_releases.py; legacy_data_root.py cannot inspect every runner process).
     runs-on: ubuntu-24.04
     env:
       # Test on the latest interpreter uv ships; macOS observations have their own native job.
@@ -71,7 +79,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     # Storage fixtures require native, consistent inode/device metadata.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     env:
       UV_PYTHON: "3.14"
     steps:
@@ -82,29 +90,6 @@ jobs:
           cache-suffix: test
       - name: Run the native-filesystem test modules
         run: ./tests/run-all -j "$(nproc)" --group native
-
-  # Branch protection requires a check called `test`; this job is that check, and it is green only
-  # when the classification ran and every shard it called for succeeded.
-  test:
-    needs: [changes, test-portable, test-native]
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require every test shard
-        env:
-          CHANGES: ${{ needs.changes.result }}
-          PORTABLE: ${{ needs.test-portable.result }}
-          NATIVE: ${{ needs.test-native.result }}
-          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
-        run: |
-          echo "changes=$CHANGES portable=$PORTABLE native=$NATIVE docs_only=$DOCS_ONLY"
-          test "$CHANGES" = success
-          test "$PORTABLE" = success
-          if [ "$DOCS_ONLY" = true ]; then
-            test "$NATIVE" = skipped
-          else
-            test "$NATIVE" = success
-          fi
 
   macos-live-use:
     runs-on: macos-latest
@@ -117,7 +102,7 @@ jobs:
         run: uv run python tests/live_use.py
 
   prices:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out the review engine's price table
@@ -138,7 +123,7 @@ jobs:
           fi
 
   lint:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -160,7 +145,7 @@ jobs:
   build:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
