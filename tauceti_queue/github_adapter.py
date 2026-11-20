@@ -1355,12 +1355,28 @@ class GitHubAdapter:
                 read=lambda path: self.client.get_json(path)[1],
                 member_read=self.team_member_read,
             )
-        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
+        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here. A labelled
+        # large refactor is measured too: an admin's approval of one may stand in for PR CI and review
+        # (`AdmissionIntake._large_refactor_approval`), and the caps the label keeps still apply.
         exempt = diff_guard.large_refactor(
             self.clone_dir, pull.head_sha, lambda path: self.client.get_json(path)[1], repo, number, pull.labels
         )
-        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if local else ()
+        measured = local or exempt
+        guard = (
+            diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if measured else ()
+        )
         return local, guard, exempt
+
+    def bump_guard(self, repo: str, head: str) -> bool:
+        """The trusted Mathlib-bump check (`check-bump.sh` on main's tip, the merge base and `head`),
+        as self-tested bump eligibility runs it. Raises `GitHubUnavailable` when its inputs could not
+        be read, so the evaluation stays pending rather than deciding either way."""
+        from tauceti_tools.self_tested import _bump_policy, _ReadAPI
+
+        verdict, output = _bump_policy().check_bump(_ReadAPI(lambda path: self.client.get_json(path)[1]), repo, head)
+        if verdict is None:
+            raise ports.GitHubUnavailable(f"bump-guard for {head[:12]}: {output}"[:300])
+        return bool(verdict)
 
     def admission_snapshot_single(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """The same snapshot as `admission_snapshot`, from one GraphQL read (decision 38 step 4, slice 5).
