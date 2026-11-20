@@ -22,7 +22,7 @@ jobs:
   # change confined to docs/ and Markdown (outside prompts/ and tests/, which the suite and the
   # wheel bundle) runs just those; pushes and the schedule always run everything.
   changes:
-    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
+    runs-on: ${{ true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
     steps:
@@ -79,7 +79,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     # Storage fixtures require native, consistent inode/device metadata.
-    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
+    runs-on: ${{ true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     env:
       UV_PYTHON: "3.14"
     steps:
@@ -102,7 +102,7 @@ jobs:
         run: uv run python tests/live_use.py
 
   prices:
-    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
+    runs-on: ${{ true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out the review engine's price table
@@ -123,7 +123,7 @@ jobs:
           fi
 
   lint:
-    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
+    runs-on: ${{ true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -145,7 +145,7 @@ jobs:
   build:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
+    runs-on: ${{ true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
