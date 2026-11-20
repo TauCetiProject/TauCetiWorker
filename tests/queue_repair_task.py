@@ -71,6 +71,7 @@ from tauceti_queue import (  # noqa: E402
     repair,
     repair_audit,
     repair_context,
+    repair_numproj,
     repair_parallel,
     repair_publish,
     repair_sandbox,
@@ -6956,6 +6957,179 @@ class ToolsMainPin(unittest.TestCase):
             self.assertNotEqual(moved.name, first)
             with self.assertRaises(repair_audit.Unavailable):
                 repair_audit.tools_checkout(root / "checkouts", "TauCetiProject/TauCetiTools", "absent")
+
+
+# A stand-in for TauCetiTools' `numproj_fix.py`: renames `.1`/`.2` after an identifier or `)` to
+# `.fst`/`.snd` in the files it is given, logs its call, and exits with RC.
+FAKE_NUMPROJ = r"""import os, re, sys
+from pathlib import Path
+files = [a for a in sys.argv[1:] if a.endswith(".lean")]
+with open(Path(os.environ["STUB_DIR"]) / "numproj-calls.log", "a") as log:
+    log.write(" ".join(sys.argv[1:]) + " cache=" + os.environ.get("TAUCETI_NUMPROJ_CACHE", "") + "\n")
+for name in files:
+    path = Path(name)
+    text = re.sub(r"(?<=[\w)])\.([12])\b", lambda m: ".fst" if m.group(1) == "1" else ".snd", path.read_text())
+    path.write_text(EDIT(text))
+for name in files:
+    print(f"numproj: {name}:2:3: not rewritten, as a test; rewrite it by hand") if RC == 1 else None
+sys.exit(RC)
+"""
+
+OLD_P = "theorem p (h : A ∧ B) : A := h.1\ndef q (x : Nat × Nat) : Nat := x.2\ndef r : Nat := 0\n"
+NEW_P = OLD_P.replace("h.1", "h.fst").replace("x.2", "x.snd")
+
+
+class NumprojPrepass(Fixture):
+    """Main renamed the numeric projections of ``TauCeti/P.lean``; member 2 edits a line next to them
+    with the old syntax, so replaying it conflicts. The pre-pass (``repair_numproj``) rewrites both
+    sides with the tool (here a stand-in) and merges them before any agent runs."""
+
+    BROKEN = ()
+    BASE_FILES = {"TauCeti/P.lean": OLD_P}
+    MEMBER_FILES = {2: {"TauCeti/P.lean": OLD_P.replace("x.2", "x.2 + 1")}}
+
+    def setUp(self):
+        super().setUp()
+        os.environ["STUB_AGENT_MODE"] = "explain-only"
+        self.use_tool()
+
+    def use_tool(self, rc: int = 0, edit: str = "lambda text: text", files=repair_numproj.TOOL_FILES) -> None:
+        tool = self.root / f"tool-{secrets.token_hex(3)}"
+        tool.mkdir()
+        for name in files:
+            (tool / name).write_text("")
+        if "numproj_fix.py" in files:
+            (tool / "numproj_fix.py").write_text(FAKE_NUMPROJ.replace("RC", str(rc)).replace("EDIT", f"({edit})"))
+        patcher = patch.object(repair_numproj, "tool_dir", lambda: tool if "numproj_fix.py" in files else None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def task_onto(self, main_p: str) -> dict:
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.content.base)
+        onto = commit(seed, "main renames projections", {"TauCeti/P.lean": main_p})
+        sh(seed, "push", "--quiet", "origin", f"{onto}:refs/heads/queue/batch-1/onto")
+        raw = self.content.task(1, kind="rebase_conflict")
+        raw.update(onto=onto, diagnostics=[])
+        raw["retained_refs"] = [*raw["retained_refs"], "refs/heads/queue/batch-1/onto"]
+        self.service.tasks = {1: raw}
+        self.onto = onto
+        return raw
+
+    def run_task(self, main_p: str = NEW_P) -> tuple[dict, list]:
+        self.task_onto(main_p)
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        return outcome, chain_tool.chain_commits(self.content.bare, self.onto, pushed)
+
+    def numproj_calls(self) -> list[str]:
+        path = self.stub_dir / "numproj-calls.log"
+        return path.read_text().splitlines() if path.exists() else []
+
+    def resolved_p(self, chain) -> str:
+        return sh(self.content.bare, "show", f"{chain[1].sha}:TauCeti/P.lean") + "\n"
+
+    def test_a_projection_only_conflict_is_resolved_without_the_agent(self):
+        outcome, chain = self.run_task()
+        self.assertEqual(self.agent_calls(), [], "no agent ran")
+        self.assertEqual(outcome["conflicts"][0]["numproj"], True)
+        self.assertEqual(self.resolved_p(chain), NEW_P.replace("x.snd", "x.snd + 1"))
+        self.assertEqual(chain[1].parents, (chain[0].sha,))
+        self.assertIn(f"Source-PR: {PROJECT}#2", chain[1].message)
+        self.assertIn("Resolved mechanically by the repair worker", chain[1].message)
+        calls = self.numproj_calls()
+        self.assertEqual(len(calls), 2, "the parent's and the commit's versions, one run each")
+        self.assertTrue(all("/.lake/numproj/run-" in c and "/.lake/numproj/cache" in c for c in calls), calls)
+        sandboxed = [c["argv"][c["argv"].index("--") + 1 :] for c in self.bwrap_calls()]
+        self.assertEqual(len([a for a in sandboxed if a[:2] == ["python3", "-I"]]), 2, "both runs are sandboxed")
+        worktrees = list((self.root / "state" / "worktrees").glob("*/.lake/numproj"))
+        self.assertTrue(worktrees and all(not list(w.glob("run-*")) for w in worktrees), "scratch is removed")
+
+    def test_a_real_conflict_still_goes_to_the_agent_from_the_rewritten_merge(self):
+        outcome, chain = self.run_task(NEW_P.replace("x.snd", "x.snd * 2"))
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 1)
+        prompt = calls[0]["prompt"]
+        self.assertIn("the worker rewrote numeric projections", prompt)
+        self.assertIn(
+            "These still have conflict markers, now between the clean prefix and the rewritten commit: "
+            "`TauCeti/P.lean`",
+            prompt,
+        )
+        self.assertNotIn("numproj", outcome["conflicts"][0])
+        # The stand-in agent keeps both sides: the commit's side is the rewritten one.
+        resolved = self.resolved_p(chain)
+        self.assertIn("x.snd + 1", resolved)
+        self.assertIn("x.snd * 2", resolved)
+        self.assertNotIn("x.2", resolved)
+
+    def test_a_tool_failure_leaves_the_conflict_to_the_agent_as_before(self):
+        self.use_tool(rc=75)
+        outcome, chain = self.run_task()
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("numeric projections", calls[0]["prompt"])
+        self.assertEqual(len(self.numproj_calls()), 2)
+        resolved = self.resolved_p(chain)
+        self.assertIn("x.2 + 1", resolved, "the agent started from git's own markers")
+        self.assertNotIn("Resolved mechanically", chain[1].message)
+
+    def test_a_missing_tool_leaves_the_conflict_to_the_agent(self):
+        self.use_tool(files=("NumProjScan.lean",))
+        outcome, chain = self.run_task()
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertEqual(self.numproj_calls(), [])
+        self.assertIn("x.2 + 1", self.resolved_p(chain))
+
+    def test_a_rewrite_that_changes_more_than_projections_is_not_used(self):
+        self.use_tool(edit="lambda text: text.replace('def r : Nat := 0', 'def r : Nat := 1')")
+        outcome, chain = self.run_task()
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertNotIn("numeric projections", self.agent_calls()[0]["prompt"])
+        self.assertIn("x.2 + 1", self.resolved_p(chain))
+        self.assertIn("def r : Nat := 0", self.resolved_p(chain))
+
+    def test_sites_the_tool_left_send_a_clean_merge_to_the_agent(self):
+        self.use_tool(rc=1)
+        outcome, chain = self.run_task()
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 1, "a clean merge is not used alone when the commit was not fully rewritten")
+        prompt = calls[0]["prompt"]
+        self.assertIn("These merged without conflicts and are in the working tree: `TauCeti/P.lean`", prompt)
+        self.assertIn("numproj: TauCeti/P.lean:2:3: not rewritten", prompt)
+        self.assertEqual(self.resolved_p(chain), NEW_P.replace("x.snd", "x.snd + 1"))
+
+    def test_an_unacceptable_mechanical_resolution_goes_to_the_agent_from_git_s_markers(self):
+        """A no-repair member may only be emptied: the clean merge fails `accept`, and the agent then
+        starts from the conflict exactly as without the pre-pass."""
+        raw = self.task_onto(NEW_P)
+        raw["members"][1]["no_repair"] = True
+        os.environ["STUB_AGENT_MODES"] = "explain-only,explain-only,explain-only"
+        cfg = self.config(agent_attempts=1)
+        repair_task.claim_and_run(cfg, self.client(cfg))
+        calls = self.agent_calls()
+        self.assertGreaterEqual(len(calls), 1)
+        self.assertNotIn("numeric projections", calls[0]["prompt"])
+
+    def test_without_warm_artifacts_the_pre_pass_does_not_run(self):
+        os.environ["STUB_LAKE_CACHE_FAIL"] = "1"
+        outcome, chain = self.run_task()
+        self.assertEqual(self.numproj_calls(), [])
+        self.assertEqual(len(self.agent_calls()), 1)
+
+    def test_the_rewrite_check(self):
+        same = repair_numproj.same_up_to_projections
+        self.assertTrue(same("f x.1 y.2.1", "f x.fst y.snd.fst"))
+        self.assertTrue(same("  exact foo (a b).1 c", "  exact foo (a b).fst\n      c"))
+        self.assertTrue(same("$h.1", "($h).val"))
+        self.assertFalse(same("f x.1", "g x.fst"))
+        self.assertFalse(same("x.1 + 1", "x.fst + 2"))
+        self.assertFalse(same("x.1", "x.fst := sorry"))
+        self.assertTrue(repair_numproj.CANDIDATE.search("h.1"))
+        self.assertTrue(repair_numproj.CANDIDATE.search("(f x).2"))
+        self.assertFalse(repair_numproj.CANDIDATE.search("theorem a : True := trivial\n"))
 
 
 if __name__ == "__main__":

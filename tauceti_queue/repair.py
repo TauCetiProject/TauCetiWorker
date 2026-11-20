@@ -1244,6 +1244,7 @@ class PromptContext:
         None  # rebase_conflict, pre_rebase: {member, commit, paths, onto, previous_base, clean_prefix_tip}
     )
     feedback: str | None = None  # a validation report from a rejected attempt
+    prepass: str | None = None  # rebase conflicts: what the numproj pre-pass did (``repair_numproj``)
     members: list[dict] = dataclasses.field(
         default_factory=list
     )  # recorded members: source_pr, accepted_head, provenance, title
@@ -1834,6 +1835,8 @@ def _rebase_sections(
         f"tree holds {commit_text} applied onto it, with git's conflict markers in the conflicting files. No "
         "rebase, cherry-pick or merge is in progress.",
     ]
+    if context.prepass:
+        happened += ["", context.prepass]
     evidence = [
         "",
         "## Conflict evidence",
