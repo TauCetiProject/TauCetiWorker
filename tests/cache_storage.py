@@ -138,6 +138,30 @@ class Storage(unittest.TestCase):
         self.assertTrue(details[(info.st_dev, info.st_ino)][3])  # protected through the inner root
         self.assertEqual(private, {})
 
+    def test_overlap_is_found_past_siblings_and_repeated_spellings(self):
+        base = self.root / "x"
+        for name in ("a/inner", "a-aux"):
+            (base / name).mkdir(parents=True)
+        (base / "alias").symlink_to(base / "a")
+        self.assertTrue(storage._overlapping([base / "a", base / "a-aux", base / "a/inner"]))
+        self.assertTrue(storage._overlapping([base / "a", base / "alias"]))
+        self.assertFalse(storage._overlapping([base / "a", base / "a-aux"]))
+
+    def test_an_aggregation_finishing_past_the_deadline_defers(self):
+        (self.root / "many").mkdir()
+        for index in range(3):
+            (self.root / "many" / f"f{index}").write_bytes(b"x")
+            os.link(self.root / "many" / f"f{index}", self.root / "many" / f"g{index}")
+        moments = iter([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0])
+        with (
+            patch.object(storage, "INVENTORY_CHECK_EVERY", 1),
+            patch.object(storage.time, "monotonic", side_effect=lambda: next(moments, 10.0)),
+        ):
+            details = {}
+            with self.assertRaises(storage.InventoryDeferred):
+                storage.inventory([self.root / "many"], details=details, deadline=5.0)
+        self.assertEqual(details, {})  # nothing handed back from a deferred inventory
+
     def test_a_directory_swapped_for_a_link_mid_walk_is_not_followed(self):
         root, outside = self.root / "walked", self.root / "outside"
         (root / "sub").mkdir(parents=True)

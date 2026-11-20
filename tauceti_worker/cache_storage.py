@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import time
+from pathlib import Path
 
 from . import expanded_cache
 from .runtime_status import atomic_json, read_json
@@ -139,12 +140,11 @@ def _scan(root, clock):
 
 
 def _overlapping(roots):
-    """Whether any walked root lies inside another, so one name can be reached twice."""
-    resolved = sorted({os.path.realpath(root) for root in roots})
-    return any(
-        later == earlier or later.startswith(earlier.rstrip(os.sep) + os.sep)
-        for earlier, later in zip(resolved, resolved[1:], strict=False)
-    )
+    """Whether one name can be reached through two walked roots: a root repeated (by any
+    spelling) or lying inside another."""
+    resolved = [Path(os.path.realpath(root)) for root in roots]
+    unique = set(resolved)
+    return len(unique) < len(resolved) or any(parent in unique for root in unique for parent in root.parents)
 
 
 def inventory(paths, *, protected=(), owners=None, details=None, private=None, deadline=None):
@@ -199,9 +199,8 @@ def inventory(paths, *, protected=(), owners=None, details=None, private=None, d
                 labels = seen[key][4]
                 labels[owner] = labels.get(owner, 0) + 1
     clock.check(now=True)
-    if details is not None:
-        details.update(seen)
     for (device, _), (size, count, links, busy, _) in seen.items():
+        clock.check()
         totals = row(device)
         totals["managed_bytes"] += size
         totals["named_bytes"] += size * count
@@ -210,6 +209,9 @@ def inventory(paths, *, protected=(), owners=None, details=None, private=None, d
             totals["protected_bytes"] += size
         if links > count:
             totals["externally_linked_bytes"] += size
+    clock.check(now=True)  # nothing is decided on an inventory finished past the deadline
+    if details is not None:
+        details.update(seen)
     return result
 
 
