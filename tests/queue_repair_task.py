@@ -6975,7 +6975,7 @@ for name in files:
 sys.exit(RC)
 """
 
-OLD_P = "theorem p (h : A ∧ B) : A := h.1\ndef q (x : Nat × Nat) : Nat := x.2\ndef r : Nat := 0\n"
+OLD_P = "theorem p (h : A ∧ B) : A := h.1\ndef q (x : Nat × Nat) : Nat := x.2\ndef r : Nat := Nat.zero\n"
 NEW_P = OLD_P.replace("h.1", "h.fst").replace("x.2", "x.snd")
 
 
@@ -7084,12 +7084,12 @@ class NumprojPrepass(Fixture):
         self.assertIn("x.2 + 1", self.resolved_p(chain))
 
     def test_a_rewrite_that_changes_more_than_projections_is_not_used(self):
-        self.use_tool(edit="lambda text: text.replace('def r : Nat := 0', 'def r : Nat := 1')")
+        self.use_tool(edit="lambda text: text.replace('def r : Nat := Nat.zero', 'def r : Nat := 1')")
         outcome, chain = self.run_task()
         self.assertEqual(len(self.agent_calls()), 1)
         self.assertNotIn("numeric projections", self.agent_calls()[0]["prompt"])
         self.assertIn("x.2 + 1", self.resolved_p(chain))
-        self.assertIn("def r : Nat := 0", self.resolved_p(chain))
+        self.assertIn("def r : Nat := Nat.zero", self.resolved_p(chain))
 
     def test_sites_the_tool_left_send_a_clean_merge_to_the_agent(self):
         self.use_tool(rc=1)
@@ -7119,6 +7119,56 @@ class NumprojPrepass(Fixture):
         self.assertEqual(self.numproj_calls(), [])
         self.assertEqual(len(self.agent_calls()), 1)
 
+    def test_a_tampered_named_field_is_not_accepted(self):
+        """Elaborated member code can write the tool's inputs: a rewrite that also changes a field that
+        was already named is refused, and the agent gets git's own conflict."""
+        self.use_tool(edit="lambda text: text.replace('Nat.zero', 'Nat.one')")
+        outcome, chain = self.run_task()
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertNotIn("numeric projections", self.agent_calls()[0]["prompt"])
+        self.assertIn("x.2 + 1", self.resolved_p(chain))
+
+    def test_a_symlinked_scratch_directory_is_not_followed(self):
+        """A symlink planted under `.lake` (where member code can write) is refused, not followed."""
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o755)
+        original = repair_numproj._private_dir
+
+        def planted(lake, *names):
+            target = lake / repair_numproj.SCRATCH
+            if not target.exists() and not target.is_symlink():
+                lake.mkdir(exist_ok=True)
+                target.symlink_to(outside)
+            return original(lake, *names)
+
+        patcher = patch.object(repair_numproj, "_private_dir", planted)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        outcome, chain = self.run_task()
+        self.assertEqual(self.numproj_calls(), [])
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertEqual(oct(outside.stat().st_mode & 0o777), oct(0o755), "nothing outside was changed")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_failed_write_restores_git_s_conflict(self):
+        real = Path.write_bytes
+
+        def failing(path, data):
+            if path.name == "P.lean" and "worktrees" in str(path):
+                real(path, b"partial")
+                raise OSError(28, "No space left on device")
+            return real(path, data)
+
+        patcher = patch.object(Path, "write_bytes", failing)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        outcome, chain = self.run_task()
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertNotIn("numeric projections", self.agent_calls()[0]["prompt"])
+        resolved = self.resolved_p(chain)
+        self.assertIn("x.2 + 1", resolved)
+        self.assertNotIn("partial", resolved)
+
     def test_the_rewrite_check(self):
         same = repair_numproj.same_up_to_projections
         self.assertTrue(same("f x.1 y.2.1", "f x.fst y.snd.fst"))
@@ -7127,6 +7177,9 @@ class NumprojPrepass(Fixture):
         self.assertFalse(same("f x.1", "g x.fst"))
         self.assertFalse(same("x.1 + 1", "x.fst + 2"))
         self.assertFalse(same("x.1", "x.fst := sorry"))
+        self.assertFalse(same("x.fst + y.1", "x.snd + y.fst"), "a named field may not change")
+        self.assertFalse(same("x.1", "x"), "nor a projection disappear")
+        self.assertFalse(same("Nat.succ", "Nat.pred"))
         self.assertTrue(repair_numproj.CANDIDATE.search("h.1"))
         self.assertTrue(repair_numproj.CANDIDATE.search("(f x).2"))
         self.assertFalse(repair_numproj.CANDIDATE.search("theorem a : True := trivial\n"))

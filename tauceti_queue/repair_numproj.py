@@ -26,7 +26,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from tauceti_queue import repair_sandbox
@@ -38,10 +38,10 @@ JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
 CANDIDATE = re.compile(r"[\w'\)\]⟩»]\.\d")
-# What a projection rewrite may change: the field after a `.`, parentheses around a receiver, and
-# whitespace (rewrapped lines). Both sides of a rewrite must agree once these are erased.
-_LAYOUT = re.compile(r"[\s()]+")
-_FIELD = re.compile(r"\.(?:\d+|[^\W\d][\w'!?]*)")
+# Tokens for `same_up_to_projections`: a `.` with digits or a name after it, or any other character
+# except whitespace and parentheses (which a rewrite may add around a receiver, or move by rewrapping).
+_TOKEN = re.compile(r"\.\d+|\.[^\W\d][\w'!?]*|[^\s()]")
+_NUMERIC = re.compile(r"\.\d+")
 
 
 @dataclasses.dataclass
@@ -71,13 +71,40 @@ def _blob(worktree: Path, rev: str, path: str) -> bytes | None:
 
 
 def same_up_to_projections(before: str, after: str) -> bool:
-    """Whether ``after`` differs from ``before`` only as a projection rewrite can: fields after a
-    `.`, parentheses and whitespace. Anything else means the tool did something it should not."""
+    """Whether ``after`` differs from ``before`` only as a projection rewrite can: a numeric
+    projection (`.1`) replaced by a named one (`.fst`), parentheses and whitespace. Anything else,
+    such as a named field changed into another, means the tool (or the member code it elaborated,
+    which can write its inputs) did something it should not."""
+    old, new = _TOKEN.findall(before), _TOKEN.findall(after)
+    return len(old) == len(new) and all(
+        a == b or (_NUMERIC.fullmatch(a) is not None and _NUMERIC.fullmatch(b) is None and b.startswith("."))
+        for a, b in zip(old, new, strict=True)
+    )
 
-    def erase(text: str) -> str:
-        return _LAYOUT.sub("", _FIELD.sub(".", text))
 
-    return erase(before) == erase(after)
+def _private_dir(lake: Path, *names: str) -> Path:
+    """``lake/names...``, created 0700 where missing. Elaborated member code can write under
+    ``.lake``, so no component may be a symlink: an error rather than following one out of the tree."""
+    path = lake
+    for name in ("", *names):
+        path = path / name if name else path
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if name:
+                os.fchmod(fd, 0o700)
+        finally:
+            os.close(fd)
+    return path
+
+
+def _read(path: Path) -> bytes:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
 
 
 def _run_tool(worktree: Path, env: dict, tool: Path, files: list[Path], cache: Path, log: Path, timeout: float) -> dict:
@@ -124,7 +151,7 @@ def prepass(
     """Rewrite numeric projections in both sides of ``commit``'s conflicting Lean files and merge them
     onto the clean ``prefix``, writing the merged files into ``worktree`` (checked out by
     ``repair.apply_conflict``). None when the pre-pass does not apply or anything unexpected happens;
-    the worktree is then untouched."""
+    the worktree then holds ``apply_conflict``'s result as before."""
     tool = tool_dir()
     if tool is None:
         return None
@@ -151,15 +178,12 @@ def prepass(
             sides[path] = (ours, base, theirs)
     if not sides:
         return None
-    lake = worktree / ".lake"
-    root = lake / SCRATCH
-    cache = root / "cache"  # the compiled scanner, once per toolchain and tree
-    scratch = root / f"run-{secrets.token_hex(6)}"
+    scratch = None
     try:
-        cache.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(cache, 0o700)
+        cache = _private_dir(worktree / ".lake", SCRATCH, "cache")  # the compiled scanner, per toolchain
+        scratch = _private_dir(worktree / ".lake", SCRATCH, f"run-{secrets.token_hex(6)}")
         copy = scratch / "tool"
-        copy.mkdir(parents=True)
+        copy.mkdir()
         for name in TOOL_FILES:
             shutil.copyfile(tool / name, copy / name)
         files: dict[str, list[Path]] = {"parent": [], "commit": []}
@@ -169,25 +193,21 @@ def prepass(
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(data)
                 files[side].append(target)
-        runs: dict[str, dict] = {}
 
-        def run(side: str) -> None:
+        def run(side: str) -> dict:
             log = logdir / f"numproj-{commit[:12]}-{side}.log"
-            runs[side] = _run_tool(worktree, env, copy, files[side], cache, log, timeout)
+            return _run_tool(worktree, env, copy, files[side], cache, log, timeout)
 
-        threads = [threading.Thread(target=run, args=(side,)) for side in files]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+        with ThreadPoolExecutor(max_workers=2) as pool:  # each side elaborates its own files
+            runs = dict(zip(files, pool.map(run, files), strict=True))
         # 0: everything rewritten; 1: some sites left for the author. Anything else is a tool failure.
-        if any(runs.get(side, {}).get("rc") not in (0, 1) for side in files):
+        if any(runs[side].get("rc") not in (0, 1) for side in files):
             return None
         rewritten: dict[str, tuple[bytes, bytes]] = {}
         changed = False
         for path, (_, base, theirs) in sides.items():
-            new_base = (scratch / "parent" / path).read_bytes()
-            new_theirs = (scratch / "commit" / path).read_bytes()
+            new_base = _read(scratch / "parent" / path)
+            new_theirs = _read(scratch / "commit" / path)
             for before, after in ((base, new_base), (theirs, new_theirs)):
                 if not same_up_to_projections(before.decode(), after.decode(errors="replace")):
                     return None
@@ -205,20 +225,28 @@ def prepass(
             (remaining if conflicts else merged).append(path)
         untouched = [p for p in paths if p not in sides]
         complete = runs["commit"]["rc"] == 0
-        for path, data in outputs.items():
-            (worktree / path).write_bytes(data)
         clean = complete and not remaining and not untouched
-        return Prepass(
+        outcome = Prepass(
             clean=clean,
             merged=merged,
             remaining=remaining + untouched,
             note=_note(clean, complete, merged, remaining, untouched, runs, scratch),
             tool={side: {k: runs[side].get(k) for k in ("rc", "seconds", "timed_out", "log")} for side in runs},
         )
-    except (OSError, UnicodeDecodeError, RuntimeError):
+    except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
         return None
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
+    try:
+        for path, data in outputs.items():
+            (worktree / path).write_bytes(data)
+    except OSError:
+        from tauceti_queue import repair
+
+        repair.apply_conflict(worktree, prefix, commit)  # back to git's own conflict, as without the pre-pass
+        return None
+    return outcome
 
 
 def _quote(paths: list[str]) -> str:

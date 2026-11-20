@@ -168,8 +168,12 @@ the task's log directory.
   files, clean or with markers between the clean prefix and the rewritten commit, and its prompt says
   which files the worker merged, which still conflict and which sites the tool left.
 - Anything unexpected returns the conflict to the agent as before: an installed TauCetiTools without
-  numproj, a tool failure or timeout, a sandbox error, a rewrite that changes more than fields after a
-  `.`, parentheses and whitespace (`repair_numproj.same_up_to_projections`), or nothing rewritten.
+  numproj, a tool failure or timeout, a sandbox error, a symlink under `.lake/numproj`, a failed write
+  (the worker applies the conflict again), nothing rewritten, or a rewrite that changes anything but
+  numeric projections into named ones, parentheses and whitespace
+  (`repair_numproj.same_up_to_projections`). The elaborated member code can write the tool's inputs, so
+  this check is what bounds the mechanical result: the most it can change is which name a numeric
+  projection gets, which the later build verification checks like any resolution.
 
 The controller's insertion probes of waiting PRs do not use the pre-pass: they are `git merge-tree`
 checks on the controller host within a twenty-second budget per pass, with no built tree to elaborate
@@ -866,7 +870,8 @@ abandonment of a stopped task, the task record and prompt for a rebase conflict,
 pre-pass with a stand-in tool (`NumprojPrepass`: a projection-only conflict resolved without the agent
 in two sandboxed runs, a real conflict and sites left by the tool handed to the agent from the
 rewritten merge, and a tool failure, a missing tool, a rewrite that changes more than projections, an
-unacceptable mechanical resolution and a cold tree all leaving git's own conflict to the agent), the
+already named field changed, a symlink planted under `.lake`, a failed write, an unacceptable mechanical
+resolution and a cold tree all leaving git's own conflict to the agent), the
 provider chain (the same stub installed as `codex`: chain order, a subscription over pace or
 unmeasurable skipped, a launch failure or a refusal before any work handed to the next provider, the
 `api` provider's key and credential-free config dir, the attempts in the outcome and the heartbeat, and
