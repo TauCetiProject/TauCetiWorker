@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,11 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_client_check as check
 from tauceti_worker import audit_clients as clients
 from tauceti_worker import audit_evidence as evidence
-from tauceti_worker import audit_pool as pool
 from tauceti_worker import audit_reader as ar
-from tauceti_worker import audit_recovery as recovery
 from tauceti_worker import security_audit as sa
-from tauceti_worker.config import Die
+from tauceti_worker.config import NoProgress
 
 UNFINISHED = {"verdict": "unfinished", "findings": []}
 PASS = {"verdict": "pass", "findings": []}
@@ -42,7 +41,7 @@ class FakeHaiku:
     def __call__(self, argv, *, input, cwd, env, timeout, **kwargs):
         plan = self.launches.pop(0)
         self.calls.append(SimpleNamespace(argv=list(argv), prompt=input, home=Path(cwd), env=dict(env)))
-        session, resume = sa.claude_session_arg(argv)
+        session, resume = argv[-1], argv[-2] == "--resume"
         projects = Path(env["CLAUDE_CONFIG_DIR"]) / "projects"
         existing = list(projects.rglob(f"{session}.jsonl"))
         if resume and not existing:
@@ -103,7 +102,7 @@ class HaikuContinuation(unittest.TestCase):
         self.pages = len(ar.pages(self.batch))
         self.assertGreater(self.pages, 4)
         for p in (
-            patch.object(clients, "selected_protocol", return_value=4),
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.object(sa, "claude_dir", return_value=self.root),
             patch.object(sa.time, "sleep"),
             patch.dict(os.environ, {sa.API_KEY_FILE_ENV: ""}),
@@ -139,12 +138,14 @@ class HaikuContinuation(unittest.TestCase):
         schema = json.loads(argv[argv.index("--json-schema") + 1])
         self.assertIn("unfinished", schema["properties"]["verdict"]["enum"])
 
-    def test_policy_has_luna_continuation_semantics(self):
-        self.assertEqual(sa.SERVED_CLAUDE_PROMPT, sa.V2_MODEL_PROMPT + sa.SERVED_READING_POLICY)
-        self.assertEqual(sa.SERVED_CLAUDE_PROMPT, sa.SERVED_MODEL_PROMPT)
-        self.assertIn('return verdict "unfinished"', sa.SERVED_CLAUDE_PROMPT)
-        self.assertIn("--no-session-persistence", sa.reviewer_argv("claude", protocol=3))
-        self.assertNotIn("--no-session-persistence", sa.reviewer_argv("claude", protocol=4))
+    def test_protocol_five_policy_and_launch(self):
+        self.assertIn("unfinished", sa.JUDGMENT_PROMPT)
+        self.assertIn("genuine uncertainty", sa.JUDGMENT_PROMPT)
+        self.assertEqual(sa.JUDGMENT_SCHEMA["properties"]["verdict"]["enum"], ["pass", "finding", "unfinished"])
+        argv = sa.claude_launch(self.root, True, self.root / "r.json", session=str(uuid.uuid4()))
+        self.assertEqual(json.loads(argv[argv.index("--json-schema") + 1]), sa.JUDGMENT_SCHEMA)
+        self.assertEqual(argv[argv.index("--append-system-prompt") + 1], sa.JUDGMENT_PROMPT + sa.JUDGMENT_COMPACTION)
+        self.assertNotIn("--no-session-persistence", argv)
 
     def test_unfinished_turn_resumes_the_same_session_to_a_pass(self):
         fake = FakeHaiku(
@@ -162,60 +163,70 @@ class HaikuContinuation(unittest.TestCase):
         self.assertEqual(first.argv[:-2], second.argv[:-2])
         self.assert_isolated(first.argv)
         self.assertEqual(first.home, second.home)
-        self.assertTrue(
-            second.prompt.startswith(sa.continuation_prompt(self.batch, attempt / "coverage-before.json", protocol=4))
-        )
-        self.assertIn(sa.SERVED_CONTINUE_PROMPT, second.prompt)
-        # The live session was written straight into the attempt, and holds both turns.
-        finals = recovery.claude_finals(attempt)
+        self.assertTrue(second.prompt.startswith("The Worker has not received a judgment"))
+        self.assertIn("next_unserved_page=2", second.prompt)
+        session = sa.claude_sessions(attempt)[0]
+        finals = [
+            item["input"]
+            for row in map(json.loads, session.read_text().splitlines())
+            if row.get("type") == "assistant"
+            for item in row["message"]["content"]
+            if item.get("name") == "StructuredOutput"
+        ]
         self.assertEqual(finals, [UNFINISHED, PASS])
-        self.assertTrue((attempt / "coverage-turn-1" / "model-transcript.jsonl").exists())
+        # Each launch's own output is kept; nothing else is copied.
+        self.assertEqual(
+            sorted(p.name for p in (attempt / "launch-1").iterdir()),
+            ["execution.json", "model-stderr.txt", "model-transcript.jsonl", "prompt.txt"],
+        )
 
-    def test_retained_session_continues_in_a_fresh_home_to_a_pass(self):
-        first = self.attempt("1")
-        fake = FakeHaiku(self.batch, [{"pages": [0, 1], "outputs": [UNFINISHED]}])
-        with patch.object(sa, "run_process", side_effect=fake), patch.object(sa, "MAX_INVOCATION_LAUNCHES", 1):
-            with self.assertRaisesRegex(Die, "inspection unfinished"):
-                sa.inspect(self.batch, "claude", first)
-        original, batch, execution = recovery.retained_claude(self.work, self.block(first))
-        self.assertEqual((original, batch), (first, self.batch))
-        second = self.attempt("2")
-        resumed = FakeHaiku(self.batch, [{"pages": range(2, self.pages), "outputs": [PASS]}])
-        with patch.object(sa, "run_process", side_effect=resumed):
-            verdict = sa.inspect(self.batch, "claude", second, resume_from=first, continue_reading=True)
-        self.assertEqual(verdict, sa.bind_verdict(PASS, self.batch))
-        (call,) = resumed.calls
-        self.assertEqual(call.argv[-2:], ["--resume", sa.claude_thread(first)])
-        self.assertNotEqual(call.home, fake.calls[0].home)
-        self.assertEqual(sa.claude_thread(second), sa.claude_thread(first))
-        self.assertEqual(recovery.claude_finals(second), [UNFINISHED, PASS])
-
-    def test_earlier_uncertainty_in_the_session_binds_a_later_pass(self):
-        uncertain = {"verdict": "incomplete", "findings": ["commit 1 TauCeti/ascii.lean: unclear elaborator origin"]}
+    def test_reads_missing_from_the_saved_session_are_served_again(self):
+        fake = FakeHaiku(
+            self.batch,
+            [{"pages": [0, 1], "outputs": [UNFINISHED]}, {"pages": range(self.pages), "outputs": [PASS]}],
+        )
         attempt = self.attempt("1")
-        # The client re-asks for structured output; the earlier uncertainty is still recorded.
-        fake = FakeHaiku(self.batch, [{"pages": range(self.pages), "outputs": [uncertain, PASS]}])
-        with patch.object(sa, "run_process", side_effect=fake):
-            verdict = sa.inspect(self.batch, "claude", attempt)
-        self.assertEqual(verdict, sa.bind_verdict(uncertain, self.batch))
-        self.assertTrue(evidence.holds(self.work, attempt))
+        saved = iter([set(), set(range(self.pages))])
+        with (
+            patch.object(sa, "run_process", side_effect=fake),
+            patch.object(sa, "claude_saved_read_pages", side_effect=lambda *a: next(saved)),
+        ):
+            self.assertEqual(sa.inspect(self.batch, "claude", attempt), sa.bind_verdict(PASS, self.batch))
+        self.assertIn("next_unserved_page=0", fake.calls[1].prompt)
 
-    def test_earlier_finding_in_a_continued_attempt_binds_its_pass(self):
-        finding = {"verdict": "finding", "findings": ["commit 1 TauCeti/ascii.lean: #eval reads the environment"]}
-        first = self.attempt("1")
-        fake = FakeHaiku(self.batch, [{"pages": [0, 1], "outputs": [finding, UNFINISHED]}])
-        with patch.object(sa, "run_process", side_effect=fake), patch.object(sa, "MAX_INVOCATION_LAUNCHES", 1):
-            # The later unfinished turn does not hide the finding: it binds at once.
-            self.assertEqual(sa.inspect(self.batch, "claude", first), sa.bind_verdict(finding, self.batch))
-        with self.assertRaisesRegex(Die, "forbid automatic recovery"):
-            recovery.retained_claude(self.work, self.block(first))
-        self.assertTrue(evidence.holds(self.work, first))
-        # Even forced, the continued session cannot discard the earlier finding.
-        second = self.attempt("2")
-        resumed = FakeHaiku(self.batch, [{"pages": range(2, self.pages), "outputs": [PASS]}])
-        with patch.object(sa, "run_process", side_effect=resumed):
-            verdict = sa.inspect(self.batch, "claude", second, resume_from=first)
-        self.assertEqual(verdict, sa.bind_verdict(finding, self.batch))
+    def test_an_earlier_concern_in_the_session_binds_a_later_pass_or_unfinished(self):
+        uncertain = {"verdict": "finding", "findings": ["commit 1 TauCeti/ascii.lean: unclear elaborator origin"]}
+        for later in (PASS, UNFINISHED):
+            with self.subTest(later=later["verdict"]):
+                attempt = self.attempt(later["verdict"])
+                fake = FakeHaiku(self.batch, [{"pages": range(self.pages), "outputs": [uncertain, later]}])
+                with patch.object(sa, "run_process", side_effect=fake):
+                    self.assertEqual(sa.inspect(self.batch, "claude", attempt), sa.bind_verdict(uncertain, self.batch))
+                self.assertEqual(len(fake.calls), 1)  # A concern ends the attempt; it is never continued.
+
+    def test_a_timeout_ends_the_attempt_without_a_judgment(self):
+        attempt = self.attempt("1")
+        fake = FakeHaiku(self.batch, [{"pages": [0, 1], "timeout": True}])
+        with patch.object(sa, "run_process", side_effect=fake), self.assertRaises(evidence.NotJudged) as stopped:
+            sa.inspect(self.batch, "claude", attempt)
+        self.assertIsInstance(stopped.exception.__cause__, subprocess.TimeoutExpired)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_three_charged_launches_without_progress_end_the_attempt(self):
+        attempt = self.attempt("1")
+        fake = FakeHaiku(self.batch, [{"pages": [0], "outputs": [UNFINISHED]}] + [{"outputs": [UNFINISHED]}] * 3)
+        with patch.object(sa, "run_process", side_effect=fake), self.assertRaises(evidence.NotJudged):
+            sa.inspect(self.batch, "claude", attempt)
+        self.assertEqual(len(fake.calls), 4)  # The first launch served a page and was not charged.
+
+    def test_an_unverified_client_waits_rather_than_using_an_older_protocol(self):
+        attempt = self.attempt("1")
+        with (
+            patch.object(clients, "selected_protocol", return_value=None),
+            patch.object(sa, "run_process", side_effect=AssertionError("no launch")),
+            self.assertRaisesRegex(NoProgress, "awaiting client delivery verification"),
+        ):
+            sa.inspect(self.batch, "claude", attempt)
 
     def test_judgment_only_in_the_captured_transcript_still_binds(self):
         attempt = self.attempt("1")
@@ -254,31 +265,6 @@ class HaikuContinuation(unittest.TestCase):
         )
         self.assertTrue(evidence.holds(self.work, attempt))
 
-    def test_timeout_mid_session_continues_in_the_pool_rather_than_restarting(self):
-        first = self.attempt("1")
-        fake = FakeHaiku(self.batch, [{"pages": [0, 1, 2], "timeout": True}])
-        with patch.object(sa, "run_process", side_effect=fake), self.assertRaises(evidence.NotJudged) as stopped:
-            sa.inspect(self.batch, "claude", first)
-        self.assertIsInstance(stopped.exception.__cause__, subprocess.TimeoutExpired)
-        self.assertEqual(ar.Reader(self.batch, first / "read-receipt.json").coverage()["served"], [0, 1, 2])
-        # The client reported page 2, but its result never reached the stored session:
-        # the resumed session must be served that page again.
-        session = sa.claude_sessions(first)[0]
-        session.write_text("".join(session.read_text().splitlines(keepends=True)[:-1]))
-        block = self.block(first, reason="Command timed out", failure_kind="provider-timeout")
-        self.assertTrue(pool.operational(stopped.exception))
-        p = pool.Pool(self.work, parallel=1, chooser=None)
-        second = self.attempt("2")
-        resumed = FakeHaiku(self.batch, [{"pages": range(2, self.pages), "outputs": [PASS]}])
-        with patch.object(sa, "run_process", side_effect=resumed):
-            verdict = p.inspect(self.batch, second, "claude", "subscription", 4, block)
-        self.assertEqual(verdict, sa.bind_verdict(PASS, self.batch))
-        (call,) = resumed.calls
-        self.assertEqual(call.argv[-2:], ["--resume", sa.claude_thread(first)])
-        self.assertEqual(call.served, [0, 1])
-        self.assertTrue(call.prompt.startswith(sa.SERVED_CONTINUE_PROMPT) or "next_unserved_page=2" in call.prompt)
-        self.assertEqual(json.loads((second / "previous-block.json").read_text()), block)
-
     def test_a_finding_before_a_timeout_binds_and_survives_a_lost_session(self):
         first = self.attempt("1")
         finding = {"verdict": "finding", "findings": ["commit 1: run_cmd executes a process"]}
@@ -290,43 +276,6 @@ class HaikuContinuation(unittest.TestCase):
             path.unlink()
         self.assertTrue(evidence.holds(self.work, first))
         self.assertEqual(sa.judged(first, self.batch, "timed out"), sa.bind_verdict(finding, self.batch))
-
-    def test_pool_starts_fresh_only_when_nothing_valid_is_retained_and_the_output_is_clean(self):
-        first = self.attempt("1")
-        (first / "execution.json").write_text(sa.serialize({"argv": ["claude", "-p"], "protocol_version": 4}))
-        (first / "model-transcript.jsonl").write_text(
-            sa.serialize({"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading page 0."}]}})
-            + "\n"
-        )
-        p = pool.Pool(self.work, parallel=1, chooser=None)
-        second = self.attempt("2")
-        fresh = FakeHaiku(self.batch, [{"pages": range(self.pages), "outputs": [PASS]}])
-        with patch.object(sa, "run_process", side_effect=fresh):
-            verdict = p.inspect(self.batch, second, "claude", "subscription", 4, self.block(first))
-        self.assertEqual(verdict, sa.bind_verdict(PASS, self.batch))
-        self.assertEqual(fresh.calls[0].argv[-2], "--session-id")
-        self.assertNotEqual(fresh.calls[0].argv[-1], None)
-
-    def test_retained_launch_must_match_the_isolated_profile(self):
-        first = self.attempt("1")
-        fake = FakeHaiku(self.batch, [{"pages": [0, 1], "outputs": [UNFINISHED]}])
-        with patch.object(sa, "run_process", side_effect=fake), patch.object(sa, "MAX_INVOCATION_LAUNCHES", 1):
-            with self.assertRaises(Die):
-                sa.inspect(self.batch, "claude", first)
-        execution = json.loads((first / "execution.json").read_text())
-        for tamper in (
-            lambda argv: argv.remove("--restricted"),
-            lambda argv: argv.insert(2, "--dangerously-skip-permissions"),
-            lambda argv: argv.__setitem__(argv.index("--tools") + 1, "Bash"),
-            lambda argv: argv.__setitem__(-1, "22222222-2222-4333-8444-555555555555"),
-        ):
-            changed = json.loads(sa.serialize(execution))
-            tamper(changed["argv"])
-            (first / "execution.json").write_text(sa.serialize(changed))
-            with self.assertRaises(Die):
-                recovery.retained_claude(self.work, self.block(first))
-        (first / "execution.json").write_text(sa.serialize(execution))
-        recovery.retained_claude(self.work, self.block(first))
 
 
 if __name__ == "__main__":

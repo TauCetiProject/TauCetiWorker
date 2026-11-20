@@ -63,7 +63,9 @@ def unique_pairs(pairs: list) -> dict:
 
 DECODER = json.JSONDecoder(object_pairs_hook=unique_pairs)
 READ_PAGE = "read_page"
-GOAL_TOOLS = frozenset({"get_goal", "create_goal", "update_goal"})
+# Codex offers its MCP resource helpers whenever an MCP server is configured. The only server is
+# the read-only audit reader, which serves no resources: a call reads nothing and is inert.
+INERT_TOOLS = frozenset({"list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"})
 
 
 class NotJudged(Die):
@@ -307,7 +309,9 @@ def recorded(state: Path, batch: dict, evidence: Evidence | None = None) -> Evid
             # one of its commits can have held a verdict about it.
             if digest in line or any(sha in line for sha in commits):
                 evidence.unreadable.append(f"{ledger}:{number}: unreadable row")
-        elif "verdict" in row and (row.get("batch") == digest or commits & judged_commits(row["verdict"])):
+        elif isinstance(row.get("verdict"), dict) and (
+            row.get("batch") == digest or commits & (judged_commits(row["verdict"]) | judged_commits(row))
+        ):
             evidence.judgments.append(row["verdict"])
         elif row.get("outcome") == UNREADABLE and (row.get("batch") == digest or commits & judged_commits(row)):
             # A hold on evidence that could not be read binds its commits exactly like a concern.
@@ -343,10 +347,12 @@ def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
     if evidence.unreadable or evidence.damaged:
         raise Die("security-audit: retained history has unreadable rows")
     execution = json.loads((attempt / "execution.json").read_text())
+    if execution.get("protocol_version") != sa.PROTOCOL:
+        raise Die("security-audit: only a judgment-protocol-5 attempt can pass")
     provider = "claude" if execution["argv"][0] == "claude" else "codex"
-    paged, protocol = execution["paged"], max(3, execution.get("protocol_version", 1))
-    allowed = ({READ_PAGE} if paged else set()) | (GOAL_TOOLS if provider == "codex" else set())
-    if unexpected := sorted(set(evidence.tools) - allowed):
+    paged = execution["paged"]
+    allowed = {READ_PAGE} if paged else set()
+    if unexpected := sorted(set(evidence.tools) - allowed - INERT_TOOLS):
         raise Die(f"security-audit: reviewer attempted an unauthorized tool call: {', '.join(unexpected)}")
     transcript = (attempt / "model-transcript.jsonl").read_text()
     if provider == "claude":
@@ -358,13 +364,12 @@ def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
         if len(sa.native_rollouts(attempt)) != 1:
             raise Die("security-audit: retained native history is missing or ambiguous")
         value = sa.codex_final(transcript, paged)
-    if paged and isinstance(value, dict) and value.get("verdict") == "unfinished":
+    if isinstance(value, dict) and value.get("verdict") == "unfinished":
         raise Die("security-audit: inspection unfinished")
-    token = value.pop("read_token", None) if protocol < 4 and paged and isinstance(value, dict) else None
     verdict = sa.bind_verdict(value, batch)
     if verdict["verdict"] != "pass":
         raise Die(f"security-audit: {verdict['verdict']} without a recorded concern")
-    sa.validate_reads(verdict, batch, (attempt / "read-receipt.json").resolve(), paged, token, protocol=protocol)
+    sa.validate_reads(verdict, batch, (attempt / "read-receipt.json").resolve(), paged)
     return verdict
 
 
@@ -410,3 +415,16 @@ def outcome_of(verdict, exc: BaseException | None) -> dict:
     if isinstance(verdict, dict) and verdict.get("verdict") != "pass":
         return {"outcome": FINDING, "verdict": verdict}
     return {"outcome": UNREADABLE if isinstance(exc, Unreadable) else NOT_JUDGED}
+
+
+def engaged(attempt: Path) -> bool:
+    """Whether the reviewer engaged with the input: it answered, or the reader served it a page.
+
+    An attempt that is not a judgment is divided only then; a provider or setup failure, where
+    no reviewer engaged, is retried on the same range."""
+    if collect(attempt).judgments:
+        return True
+    try:
+        return bool(json.loads((attempt / "read-receipt.json").read_text()).get("served"))
+    except (OSError, ValueError, AttributeError):
+        return False

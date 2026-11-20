@@ -635,7 +635,12 @@ class LegacyDataRoot(unittest.TestCase):
             base = Path(temporary).resolve()
             units = base / "config/systemd/user"
             units.mkdir(parents=True)
-            for name in ("tauceti-workers.service", "tauceti-cleanup.timer", "tauceti-cleanup.service"):
+            for name in (
+                "tauceti-workers.service",
+                "tauceti-workers.slice",
+                "tauceti-cleanup.timer",
+                "tauceti-cleanup.service",
+            ):
                 (units / name).write_text("")
             calls = []
 
@@ -652,7 +657,12 @@ class LegacyDataRoot(unittest.TestCase):
                 patch.object(purge.subprocess, "run", side_effect=run),
             ):
                 self.assertEqual(purge.stop_services(), [])
-            names = ["tauceti-cleanup.service", "tauceti-cleanup.timer", "tauceti-workers.service"]
+            names = [
+                "tauceti-cleanup.service",
+                "tauceti-cleanup.timer",
+                "tauceti-workers.service",
+                "tauceti-workers.slice",
+            ]
             self.assertEqual(calls[0], ["stop", *names])
             self.assertEqual(calls[1], ["disable", *names])
             self.assertEqual(list(units.iterdir()), [])

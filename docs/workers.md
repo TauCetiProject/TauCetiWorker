@@ -721,6 +721,19 @@ stopping their rounds. A service installed before this change keeps its workers 
 service itself: rerun `tauceti workers service install` and restart the service once,
 at a quiet moment, to move to scopes.
 
+The installer also writes `tauceti-workers.slice`. Limits set there cover the manager
+and every worker scope together, so set them on the slice rather than with
+`systemctl set-property` on the service, which worker scopes escape:
+
+```bash
+tauceti workers service install --cpu-quota 3200% --memory-high 48G
+```
+
+`--cpu-quota`, `--memory-high` and `--memory-max` take systemd's `CPUQuota=`,
+`MemoryHigh=` and `MemoryMax=` values. A later install without an option keeps the
+installed value, and an empty value (`--memory-high ''`) removes it. The install
+reloads systemd, which applies new limits to running workers without a restart.
+
 Two platform caveats:
 
 - On Linux systems that stop the user manager after the last logout,

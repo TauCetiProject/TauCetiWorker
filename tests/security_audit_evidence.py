@@ -73,7 +73,7 @@ class Classification(unittest.TestCase):
     # Fixtures ----------------------------------------------------------------
     def codex(self, native, stream):
         (self.attempt / "execution.json").write_text(
-            sa.serialize({"argv": ["codex", "exec"], "paged": False, "protocol_version": 4})
+            sa.serialize({"argv": ["codex", "exec"], "paged": False, "protocol_version": 5})
         )
         jsonl(
             self.attempt / "native-sessions/2026/rollout.jsonl",
@@ -83,7 +83,7 @@ class Classification(unittest.TestCase):
 
     def claude(self, session, stream, tail=""):
         (self.attempt / "execution.json").write_text(
-            sa.serialize({"argv": ["claude", "-p"], "paged": False, "protocol_version": 4})
+            sa.serialize({"argv": ["claude", "-p"], "paged": False, "protocol_version": 5})
         )
         jsonl(self.attempt / sa.CLAUDE_SESSIONS / "project" / f"{THREAD}.jsonl", session)
         jsonl(self.attempt / "model-transcript.jsonl", stream, tail)
@@ -309,7 +309,7 @@ class Classification(unittest.TestCase):
     def test_no_concern_and_no_valid_pass_is_not_judged(self):
         cases = {
             "unfinished": ([native_message(UNFINISHED)], exec_answer(UNFINISHED), None),
-            "unauthorized tool": ([native_call("read_mcp_resource"), native_message(PASS)], exec_answer(PASS), None),
+            "unauthorized tool": ([native_call("shell"), native_message(PASS)], exec_answer(PASS), None),
             "provider failure": ([native_message(PASS)], exec_answer(PASS), "security-audit: codex failed"),
             "no answer": ([], [{"type": "turn.completed"}], None),
             "extra field on a pass": (
@@ -325,6 +325,12 @@ class Classification(unittest.TestCase):
                 self.assertEqual(self.outcome(failure).kind, ev.NOT_JUDGED)
         self.setUp()
         self.assertEqual(self.outcome().kind, ev.NOT_JUDGED)  # Never launched.
+
+    def test_codex_mcp_resource_helpers_are_inert(self):
+        calls = [native_call(name) for name in sorted(ev.INERT_TOOLS)]
+        self.codex([*calls, native_message(PASS)], exec_answer(PASS))
+        self.assertEqual(self.outcome().kind, ev.PASS)
+        self.assertEqual(ev.INERT_TOOLS, frozenset(sa.INERT_TOOLS))
 
     def test_holds_reports_binding_evidence_only(self):
         self.assertFalse(ev.holds(self.state, self.state / "attempt-missing"))
