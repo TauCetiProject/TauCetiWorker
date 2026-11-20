@@ -1304,8 +1304,12 @@ def sweep(
                 if leased is None:
                     leased = set()
                     for lease in (directory / "uses").glob("*.list"):
+                        if past(deadline):
+                            break
                         with contextlib.suppress(FileNotFoundError):
                             leased.update(lease.read_text().split())
+                if past(deadline):
+                    continue  # A partial lease set protects nothing; the loop stops at its next check.
                 if name in leased:
                     continue
             with object_lock(directory, name, exclusive=True, blocking=False):
