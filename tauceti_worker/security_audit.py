@@ -2517,13 +2517,14 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         )
         if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
             failure["failure_kind"] = "provider-timeout"
-        running.unlink(missing_ok=True)  # Classified: the failure below records it.
         if isinstance(exc, NotJudged):
             # Not a judgment: nothing binds, and the next round inspects this range afresh.
             record(work / "ledger.jsonl", failure)
+            running.unlink(missing_ok=True)
             raise NoProgress(f"security-audit: no judgment yet ({exc}); the next round inspects afresh") from exc
         blocked.write_text(serialize(failure))
         record(work / "ledger.jsonl", failure)
+        running.unlink(missing_ok=True)  # Only once the classification is persisted.
         notify_block(work, failure)
         raise Die(f"security-audit: stopped without approval; see {blocked}: {exc}") from exc
 
