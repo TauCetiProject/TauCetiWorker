@@ -5118,6 +5118,15 @@ class Records(unittest.TestCase):
         (worktree / ".lake" / "junk").write_text("build output\n")
         tip, report = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
         self.assertTrue(report["ok"], report)
+        # A project whose `.gitignore` ignores `.lake`, as TauCeti's does, commits the same tree.
+        (worktree / ".gitignore").write_text(".lake\n")
+        ignored, _ = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
+        self.assertEqual(
+            sorted(sh(seed, "diff", "--name-only", tip, ignored).split()), [".gitignore"], "only the new .gitignore"
+        )
+        (worktree / ".gitignore").unlink()
+        tip, report = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
+        self.assertTrue(report["ok"], report)
         self.assertEqual(report["unexplained"], [])
         resolved = chain_tool.read_commit(seed, tip)
         original = chain_tool.read_commit(seed, conflicting)

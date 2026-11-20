@@ -634,7 +634,10 @@ def commit_resolution(
     with tempfile.TemporaryDirectory() as scratch:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
         git(worktree, *scope, "read-tree", prefix, env=env)
-        git(worktree, *scope, "add", "--all", "--", ".", ":(exclude).lake", env=env)
+        # `git add` refuses an exclude pathspec that names a path `.gitignore` already ignores, as
+        # TauCeti's does `.lake`; stage everything else, then drop `.lake` whichever way it was kept out.
+        git(worktree, *scope, "add", "--all", "--", ".", env=env)
+        git(worktree, *scope, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", ".lake", env=env)
         tree = git(worktree, *scope, "write-tree", env=env).strip()
     original = chain_tool.read_commit(clone, commit)
     explanation_file = worktree / LISTINGS_DIR / EXPLANATION_FILE
