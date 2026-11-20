@@ -467,6 +467,7 @@ def commit_tree(
     author: tuple[str, str],
     author_date: str | None = None,
     committer: tuple[str, str] = DEFAULT_COMMITTER,
+    committer_date: str | None = None,
 ) -> str:
     """Write a single-parent commit; like `commit --allow-empty`, an unchanged tree is still committed."""
     env = {
@@ -477,6 +478,8 @@ def commit_tree(
     }
     if author_date:
         env["GIT_AUTHOR_DATE"] = author_date
+    if committer_date:
+        env["GIT_COMMITTER_DATE"] = committer_date
     return git(repo, "commit-tree", tree, "-p", parent, "-F", "-", input=message, env=env).strip()
 
 
@@ -516,6 +519,7 @@ class CommitRecord:
     empty: bool = False
     conflict_paths: tuple[str, ...] = ()
     landed_on_base: str | None = None  # the base's own commit that landed this PR outside the queue
+    replayed: str | None = None  # `replay`'s conflicting record: the commit of the input chain that conflicted
 
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
@@ -706,7 +710,14 @@ def replay(
             message = commit.message
         if not outcome.clean:
             records.append(
-                CommitRecord(key, commit.accepted_head, None, CONFLICT, conflict_paths=outcome.conflict_paths)
+                CommitRecord(
+                    key,
+                    commit.accepted_head,
+                    None,
+                    CONFLICT,
+                    conflict_paths=outcome.conflict_paths,
+                    replayed=commit.sha,
+                )
             )
             records.extend(
                 CommitRecord(c.source_pr or c.sha, c.accepted_head, None, PENDING, landed_on_base=landing_of(c))
@@ -725,7 +736,12 @@ def replay(
         )
         records.append(
             CommitRecord(
-                key, commit.accepted_head, sha, CLEAN, empty=outcome.tree == new_tip_tree, landed_on_base=landing
+                key,
+                commit.accepted_head,
+                sha,
+                CLEAN,
+                empty=outcome.tree == new_tip_tree,
+                landed_on_base=landing,
             )
         )
         new_tip, new_tip_tree = sha, outcome.tree

@@ -59,6 +59,14 @@ AGENT_INSTRUCTION = (
     "contribution cannot be made to pass, reduce it to the part that does, down to an empty commit, and "
     "say so in its message."
 )
+# The instruction of a rebase task, which resolves one conflicting commit in the working tree.
+RESOLUTION_INSTRUCTION = (
+    "Resolve the conflict in the one commit described below. Preserve its pull request's intent and what the "
+    "target changed; where they conflict, use your judgment to choose the best alternative or combination. "
+    "Edit only the files in the working tree and write your explanation as described below: the worker makes "
+    "the commit, with the commit's own message and trailers. If the contribution cannot be made to apply, "
+    "reduce it to the part that does, down to nothing, and say so in your explanation."
+)
 
 SUBJECT_PR = re.compile(r"\(#(\d+)\)\s*$")
 MODULE_PATH = re.compile(r"TauCeti(?:/[A-Za-z_][A-Za-z0-9_']*)+\.lean")
@@ -149,8 +157,9 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
     """The findings structure from the controller's task diagnostics.
 
     The controller hands the repair task a list of findings, each ``{kind, module, message}`` as the
-    CI adapter extracted them, and for a rebase conflict one ``{kind: "conflict", source_pr, paths,
-    onto, pending, clean_prefix_tip, landed_on_base}`` entry (``landed_on_base`` lists the members the
+    CI adapter extracted them, and for a rebase conflict one ``{kind: "conflict", source_pr, commit, paths,
+    onto, pending, clean_prefix_tip, landed_on_base}`` entry (``commit`` is the conflicting commit the
+    task resolves onto ``clean_prefix_tip``; ``landed_on_base`` lists the members the
     target already carries, ``{source_pr, commit}`` each). Compiler findings become ``compiler_errors`` (with the
     line and column parsed from the message when it starts with ``path:line:col``), lint findings keep
     their module and message, every other kind is kept under ``other``, the conflict entry under
@@ -185,6 +194,7 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
         if kind == "conflict":
             findings["conflict"] = {
                 "member": raw.get("source_pr") or raw.get("member"),
+                "commit": raw.get("commit"),
                 "paths": list(raw.get("paths") or []),
                 "onto": raw.get("onto"),
                 "pending": list(raw.get("pending") or []),
@@ -467,11 +477,20 @@ def compare_chains(clone: Path, before: list[ChainCommit], after: list[ChainComm
 
 
 def owners_of(clone: Path, chain: list[ChainCommit], path: str) -> list[int]:
-    """Constituent PRs whose commit touches ``path`` (file-level ownership, as Bors attributes it)."""
+    """Constituent PRs whose commit touches ``path`` (file-level ownership, as Bors attributes it).
+
+    ``chain`` is usually linear; a conflict's chain is the replayed clean prefix followed by the input
+    chain's conflicting commit, so each commit is then judged against its own parent."""
     if not chain or not path:
         return []
-    shas = set(git(clone, "rev-list", f"{chain[0].parent}..{chain[-1].sha}", "--", path).split())
-    return [c.pr for c in chain if c.sha in shas and c.pr is not None]
+    if all(c.parent == p.sha for p, c in zip(chain, chain[1:], strict=False)):
+        shas = set(git(clone, "rev-list", f"{chain[0].parent}..{chain[-1].sha}", "--", path).split())
+        return [c.pr for c in chain if c.sha in shas and c.pr is not None]
+    return [
+        c.pr
+        for c in chain
+        if c.pr is not None and git(clone, "diff-tree", "--name-only", "-r", c.parent, c.sha, "--", path).strip()
+    ]
 
 
 def pr_number(source_pr: str) -> int:
@@ -579,6 +598,81 @@ def chain_report(
     record["problems"] = problems
     record["ok"] = not problems
     return record
+
+
+CONFLICT_MARKER = re.compile(r"^(?:<{7}|>{7})(?: |$)", re.M)
+
+
+def apply_conflict(worktree: Path, prefix: str, commit: str) -> list[str]:
+    """Check the worktree out at the clean ``prefix`` with ``commit`` applied onto it as the queue's
+    replay computes it (``git merge-tree`` with the commit's parent as merge base): the merged files,
+    with conflict markers in the conflicting ones, in the working tree. HEAD stays at the prefix and
+    no rebase, cherry-pick or merge is in progress, and no explanation from an earlier task is left.
+    Returns the conflicting paths."""
+    (worktree / LISTINGS_DIR / EXPLANATION_FILE).unlink(missing_ok=True)
+    parent = git(worktree, "rev-parse", "--verify", f"{commit}^").strip()
+    outcome = chain_tool.merge_trees(worktree, prefix, commit, merge_base=parent)
+    git(worktree, "checkout", "--quiet", "--force", "--detach", prefix)
+    git(worktree, "read-tree", "-u", "--reset", outcome.tree)
+    return list(outcome.conflict_paths)
+
+
+def commit_resolution(
+    clone: Path, worktree: Path, prefix: str, commit: str, paths: list[str], large_refactors=frozenset()
+) -> tuple[str, dict]:
+    """The worker's own commit of an agent's conflict resolution, and the report on it.
+
+    The tree is the worktree's files as ``git add --all`` stages them, read through a private index
+    and the clone's own Git directory, so the worktree's HEAD, index and refs, and any commit, rebase or
+    reset the agent made, are never read. The parent is the clean ``prefix``; the message is the
+    conflicting ``commit``'s own (title, trailers) with the agent's explanation from ``EXPLANATION_FILE``
+    appended, and the author is that commit's. The worktree is then checked out at the new commit.
+    ``problems`` names leftover conflict markers in ``paths`` and a review-size violation;
+    ``unexplained`` the member when the explanation is missing."""
+    gitdir = git(clone, "rev-parse", "--absolute-git-dir").strip()
+    scope = (f"--git-dir={gitdir}", f"--work-tree={worktree}")
+    with tempfile.TemporaryDirectory() as scratch:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        git(worktree, *scope, "read-tree", prefix, env=env)
+        git(worktree, *scope, "add", "--all", "--", ".", ":(exclude).lake", env=env)
+        tree = git(worktree, *scope, "write-tree", env=env).strip()
+    original = chain_tool.read_commit(clone, commit)
+    explanation_file = worktree / LISTINGS_DIR / EXPLANATION_FILE
+    explanation = explanation_file.read_text(errors="replace").strip() if explanation_file.is_file() else ""
+    message = original.message.rstrip() + "\n" + (f"\n{explanation}\n" if explanation else "")
+    # Dated like the original, so the same files and explanation always make the same commit (a delivery
+    # retry after a restart commits the worktree again and must submit the commit it verified).
+    sha = chain_tool.commit_tree(
+        clone,
+        tree,
+        prefix,
+        message,
+        (original.author_name, original.author_email),
+        author_date=original.author_date,
+        committer_date=original.author_date,
+    )
+    git(worktree, "checkout", "--quiet", "--force", "--detach", sha)
+    if git(worktree, "rev-parse", "HEAD").strip() != sha:
+        raise RuntimeError(f"the worktree could not be checked out at the resolved commit {sha[:12]}")
+    problems = []
+    for path in paths:
+        blob = git(clone, "cat-file", "-p", f"{sha}:{path}", check=False)
+        if CONFLICT_MARKER.search(blob):
+            problems.append(f"conflict-markers: `{path}` still contains conflict markers")
+    review = review_size_violations(clone, prefix, sha, large_refactors)
+    for entry in review:
+        problems += [f"review-size: the resolved commit against its parent: {v}" for v in entry["violations"]]
+    source_pr = original.source_pr or commit
+    return sha, {
+        "base": prefix,
+        "tip": sha,
+        "resolved": commit,
+        "review_size": review,
+        "edited": [source_pr],
+        "unexplained": [] if explanation else [source_pr],
+        "problems": problems,
+        "ok": not problems,
+    }
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1056,9 +1150,8 @@ LISTINGS_DIR = ".tauceti-repair"
 LISTINGS_FILE = "members.jsonl"  # one JSON object per member, in chain order
 CHECK_FILE = "check"  # the agent's one validation command, written beside the listings
 GUARDS_FILE = "ci_git.py"  # the shared PR-level diff guards the check script runs on each commit
-STEP_FILE = "step"  # steps the rebase through members already on main, stopping at real conflicts
+EXPLANATION_FILE = "explanation.md"  # a conflict resolution's explanation, appended to the commit by the worker
 BUILD_FILE = repair_tools.BUILD_FILE  # builds only the named modules, one Lake build at a time
-LANDED_SHOWN = 30  # members already on main listed in the prompt itself; the rest are in the listings file
 SHELL_LIMIT_SECONDS = 2 * 3600  # a repair agent's foreground shell limit (the fleet's rounds keep ten minutes)
 MEMBER_STATES = ("replayed", "conflicting", "pending")
 
@@ -1089,7 +1182,7 @@ class PromptContext:
     suspect_heads: dict[int, str] = dataclasses.field(default_factory=dict)
     named_modules: list[str] = dataclasses.field(default_factory=list)
     conflict: dict | None = (
-        None  # rebase_conflict, pre_rebase: {member, paths, onto, previous_base, pending, clean_prefix_tip, landed_on_base}
+        None  # rebase_conflict, pre_rebase: {member, commit, paths, onto, previous_base, clean_prefix_tip}
     )
     feedback: str | None = None  # a validation report from a rejected attempt
     members: list[dict] = dataclasses.field(
@@ -1102,7 +1195,6 @@ class PromptContext:
     check_findings_known: bool = False  # cached artifacts fetched; CI already supplied the failures
     listings_path: Path | None = None  # where the member listings and the check script are written
     shell_limit: int = SHELL_LIMIT_SECONDS  # what the prompt says about the foreground shell limit
-    rebase_options: str = "--keep-empty --empty=keep --reapply-cherry-picks"  # the replay's git options
     repair_context: object | None = None  # ``repair_context.compute``'s result: ownership, collisions and ripples
     pre_rebased: bool = False  # prepare: the chain is the batch's pre-rebase on the head's tip ``base``
     scope_failure_only: bool = False  # compilation passed; only the trusted scope-policy verdict failed
@@ -1377,67 +1469,30 @@ def check_script(target: str, repository: str) -> str:
     return CHECK_SCRIPT.format(target=target, repository=repository)
 
 
-STEP_SCRIPT = """#!/usr/bin/env bash
-# Step the replay of this batch onto TARGET. Written by the queue's repair worker.
-# Starts the rebase when none is in progress, else continues it. Members already on main stay as
-# empty commits (an identical patch is kept by --reapply-cherry-picks; a conflict in one of them
-# takes main's version). Stops at the first real conflict, naming the commit and the files: resolve
-# it, `git add` the files and run this script again.
-set -u
-TARGET={target}
-BASE={base}
-here=$(cd "$(dirname "$0")" && pwd)
-cd "$here/.." || exit 1
-landed=$(python3 -c 'import json,sys;[print(r["pr"]) for r in map(json.loads, open(sys.argv[1])) if r.get("landed_on_main")]' "$here/members.jsonl")
-in_progress() {{ [ -d "$(git rev-parse --git-path rebase-merge)" ]; }}
-if ! in_progress; then
-  if git merge-base --is-ancestor "$TARGET" HEAD; then echo "HEAD is already on ${{TARGET:0:12}}; nothing to replay (run check)"; exit 0; fi
-  out=$(git rebase {options} --onto "$TARGET" "$BASE" 2>&1) || in_progress || {{ echo "$out"; exit 1; }}
-fi
-while in_progress; do
-  sha=$(git rev-parse --verify -q REBASE_HEAD) || break
-  source_pr=$(git show -s --format=%B "$sha" | sed -n 's/^Source-PR: //p' | head -1)
-  case "$source_pr" in forgejo:*@*#*) pr="$source_pr" ;; *) pr="${{source_pr##*#}}" ;; esac
-  conflicted=$(git diff --name-only --diff-filter=U)
-  if [ -n "$conflicted" ] && ! grep -qx -- "${{pr:-none}}" <<<"$landed"; then
-    printf 'stopped at PR #%s, commit %s: resolve the conflict in\n%s\n' "$pr" "${{sha:0:12}}" "$conflicted"; exit 1
-  fi
-  for path in $conflicted; do  # already on main: keep main's version
-    if git cat-file -e "HEAD:$path" 2>/dev/null; then git checkout HEAD -- "$path"; else git rm -q --cached -- "$path" && rm -f "$path"; fi
-  done
-  # Commit the resolution with the member's own message and author, kept even when it is now empty.
-  git commit -q --allow-empty -C REBASE_HEAD || exit 1
-  out=$(GIT_EDITOR=true git rebase --continue 2>&1) || grep -q CONFLICT <<<"$out" || {{ echo "$out"; exit 1; }}
-done
-echo "rebase finished: $(git rev-list --count "$TARGET..HEAD") commits on ${{TARGET:0:12}}, HEAD $(git rev-parse --short=12 HEAD)"
-"""
-
-
-def step_script(target: str, base: str, options: str) -> str:
-    return STEP_SCRIPT.format(target=target, base=base, options=options)
+def resolving(context: PromptContext) -> bool:
+    """Whether the task resolves one conflicting commit, whose result is the working tree."""
+    return context.kind in REBASE_KINDS and bool((context.conflict or {}).get("commit"))
 
 
 def write_listings(
     context: PromptContext, chain: list[ChainCommit], landed: dict[int, str | None] | None = None
 ) -> str:
-    """Write the member listings, the check script, the build script and the step script beside
-    ``context.listings_path``; the display path of the listings for the prompt."""
+    """Write the member listings, the build script and (except for a conflict, whose result is the
+    working tree) the chain check script beside ``context.listings_path``; the display path of the
+    listings for the prompt."""
     assert context.listings_path is not None
     directory = context.listings_path.parent
     directory.mkdir(parents=True, exist_ok=True)
     context.listings_path.write_text(
         "".join(json.dumps(public(record), sort_keys=False) + "\n" for record in member_records(context, chain, landed))
     )
-    check = directory / CHECK_FILE
-    check.write_text(check_script(context.base, context.repository))
-    check.chmod(0o755)
-    # The check script's review-size guard: the same shared `ci_git` the worker's own check imports.
-    (directory / GUARDS_FILE).write_bytes(Path(diff_guard.ci_git.__file__).read_bytes())
+    if not resolving(context):
+        check = directory / CHECK_FILE
+        check.write_text(check_script(context.base, context.repository))
+        check.chmod(0o755)
+        # The check script's review-size guard: the same shared `ci_git` the worker's own check imports.
+        (directory / GUARDS_FILE).write_bytes(Path(diff_guard.ci_git.__file__).read_bytes())
     repair_tools.write_build_script(directory, worker_verifies=context.worker_verifies)
-    if context.kind in REBASE_KINDS and (context.conflict or {}).get("previous_base"):
-        step = directory / STEP_FILE
-        step.write_text(step_script(context.base, str(context.conflict["previous_base"]), context.rebase_options))
-        step.chmod(0o755)
     return (
         f"{LISTINGS_DIR}/{LISTINGS_FILE}"
         if context.listings_path.parts[-2:] == (LISTINGS_DIR, LISTINGS_FILE)
@@ -1541,7 +1596,7 @@ def _verification_section(
 ) -> list[str]:
     conflict = context.conflict if context.kind in REBASE_KINDS else None
     lines = ["", "## Verifying locally", ""]
-    if not context.worker_verifies:
+    if not context.worker_verifies and not resolving(context):
         lines += [
             "Fold fixups and finalize all commit-message explanations before the final whole-library build. "
             "That lets the worker start publishing outputs for the final revision while audits and lint run.",
@@ -1563,11 +1618,10 @@ def _verification_section(
             "",
             f"Run `{LISTINGS_DIR}/check-findings`: it builds the finding modules and your edited modules, "
             "then runs the reported linters or the ownership-only check. These are advisory checks, "
-            "not a claim that the entire batch passes. During a rebase, check edited modules directly; "
-            "finish all conflicts before checking their combined downstream closure. The worker performs "
-            "that closure check in its final whole-library verification.",
+            "not a claim that the entire batch passes. The worker checks the downstream closure of your "
+            "edits in its final whole-library verification.",
             "",
-            "After the focused checks and the chain check, return your summary. "
+            "After the focused checks" + (" and the chain check" if check_command else "") + ", return your summary. "
             "The worker runs the whole-library build and all of staging's audits and lints before submission "
             "and sends every remaining finding back as diagnostics. "
             "If a targeted checker is unavailable, report that and return after scoped compilation; "
@@ -1592,7 +1646,7 @@ def _verification_section(
             "",
             AUDIT_SENTENCE,
         ]
-        if check_command
+        if context.listings_path is not None
         else []
     )
     limit = _hours_text(context.shell_limit)
@@ -1619,7 +1673,7 @@ def _verification_section(
             "starts from nothing and may take hours. Do not start with it."
             + first
             + " Judge each by its exit status; the queue's CI builds the whole library once you return. Run a full "
-            "`lake build --iofail` only after the rebase is finished and only if time allows. "
+            "`lake build --iofail` only after the conflict is resolved and only if time allows. "
             + foreground
             + " "
             + CACHE_SENTENCE
@@ -1629,9 +1683,12 @@ def _verification_section(
     elif context.kind in REBASE_KINDS:
         lines += [
             "Artifacts are warm: the worker fetched the available cache outputs into `.lake` without building "
-            "the original chain. Finish the rebase first, then build the resulting chain with "
-            "`lake build --iofail` and judge it by its exit status; cached outputs are reused when their inputs "
-            "still match. " + foreground + " " + CACHE_SENTENCE + " Do not use `--fail-fast`.",
+            "the original chain. Resolve the conflict first, then build the result with `lake build --iofail` "
+            "and judge it by its exit status; cached outputs are reused when their inputs still match. "
+            + foreground
+            + " "
+            + CACHE_SENTENCE
+            + " Do not use `--fail-fast`.",
             *scoped,
         ]
     elif context.check_findings_known:
@@ -1677,37 +1734,35 @@ def _positions(first: int, last: int) -> str:
 def _rebase_sections(
     context: PromptContext, chain: list[ChainCommit], clone: Path, base_short: str, where: str | None
 ) -> tuple[list[str], list[str]]:
-    """What happened and the conflict evidence of a rebase conflict, naming every git ref once."""
+    """What happened and the conflict evidence of a rebase conflict, naming every git ref once.
+
+    ``chain`` is the clean prefix replayed onto the target followed by the one conflicting commit; the
+    commits after it are the worker's to replay, so the prompt does not name them."""
     conflict = context.conflict or {}
-    previous = (conflict.get("previous_base") or (chain[0].parent if chain else "") or "")[:12]
-    stop = conflict_position(context, chain)
+    previous = (conflict.get("previous_base") or "")[:12]
     paths = conflict.get("paths") or []
-    member = conflict.get("member")
-    number = chain[stop].pr if stop is not None else None
-    commit_text = f"PR #{number}'s commit `{chain[stop].sha[:12]}`" if stop is not None else f"{member or 'one member'}"
+    stop = conflict_position(context, chain)
+    commit = chain[stop] if stop is not None else None
+    commit_text = f"PR #{commit.pr}'s commit `{commit.sha[:12]}`" if commit else "the conflicting commit"
     in_paths = " with conflicts in " + ", ".join(f"`{p}`" for p in paths) if paths else " with conflicts"
-    before = stop if stop is not None else None
-    prefix = (conflict.get("clean_prefix_tip") or "")[:12]
-    if before:
-        cleanly = (
-            f" The {before} commit{'s' if before != 1 else ''} before it replayed cleanly"
-            + (f" and {'are' if before != 1 else 'is'} at commit `{prefix}`" if prefix else "")
-            + "."
-        )
-    elif before == 0:
-        cleanly = " It is the first commit of the batch, so nothing replayed before it."
-    else:
-        cleanly = f" The commits before it replayed cleanly and are at commit `{prefix}`." if prefix else ""
+    prefix = (conflict.get("clean_prefix_tip") or context.base)[:12]
     pre = context.kind == "pre_rebase"
     target = (
         f"the tip `{base_short}` of the head batch ahead of it" if pre else f"the current `main` commit `{base_short}`"
     )
+    cleanly = (
+        f" The {stop} commit{'s' if stop != 1 else ''} before it replayed cleanly and {'are' if stop != 1 else 'is'} "
+        f"at `{prefix}`."
+        if stop
+        else " Nothing replayed before it."
+    )
     happened = [
         "## What happened",
         "",
-        f"The queue replayed this batch of {len(chain)} squash commits, one per pull request, from its base `{previous}` "
-        f"onto {target} with git. The replay stopped at {commit_text}{in_paths}.{cleanly} "
-        f"Your job is to finish that replay so the whole batch sits on `{base_short}`."
+        f"The queue is replaying this batch, one squash commit per pull request, from its base `{previous}` onto "
+        f"{target} with git. The replay stopped at {commit_text}{in_paths}.{cleanly} Your job is to resolve that "
+        "one commit: make its change apply on top of the commits before it, as its author intended. The worker "
+        "commits your resolution and replays the rest of the batch itself; a later conflict is a separate request."
         + (
             f" The target is not `main`: `{base_short}` is what `main` becomes when the head lands, so this is the next "
             "head's expected base, and the head's CI round may still change it."
@@ -1716,8 +1771,9 @@ def _rebase_sections(
         )
         + (f" {context.origin}" if context.origin else ""),
         "",
-        f"You are in a private, detached Git worktree of {context.repository}; HEAD is the batch's tip on `{previous}`, "
-        "as it was before the replay.",
+        f"You are in a private, detached Git worktree of {context.repository}. HEAD is `{prefix}`, and the working "
+        f"tree holds {commit_text} applied onto it, with git's conflict markers in the conflicting files. No "
+        "rebase, cherry-pick or merge is in progress.",
     ]
     evidence = [
         "",
@@ -1725,64 +1781,27 @@ def _rebase_sections(
         "",
         f"- base, the batch's previous base: `{previous}`",
         f"- target, the head's tip: `{base_short}`" if pre else f"- target, the current `main`: `{base_short}`",
+        f"- clean prefix, HEAD: `{prefix}` ({_positions(1, stop)} replayed onto the target)"
+        if stop
+        else f"- clean prefix, HEAD: the target `{prefix}`",
     ]
-    if stop is not None:
+    if commit is not None:
         title = member_records(context, chain)[stop]["title"]
         evidence.append(
-            f"- conflicting commit: `{chain[stop].sha[:12]}` (PR #{number}, {_positions(stop + 1, stop + 1)} of {len(chain)}: {title})"
+            f"- conflicting commit: `{commit.sha[:12]}` (PR #{commit.pr}, {_positions(stop + 1, stop + 1)}: {title})"
         )
-        if stop:
-            evidence.append(
-                f"- clean prefix: `{prefix}` ({_positions(1, stop)} replayed onto the target)"
-                if prefix
-                else f"- clean prefix: {_positions(1, stop)} replayed onto the target"
-            )
-    elif member:
-        evidence.append(f"- conflicting member: {member}" + (f"; clean prefix `{prefix}`" if prefix else ""))
     for path in paths:
         owners = owners_of(clone, chain, path)
-        evidence.append(f"- `{path}`: {_owner_text(owners, chain)}, and `main` has changed it since the batch's base")
-    pending = len(chain) - stop - 1 if stop is not None else len(conflict.get("pending") or [])
-    if pending and stop is not None:
         evidence.append(
-            f"- not yet replayed: {pending} commit{'s' if pending != 1 else ''} after it ({_positions(stop + 2, len(chain))})"
+            f"- `{path}`: {_owner_text(owners, chain)}, and the target has changed it since the batch's base"
         )
-    elif pending:
-        evidence.append(f"- not yet replayed: {pending} commit{'s' if pending != 1 else ''} after it")
     if where:
         evidence.append(
-            f"- every member with its `position`, `commit`, `pr`, `title`, `accepted_head`, `provenance` and `state` "
-            f"(`replayed`, `conflicting` or `pending`): `{where}`, one JSON object per line, in chain order; `grep` it "
-            "for a PR number or commit (ignored by Git)"
+            f"- the clean prefix and the conflicting commit with their `position`, `commit`, `pr`, `title`, "
+            f"`accepted_head`, `provenance` and `state` (`replayed` or `conflicting`): `{where}`, one JSON object per "
+            "line, in chain order (ignored by Git)"
         )
     return happened, evidence
-
-
-def _landed_section(
-    context: PromptContext, chain: list[ChainCommit], landed: dict[int, str | None], where: str | None
-) -> list[str]:
-    """The members whose PR is already on ``main``: one line each up to ``LANDED_SHOWN``, the rest by
-    count, with what to do about them."""
-    if not landed:
-        return []
-    records = [r for r in member_records(context, chain, landed) if r["pr"] in landed]
-    lines = [
-        "",
-        "## Already on main",
-        "",
-        f"{len(records)} of the {len(chain)} members' PRs have landed on `main` outside the queue since the batch's "
-        "base. Each becomes an empty commit: its patch is already in the base (`--reapply-cherry-picks` keeps an "
-        "identical patch as an empty commit rather than dropping it), and a conflict in one of them is resolved by "
-        "taking `main`'s version."
-        + (f" They are marked `landed_on_main` (the landing commit) in `{where}`." if where else ""),
-        "",
-    ]
-    for record in records[:LANDED_SHOWN]:
-        landing = f", landed as `{record['landed_on_main'][:12]}`" if record["landed_on_main"] != "landed" else ""
-        lines.append(f"- PR #{record['pr']}: {record['title']}{landing}")
-    if len(records) > LANDED_SHOWN:
-        lines.append(f"- and {len(records) - LANDED_SHOWN} more" + (f", marked in `{where}`" if where else ""))
-    return lines
 
 
 def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list[str]:
@@ -1827,7 +1846,20 @@ def _no_repair_section(context: PromptContext, chain: list[ChainCommit]) -> list
     return lines
 
 
-def _result_section(base_short: str) -> list[str]:
+def _result_section(context: PromptContext, base_short: str) -> list[str]:
+    if resolving(context):
+        return [
+            "",
+            "## The result",
+            "",
+            "The result is the files in this worktree. When you finish, the worker commits them itself as the "
+            "conflicting commit on HEAD, with that commit's message, trailers and author and your explanation "
+            "appended, then replays the rest of the batch onto it with git; the queue runs CI on the whole batch. Do not commit, "
+            "rebase, reset, cherry-pick or create branches: the worker reads only the working tree, and anything "
+            "done to HEAD, the index, refs or history is discarded. There is nothing to push, and `gh` is not needed.",
+            "",
+            f"Do not introduce changes to {PROTECTED_PATHS}; a commit that itself modifies such a file keeps its change.",
+        ]
     return [
         "",
         "## The result",
@@ -1848,36 +1880,19 @@ def _autosquash(base_short: str) -> str:
 
 
 def _editing_section(context: PromptContext, chain: list[ChainCommit], base_short: str, where: str | None) -> list[str]:
-    conflict = context.conflict if context.kind in REBASE_KINDS else None
-    if conflict:
-        previous = (conflict.get("previous_base") or (chain[0].parent if chain else "") or "")[:12]
-        stop = conflict_position(context, chain)
-        at = f"`{chain[stop].sha[:12]}`" if stop is not None else (conflict.get("member") or "the conflicting member")
+    if resolving(context):
         return [
             "",
-            "## The rebase",
+            "## Resolving the commit",
             "",
-            f"Run `git rebase {context.rebase_options} --onto {base_short} {previous}`. It replays the chain commit "
-            f"by commit onto `{base_short}` and stops at {at} with the conflict above, and at any later commit that "
-            "conflicts. At each stop, resolve the conflict inside that commit: edit the conflicting files, `git add` "
-            "them, `git commit --allow-empty -C REBASE_HEAD` (the commit's own message and author, kept even when the "
-            "resolution leaves it empty), then `GIT_EDITOR=true git rebase --continue`. A commit whose change is "
-            f"already on `{base_short}` becomes an empty commit, never a dropped one; do not `git rebase --skip`."
-            + (
-                f" `bash {LISTINGS_DIR}/{STEP_FILE}` does this stepping for you: it starts the rebase if none is in "
-                "progress, keeps members already on `main` as empty commits (taking `main`'s version of any conflict "
-                "in them) and stops at the first real conflict, naming the commit and the files; resolve it, `git add` "
-                "the files and run it again."
-                if where
-                else ""
-            ),
+            "Edit the conflicting files so they hold this commit's change on top of HEAD, with every conflict "
+            "marker removed: keep the pull request's mathematics and what the target changed. Edit other files "
+            "too when the resolution needs it (an import, or a name the target changed). When the change is "
+            "already entirely on the target, make the files match HEAD: the commit becomes an empty one, never "
+            "a dropped one.",
             "",
-            "After the rebase has finished, append your explanation to the message of each commit whose content you "
-            'changed: `git commit --allow-empty --squash=<sha> -m "<explanation>"`, then '
-            + _autosquash(base_short)
-            + ". This keeps the commit's message and author and adds the explanation after the trailers. To change "
-            "the content of a commit that has already been replayed, make the edit, `git add` it, "
-            "`git commit --fixup=<sha>`, and run the same autosquash rebase.",
+            f"Then write a very concise explanation of what you changed and why to `{LISTINGS_DIR}/{EXPLANATION_FILE}` "
+            "(ignored by Git); the worker appends it to the commit's message.",
         ]
     source = f" (the owning commit's SHA is in the evidence above{' and in `' + where + '`' if where else ''})"
     return [
@@ -1937,14 +1952,14 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     an incremental whole-library build to building the touched modules first.
     """
     base_short = context.base[:12]
-    lines = [context.instruction or AGENT_INSTRUCTION, ""]
+    lines = [RESOLUTION_INSTRUCTION if resolving(context) else context.instruction or AGENT_INSTRUCTION, ""]
     conflict = context.conflict if context.kind in REBASE_KINDS else None
     landed = landed_on_main(context, chain, clone)
     where = write_listings(context, chain, landed) if context.listings_path is not None else None
     knowledge = findings.get("admission_predictions")
     if knowledge and context.listings_path is not None:
         (context.listings_path.parent / "admission.json").write_text(json.dumps(knowledge, indent=2) + "\n")
-    check_command = f"python3 {LISTINGS_DIR}/{CHECK_FILE}" if where else None
+    check_command = f"python3 {LISTINGS_DIR}/{CHECK_FILE}" if where and not resolving(context) else None
     if conflict:
         happened, evidence = _rebase_sections(context, chain, clone, base_short, where)
         lines += happened + evidence
@@ -2121,11 +2136,12 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
             "",
             *[f"    {text}" for text in context.feedback.splitlines()],
             "",
-            "Start from HEAD as it is now and produce a chain that passes these checks.",
+            "Start from the working tree as it is now and resolve what these checks report."
+            if resolving(context)
+            else "Start from HEAD as it is now and produce a chain that passes these checks.",
         ]
     if where is None:
         lines += _inline_listing(context, chain, landed)
-    lines += _landed_section(context, chain, landed, where)
     lines += _no_repair_section(context, chain)
     if context.repair_context is not None and where:
         lines += context.repair_context.prompt_lines()
@@ -2137,7 +2153,7 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
     from .admission_planning import prompt_lines
 
     lines += prompt_lines(knowledge, with_file=context.listings_path is not None)
-    lines += _result_section(base_short)
+    lines += _result_section(context, base_short)
     lines += _editing_section(context, chain, base_short, where)
     lines += _verification_section(context, findings, base_short, check_command)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines))
@@ -2169,6 +2185,15 @@ def prepare_errors_lines(record: dict | None) -> list[str]:
     if omitted > 0:
         lines.append(f"- and {omitted} more in the task's `prepare_errors` diagnostics")
     return lines
+
+
+def resolution_explanation_prompt(source_pr: str) -> str:
+    """Ask for the missing explanation of a conflict resolution."""
+    return (
+        f"Your resolution of {source_pr}'s commit is in the working tree, but `{LISTINGS_DIR}/{EXPLANATION_FILE}` is "
+        "missing or empty. Write a very concise explanation of what you changed to resolve the conflict and why to "
+        "that file. Change nothing else, then stop."
+    )
 
 
 def explanation_prompt(unexplained: list[str], chain: list[ChainCommit], *, base: str | None = None) -> str:

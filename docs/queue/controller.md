@@ -151,7 +151,9 @@ I/O, below):
    a head not based on the canonical commit is claimed and, when its pre-rebase (below) was made on
    exactly that commit, based there from the pre-rebased chain without a replay; otherwise replayed (`chain.replay`), a clean
    replay becoming the next version with provenance unchanged, a conflict becoming a
-   `rebase_conflict` task with the conflicting member, paths and the clean prefix as evidence;
+   `rebase_conflict` task with the conflicting member and commit, paths and the clean prefix as
+   evidence (the worker replays the chain itself and resolves each conflict in turn,
+   docs/queue/repair-task.md, "Rebase conflicts: one commit at a time");
    a head with an open task waits for a worker; otherwise CI (below) and, on a pass, promotion
    through the outbox.
 6. Pre-rebase (below): supersede stale `pre_rebase` tasks; once the head's chain is submitted and

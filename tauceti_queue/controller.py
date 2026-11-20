@@ -6191,6 +6191,8 @@ class Controller:
             {
                 "kind": "conflict",
                 "source_pr": conflict.source_pr if conflict else None,
+                # The input chain's conflicting commit, which the worker's own replay stops at.
+                "commit": conflict.replayed if conflict else None,
                 "paths": list(conflict.conflict_paths) if conflict else [],
                 "onto": canonical,
                 "message": f"replaying the chain onto {canonical[:12]} conflicts at {conflict.source_pr if conflict else '?'}",
@@ -6636,6 +6638,7 @@ class Controller:
             {
                 "kind": "conflict",
                 "source_pr": conflict.source_pr if conflict else None,
+                "commit": conflict.replayed if conflict else None,
                 "paths": list(conflict.conflict_paths) if conflict else [],
                 "onto": onto,
                 "message": (
