@@ -168,12 +168,15 @@ the task's log directory.
   files, clean or with markers between the clean prefix and the rewritten commit, and its prompt says
   which files the worker merged, which still conflict and which sites the tool left.
 - Anything unexpected returns the conflict to the agent as before: an installed TauCetiTools without
-  numproj, a tool failure or timeout, a sandbox error, a symlink under `.lake/numproj`, a failed write
-  (the worker applies the conflict again), nothing rewritten, or a rewrite that changes anything but
-  numeric projections into named ones, parentheses and whitespace
-  (`repair_numproj.same_up_to_projections`). The elaborated member code can write the tool's inputs, so
-  this check is what bounds the mechanical result: the most it can change is which name a numeric
-  projection gets, which the later build verification checks like any resolution.
+  numproj, a tool failure or timeout, a sandbox error, a symlink under `.lake/numproj`, a rewritten
+  copy that is a symlink or not a regular file, a failed write (the worker applies the conflict again),
+  nothing rewritten, or a rewrite with any edit `numproj_fix.py` does not make
+  (`repair_numproj.same_up_to_projections`): only digits after a `.` that follows an identifier or a
+  bracket may become a field name, a receiver of identifier characters may be parenthesized just before
+  its `.`, and a space may become a line break with indentation, never on a line with a string literal.
+  The elaborated member code can write the tool's copies, so this check bounds the mechanical result:
+  the most it can change is which name a numeric projection gets, which the later build verification
+  checks like any resolution.
 
 The controller's insertion probes of waiting PRs do not use the pre-pass: they are `git merge-tree`
 checks on the controller host within a twenty-second budget per pass, with no built tree to elaborate

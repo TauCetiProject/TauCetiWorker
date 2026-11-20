@@ -7170,19 +7170,44 @@ class NumprojPrepass(Fixture):
         self.assertNotIn("partial", resolved)
 
     def test_the_rewrite_check(self):
-        same = repair_numproj.same_up_to_projections
-        self.assertTrue(same("f x.1 y.2.1", "f x.fst y.snd.fst"))
-        self.assertTrue(same("  exact foo (a b).1 c", "  exact foo (a b).fst\n      c"))
-        self.assertTrue(same("$h.1", "($h).val"))
-        self.assertFalse(same("f x.1", "g x.fst"))
-        self.assertFalse(same("x.1 + 1", "x.fst + 2"))
-        self.assertFalse(same("x.1", "x.fst := sorry"))
-        self.assertFalse(same("x.fst + y.1", "x.snd + y.fst"), "a named field may not change")
-        self.assertFalse(same("x.1", "x"), "nor a projection disappear")
-        self.assertFalse(same("Nat.succ", "Nat.pred"))
+        """Only the edits `numproj_fix.py` makes pass; anything member code could add on top does not."""
+        cases = [
+            ("f x.1 y.2.1", "f x.fst y.snd.fst", True),
+            ("  exact foo (a b).1 c", "  exact foo (a b).fst\n      c", True),
+            ("$h.1", "($h).fst", True),
+            ("s.1.foo", "(s).val.foo", True),
+            ("h1.1", "h1.fst", True),
+            ("x.1.2", "x.1.snd", True),
+            ("a b", "a\n    b", True),
+            ("(x.1 + 2) * 3", "x.fst + 2 * 3", False),
+            ("a + b.1", "(a + b).fst", False),
+            ("1.5", "1.foo", False),
+            ("x.fst + y.1", "x.snd + y.fst", False),
+            ("Nat.succ", "Nat.pred", False),
+            ('def s := "x.1" ++ y.1', 'def s := "x.fst" ++ y.fst', False),
+            ("x.1", "x", False),
+            ("f x.1", "g x.fst", False),
+            ("ab", "a\nb", False),
+            ("x.1", "(x.fst", False),
+        ]
+        for before, after, accepted in cases:
+            with self.subTest(before=before, after=after):
+                self.assertEqual(repair_numproj.same_up_to_projections(before, after), accepted)
         self.assertTrue(repair_numproj.CANDIDATE.search("h.1"))
         self.assertTrue(repair_numproj.CANDIDATE.search("(f x).2"))
         self.assertFalse(repair_numproj.CANDIDATE.search("theorem a : True := trivial\n"))
+
+    def test_scratch_files_are_read_without_following_links_or_blocking(self):
+        with tempfile.TemporaryDirectory(dir=self.root) as scratch:
+            directory = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY)
+            self.addCleanup(os.close, directory)
+            (Path(scratch) / "file").write_text("x.fst\n")
+            os.symlink(Path(scratch) / "file", Path(scratch) / "link")
+            os.mkfifo(Path(scratch) / "fifo")
+            self.assertEqual(repair_numproj._read(directory, "file"), b"x.fst\n")
+            for name in ("link", "fifo"):
+                with self.subTest(name=name), self.assertRaises(OSError):
+                    repair_numproj._read(directory, name)
 
 
 if __name__ == "__main__":

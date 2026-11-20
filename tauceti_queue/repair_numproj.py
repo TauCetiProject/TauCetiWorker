@@ -24,6 +24,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -38,10 +39,12 @@ JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
 CANDIDATE = re.compile(r"[\w'\)\]⟩»]\.\d")
-# Tokens for `same_up_to_projections`: a `.` with digits or a name after it, or any other character
-# except whitespace and parentheses (which a rewrite may add around a receiver, or move by rewrapping).
-_TOKEN = re.compile(r"\.\d+|\.[^\W\d][\w'!?]*|[^\s()]")
+# For `same_up_to_projections`: a numeric projection, the named field replacing it, an identifier's
+# last characters (to tell `h1.1` from the literal `1.5`), and a receiver the tool may parenthesize.
 _NUMERIC = re.compile(r"\.\d+")
+_NAMED = re.compile(r"\.[^\W\d][\w'!?]*")
+_IDENT_END = re.compile(r"[\w']+$")
+_RECEIVER = re.compile(r"[\w'.$!?«»]+")
 
 
 @dataclasses.dataclass
@@ -71,15 +74,51 @@ def _blob(worktree: Path, rev: str, path: str) -> bytes | None:
 
 
 def same_up_to_projections(before: str, after: str) -> bool:
-    """Whether ``after`` differs from ``before`` only as a projection rewrite can: a numeric
-    projection (`.1`) replaced by a named one (`.fst`), parentheses and whitespace. Anything else,
-    such as a named field changed into another, means the tool (or the member code it elaborated,
-    which can write its inputs) did something it should not."""
-    old, new = _TOKEN.findall(before), _TOKEN.findall(after)
-    return len(old) == len(new) and all(
-        a == b or (_NUMERIC.fullmatch(a) is not None and _NUMERIC.fullmatch(b) is None and b.startswith("."))
-        for a, b in zip(old, new, strict=True)
-    )
+    """Whether ``after`` is ``before`` with only the edits ``numproj_fix.py`` makes: a numeric
+    projection's digits after an identifier or bracket replaced by a field name (`h.1` to `h.fst`), a
+    receiver made of identifier characters parenthesized right before its `.` (`$h.1` to
+    `($h).fst`), and a space replaced by a line break and indentation (a rewrapped line). Anything
+    else means the tool, or the member code it elaborated (which can write the tool's files), did
+    something it should not. Edits are refused on a line with a string literal, whose contents must
+    not change. Which field a projection gets is not checked here; the build is."""
+
+    def literal(i: int) -> bool:
+        return '"' in before[before.rfind("\n", 0, i) + 1 : (before.find("\n", i) + 1 or len(before) + 1) - 1]
+
+    i = j = 0
+    opened: int | None = None  # where in ``before`` an inserted `(` stands
+    while i < len(before) or j < len(after):
+        numeric = _NUMERIC.match(before, i)
+        named = _NAMED.match(after, j)
+        if i < len(before) and j < len(after) and before[i] == after[j] and not (numeric and named):
+            i, j = i + 1, j + 1
+            continue
+        if literal(i):
+            return False
+        if numeric and named and j > 0:
+            # A projection follows a bracket or an identifier, as rewritten so far (`x.1.2` is
+            # `x.fst.2` by now); digits alone before the `.` are a literal (`1.5`), unless they are
+            # themselves a projection the tool kept (`x.1.2` to `x.1.snd`).
+            ident = _IDENT_END.search(after, 0, j)
+            if after[j - 1] in ")]⟩»" or (
+                ident is not None and (not ident.group().isdigit() or after[ident.start() - 1 : ident.start()] == ".")
+            ):
+                i, j = numeric.end(), named.end()
+                continue
+            return False
+        if j < len(after) and after[j] == "(" and opened is None:
+            opened, j = i, j + 1
+        elif j < len(after) and after[j] == ")" and opened is not None and after[j + 1 : j + 2] == ".":
+            if not _RECEIVER.fullmatch(before, opened, i):
+                return False
+            opened, j = None, j + 1
+        elif i < len(before) and before[i] == " " and after[j : j + 1] == "\n":
+            i, j = i + 1, j + 1
+            while j < len(after) and after[j] == " ":
+                j += 1
+        else:
+            return False
+    return opened is None
 
 
 def _private_dir(lake: Path, *names: str) -> Path:
@@ -101,9 +140,13 @@ def _private_dir(lake: Path, *names: str) -> Path:
     return path
 
 
-def _read(path: Path) -> bytes:
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+def _read(directory: int, name: str) -> bytes:
+    """The regular file ``name`` in the open ``directory``, never through a symlink and never
+    blocking on a FIFO: elaborated member code may have replaced it."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
     with os.fdopen(fd, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise OSError(f"{name} is not a regular file")
         return handle.read()
 
 
@@ -178,7 +221,7 @@ def prepass(
             sides[path] = (ours, base, theirs)
     if not sides:
         return None
-    scratch = None
+    scratch, directory = None, None
     try:
         cache = _private_dir(worktree / ".lake", SCRATCH, "cache")  # the compiled scanner, per toolchain
         scratch = _private_dir(worktree / ".lake", SCRATCH, f"run-{secrets.token_hex(6)}")
@@ -186,11 +229,14 @@ def prepass(
         copy.mkdir()
         for name in TOOL_FILES:
             shutil.copyfile(tool / name, copy / name)
+        # Flat names in a directory held open: the reads after the runs go through no path the
+        # elaborated code could have swapped for a symlink. The tool takes any path; it names no module.
+        directory = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        names = {path: f"{k}.lean" for k, path in enumerate(sides)}
         files: dict[str, list[Path]] = {"parent": [], "commit": []}
         for path, (_, base, theirs) in sides.items():
             for side, data in (("parent", base), ("commit", theirs)):
-                target = scratch / side / path
-                target.parent.mkdir(parents=True, exist_ok=True)
+                target = scratch / f"{side}-{names[path]}"
                 target.write_bytes(data)
                 files[side].append(target)
 
@@ -206,8 +252,8 @@ def prepass(
         rewritten: dict[str, tuple[bytes, bytes]] = {}
         changed = False
         for path, (_, base, theirs) in sides.items():
-            new_base = _read(scratch / "parent" / path)
-            new_theirs = _read(scratch / "commit" / path)
+            new_base = _read(directory, f"parent-{names[path]}")
+            new_theirs = _read(directory, f"commit-{names[path]}")
             for before, after in ((base, new_base), (theirs, new_theirs)):
                 if not same_up_to_projections(before.decode(), after.decode(errors="replace")):
                     return None
@@ -230,12 +276,16 @@ def prepass(
             clean=clean,
             merged=merged,
             remaining=remaining + untouched,
-            note=_note(clean, complete, merged, remaining, untouched, runs, scratch),
+            note=_note(
+                clean, complete, merged, remaining, untouched, runs, {f"{scratch}/commit-{names[p]}": p for p in sides}
+            ),
             tool={side: {k: runs[side].get(k) for k in ("rc", "seconds", "timed_out", "log")} for side in runs},
         )
     except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
         return None
     finally:
+        if directory is not None:
+            os.close(directory)
         if scratch is not None:
             shutil.rmtree(scratch, ignore_errors=True)
     try:
@@ -260,7 +310,7 @@ def _note(
     remaining: list[str],
     untouched: list[str],
     runs: dict,
-    scratch: Path,
+    copies: dict[str, str],
 ) -> str:
     if clean:
         return (
@@ -289,10 +339,10 @@ def _note(
             "(`.fst`, `.snd`, `.val`, `.property`, ...) for any left in the lines this commit adds:"
         )
         log = Path(runs["commit"].get("log") or "")
-        reported = [
-            line.replace(f"{scratch}/commit/", "")
-            for line in (log.read_text(errors="replace").splitlines() if log.is_file() else [])
-            if line.startswith(f"numproj: {scratch}/commit/")
-        ]
+        reported = []
+        for line in log.read_text(errors="replace").splitlines() if log.is_file() else []:
+            for copy, path in copies.items():
+                if line.startswith(f"numproj: {copy}:"):
+                    reported.append(f"numproj: {path}{line[len('numproj: ') + len(copy) :]}")
         lines += [f"    {line}" for line in reported[:20]]
     return "\n".join(lines)
