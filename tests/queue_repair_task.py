@@ -5118,6 +5118,15 @@ class Records(unittest.TestCase):
         (worktree / ".lake" / "junk").write_text("build output\n")
         tip, report = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
         self.assertTrue(report["ok"], report)
+        # A project whose `.gitignore` ignores `.lake`, as TauCeti's does, commits the same tree.
+        (worktree / ".gitignore").write_text(".lake\n")
+        ignored, _ = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
+        self.assertEqual(
+            sorted(sh(seed, "diff", "--name-only", tip, ignored).split()), [".gitignore"], "only the new .gitignore"
+        )
+        (worktree / ".gitignore").unlink()
+        tip, report = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
+        self.assertTrue(report["ok"], report)
         self.assertEqual(report["unexplained"], [])
         resolved = chain_tool.read_commit(seed, tip)
         original = chain_tool.read_commit(seed, conflicting)
@@ -5376,8 +5385,13 @@ class Records(unittest.TestCase):
         for commit_ in chain:
             sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
             if commit_.pr == 2:
-                for index in range(3):
-                    lines = "".join(f"theorem r{index}_{i} : True := trivial\n" for i in range(700))
+                # Exceed the shared added-line cap with new files each within the new-file cap, so only
+                # the size caps fail; TauCetiTools owns both numbers and has raised them before.
+                from tauceti_tools.assets.scripts import ci_git
+
+                per_file = ci_git.NEW_FILE_LINE_CAP
+                for index in range(ci_git.REVIEW_ADDED_LINE_CAP // per_file + 1):
+                    lines = "".join(f"theorem r{index}_{i} : True := trivial\n" for i in range(per_file))
                     (seed / "TauCeti" / f"Refactor{index}.lean").write_text(lines)
                 sh(seed, "add", "-A")
                 sh(seed, "commit", "--quiet", "--amend", "--no-edit")
