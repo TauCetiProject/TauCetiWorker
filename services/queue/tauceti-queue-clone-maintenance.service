@@ -1,0 +1,17 @@
+# Hourly Git maintenance of the controller's content clone; started by
+# tauceti-queue-clone-maintenance.timer (docs/queue/operations.md, "Clone maintenance").
+
+[Unit]
+Description=Maintain the Tau Ceti AI merge queue's content clone
+
+[Service]
+Type=oneshot
+# The controller's own overrides (`TAUCETI_QUEUE_*`), so this maintains the clone the controller uses.
+EnvironmentFile=-%h/.config/tauceti-queue/environment
+WorkingDirectory=%h/TauCetiQueue
+Environment=PATH=%h/.local/bin:/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin
+Environment=UV_NO_SYNC=1
+ExecStart=/usr/bin/env bash %h/TauCetiQueue/services/queue/clone-maintenance.sh
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=3h

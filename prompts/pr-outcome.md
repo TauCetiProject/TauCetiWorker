@@ -22,7 +22,7 @@ overlaps. Remove duplicates and adapt the useful remainder to main. Do not aband
 existing content as a "different PR" just because the original headline result has landed.
 
 Immediately before changing PR state, re-read PR #__PR__ in TauCetiProject/TauCeti. It
-must still be open at starting head `__HEAD__`, authored by the authenticated account,
+must still be open at starting head `__HEAD__`, authored by an account the close authority above allows,
 and have no `keep`/`hold`/`wip`/`human`/`on-hold`/`do-not-close` label. Honor any narrower authorization
 above. If the head moved or a hold appeared, leave it untouched for a fresh selection.
 

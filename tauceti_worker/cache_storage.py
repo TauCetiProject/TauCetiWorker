@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import stat
 import time
 from pathlib import Path
 
@@ -64,51 +65,153 @@ def roots(configs, pool):
         yield cfg.checkout.with_name(cfg.checkout.name + ".lake-between-rounds")
 
 
-def inventory(paths, *, protected=(), owners=None, details=None):
+class InventoryDeferred(Exception):
+    """The run's deadline passed during the walk; nothing was decided from a partial inventory."""
+
+
+INVENTORY_CHECK_EVERY = 4096  # entries between deadline checks: cheap, yet well under a second
+
+
+class _Clock:
+    """One deadline counter for a whole inventory, across every root it walks."""
+
+    def __init__(self, deadline):
+        self.deadline, self.entries = deadline, 0
+
+    def check(self, *, now=False):
+        self.entries += 1
+        if (now or self.entries % INVENTORY_CHECK_EVERY == 0) and self.deadline is not None:
+            if time.monotonic() >= self.deadline:
+                raise InventoryDeferred("inventory deadline")
+
+
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+
+def _scan(root, clock):
+    """Every non-directory, non-symlink entry under ``root`` with its lstat, never following links.
+
+    One lstat per entry (scandir caches it). A directory is opened without following a final
+    symbolic link and must still be the inode that was queued, so one swapped for a link meanwhile
+    is skipped. A directory that cannot be opened or listed is skipped, as os.walk does; a failing
+    stat of an entry other than a vanished one propagates rather than leave a silent gap."""
+    try:
+        info = os.lstat(root)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    pending = [(str(root), info.st_dev, info.st_ino)]
+    while pending:
+        path, device, inode = pending.pop()
+        try:
+            descriptor = os.open(path, _DIRECTORY_FLAGS)
+        except OSError:
+            continue
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != (device, inode):
+                continue  # replaced since it was queued
+            try:
+                entries = os.scandir(descriptor)
+            except OSError:
+                continue
+            with entries:
+                while True:
+                    try:
+                        entry = next(entries)
+                    except StopIteration:
+                        break
+                    except OSError:
+                        break  # an unreadable listing: skip the rest of it, as os.walk does
+                    clock.check()
+                    try:
+                        found = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(found.st_mode):
+                        continue
+                    if stat.S_ISDIR(found.st_mode):
+                        pending.append((os.path.join(path, entry.name), found.st_dev, found.st_ino))
+                    else:
+                        yield found
+        finally:
+            os.close(descriptor)
+
+
+def _overlapping(roots):
+    """Whether one name can be reached through two walked roots: a root repeated (by any
+    spelling) or lying inside another."""
+    resolved = [Path(os.path.realpath(root)) for root in roots]
+    unique = set(resolved)
+    return len(unique) < len(resolved) or any(parent in unique for root in unique for parent in root.parents)
+
+
+def inventory(paths, *, protected=(), owners=None, details=None, private=None, deadline=None):
     """Allocated bytes, deduplicated by inode across both pool and private hard links.
 
     `named_bytes` counts every name, as `du --count-links` would: hard-linked files count once per
     link there, so it overstates what the disk holds. `managed_bytes` counts each inode once, and
-    `unique_inodes` is how many inodes that is."""
-    seen = {}
+    `unique_inodes` is how many inodes that is.
+
+    Memory stays bounded by the hard-linked inodes: a file with one link has one name, so it is
+    totalled at once and never remembered, unless the roots overlap and that name can be reached
+    twice. ``details`` receives the remembered inodes as
+    [bytes, names seen, links, protected, {owner: names}]. ``private`` receives, per
+    (device, owner), the bytes of that owner's unprotected single-link files that were not
+    remembered. Raises InventoryDeferred once ``deadline`` (time.monotonic) has passed, checked
+    before, during and after the walk."""
+    seen, result = {}, {}
     owners = owners or {}
-    for root in paths:
-        if not root.is_dir() or root.is_symlink():
-            continue
-        for base, dirs, files in os.walk(root, followlinks=False):
-            dirs[:] = [name for name in dirs if not (Path(base) / name).is_symlink()]
-            for name in files:
-                path = Path(base) / name
-                try:
-                    if path.is_symlink():
-                        continue
-                    info = path.stat()
-                    key = info.st_dev, info.st_ino
-                    if key in seen:
-                        seen[key][1] += 1
-                        seen[key][3] = seen[key][3] or root in protected
-                    else:
-                        seen[key] = [info.st_blocks * 512, 1, info.st_nlink, root in protected, {}]
-                    if root in owners:
-                        labels = seen[key][4]
-                        labels[owners[root]] = labels.get(owners[root], 0) + 1
-                except FileNotFoundError:
-                    continue
-    if details is not None:
-        details.update(seen)
-    result = {}
-    for (device, _), (size, count, links, busy, _) in seen.items():
-        row = result.setdefault(
+    clock = _Clock(deadline)
+    clock.check(now=True)
+    roots = [root for root in paths if root.is_dir() and not root.is_symlink()]
+    remember_all = _overlapping(roots)
+
+    def row(device):
+        return result.setdefault(
             device,
             dict(managed_bytes=0, externally_linked_bytes=0, protected_bytes=0, named_bytes=0, unique_inodes=0),
         )
-        row["managed_bytes"] += size
-        row["named_bytes"] += size * count
-        row["unique_inodes"] += 1
+
+    for root in roots:
+        busy, owner = root in protected, owners.get(root)
+        for info in _scan(root, clock):
+            size = info.st_blocks * 512
+            if info.st_nlink <= 1 and not remember_all:
+                totals = row(info.st_dev)
+                totals["managed_bytes"] += size
+                totals["named_bytes"] += size
+                totals["unique_inodes"] += 1
+                if busy:
+                    totals["protected_bytes"] += size
+                elif owner is not None and private is not None:
+                    key = info.st_dev, owner
+                    private[key] = private.get(key, 0) + size
+                continue
+            key = info.st_dev, info.st_ino
+            if key in seen:
+                seen[key][1] += 1
+                seen[key][3] = seen[key][3] or busy
+            else:
+                seen[key] = [size, 1, info.st_nlink, busy, {}]
+            if owner is not None:
+                labels = seen[key][4]
+                labels[owner] = labels.get(owner, 0) + 1
+    clock.check(now=True)
+    for (device, _), (size, count, links, busy, _) in seen.items():
+        clock.check()
+        totals = row(device)
+        totals["managed_bytes"] += size
+        totals["named_bytes"] += size * count
+        totals["unique_inodes"] += 1
         if busy:
-            row["protected_bytes"] += size
+            totals["protected_bytes"] += size
         if links > count:
-            row["externally_linked_bytes"] += size
+            totals["externally_linked_bytes"] += size
+    clock.check(now=True)  # nothing is decided on an inventory finished past the deadline
+    if details is not None:
+        details.update(seen)
     return result
 
 
@@ -157,7 +260,7 @@ def admit(cfg):
                 marker.unlink(missing_ok=True)
 
 
-def collect(configs, *, dry=False, now=None, opened=...):
+def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
     from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, remove, workspace_idle
 
     now = time.time() if now is None else now
@@ -188,9 +291,15 @@ def collect(configs, *, dry=False, now=None, opened=...):
 
     # Pool copies are deleted only while no process holds them open (open fds add no link).
     guard = Guard(opened=opened or ())
-    details = {}
-    before = inventory(paths, protected=protected, owners=owners, details=details)
-    private_candidates = {}
+    details, private_candidates = {}, {}
+    try:
+        before = inventory(
+            paths, protected=protected, owners=owners, details=details, private=private_candidates, deadline=deadline
+        )
+    except InventoryDeferred:
+        # Nothing is deleted on a partial picture; the next run walks again from the start.
+        report.setdefault("deferred", []).append("shared-caches")
+        return report
     for (device, _), (size, _, _, busy, labels) in details.items():
         if not busy and labels:
             for worker in labels:
@@ -240,6 +349,15 @@ def collect(configs, *, dry=False, now=None, opened=...):
         if path.is_file() and not path.is_symlink():
             candidates.append((path, path, "mathlib-" + path.name))
     remaining = before.get(pool_device, {}).get("managed_bytes", 0)
+    protected_roots = [os.path.realpath(path) + os.sep for path in protected]
+
+    def held(path, info):
+        """Protected: in a protected root by any name. A single-link file has only this name."""
+        row = details.get((info.st_dev, info.st_ino))
+        if row is not None:
+            return row[3]
+        return (os.path.realpath(path) + os.sep).startswith(tuple(protected_roots))
+
     removed_bytes = {device: 0 for device in devices}
 
     def stamp(candidate):
@@ -268,7 +386,7 @@ def collect(configs, *, dry=False, now=None, opened=...):
                 )
                 payload = [p for p in names if p.is_file() and p.name != "entry.json"]
                 infos = [p.stat() for p in payload]
-                if not disposable_stage and any(details.get((i.st_dev, i.st_ino), [0, 0, 0, False])[3] for i in infos):
+                if not disposable_stage and any(held(p, i) for p, i in zip(payload, infos, strict=True)):
                     note(report, "protected", str(entry))
                     continue
                 # Pool-only bundles are linked only by pool names: the entry alias, the legacy

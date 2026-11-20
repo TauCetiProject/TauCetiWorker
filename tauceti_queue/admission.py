@@ -84,7 +84,7 @@ def source_version(source: dict, revision: str, no_repair_labels=()) -> str:
                 & (
                     KEEP
                     | {s.lower() for s in no_repair_labels}
-                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair", "large-refactor"}
                 )
             ),
             "comments": [
@@ -229,6 +229,9 @@ class AdmissionPolicy:
             "single": bool(set(snapshot.paths) & {"lean-toolchain", "lake-manifest.json"}),
             "command": result["reason"],
         }
+        if snapshot.large_refactor:
+            # Repair reads this from the input, so its review-size checks skip the same caps.
+            evidence["large_refactor"] = True
         return result, authorization, evidence, comment, meta
 
 
@@ -416,7 +419,7 @@ class AdmissionPoller:
                 relevant_labels = (
                     KEEP
                     | self.controller._no_repair_labels()
-                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair", "large-refactor"}
                 )
                 if isinstance(label, str) and label and label.lower() not in relevant_labels:
                     return  # membership and repair labels are queue output, not admission evidence
@@ -781,6 +784,7 @@ class AdmissionPoller:
             if human_review and approval_binding(current) != approval_binding(current_input):
                 self.state.dirty(work["number"], urgent=True)
                 return
+            self._sync_large_refactor(current, pull.head_sha, snapshot.large_refactor)
             if result.get("diff_guard") and pull.state == "open" and not pull.draft:
                 self._diff_guard_comment(pull, result["diff_guard"])
             requested = result["recovery_heads"]
@@ -908,6 +912,20 @@ class AdmissionPoller:
                 "marker": f"<!-- {COMMENT_MARKER} diff-guard:{pull.head_sha} -->",
             },
         )
+
+    def _sync_large_refactor(self, current, head, exempt):
+        """Keep the input's `large_refactor` evidence (which repair reads) equal to this evaluation's,
+        for the same head: a label applied or removed after approval reaches the next repair task."""
+        if current is None or current["head_sha"] != head:
+            return
+        evidence = loads(current["evidence"], {})
+        if bool(evidence.get("large_refactor")) == bool(exempt):
+            return
+        if exempt:
+            evidence["large_refactor"] = True
+        else:
+            evidence.pop("large_refactor", None)
+        self.controller.store.update("inputs", {"id": current["id"]}, evidence=dumps(evidence))
 
     def _human_owned_approval(self, snapshot, current, scoreboard):
         """Keep an exact, live admin approval only where machine review is absent.

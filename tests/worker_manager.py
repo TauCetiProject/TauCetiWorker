@@ -23,6 +23,9 @@ for key in (
     "TAUCETI_WORKERS_CONFIG",
     "TAUCETI_WORKERS_STATE_DIR",
     "TAUCETI_RUNTIME_DIR",
+    "TAUCETI_PACE",
+    "TAUCETI_PACE_CLAUDE",
+    "TAUCETI_PACE_CODEX",
 ):
     os.environ.pop(key, None)
 os.environ["XDG_CONFIG_HOME"] = str(root / "config")
@@ -376,6 +379,7 @@ try:
                         "author_model": "claude-opus-5",
                         "author_effort": "high",
                         "pace": "50%@1h",
+                        "pace_claude": "0:100",
                         "stream": True,
                         "isolate_home": True,
                         "restart": "on-failure",
@@ -397,7 +401,7 @@ worker1 — waiting for quota
   phases:   rebase, review, fix-ci, fix, bump, progress, roadmap, lint-repair,
             overlap-scan, overlap-fix
   agent:    auto · host sandbox
-  pacing:   normal
+  pacing:   normal · configured curves: claude 60:40, codex 60:40
   roadmap:  auto (random each round)
   activity: —
   quota:    codex ~ (weekly ahead, 84% left)
@@ -416,7 +420,7 @@ worker2 — running
 worker3 — backing off
   phases:   roadmap, fix, fix-ci
   agent:    claude · bubble sandbox
-  pacing:   normal · curve 50%@1h
+  pacing:   normal · configured curves: claude 0:100, codex 50%@1h
   roadmap:  RepresentationTheory
             skip: Algebra
             also treat as self: maintainer
@@ -453,6 +457,9 @@ worker3 — backing off
                 # A bundle discoverable at runtime is deliberately not frozen into a persistent unit.
                 assert "SSL_CERT_FILE" not in unit and "NIX_SSL_CERT_FILE" not in unit
                 assert "ExecStart=" in unit and str(config.resolve()) in unit
+                # Workers move into scopes under the unit's slice, so a manager restart adopts them.
+                assert f"Slice={wm.WORKER_SLICE}" in unit
+                assert f'Environment="{wm.worker_scopes.SLICE_ENV}={wm.WORKER_SLICE}"' in unit
 
                 os.environ.pop("SSL_CERT_FILE", None)
                 worker_paths._ssl_cert_candidates = lambda env: (env.get("NIX_SSL_CERT_FILE"),)

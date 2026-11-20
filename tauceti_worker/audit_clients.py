@@ -2,7 +2,8 @@
 
 The verification runner writes this private local record after capturing actual
 client requests at a loopback test endpoint. This is compatibility evidence, not
-source approval. Missing or stale evidence leaves new inspections on protocol 3.
+source approval. New inspections use judgment protocol 5 only: missing or stale
+evidence makes them wait for verification, never fall back to an older protocol.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import time
 from pathlib import Path
 
 RECORD = "client-coverage.json"
+PROTOCOL = 5  # The judgment protocol whose client delivery this record verifies.
 
 
 def file_digest(path: Path) -> str:
@@ -56,16 +58,18 @@ def fingerprint(provider: str) -> dict:
         "files": files,
         "version": version.stdout.strip(),
         "provider": provider,
-        "reader_digest": sa.inspection_profile(4)["reader_digest"],
-        "catalog_digest": sa.inspection_profile(4)["catalog_digest"],
+        "reader_digest": sa.inspection_profile()["reader_digest"],
+        "catalog_digest": sa.inspection_profile()["catalog_digest"],
         "verification_digest": file_digest(Path(__file__)),
         "check_digest": file_digest(Path(__file__).with_name("audit_client_check.py")),
         "launcher_digest": file_digest(Path(sa.__file__)),
     }
 
 
-def selected_protocol(provider: str, state: Path, *, verify: bool = True) -> int:
-    """Refresh compatibility locally when needed, with one cached failure per client."""
+def selected_protocol(provider: str, state: Path, *, verify: bool = True) -> int | None:
+    """Protocol 5 once this client's delivery is verified, else None: the caller waits.
+
+    Compatibility is refreshed locally when needed, with one cached failure per client."""
     from .audit_alerts import save
     from .config import Die, log
 
@@ -75,16 +79,16 @@ def selected_protocol(provider: str, state: Path, *, verify: bool = True) -> int
             if record.is_symlink() or record.stat().st_uid != os.getuid() or record.stat().st_mode & 0o022:
                 return False
             value = json.loads(record.read_text())
-            return value.get(provider) == {"protocol_version": 4, "fingerprint": expected, "intact": True}
+            return value.get(provider) == {"protocol_version": PROTOCOL, "fingerprint": expected, "intact": True}
         except (OSError, ValueError, TypeError, AttributeError):
             return False
 
     try:
         expected = fingerprint(provider)
         if verified(expected):
-            return 4
+            return PROTOCOL
         if not verify:
-            return 3
+            return None
         state.mkdir(parents=True, exist_ok=True)
         # Separate from verify()'s short record-update lock: one probe at a time,
         # without holding the lock the probe itself needs to save its result.
@@ -92,7 +96,7 @@ def selected_protocol(provider: str, state: Path, *, verify: bool = True) -> int
             fcntl.flock(lock, fcntl.LOCK_EX)
             expected = fingerprint(provider)
             if verified(expected):
-                return 4
+                return PROTOCOL
             failures_path = state / "client-coverage-failures.json"
             try:
                 failures = json.loads(failures_path.read_text())
@@ -107,7 +111,7 @@ def selected_protocol(provider: str, state: Path, *, verify: bool = True) -> int
                 and type(failed.get("retry_at")) in (int, float)
                 and failed["retry_at"] > time.time()
             ):
-                return 3
+                return None
             log(f"security-audit: checking {provider} tool delivery at a local endpoint")
             try:
                 from .audit_client_check import verify as check
@@ -121,12 +125,12 @@ def selected_protocol(provider: str, state: Path, *, verify: bool = True) -> int
                 failures[provider] = {"fingerprint": expected, "retry_at": time.time() + 300, "error": str(exc)}
                 save(failures_path, failures)
                 log(
-                    f"security-audit: {provider} delivery check failed; protocol 4 unavailable, retrying after 5 minutes: {exc}"
+                    f"security-audit: {provider} delivery check failed; new inspections wait, retrying after 5 minutes: {exc}"
                 )
-                return 3
+                return None
             failures.pop(provider, None)
             save(failures_path, failures)
-            return 4
+            return PROTOCOL
     except (Die, OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
         log(f"security-audit: {provider} delivery verification unavailable: {exc}")
-    return 3
+    return None
