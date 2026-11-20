@@ -36,6 +36,12 @@ an already-started agent session runs to completion. Workers report
 `waiting-capacity` while draining instead of being terminated. Workers without
 the environment variable behave as before.
 
+Each round also records, in the worker's runtime status, the authoring
+backpressure it enforces: `authoring` holds the open non-draft PRs it counts as
+its own on every healthy source (`sources`, `count`), the `limit`, whether roadmap
+authoring is `blocked`, the roadmap `scope` and `skip`, and `observed_at`. The
+count comes from that round's own survey, so it is current on any forge.
+
 `TAUCETI_FLEET_MACHINE_ID` and `TAUCETI_FLEET_EVENTS` opt into a private JSONL
 provenance journal. Successful PR creation and GitHub mutations record machine,
 worker, repository and PR identity. Branch pushes record assistance when the PR

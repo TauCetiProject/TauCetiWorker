@@ -157,6 +157,30 @@ def deduplicate(observations):
             kind.actionable = [candidate for candidate in kind.actionable if candidate.pr not in duplicates]
 
 
+def report_authoring(healthy):
+    """Publish the authoring backpressure this round enforces, for supervisors such as Fleet.
+
+    The count is this round's own survey of every healthy source: what roadmap authoring is
+    actually checked against, whichever forge it runs on."""
+    import time
+
+    from .runtime_status import report_runtime
+
+    first = healthy[0][2]
+    count = sum(result.n_mine_open for _, _, result in healthy)
+    report_runtime(
+        authoring=dict(
+            observed_at=time.time(),
+            sources={name: result.n_mine_open for name, _, result in healthy},
+            count=count,
+            limit=first.max_open_prs,
+            blocked=count >= first.max_open_prs,
+            scope=first.roadmap_only or "any",
+            skip=",".join(sorted(set(filter(None, first.roadmap_skip)))),
+        )
+    )
+
+
 def run_round(w, opts, *, use_fleet_focus=True):
     import os
 
@@ -197,6 +221,7 @@ def run_round(w, opts, *, use_fleet_focus=True):
         if waits:
             raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
+    report_authoring(healthy)
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")
