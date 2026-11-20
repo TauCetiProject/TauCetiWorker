@@ -45,6 +45,7 @@ import contextlib
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -101,6 +102,8 @@ class Lookahead:
         self.pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, int(cfg.lookahead_helpers)), thread_name_prefix="lookahead"
         )
+        if not cfg.seed_packages:
+            self._cache_packages()
         self.feeder = threading.Thread(target=self._feed, args=(after,), name="lookahead-feeder", daemon=True)
         self.feeder.start()
 
@@ -134,20 +137,28 @@ class Lookahead:
     def _cache_packages(self) -> None:
         """Replay the dependencies' build in the task worktree once (``lake build Mathlib``). Lake moves a
         replayed artifact into its artifact cache, which writes in ``.lake/packages``; the helpers share
-        the task's packages read-only, so they replay nothing there themselves. Never fails."""
+        the task's packages read-only, so they replay nothing there themselves. It runs before any agent
+        builds, and the task's cancellation stops it. Never fails."""
+        from tauceti_worker.processes import owned_process
+
         try:
             argv = repair_sandbox.sandboxed_lake([*self.cfg.lake, "build", "Mathlib"], self.worktree, self.env_lake)
-            with repair_tools.build_lock(self.worktree, log=lambda *a, **k: None):
-                run = repair.run_logged(
-                    argv, self.worktree, self.logdir / "lookahead-packages.log", self.env_lake, self.cfg.build_timeout
-                )
-            log(f"task {self.task.task_id}: lookahead packages replayed, exit {run['rc']}")
+            with (
+                repair_tools.build_lock(self.worktree, log=lambda *a, **k: None),
+                (self.logdir / "lookahead-packages.log").open("ab") as output,
+                owned_process(
+                    argv, cwd=self.worktree, env=self.env_lake, stdin=subprocess.DEVNULL, stdout=output, stderr=output
+                ) as proc,
+            ):
+                while proc.poll() is None:
+                    if self.task_cancel.wait(0.5):
+                        proc.terminate()
+                        proc.wait()
+            log(f"task {self.task.task_id}: lookahead packages replayed, exit {proc.returncode}")
         except Exception as error:  # noqa: BLE001 - the helpers' builds report what is missing
             log(f"task {self.task.task_id}: lookahead packages not replayed: {type(error).__name__}: {error}")
 
     def _feed(self, after: str) -> None:
-        if not self.cfg.seed_packages:
-            self._cache_packages()
         try:
             for commit in self.candidates(after):
                 with self.lock:
