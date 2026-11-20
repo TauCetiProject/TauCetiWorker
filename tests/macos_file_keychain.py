@@ -139,6 +139,16 @@ class FileKeychain(unittest.TestCase):
         with patch.object(quota, "_read_json_file", return_value=blob):
             self.assertIn("expired", quota.Quota(cfg)._claude_launch_credential_unusable())
 
+    def test_mac_file_identity_mismatch_is_not_silently_an_operator_assertion(self):
+        cfg = types.SimpleNamespace(home=Path("/tmp/home"), quota_cache=Path("/tmp/cache"))
+
+        def read(path):
+            name = "usage-account" if Path(path) == Path("/tmp/usage.json") else "agent-account"
+            return {"claudeAiOauth": {"accessToken": name, "account": {"uuid": name}}}
+
+        with patch.object(quota, "_read_json_file", side_effect=read):
+            self.assertIn("different accounts", quota.claude_usage_configuration_problem(cfg))
+
     def test_host_environment_token_does_not_use_file_or_keychain(self):
         cfg = types.SimpleNamespace(home=Path("/tmp/home"), quota_cache=Path("/tmp/cache"))
         with (

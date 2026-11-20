@@ -1042,8 +1042,8 @@ def claude_usage_configuration_problem(cfg, *, check_identity: bool = True) -> s
     environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if route == "environment" and environment_token and environment_token == measured.get("accessToken"):
         return "Claude usage login must be a separate login from the agents' environment token"
-    if not check_identity or sys.platform == "darwin":
-        return None  # Identity follows mirroring; macOS agent selection changes separately.
+    if not check_identity:
+        return None  # Identity follows mirroring of the selected file route.
     agent = _as_dict(_as_dict(_read_json_file(claude_agent_credentials(cfg)[0])).get("claudeAiOauth"))
     if route == "environment" and environment_token and environment_token != agent.get("accessToken"):
         return None  # Opaque setup tokens offer no account field to compare; operator asserts identity.
