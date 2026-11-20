@@ -617,11 +617,6 @@ class Publication(Tmp):
     def remote(self):
         return git(self.tmp / "remote.git", "show", "main:targets.md") + "\n"
 
-    def hook(self, clone, name, body):
-        hook = clone.parent / ".git" / "hooks" / name
-        hook.write_text("#!/bin/sh\n" + body)
-        hook.chmod(0o755)
-
     def test_a_tick_on_an_unchanged_basis_is_published_and_the_clone_follows(self):
         first = self.clone("first")
         plan = self.inference(first)
@@ -639,31 +634,12 @@ class Publication(Tmp):
         self.assertEqual(reconcile.publish(first, plan), [])
         self.assertEqual((self.remote(), first.read_text()), (broadened, broadened))
 
-    def test_a_tick_is_not_published_once_a_commit_hook_changes_what_it_was_given(self):
-        first = self.clone("first")
-        plan = self.inference(first)
-        self.hook(
-            first,
-            "pre-commit",
-            "sed 's/a synthetic goal/a rewritten goal/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
-        )
-        self.assertIsNone(reconcile.publish(first, plan))
-        self.assertEqual(
-            (self.remote(), first.read_text(), git(first.parent, "status", "--porcelain")), (LIST, LIST, "")
-        )
-
-    def test_a_refused_push_leaves_nothing_even_after_a_hook_committed_on_top(self):
+    def test_a_refused_push_leaves_nothing_behind(self):
         first = self.clone("first")
         plan = self.inference(first)
         by_hand = LIST.replace("- [ ] `aside`", "- [~] `aside`")
         first.write_text(by_hand)
-        self.hook(
-            first,
-            "post-commit",
-            "grep -q 'operator note' targets.md && exit 0\n"
-            "echo '> operator note' >> targets.md && git commit -q -m note -- targets.md\n"
-            "git remote set-url --push origin /nonexistent/remote.git\n",
-        )
+        git(first.parent, "remote", "set-url", "--push", "origin", str(self.tmp / "nonexistent.git"))
         self.assertIsNone(reconcile.publish(first, plan))
         self.assertEqual(self.remote(), LIST)
         self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
@@ -678,9 +654,9 @@ class Publication(Tmp):
         git(first.parent, "commit", "-q", "-m", "other")
         git(first.parent, "push", "-q", "origin", "HEAD:main")
         plan = self.inference(first)
-        self.hook(first, "pre-push", "exit 1\n")
+        git(first.parent, "remote", "set-url", "--push", "origin", str(self.tmp / "nonexistent.git"))
         self.assertIsNone(reconcile.publish(first, plan))
-        (first.parent / ".git" / "hooks" / "pre-push").unlink()
+        git(first.parent, "remote", "set-url", "--push", "origin", str(self.tmp / "remote.git"))
         other_plan = self.inference(other)
         self.assertEqual(reconcile.publish(other, other_plan), ["`zero-one`: n"])
         self.assertEqual(self.remote(), LIST)

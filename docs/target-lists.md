@@ -265,10 +265,8 @@ The date is the day of the look, in UTC. An inferred tick counts as done for
 seven days unless its line, the goal, its README or a file its leads are in
 changes. The tick is computed, like every edit (see Writing, above), on the list
 where it is published, and is made only if the goal and the item's line there
-are still as the agent was given them and the item is still open; in a tracked
-list the commit is pushed only if they are still so in the list as committed,
-after the clone's hooks. Otherwise nothing is published and the next look asks
-again.
+are still as the agent was given them and the item is still open. Otherwise
+nothing is published and the next look asks again.
 
 **Reopened by a dependent.** A roadmap round handed an item whose `needs:`
 include inferred ticks is told which they are, and that if one is missing or
