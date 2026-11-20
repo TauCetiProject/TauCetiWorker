@@ -418,10 +418,14 @@ class Releases(unittest.TestCase):
         second = self.commit("second")
         now = time.time()
         self.claims(
-            ("repair-2@host", now + 900, now - 5), ("repair-2@host", now - 900, now - 1000), ("repair@host", now + 900, None)
+            ("repair-2@host", now + 900, now - 5),
+            ("repair-2@host", now - 900, now - 1000),
+            ("repair@host", now + 900, None),
         )
         log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--wait", "10")
-        self.assertEqual(log.count("tauceti-queue-repair@2.service holds no claim"), 2, log)  # before the install, before the restart
+        self.assertEqual(
+            log.count("tauceti-queue-repair@2.service holds no claim"), 2, log
+        )  # before the install, before the restart
         self.assertNotEqual(self.pid("tauceti-queue-repair@2.service"), pid)
         [release] = self.release_dirs(second)
         self.assertEqual(self.cwd("tauceti-queue-repair@2.service"), str(release))
