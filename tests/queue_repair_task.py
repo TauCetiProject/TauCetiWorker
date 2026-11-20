@@ -663,6 +663,20 @@ def commit(repo: Path, message: str, files: dict[str, str]) -> str:
     return sh(repo, "rev-parse", "HEAD")
 
 
+def commit_on(repo: Path, parent: str, files: dict[str, str]) -> str:
+    """A commit on ``parent`` with ``files`` written, made through a private index."""
+    with tempfile.TemporaryDirectory() as scratch:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        sh(repo, "read-tree", parent, env=env)
+        for name, content in files.items():
+            blob = subprocess.run(
+                ["git", "hash-object", "-w", "--stdin"], cwd=repo, input=content, capture_output=True, text=True
+            ).stdout.strip()
+            sh(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},{name}", env=env)
+        tree = sh(repo, "write-tree", env=env)
+    return sh(repo, "commit-tree", tree, "-p", parent, "-m", "fixture")
+
+
 class Content:
     """A bare content repository, a seed clone that built the chain, and the worker's clone."""
 
@@ -1693,6 +1707,66 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(three.parents, (two.sha,), "the second round starts from the first resolution")
         for path in ("TauCeti/Two.lean", "TauCeti/Three.lean"):
             self.assertNotIn("<<<<<<<", sh(self.content.bare, "show", f"{three.sha}:{path}"))
+
+    def test_a_later_conflict_is_resolved_ahead_on_the_target(self):
+        """With a second agent, member 3's conflict with main is resolved on ``onto`` alone while member 2's
+        is resolved on the clean prefix; at member 3 the replay merges that resolution onto its real
+        prefix and checks it like any other, and the agent is not run a third time."""
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        moved = commit(seed, "main moved again", {"TauCeti/Three.lean": "-- three, on main\n"})
+        sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        self.raw["onto"] = self.onto = moved
+        cfg = self.config(parallel_agents=2)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2", f"{PROJECT}#3"])
+        self.assertEqual([c.get("lookahead", False) for c in outcome["conflicts"]], [False, True])
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2, "one agent per conflict")
+        ahead = [c for c in calls if f"PR #3's commit `{self.content.members[2]['commit'][:12]}`" in c["prompt"]]
+        self.assertEqual(len(ahead), 1)
+        self.assertNotIn(f"PR #2's commit `{self.content.members[1]['commit'][:12]}`", ahead[0]["prompt"])
+        self.assertEqual(len(outcome["agent"]), 2, "the lookahead's agent run is recorded with the task's")
+        one, two, three = self.submitted_chain()
+        self.assertEqual(three.parents, (two.sha,))
+        for path in ("TauCeti/Two.lean", "TauCeti/Three.lean"):
+            self.assertNotIn("<<<<<<<", sh(self.content.bare, "show", f"{three.sha}:{path}"))
+        self.assertEqual(sh(self.content.clone, "for-each-ref", repair_task.RESOLUTION_PREFIX), "")
+        self.assertEqual(list((cfg.root / "worktrees").glob("task-1-lookahead-*")), [])
+
+    def test_a_lookahead_resolution_that_does_not_merge_onto_the_prefix_is_not_used(self):
+        """``recommit_resolution`` with ``made_on`` merges the resolution's change onto the prefix and
+        gives None when that merge conflicts."""
+        clone = self.content.clone
+        sh(clone, "fetch", "--quiet", str(self.content.bare), self.onto, self.content.tip)
+        conflicting = self.content.members[1]["commit"]
+        original = chain_tool.read_commit(clone, conflicting)
+
+        def resolution(parent: str, text: str) -> str:
+            tree = chain_tool.tree_of(clone, commit_on(clone, parent, {"TauCeti/Two.lean": text}))
+            return chain_tool.commit_tree(
+                clone,
+                tree,
+                parent,
+                original.message.rstrip() + "\n\nResolved.\n",
+                (original.author_name, original.author_email),
+                author_date=original.author_date,
+                committer_date=original.author_date,
+            )
+
+        ahead = resolution(self.onto, "-- two, resolved on the target\n")
+        prefix = commit_on(clone, self.onto, {"TauCeti/Two.lean": "-- two, changed by an earlier member\n"})
+        self.assertIsNone(
+            repair.recommit_resolution(clone, ahead, prefix, conflicting, ["TauCeti/Two.lean"], made_on=self.onto)
+        )
+        other = commit_on(clone, self.onto, {"TauCeti/Other.lean": "-- elsewhere\n"})
+        sha, report = repair.recommit_resolution(
+            clone, ahead, other, conflicting, ["TauCeti/Two.lean"], made_on=self.onto
+        )
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(sh(clone, "show", f"{sha}:TauCeti/Two.lean"), "-- two, resolved on the target")
+        self.assertEqual(sh(clone, "show", f"{sha}:TauCeti/Other.lean"), "-- elsewhere")
 
     def test_a_stopped_task_resumes_after_its_last_resolution(self):
         """The worker stops while the agent resolves member 3, after member 2's resolution was accepted.
