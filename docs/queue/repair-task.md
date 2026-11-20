@@ -147,9 +147,10 @@ to `agent_attempts`, with the report as feedback:
 **Renamed numeric projections.** When `main` rewrites numeric projections (`x.1` to `x.fst`, as the
 toolchain bump to v4.37.0-rc1 did across the library), a member written against the old `main`
 conflicts wherever its change touches a rewritten line. Before the agent runs, the worker tries a
-mechanical pre-pass (`repair_numproj.prepass`). For each conflicting Lean file whose parent P or
-commit C version has a numeric projection, it runs TauCetiTools' numproj tool (`tauceti-tools
-numproj`, the installed package's `numproj_fix.py`) on copies of both versions, giving P' and C', and
+mechanical pre-pass (`repair_numproj.prepass`). Take a conflicting commit C with parent P, and a
+conflicting Lean file that is a regular file of at most 256 kB in the prefix, P and C, with a numeric
+projection in P's or C's version. The worker runs TauCetiTools' numproj tool (`tauceti-tools numproj`,
+the installed package's `numproj_fix.py`) on copies of both versions, giving P' and C', and
 merges them with `git merge-file` with base P', ours the clean prefix and theirs C'. The tool elaborates
 each file against the worktree's warm build, so the pre-pass runs only when the task's artifacts are
 available, and the tool runs in the build sandbox like any build of member code, from a fresh copy of

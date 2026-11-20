@@ -7189,15 +7189,13 @@ class NumprojPrepass(Fixture):
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_a_failed_write_restores_git_s_conflict(self):
-        real = Path.write_bytes
+        real = repair_numproj._write
 
         def failing(path, data):
-            if path.name == "P.lean" and "worktrees" in str(path):
-                real(path, b"partial")
-                raise OSError(28, "No space left on device")
-            return real(path, data)
+            real(path, b"partial")
+            raise OSError(28, "No space left on device")
 
-        patcher = patch.object(Path, "write_bytes", failing)
+        patcher = patch.object(repair_numproj, "_write", failing)
         patcher.start()
         self.addCleanup(patcher.stop)
         outcome, chain = self.run_task()
@@ -7206,6 +7204,28 @@ class NumprojPrepass(Fixture):
         resolved = self.resolved_p(chain)
         self.assertIn("x.2 + 1", resolved)
         self.assertNotIn("partial", resolved)
+
+    def test_a_tracked_symlink_is_not_rewritten(self):
+        """Git records a symlink's target as its content; the pre-pass leaves such a path to the agent
+        and never writes through it."""
+        clone = self.content.clone
+        sh(clone, "fetch", "--quiet", str(self.content.bare), "+refs/heads/*:refs/remotes/origin/*")
+        with tempfile.TemporaryDirectory(dir=self.root) as directory:
+            tree = Path(directory)
+            sh(clone, "worktree", "add", "--quiet", "--detach", str(tree), self.content.base)
+            self.addCleanup(sh, clone, "worktree", "remove", "--force", str(tree), check=False)
+            os.symlink("x.1", tree / "TauCeti" / "Link.lean")
+            (tree / "TauCeti" / "Big.lean").write_text("x.1\n" * (repair_numproj.MAX_BYTES // 4 + 1))
+            sh(tree, "add", "-A")
+            sh(tree, "-c", "user.name=T", "-c", "user.email=t@example.invalid", "commit", "--quiet", "-m", "links")
+            self.assertIsNone(repair_numproj._blob(tree, "HEAD", "TauCeti/Link.lean"))
+            self.assertIsNone(repair_numproj._blob(tree, "HEAD", "TauCeti/Big.lean"), "too large to check")
+            self.assertEqual(repair_numproj._blob(tree, "HEAD", "TauCeti/P.lean"), OLD_P.encode())
+            self.assertIsNone(repair_numproj._blob(tree, "HEAD", "TauCeti/Absent.lean"))
+            os.symlink(self.root / "outside", tree / "Out.lean")
+            with self.assertRaises(OSError):
+                repair_numproj._write(tree / "Out.lean", b"x")
+            self.assertFalse((self.root / "outside").exists())
 
     def test_the_rewrite_check(self):
         """The findings a rewrite implies, or None for an edit `numproj_fix.py` never makes."""
@@ -7228,6 +7248,7 @@ class NumprojPrepass(Fixture):
             ("f x.1", "g x.fst"),
             ("ab", "a\nb"),
             ("x.1", "(x.fst"),
+            ("1.5", "(1).toFloat"),
         ]:
             with self.subTest(before=before, after=after):
                 self.assertIsNone(edits(before, after))
@@ -7253,6 +7274,7 @@ class NumprojPrepass(Fixture):
         self.assertFalse(same("-- y.1 here\nx", "-- y.fst here\nx", fix), "a comment is not code")
         self.assertFalse(same('def s := "y.1"', 'def s := "y.fst"', fix), "nor is a string")
         self.assertFalse(same("a b x.1", "a\nb x.fst", fix), "a line break the tool did not make")
+        self.assertFalse(same("def v : Float := 1.5", "def v : Float := (1).toFloat", fix), "a literal")
 
     @unittest.skipUnless(REAL_NUMPROJ, "the installed TauCetiTools has no numproj")
     def test_the_real_tool_s_rewrites_pass_and_injections_do_not(self):

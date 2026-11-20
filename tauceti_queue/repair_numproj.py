@@ -19,6 +19,7 @@ rewritten) returns None and leaves the worktree as ``apply_conflict`` wrote it.
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import hashlib
 import importlib.util
@@ -37,6 +38,9 @@ from tauceti_queue import repair_sandbox
 TOOL_FILES = ("numproj_fix.py", "NumProjScan.lean", "local_axioms.py")
 SCRATCH = "numproj"  # under the worktree's `.lake`, the only part of the tree the sandbox can write
 TIMEOUT_SECONDS = 1800.0
+# The host-side check of a rewrite is near-linear but not strictly so (the tool's lexer and line
+# copies); a larger Lean file is left to the agent. TauCeti's largest sources are well below this.
+MAX_BYTES = 256_000
 JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
@@ -69,10 +73,31 @@ def tool_dir() -> Path | None:
 
 
 def _blob(worktree: Path, rev: str, path: str) -> bytes | None:
+    """``path`` at ``rev`` when it is a regular file there (not a symlink or submodule) of at most
+    ``MAX_BYTES``, else None."""
+    listing = subprocess.run(
+        ["git", "-C", str(worktree), "ls-tree", "-l", "-z", rev, "--", path],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.split("\0")[0]
+    head, _, listed = listing.partition("\t")
+    fields = head.split()  # mode, type, object, size
+    if listed != path or len(fields) != 4 or fields[0] not in ("100644", "100755") or not fields[3].isdigit():
+        return None
+    if int(fields[3]) > MAX_BYTES:
+        return None
     proc = subprocess.run(
         ["git", "-C", str(worktree), "cat-file", "blob", f"{rev}:{path}"], capture_output=True, check=False
     )
     return proc.stdout if proc.returncode == 0 else None
+
+
+def _write(path: Path, data: bytes) -> None:
+    """Replace the worktree's regular file ``path``, never writing through a symlink."""
+    fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
 
 
 def projection_edits(before: str, after: str) -> set[tuple[int, int, str, tuple[int, int] | None]] | None:
@@ -84,8 +109,11 @@ def projection_edits(before: str, after: str) -> set[tuple[int, int, str, tuple[
     then checks the findings by applying them with the tool's own code."""
     edits: set[tuple[int, int, str, tuple[int, int] | None]] = set()
 
+    starts = [0] + [k + 1 for k, ch in enumerate(before) if ch == "\n"]
+
     def place(i: int) -> tuple[int, int]:
-        return before.count("\n", 0, i) + 1, i - (before.rfind("\n", 0, i) + 1)
+        line = bisect.bisect_right(starts, i)
+        return line, i - starts[line - 1]
 
     i = j = 0
     opened: int | None = None  # where in ``before`` an inserted `(` stands
@@ -113,7 +141,9 @@ def projection_edits(before: str, after: str) -> set[tuple[int, int, str, tuple[
         elif j < len(after) and after[j] == "(" and opened is None:
             opened, j = i, j + 1
         elif j < len(after) and after[j] == ")" and opened is not None and _NUMERIC.match(before, i):
-            if not _RECEIVER.fullmatch(before, opened, i) or place(opened)[0] != place(i)[0]:
+            # An identifier chain, `$h` or `℘s`: never digits first, which would be a literal (`1.5`).
+            receiver = _RECEIVER.fullmatch(before, opened, i)
+            if not receiver or before[opened].isdigit() or place(opened)[0] != place(i)[0]:
                 return None
             span = (place(opened)[1], place(i)[1])
             opened, j = None, j + 1
@@ -187,7 +217,7 @@ def _read(directory: int, name: str) -> bytes:
     with os.fdopen(fd, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             raise OSError(f"{name} is not a regular file")
-        return handle.read()
+        return handle.read(2 * MAX_BYTES + 1)
 
 
 def _run_tool(worktree: Path, env: dict, tool: Path, files: list[Path], cache: Path, log: Path, timeout: float) -> dict:
@@ -298,6 +328,8 @@ def prepass(
         for path, (_, base, theirs) in sides.items():
             new_base = _read(directory, f"parent-{names[path]}")
             new_theirs = _read(directory, f"commit-{names[path]}")
+            if max(len(new_base), len(new_theirs)) > 2 * MAX_BYTES:
+                return None
             for before, after in ((base, new_base), (theirs, new_theirs)):
                 if not rewrites_only(before.decode(), after.decode(errors="replace"), fix):
                     return None
@@ -334,7 +366,7 @@ def prepass(
             shutil.rmtree(scratch, ignore_errors=True)
     try:
         for path, data in outputs.items():
-            (worktree / path).write_bytes(data)
+            _write(worktree / path, data)
     except OSError:
         from tauceti_queue import repair
 
