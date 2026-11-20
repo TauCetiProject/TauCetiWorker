@@ -30,9 +30,10 @@
 #                    restart picks up the new release).
 #   --when-idle      restart only once the queue shows the running worker holding no claim: no row
 #                    in the controller's claims table (~/TauCetiQueue-data/queue.sqlite3, read-only)
-#                    for the TAUCETI_QUEUE_WORKER the unit's process runs as, with released_at unset
-#                    and expires_at in the future. It checks every 60s before installing anything,
-#                    and again right before the restart.
+#                    for the TAUCETI_QUEUE_WORKER the unit's process runs as with released_at unset
+#                    (an expired claim counts until the controller releases it, since a renewal
+#                    waiting for its lock keeps it). It checks every 60s before installing
+#                    anything, and again right before the restart.
 #   --idle-timeout SECONDS  give up waiting after SECONDS (default: wait for as long as it takes).
 #   --wait SECONDS   how long to wait for the restarted worker to report serving (default: 60).
 #
@@ -103,7 +104,7 @@ if [ "$WHEN_IDLE" = 1 ]; then
   [ -f "$QUEUE_DB" ] || die "--when-idle reads the queue's claims from $QUEUE_DB, which does not exist on this host"
 fi
 
-# --when-idle: the live claims, in the queue, of the worker the unit runs now. Its identity is read
+# --when-idle: the unreleased claims, in the queue, of the worker the unit runs now. Its identity is read
 # from the running process's own environment, as the worker computes it (default_worker_identity
 # in tauceti_queue/repair_task.py), so an edited environment file cannot misname it. Prints
 # nothing when the unit has no running process; fails, and so counts as busy, when it cannot tell.
@@ -124,15 +125,14 @@ worker = env.get("TAUCETI_QUEUE_WORKER") or f"{env.get('TAUCETI_WORKER_ID', 'def
 db = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
 now = time.time()
 rows = db.execute(
-    "SELECT id, task_id, operation, expires_at FROM claims"
-    " WHERE worker = ? AND released_at IS NULL AND expires_at > ? ORDER BY id",
-    (worker, now),
+    "SELECT id, task_id, operation, expires_at FROM claims WHERE worker = ? AND released_at IS NULL ORDER BY id",
+    (worker,),
 ).fetchall()
 if rows:
-    print(f"{worker} holds " + "; ".join(f"claim {i} (task {t}, {op}, expires in {e - now:.0f}s)" for i, t, op, e in rows))
+    print(f"{worker} holds " + "; ".join(f"claim {i} (task {t}, {op}, expires_at {e - now:+.0f}s)" for i, t, op, e in rows))
 PY
 }
-# wait_until_idle: return once the queue shows no live claim for the running worker. Never returns
+# wait_until_idle: return once the queue shows no unreleased claim for the running worker. Never returns
 # early on anything it cannot read; exits 3 after --idle-timeout.
 wait_until_idle() {
   local claims deadline="" left

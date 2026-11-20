@@ -389,7 +389,7 @@ class Releases(unittest.TestCase):
             "install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "1", "--wait", "10", expect=3
         )
         self.assertIn("waiting before restarting tauceti-queue-repair@2.service: repair-2@host holds claim", log)
-        self.assertIn("(task 7, repair, expires in", log)
+        self.assertIn("(task 7, repair, expires_at +", log)
         self.assertIn("was not restarted", log)
         self.assertEqual(self.pid("tauceti-queue-repair@2.service"), pid)
         self.assertEqual(len(self.release_dirs()), 1)
@@ -405,13 +405,20 @@ class Releases(unittest.TestCase):
         self.assertIn("repair-2@host holds claim", log)
         self.assertEqual(self.pid("tauceti-queue-repair@2.service"), pid)
 
-    def test_when_idle_ignores_released_expired_and_other_workers_claims(self):
+    def test_when_idle_waits_for_an_expired_claim_the_controller_has_not_released(self):
+        """A renewal waiting for the controller's lock keeps an expired claim; only the release ends it."""
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        self.claims(("repair-2@host", time.time() - 5, None))
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "1", expect=3)
+        self.assertIn("repair-2@host holds claim", log)
+
+    def test_when_idle_ignores_released_and_other_workers_claims(self):
         self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
         pid = self.pid("tauceti-queue-repair@2.service")
         second = self.commit("second")
         now = time.time()
         self.claims(
-            ("repair-2@host", now + 900, now - 5), ("repair-2@host", now - 5, None), ("repair@host", now + 900, None)
+            ("repair-2@host", now + 900, now - 5), ("repair-2@host", now - 900, now - 1000), ("repair@host", now + 900, None)
         )
         log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--wait", "10")
         self.assertEqual(log.count("tauceti-queue-repair@2.service holds no claim"), 2, log)  # before the install, before the restart

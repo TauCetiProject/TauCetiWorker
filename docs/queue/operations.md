@@ -753,8 +753,9 @@ touched.
 `--when-idle` waits for the worker to be between tasks before restarting it, so updating a worker
 needs no ad hoc waiter. The signal is the queue's own record: the installer opens the controller's
 database (`~/TauCetiQueue-data/queue.sqlite3`, read-only, so it runs on the controller's host) and
-waits while `claims` has a row for the running worker with `released_at` unset and `expires_at` in
-the future. The worker's name (for example `repair-2@tauchonki2`) is the `TAUCETI_QUEUE_WORKER` of the
+waits while `claims` has a row for the running worker with `released_at` unset. An expired claim
+counts until the controller releases it (on its next tick), because a renewal waiting for the
+controller's lock keeps it. The worker's name (for example `repair-2@tauchonki2`) is the `TAUCETI_QUEUE_WORKER` of the
 unit's running process, read from its environment, so an environment file edited since the worker
 started does not misname it; a unit with no running process has nothing to wait for. It prints the
 claims it is waiting for, checks every 60 seconds, and waits for as long as it takes unless
