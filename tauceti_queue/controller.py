@@ -2013,7 +2013,8 @@ class Controller:
         `repair_concurrency` 1 nothing runs in the background). The role is the batch's, not the
         task kind's: an evicted batch's retained repair is background work, ahead of the other kinds
         by priority. Selection and insertion of the claim share the controller lock; concurrent
-        requests cannot select the same batch.
+        requests cannot select the same batch. When the background slots are full, the next head's
+        unclaimed `pre_rebase` takes the slot of the newest own-base preparation of a later batch.
         """
         active = self._active_task_claims()
         held_batches = {claim["batch_id"] for claim in active}
@@ -2028,7 +2029,41 @@ class Controller:
             for task, batch in unheld:
                 if batch["id"] != head_id:
                     return task, batch
-        return None
+            return None
+        # Pre-rebase first: the next head's pre-rebase is on the way to staging, a later batch's
+        # own-base preparation is not. When the background slots are full, the newest such
+        # preparation gives its slot to the pre-rebase: the claims do not grow, so the capacity kept
+        # for head work stays available.
+        successor = self._open_batch()
+        if successor is None:
+            return None
+        pre_rebase = next(
+            (pair for pair in unheld if pair[1]["id"] == successor["id"] and pair[0]["kind"] == TASK_PRE_REBASE),
+            None,
+        )
+        if pre_rebase is None:
+            return None
+        preparations = [
+            claim
+            for claim in background
+            if claim["operation"] == f"task:{TASK_PREPARE}"
+            and claim["batch_id"] != successor["id"]
+            and (self.store.row("tasks", {"id": claim["task_id"]}) or {}).get("pre_rebase_source") is None
+        ]
+        if not preparations:
+            return None
+        newest = max(preparations, key=lambda claim: (claim["created_at"], claim["id"]))
+        now = self.clock()
+        self._supersede_prepare(newest["batch_id"], "pre-rebase-first", now, own_base_only=True)
+        self.store.journal(
+            now,
+            "pre-rebase-first",
+            successor["id"],
+            task_id=pre_rebase[0]["id"],
+            superseded_batch=newest["batch_id"],
+            superseded_task=newest["task_id"],
+        )
+        return pre_rebase
 
     def _background_claims(self, batch_id: int) -> list[dict[str, Any]]:
         """The live claims on the batch's background tasks (`prepare`, `pre_rebase`)."""

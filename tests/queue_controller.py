@@ -1683,6 +1683,46 @@ class PreRebase(ControllerCase):
         self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "pre_rebase")
         self.assertIsNone(batch["prepared_version"])
 
+    def test_the_next_heads_pre_rebase_takes_the_newest_later_preparations_slot(self):
+        """Background slots full of later batches' preparations: the next head's pre-rebase takes the
+        newest one's slot, and the slot kept for head work stays free."""
+        for name, value in (
+            ("repair_concurrency", 3),
+            ("background_start_limit", 3),
+            ("open_batch_limit", 3),
+            ("prepare_open_batches", False),
+        ):
+            self.controller.set_setting(name, value, "kim")
+        self.controller.set_setting("publication_enabled", False, "kim")  # holds the pre-rebase off
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        for number in (102, 103, 104):  # each conflicts with the open batches before it
+            self.approve(number, {"Shared.lean": f"line one\nline two by {number}\nline three\n"})
+            self.controller.tick()
+        successor, later, last = self.controller.store.rows("batches", {"state": "open"}, order="id")
+        for batch in (later, last):
+            self.controller._create_task(batch, "prepare", batch["base"], [], self.clock())
+        first = self.controller.claim_task("w1", "admin-worker")
+        self.clock.advance(1)
+        second = self.controller.claim_task("w2", "admin-worker")
+        self.assertEqual(
+            {(first.kind, first.batch_id), (second.kind, second.batch_id)},
+            {("prepare", later["id"]), ("prepare", last["id"])},
+        )
+        self.controller.set_setting("publication_enabled", True, "kim")
+        self.controller.tick()
+        [pre_rebase] = [t for t in self.open_tasks(successor) if t["kind"] == "pre_rebase"]
+        third = self.controller.claim_task("w3", "admin-worker")
+        self.assertEqual((third.kind, third.task_id), ("pre_rebase", pre_rebase["id"]))
+        released = self.controller.store.row("tasks", {"id": second.task_id})
+        self.assertEqual((released["state"], released["resolution"]), ("superseded", "pre-rebase-first"))
+        self.assertEqual(
+            self.controller.store.row("tasks", {"id": first.task_id})["state"], "open", "the older one keeps its slot"
+        )
+        self.assertEqual(len(self.controller._active_task_claims()), 2, "the claims did not grow")
+        self.assertIsNone(self.controller.claim_task("w4", "admin-worker"), "the slot kept for head work stays free")
+        self.assertEqual(len(self.controller.store.journal_entries("pre-rebase-first")), 1)
+
     def test_background_checks_yield_when_the_predecessor_lands(self):
         self.conflicting_batch()
         task = self.controller.claim_task("w", "admin-worker")
@@ -1694,6 +1734,35 @@ class PreRebase(ControllerCase):
         self.controller.tick()
         self.assertIsNone(self.controller._head(), "the source claim still owns the successor")
         self.controller.renew_task(task.task_id, task.claim_token)
+
+    def test_a_pre_rebase_in_flight_when_the_head_lands_is_what_the_next_head_seals_with(self):
+        """Its work is not lost: promotion waits for the claim, and the submitted chain, already on the
+        landed head's tip (now `main`), becomes the head without another rebase."""
+        self.conflicting_batch()
+        batch = self.open_batch()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution({"Shared.lean": resolved}, explanation="Kept both edits.")},
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual((head["id"], head["base"]), (batch["id"], self.repo.main_sha()))
+        self.assertEqual(self.repo.file_at(head["tip"], "Shared.lean"), resolved)
+        self.assertEqual(
+            self.controller.store.rows("tasks", {"batch_id": batch["id"], "kind": "rebase_conflict"}),
+            [],
+            "no new rebase",
+        )
 
     def batch_conflicting_in_the_middle(self):
         """A head waiting on CI and an open batch [103, 102, 104] whose member 102 conflicts with it."""
