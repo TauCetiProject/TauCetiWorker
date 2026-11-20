@@ -237,6 +237,18 @@ class Ordering(PoolFixture):
         self.assertEqual(len(self.advanced), 4)
         self.assertFalse((self.state / "blocked.json").exists())
 
+    def test_a_range_retried_many_times_keeps_only_its_last_attempts(self):
+        def inspect(batch, attempt):
+            if self.index(batch) == 0 and self.calls.count(0) <= 5:
+                self.not_judged(attempt, engaged=False)
+            return self.verdict(batch)
+
+        self.serve(inspect)
+        self.assertEqual(self.calls.count(0), 6)
+        attempts = sorted(self.state.glob("attempt-*"))
+        self.assertLessEqual(len(attempts), 2 + 2 + 2)  # Range 0's last two, plus the two other ranges.
+        self.assertEqual(sum(1 for r in self.ledger() if r.get("outcome") == "not-judged"), 5)
+
     def test_a_launch_where_no_reviewer_engaged_retries_the_same_range(self):
         def inspect(batch, attempt):
             if self.index(batch) == 0 and self.calls.count(0) == 1:

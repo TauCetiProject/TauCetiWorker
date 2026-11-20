@@ -16,6 +16,7 @@ import concurrent.futures
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -77,6 +78,7 @@ class Slot:
 
 
 RETRY_CAP = 3600  # A retry backs off up to an hour, and never stops.
+KEPT_ATTEMPTS = 2  # Attempts of a range kept while it is retried.
 
 
 class Pool:
@@ -385,6 +387,13 @@ class Pool:
         slot.failures += 1
         slot.status = "planned"
         slot.avoid = slot.provider
+        # Retries never stop, so their storage must not grow: keep the last two attempts. An older
+        # attempt was classified as no judgment and its outcome is in the ledger; one whose
+        # evidence holds is never removed (it would have bound the range instead).
+        for old in slot.attempts[:-KEPT_ATTEMPTS]:
+            if not evidence.holds(self.work, Path(old)):
+                shutil.rmtree(old, ignore_errors=True)
+        slot.attempts = slot.attempts[-KEPT_ATTEMPTS:]
         slot.retry_at = time.time() + min(RETRY_CAP, RETRY_SECONDS * 2 ** (slot.failures - 1))
         self.persist()
         log(f"security-audit pool: {span} not judged on {slot.provider} ({exc}); fresh retry {slot.failures}")
