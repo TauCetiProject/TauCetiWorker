@@ -2335,12 +2335,27 @@ class Preparation(ControllerCase):
         self.controller.tick()
         self.assertEqual(self.prepare_tasks(), [])
         self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["base"], batch["base"])
-        self.assertTrue(
-            any(f"{main[:12]} conflicts at {PROJECT}#201" in r for r in self.controller.status()["reasons"]),
-            self.controller.status()["reasons"],
-        )
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
+        [diagnostic] = loads(task["diagnostics"])
+        self.assertEqual(diagnostic["source_pr"], f"{PROJECT}#201")
         self.controller.tick()
         self.assertEqual(len(self.controller.store.journal_entries("open-rebase-conflict")), 1, "replayed once")
+        self.assertTrue(
+            any("waits for a worker to resolve its rebase onto main" in r for r in self.controller.status()["reasons"])
+        )
+
+    def test_a_conflict_recorded_before_the_background_rebase_existed_still_gets_its_task(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"P201.lean": "main's own\n"})
+        self.controller._set_state(
+            f"open_rebase_conflict:{batch['id']}",
+            {"version": batch["version"], "onto": main, "source_pr": f"{PROJECT}#201"},
+        )
+        self.quiet()
+        self.controller.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
 
     def test_small_batches_and_the_setting_turned_off_get_no_prepare_task(self):
         self.controller.set_setting("prepare_min_members", 4, "t")

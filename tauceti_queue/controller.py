@@ -6375,26 +6375,24 @@ class Controller:
         lands. The replay runs without the controller lock, under a `rebase` claim on the batch that
         holds insertion off, and is applied only if neither the batch nor the canonical commit moved
         meanwhile. A clean replay re-bases the batch (members' commits, base, tip, a new version). A
-        conflicting one is recorded per batch version and canonical commit, so it is not repeated each
-        pass, and the batch gets no own-base preparation; its conflicts are resolved when it is
-        pre-rebased. A batch with a pre-rebase is left as it is: its preparation is that of the
+        conflicting one creates the batch's `rebase_conflict` task onto `main`, which a worker
+        resolves in the background; while it is open the replay is not repeated and the batch gets no
+        own-base preparation. A batch with a pre-rebase is left as it is: its preparation is that of the
         pre-rebased chain, which names its own chain. Without `rebase_clean` (a batch already prepared)
-        a clean replay leaves the batch and its preparation as they are, and is recorded likewise."""
+        a clean replay leaves the batch and its preparation as they are, and is recorded per batch
+        version and canonical commit so it is not repeated."""
         canonical = self._canonical
         if not canonical or batch["base"] == canonical:
             return True
         if batch["pre_rebase_state"]:
             return False
-        key = f"open_rebase_conflict:{batch['id']}"
+        if self._open_rebase_task(batch) is not None:
+            self._note_reason(f"open batch {batch['id']} waits for a worker to resolve its rebase onto main")
+            return False
+        key = f"open_rebase_clean:{batch['id']}"
         recorded = self._state(key) or {}
         if recorded.get("version") == batch["version"] and recorded.get("onto") == canonical:
-            if recorded.get("source_pr") is None:
-                return True  # a clean replay of a prepared batch, left as it is
-            self._note_reason(
-                f"open batch {batch['id']}: its replay onto {canonical[:12]} conflicts at {recorded.get('source_pr')}; "
-                "it is prepared once a worker resolves its rebase onto main"
-            )
-            return False
+            return True  # a clean replay of a prepared batch, left as it is
         if self._active_claims(batch["id"]):
             return False
         with self.store.transaction():
@@ -6421,18 +6419,18 @@ class Controller:
         if not moved and result.status == chain.CLEAN and not rebase_clean:
             with self.store.transaction():
                 self._release_claim(claim, "clean", now)
-                self._set_state(key, {"version": batch["version"], "onto": canonical, "source_pr": None})
+                self._set_state(key, {"version": batch["version"], "onto": canonical})
             return True
         if moved or result.status != chain.CLEAN:
             with self.store.transaction():
                 self._release_claim(claim, "batch-moved" if moved else "conflict", now)
                 if not moved:
                     source_pr = result.conflict.source_pr if result.conflict else None
-                    self._set_state(key, {"version": batch["version"], "onto": canonical, "source_pr": source_pr})
                     self.store.journal(now, "open-rebase-conflict", batch["id"], onto=canonical, source_pr=source_pr)
-            if not moved and self._open_rebase_task(batch) is None:
-                # A worker resolves the conflicts onto `main` in the background, as for the head;
-                # adopting the result re-bases the batch, which is then prepared on `main`.
+            if not moved:
+                # A worker resolves the conflicts onto `main` in the background, as for the head; the
+                # open task is what keeps the replay from repeating. Adopting the result re-bases the
+                # batch, which is then prepared on `main`.
                 self._create_task(
                     batch, TASK_REBASE_CONFLICT, canonical, self._conflict_diagnostics(result, canonical), now
                 )
