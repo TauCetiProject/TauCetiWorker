@@ -400,6 +400,21 @@ class OpenFileLimitTests(unittest.TestCase):
         self.assertEqual(resource.getrlimit(resource.RLIMIT_NOFILE), (expected, hard))
 
 
+class StackLimitTests(unittest.TestCase):
+    def test_raises_the_soft_stack_limit_to_the_hard_limit_for_children(self):
+        import resource
+        import subprocess
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_STACK, (soft, hard))
+        low = 8 * 1024 * 1024 if hard == resource.RLIM_INFINITY else min(8 * 1024 * 1024, hard)
+        resource.setrlimit(resource.RLIMIT_STACK, (low, hard))
+        s.raise_stack_limit()
+        self.assertEqual(resource.getrlimit(resource.RLIMIT_STACK), (hard, hard))
+        child = subprocess.run(["sh", "-c", "ulimit -s"], capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(child, "unlimited" if hard == resource.RLIM_INFINITY else str(hard // 1024))
+
+
 class SignatureTests(Fixture):
     def key(self):
         _, closure = self.attach()

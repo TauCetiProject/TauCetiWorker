@@ -886,6 +886,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    from tauceti_worker.shared_mathlib import raise_stack_limit
+
+    raise_stack_limit()  # leantar under Lake, in the repair worker's builds and publications
     args = build_parser().parse_args(argv)
     try:
         if args.command == "serve":

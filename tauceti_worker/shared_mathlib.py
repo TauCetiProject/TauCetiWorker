@@ -1325,6 +1325,21 @@ def raise_open_file_limit(wanted=65536):
         resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
 
 
+def raise_stack_limit():
+    """Raise this process's soft RLIMIT_STACK to its hard limit, for every child it starts.
+
+    leantar 0.1.21 (Lean v4.37.0-rc1) overflows the default 8 MiB stack when it packs or
+    extracts a large olean (exit 139), which Lake runs for `-o`, cache staging and restores."""
+    import resource
+
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_STACK, (hard, hard))
+    except (OSError, ValueError):
+        pass
+
+
 def stop_sharing(pool, reason):
     """Stop future rounds; never disturb existing leases or immutable readers."""
     from .config import log
