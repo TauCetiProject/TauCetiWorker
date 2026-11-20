@@ -37,7 +37,7 @@ import re
 import secrets
 import subprocess
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -669,12 +669,8 @@ def replay(
     onto: str,
     chain_id: str | None = None,
     committer: tuple[str, str] = DEFAULT_COMMITTER,
-    empty: Mapping[str, str] | None = None,
 ) -> ChainResult:
     """Rebase the chain `base..tip` onto `onto`, one commit per commit, under a new private ref.
-
-    `empty` maps a member's `Source-PR` to a note: that member's commit is replaced by an empty one
-    whose message is its own with the note appended (the controller's withdrawal of a member).
 
     Messages, authorship and trailers are copied; an empty commit stays an empty commit, and a commit
     whose change is already in the new base becomes one. A commit whose PR the new base's history
@@ -702,10 +698,7 @@ def replay(
     for index, commit in enumerate(commits):
         key = commit.source_pr or commit.sha
         landing = landing_of(commit)
-        if empty and commit.source_pr in empty:
-            outcome = MergeOutcome(tree=new_tip_tree)
-            message = commit.message.rstrip() + "\n\n" + empty[commit.source_pr].strip() + "\n"
-        elif landing:
+        if landing:
             outcome = MergeOutcome(tree=new_tip_tree)
             message = landed_message(commit.message, landing)
         else:

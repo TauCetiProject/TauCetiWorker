@@ -2,9 +2,7 @@
 
 A failing head is repaired by agents however often it fails. The queue never withdraws, bisects,
 evicts or holds a member of the head on its own: there is no eviction cap, no count of repeated
-failures or fruitless claims, and no human in the repair loop. None of the queue's states waits for
-an operator: everything it retries it retries on its own, so the queue keeps working while nobody is
-watching.
+failures or fruitless claims, and no human in the repair loop.
 
 ## Repair
 
@@ -46,7 +44,7 @@ the `failures` table and its rows are kept as history and no longer written; inp
 `queue-withdrawn` are re-admitted by a new approval as before; earlier records in
 `state:escalations` stay on the status page until they age out; and a `state:escalation_hold` is no
 longer read, so a head held before the change is repaired again at once. A stored value of a removed
-setting is ignored, and one in the configuration file's `[settings]` is logged as not applied.
+setting is ignored. The configuration file never accepted these settings.
 
 ## Infrastructure failures
 
