@@ -2307,6 +2307,77 @@ class Preparation(QueueFixture):
         self.assertEqual([t.kind for t in preparer.tasks], ["prepare"])
 
 
+class OpenBatchRebaseOntoMain(QueueFixture):
+    """An open batch whose replay onto `main` conflicts gets a background `rebase_conflict` task onto
+    `main`; adopting it re-bases the batch, which is then prepared on `main`."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
+        self.controller.set_setting("prepare_min_members", 2, "t")
+        self.controller.set_setting("pre_rebase_enabled", False, "t")
+
+    def test_a_conflicting_open_batch_is_rebased_onto_main_by_a_worker_then_prepared_there(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        batch = self.open_batch()
+        main = self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"], task["base"]), ("rebase_conflict", main, batch["base"]))
+        self.tick()
+        self.assertEqual(
+            len(self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})), 1, "one task"
+        )
+
+        def resolve(claimed):
+            self.assertEqual(
+                (claimed.kind, claimed.batch_id, claimed.extra.get("background")),
+                ("rebase_conflict", batch["id"], True),
+            )
+            return {
+                f"{PROJECT}#202": Resolution(
+                    {"Shared.lean": "one\ntwo on main and by 202\nthree\n"}, explanation="Kept both line two edits."
+                )
+            }
+
+        resolver = self.agent("resolver", script=resolve)
+        self.assertTrue(resolver.run(self.controller).accepted)
+        rebased = self.open_batch()
+        self.assertEqual(rebased["id"], batch["id"])
+        self.assertEqual(rebased["base"], main)
+        self.assertGreater(rebased["version"], batch["version"])
+        self.assertIsNone(rebased["prepared_version"], "a rebase is not a preparation")
+        self.tick()
+        [prepare] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((prepare["kind"], prepare["base"]), ("prepare", main))
+
+    def test_insertion_goes_around_an_open_batch_being_rebased(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        batch = self.open_batch()
+        self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        claimed = self.agent("holder").claim(self.controller)
+        self.assertEqual((claimed.kind, claimed.batch_id), ("rebase_conflict", batch["id"]))
+        self.approve(204, {"TauCeti/P204.lean": "204\n"})
+        self.tick()
+        self.assertNotIn(
+            f"{PROJECT}#204",
+            [m["source_pr"] for m in self.members(self.controller.store.row("batches", {"id": batch["id"]}))],
+        )
+
+
 class SequencedBackgroundTasks(QueueFixture):
     """An open batch is prepared before it is pre-rebased: a preparation adopted under a running
     pre-rebase would rewrite its chain and discard the agent's conflict resolutions."""
