@@ -35,7 +35,7 @@ from .config import positive_integer, security_audit_problem, validate_extra_roa
 from .constants import AGENTS, ALLOWED_TASKS, DRAIN_SIGNAL, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, fleet_dir, self_argv, self_env
-from .quota import parse_pace_curve
+from .quota import PACE_PROVIDERS, effective_pace_specs, pace_env, parse_pace_curve
 from .round import signal_group
 from .runtime_status import STATUS_ENV, StatusPublisher, atomic_json, read_json
 from .runtime_status import update_status as update_status
@@ -71,6 +71,8 @@ _WORKER_KEYS = {
     "author_model",
     "author_effort",
     "pace",
+    "pace_claude",
+    "pace_codex",
     "stream",
     "isolate_home",
     "restart",
@@ -261,6 +263,15 @@ def _pace(value, where: str) -> str | None:
     return spec
 
 
+def _pacing_environment(spec: dict, inherited=None) -> dict:
+    """The child environment after its env table and matching pacing flags apply."""
+    values = {**(os.environ if inherited is None else inherited), **(spec.get("env") or {})}
+    for name, variable in (("pace", "TAUCETI_PACE"), *((f"pace_{p}", pace_env(p)) for p in PACE_PROVIDERS)):
+        if spec.get(name) is not None:
+            values[variable] = spec[name]
+    return values
+
+
 # Names the manager or the worker's own bootstrap owns. Setting one from the config would break the
 # thing it configures, and the failure would read as a worker bug rather than a configuration error:
 # the first four decide which state file the worker heartbeats into, whether it knows it is managed,
@@ -340,6 +351,8 @@ class WorkerSpec:
     author_model: str | None = None
     author_effort: str | None = None
     pace: str | None = None
+    pace_claude: str | None = None
+    pace_codex: str | None = None
     stream: bool = False
     isolate_home: bool = False
     restart: str = "always"
@@ -417,6 +430,8 @@ class WorkerSpec:
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
             pace=_pace(raw.get("pace"), f"workers[{index}].pace"),
+            pace_claude=_pace(raw.get("pace_claude"), f"workers[{index}].pace_claude"),
+            pace_codex=_pace(raw.get("pace_codex"), f"workers[{index}].pace_codex"),
             stream=_boolean(raw.get("stream", False), f"workers[{index}].stream"),
             isolate_home=_boolean(raw.get("isolate_home", False), f"workers[{index}].isolate_home"),
             restart=restart,
@@ -440,8 +455,15 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
         if spec.claude_billing not in ("subscription", "api"):
             raise WorkersError("claude_billing must be subscription or api")
+        # Configuration is independent of the shell inspecting it. The child's inherited
+        # environment is validated by resolve_pace/configure_api before it can spend.
+        pacing = _pacing_environment(spec.as_dict(), inherited={})
+        variables = ("TAUCETI_PACE", *(pace_env(provider) for provider in PACE_PROVIDERS))
+        for variable in variables:
+            _pace(pacing.get(variable), f"workers[{index}].env.{variable}")
         if spec.claude_billing == "api":
-            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or spec.pace:
+            paced = any(str(pacing.get(variable) or "").strip() for variable in variables)
+            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or paced:
                 raise WorkersError("Claude API workers require agent=claude and no subscription quota overrides")
         elif spec.budget or spec.anthropic_api_key_file:
             raise WorkersError("budget and anthropic_api_key_file require claude_billing=api")
@@ -505,6 +527,8 @@ class WorkerSpec:
             "author_model",
             "author_effort",
             "pace",
+            "pace_claude",
+            "pace_codex",
         ):
             item = getattr(self, name)
             if item is not None:
@@ -567,6 +591,8 @@ class WorkerSpec:
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
             (self.pace, "--pace"),
+            (self.pace_claude, "--pace-claude"),
+            (self.pace_codex, "--pace-codex"),
         ):
             if field is not None:
                 argv += [flag, field]
@@ -928,6 +954,7 @@ def cmd_managed_runner(args) -> int:
                 github_account=spec.github_account,
                 only=list(spec.only),
                 sandbox=spec.sandbox,
+                pace_curves=effective_pace_specs(_pacing_environment(spec.as_dict(), env)),
                 log_file=str(log_path) if logf is not sys.stderr else None,
                 started_at=started,
                 heartbeat_at=time.time(),
@@ -1693,8 +1720,19 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         lines.extend(_status_field("github", [str(github_account)], width))
 
     pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
-    if spec.get("pace"):
-        pacing += f" · curve {spec['pace']}"
+    if spec.get("claude_billing") != "api" and not spec.get("ignore_quota"):
+        curves = item.get("pace_curves")
+        running = (
+            item.get("alive")
+            and item.get("spec_hash")
+            and item.get("actual_spec_hash") == item.get("spec_hash")
+            and isinstance(curves, dict)
+            and all(isinstance(curves.get(provider), str) for provider in PACE_PROVIDERS)
+        )
+        if not running:
+            curves = effective_pace_specs(_pacing_environment(spec, inherited={}))
+        label = "effective" if running else "configured"
+        pacing += f" · {label} curves: " + ", ".join(f"{provider} {curves[provider]}" for provider in PACE_PROVIDERS)
     lines.extend(_status_field("pacing", [pacing], width))
 
     # Worth stating rather than leaving implicit: this worker rotates the operator's Claude credential.
@@ -2427,6 +2465,8 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
     add.add_argument("--pace", help="soft pacing curve as time%%:budget%% points, e.g. 0:10,50:70,90:90")
+    for provider in PACE_PROVIDERS:
+        add.add_argument(f"--pace-{provider}", help=f"soft pacing curve for {provider}'s windows only")
     add.add_argument("--stream", action="store_true", help="keep the agent transcript in the console log")
     add.add_argument(
         "--isolate-home",
@@ -2531,6 +2571,8 @@ def cmd_workers(args) -> int:
                     "author_model",
                     "author_effort",
                     "pace",
+                    "pace_claude",
+                    "pace_codex",
                 ):
                     value = getattr(args, key, None)
                     if value is not None:

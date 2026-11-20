@@ -31,6 +31,7 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--ignore-quota` | Ignore soft pacing for an explicit `--agent codex\|claude`; unreadable usage and provider hard limits still stop the round. Kiro and OpenRouter agents do not use the subscription pacer. |
 | `--quota-cmd CMD` | External pacer, run as `<cmd> <agent>`: first stdout token = model to run, empty output or nonzero exit = wait. |
 | `--pace T:B[,T:B...]` | Pacing curve as `time%:budget%` points (e.g. `0:10,50:70,90:90`): usage must remain below the interpolated budget; time 0/100 default to 0/100. Default is `60:40`; `0:0,100:100` gives the plain `used% < elapsed%` rule. |
+| `--pace-claude T:B[,T:B...]`, `--pace-codex T:B[,T:B...]` | Pacing curve for that provider's session and weekly windows only, in the form `--pace` takes. A provider without one follows `--pace`, so an `auto` worker can spend two subscriptions on two curves. A provider's own curve, from its flag or its variable, applies whatever `--pace` says; an empty value returns the provider to `--pace`. |
 | `--worker-id ID` | Run an independent worker under this name; any id but `default` also isolates its credential directories (`$HOME` on Linux; provider-specific Claude, Codex, and Kiro directories on macOS). |
 | `--isolate-home` | Force that per-worker isolation even for the `default` id (a distinct id already implies it). |
 | `--dry-run` | Survey and print the picker's decision; act on nothing. |
@@ -359,7 +360,11 @@ CODEX_HOME=~/.codex-tauceti tauceti work --agent codex --account you@example.com
 
 ## Environment variables
 
-Flags win over these. Most are tuning knobs with sane defaults.
+Each flag overrides its matching variable. A provider-specific pacing curve is
+more specific than the global curve even when inherited: `TAUCETI_PACE_CLAUDE`
+still applies beside `--pace`. Use `--pace-claude=` (or `pace_claude = ""` in
+workers.toml) to clear that override and return Claude to the global curve.
+Most variables are tuning knobs with sane defaults.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -379,6 +384,7 @@ Flags win over these. Most are tuning knobs with sane defaults.
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
+| `TAUCETI_PACE_CLAUDE`, `TAUCETI_PACE_CODEX` | _(unset)_ | Pacing curve for `--pace-claude` / `--pace-codex`; unset or empty = that provider follows `TAUCETI_PACE`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |
 | `TAUCETI_VERIFY_IMMUTABLE_INSTALLATIONS` | unset | JSON mapping of absolute resolved installation paths to publisher provenance tokens. Only validated read-only installations use compact cached identities; writable inputs retain full validation. See [verification](verification.md). |
 | `TAUCETI_VERIFY_HELPER` | `0` | V0 dispatch remains the default. Set `1` only for an opt-in natural canary; helper CLI and receipts are available independently. Dispatch changes preserve running helpers and recovery jobs. |
@@ -436,6 +442,11 @@ of subscription quota pacing. Supply `ANTHROPIC_API_KEY` or
 `--anthropic-api-key-file PATH`. Add `--budget` to consult the user-level grant
 ledger immediately before each paid Claude invocation. These settings are
 propagated through loop children, managed workers, reviewers, and Bubble.
+
+API billing rejects subscription pacing controls, including nonempty inherited
+`TAUCETI_PACE`, `TAUCETI_PACE_CLAUDE` and `TAUCETI_PACE_CODEX`. Clear them in the
+environment or with their matching blank flags (`--pace=`, `--pace-claude=`,
+`--pace-codex=`) before starting an API worker.
 
 `tauceti budget --grant USD` adds credit; `--set-grant USD` sets the current
 balance through an adjustment; `--grant-rate USD_PER_HOUR` changes automatic
