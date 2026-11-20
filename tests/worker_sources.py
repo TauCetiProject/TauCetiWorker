@@ -794,6 +794,51 @@ ci="one/project"
             self.assertTrue(publish_native_reviews(self.cfg))
             pending.assert_called_once()
 
+    def test_a_round_publishes_the_authoring_backpressure_it_enforces(self):
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import NoEligibleWork, RoundOpts
+
+        observations = self.observations([], [])
+        observations[0][2].n_mine_open, observations[1][2].n_mine_open = 3, 4
+        for _, _, result in observations:
+            result.max_open_prs = 7
+            result.roadmap_skip = ["B", "A", ""]
+        options = RoundOpts(only=["review"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True)
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            self.assertRaises(NoEligibleWork),  # nothing actionable: reported all the same
+        ):
+            run_round(None, options)
+        authoring = report.call_args.kwargs["authoring"]
+        names = [name for name, _, _ in observations]
+        self.assertEqual(authoring["sources"], {names[0]: 3, names[1]: 4})
+        self.assertEqual(
+            {k: authoring[k] for k in ("count", "limit", "blocked", "scope", "skip")},
+            dict(count=7, limit=7, blocked=True, scope="any", skip="A,B"),
+        )
+        for _, _, result in observations:  # a Fleet-focused round counts every roadmap
+            result.roadmap_only, result._automatic_open_count = "Algebra", result.n_mine_open
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            self.assertRaises(NoEligibleWork),
+        ):
+            run_round(None, options)
+        self.assertEqual(report.call_args.kwargs["authoring"]["scope"], "any")
+        for _, _, result in observations:  # an explicit area counts only that area
+            del result._automatic_open_count
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", return_value=0),
+            self.assertRaises(NoEligibleWork),
+        ):
+            run_round(None, options)
+        self.assertEqual(report.call_args.kwargs["authoring"]["scope"], "Algebra")
+
     def test_native_execution_failure_does_not_invalidate_github_authoring_inventory(self):
         import contextlib
 

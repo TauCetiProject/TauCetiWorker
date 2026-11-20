@@ -941,12 +941,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `pre_rebase_enabled` | `true` | `true` or `false` |
 | `prepare_pre_rebased` | `true` | `true` or `false` |
 | `withdraw_emptied_at_adoption` | `true` | `true` or `false` ([reject-empty-commits.md](reject-empty-commits.md)) |
-| `failure_repeat_limit` | `2` | integer, at least 0; 0 disables ([escalation.md](escalation.md)) |
-| `repair_fruitless_claim_limit` | `3` | integer, at least 0; 0 disables |
-| `source_failure_round_limit` | `6` | integer, at least 0; 0 disables |
-| `policy_rejection_withdraw` | `true` | `true` or `false` |
-| `attribution_max_members` | `10` | integer, at least 0; 0: no bound |
-| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff |
+| `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff ([escalation.md](escalation.md)) |
 | `automatic_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
 | `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
@@ -957,7 +952,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `forgejo_recheck_seconds` | `21600` | integer, at least 0; a settled Forgejo PR whose listed facts are unchanged is evaluated again this long after its last attempt ([mixed-sources.md](mixed-sources.md)) |
 | `control_lane_enabled` | `false` | `true` or `false`; stage GitHub control-file PRs in their own lane batch ([mixed-sources.md](mixed-sources.md), "The control-file lane") |
 
-Escalations (withdrawals, bisections, the start and end of an infrastructure backoff) are sent as Zulip direct messages when
+Escalations (the start and end of an infrastructure backoff) are sent as Zulip direct messages when
 `TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
 configuration file; see [escalation.md](escalation.md), "Alerts and notifications".
 

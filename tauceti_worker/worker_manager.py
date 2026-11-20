@@ -35,7 +35,7 @@ from .config import positive_integer, security_audit_problem, validate_extra_roa
 from .constants import AGENTS, ALLOWED_TASKS, DRAIN_SIGNAL, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
 from .paths import HERE, ensure_ssl_cert_file, entry_cmd, fleet_dir, self_argv, self_env
-from .quota import parse_pace_curve
+from .quota import PACE_PROVIDERS, effective_pace_specs, pace_env, parse_pace_curve
 from .round import signal_group
 from .runtime_status import STATUS_ENV, StatusPublisher, atomic_json, read_json
 from .runtime_status import update_status as update_status
@@ -71,6 +71,8 @@ _WORKER_KEYS = {
     "author_model",
     "author_effort",
     "pace",
+    "pace_claude",
+    "pace_codex",
     "stream",
     "isolate_home",
     "restart",
@@ -261,6 +263,15 @@ def _pace(value, where: str) -> str | None:
     return spec
 
 
+def _pacing_environment(spec: dict, inherited=None) -> dict:
+    """The child environment after its env table and matching pacing flags apply."""
+    values = {**(os.environ if inherited is None else inherited), **(spec.get("env") or {})}
+    for name, variable in (("pace", "TAUCETI_PACE"), *((f"pace_{p}", pace_env(p)) for p in PACE_PROVIDERS)):
+        if spec.get(name) is not None:
+            values[variable] = spec[name]
+    return values
+
+
 # Names the manager or the worker's own bootstrap owns. Setting one from the config would break the
 # thing it configures, and the failure would read as a worker bug rather than a configuration error:
 # the first four decide which state file the worker heartbeats into, whether it knows it is managed,
@@ -340,6 +351,8 @@ class WorkerSpec:
     author_model: str | None = None
     author_effort: str | None = None
     pace: str | None = None
+    pace_claude: str | None = None
+    pace_codex: str | None = None
     stream: bool = False
     isolate_home: bool = False
     restart: str = "always"
@@ -417,6 +430,8 @@ class WorkerSpec:
             author_model=_string(raw.get("author_model"), f"workers[{index}].author_model", optional=True),
             author_effort=_string(raw.get("author_effort"), f"workers[{index}].author_effort", optional=True),
             pace=_pace(raw.get("pace"), f"workers[{index}].pace"),
+            pace_claude=_pace(raw.get("pace_claude"), f"workers[{index}].pace_claude"),
+            pace_codex=_pace(raw.get("pace_codex"), f"workers[{index}].pace_codex"),
             stream=_boolean(raw.get("stream", False), f"workers[{index}].stream"),
             isolate_home=_boolean(raw.get("isolate_home", False), f"workers[{index}].isolate_home"),
             restart=restart,
@@ -440,8 +455,15 @@ class WorkerSpec:
             raise WorkersError(f"workers[{index}] author_model/author_effort require an explicit agent")
         if spec.claude_billing not in ("subscription", "api"):
             raise WorkersError("claude_billing must be subscription or api")
+        # Configuration is independent of the shell inspecting it. The child's inherited
+        # environment is validated by resolve_pace/configure_api before it can spend.
+        pacing = _pacing_environment(spec.as_dict(), inherited={})
+        variables = ("TAUCETI_PACE", *(pace_env(provider) for provider in PACE_PROVIDERS))
+        for variable in variables:
+            _pace(pacing.get(variable), f"workers[{index}].env.{variable}")
         if spec.claude_billing == "api":
-            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or spec.pace:
+            paced = any(str(pacing.get(variable) or "").strip() for variable in variables)
+            if spec.agent != "claude" or spec.ignore_quota or spec.auto_refresh or paced:
                 raise WorkersError("Claude API workers require agent=claude and no subscription quota overrides")
         elif spec.budget or spec.anthropic_api_key_file:
             raise WorkersError("budget and anthropic_api_key_file require claude_billing=api")
@@ -505,6 +527,8 @@ class WorkerSpec:
             "author_model",
             "author_effort",
             "pace",
+            "pace_claude",
+            "pace_codex",
         ):
             item = getattr(self, name)
             if item is not None:
@@ -567,6 +591,8 @@ class WorkerSpec:
             (self.author_model, "--author-model"),
             (self.author_effort, "--author-effort"),
             (self.pace, "--pace"),
+            (self.pace_claude, "--pace-claude"),
+            (self.pace_codex, "--pace-codex"),
         ):
             if field is not None:
                 argv += [flag, field]
@@ -928,6 +954,7 @@ def cmd_managed_runner(args) -> int:
                 github_account=spec.github_account,
                 only=list(spec.only),
                 sandbox=spec.sandbox,
+                pace_curves=effective_pace_specs(_pacing_environment(spec.as_dict(), env)),
                 log_file=str(log_path) if logf is not sys.stderr else None,
                 started_at=started,
                 heartbeat_at=time.time(),
@@ -1693,8 +1720,19 @@ def _worker_configuration_lines(item: dict, width: int) -> list[str]:
         lines.extend(_status_field("github", [str(github_account)], width))
 
     pacing = "ignored (--ignore-quota; hard limits still apply)" if spec.get("ignore_quota") else "normal"
-    if spec.get("pace"):
-        pacing += f" · curve {spec['pace']}"
+    if spec.get("claude_billing") != "api" and not spec.get("ignore_quota"):
+        curves = item.get("pace_curves")
+        running = (
+            item.get("alive")
+            and item.get("spec_hash")
+            and item.get("actual_spec_hash") == item.get("spec_hash")
+            and isinstance(curves, dict)
+            and all(isinstance(curves.get(provider), str) for provider in PACE_PROVIDERS)
+        )
+        if not running:
+            curves = effective_pace_specs(_pacing_environment(spec, inherited={}))
+        label = "effective" if running else "configured"
+        pacing += f" · {label} curves: " + ", ".join(f"{provider} {curves[provider]}" for provider in PACE_PROVIDERS)
     lines.extend(_status_field("pacing", [pacing], width))
 
     # Worth stating rather than leaving implicit: this worker rotates the operator's Claude credential.
@@ -2108,8 +2146,15 @@ def _systemd_quote(value: str) -> str:
 def _service_environment() -> dict[str, str]:
     from .paths import INSTALLED, legacy_data_root
 
+    # cli_main puts its own runtime's scripts/ first on PATH at every start. Freezing that entry into
+    # the unit would leave a path to one runtime revision behind after an update.
+    path = os.pathsep.join(
+        entry
+        for entry in os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin").split(os.pathsep)
+        if Path(entry).parts[-2:] != ("tauceti_worker", "scripts") and entry != str(HERE / "scripts")
+    )
     service_env = {
-        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+        "PATH": path,
         # A source checkout needs its root on the path. An installed package is importable already,
         # and its directory belongs to one runtime revision, which an update may delete.
         "PYTHONPATH": "" if INSTALLED else self_env()["PYTHONPATH"],
@@ -2139,6 +2184,62 @@ def _service_environment() -> dict[str, str]:
 
 
 WORKER_SLICE = "tauceti-workers.slice"
+# Resource limits on the worker slice cover the manager and every worker scope, as the service's own
+# cgroup did before workers moved into scopes. Values use systemd's syntax.
+SLICE_LIMITS = {"cpu_quota": "CPUQuota", "memory_high": "MemoryHigh", "memory_max": "MemoryMax"}
+# A size in bytes or with a base-1024 suffix, a percentage of physical memory, or no limit.
+_MEMORY = r"(?:[0-9]+(?:\.[0-9]+)?[KMGTPE]?|100(?:\.0+)?%|[0-9]{1,2}(?:\.[0-9]+)?%|infinity)"
+_SLICE_LIMIT_SYNTAX = {
+    "CPUQuota": re.compile(r"[0-9]+(?:\.[0-9]+)?%"),
+    "MemoryHigh": re.compile(_MEMORY),
+    "MemoryMax": re.compile(_MEMORY),
+}
+
+
+def _slice_path() -> Path:
+    return _service_path().with_name(WORKER_SLICE)
+
+
+def _installed_slice_limits() -> dict[str, str]:
+    """The limits a previous install wrote, so a reinstall without options keeps them."""
+    try:
+        lines = _slice_path().read_text().splitlines()
+    except FileNotFoundError:
+        return {}
+    limits = {}
+    for line in lines:
+        key, _, value = line.partition("=")
+        if key in _SLICE_LIMIT_SYNTAX and value.strip():
+            # Kept as written, including a value this check would not accept, rather than dropped.
+            limits[key] = value.strip()
+    return limits
+
+
+def slice_limits(requested: dict[str, str | None]) -> dict[str, str]:
+    """Merge requested limits over the installed ones; an empty value removes a limit."""
+    limits = _installed_slice_limits()
+    for option, key in SLICE_LIMITS.items():
+        value = requested.get(option)
+        if value is None:
+            continue
+        if value == "":
+            limits.pop(key, None)
+        elif _SLICE_LIMIT_SYNTAX[key].fullmatch(value) and (
+            value == "infinity" or float(value.rstrip("%KMGTPE")) > 0  # systemd ignores a zero limit
+        ):
+            limits[key] = value
+        else:
+            raise WorkersError(f"--{option.replace('_', '-')} {value!r} is not a systemd {key}= value")
+    return limits
+
+
+def _systemd_slice(limits: dict[str, str]) -> str:
+    settings = "".join(f"{key}={limits[key]}\n" for key in SLICE_LIMITS.values() if key in limits)
+    return f"""[Unit]
+Description=Tau Ceti workers and their manager
+
+[Slice]
+{settings}"""
 
 
 def _systemd_unit(config: Path) -> str:
@@ -2182,8 +2283,11 @@ def _service_path() -> Path:
     return base / "systemd" / "user" / "tauceti-workers.service"
 
 
-def service_action(action: str, config: Path) -> int:
+def service_action(action: str, config: Path, limits: dict[str, str | None] | None = None) -> int:
     path = _service_path()
+    requested = {key: value for key, value in (limits or {}).items() if value is not None}
+    if requested and (action != "install" or sys.platform == "darwin"):
+        raise WorkersError("worker slice limits apply only to `service install` on Linux")
     if sys.platform == "darwin":
         domain = f"gui/{os.getuid()}"
         service = f"{domain}/{_launchd_label()}"
@@ -2233,7 +2337,12 @@ def service_action(action: str, config: Path) -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         if path.is_symlink():
             path.unlink()
+        slice_text = _systemd_slice(slice_limits(requested))
+        if _slice_path().is_symlink():
+            _slice_path().unlink()
+        _slice_path().write_text(slice_text)
         path.write_text(_systemd_unit(config))
+        # A reload applies changed slice limits to the running slice; workers keep running.
         subprocess.run([systemctl, "--user", "daemon-reload"], check=True)
         subprocess.run([systemctl, "--user", "enable", "--now", path.name], check=True)
         from .config import Die
@@ -2247,10 +2356,11 @@ def service_action(action: str, config: Path) -> int:
         return 0
     if action == "uninstall":
         subprocess.run([systemctl, "--user", "disable", "--now", path.name], check=False)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        for unit in (path, _slice_path()):
+            try:
+                unit.unlink()
+            except FileNotFoundError:
+                pass
         subprocess.run([systemctl, "--user", "daemon-reload"], check=True)
         return 0
     return subprocess.run([systemctl, "--user", action, path.name]).returncode
@@ -2427,6 +2537,8 @@ def add_workers_parser(subparsers) -> None:
     add.add_argument("--author-model", help="exact authoring model; needs an explicit --agent")
     add.add_argument("--author-effort", help="reasoning effort for an explicit codex/claude/kiro agent")
     add.add_argument("--pace", help="soft pacing curve as time%%:budget%% points, e.g. 0:10,50:70,90:90")
+    for provider in PACE_PROVIDERS:
+        add.add_argument(f"--pace-{provider}", help=f"soft pacing curve for {provider}'s windows only")
     add.add_argument("--stream", action="store_true", help="keep the agent transcript in the console log")
     add.add_argument(
         "--isolate-home",
@@ -2453,6 +2565,13 @@ def add_workers_parser(subparsers) -> None:
         choices=("install", "uninstall", "start", "stop", "restart", "status"),
         help="service operation",
     )
+    for option, key in SLICE_LIMITS.items():
+        service.add_argument(
+            f"--{option.replace('_', '-')}",
+            metavar=key.upper(),
+            help=f"set {key}= on {WORKER_SLICE} at install (Linux); an empty value removes it, "
+            "and an omitted option keeps the installed value",
+        )
     edit = actions.add_parser("edit", help="open workers.toml in $VISUAL or $EDITOR")
     edit.add_argument("--editor", help="editor command to use instead of $VISUAL or $EDITOR")
     imp = actions.add_parser("import", help="import legacy workers.conf commands")
@@ -2531,6 +2650,8 @@ def cmd_workers(args) -> int:
                     "author_model",
                     "author_effort",
                     "pace",
+                    "pace_claude",
+                    "pace_codex",
                 ):
                     value = getattr(args, key, None)
                     if value is not None:
@@ -2574,7 +2695,9 @@ def cmd_workers(args) -> int:
             return 0
         if action == "service":
             try:
-                return service_action(args.service_action, config)
+                return service_action(
+                    args.service_action, config, {option: getattr(args, option) for option in SLICE_LIMITS}
+                )
             except (OSError, subprocess.CalledProcessError) as exc:
                 raise WorkersError(f"service {args.service_action} failed: {exc}") from None
         if action == "edit":
