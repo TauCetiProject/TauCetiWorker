@@ -2298,6 +2298,50 @@ class Preparation(ControllerCase):
         self.assertEqual(claimed.extra["renew_after"], 15, "background checks promptly yield for head handoff")
         self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"), "within repair_concurrency")
 
+    def test_an_open_batch_behind_main_is_replayed_onto_it_before_it_is_prepared(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"Admin.lean": "x\n"})
+        self.quiet()
+        self.controller.tick()
+        [task] = self.prepare_tasks()
+        rebased = self.controller.store.row("batches", {"id": batch["id"]})
+        self.assertEqual((rebased["base"], rebased["version"]), (main, batch["version"] + 1))
+        self.assertEqual((task["base"], task["onto"], task["tip"]), (main, main, rebased["tip"]))
+        self.assertEqual(task["batch_version"], rebased["version"])
+        self.assertEqual(
+            sorted(c.source_pr for c in chain.chain_commits(self.controller.clone, main, rebased["tip"])),
+            [f"{PROJECT}#201", f"{PROJECT}#202", f"{PROJECT}#203"],
+        )
+        self.assertEqual(len(self.controller.store.journal_entries("open-rebased")), 1)
+
+    def test_an_unclaimed_preparation_on_a_base_main_moved_past_is_superseded_and_not_offered(self):
+        self.open_batch()
+        self.quiet()
+        [stale] = self.prepare_tasks()
+        main = self.repo.advance_main({"Admin.lean": "x\n"})
+        self.controller.set_setting("prepare_open_batches", False, "t")
+        self.controller.tick()
+        self.assertEqual(self.controller.store.row("tasks", {"id": stale["id"]})["resolution"], "base-behind")
+        self.assertEqual(self.prepare_tasks(), [], "the setting off: no new preparation")
+        self.controller.set_setting("prepare_open_batches", True, "t")
+        self.controller.tick()
+        [task] = self.prepare_tasks()
+        self.assertEqual(task["base"], main)
+
+    def test_an_open_batch_whose_replay_onto_main_conflicts_is_not_prepared_on_its_old_base(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"P201.lean": "main's own\n"})
+        self.quiet()
+        self.controller.tick()
+        self.assertEqual(self.prepare_tasks(), [])
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["base"], batch["base"])
+        self.assertTrue(
+            any(f"{main[:12]} conflicts at {PROJECT}#201" in r for r in self.controller.status()["reasons"]),
+            self.controller.status()["reasons"],
+        )
+        self.controller.tick()
+        self.assertEqual(len(self.controller.store.journal_entries("open-rebase-conflict")), 1, "replayed once")
+
     def test_small_batches_and_the_setting_turned_off_get_no_prepare_task(self):
         self.controller.set_setting("prepare_min_members", 4, "t")
         self.open_batch()
