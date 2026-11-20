@@ -63,7 +63,10 @@ def unique_pairs(pairs: list) -> dict:
 
 DECODER = json.JSONDecoder(object_pairs_hook=unique_pairs)
 READ_PAGE = "read_page"
-GOAL_TOOLS = frozenset({"get_goal", "create_goal", "update_goal"})
+GOAL_TOOLS = frozenset({"get_goal", "create_goal", "update_goal"})  # Protocols 3 and 4 only.
+# Codex offers its MCP resource helpers whenever an MCP server is configured. The only server is
+# the read-only audit reader, which serves no resources: a call reads nothing and is inert.
+INERT_TOOLS = frozenset({"list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"})
 
 
 class NotJudged(Die):
@@ -345,8 +348,8 @@ def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
     execution = json.loads((attempt / "execution.json").read_text())
     provider = "claude" if execution["argv"][0] == "claude" else "codex"
     paged, protocol = execution["paged"], max(3, execution.get("protocol_version", 1))
-    allowed = ({READ_PAGE} if paged else set()) | (GOAL_TOOLS if provider == "codex" else set())
-    if unexpected := sorted(set(evidence.tools) - allowed):
+    allowed = ({READ_PAGE} if paged else set()) | (GOAL_TOOLS if provider == "codex" and protocol < 5 else set())
+    if unexpected := sorted(set(evidence.tools) - allowed - INERT_TOOLS):
         raise Die(f"security-audit: reviewer attempted an unauthorized tool call: {', '.join(unexpected)}")
     transcript = (attempt / "model-transcript.jsonl").read_text()
     if provider == "claude":
@@ -410,3 +413,16 @@ def outcome_of(verdict, exc: BaseException | None) -> dict:
     if isinstance(verdict, dict) and verdict.get("verdict") != "pass":
         return {"outcome": FINDING, "verdict": verdict}
     return {"outcome": UNREADABLE if isinstance(exc, Unreadable) else NOT_JUDGED}
+
+
+def engaged(attempt: Path) -> bool:
+    """Whether the reviewer engaged with the input: it answered, or the reader served it a page.
+
+    An attempt that is not a judgment is divided only then; a provider or setup failure, where
+    no reviewer engaged, is retried on the same range."""
+    if collect(attempt).judgments:
+        return True
+    try:
+        return bool(json.loads((attempt / "read-receipt.json").read_text()).get("served"))
+    except (OSError, ValueError, AttributeError):
+        return False

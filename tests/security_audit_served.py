@@ -72,6 +72,21 @@ def read_events(provider, pages, *, failed=False):
     return events
 
 
+def read_all(reader, env):
+    """Serve every page; a Claude client also stores each result in its session, as the real one does."""
+    rows = []
+    for page in range(len(reader.pages)):
+        result = reader.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+        use = {"type": "tool_use", "id": f"read-{page}", "name": "mcp__audit__read_page", "input": {"page": page}}
+        back = {"type": "tool_result", "tool_use_id": f"read-{page}", "content": result["content"]}
+        rows += [{"type": "assistant", "message": {"content": [use]}}, {"type": "user", "message": {"content": [back]}}]
+    if "CLAUDE_CONFIG_DIR" in env:
+        session = Path(env["CLAUDE_CONFIG_DIR"]) / "projects" / "home" / "session.jsonl"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        with session.open("a") as stream:
+            stream.write("".join(sa.serialize(row) + "\n" for row in rows))
+
+
 def native_read_rows(pages, batch):
     expected = ar.pages(batch)
     rows = []
@@ -644,8 +659,7 @@ class ServedJudgments(unittest.TestCase):
                 self.assertEqual(set(schema["required"]), {"verdict", "findings"})
                 self.assertEqual(len(args), 4)
                 r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-                for page in range(len(r.pages)):
-                    r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+                read_all(r, kwargs["env"])
                 if provider == "codex":
                     append_native_reads(kwargs["cwd"], range(len(r.pages)), self.thread, self.batch)
                     historical.append_native(kwargs["cwd"], value, self.thread)
@@ -660,12 +674,65 @@ class ServedJudgments(unittest.TestCase):
                 return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
             with (
+                patch.object(clients, "selected_protocol", return_value=5),
                 patch.object(sa, "codex_dir", return_value=self.work),
                 patch.object(sa, "claude_dir", return_value=self.work),
                 patch.object(sa, "run_process", side_effect=model),
             ):
                 self.assertEqual(sa.inspect(self.batch, provider, attempt), sa.bind_verdict(value, self.batch))
-            self.assertEqual(sa.attempt_protocol(attempt), 4)
+            self.assertEqual(sa.attempt_protocol(attempt), 5)
+
+    def test_protocol_five_luna_continues_its_session_and_inert_helper_calls_do_not_block_a_pass(self):
+        (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture"}}')
+        attempt = self.work / "attempt-five"
+        attempt.mkdir()
+        launches = []
+
+        def model(argv, **kwargs):
+            launches.append(list(argv))
+            catalog = json.loads((kwargs["cwd"] / "model-catalog.json").read_text())
+            tools = catalog["models"][0]["model_messages"]["tools"]["mcp_resources"]
+            self.assertEqual(
+                {k: v["description"] for k, v in tools.items()}, dict.fromkeys(sa.INERT_TOOLS, sa.INERT_DESCRIPTION)
+            )
+            self.assertEqual(argv[argv.index("goals") - 1], "--disable")  # No goal tools in protocol 5.
+            self.assertNotIn("--enable", argv)
+            args = json.loads(next(v.split("=", 1)[1] for v in argv if v.startswith("mcp_servers.audit.args=")))
+            r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
+            first = len(launches) == 1
+            pages = [0] if first else range(1, len(r.pages))
+            for page in pages:
+                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            append_native_reads(kwargs["cwd"], pages, self.thread, self.batch)
+            sessions = kwargs["cwd"] / ".codex/sessions"
+            with next(sessions.glob("*.jsonl")).open("a") as native:
+                stray = {
+                    "type": "response_item",
+                    "payload": {"type": "function_call", "name": "read_mcp_resource", "arguments": "{}"},
+                }
+                native.write(sa.serialize(stray) + "\n")
+            value = {"verdict": "unfinished" if first else "pass", "findings": []}
+            historical.append_native(kwargs["cwd"], value, self.thread)
+            events = [
+                {"type": "thread.started", "thread_id": self.thread},
+                *read_events("codex", pages),
+                {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(value)}},
+                {"type": "turn.completed"},
+            ]
+            return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
+
+        with (
+            patch.object(clients, "selected_protocol", return_value=5),
+            patch.object(sa, "codex_dir", return_value=self.work),
+            patch.object(sa, "run_process", side_effect=model),
+        ):
+            self.assertEqual(
+                sa.inspect(self.batch, "codex", attempt),
+                sa.bind_verdict({"verdict": "pass", "findings": []}, self.batch),
+            )
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(launches[1][-3:], ["resume", self.thread, "-"])
+        self.assertEqual(json.loads((attempt / "execution.json").read_text())["protocol_version"], 5)
 
     def test_three_turns_then_restart_preserve_original_inspection_and_judgment(self):
         (self.work / "auth.json").write_text('{"tokens":{"access_token":"fixture","refresh_token":"fixture"}}')
@@ -732,14 +799,14 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
             return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
             patch.object(sa, "run_process", side_effect=model),
         ):
@@ -774,14 +841,14 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
             return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
             patch.object(sa, "claude_dir", return_value=self.work / "no-subscription"),
             patch.object(sa, "run_process", side_effect=model),
@@ -813,14 +880,14 @@ class ServedJudgments(unittest.TestCase):
             config = json.loads(argv[argv.index("--mcp-config") + 1])
             args = config["mcpServers"]["audit"]["args"]
             r = ar.Reader(json.loads(Path(args[2]).read_text()), Path(args[3]))
-            for page in range(len(r.pages)):
-                r.request("tools/call", {"name": ar.TOOL, "arguments": {"page": page}})
+            read_all(r, kwargs["env"])
             events = read_events("claude", range(len(r.pages))) + [
                 {"type": "result", "subtype": "success", "structured_output": value}
             ]
             return SimpleNamespace(returncode=0, stdout="\n".join(map(sa.serialize, events)), stderr="")
 
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: str(key_file)}),
             patch.object(sa, "claude_dir", return_value=self.work),
             patch.object(sa, "run_process", side_effect=model),
@@ -832,6 +899,7 @@ class ServedJudgments(unittest.TestCase):
                 self.assertEqual(verdict, sa.bind_verdict(value, self.batch))
         self.assertEqual(seen, [(None, True), ("sk-ant-fixture-secret", False)])
         with (
+            patch.object(clients, "selected_protocol", return_value=5),
             patch.dict(sa.os.environ, {sa.API_KEY_FILE_ENV: ""}),
             patch.object(sa, "run_process", side_effect=model),
             self.assertRaises(Die),
@@ -938,41 +1006,60 @@ class ServedJudgments(unittest.TestCase):
 class FreshRun(unittest.TestCase):
     setUp = historical.Run.setUp
 
-    def test_verified_client_selects_protocol_four_and_records_matching_policy(self):
+    def test_fresh_runs_use_protocol_five_and_record_its_policy(self):
+        for provider, launcher_goals in (("codex", False), ("claude", False)):
+            self.opts.work_model = provider
+            with (
+                patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
+                patch.object(sa, "advance", return_value=self.target),
+            ):
+                self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
+            self.assertEqual(model.call_args.kwargs, {})
+            rows = list(map(json.loads, (self.state / sa.CURSOR / "ledger.jsonl").read_text().splitlines()))
+            row = [r for r in rows if "verdict" in r][-1]
+            self.assertEqual(row["protocol_version"], 5)
+            self.assertEqual(row["reader_digest"], sa.inspection_profile(5)["reader_digest"])
+            self.assertEqual(row["prompt_digest"], hashlib.sha256(sa.JUDGMENT_PROMPT.encode()).hexdigest())
+            self.assertEqual(
+                "goals" in " ".join(row["launcher_profile"]) and "--enable" in row["launcher_profile"], launcher_goals
+            )
+
+
+class StoppedRound(unittest.TestCase):
+    setUp = historical.Run.setUp
+
+    def stopped(self, outputs):
+        work = self.state / sa.CURSOR
+        attempt = work / "attempt-1"
+        attempt.mkdir(parents=True)
+        batch = {"from_sha": self.old, "main_sha": self.old, "commits": [{"sha": self.target, "files": []}]}
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        uses = [{"type": "tool_use", "name": "StructuredOutput", "input": value} for value in outputs]
+        (attempt / "model-transcript.jsonl").write_text(
+            "".join(sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n" for use in uses)
+        )
+        (work / "running.json").write_text(sa.serialize({"attempt": str(attempt)}))
+        return work
+
+    def test_a_finding_in_a_stopped_round_binds_before_any_new_inspection(self):
+        work = self.stopped([{"verdict": "finding", "findings": ["IO"]}])
+        with patch.object(sa, "inspect") as model, self.assertRaises(NoProgress):
+            sa.run(SimpleNamespace(state=self.state), self.opts)
+        model.assert_not_called()
+        blocked = json.loads((work / "blocked.json").read_text())
+        self.assertEqual((blocked["outcome"], blocked["verdict"]["findings"]), ("finding", ["IO"]))
+        self.assertFalse((work / "running.json").exists())
+
+    def test_a_stopped_round_without_a_judgment_is_inspected_afresh(self):
+        work = self.stopped([{"verdict": "unfinished", "findings": []}])
         with (
-            patch.object(clients, "selected_protocol", return_value=4),
             patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
             patch.object(sa, "advance", return_value=self.target),
         ):
             self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
-        self.assertEqual(model.call_args.kwargs, {"protocol": 4})
-        rows = list(map(json.loads, (self.state / sa.CURSOR / "ledger.jsonl").read_text().splitlines()))
-        row = next(r for r in rows if "verdict" in r)
-        self.assertEqual(row["protocol_version"], 4)
-        self.assertEqual(row["reader_digest"], sa.inspection_profile(4)["reader_digest"])
-        self.assertEqual(row["prompt_digest"], hashlib.sha256(sa.SERVED_MODEL_PROMPT.encode()).hexdigest())
-
-    def test_fresh_claude_ledger_identifies_the_executed_prompt(self):
-        self.opts.work_model = "claude"
-        with (
-            patch.object(clients, "selected_protocol", return_value=4),
-            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}),
-            patch.object(sa, "advance", return_value=self.target),
-        ):
-            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
-        rows = list(map(json.loads, (self.state / sa.CURSOR / "ledger.jsonl").read_text().splitlines()))
-        row = next(r for r in rows if "verdict" in r)
-        self.assertEqual(row["prompt_digest"], hashlib.sha256(sa.SERVED_CLAUDE_PROMPT.encode()).hexdigest())
-
-    def test_protocol_selection_is_passed_once_even_if_verification_changes(self):
-        with (
-            patch.object(clients, "selected_protocol", side_effect=[3, 4]) as selected,
-            patch.object(sa, "inspect", return_value={"verdict": "pass", "findings": []}) as model,
-            patch.object(sa, "advance", return_value=self.target),
-        ):
-            self.assertEqual(sa.run(SimpleNamespace(state=self.state), self.opts), 0)
-        selected.assert_called_once()
-        self.assertEqual(model.call_args.kwargs, {"protocol": 3})
+        model.assert_called_once()
+        self.assertFalse((work / "running.json").exists())
 
 
 class ClientCompatibility(unittest.TestCase):
@@ -992,20 +1079,20 @@ class ClientCompatibility(unittest.TestCase):
             ):
                 clients.fingerprint("claude")
 
-    def test_missing_stale_and_changed_clients_use_token_protocol(self):
+    def test_missing_stale_and_changed_clients_are_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
             expected = {"client": "one"}
             with patch.object(clients, "fingerprint", return_value=expected):
-                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), None)
                 p = state / clients.RECORD
-                p.write_text(sa.serialize({"codex": {"protocol_version": 4, "fingerprint": expected, "intact": True}}))
-                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 4)
+                p.write_text(sa.serialize({"codex": {"protocol_version": 5, "fingerprint": expected, "intact": True}}))
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 5)
                 with patch.object(clients, "fingerprint", return_value={"client": "two"}):
-                    self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
-                self.assertEqual(clients.selected_protocol("claude", state, verify=False), 3)
+                    self.assertEqual(clients.selected_protocol("codex", state, verify=False), None)
+                self.assertEqual(clients.selected_protocol("claude", state, verify=False), None)
                 p.chmod(0o666)
-                self.assertEqual(clients.selected_protocol("codex", state, verify=False), 3)
+                self.assertEqual(clients.selected_protocol("codex", state, verify=False), None)
 
     def test_missing_and_changed_verification_refresh_automatically(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1014,18 +1101,18 @@ class ClientCompatibility(unittest.TestCase):
 
             def verify(provider, state):
                 (state / clients.RECORD).write_text(
-                    sa.serialize({provider: {"protocol_version": 4, "fingerprint": dict(current), "intact": True}})
+                    sa.serialize({provider: {"protocol_version": 5, "fingerprint": dict(current), "intact": True}})
                 )
 
             with (
                 patch.object(clients, "fingerprint", side_effect=lambda _: dict(current)),
                 patch.object(check, "verify", side_effect=verify) as probe,
             ):
-                self.assertEqual(clients.selected_protocol("codex", state), 4)
-                self.assertEqual(clients.selected_protocol("codex", state), 4)
+                self.assertEqual(clients.selected_protocol("codex", state), 5)
+                self.assertEqual(clients.selected_protocol("codex", state), 5)
                 self.assertEqual(probe.call_count, 1)
                 current["client"] = "two"
-                self.assertEqual(clients.selected_protocol("codex", state), 4)
+                self.assertEqual(clients.selected_protocol("codex", state), 5)
                 self.assertEqual(probe.call_count, 2)
 
     def test_concurrent_selection_runs_only_one_probe(self):
@@ -1037,7 +1124,7 @@ class ClientCompatibility(unittest.TestCase):
                 from tauceti_worker.audit_alerts import save
 
                 save(
-                    state / clients.RECORD, {provider: {"protocol_version": 4, "fingerprint": expected, "intact": True}}
+                    state / clients.RECORD, {provider: {"protocol_version": 5, "fingerprint": expected, "intact": True}}
                 )
 
             with (
@@ -1046,7 +1133,7 @@ class ClientCompatibility(unittest.TestCase):
             ):
                 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
                     self.assertEqual(
-                        list(pool.map(lambda _: clients.selected_protocol("codex", state), range(8))), [4] * 8
+                        list(pool.map(lambda _: clients.selected_protocol("codex", state), range(8))), [5] * 8
                     )
                 probe.assert_called_once()
 
@@ -1058,14 +1145,14 @@ class ClientCompatibility(unittest.TestCase):
                 patch.object(check, "verify", side_effect=RuntimeError("unexpected client format")) as probe,
                 patch.object(clients.time, "time", return_value=1000) as now,
             ):
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(clients.selected_protocol("codex", state), None)
+                self.assertEqual(clients.selected_protocol("codex", state), None)
                 self.assertEqual(probe.call_count, 1)
                 now.return_value = 1301
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(clients.selected_protocol("codex", state), None)
                 self.assertEqual(probe.call_count, 2)
                 fingerprint.return_value = {"client": "two"}
-                self.assertEqual(clients.selected_protocol("codex", state), 3)
+                self.assertEqual(clients.selected_protocol("codex", state), None)
                 self.assertEqual(probe.call_count, 3)
 
     def test_capture_rejects_missing_or_truncated_middle_even_if_tail_survives(self):

@@ -48,7 +48,7 @@ INLINE_POLICY = (
 
 def coverage(batch: dict, receipt: Path, *, protocol: int = 3) -> dict:
     """Validate the owned receipt; absence means no source has been delivered yet."""
-    if protocol == 4:
+    if protocol >= 4:
         from .audit_reader import Reader
 
         proof = Reader(batch, receipt).coverage()

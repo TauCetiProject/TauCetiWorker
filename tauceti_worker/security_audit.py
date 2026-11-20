@@ -26,7 +26,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
-from .audit_evidence import FINDING, PASS, UNREADABLE, NotJudged, Unreadable, classify, outcome_of
+from .audit_evidence import FINDING, NOT_JUDGED, PASS, UNREADABLE, NotJudged, Unreadable, classify, outcome_of
 from .audit_progress import (
     GOAL_REQUEST,
     INLINE_CONTINUE_PROMPT,
@@ -187,13 +187,75 @@ SERVED_CODEX_CATALOG["models"][0]["model_messages"]["instructions_template"] = (
     SERVED_MODEL_PROMPT + SERVED_COMPACTION_POLICY + SERVED_GOAL_REQUEST
 )
 
+# Judgment protocol 5: the only protocol for new inspections. The verdict is pass, finding or
+# unfinished; genuine uncertainty is a finding, and a range with no judgment is never bound.
+PROTOCOL = 5
+JUDGMENT_PROMPT = (
+    PROMPT.split("If a construct's origin or its use is genuinely uncertain")[0]
+    + """A concern about the code, or genuine uncertainty about whether a construct is safe or
+where it comes from, is a finding: a concern for human review, not necessarily a
+demonstrated vulnerability. Be conservative about suspicious indirection: if supplied
+context cannot establish safety, return finding, never guess pass. Do not judge proof
+correctness, readability or mathematical scope.
+Return ONLY JSON with verdict and findings. The Worker binds your answer to this
+immutable inspection; do not return commit SHAs, an input digest or another batch
+identifier. The verdict is exactly one of:
+- pass: you inspected the ENTIRE batch and have no finding; findings is [].
+- finding: at least one concern, even if parts remain unread. Each finding names the
+  numbered commit, path and line, and explains the concern. Findings always stay binding.
+- unfinished: you have not finished and have no finding; findings is []. Unread pages,
+  lost context or running out of time are never findings: the Worker continues the
+  inspection or divides it into smaller complete inspections.
+Never hide a concern in an unfinished answer, and never start independent partial audits.
+"""
+)
+JUDGMENT_COMPACTION = """Native compaction continues this SAME inspection session. Preserve per-commit notes,
+progress, ALL findings and unresolved questions across compaction, and reread pages when
+the retained notes are insufficient. Compaction is never a reason to discard a finding.
+"""
+JUDGMENT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["verdict", "findings"],
+    "properties": {
+        "verdict": {"type": "string", "enum": ["pass", "finding", "unfinished"]},
+        "findings": {"type": "array", "items": {"type": "string"}},
+    },
+}
+JUDGMENT_PAGES = """
+The complete bundle is available through audit.read_page (Claude: mcp__audit__read_page).
+Read ALL numbered pages in this ONE inspection session. Call read_page with only page
+(an integer). Request next_unserved_page; earlier pages may be reread, later unserved
+pages cannot be skipped. The Worker tracks served coverage, which does not establish
+understanding or source safety. No other tools, commands, files, URLs or agents are
+available, and the MCP resource helpers serve nothing.
+Manifest:
+"""
+JUDGMENT_INLINE = """
+The ENTIRE bundle is included inline below. There are no pages and no tools.
+"""
+# Codex registers its MCP resource helpers whenever any MCP server is configured, and nothing
+# turns them off. Their descriptions say they are unavailable; calls to them are inert.
+INERT_TOOLS = ("list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource")
+INERT_DESCRIPTION = (
+    "Unavailable in this inspection: there are no MCP resources. Never call this tool. "
+    "Read the prepared input only with audit.read_page."
+)
+JUDGMENT_CATALOG = copy.deepcopy(CODEX_CATALOG)
+JUDGMENT_CATALOG["models"][0]["model_messages"] = {
+    "instructions_template": JUDGMENT_PROMPT
+    + JUDGMENT_COMPACTION
+    + "\nThe only tool is audit.read_page, which reads the prepared input.",
+    "tools": {"mcp_resources": {name: {"description": INERT_DESCRIPTION} for name in INERT_TOOLS}},
+}
+
 
 def reader_path(protocol=3):
-    return Path(__file__).with_name("audit_reader.py" if protocol == 4 else "audit_reader_v3.py").resolve()
+    return Path(__file__).with_name("audit_reader.py" if protocol >= 4 else "audit_reader_v3.py").resolve()
 
 
 def reader_pages(batch, protocol=3):
-    if protocol == 4:
+    if protocol >= 4:
         from .audit_reader import pages as served_pages
 
         return served_pages(batch)
@@ -205,7 +267,7 @@ def attempt_protocol(work):
 
 
 def inspection_catalog(protocol=3):
-    return SERVED_CODEX_CATALOG if protocol == 4 else CODEX_CATALOG
+    return {5: JUDGMENT_CATALOG, 4: SERVED_CODEX_CATALOG}.get(protocol, CODEX_CATALOG)
 
 
 def api(path: str, *, method: str = "GET", body=None):
@@ -523,13 +585,16 @@ def reviewer_argv(provider: str, *, goals: bool = True, protocol: int = 3) -> li
             "--setting-sources",
             "",
             "--disable-slash-commands",
-            # Protocol 4 keeps the isolated session so a stopped inspection can
-            # continue in it; the Worker retains it under the attempt directory.
-            *(["--no-session-persistence"] if protocol != 4 else []),
+            # From protocol 4 the isolated session is kept so the inspection can continue
+            # in it; the Worker retains it under the attempt directory.
+            *(["--no-session-persistence"] if protocol < 4 else []),
             "--permission-mode",
             "dontAsk",
             "--append-system-prompt",
-            SERVED_CLAUDE_PROMPT + SERVED_COMPACTION_POLICY if protocol == 4 else MODEL_PROMPT + COMPACTION_POLICY,
+            {
+                5: JUDGMENT_PROMPT + JUDGMENT_COMPACTION,
+                4: SERVED_CLAUDE_PROMPT + SERVED_COMPACTION_POLICY,
+            }.get(protocol, MODEL_PROMPT + COMPACTION_POLICY),
         ]
     if provider == "codex":
         cmd = [
@@ -1085,6 +1150,8 @@ def claude_saved_read_pages(work: Path, expected_pages: list[list[dict]]) -> set
 
 
 def verdict_schema(provider: str, paged: bool, protocol: int) -> dict:
+    if protocol == PROTOCOL:
+        return JUDGMENT_SCHEMA
     if not paged:
         return MODEL_SCHEMA
     verdicts = MODEL_SCHEMA["properties"]["verdict"]["enum"]
@@ -1131,7 +1198,7 @@ def claude_launch(
         )
         cmd += ["--allowedTools", "mcp__audit__read_page"]
     cmd += ["--json-schema", serialize(verdict_schema("claude", paged, protocol))]
-    if protocol == 4:
+    if protocol >= 4:
         if session is None or str(uuid.UUID(session)) != session:
             raise Die("security-audit: a retained Haiku session needs a canonical session id")
         cmd += ["--resume" if resume else "--session-id", session]
@@ -1205,8 +1272,11 @@ def reconcile_coverage(work: Path, batch: dict) -> dict:
         if transcript.exists()
         else set()
     )
+    # A read counts only once its result is in the saved session that a continuation resumes.
     if value["provider"] == "codex":
         successful &= saved_read_pages(native_rollouts(work), before_reader.pages)
+    else:
+        successful &= claude_saved_read_pages(work, before_reader.pages)
     receipt = work / "read-receipt.json"
     with receipt.with_suffix(".lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -1776,6 +1846,61 @@ def inspection_prompt(
     return policy + (SERVED_PAGE_PROMPT if protocol == 4 else PAGE_PROMPT) + serialize(manifest)
 
 
+def client_env(home: Path, provider: str, claude_credential: str | None) -> dict:
+    """The isolated client's environment: a temporary HOME holding only a mirrored credential.
+
+    `claude_credential` selects Haiku's billing: "subscription" never uses a configured API key,
+    "api-key" requires one, and None prefers a configured key."""
+    env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "SSL_CERT_FILE", "LANG")}
+    env.update(HOME=str(home), CODEX_HOME=str(home / ".codex"), CLAUDE_CONFIG_DIR=str(home / ".claude"))
+    # Use Haiku's native compaction defaults, without inheriting a disabled
+    # compactor, aggressive thresholds, or claude.ai connectors.
+    env.update(
+        ENABLE_CLAUDEAI_MCP_SERVERS="false",
+        ENABLE_TOOL_SEARCH="false",
+        CLAUDE_CODE_DISABLE_CLAUDE_MDS="1",
+        MAX_MCP_OUTPUT_TOKENS="120000",
+        MAX_STRUCTURED_OUTPUT_RETRIES="1",
+    )
+    source = (
+        codex_dir(Path.home()) / "auth.json" if provider == "codex" else claude_dir(Path.home()) / ".credentials.json"
+    )
+    dest = home / (".codex/auth.json" if provider == "codex" else ".claude/.credentials.json")
+    dest.parent.mkdir(parents=True)
+    api_key = anthropic_api_key() if provider == "claude" and claude_credential != "subscription" else None
+    if provider == "claude" and claude_credential == "api-key" and not api_key:
+        raise Die(f"security-audit: API-key Haiku review requires {API_KEY_FILE_ENV}")
+    if api_key:
+        # API billing, independent of subscription pacing. The key reaches only
+        # the isolated client process; the reviewer has no tool to read it.
+        env["ANTHROPIC_API_KEY"] = api_key
+    elif source.is_file():
+        _mirror_creds_file(
+            source,
+            dest,
+            block_key="tokens" if provider == "codex" else "claudeAiOauth",
+            tok_key="access_token" if provider == "codex" else "accessToken",
+            rt_key="refresh_token" if provider == "codex" else "refreshToken",
+            rt_placeholder=CODEX_RT_PLACEHOLDER if provider == "codex" else None,
+        )
+    elif provider == "claude":
+        from .quota import _claude_keychain_creds
+
+        creds = _claude_keychain_creds()
+        if not creds:
+            raise Die("security-audit: no isolated Claude subscription credential available")
+        creds["claudeAiOauth"].pop("refreshToken", None)
+        dest.write_text(json.dumps(creds))
+        dest.chmod(0o600)
+    else:
+        raise Die("security-audit: no Codex subscription credential available")
+    if not api_key:
+        if not dest.is_file():
+            raise Die("security-audit: no usable subscription access token available")
+        dest.chmod(0o600)
+    return env
+
+
 def inspect(
     batch: dict,
     provider: str,
@@ -1797,6 +1922,11 @@ def inspect(
 
     if claude_credential not in (None, "subscription", "api-key"):
         raise Die("security-audit: unknown Claude credential kind")
+    if resume_from is None and protocol in (None, PROTOCOL):
+        # Every fresh inspection uses judgment protocol 5, or waits for its client to be verified.
+        if selected_protocol(provider, work.parent) != PROTOCOL:
+            raise NoProgress("security-audit: awaiting client delivery verification")
+        return inspect_fresh(batch, provider, work, claude_credential=claude_credential)
 
     if resume_from is not None:
         retained_protocol = attempt_protocol(resume_from)
@@ -1838,58 +1968,9 @@ def inspect(
     paged = len(serialize(batch).encode()) > INLINE_BYTES
     with tempfile.TemporaryDirectory(prefix="tauceti-security-review-") as tmp:
         home = Path(tmp)
-        env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "SSL_CERT_FILE", "LANG")}
-        env.update(HOME=str(home), CODEX_HOME=str(home / ".codex"), CLAUDE_CONFIG_DIR=str(home / ".claude"))
+        env = client_env(home, provider, claude_credential)
         if provider == "codex":
-            state = prepare_goal_state(work, batch, resume_from)
-            env["CODEX_SQLITE_HOME"] = str(state)
-        # Use Haiku's native compaction defaults, without inheriting a disabled
-        # compactor, aggressive thresholds, or claude.ai connectors.
-        env.update(
-            ENABLE_CLAUDEAI_MCP_SERVERS="false",
-            ENABLE_TOOL_SEARCH="false",
-            CLAUDE_CODE_DISABLE_CLAUDE_MDS="1",
-            MAX_MCP_OUTPUT_TOKENS="120000",
-            MAX_STRUCTURED_OUTPUT_RETRIES="1",
-        )
-        source = (
-            codex_dir(Path.home()) / "auth.json"
-            if provider == "codex"
-            else claude_dir(Path.home()) / ".credentials.json"
-        )
-        dest = home / (".codex/auth.json" if provider == "codex" else ".claude/.credentials.json")
-        dest.parent.mkdir(parents=True)
-        api_key = anthropic_api_key() if provider == "claude" and claude_credential != "subscription" else None
-        if provider == "claude" and claude_credential == "api-key" and not api_key:
-            raise Die(f"security-audit: API-key Haiku review requires {API_KEY_FILE_ENV}")
-        if api_key:
-            # API billing, independent of subscription pacing. The key reaches only
-            # the isolated client process; the reviewer has no tool to read it.
-            env["ANTHROPIC_API_KEY"] = api_key
-        elif source.is_file():
-            _mirror_creds_file(
-                source,
-                dest,
-                block_key="tokens" if provider == "codex" else "claudeAiOauth",
-                tok_key="access_token" if provider == "codex" else "accessToken",
-                rt_key="refresh_token" if provider == "codex" else "refreshToken",
-                rt_placeholder=CODEX_RT_PLACEHOLDER if provider == "codex" else None,
-            )
-        elif provider == "claude":
-            from .quota import _claude_keychain_creds
-
-            creds = _claude_keychain_creds()
-            if not creds:
-                raise Die("security-audit: no isolated Claude subscription credential available")
-            creds["claudeAiOauth"].pop("refreshToken", None)
-            dest.write_text(json.dumps(creds))
-            dest.chmod(0o600)
-        else:
-            raise Die("security-audit: no Codex subscription credential available")
-        if not api_key:
-            if not dest.is_file():
-                raise Die("security-audit: no usable subscription access token available")
-            dest.chmod(0o600)
+            env["CODEX_SQLITE_HOME"] = str(prepare_goal_state(work, batch, resume_from))
         policy = (
             (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
             if protocol == 4
@@ -1986,6 +2067,143 @@ def inspect(
     return judged(work, batch, failure)
 
 
+MAX_CHARGED_LAUNCHES = 3
+
+
+def judgment_prompt(batch: dict, paged: bool) -> str:
+    """The complete protocol-5 instruction: policy, trusted baseline names, then input or manifest."""
+    policy = JUDGMENT_PROMPT + trusted_names_text()
+    if not paged:
+        return policy + JUDGMENT_INLINE + serialize(batch)
+    manifest = {
+        "input_digest": batch["input_digest"],
+        "pages": len(reader_pages(batch, PROTOCOL)),
+        "commits": [
+            {"sha": c["sha"], "parent": c["parent"], "files": [f["path"] for f in c["files"]]} for c in batch["commits"]
+        ],
+    }
+    return policy + JUDGMENT_PAGES + serialize(manifest)
+
+
+def judgment_continuation(batch: dict, receipt: Path, paged: bool) -> str:
+    """Why the same inspection continues: it has not returned a judgment for the entire batch."""
+    status = "The whole bundle is inline above. "
+    if paged:
+        from .audit_reader import Reader
+
+        proof = Reader(batch, receipt).coverage()
+        remaining = proof["pages"] - len(proof["served"])
+        status = (
+            f"{remaining} pages remain unserved; next_unserved_page={len(proof['served'])}. "
+            if remaining
+            else "Every page was served; finish the judgment. "
+        )
+    return (
+        "The Worker has not received a judgment for the entire batch. "
+        + status
+        + "Continue this SAME inspection, keeping every finding and note, and reread pages when needed. "
+        "Served coverage does not establish safety.\n"
+    )
+
+
+def inspect_fresh(batch: dict, provider: str, work: Path, *, claude_credential: str | None = None) -> dict:
+    """One fresh protocol-5 inspection of one exact batch, judged by the shared classification.
+
+    While the attempt is not a judgment, it continues in its own session within one budget:
+    at most three charged launches, where a launch that served new pages is not charged. A
+    timeout, or a launch that left no session to continue, ends it. `judged` then returns a
+    pass or every recorded concern, or raises NotJudged or Unreadable."""
+    from .audit_reader import Reader
+
+    paged = len(serialize(batch).encode()) > INLINE_BYTES
+    receipt = (work / "read-receipt.json").resolve()
+    failure = None
+    with tempfile.TemporaryDirectory(prefix="tauceti-security-review-") as tmp:
+        home = Path(tmp)
+        env = client_env(home, provider, claude_credential)
+        (home / "input.json").write_text(serialize(batch))
+        if provider == "codex":
+            (work / "native-sessions").mkdir(exist_ok=True)
+            (home / ".codex/sessions").symlink_to((work / "native-sessions").resolve(), target_is_directory=True)
+            (home / "verdict-schema.json").write_text(serialize(JUDGMENT_SCHEMA))
+            (home / "model-catalog.json").write_text(serialize(JUDGMENT_CATALOG))
+            cmd = codex_launch(home, paged, "", None, receipt, goals=False, protocol=PROTOCOL)
+        else:
+            # The client writes its session straight into the attempt, as Codex writes its rollout.
+            (work / CLAUDE_SESSIONS).mkdir(exist_ok=True)
+            (home / ".claude/projects").symlink_to((work / CLAUDE_SESSIONS).resolve(), target_is_directory=True)
+            cmd = claude_launch(home, paged, receipt, protocol=PROTOCOL, session=str(uuid.uuid4()))
+        base = judgment_prompt(batch, paged)
+        prompt, charged = base, 0
+        for number in range(MAX_INVOCATION_LAUNCHES):
+            if number:
+                # Keep the previous launch's own output: the classification reads every archived
+                # transcript. Only what that launch alone wrote moves, so evidence grows with the
+                # reviewer's output, never with copies of the shared session or input.
+                archive = work / f"launch-{number}"
+                archive.mkdir()
+                for name in ("model-transcript.jsonl", "model-stderr.txt", "execution.json", "prompt.txt"):
+                    if (work / name).exists():
+                        (work / name).rename(archive / name)
+            before = Reader(batch, receipt).coverage() if paged else None
+            if paged:
+                save(work / "coverage-launch.json", {"before": before, "provider": provider})
+            (work / "model-transcript.jsonl").write_text("")
+            (work / "prompt.txt").write_text(prompt)
+            (work / "execution.json").write_text(
+                serialize(
+                    {
+                        "argv": cmd,
+                        # Never persist a provider API key in retained evidence.
+                        "environment": {
+                            k: ("<anthropic-api-key-file>" if k == "ANTHROPIC_API_KEY" else v) for k, v in env.items()
+                        },
+                        "paged": paged,
+                        "protocol_version": PROTOCOL,
+                        "batch_identity": {
+                            "input_digest": batch["input_digest"],
+                            "commits": [c["sha"] for c in batch["commits"]],
+                        },
+                        "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
+                        **inspection_profile(PROTOCOL),
+                        "trusted_names_digest": trusted_names_digest(),
+                    }
+                )
+            )
+            try:
+                result = run_process(cmd, input=prompt, cwd=home, env=env, text=True, capture_output=True, timeout=1800)
+            except subprocess.TimeoutExpired as exc:
+                output = exc.stdout or b""
+                (work / "model-transcript.jsonl").write_bytes(output if isinstance(output, bytes) else output.encode())
+                failure = exc
+            else:
+                (work / "model-transcript.jsonl").write_text(result.stdout)
+                (work / "model-stderr.txt").write_text(result.stderr)
+                failure = f"{provider} failed; see {work / 'model-stderr.txt'}" if result.returncode else None
+            finally:
+                if paged:
+                    reconcile_coverage(work, batch)
+            if isinstance(failure, subprocess.TimeoutExpired):
+                break
+            if classify(work.parent, work, batch, failure).kind != NOT_JUDGED:
+                break
+            grew = paged and len(Reader(batch, receipt).coverage()["served"]) > len(before["served"])
+            charged += 0 if grew else 1
+            if charged == MAX_CHARGED_LAUNCHES:
+                break
+            try:
+                thread = retained_thread(work) if provider == "codex" else claude_thread(work)
+            except Die:
+                break  # Nothing was retained to continue.
+            if provider == "codex":
+                cmd = codex_launch(home, paged, "", thread, receipt, goals=False, protocol=PROTOCOL)
+            else:
+                cmd = claude_launch(home, paged, receipt, protocol=PROTOCOL, session=thread, resume=True)
+            prompt = judgment_continuation(batch, receipt, paged) + base
+            log(f"security-audit: no judgment yet; launch {number + 2} continues the same session ({charged} charged)")
+    return judged(work, batch, failure)
+
+
 def judged(work: Path, batch: dict, failure=None) -> dict:
     """Return a binding verdict (pass, or every recorded concern); raise otherwise.
 
@@ -2007,7 +2225,7 @@ def validate_reads(
     """A model's pass cannot substitute for delivering the entire prepared input."""
     if not paged or verdict["verdict"] != "pass":
         return
-    if protocol == 4:
+    if protocol >= 4:
         from .audit_progress import coverage
 
         if coverage(batch, receipt, protocol=protocol)["missing"]:
@@ -2094,13 +2312,15 @@ def review_record(
         "batch": batch["input_digest"],
         "prompt_digest": hashlib.sha256(
             (
-                (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
+                JUDGMENT_PROMPT
+                if protocol == PROTOCOL
+                else (SERVED_MODEL_PROMPT if provider == "codex" else SERVED_CLAUDE_PROMPT)
                 if protocol == 4
                 else MODEL_PROMPT
             ).encode()
         ).hexdigest(),
         "protocol_version": protocol,
-        "launcher_profile": reviewer_argv(provider, protocol=protocol),
+        "launcher_profile": reviewer_argv(provider, goals=protocol < PROTOCOL, protocol=protocol),
         "execution_record": str(attempt / "execution.json"),
         "catalog_digest": hashlib.sha256(serialize(inspection_catalog(protocol)).encode()).hexdigest()
         if provider == "codex"
@@ -2181,6 +2401,47 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         )
         else None
     )
+    running = work / "running.json"
+    if running.exists() and not opts.dry_run:
+        # A round stopped mid-inspection: classify what its attempt recorded before anything else.
+        attempt = Path(json.loads(running.read_text())["attempt"])
+        stopped = json.loads((attempt / "input.json").read_text())
+        verdict = None
+        try:
+            verdict = judged(attempt, stopped, "security-audit: interrupted when the Worker stopped")
+        except NotJudged:
+            pass  # Nothing binds: this round inspects afresh.
+        except Unreadable as exc:
+            failure = {"from_sha": stopped["from_sha"], "to_sha": stopped["commits"][-1]["sha"], "reason": str(exc)}
+            failure.update(outcome_of(None, exc), attempt=str(attempt), batch=stopped["input_digest"])
+            failure["commits"] = [c["sha"] for c in stopped["commits"]]
+            blocked.write_text(serialize(failure))
+            record(work / "ledger.jsonl", failure)
+            notify_block(work, failure)
+        if verdict is not None:
+            record(
+                work / "ledger.jsonl",
+                review_record(
+                    admin_login(),
+                    opts.work_model,
+                    PROTOCOL,
+                    stopped,
+                    attempt,
+                    verdict,
+                    credential_kind(opts.work_model),
+                ),
+            )
+            failure = {
+                "from_sha": stopped["from_sha"],
+                "to_sha": stopped["commits"][-1]["sha"],
+                "attempt": str(attempt),
+            }
+            failure.update(outcome_of(verdict, None), reason="security-audit: " + "; ".join(verdict["findings"]))
+            blocked.write_text(serialize(failure))
+            record(work / "ledger.jsonl", failure)
+            notify_block(work, failure)
+        running.unlink()
+        previous = json.loads(blocked.read_text()) if blocked.exists() else {}
     if not opts.dry_run and previous.get("from_sha") == cursor and not size_failure:
         notify_block(work, previous)
         if recover(cfg, opts, previous):
@@ -2223,15 +2484,14 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
     (attempt / "input.json").write_text(serialize(batch))
     actor = admin_login()  # Resolve identity before a model verdict can exist.
     provider = opts.work_model
-    from .audit_clients import selected_protocol
-
-    protocol = selected_protocol(provider, work)
+    protocol = PROTOCOL
     model = reviewer_model(provider)
     log(f"security-audit: isolated reviewer {provider}/{model}, protocol {protocol}")
     verdict = None
+    save(running, {"attempt": str(attempt)})  # Until classified, a stopped round's attempt is settled next.
     try:
         if any(c["files"] for c in batch["commits"]):
-            verdict = inspect(batch, provider, attempt, protocol=protocol)
+            verdict = inspect(batch, provider, attempt)
         else:
             verdict = {
                 "input_digest": batch["input_digest"],
@@ -2243,6 +2503,7 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
             work / "ledger.jsonl",
             review_record(actor, provider, protocol, batch, attempt, verdict, credential_kind(provider)),
         )
+        running.unlink(missing_ok=True)
         if verdict["verdict"] != "pass":
             raise Die("security-audit: " + "; ".join(verdict["findings"]))
         landed = advance(repo, batch)
@@ -2259,8 +2520,14 @@ def run(cfg, opts, *, min_commits: int = 1) -> int:
         )
         if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
             failure["failure_kind"] = "provider-timeout"
+        if isinstance(exc, NotJudged):
+            # Not a judgment: nothing binds, and the next round inspects this range afresh.
+            record(work / "ledger.jsonl", failure)
+            running.unlink(missing_ok=True)
+            raise NoProgress(f"security-audit: no judgment yet ({exc}); the next round inspects afresh") from exc
         blocked.write_text(serialize(failure))
         record(work / "ledger.jsonl", failure)
+        running.unlink(missing_ok=True)  # Only once the classification is persisted.
         notify_block(work, failure)
         raise Die(f"security-audit: stopped without approval; see {blocked}: {exc}") from exc
 
