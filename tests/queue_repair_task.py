@@ -7231,6 +7231,44 @@ class NumprojImports(NumprojBase):
         self.assertNotIn("<<<<<<<", seen["P"])
         self.assertIn("x.snd * 2", seen["P"], "the clean prefix's version")
 
+    def test_every_conflicting_file_is_built_at_the_clean_prefix(self):
+        """A conflicting file the tool does not rewrite (no numeric projection) is swapped too: a module
+        the build needs may import it."""
+        repo = self.root / "swap"
+        repo.mkdir()
+        sh(repo, "init", "--quiet")
+        sh(repo, "config", "user.name", "T")
+        sh(repo, "config", "user.email", "t@example.invalid")
+        prefix = commit(
+            repo, "prefix", {"TauCeti/A.lean": "import TauCeti.Q\n", "TauCeti/Q.lean": "-- clean\n", "P.lean": "-- p\n"}
+        )
+        (repo / "TauCeti/Q.lean").write_text("<<<<<<< ours\n=======\n>>>>>>> theirs\n")
+        seen = {}
+
+        def run_logged(argv, cwd, log, env=None, timeout=None):
+            seen["Q"] = (Path(cwd) / "TauCeti/Q.lean").read_text()
+            return {"rc": 0}
+
+        with (
+            patch.object(repair, "run_logged", run_logged),
+            patch.object(repair, "apply_conflict", lambda *a: None),
+            patch.object(repair_numproj.repair_sandbox, "sandboxed_lake", lambda argv, *a, **k: argv),
+        ):
+            built = repair_numproj._build_imports(
+                repo,
+                prefix,
+                prefix,
+                {"P.lean": (b"", b"import TauCeti.A\n", b"import TauCeti.A\n")},
+                ["P.lean", "TauCeti/Q.lean"],
+                {},
+                self.root / "imports.log",
+                60,
+                ("lake",),
+                None,
+            )
+        self.assertTrue(built)
+        self.assertEqual(seen["Q"], "-- clean\n")
+
 
 class NumprojPrepass(NumprojBase):
     def test_a_projection_only_conflict_is_resolved_without_the_agent(self):

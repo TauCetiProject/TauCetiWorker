@@ -293,7 +293,16 @@ def module_path(module: str) -> str:
 
 
 def _build_imports(
-    worktree: Path, prefix: str, commit: str, sides: dict, env: dict, log: Path, timeout: float, lake, lock
+    worktree: Path,
+    prefix: str,
+    commit: str,
+    sides: dict,
+    paths: list[str],
+    env: dict,
+    log: Path,
+    timeout: float,
+    lake,
+    lock,
 ) -> bool:
     """Build the modules the tool needs to elaborate the files (``imported_modules``), with the clean
     prefix's version of every conflicting file in place of git's markers meanwhile (one of the modules
@@ -307,8 +316,10 @@ def _build_imports(
     argv = repair_sandbox.sandboxed_lake([*lake, "build", *modules], worktree, env)
     with repair_tools.build_lock(worktree, log=lambda *a, **k: None, lock=lock):
         try:
-            for path, (ours, _, _) in sides.items():
-                _write(worktree / path, ours)
+            for path in paths:  # rewritten or not, any of them may be imported
+                clean = _blob(worktree, prefix, path)
+                if clean is not None and (worktree / path).is_file() and not (worktree / path).is_symlink():
+                    _write(worktree / path, clean)
             return repair.run_logged(argv, worktree, log, env=env, timeout=timeout)["rc"] == 0
         finally:
             repair.apply_conflict(worktree, prefix, commit)
@@ -381,7 +392,7 @@ def prepass(
     scratch, directory = None, None
     try:
         log = logdir / f"numproj-{commit[:12]}-imports.log"
-        if not _build_imports(worktree, prefix, commit, sides, env, log, timeout, lake, build_lock):
+        if not _build_imports(worktree, prefix, commit, sides, paths, env, log, timeout, lake, build_lock):
             return None
         cache = _private_dir(worktree / ".lake", SCRATCH, "cache")  # the compiled scanner, per toolchain
         scratch = _private_dir(worktree / ".lake", SCRATCH, f"run-{secrets.token_hex(6)}")
