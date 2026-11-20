@@ -164,6 +164,80 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.intake.run_once()["approved"], 1)
         self.assertEqual(self.controller.store.rows("outbox", {"kind": "comment"}), [])
 
+    def test_an_admin_large_refactor_label_lifts_the_size_caps_at_admission(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", temp, "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            git("init", "--quiet")
+            (repo / "TauCeti").mkdir()
+            (repo / "TauCeti/A.lean").write_text("-- a\n")
+            git("add", "--all")
+            git("commit", "--quiet", "-m", "base")
+            base = git("rev-parse", "HEAD")
+            for index in range(diff_guard.ci_git.REVIEW_FILE_CAP + 1):
+                (repo / "TauCeti" / f"F{index}.lean").write_text(f"-- {index}\n")
+            git("add", "--all")
+            git("commit", "--quiet", "-m", "head")
+            head = git("rev-parse", "HEAD")
+            committed = int(git("show", "-s", "--format=%ct", head))
+            labelled = datetime.fromtimestamp(committed + 60, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            def read(path):
+                if "/events?" in path:
+                    return [
+                        {
+                            "id": 1,
+                            "event": "labeled",
+                            "label": {"name": "large-refactor"},
+                            "actor": {"login": "admin", "id": 7},
+                            "created_at": labelled,
+                        }
+                    ]
+                return {"role_name": "admin", "user": {"id": 7}}
+
+            self.assertIn("too large to review", diff_guard.violations(repo, base, head)[0])
+            self.assertFalse(diff_guard.large_refactor(repo, head, read, REPO, 1, ("self-tested",)))
+            exempt = diff_guard.large_refactor(repo, head, read, REPO, 1, ("self-tested", "large-refactor"))
+            self.assertTrue(exempt)
+            self.assertEqual(diff_guard.violations(repo, base, head, large_refactor=exempt), ())
+
+    def test_repair_reads_the_large_refactor_exemption_from_the_admitted_head(self):
+        from tauceti_queue.controller import Controller
+
+        member = {"accepted_head": "a" * 40}
+        exempt = {"head_sha": "a" * 40, "evidence": json.dumps({"large_refactor": True})}
+        self.assertTrue(Controller._large_refactor_member(member, exempt))
+        self.assertFalse(Controller._large_refactor_member(member, {**exempt, "head_sha": "b" * 40}))
+        self.assertFalse(Controller._large_refactor_member(member, {**exempt, "evidence": "{}"}))
+
+    def test_a_label_change_after_approval_updates_only_the_exemption_evidence(self):
+        from tauceti_queue.store import dumps
+
+        current = {"id": 9, "head_sha": "a" * 40, "evidence": json.dumps({"kind": "admission_policy"})}
+        with mock.patch.object(self.controller.store, "update") as update:
+            self.intake._sync_large_refactor(current, "b" * 40, True)
+            update.assert_not_called()
+            self.intake._sync_large_refactor(current, "a" * 40, False)
+            update.assert_not_called()
+            self.intake._sync_large_refactor(current, "a" * 40, True)
+        update.assert_called_once_with(
+            "inputs", {"id": 9}, evidence=dumps({"kind": "admission_policy", "large_refactor": True})
+        )
+        labelled = {**current, "evidence": json.dumps({"kind": "admission_policy", "large_refactor": True})}
+        with mock.patch.object(self.controller.store, "update") as update:
+            self.intake._sync_large_refactor(labelled, "a" * 40, False)
+        update.assert_called_once_with("inputs", {"id": 9}, evidence=dumps({"kind": "admission_policy"}))
+
     def test_ci_built_heads_rely_on_pr_ci_for_the_diff_guards(self):
         with mock.patch("tauceti_queue.diff_guard.violations") as measure:
             self.ready()

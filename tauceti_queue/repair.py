@@ -481,7 +481,7 @@ def pr_number(source_pr: str) -> int:
     return from_source_pr(source_pr)
 
 
-def review_size_violations(clone: Path, base: str, tip: str) -> list[dict]:
+def review_size_violations(clone: Path, base: str, tip: str, large_refactors=frozenset()) -> list[dict]:
     """The staging member review-size policy on each commit of ``base..tip`` against its parent.
 
     Staging (TauCetiTools ``ci_candidate_workflow.member_size_policy``) measures each member's commit as
@@ -489,7 +489,9 @@ def review_size_violations(clone: Path, base: str, tip: str) -> list[dict]:
     also measures admission (``diff_guard``); so a repair that splits a member's change inside the batch
     counts.
     One ``{pr, commit, parent, violations}`` per commit that fails; an unreadable chain yields nothing
-    (``chain.validate`` reports it) and an unmeasurable diff is left to CI.
+    (``chain.validate`` reports it) and an unmeasurable diff is left to CI. A commit whose
+    ``(pr, accepted_head)`` is in ``large_refactors`` (an admin-labelled large refactor, from the
+    task's members) is measured without the three size caps, as staging measures it.
     """
     try:
         commits = read_chain(clone, base, tip)
@@ -501,7 +503,13 @@ def review_size_violations(clone: Path, base: str, tip: str) -> list[dict]:
             if commit.empty:
                 continue
             try:
-                result = diff_guard.ci_git.pr_guards(reader, commit.parent, commit.sha, scope=False)
+                result = diff_guard.ci_git.pr_guards(
+                    reader,
+                    commit.parent,
+                    commit.sha,
+                    scope=False,
+                    large_refactor=(commit.pr, commit.accepted_head) in large_refactors,
+                )
             except ValueError:
                 continue
             if result["violations"]:
@@ -512,7 +520,14 @@ def review_size_violations(clone: Path, base: str, tip: str) -> list[dict]:
 
 
 def chain_report(
-    clone: Path, base: str, prior_tip: str | None, tip: str, members: list[str], *, prior_base: str | None = None
+    clone: Path,
+    base: str,
+    prior_tip: str | None,
+    tip: str,
+    members: list[str],
+    *,
+    prior_base: str | None = None,
+    large_refactors=frozenset(),
 ) -> dict:
     """The queue's result checks on a proposed chain, as one JSON-ready record.
 
@@ -552,7 +567,7 @@ def chain_report(
             problems.append(f"compare: {error}")
     elif prior_tip == tip:
         record["compare"] = {"ok": True, "unchanged": True}
-    record["review_size"] = review_size_violations(clone, base, tip)
+    record["review_size"] = review_size_violations(clone, base, tip, large_refactors)
     for entry in record["review_size"]:
         member = f"#{entry['pr']}" if entry["pr"] is not None else "a commit"
         problems += [
@@ -1214,6 +1229,8 @@ def member_records(
         }
         if (member or {}).get("no_repair"):
             record["no_repair"] = True
+        if (member or {}).get("large_refactor") and record["accepted_head"] == (member or {}).get("accepted_head"):
+            record["large_refactor"] = True
         if stop is not None:
             record["state"] = (
                 MEMBER_STATES[0] if index < stop else MEMBER_STATES[1] if index == stop else MEMBER_STATES[2]
@@ -1276,7 +1293,7 @@ except ImportError:
     ci_git = None
 
 
-def guards(shas: list) -> dict:
+def guards(shas: list, exempt=frozenset()) -> dict:
     """The staging member review-size policy on each commit against its parent: `{{sha: (parent,
     result)}}`, with no result where it cannot be measured here (the worker measures it again)."""
     measured = {{}}
@@ -1285,7 +1302,9 @@ def guards(shas: list) -> dict:
             for sha in shas:
                 parent = git("rev-parse", f"{{sha}}^").strip()
                 try:
-                    measured[sha] = (parent, ci_git.pr_guards(reader, parent, sha, scope=False))
+                    measured[sha] = (
+                        parent, ci_git.pr_guards(reader, parent, sha, scope=False, large_refactor=sha in exempt)
+                    )
                 except ValueError:
                     measured[sha] = (parent, None)
     except (AttributeError, OSError, subprocess.SubprocessError):
@@ -1297,7 +1316,17 @@ if sys.argv[1:2] == ["--size"]:
     if len(sys.argv) != 3:
         fail("usage: check --size <commit>")
     sha = git("rev-parse", "--verify", f"{{sys.argv[2]}}^{{{{commit}}}}").strip()
-    parent, result = guards([sha]).get(sha, ("", None))
+    # An admin-labelled large refactor (its member record says so) is measured without the size caps.
+    listed = [json.loads(line) for line in (HERE / "members.jsonl").read_text().splitlines() if line.strip()]
+    large = {{
+        (m.get("source_pr") or f"{{REPOSITORY}}#{{m['pr']}}", m["accepted_head"])
+        for m in listed
+        if m.get("large_refactor")
+    }}
+    found = trailers(git("show", "-s", "--format=%B", sha))
+    claimed = (found.get("Source-PR") or [], found.get("Accepted-Head") or [])
+    exempt = {{sha}} if [len(x) for x in claimed] == [1, 1] and (claimed[0][0], claimed[1][0]) in large else set()
+    parent, result = guards([sha], exempt).get(sha, ("", None))
     print(json.dumps({{"commit": sha, "parent": parent, **(result or {{"error": "not measurable"}})}}, indent=1))
     sys.exit(1 if result is None or result["violations"] else 0)
 members = [json.loads(line) for line in (HERE / "members.jsonl").read_text().splitlines() if line.strip()]
@@ -1330,7 +1359,7 @@ for member, sha in zip(members, shas):
     if not message.rstrip().startswith(original.rstrip()):
         fail(f"{{where}}: the original message of {{member['commit'][:12]}} is not a prefix of the new one")
 # Staging's member review-size policy: each member's commit against its parent in this chain.
-measured = guards(shas)
+measured = guards(shas, {{sha for member, sha in zip(members, shas) if member.get("large_refactor")}})
 for member, sha in zip(members, shas):
     parent, result = measured.get(sha, ("", None))
     if result is not None and result["violations"]:
@@ -1883,7 +1912,8 @@ def _review_size_section(check_command: str | None) -> list[str]:
         "member's commit as it sits in this chain against that commit's parent, that is the diff that lands for "
         f"the member, with PR CI's caps: a new Lean file at most {ci_git.NEW_FILE_LINE_CAP} lines, and at most "
         f"{added_cap} added lines, {removed_cap} removed lines and {ci_git.REVIEW_FILE_CAP} "
-        "files per member (Lake-pin bumps are exempt from the line caps).",
+        "files per member (Lake-pin bumps are exempt from the line caps; a member whose listing says "
+        "`large_refactor` carries a repository admin's label and is exempt from all three).",
         "",
         "Splitting the change inside the batch is a valid repair: for example split a too-long new file into two "
         "or more smaller files (each importing what it needs, with its importers updated), keeping the result in "

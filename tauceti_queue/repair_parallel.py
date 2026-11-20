@@ -868,7 +868,15 @@ def repair_groups(
     failed_modules: list[str] = []
     check_findings: list[dict] = []
     if folded_tip:
-        report = repair.chain_report(cfg.clone, base, tip, folded_tip, task.member_keys, prior_base=task.base)
+        report = repair.chain_report(
+            cfg.clone,
+            base,
+            tip,
+            folded_tip,
+            task.member_keys,
+            prior_base=task.base,
+            large_refactors=task.large_refactor_heads,
+        )
         record["report"] = report
         if not report["ok"]:
             git(worktree, "checkout", "--quiet", "--force", "--detach", tip)

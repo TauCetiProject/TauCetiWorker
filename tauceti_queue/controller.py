@@ -2948,6 +2948,7 @@ class Controller:
                     no_repair=bool(member["no_repair"] or member["withdrawn"]),
                     withdrawn=bool(member["withdrawn"]),
                     declaration_names=loads(input_row.get("declaration_names"), {}),
+                    large_refactor=self._large_refactor_member(member, input_row),
                 )
             )
         refs = [self.batch_ref(batch["id"], task["batch_version"])] + [m.retained_ref for m in members]
@@ -3353,6 +3354,14 @@ class Controller:
 
     def _head(self) -> dict[str, Any] | None:
         return self.store.row("batches", {"repository": self.repository, "state": BATCH_HEAD}, order="id DESC")
+
+    @staticmethod
+    def _large_refactor_member(member: dict[str, Any], row: dict[str, Any]) -> bool:
+        """Admission found an admin's `large-refactor` label on this member's accepted head, so
+        repair's review-size checks skip the size caps for it, as staging does."""
+        if row.get("head_sha") != member["accepted_head"]:
+            return False
+        return loads(row.get("evidence"), {}).get("large_refactor") is True
 
     def _members(self, batch_id: int) -> list[dict[str, Any]]:
         return self.store.rows("members", {"batch_id": batch_id, "removed": 0}, order="position")
