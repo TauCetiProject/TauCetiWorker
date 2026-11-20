@@ -2081,8 +2081,10 @@ def _service_command(config: Path) -> list[str]:
     # Fleet repoints <fleet>/bin/tauceti at each worker revision it pins, and may delete older
     # revisions. The unit must name that launcher, not whichever `tauceti` is first on PATH or the
     # revision that happened to run the install, so a restart picks up the pinned revision.
-    launcher = fleet / "bin" / "tauceti" if fleet is not None else None
-    if launcher is not None and launcher.is_file():
+    if fleet is not None:
+        launcher = fleet / "bin" / "tauceti"
+        if not launcher.is_file():
+            raise WorkersError(f"Fleet's worker launcher {launcher} is missing; run `tauceti-fleet update local` first")
         return [str(launcher), "workers", "--config", str(config), "manager"]
     entry = entry_cmd()
     if len(entry) == 1 and not Path(entry[0]).is_absolute():
