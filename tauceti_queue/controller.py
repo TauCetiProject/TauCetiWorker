@@ -885,8 +885,7 @@ class Controller:
         `_retain` pushes through the outbox only while `publication_enabled` is true, so a ref retained
         in shadow mode exists in the clone alone, and a repair task or CI fetching it from GitHub finds
         nothing. For the head and every open batch, the refs the controller would have pushed (the
-        batch's tip under its current version, each non-removed member's accepted head and the clean
-        prefix of each open conflict task) are
+        batch's tip under its current version and each non-removed member's accepted head) are
         enqueued when the clone still holds them under that name and the outbox has no entry for the
         ref and SHA. Done entries stay in the outbox, so the check is one indexed lookup per ref and no
         GitHub call: a pass over a fully published queue enqueues nothing. Runs at restart, when
@@ -899,10 +898,6 @@ class Controller:
             wanted = [(self.batch_ref(batch["id"], batch["version"]), batch["tip"])]
             for member in self._members(batch["id"]):
                 wanted.append((self.input_ref(member["number"], member["accepted_head"]), member["accepted_head"]))
-            for task in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
-                if (step := self._conflict_step(task)) is not None:
-                    prefix = step["clean_prefix_tip"]
-                    wanted.append((self.conflict_ref(batch["id"], prefix), prefix))
             for ref, sha in wanted:
                 key = f"retain:{ref}:{sha}"
                 if self.store.row("outbox", {"key": key}) is not None or self._local_ref(ref) != sha:
@@ -945,11 +940,6 @@ class Controller:
     def pre_rebased_ref(batch_id: int, tip: str) -> str:
         """The published ref of an open batch's pre-rebased chain `tip`, which a worker preparing it fetches."""
         return f"{chain.REF_NAMESPACE}/batches/{batch_id}/pre-rebased/{tip}"
-
-    @staticmethod
-    def conflict_ref(batch_id: int, prefix: str) -> str:
-        """The published ref of a conflict task's clean prefix, which its worker resolves the commit onto."""
-        return f"{chain.REF_NAMESPACE}/batches/{batch_id}/conflicts/{prefix}"
 
     @staticmethod
     def submission_ref(task_id: int, claim_id: int) -> str:
@@ -2357,20 +2347,6 @@ class Controller:
                 return reject("version-mismatch")
             if retained is None:
                 return reject("tip-unavailable")
-            # A conflict task's result is the one resolved commit: the controller replays the rest of the
-            # chain onto it, and only a replay that reaches the end is validated and adopted as a chain.
-            step = self._conflict_step(task)
-            resolved = tip_sha
-            if step is not None:
-                replayed, problems = self._continue_replay(task, step, resolved)
-                if replayed is None:
-                    explain = all(v.code == "explanation-required" for v in problems)
-                    return reject("explanation-required" if explain else "invalid-chain", problems)
-                if replayed.status != chain.CLEAN:
-                    return self._accept_resolution(
-                        task, claim, batch, step, resolved, replayed, worker_notes, retained, now
-                    )
-                tip_sha = replayed.tip
             members = self._task_members(task)
             records = [self._chain_member(member) for member in members]
             report = chain.validate(self.clone, task["onto"], tip_sha, records)
@@ -2513,31 +2489,13 @@ class Controller:
                 )
             if self._predicted_collisions(knowledge):
                 self._record_prediction_result(task, batch, comparison, tip_sha, worker_notes, now)
+            if task["kind"] == TASK_PRE_REBASE:
+                return self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
             if self._pre_rebased_prepare(task):
                 return self._adopt_prepared_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
             if self._prediction_task(task) and tip_sha == task["tip"]:
                 return self._adopt_prediction_noop(task, claim, batch, tip_sha, retained, worker_notes, now)
-            with self.store.transaction():
-                if task["kind"] == TASK_PRE_REBASE:
-                    adoption = self._adopt_pre_rebase(task, claim, batch, tip_sha, comparison, worker_notes, now)
-                else:
-                    adoption = self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
-                if step is not None and adoption.accepted:
-                    self._record_resolution(task, step, resolved)
-                    # In the adoption's transaction: the receipt a worker resending the same resolved
-                    # commit after a lost response finds.
-                    self.store.insert(
-                        "submissions",
-                        task_id=task_id,
-                        claim_id=claim["id"],
-                        tip=resolved,
-                        retained_ref=retained,
-                        accepted=1,
-                        reason="resolved-commit",
-                        worker_notes="",
-                        created_at=now,
-                    )
-            return adoption
+            return self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
 
     def _commit_empty(self, sha: str | None) -> bool:
         """A single-parent commit whose tree is its parent's."""
@@ -3035,9 +2993,6 @@ class Controller:
             ahead = self._head()
             if ahead is not None and ahead["tip"] == task["onto"]:
                 refs.insert(1, self.batch_ref(ahead["id"], ahead["version"]))  # where `onto` is fetched from
-        step = self._conflict_step(task)
-        if step is not None:
-            refs.insert(1, self.conflict_ref(batch["id"], step["clean_prefix_tip"]))
         if self.candidate_ci is not None and getattr(self.source, "task_git_transport", None) == NATIVE_GIT_REFS:
             refs = [native_retained_ref(ref) for ref in refs]
             members = [
@@ -3067,7 +3022,7 @@ class Controller:
         )
 
     def _can_checkpoint_repair(self, task: dict[str, Any]) -> bool:
-        return self.candidate_ci is None and task["kind"] == TASK_REPAIR
+        return self.candidate_ci is None and task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT, TASK_PRE_REBASE)
 
     def _create_task(
         self,
@@ -5910,9 +5865,7 @@ class Controller:
     def _preserved_onto(self, task: dict[str, Any]) -> str | None:
         """The parent a preserved task may still submit onto, while it is open and claimed."""
         onto = (self._state("emergency_preserved") or {}).get(str(task["id"]))
-        if onto is None or task["state"] != TASK_OPEN:
-            return None
-        if not self._active_claims(task["batch_id"], task_id=task["id"]):
+        if onto is None or task["state"] != TASK_OPEN or not self._active_claims(task["batch_id"], task_id=task["id"]):
             return None
         return onto
 
@@ -6252,14 +6205,7 @@ class Controller:
     def _rebase_head(self, head: dict[str, Any], canonical: str, now: float) -> bool:
         """Replay the head onto the canonical commit; True when it is now based there."""
         task = self._open_task(head)
-        # A conflict task from before single-commit resolution names no conflicting commit: an unclaimed
-        # one is replaced by replaying again below.
-        if (
-            task is not None
-            and task["kind"] == "rebase_conflict"
-            and task["onto"] == canonical
-            and self._conflict_step(task) is not None
-        ):
+        if task is not None and task["kind"] == "rebase_conflict" and task["onto"] == canonical:
             self._reasons.append(f"head {head['id']} waits for a worker to resolve rebase conflict task {task['id']}")
             return False
         if self._active_claims(head["id"]):
@@ -6271,14 +6217,7 @@ class Controller:
             claim = self._take_claim(head, "rebase", now)
         chain_id = f"rebase-{head['id']}-{secrets.token_hex(4)}"
         try:
-            result = chain.replay(
-                self.clone,
-                head["base"],
-                head["tip"],
-                canonical,
-                chain_id=chain_id,
-                resolutions=self._resolutions(head["id"]),
-            )
+            result = chain.replay(self.clone, head["base"], head["tip"], canonical, chain_id=chain_id)
         except chain.ChainError as error:
             with self.store.transaction():
                 self._release_claim(claim, "error", now)
@@ -6290,23 +6229,11 @@ class Controller:
         if result.status == chain.CLEAN:
             version = head["version"] + 1
             by_pr = {record.source_pr: record for record in result.commits}
-            edits = self._resolution_edits(head["id"], result)
             with self.store.transaction():
                 for member in self._members(head["id"]):
                     record = by_pr.get(member["source_pr"])
-                    if record is None:
-                        continue
-                    values: dict[str, Any] = {"commit_sha": record.sha}
-                    edit = edits.get(member["source_pr"])
-                    if edit:
-                        # An accepted resolution, applied by this replay (its task was superseded).
-                        values.update(
-                            provenance="edited",
-                            task_id=edit["task_id"],
-                            explanation=(member["explanation"] + "\n\n" + edit["explanation"]).strip(),
-                            edited_shas=dumps(loads(member["edited_shas"], []) + [record.sha]),
-                        )
-                    self.store.update("members", {"id": member["id"]}, **values)
+                    if record is not None:
+                        self.store.update("members", {"id": member["id"]}, commit_sha=record.sha)
                 self.store.update(
                     "batches", {"id": head["id"]}, version=version, base=canonical, tip=result.tip, expected_parent=None
                 )
@@ -6330,7 +6257,22 @@ class Controller:
                 )
             return True
         conflict = result.conflict
-        diagnostics = [self._conflict_diagnostic(head["id"], result, canonical, "replaying the chain onto")]
+        diagnostics = [
+            {
+                "kind": "conflict",
+                "source_pr": conflict.source_pr if conflict else None,
+                # The input chain's conflicting commit, which the worker's own replay stops at.
+                "commit": conflict.replayed if conflict else None,
+                "paths": list(conflict.conflict_paths) if conflict else [],
+                "onto": canonical,
+                "message": f"replaying the chain onto {canonical[:12]} conflicts at {conflict.source_pr if conflict else '?'}",
+                "pending": [r.source_pr for r in result.commits if r.status == chain.PENDING],
+                "clean_prefix_tip": result.tip,
+                # Members the new base already carries (landed outside the queue): empty commits in the
+                # clean prefix, or still pending; the agent keeps them empty rather than replaying them.
+                "landed_on_base": result.landed_on_base,
+            }
+        ]
         with self.store.transaction():
             self._release_claim(claim, "conflict", now)
             self.store.journal(
@@ -6344,227 +6286,6 @@ class Controller:
         self._create_task(head, "rebase_conflict", canonical, diagnostics, now)
         self._reasons.append(f"head {head['id']} needs an agent to resolve the rebase conflict")
         return False
-
-    def _conflict_diagnostic(self, batch_id: int, result: chain.ChainResult, onto: str, what: str) -> dict[str, Any]:
-        """The `conflict` diagnostic of a replay that stopped at a conflict, for a single-commit task.
-
-        `commit` is the conflicting commit of the input chain and `clean_prefix_tip` the replayed
-        commits before it, kept under `conflict_ref` for as long as a task may need it; the worker
-        resolves only that commit onto the prefix (`_continue_replay` replays the rest). `landed_on_base`
-        lists the members the new base already carries, which the replay made empty commits."""
-        conflict = result.conflict
-        assert conflict is not None
-        self._retain(self.conflict_ref(batch_id, result.tip), result.tip)
-        return {
-            "kind": "conflict",
-            "source_pr": conflict.source_pr,
-            "commit": conflict.replayed,
-            "paths": list(conflict.conflict_paths),
-            "onto": onto,
-            "message": f"{what} {onto[:12]} conflicts at {conflict.source_pr}",
-            "pending": [r.source_pr for r in result.commits if r.status == chain.PENDING],
-            "clean_prefix_tip": result.tip,
-            "landed_on_base": result.landed_on_base,
-        }
-
-    @staticmethod
-    def _conflict_step(task: dict[str, Any]) -> dict[str, Any] | None:
-        """A rebase task's conflict diagnostic when it names the one commit to resolve, else None."""
-        if task["kind"] not in (TASK_REBASE_CONFLICT, TASK_PRE_REBASE):
-            return None
-        return next(
-            (d for d in loads(task["diagnostics"], []) if d.get("kind") == "conflict" and d.get("commit")),
-            None,
-        )
-
-    def _continue_replay(
-        self, task: dict[str, Any], step: dict[str, Any], resolved: str
-    ) -> tuple[chain.ChainResult | None, list[chain.Violation]]:
-        """Check a resolved commit against its task and replay the rest of the chain onto it.
-
-        The resolution must be one commit on the task's clean prefix, its message the conflicting
-        commit's own with an explanation appended that names no other `Source-PR` or `Accepted-Head`.
-        The commits after the conflicting one are then replayed onto it, as `_rebase_head` replays the
-        chain; that result is the whole chain when clean, or stops at the next conflict."""
-        original = chain.read_commit(self.clone, step["commit"])
-        commit = chain.read_commit(self.clone, resolved)
-        problems = []
-        if commit.parents != (step["clean_prefix_tip"],):
-            problems.append(
-                chain.Violation(
-                    "wrong-base",
-                    f"the resolved commit must have the clean prefix {step['clean_prefix_tip'][:12]} as its only parent",
-                    commit=resolved,
-                )
-            )
-        if not chain.message_preserved(original.message, commit.message):
-            problems.append(
-                chain.Violation(
-                    "message-not-preserved",
-                    f"{original.source_pr}: the conflicting commit's message must prefix the resolved one",
-                    commit=resolved,
-                    source_pr=original.source_pr,
-                )
-            )
-        elif not chain.appended_text(original.message, commit.message):
-            problems.append(
-                chain.Violation(
-                    "explanation-required",
-                    f"{original.source_pr}: the resolution needs an explanation appended to the message",
-                    commit=resolved,
-                    source_pr=original.source_pr,
-                )
-            )
-        elif (commit.source_pr, commit.accepted_head) != (original.source_pr, original.accepted_head):
-            # Caught here rather than when the whole chain is validated: a later task cannot undo it.
-            problems.append(
-                chain.Violation(
-                    "identity-changed",
-                    f"{original.source_pr}: the explanation must not add `Source-PR` or `Accepted-Head` trailers",
-                    commit=resolved,
-                    source_pr=original.source_pr,
-                )
-            )
-        member = next((m for m in self._members(task["batch_id"]) if m["source_pr"] == original.source_pr), None)
-        if member is not None and (member["no_repair"] or member["withdrawn"]) and not self._commit_empty(resolved):
-            # Checked here too: a later task could not undo an edit that the final validation refuses.
-            problems.append(
-                chain.Violation(
-                    "no-repair-edited",
-                    f"{original.source_pr} is never edited: leave its content alone, or reduce it to an empty "
-                    "commit naming the interacting PR, file and finding",
-                    commit=resolved,
-                    source_pr=original.source_pr,
-                )
-            )
-        if problems:
-            return None, problems
-        chain_id = f"resolved-{task['id']}-{secrets.token_hex(4)}"
-        try:
-            result = chain.replay(
-                self.clone,
-                step["commit"],
-                task["tip"],
-                resolved,
-                chain_id=chain_id,
-                resolutions=self._resolutions(task["batch_id"]),
-            )
-            absorbed = self._absorbed_members(task, step, result, resolved)
-        except chain.ChainError as error:
-            return None, [chain.Violation("replay-failed", str(error), commit=resolved)]
-        finally:
-            chain.delete_chain_ref(self.clone, chain_id)
-        return (None, absorbed) if absorbed else (result, [])
-
-    def _absorbed_members(
-        self, task: dict[str, Any], step: dict[str, Any], result: chain.ChainResult, resolved: str
-    ) -> list[chain.Violation]:
-        """Later members a resolution took into itself: empty when replayed onto it, though they did not
-        land on the base and their change applies onto the clean prefix and changes it. Taking a later
-        member's content is replaying it by hand, which would leave that member an empty commit. A
-        member that conflicts with the prefix is not judged: commits between may legitimately empty it,
-        and refusing such a resolution would leave the task nothing it could submit."""
-        emptied = {
-            r.source_pr
-            for r in result.commits
-            if r.status == chain.CLEAN and r.empty and not r.landed_on_base and r.resolution is None
-        }
-        if not emptied:
-            return []
-        prefix_tree = chain.tree_of(self.clone, step["clean_prefix_tip"])
-        found = []
-        for later in chain.chain_commits(self.clone, step["commit"], task["tip"]):
-            if later.source_pr not in emptied or later.tree == chain.tree_of(self.clone, later.parents[0]):
-                continue
-            outcome = chain.merge_trees(self.clone, step["clean_prefix_tip"], later.sha, merge_base=later.parents[0])
-            if outcome.clean and outcome.tree != prefix_tree:
-                found.append(
-                    chain.Violation(
-                        "absorbed-later-member",
-                        f"the resolution already contains {later.source_pr}'s change, which the queue replays "
-                        "after it: keep only the conflicting commit's change",
-                        commit=resolved,
-                        source_pr=later.source_pr,
-                    )
-                )
-        return found
-
-    def _resolutions(self, batch_id: int) -> dict[str, str]:
-        """The batch's accepted conflict resolutions: input commit -> resolved commit, for `chain.replay`."""
-        return {sha: entry["commit"] for sha, entry in (self._state(f"resolutions:{batch_id}") or {}).items()}
-
-    def _resolution_edits(self, batch_id: int, result: chain.ChainResult) -> dict[str, dict[str, Any]]:
-        """The members a replay took from accepted resolutions, as `_set_pre_rebase` edits:
-        `{source_pr: {explanation, task_id}}`."""
-        stored = {
-            entry["commit"]: (sha, entry) for sha, entry in (self._state(f"resolutions:{batch_id}") or {}).items()
-        }
-        edits = {}
-        for record in result.commits:
-            if record.resolution in stored:
-                original, entry = stored[record.resolution]
-                explanation = chain.appended_text(
-                    chain.read_commit(self.clone, original).message,
-                    chain.read_commit(self.clone, record.resolution).message,
-                )
-                edits[record.source_pr] = {"explanation": explanation, "task_id": entry["task_id"]}
-        return edits
-
-    def _accept_resolution(
-        self,
-        task: dict[str, Any],
-        claim: dict[str, Any],
-        batch: dict[str, Any],
-        step: dict[str, Any],
-        resolved: str,
-        result: chain.ChainResult,
-        worker_notes: str,
-        retained: str,
-        now: float,
-    ) -> Adoption:
-        """Accept a resolved commit whose continued replay stopped at a later conflict. The resolution is
-        recorded for the batch (`_resolutions`), so every later replay of it, by the next tick or after
-        a reseal, a supersession or a moved head, applies it and stops at the next unresolved commit,
-        where the usual path opens the next task. Nothing is adopted until a replay finishes."""
-        with self.store.transaction():
-            self._record_resolution(task, step, resolved)
-            self.store.update(
-                "tasks",
-                {"id": task["id"]},
-                state=TASK_SUBMITTED,
-                resolved_at=now,
-                resolution="resolved-commit",
-                submissions=task["submissions"] + 1,
-            )
-            self.store.update("claims", {"id": claim["id"]}, released_at=now, release_reason="submitted")
-            self.store.insert(
-                "submissions",
-                task_id=task["id"],
-                claim_id=claim["id"],
-                tip=resolved,
-                retained_ref=retained,
-                accepted=1,
-                reason="resolved-commit",
-                worker_notes=worker_notes,
-                created_at=now,
-            )
-            self._count("conflict_commits_resolved")
-            self.store.journal(
-                now,
-                "conflict-commit-resolved",
-                batch["id"],
-                task_id=task["id"],
-                resolved=resolved,
-                next_conflict=result.conflict.source_pr if result.conflict else None,
-            )
-        self.report_inference(claim["worker"], True)
-        self._wake.set()
-        return Adoption(True, "resolved-commit", task["id"], batch["id"], None, resolved, retained, [])
-
-    def _record_resolution(self, task: dict[str, Any], step: dict[str, Any], resolved: str) -> None:
-        key = f"resolutions:{task['batch_id']}"
-        stored = self._state(key) or {}
-        self._set_state(key, {**stored, step["commit"]: {"commit": resolved, "task_id": task["id"]}})
 
     # --- background preparation of open batches ----------------------------------------------------
 
@@ -6938,11 +6659,7 @@ class Controller:
         if own_prepare and not self._active_claims(batch["id"], task_id=own_prepare["id"]):
             self._supersede_prepare(batch["id"], "pre-rebase", now, own_base_only=True)
         state = batch["pre_rebase_state"]
-        pending = self._open_pre_rebase_task(batch)
-        # An unclaimed task from before single-commit resolution is replaced by replaying again below.
-        if pending is not None and (
-            self._conflict_step(pending) is not None or self._active_claims(batch["id"], task_id=pending["id"])
-        ):
+        if self._open_pre_rebase_task(batch) is not None:
             self._reasons.append(f"open batch {batch['id']} waits for a worker to resolve its pre-rebase")
             return
         waiting = self._pre_rebase_waits_for_prepare(batch)
@@ -6959,9 +6676,7 @@ class Controller:
         def replay(base: str, tip: str, target: str) -> chain.ChainResult:
             chain_id = f"pre-rebase-{batch['id']}-{secrets.token_hex(4)}"
             refs.append(chain_id)
-            return chain.replay(
-                self.clone, base, tip, target, chain_id=chain_id, resolutions=self._resolutions(batch["id"])
-            )
+            return chain.replay(self.clone, base, tip, target, chain_id=chain_id)
 
         try:
             carried = self._carry_pre_rebase(batch, onto, replay)
@@ -6984,22 +6699,26 @@ class Controller:
         assert result is not None
         if result.status == chain.CLEAN:
             with self.store.transaction():
-                edits = self._resolution_edits(batch["id"], result)
-                self._set_pre_rebase(
-                    batch,
-                    PRE_REBASE_ADOPTED if edits else PRE_REBASE_CLEAN,
-                    now,
-                    tip=result.tip,
-                    onto=onto,
-                    source=batch["tip"],
-                    edits=edits,
-                )
+                self._set_pre_rebase(batch, PRE_REBASE_CLEAN, now, tip=result.tip, onto=onto, source=batch["tip"])
                 self._count("pre_rebases")
                 self.store.journal(now, "pre-rebased", batch["id"], onto=onto, tip=result.tip, carried=False)
             return
         conflict = result.conflict
         diagnostics = [
-            self._conflict_diagnostic(batch["id"], result, onto, "replaying the open batch onto the head's tip"),
+            {
+                "kind": "conflict",
+                "source_pr": conflict.source_pr if conflict else None,
+                "commit": conflict.replayed if conflict else None,
+                "paths": list(conflict.conflict_paths) if conflict else [],
+                "onto": onto,
+                "message": (
+                    f"replaying the open batch onto the head's tip {onto[:12]} conflicts at "
+                    f"{conflict.source_pr if conflict else '?'}"
+                ),
+                "pending": [r.source_pr for r in result.commits if r.status == chain.PENDING],
+                "clean_prefix_tip": result.tip,
+                "landed_on_base": result.landed_on_base,
+            },
             self._cross_batch(head, batch),
         ]
         with self.store.transaction():

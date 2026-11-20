@@ -1758,9 +1758,7 @@ class PreRebase(ControllerCase):
         self.assertEqual(self.open_batch()["pre_rebase_prepared"], tip)
         self.assertEqual(self.open_tasks(self.open_batch()), [])
 
-    def test_a_conflict_resolution_is_not_retained_as_a_checkpoint(self):
-        """A conflict task's result is one resolved commit, not a chain to continue repairing: the queue
-        replays the rest of the batch onto it, and the head's CI and repair tasks take it from there."""
+    def test_compiling_repair_is_retained_for_the_next_claim_without_adoption(self):
         self.conflicting_batch()
         agent = ScriptedAgent(
             "w",
@@ -1772,16 +1770,27 @@ class PreRebase(ControllerCase):
             },
         )
         task = agent.claim(self.controller)
-        self.assertNotIn("can_checkpoint_repair", task.extra)
         tip = agent.produce(task)
-        notes = json.dumps({"repair_checkpoint": [{"kind": "lint", "module": "Shared", "message": "unused argument"}]})
+        findings = [{"kind": "lint", "module": "Shared", "message": "unused argument"}]
+        notes = json.dumps({"repair_checkpoint": findings})
         before = self.open_batch()
         result = self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True)
-        self.assertEqual((result.accepted, result.reason), (False, "invalid-repair-checkpoint"))
+        self.assertFalse(result.accepted, result)
+        self.assertEqual(result.reason, "repair-checkpoint")
         self.assertEqual(self.open_batch(), before)
-        adoption = self.controller.submit_task(task.task_id, task.claim_token, tip)
+        self.assertEqual(
+            self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True).reason,
+            "repair-checkpoint",
+        )
+        self.assertEqual(self.controller.store.count("submissions", {"task_id": task.task_id}), 1)
+        next_task = self.controller.claim_task("next", "admin-worker")
+        self.assertEqual(next_task.extra["repair_checkpoint"], {"tip": tip, "diagnostics": findings})
+        self.assertEqual(next_task.warm_revs[0], tip)
+        self.assertIn(result.retained_ref, next_task.retained_refs)
+        self.assertEqual(next_task.tip, task.tip, "the original membership and validation baseline survive")
+        adoption = self.controller.submit_task(task.task_id, next_task.claim_token, tip)
         self.assertTrue(adoption.accepted, adoption)
-        self.assertTrue(chain.is_ancestor(self.repo.clone, tip, self.open_batch()["pre_rebase_tip"]))
+        self.assertEqual(self.open_batch()["pre_rebase_tip"], tip)
 
     def test_claimed_own_base_preparation_finishes_before_rebase(self):
         self.controller.set_setting("prepare_min_members", 1, "kim")

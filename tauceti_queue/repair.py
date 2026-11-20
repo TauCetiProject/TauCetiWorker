@@ -1704,7 +1704,7 @@ def _rebase_sections(
     """What happened and the conflict evidence of a rebase conflict, naming every git ref once.
 
     ``chain`` is the clean prefix replayed onto the target followed by the one conflicting commit; the
-    commits after it are the queue's to replay, so the prompt does not name them."""
+    commits after it are the worker's to replay, so the prompt does not name them."""
     conflict = context.conflict or {}
     previous = (conflict.get("previous_base") or "")[:12]
     paths = conflict.get("paths") or []
@@ -1728,8 +1728,8 @@ def _rebase_sections(
         "",
         f"The queue is replaying this batch, one squash commit per pull request, from its base `{previous}` onto "
         f"{target} with git. The replay stopped at {commit_text}{in_paths}.{cleanly} Your job is to resolve that "
-        "one commit: make its change apply on top of the commits before it, as its author intended. The queue "
-        "replays the rest of the batch itself once the worker has committed your resolution."
+        "one commit: make its change apply on top of the commits before it, as its author intended. The worker "
+        "commits your resolution and replays the rest of the batch itself; a later conflict is a separate request."
         + (
             f" The target is not `main`: `{base_short}` is what `main` becomes when the head lands, so this is the next "
             "head's expected base, and the head's CI round may still change it."
@@ -1821,7 +1821,7 @@ def _result_section(context: PromptContext, base_short: str) -> list[str]:
             "",
             "The result is the files in this worktree. When you finish, the worker commits them itself as the "
             "conflicting commit on HEAD, with that commit's message, trailers and author and your explanation "
-            "appended; the queue then replays the rest of the batch onto it with git and runs CI. Do not commit, "
+            "appended, then replays the rest of the batch onto it with git; the queue runs CI on the whole batch. Do not commit, "
             "rebase, reset, cherry-pick or create branches: the worker reads only the working tree, and anything "
             "done to HEAD, the index, refs or history is discarded. There is nothing to push, and `gh` is not needed.",
             "",

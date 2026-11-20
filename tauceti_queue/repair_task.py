@@ -55,6 +55,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -69,6 +70,7 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
+from tauceti_queue import chain as chain_tool
 from tauceti_queue import (
     repair,
     repair_audit,
@@ -394,14 +396,6 @@ class Task:
     def validation_base(self) -> str:
         """The base the result must sit on: ``onto`` (the batch base itself for a repair)."""
         return self.onto or self.base
-
-    @property
-    def conflict_step(self) -> dict | None:
-        """A rebase task's conflict when it names the one ``commit`` to resolve onto ``clean_prefix_tip``."""
-        if self.kind not in repair.REBASE_KINDS:
-            return None
-        conflict = task_findings(self).get("conflict") or {}
-        return conflict if conflict.get("commit") and conflict.get("clean_prefix_tip") else None
 
 
 class _NoTaskRedirect(urllib.request.HTTPRedirectHandler):
@@ -1283,8 +1277,7 @@ def _fetch_retained_once(
         names = sorted(missing)
         shown = ", ".join(names[:3]) + (f" and {len(names) - 3} more" if len(names) > 3 else "")
         raise RuntimeError(f"{len(names)} retained ref(s) not fetchable: {shown} ({missing[names[0]]})")
-    step = task.conflict_step or {}
-    for sha in (task.base, task.tip, task.validation_base, *filter(None, [step.get("clean_prefix_tip")])):
+    for sha in (task.base, task.tip, task.validation_base):
         if git(clone, "cat-file", "-t", sha, check=False).strip() != "commit":
             git(clone, "fetch", "--quiet", "origin", sha, check=False)
         if git(clone, "cat-file", "-t", sha, check=False).strip() != "commit":
@@ -1572,8 +1565,7 @@ def prompt_context(
     knowledge = task_findings(task).get("admission_predictions")
     if knowledge:
         findings.setdefault("admission_predictions", knowledge)
-    # A verification round replaces the findings; a conflict task still resolves its one commit.
-    conflict = dict(findings.get("conflict") or task_findings(task).get("conflict") or {}) or None
+    conflict = dict(findings.get("conflict") or {}) or None
     if conflict is not None:
         conflict.setdefault("onto", task.onto)
         conflict.setdefault("previous_base", task.base)
@@ -2248,6 +2240,189 @@ def run_task(
         return _run_task(cfg, task, client, resume_state=resume_state, stop=stop)
 
 
+def resolve_conflicts(
+    cfg: RunnerConfig,
+    task: Task,
+    worktree: Path,
+    logdir: Path,
+    cancel: threading.Event,
+    state: TaskState,
+    env_lake: dict,
+    *,
+    artifacts: dict | None,
+    agent_records: list[dict],
+) -> dict:
+    """Replay a rebase task's chain onto ``onto`` and resolve its conflicts one commit at a time.
+
+    The worker replays ``base..tip`` onto ``onto`` with ``chain.replay``, as the queue does, and stops
+    at the first conflicting commit. The agent gets that commit applied onto the clean prefix, with
+    git's conflict markers, and nothing after it: no rebase in progress, no step script, no later
+    commit. The worker commits the working tree as the resolution (``repair.commit_resolution``), so
+    nothing the agent does to HEAD, refs or history counts; checks it; replays the rest of the chain
+    onto it; and repeats at the next conflict, on the same claim and worktree. Nothing is submitted
+    until the replay reaches the end, so the queue keeps no state between conflicts.
+
+    Returns ``{"status": "ok", "tip", "agent", "resolved"}`` with the worktree checked out at the whole
+    chain, ``{"status": "cancelled"}``, or a release status with its ``reason``: an agent status in
+    ``RELEASED_AGENT_STATUSES``, or ``agent_failed`` when a conflict stays unresolved after
+    ``cfg.agent_attempts`` attempts."""
+    chain_ids: list[str] = []
+    members = {m.source_pr: m for m in task.members}
+    resolved: list[dict] = []
+    agent: dict = {"status": "ok"}
+
+    def replay(base: str, onto: str) -> chain_tool.ChainResult:
+        chain_id = f"worker-{task.task_id}-{secrets.token_hex(4)}"
+        chain_ids.append(chain_id)
+        return chain_tool.replay(cfg.clone, base, task.tip, onto, chain_id=chain_id)
+
+    try:
+        result = replay(task.base, task.onto)
+        while result.status != chain_tool.CLEAN:
+            conflict = result.conflict
+            if conflict is None or conflict.replayed is None:
+                raise RuntimeError(f"the replay stopped without a conflicting commit: {result.status}")
+            prefix, commit, source_pr = result.tip, conflict.replayed, conflict.source_pr
+            entry = {
+                "kind": "conflict",
+                "source_pr": source_pr,
+                "commit": commit,
+                "paths": list(conflict.conflict_paths),
+                "onto": task.onto,
+                "message": f"replaying the chain onto {task.onto[:12]} conflicts at {source_pr}",
+                "pending": [r.source_pr for r in result.commits if r.status == chain_tool.PENDING],
+                "clean_prefix_tip": prefix,
+                "landed_on_base": result.landed_on_base,
+            }
+            findings = {**task_findings(task), "conflict": repair.findings_from_diagnostics([entry])["conflict"]}
+            # The clean prefix and the one conflicting commit: the commits after it are the worker's to replay.
+            chain_before = [*read_chain(cfg.clone, task.onto, prefix), *read_chain(cfg.clone, f"{commit}^", commit)]
+            ownership = repair_context.compute(
+                cfg.clone,
+                chain_before,
+                task.validation_base,
+                worktree,
+                declaration_names={m.number: m.declaration_names for m in task.members},
+                edited_prs={m.number for m in task.members if m.provenance == "edited"},
+            )
+            paths = repair.apply_conflict(worktree, prefix, commit)
+            log(f"task {task.task_id}: resolving {source_pr}'s commit {commit[:12]} onto {prefix[:12]}")
+            feedback: str | None = None
+            label = f"conflict-{len(resolved) + 1}"
+            tip, report = prefix, {}
+            for attempt in range(1, cfg.agent_attempts + 1):
+                if attempt > 1:
+                    # The agent continues from its own files, on the clean prefix as before.
+                    git(worktree, "checkout", "--quiet", "--force", "--detach", prefix)
+                    git(worktree, "read-tree", "-u", "--reset", tip)
+                context = prompt_context(
+                    task,
+                    feedback,
+                    findings,
+                    artifacts=artifacts,
+                    listings=repair.listings_path(worktree),
+                    shell_limit=int(cfg.shell_limit),
+                    worker_verifies=cfg.worker_audits,
+                )
+                context.repair_context = ownership
+                prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
+                agent = run_repair_agent(
+                    cfg, task, worktree, prompt, logdir, cancel, state, env_lake, label=f"{label}-attempt-{attempt}"
+                )
+                agent_records.append(agent)
+                if agent["status"] == "cancelled" or agent["status"] in RELEASED_AGENT_STATUSES:
+                    return {"status": agent["status"], "reason": agent.get("reason"), "resolved": resolved}
+                tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths)
+                if report["ok"] and report["unexplained"] and not cancel.is_set():
+                    follow = run_repair_agent(
+                        cfg,
+                        task,
+                        worktree,
+                        repair.resolution_explanation_prompt(source_pr),
+                        logdir,
+                        cancel,
+                        state,
+                        env_lake,
+                        resume=agent.get("session"),
+                        resume_provider=agent.get("provider"),
+                        label=f"{label}-attempt-{attempt}-explanation",
+                    )
+                    agent_records.append(follow)
+                    if follow["status"] == "cancelled" or follow["status"] in RELEASED_AGENT_STATUSES:
+                        return {"status": follow["status"], "reason": follow.get("reason"), "resolved": resolved}
+                    tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths)
+                rest = None
+                if report["ok"] and not report["unexplained"]:
+                    member = members.get(source_pr)
+                    if (
+                        member is not None
+                        and (member.no_repair or member.withdrawn)
+                        and chain_tool.tree_of(cfg.clone, tip) != chain_tool.tree_of(cfg.clone, prefix)
+                    ):
+                        report["problems"].append(
+                            f"no-repair-edited: {source_pr} is never edited: reduce it to an empty commit whose "
+                            "explanation names the interacting PR, file and finding"
+                        )
+                    rest = replay(commit, tip)
+                    report["problems"] += absorbed_members(cfg.clone, prefix, commit, tip, task.tip, rest)
+                    report["ok"] = not report["problems"]
+                state.write("conflict_validated", conflict=source_pr, attempt=attempt, tip=tip, report=report)
+                if rest is not None and report["ok"]:
+                    break
+                feedback = "Local validation of the previous attempt's resolution:\n" + format_report(report)
+                log(f"task {task.task_id}: the resolution of {source_pr} is not acceptable (attempt {attempt})")
+            else:
+                return {
+                    "status": "agent_failed",
+                    "reason": f"{source_pr}: the conflict stays unresolved\n{format_report(report)}",
+                    "resolved": resolved,
+                }
+            resolved.append({"source_pr": source_pr, "commit": commit, "resolved": tip})
+            result = rest
+        git(worktree, "checkout", "--quiet", "--force", "--detach", result.tip)
+        return {"status": "ok", "tip": result.tip, "agent": agent, "resolved": resolved}
+    finally:
+        for chain_id in chain_ids:
+            with contextlib.suppress(Exception):
+                chain_tool.delete_chain_ref(cfg.clone, chain_id)
+
+
+def absorbed_members(
+    clone: Path, prefix: str, commit: str, resolved: str, tip: str, rest: chain_tool.ChainResult
+) -> list[str]:
+    """Later members a resolution of ``commit`` took into itself, as problems.
+
+    A later member of the input chain ``commit..tip`` (replayed already in ``rest`` or still pending
+    behind a later conflict) is absorbed when it did not land on the base, its change applies onto
+    the clean ``prefix`` and changes it, the resolved commit already holds it (applying it there
+    changes nothing), and the conflicting commit did not carry it in the input chain. Taking a later
+    member's content is replaying it by hand, and would leave that member an empty commit. A member
+    that conflicts with the prefix is not judged; content moved in part is not detected mechanically."""
+    landed = {r.source_pr for r in rest.commits if r.landed_on_base}
+    prefix_tree = chain_tool.tree_of(clone, prefix)
+    resolved_tree = chain_tool.tree_of(clone, resolved)
+    original_tree = chain_tool.tree_of(clone, commit)
+    problems = []
+    for later in chain_tool.chain_commits(clone, commit, tip):
+        parent = later.parents[0]
+        if later.source_pr in landed or later.tree == chain_tool.tree_of(clone, parent):
+            continue
+        onto_prefix = chain_tool.merge_trees(clone, prefix, later.sha, merge_base=parent)
+        if not onto_prefix.clean or onto_prefix.tree == prefix_tree:
+            continue
+        onto_resolved = chain_tool.merge_trees(clone, resolved, later.sha, merge_base=parent)
+        if not onto_resolved.clean or onto_resolved.tree != resolved_tree:
+            continue
+        onto_original = chain_tool.merge_trees(clone, commit, later.sha, merge_base=parent)
+        if onto_original.clean and onto_original.tree == original_tree:
+            continue
+        problems.append(
+            f"absorbed-later-member: the resolution already contains {later.source_pr}'s change, which the worker "
+            "replays after it: keep only the conflicting commit's change"
+        )
+    return problems
+
+
 def _run_task(
     cfg: RunnerConfig,
     task: Task,
@@ -2295,9 +2470,10 @@ def _run_task(
     outcome.update(task_id=task.task_id, status="running", worker=cfg.worker)
     state.progress_outcome = outcome
     continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits else None
-    # A rebase task resolves one conflicting commit onto the replay's clean prefix; the queue replays the rest.
-    step = task.conflict_step
-    start_tip = continuation["tip"] if continuation else step["clean_prefix_tip"] if step else task.tip
+    start_tip = continuation["tip"] if continuation else task.tip
+    # A rebase task's agent step is the worker's own replay, the agent resolving one conflict at a time
+    # (`resolve_conflicts`); a retained repair checkpoint is already on the target and is repaired as is.
+    rebasing = task.kind in repair.REBASE_KINDS and not continuation
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
     known_checks = bool(continuation) or known_check_failures(task)
@@ -2366,17 +2542,6 @@ def _run_task(
 
     try:
         state.write("claimed", worker=cfg.worker, service=cfg.service, resumed=resuming)
-        if task.kind in repair.REBASE_KINDS and step is None:
-            return release_task(
-                cfg,
-                client,
-                task,
-                state,
-                "agent_failed",
-                "the conflict task names no conflicting commit to resolve; the queue replays and recreates it",
-                outcome,
-                lease,
-            )
         if task.repository != cfg.repository:
             verify_admin(task.repository)
         from tauceti_queue.repair_cache import task_cache
@@ -2417,8 +2582,6 @@ def _run_task(
                     warm=repair_publish.warm(cfg.publish, task),
                     build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
                 )
-            if step is not None:
-                repair.apply_conflict(worktree, start_tip, step["commit"])
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
                 missing = [a["revision"][:12] for a in artifacts["warm_attempts"] if not a["mapping_found"]]
@@ -2487,14 +2650,7 @@ def _run_task(
                     outcome,
                     lease,
                 )
-        if step is not None:
-            # The clean prefix and the one conflicting commit: the commits after it are not the agent's.
-            chain_before = [
-                *read_chain(cfg.clone, task.validation_base, start_tip),
-                *read_chain(cfg.clone, f"{step['commit']}^", step["commit"]),
-            ]
-        else:
-            chain_before = read_chain(cfg.clone, task.base, task.tip)
+        chain_before = read_chain(cfg.clone, task.base, task.tip)
         prompt_chain = read_chain(cfg.clone, task.validation_base, start_tip) if continuation else chain_before
         ownership = repair_context.compute(
             cfg.clone,
@@ -2593,30 +2749,6 @@ def _run_task(
             else None
         )
         pushed: str | None = state.record.get("pushed_tip") if pending_delivery else None
-
-        def attempt_result(attempt: int) -> tuple[str, dict]:
-            """The attempt's result and the queue's checks on it: for a conflict, the commit the worker
-            makes of the working tree on the clean prefix (whatever the agent did to HEAD or history);
-            otherwise the chain at HEAD."""
-            if step is not None:
-                tip, report = repair.commit_resolution(
-                    cfg.clone, worktree, start_tip, step["commit"], list(step.get("paths") or [])
-                )
-            else:
-                tip = git(worktree, "rev-parse", "HEAD").strip()
-                report = repair.chain_report(
-                    cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
-                )
-            git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
-            return tip, report
-
-        def explanation_request(names: list[str], tip: str) -> str:
-            if step is not None:
-                return repair.resolution_explanation_prompt(names[0] if names else str(step.get("member")))
-            return repair.explanation_prompt(
-                names, repair.read_chain(cfg.clone, task.validation_base, tip), base=task.validation_base
-            )
-
         attempt = 0
         validation_retries = 0
         verify_rounds = 0
@@ -2662,6 +2794,30 @@ def _run_task(
                 resubmit = False  # the explanation turn already ran; check and submit its result
             elif skip_agent:
                 skip_agent = False  # every group folded and the verification build passed; check and submit
+            elif rebasing:
+                pending_delivery = None
+                state.record.pop("delivery", None)
+                outcome.pop("repair_checkpoint", None)
+                resolution = resolve_conflicts(
+                    cfg,
+                    task,
+                    worktree,
+                    logdir,
+                    cancel,
+                    state,
+                    env_lake,
+                    artifacts=outcome.get("artifacts") or state.record.get("artifacts"),
+                    agent_records=agent_records,
+                )
+                outcome["agent"] = agent_records
+                outcome["conflicts"] = resolution["resolved"]
+                if resolution["status"] == "cancelled":
+                    return cancelled("the agent was cancelled")
+                if resolution["status"] != "ok":
+                    return release_task(
+                        cfg, client, task, state, resolution["status"], resolution.get("reason"), outcome, lease
+                    )
+                agent = resolution["agent"]
             else:
                 pending_delivery = None
                 state.record.pop("delivery", None)
@@ -2703,13 +2859,21 @@ def _run_task(
                     return cancelled("the agent was cancelled")
                 if agent["status"] in RELEASED_AGENT_STATUSES:
                     return release_task(cfg, client, task, state, agent["status"], agent.get("reason"), outcome, lease)
-            tip, report = attempt_result(attempt)
-            if report["ok"] and report["unexplained"] and not cancel.is_set():
+            tip = git(worktree, "rev-parse", "HEAD").strip()
+            git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
+            report = repair.chain_report(
+                cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+            )
+            if report["ok"] and report["unexplained"] and not cancel.is_set() and not rebasing:
                 follow = run_repair_agent(
                     cfg,
                     task,
                     worktree,
-                    explanation_request(report["unexplained"], tip),
+                    repair.explanation_prompt(
+                        report["unexplained"],
+                        repair.read_chain(cfg.clone, task.validation_base, tip),
+                        base=task.validation_base,
+                    ),
                     logdir,
                     cancel,
                     state,
@@ -2725,10 +2889,12 @@ def _run_task(
                     return release_task(
                         cfg, client, task, state, follow["status"], follow.get("reason"), outcome, lease
                     )
-                tip, report = attempt_result(attempt)
-            report["dirty"] = step is None and bool(
-                git(worktree, "status", "--porcelain", "--untracked-files=no").strip()
-            )
+                tip = git(worktree, "rev-parse", "HEAD").strip()
+                git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
+                report = repair.chain_report(
+                    cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                )
+            report["dirty"] = bool(git(worktree, "status", "--porcelain", "--untracked-files=no").strip())
             report["unchanged"] = tip == task.tip
             report["agent_failed"] = agent["status"] == "failed"
             state.write("validated", attempt=attempt, tip=tip, report=report)
@@ -2744,11 +2910,9 @@ def _run_task(
                     detail = f"agent exceeded the worker's {cfg.agent_timeout:.0f}s cap\n{detail}"
                 elif agent["status"] == "failed":
                     detail = f"agent exited {agent.get('rc')}\n{detail}"
-                if attempt < cfg.agent_attempts:
+                if attempt < cfg.agent_attempts and not rebasing:
                     feedback = (
-                        f"Local validation of the previous attempt's resolution:\n{detail}"
-                        if step is not None
-                        else "Local validation of the previous attempt's chain:\n"
+                        "Local validation of the previous attempt's chain:\n"
                         + detail
                         + f"\n\nThe chain the task started from is retained at `{RESULT_REF_PREFIX}/{task.task_id}/input` "
                         f"(tip `{task.tip[:12]}`, on base `{task.validation_base[:12]}`)."
@@ -2801,9 +2965,11 @@ def _run_task(
                         verification["diagnostics"]
                     )
                     state.write("verification_failed", attempt=attempt, tip=tip, detail=detail)
-                    # A conflict task's tree is a prefix of the chain: a later member may fix what fails here,
-                    # so its failures do not send the agent round again.
-                    if verify_rounds < cfg.verify_retries and step is None:
+                    if rebasing:
+                        # The agent resolved conflicts and never saw the whole chain: the head's CI and repair
+                        # tasks take the build from here.
+                        log(f"task {task.task_id}: the rebased chain fails verification; submitting it for CI")
+                    elif verify_rounds < cfg.verify_retries:
                         verify_rounds += 1
                         findings = repair.findings_from_diagnostics(verification["diagnostics"])
                         feedback = (
@@ -2813,9 +2979,6 @@ def _run_task(
                         )
                         log(f"attempt {attempt}: verification failed; running the agent on its findings")
                         continue
-                    if step is not None:
-                        # The queue replays the rest and its CI judges the whole chain.
-                        log(f"task {task.task_id}: the resolved commit fails verification; submitting it")
                     elif not (
                         task.extra.get("can_checkpoint_repair")
                         and verification.get("build", {}).get("rc") == 0
@@ -2937,7 +3100,7 @@ def _run_task(
             if reason in CLAIM_CODES:
                 return discard(f"result rejected: {reason}")
             lease.submitting.clear()
-            if reason == "explanation-required" and explanation_resubmits < cfg.validation_retries:
+            if reason == "explanation-required" and explanation_resubmits < cfg.validation_retries and not rebasing:
                 # The controller asks the same claim to add the explanation and resubmit.
                 explanation_resubmits += 1
                 named = rejected_members(response) or report.get("edited") or task.member_keys
@@ -2945,7 +3108,9 @@ def _run_task(
                     cfg,
                     task,
                     worktree,
-                    explanation_request(named, tip),
+                    repair.explanation_prompt(
+                        named, repair.read_chain(cfg.clone, task.validation_base, tip), base=task.validation_base
+                    ),
                     logdir,
                     cancel,
                     state,
@@ -2965,7 +3130,11 @@ def _run_task(
                 feedback = None
                 resubmit = True
                 continue
-            if reason in ("invalid-chain", "no-repair-edited") and validation_retries < cfg.validation_retries:
+            if (
+                reason in ("invalid-chain", "no-repair-edited")
+                and validation_retries < cfg.validation_retries
+                and not rebasing
+            ):
                 validation_retries += 1
                 feedback = "The queue's validation of the previous attempt's chain:\n" + format_service_validation(
                     response

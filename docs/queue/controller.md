@@ -107,7 +107,7 @@ I/O, below):
    it, so the member cannot conflict with the changes that landed beside it; `chain.build` does the
    same for a rebuild. The replay result, the `rebased`, `rebase-conflict` and `rebuilt` journal
    entries and a `rebase_conflict` task's diagnostics list these members under `landed_on_base`
-   (`{source_pr, commit}` each); the members' listings mark them `landed_on_main`.
+   (`{source_pr, commit}` each), and the repair prompt states them as "Already on main".
 3. Insertion passes: while there are waiting inputs not yet probed in this pass against an open
    batch they are eligible for, ensure the first open batch exists (based on the canonical commit),
    pick the oldest open batch with eligible inputs, draw one (below), reserve it, claim the batch,
@@ -151,10 +151,9 @@ I/O, below):
    a head not based on the canonical commit is claimed and, when its pre-rebase (below) was made on
    exactly that commit, based there from the pre-rebased chain without a replay; otherwise replayed (`chain.replay`), a clean
    replay becoming the next version with provenance unchanged, a conflict becoming a
-   `rebase_conflict` task that resolves only the conflicting commit onto the clean prefix (the
-   prefix kept under `conflict_ref`); the controller records each accepted resolution for the batch
-   and every replay applies them, so a replay that finishes is adopted and one that stops opens a task
-   for the next conflicting commit (docs/queue/repair-task.md, "Rebase conflicts: one commit at a time");
+   `rebase_conflict` task with the conflicting member and commit, paths and the clean prefix as
+   evidence (the worker replays the chain itself and resolves each conflict in turn,
+   docs/queue/repair-task.md, "Rebase conflicts: one commit at a time");
    a head with an open task waits for a worker; otherwise CI (below) and, on a pass, promotion
    through the outbox.
 6. Pre-rebase (below): supersede stale `pre_rebase` tasks; once the head's chain is submitted and

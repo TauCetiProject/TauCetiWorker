@@ -108,50 +108,46 @@ time"); a worker releases a conflict task without `commit` (made by an older con
 
 ### Rebase conflicts: one commit at a time
 
-The controller replays a batch with `chain.replay`, which stops at the first conflict, and hands the
-worker only that commit. The worker checks out the clean prefix and applies the commit onto it as the
-replay computed it (`repair.apply_conflict`: `git merge-tree` with the commit's parent as merge base,
-written to the working tree with `git read-tree -u --reset`), so the conflicting files carry git's
-markers, HEAD stays at the prefix and no rebase, cherry-pick or merge is in progress. The agent edits
-files and writes its explanation to `.tauceti-repair/explanation.md`; it gets no rebase recipe, no
-step script and no reference to the commits after the conflicting one.
+A `rebase_conflict` or `pre_rebase` task carries the chain `base..tip` and the target `onto`, and its
+`conflict` diagnostic names where the controller's replay stopped (`commit`, `paths`,
+`clean_prefix_tip`); the worker does not rely on that SHA and replays the chain itself
+(`repair_task.resolve_conflicts`) with the same `chain.replay`, so the whole task runs on one claim
+and one worktree and the controller keeps no state between conflicts.
 
-After each agent turn the worker makes the commit itself (`repair.commit_resolution`): the tree is the
-worktree's files as `git add --all` stages them (without `.lake` and `.tauceti-repair`), read through a
-private index and the clone's own Git directory; the parent is the clean prefix; the message is the
-conflicting commit's own, trailers included, with the explanation appended; the author and author date
-are that commit's. The worktree's HEAD, index and refs, and any commit, rebase or reset the agent made,
-are never read, so the agent cannot replay or rewrite history. Leftover conflict markers in the
-conflicting files and a review-size violation of the commit are problems that send the agent round
-again; a missing explanation gets the usual explanation turn. The worker then verifies the resolved
-commit's tree as it verifies a chain (whole-library incremental build, checks as the task's policy
-says) and submits the commit. That tree is only a prefix of the chain, and a later member may fix
-what fails there, so a failing verification is recorded and the commit submitted without another
-agent round; CI of the whole chain judges it.
+At each conflict the worker checks out the clean prefix and applies the conflicting commit onto it as
+the replay computed it (`repair.apply_conflict`: `git merge-tree` with the commit's parent as merge
+base, written to the working tree with `git read-tree -u --reset`), so the conflicting files carry
+git's markers, HEAD stays at the prefix and no rebase, cherry-pick or merge is in progress. The agent
+edits files and writes its explanation to `.tauceti-repair/explanation.md`; it gets no rebase recipe,
+no step script and no reference to the commits after the conflicting one.
 
-The controller's dedicated acceptance path (`Controller._continue_replay`) requires the commit's only
-parent to be the clean prefix, its message to be the conflicting commit's with text appended and no
-other `Source-PR` or `Accepted-Head`, and a no-repair member to be left alone or emptied. It then
-replays the commits after the conflicting one onto it with `chain.replay`, and refuses the resolution
-(`absorbed-later-member`) when a member that replay made empty did not land on the base and its
-change applies onto the clean prefix and changes it: a resolution that took in a later member's change
-is a replay by hand. A member that conflicts with the prefix is not judged, since commits between may
-legitimately empty it and refusing would leave the task nothing to submit; content moved between
-members in part, or into a member the replay has not reached, is not detected mechanically, as for any
-repair. These are checked before the resolution is accepted because a later task cannot undo them. A clean replay is the whole
-chain on `onto`: it goes through the ordinary validation and comparison and is adopted (the head's
-next version, or the batch's pre-rebase) as a submitted chain is, and the resolved commit is recorded
-as a receipt for a resend after a lost response. An accepted resolution belongs to the batch, not to the task: the controller records it
-(`state:resolutions:<batch>`, conflicting commit to resolved commit) and every later replay of the batch
-(`_rebase_head`, `_pre_rebase`, the continued replay itself) applies it through `chain.replay`'s
-`resolutions`, the resolved commit's change from its own prefix in place of the input commit. A
-replay that stops at a later conflict accepts the commit as `resolved-commit`
-(`Controller._accept_resolution`) and adopts nothing; the next tick replays the batch again with the
-resolutions and the usual path opens a task for the next conflicting commit, whose clean prefix holds
-the earlier resolutions. So a supersession, a reseal or a moved head loses no accepted resolution, and
-no task needs to be held for it; a replay that finishes in the tick records the resolved members as
-edited with their explanations, as an adoption does. A resolution that no longer applies onto a
-changed prefix is a conflict at that commit again. Conflict tasks take no repair checkpoints.
+The worker then makes the commit itself (`repair.commit_resolution`): the tree is the worktree's files
+as `git add --all` stages them (without `.lake` and `.tauceti-repair`), read through a private index
+and the clone's own Git directory; the parent is the clean prefix; the message is the conflicting
+commit's own, trailers included, with the explanation appended; the author and author date are that
+commit's. The worktree's HEAD, index and refs, and any commit, rebase or reset the agent made, are
+never read, so the agent cannot replay or rewrite history. A missing explanation gets one explanation
+turn in the same session. These are problems that send the agent round again on the same conflict, up
+to `agent_attempts`, with the report as feedback:
+
+- leftover conflict markers in the conflicting files, or a review-size violation of the commit;
+- a no-repair or withdrawn member whose resolution changes the prefix (it may only be emptied);
+- `absorbed-later-member`: a later member of the input chain, replayed or still pending, that did not
+  land on the base, whose change applies onto the clean prefix and changes it, is already in the
+  resolved commit, and was not in the conflicting commit itself (`repair_task.absorbed_members`).
+  Taking a later member's content is replaying it by hand. A member that conflicts with the prefix is
+  not judged, and content moved between members in part is not detected mechanically, as for any
+  repair.
+
+An accepted resolution is the new base for replaying the rest of the input chain (`chain.replay` from
+the conflicting commit onto the resolved one), which stops at the next conflict or reaches the end. A
+conflict that stays unresolved releases the task (`agent_failed`). When the replay reaches the end the
+worktree is checked out at the whole chain on `onto`, which goes through the ordinary local checks,
+verification and full-chain submission, unchanged. The agent never saw the whole chain, so a failing
+verification is recorded and the chain submitted without another agent round, and a rejection by the
+controller is not sent back to the agent: the head's CI and repair tasks take a chain that does not
+build from there. A task with a retained repair checkpoint is already on the target and is repaired as
+a chain.
 
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
 `violations` (chain tool findings, `{code, detail, commit, source_pr}`), `provenance`. The runner

@@ -399,7 +399,16 @@ elif mode == "no-explanation":
     rebuild(explain=resume is not None)
     finish()
 elif mode == "explain-only":
-    (repair_dir / "explanation.md").write_text("Kept the commit as it applies.\n")
+    # Resolve the conflict markers by keeping both sides, and change nothing else.
+    for path in Path("TauCeti").glob("*.lean"):
+        text = path.read_text()
+        if "<<<<<<<" in text:
+            path.write_text("\n".join(l for l in text.splitlines() if not l.startswith(("<<<<<<<", "=======", ">>>>>>>"))) + "\n")
+    (repair_dir / "explanation.md").write_text("Kept both sides of the conflict.\n")
+    finish()
+elif mode == "absorb":
+    rebuild()
+    Path("TauCeti/Three.lean").write_text("theorem three : True := trivial\n")
     finish()
 elif mode == "move-history":
     # Resolve, then try to finish the replay by hand: commit, cherry-pick what follows, move HEAD.
@@ -710,22 +719,22 @@ class Content:
             "extra": {"canonical_branch": "main"},
         }
 
-    def rebase_task(self, task_id: int = 1) -> dict:
-        """A rebase-conflict task: main moved past the batch base, so ``onto`` differs from ``base``; the
-        queue's replay put member 1 on ``onto`` (the clean prefix) and the task resolves member 2's commit."""
+    def rebase_task(self, task_id: int = 1, kind: str = "rebase_conflict") -> dict:
+        """A rebase-conflict task: main moved past the batch base, so ``onto`` differs from ``base``, and
+        added its own ``TauCeti/Two.lean``, so replaying the chain puts member 1 on ``onto`` (the clean
+        prefix) and conflicts at member 2's commit. The worker replays the chain itself."""
         seed = self.bare.parent / "seed"
         sh(seed, "checkout", "--quiet", "--detach", self.base)
-        onto = commit(seed, "main moved", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+        onto = commit(
+            seed,
+            "main moved",
+            {"TauCeti/A.lean": "theorem a : True := by trivial\n", "TauCeti/Two.lean": "-- two, on main\n"},
+        )
         prefix = chain_tool.replay(seed, self.base, self.members[0]["commit"], onto, chain_id="prefix").tip
         sh(seed, "push", "--quiet", "origin", f"{onto}:refs/heads/queue/batch-1/onto")
-        sh(seed, "push", "--quiet", "origin", f"{prefix}:refs/heads/queue/batch-1/conflict")
-        task = self.task(task_id, kind="rebase_conflict")
+        task = self.task(task_id, kind=kind)
         task["onto"] = onto
-        task["retained_refs"] = [
-            *task["retained_refs"],
-            "refs/heads/queue/batch-1/onto",
-            "refs/heads/queue/batch-1/conflict",
-        ]
+        task["retained_refs"] = [*task["retained_refs"], "refs/heads/queue/batch-1/onto"]
         task["diagnostics"] = [
             {
                 "kind": "conflict",
@@ -789,7 +798,6 @@ class FakeService:
         self.claims: dict[int, dict] = {}  # claim id -> record
         self.done: set[int] = set()
         self.results: list[dict] = []
-        self.replays: list = []  # the controller-side replays after a resolved commit
         self.releases: list[dict] = []
         self.renewals = 0
         self.claim_attempts: list[dict] = []
@@ -967,27 +975,6 @@ class FakeService:
             return adoption(False, "tip-unavailable")
         if pushed != tip_sha:
             return adoption(False, "tip-unavailable")
-        step = next((d for d in task.get("diagnostics") or [] if d.get("kind") == "conflict" and d.get("commit")), None)
-        if step is not None:
-            # The controller's `_continue_replay`: the resolved commit on the prefix, then the rest replayed.
-            original = chain_tool.read_commit(self.bare, step["commit"])
-            resolved = chain_tool.read_commit(self.bare, tip_sha)
-            if resolved.parents != (step["clean_prefix_tip"],):
-                return adoption(False, "invalid-chain", [{"code": "wrong-base", "detail": "not on the prefix"}])
-            if not chain_tool.appended_text(original.message, resolved.message):
-                return adoption(
-                    False,
-                    "explanation-required",
-                    [{"code": "explanation-required", "detail": "no explanation", "source_pr": original.source_pr}],
-                )
-            replayed = chain_tool.replay(self.bare, step["commit"], task["tip"], tip_sha)
-            self.replays.append(replayed)
-            if replayed.status != chain_tool.CLEAN:
-                self.done.add(task_id)
-                claim["released_at"] = time.time()
-                claim["release_reason"] = "submitted"
-                return adoption(True, "resolved-commit")
-            tip_sha = replayed.tip
         members = [m["source_pr"] for m in task["members"]]
         report = chain_tool.validate(self.bare, task["onto"], tip_sha, members)
         if not report.ok:
@@ -1171,21 +1158,9 @@ class Fixture(unittest.TestCase):
         return repair_task.TaskClient(cfg.service, TOKEN, worker or cfg.worker)
 
     def pre_rebase_task(self) -> dict:
-        """Task 1 as a ``pre_rebase`` task on its own base that resolves member 2's commit onto member 1's."""
-        task = self.service.tasks[1]
-        task.update(kind="pre_rebase")
-        task["diagnostics"] = [
-            {
-                "kind": "conflict",
-                "source_pr": f"{PROJECT}#2",
-                "commit": self.content.members[1]["commit"],
-                "paths": ["TauCeti/Two.lean"],
-                "onto": self.content.base,
-                "message": "replaying the open batch conflicts",
-                "pending": [f"{PROJECT}#3"],
-                "clean_prefix_tip": self.content.members[0]["commit"],
-            }
-        ]
+        """Task 1 as a ``pre_rebase`` task whose replay conflicts at member 2's commit (``rebase_task``)."""
+        task = self.content.rebase_task(1, kind="pre_rebase")
+        self.service.tasks[1] = task
         return task
 
     def agent_calls(self) -> list[dict]:
@@ -1575,6 +1550,16 @@ class RebaseArtifacts(Fixture):
     def fetches(self) -> list[str]:
         return [c.split("--rev=")[1] for c in self.lake_calls() if c.startswith("cache get")]
 
+    def submitted_chain(self) -> list:
+        """The chain the worker pushed, checked as the queue checks it: every member on ``onto``."""
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        members = [m["source_pr"] for m in self.content.members]
+        report = chain_tool.validate(self.content.bare, self.onto, pushed, members)
+        self.assertTrue(report.ok, report)
+        comparison = chain_tool.compare(self.content.bare, self.content.base, self.content.tip, self.onto, pushed)
+        self.assertTrue(comparison.ok, comparison)
+        return chain_tool.chain_commits(self.content.bare, self.onto, pushed)
+
     def test_explanation_follow_up_preserves_the_new_rebase_target(self):
         self.raw["kind"] = "pre_rebase"
         os.environ["STUB_AGENT_MODE"] = "no-explanation"
@@ -1586,20 +1571,20 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(calls[1]["resume"], "sess-1")
         self.assertIn(f"Your resolution of {PROJECT}#2's commit is in the working tree", calls[1]["prompt"])
         self.assertIn("explanation.md` is missing or empty", calls[1]["prompt"])
-        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
-        prefix = self.raw["diagnostics"][0]["clean_prefix_tip"]
-        self.assertEqual(sh(self.content.bare, "rev-parse", f"{pushed}^"), prefix, "one commit on the clean prefix")
-        self.assertNotIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Two.lean"))
-        self.assertIn(
-            "Repair: replaced the unknown identifier", sh(self.content.bare, "log", "-1", "--format=%B", pushed)
+        one, two, three = self.submitted_chain()
+        self.assertNotIn("BROKEN", sh(self.content.bare, "show", f"{two.sha}:TauCeti/Two.lean"))
+        self.assertIn("Repair: replaced the unknown identifier", two.message)
+        self.assertTrue(
+            chain_tool.same_change(
+                self.content.bare, chain_tool.read_commit(self.content.bare, self.content.members[2]["commit"]), three
+            )
         )
-        [replayed] = self.service.replays
-        comparison = chain_tool.compare(self.content.bare, self.content.base, self.content.tip, self.onto, replayed.tip)
-        self.assertTrue(comparison.ok, comparison)
+        self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2"])
 
     def test_the_agent_cannot_replay_or_move_history(self):
         """The agent commits its resolution, cherry-picks the next member and moves HEAD: the worker
-        submits only the working tree, committed on the clean prefix with the member's message."""
+        commits only the working tree on the clean prefix with the member's message, and replays
+        member 3 itself."""
         os.environ["STUB_AGENT_MODE"] = "move-history"
         os.environ["STUB_LATER_COMMITS"] = self.content.members[2]["commit"]
         os.environ["STUB_MOVE_HEAD_TO"] = self.content.tip
@@ -1608,21 +1593,14 @@ class RebaseArtifacts(Fixture):
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
-        prefix = self.raw["diagnostics"][0]["clean_prefix_tip"]
-        self.assertEqual(sh(self.content.bare, "rev-parse", f"{pushed}^"), prefix)
-        message = sh(self.content.bare, "log", "-1", "--format=%B", pushed)
-        self.assertIn(f"Source-PR: {PROJECT}#2", message)
-        self.assertNotIn("agent's own commit", message)
-        [replayed] = self.service.replays
-        self.assertEqual(replayed.status, chain_tool.CLEAN, "the queue replayed member 3 itself")
-        self.assertFalse(replayed.commits[-1].empty, "member 3 keeps its own content")
-        report = chain_tool.validate(
-            self.content.bare, self.onto, replayed.tip, [m["source_pr"] for m in self.content.members]
-        )
-        self.assertTrue(report.ok, report)
+        one, two, three = self.submitted_chain()
+        self.assertEqual(two.parents, (one.sha,))
+        self.assertIn(f"Source-PR: {PROJECT}#2", two.message)
+        self.assertNotIn("agent's own commit", two.message)
+        self.assertNotEqual(three.tree, two.tree, "member 3 keeps its own content")
 
-    def test_service_explanation_retry_preserves_the_new_rebase_target(self):
+    def test_a_service_rejection_of_a_rebased_chain_is_not_sent_back_to_the_agent(self):
+        """The agent only ever sees one conflicting commit: a rejection of the whole chain ends the task."""
         self.service.result_script = [
             {
                 "accepted": False,
@@ -1632,11 +1610,42 @@ class RebaseArtifacts(Fixture):
         ]
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual((outcome["status"], outcome["reason"]), ("not_adopted", "explanation-required"))
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(len(self.agent_calls()), 1)
+
+    def test_every_conflict_is_resolved_on_one_claim(self):
+        """Main also changed member 3's file: the worker resolves member 2, replays on, stops at member 3
+        and resolves it in the same task, then submits the whole chain once."""
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        moved = commit(seed, "main moved again", {"TauCeti/Three.lean": "-- three, on main\n"})
+        sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        self.raw["onto"] = self.onto = moved
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assertEqual(len(self.service.results), 2)
+        self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2", f"{PROJECT}#3"])
         calls = self.agent_calls()
         self.assertEqual(len(calls), 2)
-        self.assertIn(f"Your resolution of {PROJECT}#2's commit is in the working tree", calls[1]["prompt"])
+        self.assertNotIn(f"{PROJECT}#3", calls[0]["prompt"], "the first round does not see the later commit")
+        self.assertIn(f"PR #3's commit `{self.content.members[2]['commit'][:12]}`", calls[1]["prompt"])
+        self.assertEqual(len(self.service.results), 1, "one submission: the whole chain")
+        one, two, three = self.submitted_chain()
+        self.assertEqual(three.parents, (two.sha,), "the second round starts from the first resolution")
+        for path in ("TauCeti/Two.lean", "TauCeti/Three.lean"):
+            self.assertNotIn("<<<<<<<", sh(self.content.bare, "show", f"{three.sha}:{path}"))
+
+    def test_a_resolution_that_takes_in_a_later_member_is_refused(self):
+        """Replaying member 3 by hand inside member 2's resolution is refused before the replay continues."""
+        os.environ["STUB_AGENT_MODE"] = "absorb"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(self.service.releases[-1]["reason"], "agent_failed")
+        self.assertIn("absorbed-later-member", self.service.releases[-1]["error"])
+        self.assertIn("absorbed-later-member", self.agent_calls()[1]["prompt"], "the retry is told why")
+        self.assertEqual(self.service.results, [])
 
     def observe_log(self) -> list[str]:
         lines: list[str] = []
@@ -4808,7 +4817,6 @@ class Records(unittest.TestCase):
         self.assertEqual(task.validation_base, onto)
         self.assertEqual(task.member_keys, [f"{PROJECT}#1", f"{PROJECT}#2", f"{PROJECT}#3"])
         self.assertEqual(task.submission_ref, "refs/tauceti-queue/submissions/9/5")
-        self.assertEqual(task.conflict_step["commit"], content.members[1]["commit"])
         self.assertEqual(repair_task.Task.from_json(task.to_json()), task)
         # The worker's chain: the clean prefix, then the one conflicting commit; never the commits after it.
         chain = [
@@ -4854,16 +4862,6 @@ class Records(unittest.TestCase):
         records = [json.loads(line) for line in listings.read_text().splitlines()]
         self.assertEqual([(r["pr"], r["state"]) for r in records], [(1, "replayed"), (2, "conflicting")])
         self.assertEqual(sh(seed, "status", "--porcelain"), "", "the listings are excluded from Git")
-        # A verification round's findings replace the task's, but the task still resolves its one commit.
-        verified = repair.findings_from_diagnostics(
-            [{"kind": "compiler", "module": "TauCeti/Two.lean", "message": "TauCeti/Two.lean:1:1: boom"}]
-        )
-        retry = repair.compose_prompt(
-            repair_task.prompt_context(task, "verification failed", verified), verified, chain, seed
-        )
-        self.assertTrue(retry.startswith(repair.RESOLUTION_INSTRUCTION))
-        self.assertIn("## Resolving the commit", retry)
-        self.assertNotIn("--fixup", retry)
         with self.assertRaises(ValueError):
             repair_task.Task.from_json({**raw, "kind": "mystery", "claim_token": "x", "expires_at": 1})
 
@@ -5307,7 +5305,7 @@ class WorkerAudits(Fixture):
         self.assertFalse(compilation["full_checks"])
 
     def test_staging_pre_rebase_retains_build_receipt_without_full_check_claim(self):
-        self.pre_rebase_task()
+        onto = self.pre_rebase_task()["onto"]
         self.service.tasks[1]["extra"]["checks_owner"] = "staging"
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
@@ -5318,7 +5316,7 @@ class WorkerAudits(Fixture):
             receipt,
             {
                 "tip": outcome["tip"],
-                "base": self.content.base,
+                "base": onto,
                 "tools": f"TauCetiProject/TauCetiTools@{TOOLS_REF}",
                 "scope": "build",
             },

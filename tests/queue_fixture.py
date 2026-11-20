@@ -43,14 +43,7 @@ from tauceti_queue.controller import (  # noqa: E402
     TaskError,
     publishing,
 )
-from tauceti_queue.fakes import (  # noqa: E402
-    Resolution,
-    ScriptedAgent,
-    Status,
-    make_controller,
-    reopen_controller,
-    run_git,
-)
+from tauceti_queue.fakes import Resolution, ScriptedAgent, Status, make_controller, reopen_controller  # noqa: E402
 from tauceti_queue.loop import ReconciliationLoop  # noqa: E402
 from tauceti_queue.ports import CandidatePhase  # noqa: E402
 
@@ -417,175 +410,6 @@ class Repair(QueueFixture):
         self.assertEqual(len(self.github.comments_for(103)), 1)
         self.assertNotIn("edited this contribution", self.github.comments_for(103)[0]["body"])
         self.assertIn("edited this contribution", self.github.comments_for(102)[0]["body"])
-
-    def test_a_second_conflict_in_the_suffix_opens_a_second_single_commit_task(self):
-        # 102 conflicts with 101's edit of Shared.lean and 105 with 104's of Other.lean.
-        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
-        self.approve(104, {"Other.lean": "first changed by 104\nsecond\n"})
-        self.tick()
-        canonical = self.head()["tip"]
-        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
-        self.approve(105, {"Other.lean": "first changed by 105\nsecond\n"})
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertEqual(self.repo.main_sha(), canonical)
-        head = self.head()
-        commits = {m["source_pr"]: m["commit_sha"] for m in self.members(head)}
-        order = [m["source_pr"] for m in self.members(head)]
-        self.assertEqual(sorted(order), [f"{PROJECT}#102", f"{PROJECT}#105"])
-        [first] = self.controller.status()["head"]["task"]["diagnostics"][:1]
-        self.assertEqual((first["source_pr"], first["commit"]), (order[0], commits[order[0]]))
-        self.assertEqual(first["clean_prefix_tip"], canonical, "nothing replayed before the first member")
-        resolutions = {
-            f"{PROJECT}#102": Resolution(
-                {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"},
-                explanation="Merged the line two edits of #101 and this PR.",
-            ),
-            f"{PROJECT}#105": Resolution(
-                {"Other.lean": "first changed by 104 and 105\nsecond\n"},
-                explanation="Merged the first-line edits of #104 and this PR.",
-            ),
-        }
-        agent = self.agent(script=lambda task: resolutions)
-        resolved = agent.run(self.controller)
-        self.assertEqual((resolved.accepted, resolved.reason), (True, "resolved-commit"))
-        self.assertEqual(self.head()["tip"], head["tip"], "nothing is adopted before the replay finishes")
-        self.tick()
-        task = self.controller.status()["head"]["task"]
-        self.assertEqual(task["kind"], "rebase_conflict")
-        [second] = [d for d in task["diagnostics"] if d["kind"] == "conflict"]
-        self.assertEqual((second["source_pr"], second["commit"]), (order[1], commits[order[1]]))
-        [first_commit] = chain.chain_commits(self.repo.clone, canonical, second["clean_prefix_tip"])
-        resolution = chain.read_commit(self.repo.clone, resolved.tip)
-        self.assertEqual(
-            (first_commit.tree, first_commit.message),
-            (resolution.tree, resolution.message),
-            "the next replay applies the accepted resolution",
-        )
-        self.assertEqual(agent.tasks[-1].tip, head["tip"], "both tasks describe the head's own chain")
-        adoption = agent.run(self.controller)
-        self.assertEqual((adoption.accepted, adoption.reason), (True, "adopted"))
-        self.assertEqual(adoption.provenance, {f"{PROJECT}#102": "edited", f"{PROJECT}#105": "edited"})
-        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 2)
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertEqual(self.repo.file_at("main", "Other.lean"), "first changed by 104 and 105\nsecond\n")
-        self.assertIn("Merged the line two edits", self.github.comments_for(102)[0]["body"])
-        self.assertIn("Merged the first-line edits", self.github.comments_for(105)[0]["body"])
-
-    def test_an_accepted_resolution_survives_its_next_task_being_superseded(self):
-        """Accepted resolutions belong to the batch, not to a task: when main moves and the head is
-        replayed again, the replay applies them and the agent resolves only what is still open."""
-        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
-        self.approve(104, {"Other.lean": "first changed by 104\nsecond\n"})
-        self.tick()
-        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
-        self.approve(105, {"Other.lean": "first changed by 105\nsecond\n"})
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        resolutions = {
-            f"{PROJECT}#102": Resolution(
-                {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"}, explanation="Merged 102."
-            ),
-            f"{PROJECT}#105": Resolution(
-                {"Other.lean": "first changed by 104 and 105\nsecond\n"}, explanation="Merged 105."
-            ),
-        }
-        agent = self.agent(script=lambda task: resolutions)
-        self.assertEqual(agent.run(self.controller).reason, "resolved-commit")
-        first = agent.tasks[-1].diagnostics[0]["source_pr"]
-        # main moves before anyone claims the next task: the head is replayed onto the new main.
-        self.repo.advance_main({"Unrelated.lean": "u\n"}, "unrelated (#999)")
-        self.tick(2)
-        task = self.controller.status()["head"]["task"]
-        [conflict] = [d for d in task["diagnostics"] if d["kind"] == "conflict"]
-        self.assertNotEqual(conflict["source_pr"], first, "the accepted resolution was applied, not asked again")
-        adoption = agent.run(self.controller)
-        self.assertEqual((adoption.accepted, adoption.reason), (True, "adopted"))
-        self.assertEqual(adoption.provenance, {f"{PROJECT}#102": "edited", f"{PROJECT}#105": "edited"})
-        self.assertEqual(len(agent.tasks), 2)
-
-    def test_a_clean_finish_validates_the_whole_chain(self):
-        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
-        self.tick()
-        canonical = self.head()["tip"]
-        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
-        self.approve(103, {"C.lean": "c\n"})
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        head = self.head()
-        merged = {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"}
-        # A resolution not on the clean prefix is refused before anything is replayed.
-        task = self.agent().claim(self.controller)
-        stray = chain.commit_tree(
-            self.repo.clone,
-            chain.tree_of(self.repo.clone, canonical),
-            head["base"],
-            chain.read_commit(self.repo.clone, self.members(head)[0]["commit_sha"]).message + "\nExplained.\n",
-            ("A", "a@example.invalid"),
-        )
-        run_git(self.repo.clone, "push", "-q", "-f", str(self.repo.origin), f"{stray}:{task.submission_ref}")
-        refused = self.controller.submit_task(task.task_id, task.claim_token, stray)
-        self.assertEqual((refused.accepted, refused.reason), (False, "invalid-chain"))
-        self.assertEqual(refused.violations[0]["code"], "wrong-base")
-        self.controller.release_task(task.task_id, task.claim_token, "agent_failed", "")
-        # A resolution that takes in the next member's change (a replay by hand) is refused: that member
-        # would be left an empty commit.
-        absorber = self.agent(
-            "absorber",
-            script=lambda task: {f"{PROJECT}#102": Resolution({**merged, "C.lean": "c\n"}, explanation="Merged.")},
-        )
-        absorbed = absorber.run(self.controller)
-        self.assertEqual((absorbed.accepted, absorbed.reason), (False, "invalid-chain"))
-        self.assertEqual(
-            [(v["code"], v["source_pr"]) for v in absorbed.violations], [("absorbed-later-member", f"{PROJECT}#103")]
-        )
-        self.controller.release_task(absorbed.task_id, absorber.tasks[-1].claim_token, "agent_failed", "")
-        # An explanation smuggling in a second member's identity is refused at once: a later task
-        # could not undo it.
-        smuggler = self.agent(
-            "smuggler",
-            script=lambda task: {
-                f"{PROJECT}#102": Resolution(merged, explanation=f"Merged.\n\nSource-PR: {PROJECT}#103")
-            },
-        )
-        smuggled = smuggler.run(self.controller)
-        self.assertEqual((smuggled.accepted, smuggled.reason), (False, "invalid-chain"))
-        self.controller.release_task(smuggled.task_id, smuggler.tasks[-1].claim_token, "agent_failed", "")
-        self.assertEqual([v["code"] for v in smuggled.violations], ["identity-changed"])
-        self.assertEqual(self.head()["tip"], head["tip"])
-        resolver = self.agent(
-            "resolver", script=lambda task: {f"{PROJECT}#102": Resolution(merged, explanation="Merged the edits.")}
-        )
-        validated = []
-        validate = chain.validate
-
-        def spy(repo, base, tip, members):
-            validated.append((base, tip, sorted(chain.member_key(m) for m in members)))
-            return validate(repo, base, tip, members)
-
-        with patch.object(chain, "validate", spy):
-            adoption = resolver.run(self.controller)
-        self.assertEqual((adoption.accepted, adoption.reason), (True, "adopted"))
-        adopted = self.head()
-        self.assertEqual(
-            (adopted["base"], adopted["tip"], adopted["version"]), (canonical, adoption.tip, head["version"] + 1)
-        )
-        # The replay that finished was validated as the whole chain, every member included.
-        self.assertEqual(validated, [(canonical, adoption.tip, [f"{PROJECT}#102", f"{PROJECT}#103"])])
-        # The receipt answers a resend of the same resolved commit after a lost response.
-        [receipt] = self.controller.store.rows(
-            "submissions", {"task_id": adoption.task_id, "reason": "resolved-commit"}
-        )
-        self.assertEqual(chain.read_commit(self.repo.clone, receipt["tip"]).parents, (canonical,))
-        resend = self.controller.submit_task(adoption.task_id, resolver.tasks[-1].claim_token, receipt["tip"])
-        self.assertEqual((resend.accepted, resend.reason), (True, "already-adopted"))
-        self.tick()
-        self.assertEqual(self.controller.status()["head"]["stage"], "ci", "the replayed chain goes to CI as today")
 
     def test_s14_shrink_to_green_rejects_the_empty_contribution_and_names_what_was_dropped(self):
         self.github.ci_policy = fail_members(102)
@@ -3775,13 +3599,15 @@ class PreRebase(QueueFixture):
                     },
                     explanation="Merged the line two edits of #101 and this PR; foo_bar is foo_baz after #101.",
                 ),
+                f"{PROJECT}#103": Resolution(
+                    {"TauCeti/Also.lean": None}, empty=True, explanation="#101 adds both_add."
+                ),
             }
 
         agent = self.agent(script=script)
         adoption = agent.run(self.controller)
         self.assertTrue(adoption.accepted, adoption)
-        # The task resolves 102's commit only; the queue replays 103 onto it mechanically.
-        self.assertEqual(adoption.provenance, {f"{PROJECT}#102": "edited", f"{PROJECT}#103": "clean"})
+        self.assertEqual(adoption.provenance, {f"{PROJECT}#102": "edited", f"{PROJECT}#103": "edited"})
         adopted = self.open_batch()
         self.assertEqual(
             (adopted["state"], adopted["base"], adopted["tip"], adopted["version"]),
@@ -3806,7 +3632,7 @@ class PreRebase(QueueFixture):
         self.assertTrue(self.journal("rebased")[-1]["detail"]["pre_rebased"])
         self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
         self.assertEqual(
-            {m["number"]: m["provenance"] for m in self.members(sealed)}, {102: "edited", 103: "clean", 104: "clean"}
+            {m["number"]: m["provenance"] for m in self.members(sealed)}, {102: "edited", 103: "edited", 104: "clean"}
         )
         self.run_ci()
         self.tick(2)
@@ -3816,7 +3642,11 @@ class PreRebase(QueueFixture):
         self.assertEqual(self.repo.file_at("main", "TauCeti/Use.lean"), "theorem uses : True := foo_baz\n")
         self.assertIn("edited this contribution", self.github.comments_for(102)[0]["body"])
         self.assertNotIn("edited this contribution", self.github.comments_for(104)[0]["body"])
-        self.assertNotIn("edited this contribution", self.github.comments_for(103)[0]["body"])
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["reason"], "empty-commit")
+        [comment] = self.github.comments_for(103)
+        self.assertIn("rejected during staging repair", comment["body"])
+        self.assertIn("#101 adds both_add.", comment["body"])
+        self.assertEqual(self.github.closed[103], "Change 103")
 
     def test_a_head_tip_change_supersedes_the_open_pre_rebase_task_and_redoes_it(self):
         self.github.ci_policy = verdicts("fail")
