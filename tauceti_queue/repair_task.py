@@ -2411,7 +2411,9 @@ def resolve_conflicts(
                     rest = accept(tip, report)
                     state.write("conflict_validated", conflict=source_pr, attempt=0, tip=tip, report=report)
                     if rest is not None:
-                        log(f"task {task.task_id}: using the {how} resolution of {source_pr}'s commit {commit[:12]}")
+                        log(
+                            f"task {task.task_id}: {'reusing the stored' if made_on is None else 'using the lookahead'} resolution of {source_pr}'s commit {commit[:12]}"
+                        )
                         if made_on is not None and not cancel.is_set():
                             store_resolution(cfg.clone, task.task_id, commit, prefix, tip)
                         resolved.append({"source_pr": source_pr, "commit": commit, "resolved": tip, how: True})
