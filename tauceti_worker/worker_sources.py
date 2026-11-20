@@ -52,6 +52,12 @@ def canonical_mathematics_source():
     )
 
 
+def activity_repository():
+    """The activity report's key for the selected TauCeti repository; Forgejo keys name their forge."""
+    source = current()
+    return source.repository.key if source else TAUCETI
+
+
 def pull_url(number):
     source = current()
     return (source.repository if source else RepositoryRef(GITHUB, TAUCETI)).pull_url(number)

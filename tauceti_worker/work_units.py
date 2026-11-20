@@ -1504,6 +1504,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         log(f"{stage} #{c.pr}: merge queue owns this PR; skipping ordinary maintenance")
         return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
+    from .worker_sources import activity_repository
+
+    # Activity receipts (push hook, admissions) key the PR by its forge.
+    os.environ["TAUCETI_GITHUB_REPOSITORY"] = activity_repository()
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
@@ -1713,7 +1717,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         with contextlib.suppress(Exception):
             from .fleet_events import emit
 
-            emit("pr_activity", repository=TAUCETI, pr=c.pr, activity=stage, head_sha=c.head)
+            emit("pr_activity", repository=activity_repository(), pr=c.pr, activity=stage, head_sha=c.head)
     return rc
 
 
