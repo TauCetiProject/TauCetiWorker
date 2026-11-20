@@ -6315,13 +6315,18 @@ class Controller:
     def _onto_canonical(self, batch: dict[str, Any], now: float) -> bool:
         """Whether the open batch is based on the canonical commit, replaying it there first when it is
         not: it lands on top of `main`, so a preparation on an older base builds a tree that never
-        lands. A clean replay re-bases the batch (members' commits, base, tip, a new version, as
-        `_rebase_head` does for the head). A conflicting one is recorded per batch version and
-        canonical commit, so the replay is not repeated each pass, and the batch gets no own-base
-        preparation; its conflicts are resolved when it is pre-rebased."""
+        lands. The replay runs without the controller lock, under a `rebase` claim on the batch that
+        holds insertion off, and is applied only if neither the batch nor the canonical commit moved
+        meanwhile. A clean replay re-bases the batch (members' commits, base, tip, a new version). A
+        conflicting one is recorded per batch version and canonical commit, so it is not repeated each
+        pass, and the batch gets no own-base preparation; its conflicts are resolved when it is
+        pre-rebased. A batch with a pre-rebase is left as it is: its preparation is that of the
+        pre-rebased chain, which names its own chain."""
         canonical = self._canonical
         if not canonical or batch["base"] == canonical:
             return True
+        if batch["pre_rebase_state"]:
+            return False
         key = f"open_rebase_conflict:{batch['id']}"
         recorded = self._state(key) or {}
         if recorded.get("version") == batch["version"] and recorded.get("onto") == canonical:
@@ -6332,19 +6337,34 @@ class Controller:
             return False
         if self._active_claims(batch["id"]):
             return False
+        with self.store.transaction():
+            claim = self._take_claim(batch, "rebase", now)
         chain_id = f"open-rebase-{batch['id']}-{secrets.token_hex(4)}"
+        result: chain.ChainResult | None = None
         try:
-            result = chain.replay(self.clone, batch["base"], batch["tip"], canonical, chain_id=chain_id)
+            with self._lock.unlocked():
+                result = chain.replay(self.clone, batch["base"], batch["tip"], canonical, chain_id=chain_id)
         except chain.ChainError as error:
             self._note_reason(f"open batch {batch['id']}: replay onto {canonical[:12]} failed: {error}")
-            return False
         finally:
             chain.delete_chain_ref(self.clone, chain_id)
-        if result.status != chain.CLEAN:
-            source_pr = result.conflict.source_pr if result.conflict else None
+        current = self.store.row("batches", {"id": batch["id"]})
+        moved = (
+            result is None
+            or current is None
+            or current["version"] != batch["version"]
+            or current["state"] != BATCH_OPEN
+            or current["pre_rebase_state"]
+            or self._canonical != canonical
+            or [c for c in self._active_claims(batch["id"]) if c["id"] != claim["id"]]
+        )
+        if moved or result.status != chain.CLEAN:
             with self.store.transaction():
-                self._set_state(key, {"version": batch["version"], "onto": canonical, "source_pr": source_pr})
-                self.store.journal(now, "open-rebase-conflict", batch["id"], onto=canonical, source_pr=source_pr)
+                self._release_claim(claim, "batch-moved" if moved else "conflict", now)
+                if not moved:
+                    source_pr = result.conflict.source_pr if result.conflict else None
+                    self._set_state(key, {"version": batch["version"], "onto": canonical, "source_pr": source_pr})
+                    self.store.journal(now, "open-rebase-conflict", batch["id"], onto=canonical, source_pr=source_pr)
             return False
         version = batch["version"] + 1
         by_pr = {record.source_pr: record for record in result.commits}
@@ -6356,6 +6376,7 @@ class Controller:
             self.store.update("batches", {"id": batch["id"]}, version=version, base=canonical, tip=result.tip)
             self._record_tip(batch["id"], version, result.tip, now)
             self._retain(self.batch_ref(batch["id"], version), result.tip)
+            self._release_claim(claim, "rebased", now)
             self._count("open_batch_rebases")
             self.store.journal(
                 now,
