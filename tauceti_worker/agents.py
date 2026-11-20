@@ -973,6 +973,8 @@ def host_agent_argv(
     from .build_resources import defaults
 
     env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
+    env.pop("TAUCETI_CLAUDE_USAGE_CREDENTIALS", None)
+    env.pop("TAUCETI_CLAUDE_USAGE_OPERATOR_HOME", None)
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
@@ -3548,6 +3550,9 @@ def isolate_home(wid: str) -> Path:
     Returns the worker home. Children inherit the exported variables (and, off macOS, $HOME)."""
     import shutil
 
+    from .quota import normalize_claude_usage_credentials
+
+    normalize_claude_usage_credentials()
     home = _worker_iso_home(wid)
     iso_claude, iso_codex = home / ".claude", home / ".codex"
     iso_kiro_home, iso_kiro_data = home / ".kiro", kiro_data_dir(home, {})

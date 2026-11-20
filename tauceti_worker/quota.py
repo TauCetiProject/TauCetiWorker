@@ -27,7 +27,7 @@ from uuid import uuid4
 
 from . import oauth as credential_refresh
 from .config import Config, log
-from .constants import POLL
+from .constants import ALLOWED_TASKS, POLL, SANDBOX_DEFAULT
 from .github import GitHubError
 
 
@@ -344,6 +344,7 @@ class Provider:
     # Only --ignore-quota may proceed without a usable reading.
     telemetry_unavailable: bool = False
     model_refusal: bool = False  # actual model refusal; bounded retry independent of usage polling
+    credential_scope: str | None = None  # optional usage-login inspection or work-phase route
 
 
 def _finite_num(x: object) -> bool:
@@ -869,6 +870,139 @@ def claude_dir(home: Path) -> Path:
     return Path(d) if d else home / ".claude"
 
 
+def normalize_claude_usage_credentials() -> Path | None:
+    """Pin the usage file in the operator context before a worker moves HOME, including old loops."""
+    raw = os.environ.get("TAUCETI_CLAUDE_USAGE_CREDENTIALS", "").strip()
+    if not raw:
+        return None
+    from .paths import login_home
+
+    home = os.environ.get("HOME", str(login_home()))
+    if os.environ.get("TAUCETI_DATA_HOME") == home:
+        anchor = os.environ.get("TAUCETI_CLAUDE_USAGE_OPERATOR_HOME") or str(login_home())
+    else:
+        anchor = home
+    os.environ["TAUCETI_CLAUDE_USAGE_OPERATOR_HOME"] = anchor
+    if raw == "~" or raw.startswith("~/"):
+        path = Path(anchor) / raw.removeprefix("~").lstrip("/")
+    else:
+        path = Path(raw).expanduser()
+    path = Path(os.path.abspath(path))
+    try:
+        if path.is_dir():
+            path /= ".credentials.json"
+    except OSError:
+        pass
+    os.environ["TAUCETI_CLAUDE_USAGE_CREDENTIALS"] = str(path)
+    return path
+
+
+def claude_usage_credentials() -> Path | None:
+    """Optional normalized usage-only login file, independent of the credential agents receive."""
+    return normalize_claude_usage_credentials()
+
+
+def claude_agent_credential_route(phases: list[str], *, bubble: bool) -> str:
+    """Strictest actual credential route among the worker's selected agent phases."""
+    selected = phases or ALLOWED_TASKS
+    if "security-audit" in selected:
+        return "access-only"
+    if "review" in selected or (bubble and any(SANDBOX_DEFAULT.get(phase, False) for phase in selected)):
+        return "file"
+    return "environment"
+
+
+def claude_agent_credentials(cfg) -> tuple[Path, ...]:
+    """Agent-facing file and its renewable source, never the separate usage login."""
+    directory = claude_dir(cfg.home)
+    paths = [directory / ".credentials.json"]
+    source = _read_marker(directory / ".tauceti-creds-source")
+    if source:
+        paths.append(Path(source).expanduser() / ".credentials.json")
+    return tuple(dict.fromkeys(paths))
+
+
+def claude_file_credential_problem(path: Path, *, renewable: bool) -> str | None:
+    """Validate a file handed to an agent; copies must already hold a live access token."""
+    oauth = _as_dict(_as_dict(_read_json_file(path)).get("claudeAiOauth"))
+    if not isinstance(oauth.get("accessToken"), str) or not oauth["accessToken"].strip():
+        return f"no {path} (the credential agents launch from)"
+    expires = oauth.get("expiresAt")
+    if expires is not None and not _finite_num(expires):
+        return f"invalid expiry in {path} (the credential agents launch from)"
+    can_renew = renewable and isinstance(oauth.get("refreshToken"), str) and bool(oauth["refreshToken"].strip())
+    if not can_renew and expires is not None and expires <= time.time() * 1000:
+        return (
+            f"the token agents launch from in {path} has expired; renew that login or replace it with a "
+            "new `claude setup-token`"
+        )
+    return None
+
+
+def _same_credential_file(first: Path, second: Path) -> bool:
+    if first.resolve() == second.resolve():
+        return True
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
+def _claude_identity(oauth: dict) -> dict[str, set[str]]:
+    account = _as_dict(oauth.get("account"))
+    values = {
+        "account": [oauth.get(k) for k in ("accountUuid", "account_uuid", "accountId")]
+        + [account.get(k) for k in ("uuid", "id")],
+        "email": [oauth.get("emailAddress"), account.get("email_address")],
+    }
+    return {
+        kind: {v.strip().casefold() for v in items if isinstance(v, str) and v.strip()}
+        for kind, items in values.items()
+    }
+
+
+def claude_usage_identity_verified(cfg) -> bool:
+    """Whether available local account fields corroborate the two credentials; never probes a provider."""
+    usage = claude_usage_credentials()
+    if usage is None or sys.platform == "darwin":
+        return False
+    measured = _as_dict(_as_dict(_read_json_file(usage)).get("claudeAiOauth"))
+    agent = _as_dict(_as_dict(_read_json_file(claude_agent_credentials(cfg)[0])).get("claudeAiOauth"))
+    route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
+    environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if route == "environment" and environment_token and environment_token != agent.get("accessToken"):
+        return False
+    first, second = _claude_identity(measured), _claude_identity(agent)
+    if any(first[kind] and second[kind] and first[kind].isdisjoint(second[kind]) for kind in first):
+        return False
+    return any(first[kind] & second[kind] for kind in first)
+
+
+def claude_usage_configuration_problem(cfg) -> str | None:
+    """Reject usage/agent aliases or locally demonstrated account mismatch before reads or rotation."""
+    usage = claude_usage_credentials()
+    if usage is None:
+        return None
+    for path in claude_agent_credentials(cfg):
+        try:
+            if _same_credential_file(usage, path):
+                return "Claude usage login must be a separate file from the agents' credential and its source"
+        except (OSError, RuntimeError):
+            return "cannot establish that Claude usage and agent credential files are separate"
+    if sys.platform == "darwin":
+        return None  # macOS agent Keychain selection is unchanged by this usage-only feature.
+    measured = _as_dict(_as_dict(_read_json_file(usage)).get("claudeAiOauth"))
+    agent = _as_dict(_as_dict(_read_json_file(claude_agent_credentials(cfg)[0])).get("claudeAiOauth"))
+    route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
+    environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if route == "environment" and environment_token and environment_token != agent.get("accessToken"):
+        return None  # Opaque setup tokens offer no account field to compare; operator asserts identity.
+    first, second = _claude_identity(measured), _claude_identity(agent)
+    if any(first[kind] and second[kind] and first[kind].isdisjoint(second[kind]) for kind in first):
+        return "Claude usage login and agent credential identify different accounts"
+    return None
+
+
 def _write_json_atomic(path: Path, data: dict) -> None:
     """Non-corrupting credential-file write: a UNIQUE temp file in the same dir (a concurrent writer
     can't consume ours), preserve the existing mode (else 0600), fsync, then atomic rename. Raises on
@@ -1244,10 +1378,11 @@ class Quota:
         """
         if provider == "claude":
             source = self._claude_creds_source()
+            usage = claude_usage_credentials()
             value = (
                 known.get(provider)
-                if sys.platform == "darwin"
-                else _as_dict(reader(source / ".credentials.json")).get("claudeAiOauth")
+                if sys.platform == "darwin" and usage is None
+                else _as_dict(reader(usage or source / ".credentials.json")).get("claudeAiOauth")
             )
         else:
             source = self._codex_creds_source()
@@ -1992,7 +2127,11 @@ class Quota:
         a file), so we read it FIRST and only fall back to a file; from_keychain marks creds we must NOT
         refresh/persist, since rotating the shared token would log out the operator's claude. Reading the
         Keychain first also means a credentials file we materialize for the bubble never shadows the live
-        Keychain here. On Linux the file is the store."""
+        Keychain here. On Linux the file is the store. A usage login (claude_usage_credentials) replaces
+        all of these on every platform: it is a file only the pacer reads."""
+        usage = claude_usage_credentials()
+        if usage is not None:
+            return _as_dict(_as_dict(_read_json_file(usage)).get("claudeAiOauth")) or None, False
         if sys.platform == "darwin":
             kc = _claude_keychain_creds()
             if kc and kc.get("claudeAiOauth"):
@@ -2032,13 +2171,24 @@ class Quota:
         worker on the host, so a credential that can no longer be rotated is retried at a bounded rate
         rather than once per poll, and a rotation another process just performed is not immediately
         spent again. A failure is reported and swallowed: an unrefreshable credential still reads as an
-        unavailable provider, which is the honest answer."""
-        if sys.platform == "darwin" or os.environ.get("TAUCETI_AUTO_REFRESH") != "1":
+        unavailable provider, which is the honest answer.
+
+        With a usage login (claude_usage_credentials) that file is the one rotated, on macOS too, and
+        the agents' credential is left alone."""
+        usage = claude_usage_credentials()
+        if usage is not None and claude_usage_configuration_problem(self.cfg):
+            return False
+        if os.environ.get("TAUCETI_AUTO_REFRESH") != "1" or (sys.platform == "darwin" and usage is None):
             return False
         # The ORIGINAL, never the mirror the pacer reads: mirror_creds overwrites the mirror from the
         # original every cycle, so rotating the mirror would be undone and leave the real credential
         # expired. _claude_creds_source resolves the isolate_home marker for exactly this.
-        prov = credential_refresh.provider("claude", credentials=self._claude_creds_source() / ".credentials.json")
+        prov = credential_refresh.provider(
+            "claude", credentials=usage or self._claude_creds_source() / ".credentials.json"
+        )
+        if usage is not None:
+            # $TAUCETI_REFRESH_MIRROR is the copy agents launch from, and it must keep their own token.
+            prov = replace(prov, mirror=None)
         if not credential_refresh.renewable(prov):
             return False
         if not force:
@@ -2063,6 +2213,18 @@ class Quota:
         return False
 
     def claude(self, *, refresh: bool = False, renew: bool = False) -> Provider:
+        result = self._claude_read(refresh=refresh, renew=renew)
+        if claude_usage_credentials() is not None:
+            route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL")
+            scope = (
+                f"work credential route: {route}"
+                if route
+                else ("host credential inspection; review/audit credentials checked when work starts")
+            )
+            result = replace(result, credential_scope=scope)
+        return result
+
+    def _claude_read(self, *, refresh: bool = False, renew: bool = False) -> Provider:
         """Read the Claude usage endpoint and report whether opus may run. PURE: it reads, it never
         spends. A dashboard refresh, `tauceti status`, and an `auto` selection that ends up picking
         codex must all be able to call this without making a Claude request.
@@ -2082,6 +2244,8 @@ class Quota:
                                    unreadable quota constraint is not the same as no constraint.
           idle                   → ordinary work may start if the other limits and startup pace allow it.
         """
+        if claude_usage_credentials() is not None and (problem := claude_usage_configuration_problem(self.cfg)):
+            return Provider("claude", False, None, error=problem)
         # Renew before reading, then mirror, so a rotation reaches an isolated worker's copy in the same
         # call that performed it.
         if renew and not getattr(self, "_cache_only", False):
@@ -2091,10 +2255,16 @@ class Quota:
         oauth, _from_keychain = self._claude_creds()
         self._wait_identities = getattr(self, "_wait_identities", {}) | {"claude": oauth}
         if not oauth:
-            err = f"no {claude_dir(self.cfg.home) / '.credentials.json'}"
-            if sys.platform == "darwin":
+            usage = claude_usage_credentials()
+            err = f"no {usage or claude_dir(self.cfg.home) / '.credentials.json'}"
+            if usage is not None:
+                err += " (the usage login $TAUCETI_CLAUDE_USAGE_CREDENTIALS names)"
+            elif sys.platform == "darwin":
                 err += ' (and no "Claude Code-credentials" Keychain entry)'
             return Provider("claude", False, None, error=err)
+        unusable = self._claude_launch_credential_unusable()
+        if unusable:
+            return Provider("claude", False, None, error=unusable)
         # The cache is keyed by the access token: a rotation to a different account changes it (forcing a
         # re-fetch); an external same-account refresh also changes it, costing one harmless extra fetch.
         # Account cooldown identity is deliberately stable across token refreshes.
@@ -2105,7 +2275,11 @@ class Quota:
             # The stored expiry said the token was live and the endpoint disagreed — a clock skew, a
             # server-side revocation, or a credential rotated behind our back. Believe the endpoint over
             # the file: rotate once (rate-limited), and re-read rather than reporting a 401 we can fix.
-            if self._refresh_claude_credential(force=True):
+            # Workers sharing a usage login all read the one file, so a sibling may have rotated it since
+            # this read. The token it left there is then the fix, and no refresh token is spent on it.
+            shared = claude_usage_credentials() is not None
+            current = (self._claude_creds()[0] or {}).get("accessToken") if shared else None
+            if current not in (None, oauth.get("accessToken")) or self._refresh_claude_credential(force=True):
                 mirror_creds(self.cfg)
                 oauth, _from_keychain = self._claude_creds()
                 if oauth:
@@ -2114,6 +2288,26 @@ class Quota:
                         fp, oauth.get("accessToken"), refresh=True, account=self._claude_account_key(oauth)
                     )
         return prov
+
+    def _claude_launch_credential_unusable(self) -> str | None:
+        """Why the agents cannot launch, when a usage login answers for them and their own credential
+        is known to be unusable: the file in $CLAUDE_CONFIG_DIR is missing, or it holds a token past
+        its expiry that the agents cannot renew. None otherwise, and always off this route, on macOS,
+        where agents read the Keychain first, and with $CLAUDE_CODE_OAUTH_TOKEN set where the agents
+        inherit it and authenticate with it ahead of the file. `work` records in
+        $TAUCETI_CLAUDE_AGENT_CREDENTIAL what its phases' launches receive
+        (cli.claude_agent_credential_route). Only an "environment" launch uses the file in place and keeps
+        a renewal; the other routes hand the agent a copy, so their file needs a live access token."""
+        route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
+        if (
+            claude_usage_credentials() is None
+            or sys.platform == "darwin"
+            or (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and route == "environment")
+        ):
+            return None
+        return claude_file_credential_problem(
+            claude_dir(self.cfg.home) / ".credentials.json", renewable=route == "environment"
+        )
 
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None
@@ -2289,7 +2483,11 @@ class Quota:
 
     def _claude_creds_source(self) -> Path:
         """The canonical credential location this worker is measuring — the operator's real claude dir
-        even when running under an isolated $HOME (isolate_home leaves a .tauceti-creds-source marker)."""
+        even when running under an isolated $HOME (isolate_home leaves a .tauceti-creds-source marker),
+        or the usage login's directory, which every worker naming that login then shares."""
+        usage = claude_usage_credentials()
+        if usage is not None:
+            return usage.parent
         d = claude_dir(self.cfg.home)
         src = _read_marker(d / ".tauceti-creds-source")
         return Path(src) if src else d
@@ -2298,7 +2496,8 @@ class Quota:
         """Stable account identity for shared usage polling and cooldowns.
 
         Prefer a provider account identifier; otherwise share by canonical credential
-        source. Separate credential copies on separate hosts do not coordinate.
+        source, or by the usage login's file, since several can share a directory.
+        Separate credential copies on separate hosts do not coordinate.
         """
         if oauth is None:
             oauth, _kc = self._claude_creds()
@@ -2312,7 +2511,7 @@ class Quota:
                 for sub in ("uuid", "id", "email_address"):
                     if isinstance(blk.get(sub), str) and blk[sub]:
                         return f"account:{blk[sub]}"
-        return f"creds:{self._claude_creds_source()}"
+        return f"creds:{claude_usage_credentials() or self._claude_creds_source()}"
 
     @staticmethod
     def _next_eligible(windows: list[Window], now: float | None = None) -> float | None:
@@ -2505,4 +2704,6 @@ def quota_line(snap: dict, *, markup: bool = True) -> str:
             soft, why = _unavail_reason(prov)
             glyph = _glyph("~", "yellow", markup) if soft else _glyph("✗", "red", markup)
             parts.append(f"{name} {glyph} ({why})")
+        if getattr(prov, "credential_scope", None):
+            parts[-1] += f" ({prov.credential_scope})"
     return "   ".join(parts) if parts else "quota: (not checked)"
