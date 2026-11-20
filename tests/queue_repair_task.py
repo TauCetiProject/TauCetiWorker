@@ -1693,6 +1693,91 @@ class RebaseArtifacts(Fixture):
         for path in ("TauCeti/Two.lean", "TauCeti/Three.lean"):
             self.assertNotIn("<<<<<<<", sh(self.content.bare, "show", f"{three.sha}:{path}"))
 
+    def test_a_stopped_task_resumes_after_its_last_resolution(self):
+        """The worker stops while the agent resolves member 3, after member 2's resolution was accepted.
+        Another worker sharing the clone re-claims the task later, so its replay makes the same prefix
+        under another SHA: member 2's conflict is not given to the agent again, and the submitted chain
+        is the one an uninterrupted run builds."""
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        moved = commit(seed, "main moved again", {"TauCeti/Three.lean": "-- three, on main\n"})
+        sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        self.raw["onto"] = self.onto = moved
+        # Fixed committer dates make the replays reproducible, so the chains can be compared by SHA.
+        dates = patch.dict(os.environ, {"GIT_COMMITTER_DATE": "1700000000 +0000"})
+        dates.start()
+        self.addCleanup(dates.stop)
+
+        def contents(tip: str) -> list[tuple]:
+            return [
+                (c.tree, c.message, c.author_name, c.author_date)
+                for c in chain_tool.chain_commits(clone, self.onto, tip)
+            ]
+
+        clone = self.content.clone
+        stored = lambda: sh(clone, "for-each-ref", "--format=%(refname)", repair_task.RESOLUTION_PREFIX).split()  # noqa: E731
+
+        # The reference: task 2, the same chain and target, run without a stop.
+        self.service.tasks = {2: {**self.raw, "task_id": 2}}
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        reference = chain_tool.chain_commits(clone, self.onto, outcome["tip"])
+        self.assertEqual(len(reference), 3)
+        self.assertEqual(stored(), [], "an answered task leaves no stored resolution")
+
+        self.service.tasks = {1: self.raw}
+        os.environ["STUB_AGENT_MODES"] = "repair,repair,repair,sleep"  # task 2 made calls 1 and 2
+        os.environ["STUB_SLEEP"] = "60"
+        stop = repair_task.Stop()
+        self.addCleanup(stop.set, "cleanup")
+
+        def stop_in_the_second_conflict():
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline and len(self.agent_calls()) < 4:
+                time.sleep(0.05)
+            time.sleep(0.5)
+            stop.set("test")
+
+        threading.Thread(target=stop_in_the_second_conflict, daemon=True).start()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg), stop=stop)
+        self.assertEqual((outcome["status"], outcome["reason"]), ("released", "worker-stopped"), outcome)
+        self.assertIn("PR #3's commit", self.agent_calls()[3]["prompt"], "stopped in the second conflict")
+        self.assertEqual(len(stored()), 1, "member 2's accepted resolution is recorded")
+        recorded = sh(clone, "rev-parse", stored()[0])
+        self.assertEqual(recorded, reference[1].sha, "the run before the stop made the reference's commit")
+
+        os.environ.pop("STUB_AGENT_MODES")
+        os.environ["GIT_COMMITTER_DATE"] = "1700003600 +0000"  # the restart replays an hour later
+        other = self.config(root=self.root / "state-b", worker="worker-b@test")
+        outcome = repair_task.claim_and_run(other, self.client(other))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 5, "one more agent run: member 3's conflict")
+        self.assertIn(f"PR #3's commit `{self.content.members[2]['commit'][:12]}`", calls[4]["prompt"])
+        self.assertNotIn(f"PR #2's commit `{self.content.members[1]['commit'][:12]}`", calls[4]["prompt"])
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True, False])
+        resumed = chain_tool.chain_commits(clone, self.onto, outcome["tip"])
+        self.assertNotEqual(resumed[0].sha, reference[0].sha, "the prefix was replayed under another SHA")
+        self.assertEqual(contents(outcome["tip"]), contents(reference[-1].sha), "the same chain")
+        self.assertEqual(stored(), [])
+
+    def test_a_stored_resolution_that_does_not_match_is_not_used(self):
+        """An entry naming another commit's resolution under this commit's key is not reused: the agent
+        resolves the conflict and the entry is dropped."""
+        cfg = self.config()
+        clone = self.content.clone
+        sh(clone, "fetch", "--quiet", str(self.content.bare), self.onto, self.content.tip)
+        prefix = chain_tool.replay(clone, self.content.base, self.content.members[0]["commit"], self.onto).tip
+        conflicting = self.content.members[1]["commit"]
+        ref = repair_task.resolution_ref("1", conflicting, chain_tool.tree_of(clone, prefix))
+        sh(clone, "update-ref", ref, self.content.members[2]["commit"])
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [False])
+        self.assertEqual(sh(clone, "for-each-ref", repair_task.RESOLUTION_PREFIX), "")
+
     def test_a_resolution_that_takes_in_a_later_member_is_refused(self):
         """Replaying member 3 by hand inside member 2's resolution is refused before the replay continues."""
         os.environ["STUB_AGENT_MODE"] = "absorb"

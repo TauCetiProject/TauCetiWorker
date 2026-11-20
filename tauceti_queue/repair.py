@@ -657,6 +657,54 @@ def commit_resolution(
     git(worktree, "checkout", "--quiet", "--force", "--detach", sha)
     if git(worktree, "rev-parse", "HEAD").strip() != sha:
         raise RuntimeError(f"the worktree could not be checked out at the resolved commit {sha[:12]}")
+    return sha, resolution_report(clone, prefix, sha, original, paths, large_refactors, explained=bool(explanation))
+
+
+def recommit_resolution(
+    clone: Path, stored: str, prefix: str, commit: str, paths: list[str], large_refactors=frozenset()
+) -> tuple[str, dict] | None:
+    """An earlier accepted resolution ``stored`` of ``commit``, committed again on the clean ``prefix``
+    as ``commit_resolution`` would commit the same files and explanation: its tree and message, the
+    conflicting commit's author and date. The worker's replay dates its commits when it runs, so a
+    rerun's prefix has the same tree under another SHA. None when ``stored`` is not a resolution of
+    ``commit`` on a prefix with ``prefix``'s tree (missing, foreign or otherwise mismatched); the report
+    is ``commit_resolution``'s. The worktree is not touched."""
+    try:
+        resolved = chain_tool.read_commit(clone, stored)
+        original = chain_tool.read_commit(clone, commit)
+        parent_tree = chain_tool.tree_of(clone, resolved.parents[0]) if len(resolved.parents) == 1 else None
+    except chain_tool.ChainError:
+        return None
+    if parent_tree != chain_tool.tree_of(clone, prefix) or not resolved.message.startswith(
+        original.message.rstrip() + "\n"
+    ):
+        return None
+
+    def recommit(parent: str) -> str:
+        return chain_tool.commit_tree(
+            clone,
+            resolved.tree,
+            parent,
+            resolved.message,
+            (original.author_name, original.author_email),
+            author_date=original.author_date,
+            committer_date=original.author_date,
+        )
+
+    # Only a commit made exactly as the worker makes one (author, committer and dates) is reused, not
+    # one an agent made with `git commit` and pointed a ref at.
+    if recommit(resolved.parents[0]) != stored:
+        return None
+    sha = recommit(prefix)
+    explained = bool(chain_tool.appended_text(original.message, resolved.message).strip())
+    return sha, resolution_report(clone, prefix, sha, original, paths, large_refactors, explained=explained)
+
+
+def resolution_report(
+    clone: Path, prefix: str, sha: str, original, paths: list[str], large_refactors, *, explained: bool
+) -> dict:
+    """``commit_resolution``'s report on the resolved commit ``sha`` of ``original`` on ``prefix``."""
+    commit = original.sha
     problems = []
     for path in paths:
         blob = git(clone, "cat-file", "-p", f"{sha}:{path}", check=False)
@@ -666,13 +714,13 @@ def commit_resolution(
     for entry in review:
         problems += [f"review-size: the resolved commit against its parent: {v}" for v in entry["violations"]]
     source_pr = original.source_pr or commit
-    return sha, {
+    return {
         "base": prefix,
         "tip": sha,
         "resolved": commit,
         "review_size": review,
         "edited": [source_pr],
-        "unexplained": [] if explanation else [source_pr],
+        "unexplained": [] if explained else [source_pr],
         "problems": problems,
         "ok": not problems,
     }
