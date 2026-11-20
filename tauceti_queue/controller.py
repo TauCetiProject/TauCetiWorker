@@ -6330,6 +6330,10 @@ class Controller:
                 # evicted batch returns; an own-base preparation would rewrite the chain under it.
                 continue
             if not self._prepare_due(batch, now):
+                if batch["prepared_version"] == batch["version"]:
+                    # Prepared on a base `main` has moved past: kept when its replay onto `main` is clean,
+                    # rebased onto `main` in the background (and then prepared again) when it conflicts.
+                    self._onto_canonical(batch, now, rebase_clean=False)
                 continue
             pre_rebase = self._open_pre_rebase_task(batch)
             if pre_rebase is not None and self._active_claims(batch["id"], task_id=pre_rebase["id"]):
@@ -6365,7 +6369,7 @@ class Controller:
             and task["base"] != self._canonical
         )
 
-    def _onto_canonical(self, batch: dict[str, Any], now: float) -> bool:
+    def _onto_canonical(self, batch: dict[str, Any], now: float, *, rebase_clean: bool = True) -> bool:
         """Whether the open batch is based on the canonical commit, replaying it there first when it is
         not: it lands on top of `main`, so a preparation on an older base builds a tree that never
         lands. The replay runs without the controller lock, under a `rebase` claim on the batch that
@@ -6374,7 +6378,8 @@ class Controller:
         conflicting one is recorded per batch version and canonical commit, so it is not repeated each
         pass, and the batch gets no own-base preparation; its conflicts are resolved when it is
         pre-rebased. A batch with a pre-rebase is left as it is: its preparation is that of the
-        pre-rebased chain, which names its own chain."""
+        pre-rebased chain, which names its own chain. Without `rebase_clean` (a batch already prepared)
+        a clean replay leaves the batch and its preparation as they are, and is recorded likewise."""
         canonical = self._canonical
         if not canonical or batch["base"] == canonical:
             return True
@@ -6383,6 +6388,8 @@ class Controller:
         key = f"open_rebase_conflict:{batch['id']}"
         recorded = self._state(key) or {}
         if recorded.get("version") == batch["version"] and recorded.get("onto") == canonical:
+            if recorded.get("source_pr") is None:
+                return True  # a clean replay of a prepared batch, left as it is
             self._note_reason(
                 f"open batch {batch['id']}: its replay onto {canonical[:12]} conflicts at {recorded.get('source_pr')}; "
                 "it is prepared once a worker resolves its rebase onto main"
@@ -6411,6 +6418,11 @@ class Controller:
             or self._canonical != canonical
             or [c for c in self._active_claims(batch["id"]) if c["id"] != claim["id"]]
         )
+        if not moved and result.status == chain.CLEAN and not rebase_clean:
+            with self.store.transaction():
+                self._release_claim(claim, "clean", now)
+                self._set_state(key, {"version": batch["version"], "onto": canonical, "source_pr": None})
+            return True
         if moved or result.status != chain.CLEAN:
             with self.store.transaction():
                 self._release_claim(claim, "batch-moved" if moved else "conflict", now)

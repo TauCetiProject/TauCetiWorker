@@ -2357,6 +2357,44 @@ class OpenBatchRebaseOntoMain(QueueFixture):
         [prepare] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
         self.assertEqual((prepare["kind"], prepare["base"]), ("prepare", main))
 
+    def prepared_batch(self):
+        """A head in CI and an open batch 202/203 prepared clean on its base."""
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        task = self.controller.claim_task("preparer", "admin-worker")
+        self.assertEqual(task.kind, "prepare")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        batch = self.open_batch()
+        self.assertEqual(batch["prepared_version"], batch["version"])
+        return batch
+
+    def test_a_prepared_batch_whose_replay_onto_main_conflicts_is_rebased_onto_main(self):
+        batch = self.prepared_batch()
+        main = self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
+
+    def test_a_prepared_batch_whose_replay_onto_main_is_clean_keeps_its_preparation(self):
+        batch = self.prepared_batch()
+        self.repo.advance_main({"Elsewhere.lean": "x\n"})
+        self.tick()
+        self.tick()
+        kept = self.open_batch()
+        self.assertEqual(
+            (kept["version"], kept["base"], kept["prepared_version"]),
+            (batch["version"], batch["base"], batch["version"]),
+        )
+        self.assertEqual(self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"}), [])
+        rebase_claims = self.controller.store.rows("claims", {"batch_id": batch["id"], "operation": "rebase"})
+        self.assertEqual(len(rebase_claims), 1, "replayed once, then remembered")
+
     def test_insertion_goes_around_an_open_batch_being_rebased(self):
         self.approve(101, {"A.lean": "a\n"})
         self.tick()
