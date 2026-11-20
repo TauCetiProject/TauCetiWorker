@@ -1716,7 +1716,6 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if rc == 0 and stage in PR_TASKS and c.pr and (stage not in PROGRESS_GUARDED or progress is True):
         with contextlib.suppress(Exception):
             from .fleet_events import emit
-            from .worker_sources import activity_repository
 
             emit("pr_activity", repository=activity_repository(), pr=c.pr, activity=stage, head_sha=c.head)
     return rc
