@@ -466,6 +466,7 @@ class Releases(unittest.TestCase):
         self.run_script("install-monitoring.sh", "--wait", "0")
         monitoring_pid = self.pid("tauceti-queue-monitoring.service")
         (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
+        (self.home / ".config/tauceti-queue/security-audit-anthropic-api-key").write_text("key")
         (self.home / ".config/tauceti-security-audit").mkdir(exist_ok=True)
         for name in ("github-app.json", "github-private-key.pem"):
             (self.home / ".config/tauceti-security-audit" / name).write_text("{}")
@@ -499,6 +500,7 @@ class Releases(unittest.TestCase):
 
     def test_security_audit_drop_in_is_refused(self):
         (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
+        (self.home / ".config/tauceti-queue/security-audit-anthropic-api-key").write_text("key")
         (self.home / ".config/tauceti-security-audit").mkdir(exist_ok=True)
         for name in ("github-app.json", "github-private-key.pem"):
             (self.home / ".config/tauceti-security-audit" / name).write_text("{}")

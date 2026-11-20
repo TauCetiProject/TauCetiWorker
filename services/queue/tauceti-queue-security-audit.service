@@ -26,6 +26,8 @@ Environment=PATH=%h/.local/bin:%h/.nix-profile/bin:/run/current-system/sw/bin:/u
 Environment=TAUCETI_LEGACY_DATA_ROOT=%h/TauCetiQueue-data/security-audit-pool
 # Cursor pushes and readiness dispatches use this GitHub App, not a personal account's quota.
 Environment=TAUCETI_SECURITY_AUDIT_GITHUB_APP=%h/.config/tauceti-security-audit
+# When neither subscription is available, Haiku reviews are billed to this API key file.
+Environment=TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE=%h/.config/tauceti-queue/security-audit-anthropic-api-key
 Environment=TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG=%h/.config/tauceti-queue/security-audit-zulip.json
 ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_worker.security_audit pool --state %h/TauCetiQueue-data/security-audit-pool/state/pool/security-audit --parallel 16 --ignore-quota
 Restart=on-failure
