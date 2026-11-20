@@ -47,8 +47,8 @@ LOG_BYTES = 64_000  # of a tool log, for the sites it reports to the agent
 JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
-# An import in a Lean header, with the module system's modifiers.
-IMPORT = re.compile(r"^(?:(?:public|private|meta)\s+)*import\s+(?:all\s+)?([\w.'«»]+)", re.M)
+# The words of a Lean header besides `import` and the module names (`header_imports`).
+HEADER_WORDS = ("module", "prelude", "public", "private", "meta", "all")
 CANDIDATE = re.compile(r"[\w'!?\)\]⟩»·℘]\.\d")
 # For `projection_edits`: a numeric projection, the named field replacing it, and a receiver the
 # tool may parenthesize.
@@ -242,14 +242,31 @@ def _run_tool(worktree: Path, env: dict, tool: Path, files: list[Path], cache: P
     return repair.run_logged(wrapped, worktree, log, env=run_env, timeout=timeout)
 
 
-def imported_modules(worktree: Path, sides: dict, paths: list[str]) -> list[str]:
-    """The project modules the two versions of the conflicting files import: those with a source in the
-    worktree that is not itself conflicting."""
+def header_imports(text: str) -> list[str]:
+    """The modules a Lean file's header imports: its leading `module`, `prelude` and `import` lines with
+    their modifiers, comments skipped, up to the first other token."""
+    text = re.sub(r"--[^\n]*", " ", re.sub(r"/-.*?-/", " ", text, flags=re.S))
+    modules, expecting = [], False
+    for token in text.split():
+        if expecting:
+            if token != "all":
+                modules.append(token)
+                expecting = False
+        elif token == "import":
+            expecting = True
+        elif token not in HEADER_WORDS:
+            break
+    return modules
+
+
+def imported_modules(worktree: Path, sides: dict) -> list[str]:
+    """The project modules the two versions of the conflicting files import: those with a source in
+    the worktree."""
     modules = set()
     for _, base, theirs in sides.values():
         for text in (base, theirs):
-            modules.update(IMPORT.findall(text.decode(errors="replace")))
-    return sorted(m for m in modules if (worktree / module_path(m)).is_file() and module_path(m) not in paths)
+            modules.update(header_imports(text.decode(errors="replace")))
+    return sorted(m for m in modules if (worktree / module_path(m)).is_file())
 
 
 def module_path(module: str) -> str:
@@ -257,21 +274,28 @@ def module_path(module: str) -> str:
 
 
 def _build_imports(
-    worktree: Path, sides: dict, paths: list[str], env: dict, log: Path, timeout: float, lake, lock
+    worktree: Path, prefix: str, sides: dict, paths: list[str], env: dict, log: Path, timeout: float, lake, lock
 ) -> bool:
-    """Build the modules the tool needs to elaborate the files (``imported_modules``); False when the
-    build fails, since the tool cannot elaborate them then."""
+    """Build the modules the tool needs to elaborate the files (``imported_modules``), with the clean
+    prefix's version of every conflicting file in place of git's markers meanwhile (one of the modules
+    may import one); False when the build fails, since the tool cannot elaborate the files then."""
     from tauceti_queue import repair, repair_tools
 
-    modules = imported_modules(worktree, sides, paths)
+    modules = imported_modules(worktree, sides)
     if not modules:
         return True
-    try:
-        argv = repair_sandbox.sandboxed_lake([*lake, "build", *modules], worktree, env)
-    except repair_sandbox.SandboxUnavailable:
-        return False
+    argv = repair_sandbox.sandboxed_lake([*lake, "build", *modules], worktree, env)
+    marked = {p: (worktree / p).read_bytes() for p in paths if (worktree / p).is_file()}
+    clean = {p: _blob(worktree, prefix, p) for p in marked}
     with repair_tools.build_lock(worktree, log=lambda *a, **k: None, lock=lock):
-        return repair.run_logged(argv, worktree, log, env=env, timeout=timeout)["rc"] == 0
+        try:
+            for path, data in clean.items():
+                if data is not None:
+                    _write(worktree / path, data)
+            return repair.run_logged(argv, worktree, log, env=env, timeout=timeout)["rc"] == 0
+        finally:
+            for path, data in marked.items():
+                _write(worktree / path, data)
 
 
 def _merge(ours: bytes, base: bytes, theirs: bytes, labels: tuple[str, str, str]) -> tuple[int, bytes] | None:
@@ -338,12 +362,11 @@ def prepass(
             sides[path] = (ours, base, theirs)
     if not sides:
         return None
-    if not _build_imports(
-        worktree, sides, paths, env, logdir / f"numproj-{commit[:12]}-imports.log", timeout, lake, build_lock
-    ):
-        return None
     scratch, directory = None, None
     try:
+        log = logdir / f"numproj-{commit[:12]}-imports.log"
+        if not _build_imports(worktree, prefix, sides, paths, env, log, timeout, lake, build_lock):
+            return None
         cache = _private_dir(worktree / ".lake", SCRATCH, "cache")  # the compiled scanner, per toolchain
         scratch = _private_dir(worktree / ".lake", SCRATCH, f"run-{secrets.token_hex(6)}")
         copy = scratch / "tool"
