@@ -241,7 +241,7 @@ def verify(provider: str, state: Path):
         )
         prompt = sa.judgment_prompt(batch, True)
         if provider == "codex":
-            cmd = sa.codex_launch(home, True, goals=False, protocol=sa.PROTOCOL)
+            cmd = sa.codex_launch(home, True, home / "read-receipt.json")
             cmd[-1:-1] = [
                 "-c",
                 'model_provider="audit_test"',
@@ -251,7 +251,7 @@ def verify(provider: str, state: Path):
                 + ',wire_api="responses",requires_openai_auth=false,supports_websockets=false}',
             ]
         else:
-            cmd = sa.reviewer_argv(provider, protocol=sa.PROTOCOL)
+            cmd = sa.reviewer_argv(provider)
             cmd.remove("--safe-mode")
             cmd[cmd.index("--mcp-config") + 1] = sa.serialize(
                 {
@@ -261,7 +261,7 @@ def verify(provider: str, state: Path):
                             "command": sys.executable,
                             "args": [
                                 "-I",
-                                str(sa.reader_path(sa.PROTOCOL)),
+                                str(sa.reader_path()),
                                 str(home / "input.json"),
                                 str(home / "served.json"),
                             ],

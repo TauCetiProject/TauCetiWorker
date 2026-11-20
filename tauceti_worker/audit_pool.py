@@ -13,6 +13,7 @@ nothing beyond it can advance), and only an attempt with no judgment is retried.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import fcntl
 import json
 import os
@@ -26,7 +27,7 @@ from . import audit_evidence as evidence
 from . import audit_watchdog
 from . import security_audit as sa
 from .audit_alerts import notify_block, save
-from .audit_evidence import NotJudged, Unreadable, concern, holds
+from .audit_evidence import NotJudged, Unreadable
 from .config import Die, NoProgress, log
 
 RETRY_SECONDS = 60
@@ -468,21 +469,12 @@ class Pool:
             f"split into {len(shas[:half])} + {len(shas[half:])} commits"
         )
 
-    def concluded(self, slot: Slot, attempt: Path, verdict: dict, cursor: str, *, batch: dict | None = None) -> None:
+    def concluded(self, slot: Slot, attempt: Path, verdict: dict, cursor: str) -> None:
         """A binding verdict: a pass may advance; any recorded concern blocks the range for review."""
         span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
-        launched = (attempt / "execution.json").exists()
         sa.record(
             self.work / "ledger.jsonl",
-            sa.review_record(
-                self.actor or "",
-                slot.provider,
-                sa.attempt_protocol(attempt) if launched else sa.PROTOCOL,
-                batch or slot.batch,
-                attempt,
-                verdict,
-                slot.credential,
-            ),
+            sa.review_record(self.actor or "", slot.provider, slot.batch, attempt, verdict, slot.credential),
         )
         slot.verdict = verdict
         if verdict["verdict"] == "pass" and verdict["input_digest"] != slot.digest:
@@ -550,30 +542,6 @@ class Pool:
                 (self.work / "blocked.json").write_text(sa.serialize(failure))
         return cursor
 
-    def supersede(self, previous: dict) -> bool:
-        """Archive a block whose evidence binds nothing, so the pool inspects its batch afresh.
-
-        A recorded concern or unreadable evidence (in the attempt, its lineage or the ledger)
-        and a planning block remain binding."""
-        if previous.get("manual_inspection_required") or previous.get("outcome") in ("finding", "unreadable"):
-            return False
-        span = (previous.get("from_sha"), previous.get("to_sha"))
-        ledger = self.work / "ledger.jsonl"
-        for line in ledger.read_text().splitlines() if ledger.exists() else ():
-            row = json.loads(line)
-            if (row.get("from_sha"), row.get("to_sha")) == span and concern(row.get("verdict")):
-                return False
-        for key in ("attempt", "continuation_of"):
-            if previous.get(key) and holds(self.work, Path(previous[key])):
-                return False
-        archived = self.work / f"superseded-by-pool-block-{time.time_ns()}.json"
-        (self.work / "blocked.json").rename(archived)
-        sa.record(ledger, {"superseded_operational_block": previous, "archived": str(archived)})
-        log(
-            f"security-audit pool: superseded operational block {span[0][:12]}..{(span[1] or '')[:12]}; fresh isolated inspection"
-        )
-        return True
-
     # Loop ------------------------------------------------------------------
     def step(self, executor) -> bool:
         """One control pass. A binding block at the cursor holds advancement, never the pool."""
@@ -588,30 +556,12 @@ class Pool:
             raise
         self.settle_journal()
         self.sync(cursor, main)
-        blocked = self.work / "blocked.json"
-        hold = False
-        if blocked.exists():
-            previous = json.loads(blocked.read_text())
-            # A launch journals its own attempt in blocked.json. One of this pool's
-            # own attempts is not a block: its slot's status already binds it.
-            mine = {str(attempt) for _, attempt in self.running.values()}
-            mine.update(a for slot in self.slots for a in slot.attempts)
-            ours = previous.get("attempt") in mine
-            hold = previous.get("from_sha") == cursor and not ours and not self.supersede(previous)
-        # Delivery is idempotent and backs off on its own receipts. Re-offer every held block on
-        # each pass, so a failed DM is retried rather than only attempted when the block is created.
-        if hold:
-            notify_block(self.work, previous)
+        # Binding ranges are the durable list and the ledger's recorded concerns, never blocked.json,
+        # which only mirrors the block at the cursor for operators and alerts. Delivery is idempotent
+        # and backs off on its own receipts, so every held block is offered again on each pass.
         for slot in self.slots:
             if slot.status == "blocked" and slot.failure:
                 notify_block(self.work, slot.failure)
-        if hold and not (self.slots and self.slots[0].status in ("pass", "blocked")):
-            # The batch at the cursor holds a binding judgment this pool cannot
-            # identify in its window; never plan or inspect it again. Wait for review.
-            if self.holding != cursor:
-                log(f"security-audit pool: unresolved block at the cursor; read {blocked}")
-                self.holding = cursor
-            return True
         if self.slots and self.slots[0].status == "blocked":
             if self.holding != cursor:
                 log("security-audit pool: block at the cursor awaits human review; inspecting ahead")
@@ -636,14 +586,36 @@ class Pool:
             raise self.observation
         return self.observation
 
-    def serve(self, *, stop=None) -> None:
-        """Run until a binding block holds the cursor, or `stop(pool)` returns true."""
+    @contextlib.contextmanager
+    def owned(self, busy: type[Exception]):
+        """Hold the cursor's scheduler lock; `busy` is raised when another scheduler holds it."""
         self.work.mkdir(parents=True, exist_ok=True)
         with (self.work / "pool.lock").open("a+") as lock:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise Die("security-audit: another pool already owns this audit state") from None
+                raise busy("security-audit: another scheduler owns this audit state") from None
+            yield
+
+    def round(self) -> int:
+        """One bounded quantum for a Worker round: advance, inspect at most one range, advance again.
+
+        Raises AuditNotDue when no work is due and NoProgress while it waits (a retry's backoff, a
+        binding range, or no reviewer), so the round returns and maintenance takes its turn."""
+        with self.owned(sa.AuditNotDue), concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            self.step(executor)
+            if not self.running:
+                if not self.slots and self.planning_blocked is None:
+                    raise sa.AuditNotDue("security-audit: no audit work is due")
+                raise NoProgress("security-audit: audit work is waiting (backoff, a binding range or no reviewer)")
+            for future in concurrent.futures.as_completed(list(self.running)):
+                self.finished(future, sa.remote_sha(sa.CURSOR))
+            self.advance(sa.remote_sha(sa.CURSOR))
+        return 0
+
+    def serve(self, *, stop=None) -> None:
+        """Run until `stop(pool)` returns true; a binding block holds advancement, never the pool."""
+        with self.owned(Die):
             log(f"security-audit pool: up to {self.parallel} isolated reviewers; {self.chooser.describe()}")
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel) as executor:
                 while True:
@@ -730,3 +702,18 @@ class Chooser:
                 options.append(("claude", "api-key"))
         preferred = [option for option in options if option[0] != avoid]
         return (preferred or options or [None])[0]
+
+
+class Single:
+    """The reviewer of a Worker round: already paced by the round itself."""
+
+    def __init__(self, provider: str):
+        if provider not in ("codex", "claude"):
+            raise Die("security-audit: the audit reviewer must be codex or claude")
+        self.provider = provider
+
+    def describe(self) -> str:
+        return f"reviewer: {self.provider}"
+
+    def choose(self, avoid: str | None = None):
+        return (self.provider, sa.credential_kind(self.provider))
