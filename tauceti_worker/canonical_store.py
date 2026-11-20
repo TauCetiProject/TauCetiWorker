@@ -1247,13 +1247,15 @@ def boundary(checkout, env, *, phase, prefix=()):
     return report
 
 
-def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60, opened=()):
+def sweep(
+    pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60, opened=(), deadline=None
+):
     """Evict canonical objects only their own pool names link to, under the exclusive object lock.
 
     Link counts are evidence, not a refcount: a checkout or private store that links an object
     keeps it alive. Names a checkout recorded at a recent relink are kept unless under pressure.
     """
-    from .retention import note
+    from .retention import note, past
 
     now = time.time() if now is None else now
     directory = store(pool)
@@ -1271,6 +1273,9 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
             if now - lease.stat().st_mtime > lifetime:
                 remove(lease, pool, report, dry=dry, check_users=False, mounts=[])
     for path in objects.iterdir():
+        if past(deadline):
+            report.setdefault("deferred", []).append("canonical-objects")
+            break
         name = path.name
         try:
             info = path.lstat()

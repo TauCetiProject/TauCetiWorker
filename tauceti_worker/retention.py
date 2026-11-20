@@ -642,13 +642,16 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
         if shared and not defer("shared-caches"):
             from .cache_storage import collect
 
+            # The shared caches get half of the remaining time, so the per-worker phases below
+            # (recycling, retired checkouts, logs, transcripts) always run too.
+            shared_deadline = None if deadline is None else time.monotonic() + remaining(deadline, math.inf) / 2
             try:
                 storage = collect(
                     configs if shared_configs is None else shared_configs,
                     dry=dry,
                     now=now,
                     opened=opened,
-                    deadline=deadline,
+                    deadline=shared_deadline,
                 )
                 merge_report(report, storage)
                 report.update(
