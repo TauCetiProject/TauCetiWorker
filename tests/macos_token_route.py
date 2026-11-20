@@ -68,6 +68,8 @@ class Keychain:
         if cmd[0] != "security":
             raise AssertionError(f"unexpected subprocess: {cmd}")
         self.calls.append(cmd)
+        if "-w" not in cmd:
+            return types.SimpleNamespace(returncode=44, stdout="", stderr="")
         return types.SimpleNamespace(returncode=0, stdout=json.dumps(OPERATOR), stderr="")
 
 
@@ -153,7 +155,11 @@ try:
     check("the error names the worker's token file", str(worker_file) in (blocked.error or ""), True)
     check("no usage request is made for it", requests, [])
 
-    check("the login Keychain was never read", keychain.calls, [])
+    check(
+        "no Keychain password or unlock was requested",
+        [cmd for cmd in keychain.calls if "-w" in cmd or "unlock-keychain" in cmd],
+        [],
+    )
 
     # 8. Without a usage login the Keychain is the agents' credential, and the file is not checked.
     os.environ.pop(VARIABLE)

@@ -886,6 +886,37 @@ def claude_usage_credentials() -> Path | None:
     return path / ".credentials.json" if is_dir else path
 
 
+def claude_file_keychain_problem(home: Path) -> str | None:
+    """Refuse a macOS file route shadowed by a directory-specific Claude Keychain item.
+
+    Query metadata only: never retrieve a password, unlock the Keychain, or mutate it. The
+    native acceptance check must verify the CLI version's directory-service convention.
+    """
+    if sys.platform != "darwin" or claude_usage_credentials() is None:
+        return None
+    directory = os.environ.get("CLAUDE_CONFIG_DIR")
+    service = "Claude Code-credentials"
+    if directory:
+        service += "-" + hashlib.sha256(directory.encode()).hexdigest()[:8]
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "cannot verify the Claude file route against the macOS Keychain; no agent was launched"
+    if result.returncode == 44:  # errSecItemNotFound; the configured file can supply the credential.
+        return None
+    if result.returncode == 0:
+        return (
+            "a Claude Keychain entry shadows the configured agent credential file; use a dedicated "
+            "CLAUDE_CONFIG_DIR with no sign-in entry (the worker does not remove Keychain items)"
+        )
+    return "cannot verify the Claude file route against the macOS Keychain; no agent was launched"
+
+
 def _write_json_atomic(path: Path, data: dict) -> None:
     """Non-corrupting credential-file write: a UNIQUE temp file in the same dir (a concurrent writer
     can't consume ours), preserve the existing mode (else 0600), fsync, then atomic rename. Raises on
@@ -2185,7 +2216,7 @@ class Quota:
                 f"the token agents launch from in {path} has expired; renew that login or replace it with a "
                 "new `claude setup-token`"
             )
-        return None
+        return claude_file_keychain_problem(self.cfg.home)
 
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None

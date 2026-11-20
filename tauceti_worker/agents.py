@@ -2530,6 +2530,10 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
 
     source = claude_dir(cfg.home) / ".credentials.json"
     if claude_usage_credentials() is not None:
+        from .quota import claude_file_keychain_problem
+
+        if problem := claude_file_keychain_problem(cfg.home):
+            raise Die(problem)
         # The configured file is the agents' credential here; the Keychain item for the default config
         # directory is at most the operator's own sign-in.
         blob = _read_json_file(source)
