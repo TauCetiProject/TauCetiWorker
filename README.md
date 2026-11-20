@@ -460,8 +460,18 @@ inspected again, nothing beyond it advances, and the usual block and alert are
 recorded. An attempt that is not a judgment gets at most two more attempts before
 blocking. A block left at the cursor by an ordinary round whose evidence binds nothing
 is archived and inspected afresh; source findings never are.
-Passing results persist under `pool/` and are reused after a restart only when the
-rebuilt input is byte-identical and still the next main prefix. While the pool
+The pool's whole scheduling state is one ordered list of active ranges,
+`pool/ranges.json`, replaced atomically on every change: each range's exact commits,
+status, verdict or block, attempts, reviewer, retry count and next retry time. Every
+batch input is built by one function (`build_batch`) from a range's exact consecutive
+first-parent commits, with complete per-commit images and diffs. After a restart the
+list is restored while it is still the next main prefix; a pass is reused only when its
+rebuilt input is byte-identical, and a block stays binding. When a human attestation moves
+the cursor, ranges after it are kept, and a range it entered keeps only its remaining
+commits: still binding if blocked or in flight, otherwise inspected afresh. A range that was running
+when the pool stopped is first classified from its attempt's own evidence: a recorded
+concern binds, and only an attempt with no judgment is retried. An unreadable list
+holds the pool rather than replanning over a block. While the pool
 holds `pool.lock`, ordinary audit rounds for that state defer to it. A GitHub rate
 limit defers admin checks and cursor updates until reset without failing reviews.
 

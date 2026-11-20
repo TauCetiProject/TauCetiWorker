@@ -179,7 +179,22 @@ class Classification(unittest.TestCase):
         self.assertEqual(self.outcome().kind, ev.PASS)
         sa.record(self.state / "ledger.jsonl", {"batch": self.batch["input_digest"], "verdict": FINDING})
         self.assertFinding(self.outcome())
-        self.assertTrue(ev.recorded(self.state, self.batch["input_digest"]).concerns())
+        self.assertTrue(ev.recorded(self.state, self.batch).concerns())
+
+    def test_a_ledger_concern_binds_every_range_containing_its_commits(self):
+        self.codex([native_message(PASS)], exec_answer(PASS))
+        other = {
+            "input_digest": "other-plan",
+            "commits": ["c" * 40, "b" * 40],
+            "verdict": "finding",
+            "findings": ["IO"],
+        }
+        sa.record(self.state / "ledger.jsonl", {"batch": "other-plan", "verdict": other})
+        self.assertFinding(self.outcome(), ["IO"])
+        self.setUp()
+        self.codex([native_message(PASS)], exec_answer(PASS))
+        (self.state / "ledger.jsonl").write_text('{"batch": "x", "verdict": {"commits": ["' + "b" * 40 + '"], "verd\n')
+        self.assertEqual(self.outcome().kind, ev.UNREADABLE)
 
     def test_an_empty_incomplete_names_no_concern(self):
         self.assertEqual(ev.concern({"verdict": "incomplete", "findings": []}), [])

@@ -377,6 +377,28 @@ ci="one/project"
         result = self.native_survey([self.row(1), self.row(2, author=4)], blocking=True)
         self.assertEqual([candidate.pr for candidate in result.needs_fix.actionable], [1])
 
+    def test_adopted_native_author_is_repaired_without_counting_as_authored(self):
+        fork = {**self.row(3, author=4), "headRepository": {"nameWithOwner": "kim/project", "name": "project"}}
+        with patch.dict(os.environ, {"TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS": "4"}):
+            result = self.native_survey([self.row(1), self.row(2, author=4), fork], blocking=True)
+        self.assertEqual([candidate.pr for candidate in result.needs_fix.actionable], [1, 2])
+        self.assertEqual([p.number for p in result._mine_open_prs], [1])
+
+    def test_adopted_native_author_authorizes_only_same_repository_repairs(self):
+        w = self.native_worker()
+        w.gh.authenticated_actor = Mock(return_value=self.actor)
+        w.gh.validate_binding = Mock()
+        candidate = Candidate(1, "a" * 40, source_repository=self.repo, source_repository_id=7)
+        same = {"user": {"id": 4}, "head": {"repo": {"id": 7}}}
+        fork = {"user": {"id": 4}, "head": {"repo": {"id": 8}}}
+        with patch.dict(os.environ, {"TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS": "4"}):
+            w.gh.live_pull = Mock(return_value=same)
+            self.assertTrue(w.gh.authorize_candidate(candidate, require_writer=True))
+            w.gh.live_pull = Mock(return_value=fork)
+            self.assertFalse(w.gh.authorize_candidate(candidate, require_writer=True))
+        w.gh.live_pull = Mock(return_value=same)
+        self.assertFalse(w.gh.authorize_candidate(candidate, require_writer=True))
+
     def test_unavailable_history_never_becomes_unreviewed_work(self):
         result = self.native_survey([self.row()], metadata=Meta({}, "fetch_failed"))
         self.assertFalse(result.reviewable.actionable)

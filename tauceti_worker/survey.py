@@ -441,6 +441,10 @@ class Survey:
         # Qualified source records cannot fall back to a GitHub display login.
         return not hasattr(pr, "source_repository") and pr.author == self.me_login
 
+    def authored(self, pr: PRInfo) -> bool:
+        """PRs this identity opened itself: authoring pressure and "mine" counts use these."""
+        return self.owns(pr)
+
     def kind(self, name: str) -> WorkKind:
         return {
             "rebase": self.rebaseable,
@@ -986,7 +990,7 @@ def classify_survey(
     ]
     me_login = sv.me_login or me()
     sv.me_login = me_login
-    mine = [p for p in nondraft if sv.owns(p)]
+    mine = [p for p in nondraft if sv.authored(p)]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
     bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
@@ -1018,7 +1022,7 @@ def classify_survey(
     sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
     # total with the subset this identity authored, for the per-round "open PRs" line.
-    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.owns)
+    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.authored)
 
     # 1) rebase: tended (ours or bot-authored), conflicting or a sweep handoff for
     #    this exact head, under the per-PR budget since last verified progress.

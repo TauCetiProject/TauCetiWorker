@@ -34,7 +34,7 @@ from . import worker_scopes
 from .config import positive_integer, security_audit_problem, validate_extra_roadmap_prompt
 from .constants import AGENTS, ALLOWED_TASKS, DRAIN_SIGNAL, EXPLICIT_TASKS, MAX_OPEN_PRS
 from .github import unselected_github_env, validate_github_account
-from .paths import HERE, ensure_ssl_cert_file, entry_cmd, self_argv, self_env
+from .paths import HERE, ensure_ssl_cert_file, entry_cmd, fleet_dir, self_argv, self_env
 from .quota import PACE_PROVIDERS, effective_pace_specs, pace_env, parse_pace_curve
 from .round import signal_group
 from .runtime_status import STATUS_ENV, StatusPublisher, atomic_json, read_json
@@ -2115,10 +2115,28 @@ def cmd_tmux(config: Path, attach: bool) -> int:
 
 
 def _service_command(config: Path) -> list[str]:
+    fleet = fleet_dir()
+    # Fleet repoints <fleet>/bin/tauceti at each worker revision it pins, and may delete older
+    # revisions. The unit must name that launcher, not whichever `tauceti` is first on PATH or the
+    # revision that happened to run the install, so a restart picks up the pinned revision.
+    if fleet is not None:
+        launcher = fleet / "bin" / "tauceti"
+        if not launcher.is_file():
+            raise WorkersError(f"Fleet's worker launcher {launcher} is missing; run `tauceti-fleet update local` first")
+        return [str(launcher), "workers", "--config", str(config), "manager"]
     entry = entry_cmd()
     if len(entry) == 1 and not Path(entry[0]).is_absolute():
         entry[0] = shutil.which(entry[0]) or entry[0]
     return [*entry, "workers", "--config", str(config), "manager"]
+
+
+def _service_working_directory() -> Path:
+    # An installed package (a Fleet runtime, a uv tool) lives in a directory that an update replaces
+    # or deletes, and systemd refuses to start a unit whose working directory is missing. A source
+    # checkout keeps its repository root.
+    from .paths import HERE, INSTALLED, login_home
+
+    return login_home() if INSTALLED else HERE
 
 
 def _systemd_quote(value: str) -> str:
@@ -2126,10 +2144,13 @@ def _systemd_quote(value: str) -> str:
 
 
 def _service_environment() -> dict[str, str]:
-    env = self_env()
+    from .paths import INSTALLED, legacy_data_root
+
     service_env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
-        "PYTHONPATH": env["PYTHONPATH"],
+        # A source checkout needs its root on the path. An installed package is importable already,
+        # and its directory belongs to one runtime revision, which an update may delete.
+        "PYTHONPATH": "" if INSTALLED else self_env()["PYTHONPATH"],
     }
     runtime_bundle = ensure_ssl_cert_file({})
     configured = os.environ.get("SSL_CERT_FILE")
@@ -2149,8 +2170,6 @@ def _service_environment() -> dict[str, str]:
         # The unit may outlive a Nix store path. Preserve it as a candidate, not as the final
         # SSL_CERT_FILE, so cli_main revalidates it and can fall back or warn after collection.
         service_env["NIX_SSL_CERT_FILE"] = advertised_path
-    from .paths import INSTALLED, legacy_data_root
-
     if INSTALLED or os.environ.get("TAUCETI_LEGACY_DATA_ROOT"):
         # The unit must keep this installation's data root, including an XDG_DATA_HOME choice.
         service_env["TAUCETI_LEGACY_DATA_ROOT"] = str(legacy_data_root().resolve())
@@ -2164,7 +2183,7 @@ def _systemd_unit(config: Path) -> str:
     command = " ".join(_systemd_quote(part) for part in _service_command(config))
     # Assignment values are not shell syntax: quotes become literal in WorkingDirectory=. Escape the
     # small set systemd treats specially while keeping the path absolute after parsing.
-    working_directory = str(HERE).replace("\\", "\\\\").replace(" ", "\\x20").replace("%", "%%")
+    working_directory = str(_service_working_directory()).replace("\\", "\\\\").replace(" ", "\\x20").replace("%", "%%")
     # Each worker moves itself into a transient scope under this slice, so restarting the manager
     # (an update, a crash) adopts running workers instead of stopping them mid-round, as Fleet does.
     service_environment = {**_service_environment(), worker_scopes.SLICE_ENV: WORKER_SLICE}
@@ -2216,7 +2235,7 @@ def service_action(action: str, config: Path) -> int:
             payload = {
                 "Label": _launchd_label(),
                 "ProgramArguments": _service_command(config),
-                "WorkingDirectory": str(HERE),
+                "WorkingDirectory": str(_service_working_directory()),
                 "RunAtLoad": True,
                 "KeepAlive": True,
                 "EnvironmentVariables": _service_environment(),

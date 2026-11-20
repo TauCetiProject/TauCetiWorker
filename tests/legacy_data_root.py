@@ -683,6 +683,55 @@ class LegacyDataRoot(unittest.TestCase):
             with patch.object(paths, "INSTALLED", True), patch.object(paths, "HERE", home / "uv/tools/tauceti_worker"):
                 self.assertIsNone(paths.fleet_data_root())
 
+    def test_fleet_service_unit_survives_runtime_updates(self):
+        from tauceti_worker import worker_manager
+
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(os.environ):
+            home = Path(temporary).resolve()
+            fleet = home / ".local/share/tauceti-fleet"
+
+            def runtime(revision):
+                path = fleet / "worker-runtimes" / revision
+                (path / "lib/python3.13/site-packages/tauceti_worker").mkdir(parents=True)
+                (path / "bin").mkdir()
+                (path / "bin/tauceti").write_text(f"#!/bin/sh\necho {revision}\n")
+                (path / "bin/tauceti").chmod(0o755)
+                return path
+
+            old = runtime("abc123")
+            config_file = home / ".config/tauceti/workers.toml"
+            os.environ["TAUCETI_LEGACY_DATA_ROOT"] = str(home / "data")
+            os.environ["PATH"] = f"{old / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}"
+            with (
+                patch.object(paths, "INSTALLED", True),
+                patch.object(paths, "HERE", old / "lib/python3.13/site-packages/tauceti_worker"),
+                patch.object(paths, "login_home", return_value=home),
+            ):
+                # Never fall back to the running revision's console script, which an update deletes.
+                with self.assertRaisesRegex(worker_manager.WorkersError, "launcher"):
+                    worker_manager._service_command(config_file)
+                (fleet / "bin").mkdir()
+                (fleet / "bin/tauceti").symlink_to(old / "bin/tauceti")
+                unit = worker_manager._systemd_unit(config_file)
+                command = worker_manager._service_command(config_file)
+            # The launcher Fleet repoints at each pinned revision, and a working directory that a
+            # runtime update cannot delete.
+            self.assertIn(f'ExecStart="{fleet}/bin/tauceti" "workers" "--config" "{config_file}" "manager"', unit)
+            self.assertIn(f"WorkingDirectory={home}\n", unit)
+            self.assertIn('Environment="PYTHONPATH="\n', unit)
+            self.assertNotIn(str(old), unit.replace(os.environ["PATH"], ""))
+            # A Fleet update repoints the launcher and deletes the old revision; the command follows.
+            new = runtime("def456")
+            (fleet / "bin/tauceti").unlink()
+            (fleet / "bin/tauceti").symlink_to(new / "bin/tauceti")
+            for path in sorted(old.rglob("*"), reverse=True):
+                path.unlink() if not path.is_dir() else path.rmdir()
+            old.rmdir()
+            ran = subprocess.run(command[:1], capture_output=True, text=True, check=True, cwd=home)
+            self.assertEqual(ran.stdout.strip(), "def456")
+            with patch.object(paths, "INSTALLED", False):
+                self.assertEqual(worker_manager._service_working_directory(), paths.HERE)
+
     def test_data_inside_a_virtualenv_is_refused_or_reported(self):
         from tauceti_worker.config import Die
 
