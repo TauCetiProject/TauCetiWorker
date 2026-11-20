@@ -18,6 +18,24 @@ a function on the module that actually looks it up.
 
 from __future__ import annotations
 
+
+def _raise_stack_limit() -> None:
+    # leantar 0.1.21 (Lean v4.37.0-rc1) overflows the default 8 MiB stack on a large olean (exit 139).
+    # Every process of this package raises its soft stack limit to the hard limit on import, so the
+    # Lake builds, cache staging and restores it starts inherit it, whatever its entry point.
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_STACK, (hard, hard))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
+_raise_stack_limit()
+
+
 from tauceti_tools.project import bootstrap_qualified as _bootstrap_project
 
 
