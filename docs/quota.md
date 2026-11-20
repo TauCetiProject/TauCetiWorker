@@ -179,7 +179,10 @@ Both values are paths, so the `env` table holds no secret. The usage path is
 expanded and made absolute before isolation changes `HOME`; a directory is pinned
 to its `.credentials.json` file. It must be a separate file from both the agents'
 credential and its original source: identical paths, symlinks and hardlinks are
-refused before usage reads or refreshes. Agents do not receive the usage-path
+refused before usage reads or refreshes. Matching access or refresh tokens in
+the available agent files also reject a copied login. This cannot detect an
+export copied from a macOS Keychain: exclusive refresh ownership remains an
+operator assertion, and no new Keychain secret read is performed. Agents do not receive the usage-path
 environment variable.
 
 The two credentials must belong to the same account. When both files expose
@@ -209,6 +212,13 @@ Workers naming the same usage login share its observations, fetch lock and
 cooldowns under `<usage login directory>/.tauceti-quota/usage/`, exactly as
 workers sharing a credential source do. Model-limit refusals are recorded against
 the usage login too, so the two credentials must belong to one account.
+
+The variable must also be set in the environment running `status`, `doctor` or
+the dashboard; these commands do not load a worker's `env` table. Review phases
+pass `--require-claude-config-file` to the Review runtime, which validates the
+agent file and uses an access-only copy in a private reviewer home. An older
+explicitly pinned `TAUCETI_REVIEW_REF` or `TAUCETI_REVIEW_ENGINE_DIR` refuses the
+unknown flag before inference instead of silently choosing another login.
 
 Status and dashboard readings describe host credential inspection; they do not
 certify every possible agent phase. `work` chooses the strictest credential route

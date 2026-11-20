@@ -243,10 +243,19 @@ def _codex_model_unavailable(returncode: int, transcript: str) -> bool:
     return returncode != 0 and _codex_model_rejected(*_codex_error_details(transcript))
 
 
+def _without_usage_credentials(env: dict) -> dict:
+    """Keep usage-login configuration inside worker orchestration, away from agent processes."""
+    return {
+        k: v
+        for k, v in env.items()
+        if k not in ("TAUCETI_CLAUDE_USAGE_CREDENTIALS", "TAUCETI_CLAUDE_USAGE_OPERATOR_HOME")
+    }
+
+
 def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[str]:
     """Make one read-only, ephemeral request that cannot mutate the authoring checkout."""
     cfg.state.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
+    env = _without_usage_credentials(dict(os.environ))
     env.pop("OPENAI_API_KEY", None)  # authoring is subscription-paced; probe that same account
     env.pop("ANTHROPIC_API_KEY", None)
     command = [
@@ -414,7 +423,7 @@ def validate_kiro_model_access(cfg: Config, profile: AuthoringProfile) -> Author
         return profile
     _validate_kiro_model_pin(profile.model, profile.model_source)
     cfg.state.mkdir(parents=True, exist_ok=True)
-    env = kiro_process_env(dict(os.environ))
+    env = kiro_process_env(_without_usage_credentials(dict(os.environ)))
     try:
         result = subprocess.run(
             ["kiro-cli", "chat", "--list-models", "--format", "json"],
@@ -974,8 +983,7 @@ def host_agent_argv(
     from .build_resources import defaults
 
     env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
-    env.pop("TAUCETI_CLAUDE_USAGE_CREDENTIALS", None)
-    env.pop("TAUCETI_CLAUDE_USAGE_OPERATOR_HOME", None)
+    env = _without_usage_credentials(env)
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
@@ -1546,7 +1554,7 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
 
             if current() is None:
                 api_env.update(CLAIM_REPO=claims_repo(), TAUCETI_CLAIM_SH=CLAIM_SH)
-    env_kwargs = {"env": api_env} if api_env is not None else {}
+    env_kwargs = {"env": _without_usage_credentials(dict(os.environ) if api_env is None else api_env)}
     if os.environ.get("TAUCETI_STREAM"):
         return run_process(argv, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)
@@ -3282,6 +3290,8 @@ def _review_in_bubble_with(
         f"--reviewer {reviewers} --expect-head {head} --submitted-by {me()}"
         f"{claude_flag}{codex_flag}{kiro_flag}"
     )
+    if claude_usage_credentials() is not None and os.environ.get("TAUCETI_CLAUDE_BILLING") != "api":
+        inner += " --require-claude-config-file"
     if result_file is not None:
         inner = f"env TAUCETI_REVIEW_RESULT_FILE=/opt/review-result/{shlex.quote(result_file.name)} " + inner
     if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api":

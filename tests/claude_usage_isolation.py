@@ -136,6 +136,39 @@ class Isolation(unittest.TestCase):
         os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"] = "file"
         self.assertIsNotNone(quota.claude_usage_configuration_problem(self.cfg))
 
+    def test_copied_agent_tokens_are_not_a_separate_usage_login(self):
+        for key in ("accessToken", "refreshToken"):
+            credential(self.agent, refresh="agent-refresh")
+            credential(self.usage, "usage-token", refresh="usage-refresh")
+            document = json.loads(self.usage.read_text())
+            document["claudeAiOauth"][key] = json.loads(self.agent.read_text())["claudeAiOauth"][key]
+            self.usage.write_text(json.dumps(document))
+            self.assertIn("not a copy", quota.claude_usage_configuration_problem(self.cfg))
+        credential(self.usage, "usage-token", refresh="usage-refresh")
+        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "usage-token"
+        self.assertIn("environment token", quota.claude_usage_configuration_problem(self.cfg))
+
+    def test_usage_symlink_is_pinned_to_its_real_filename(self):
+        link = self.root / "usage-link.json"
+        link.symlink_to(self.usage)
+        os.environ[USAGE_VAR] = str(link)
+        self.assertEqual(quota.normalize_claude_usage_credentials(), self.usage)
+
+    def test_review_engine_and_probe_environments_do_not_receive_usage_paths(self):
+        os.environ["TAUCETI_CLAUDE_USAGE_OPERATOR_HOME"] = str(self.home)
+        with patch.object(agents, "run_process", return_value=SimpleNamespace(returncode=0)) as run:
+            agents._codex_model_probe(SimpleNamespace(state=self.root / "probe"), "model")
+        self.assertNotIn(USAGE_VAR, run.call_args.kwargs["env"])
+        with (
+            patch.object(agents, "run_process", return_value=SimpleNamespace(returncode=0)) as run,
+            patch("tauceti_worker.fleet_capacity.check_launch_admission"),
+            patch("tauceti_worker.claude_api.review_environment", return_value=None),
+            patch.dict(os.environ, {"TAUCETI_STREAM": "1"}),
+        ):
+            agents.run_to_logfile(["engine"], self.root / "review.log", "review #1")
+        self.assertNotIn(USAGE_VAR, run.call_args.kwargs["env"])
+        self.assertNotIn("TAUCETI_CLAUDE_USAGE_OPERATOR_HOME", run.call_args.kwargs["env"])
+
     def test_unidentified_setup_token_is_not_called_verified(self):
         self.assertIsNone(quota.claude_usage_configuration_problem(self.cfg))
         self.assertFalse(quota.claude_usage_identity_verified(self.cfg))
@@ -198,6 +231,13 @@ class Isolation(unittest.TestCase):
         value["claudeAiOauth"]["expiresAt"] = "invalid"
         self.agent.write_text(json.dumps(value))
         self.assertIn("invalid expiry", quota.claude_file_credential_problem(self.agent, renewable=False))
+        for expiry in (None, True, float("nan"), float("inf")):
+            value["claudeAiOauth"]["expiresAt"] = expiry
+            self.agent.write_text(json.dumps(value))
+            self.assertIn("invalid expiry", quota.claude_file_credential_problem(self.agent, renewable=False))
+        value["claudeAiOauth"].pop("expiresAt")
+        self.agent.write_text(json.dumps(value))
+        self.assertIsNone(quota.claude_file_credential_problem(self.agent, renewable=False))
         credential(self.agent, expires=-60, refresh="refresh")
         self.assertIsNone(quota.claude_file_credential_problem(self.agent, renewable=True))
         self.assertIn("expired", quota.claude_file_credential_problem(self.agent, renewable=False))

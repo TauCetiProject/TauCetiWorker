@@ -356,7 +356,7 @@ try:
         check("the error names the agents' file", str(agent_files[1]) in (expired.error or ""), True)
         # An isolated copy never holds a refresh token, so only an unisolated worker's own login renews.
         (agent_files[1].parent / ".tauceti-creds-source").unlink()
-        agent_files[1].write_text(login("agent-login", -60))
+        agent_files[1].write_text(login("agent-login", -60, "agent-only-refresh"))
         check("an expired login that can renew itself is", quota.claude(renew=True).available, True)
         with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "access-only"}):
             check("unless the agent gets it without its refresh token", quota.claude(renew=True).available, False)
@@ -389,7 +389,8 @@ try:
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 
-# 9) A TauCetiReview rubric reviewer runs in a clean home seeded with the credential file only.
+# 9) Installed Review pin contract only. Production resolves a separate source runtime;
+# its custom-CLAUDE_CONFIG_DIR contract is verified with the companion Review implementation.
 from runner import reviewers  # noqa: E402
 
 tmp = Path(tempfile.mkdtemp())

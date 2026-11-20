@@ -917,6 +917,10 @@ def normalize_claude_usage_credentials() -> Path | None:
             path /= ".credentials.json"
     except OSError:
         pass
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        pass  # Configuration validation below refuses an unresolvable alias before use.
     os.environ["TAUCETI_CLAUDE_USAGE_CREDENTIALS"] = str(path)
     return path
 
@@ -952,7 +956,7 @@ def claude_file_credential_problem(path: Path, *, renewable: bool) -> str | None
     if not isinstance(oauth.get("accessToken"), str) or not oauth["accessToken"].strip():
         return f"no {path} (the credential agents launch from)"
     expires = oauth.get("expiresAt")
-    if expires is not None and not _finite_num(expires):
+    if "expiresAt" in oauth and not _finite_num(expires):
         return f"invalid expiry in {path} (the credential agents launch from)"
     can_renew = renewable and isinstance(oauth.get("refreshToken"), str) and bool(oauth["refreshToken"].strip())
     if not can_renew and expires is not None and expires <= time.time() * 1000:
@@ -1014,9 +1018,20 @@ def claude_usage_configuration_problem(cfg) -> str | None:
         except (OSError, RuntimeError):
             return "cannot establish that Claude usage and agent credential files are separate"
     measured = _as_dict(_as_dict(_read_json_file(usage)).get("claudeAiOauth"))
-    agent = _as_dict(_as_dict(_read_json_file(claude_agent_credentials(cfg)[0])).get("claudeAiOauth"))
+    for path in claude_agent_credentials(cfg):
+        agent = _as_dict(_as_dict(_read_json_file(path)).get("claudeAiOauth"))
+        if any(
+            isinstance(measured.get(key), str) and measured[key].strip() and measured[key] == agent.get(key)
+            for key in ("accessToken", "refreshToken")
+        ):
+            return "Claude usage login must be a separate login, not a copy of the agents' credential"
     route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
     environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if route == "environment" and environment_token and environment_token == measured.get("accessToken"):
+        return "Claude usage login must be a separate login from the agents' environment token"
+    if sys.platform == "darwin":
+        return None  # macOS agent Keychain selection is unchanged by this usage-only feature.
+    agent = _as_dict(_as_dict(_read_json_file(claude_agent_credentials(cfg)[0])).get("claudeAiOauth"))
     if route == "environment" and environment_token and environment_token != agent.get("accessToken"):
         return None  # Opaque setup tokens offer no account field to compare; operator asserts identity.
     first, second = _claude_identity(measured), _claude_identity(agent)
