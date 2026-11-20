@@ -331,7 +331,9 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
         if row["managed_bytes"] > row["limit_bytes"] or row["free_before"] < headroom(row["total"], LOW)
     ]
     pool_device = pool.stat().st_dev if owned else None
-    urgent = str(pool_device) in pressured
+    # A walk too big to finish is itself a sign the pool is large: free space alone then decides
+    # when to stop (below), so a host with room to spare still keeps its warm entries.
+    urgent = str(pool_device) in pressured or "shared-cache-inventory" in report.get("deferred", [])
     # Oldest reuse first. These are disposable entries, not source or accounting records.
     candidates = []
     for entry in (pool / "entries").glob("*") if owned else ():

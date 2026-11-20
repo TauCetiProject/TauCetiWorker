@@ -1269,10 +1269,13 @@ def sweep(
     refused = rejected(pool)
     reconciling_until = time.monotonic() + reconcile_budget
     for lease in (directory / "uses").glob("*.list"):
+        if past(deadline):
+            break
         with contextlib.suppress(FileNotFoundError):
             if now - lease.stat().st_mtime > lifetime:
                 remove(lease, pool, report, dry=dry, check_users=False, mounts=[])
-    for path in objects.iterdir():
+    for entry in os.scandir(objects):  # Lazily: the store can hold millions of objects.
+        path = Path(entry.path)
         if past(deadline):
             report.setdefault("deferred", []).append("canonical-objects")
             break
@@ -1288,6 +1291,7 @@ def sweep(
                     old.lstat().st_ino != info.st_ino
                     and not dry
                     and time.monotonic() < reconciling_until
+                    and not past(deadline)
                     # Busy shards wait for the next sweep.
                     and reconcile(pool, name, old, blocking=False, guard=guard, refused=refused)
                 ):
@@ -1325,6 +1329,8 @@ def sweep(
         except OSError as error:
             note(report, "errors", f"{path}: {error}")
     for meta in (directory / "meta").glob("*/*.json"):
+        if past(deadline):
+            break
         with contextlib.suppress(FileNotFoundError):
             if not (objects / meta.name[: -len(".json")]).exists() and now - meta.stat().st_mtime > 3600:
                 if not dry:
