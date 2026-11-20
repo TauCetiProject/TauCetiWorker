@@ -7135,7 +7135,7 @@ REAL_NUMPROJ = (
 )
 
 
-class NumprojPrepass(Fixture):
+class NumprojBase(Fixture):
     """Main renamed the numeric projections of ``TauCeti/P.lean``; member 2 edits a line next to them
     with the old syntax, so replaying it conflicts. The pre-pass (``repair_numproj``) rewrites both
     sides with the tool (here a stand-in) and merges them before any agent runs."""
@@ -7187,6 +7187,52 @@ class NumprojPrepass(Fixture):
     def resolved_p(self, chain) -> str:
         return sh(self.content.bare, "show", f"{chain[1].sha}:TauCeti/P.lean") + "\n"
 
+
+class NumprojImports(NumprojBase):
+    """A rebase task's tree is not built when it is prepared: the project modules the conflicting file
+    imports are built before the tool runs, so it can elaborate the file; Mathlib's modules are not."""
+
+    IMPORTING = "public import Mathlib.Logic.Basic\nimport TauCeti.A\n"
+    BASE_FILES = {"TauCeti/P.lean": IMPORTING + OLD_P}
+    MEMBER_FILES = {2: {"TauCeti/P.lean": IMPORTING + OLD_P.replace("x.2", "x.2 + 1")}}
+
+    def test_the_imported_project_modules_are_built_before_the_tool_runs(self):
+        outcome, chain = self.run_task(self.IMPORTING + NEW_P)
+        self.assertEqual(outcome["conflicts"][0]["numproj"], True)
+        self.assertEqual(self.agent_calls(), [])
+        builds = [c for c in self.lake_calls() if c.startswith("build")]
+        self.assertIn("build TauCeti.A", builds)
+        self.assertFalse([b for b in builds if "Mathlib" in b], builds)
+
+    def test_the_header_is_parsed_with_comments_and_modifiers(self):
+        text = (
+            "/-\nCopyright\nimport Not.This\n-/\nmodule\n\n  public import Mathlib.Logic.Basic\n"
+            "import /- inline -/ TauCeti.A -- a comment\nmeta import all TauCeti.B\n\n/-! doc -/\n"
+            "theorem t : True := trivial\nimport Not.Header\n"
+        )
+        nested = "/- outer /- inner -/ outer -/\nimport TauCeti.A\n-- /- not a block\nimport TauCeti.B\n"
+        self.assertEqual(repair_numproj.header_imports(nested), ["TauCeti.A", "TauCeti.B"])
+        self.assertEqual(repair_numproj.header_imports(text), ["Mathlib.Logic.Basic", "TauCeti.A", "TauCeti.B"])
+
+    def test_a_conflicting_file_is_built_at_the_clean_prefix_and_restored(self):
+        """The build of the imports sees the clean prefix's version of a conflicting file (a clean
+        import may import it); git's markers are back in the worktree afterwards."""
+        seen = {}
+        original = repair.run_logged
+
+        def run_logged(argv, cwd, log, env=None, timeout=None):
+            if "numproj" in str(log) and str(log).endswith("-imports.log"):
+                seen["P"] = (Path(cwd) / "TauCeti/P.lean").read_text()
+            return original(argv, cwd, log, env=env, timeout=timeout)
+
+        with patch.object(repair, "run_logged", run_logged):
+            self.use_tool(rc=1)  # not mechanical: the agent sees the worktree the pre-pass leaves
+            self.run_task(self.IMPORTING + NEW_P.replace("x.snd", "x.snd * 2"))
+        self.assertNotIn("<<<<<<<", seen["P"])
+        self.assertIn("x.snd * 2", seen["P"], "the clean prefix's version")
+
+
+class NumprojPrepass(NumprojBase):
     def test_a_projection_only_conflict_is_resolved_without_the_agent(self):
         outcome, chain = self.run_task()
         self.assertEqual(self.agent_calls(), [], "no agent ran")
