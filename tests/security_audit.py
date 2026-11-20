@@ -726,6 +726,80 @@ class Authority(unittest.TestCase):
             else:
                 self.assertEqual(r["bypass_actors"], [])
 
+    def app_fixture(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        directory = Path(tmp.name)
+        (directory / "github-app.json").write_text(json.dumps({"id": 42, "slug": "tauceti-security-audit"}))
+        self.addCleanup(setattr, sa, "_app_source", None)
+        return directory
+
+    def test_audit_app_pushes_cursor_with_its_own_token(self):
+        directory = self.app_fixture()
+        old, target = "a" * 40, "c" * 40
+        with (
+            patch.dict(sa.os.environ, {sa.APP_ENV: str(directory), "GH_TOKEN": "ghp-personal"}),
+            patch.object(sa, "app_token", return_value="ghs-app-token"),
+            patch.object(sa.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run,
+        ):
+            sa.push_cursor(Path("repo"), old, target)
+        self.assertEqual(run.call_args.kwargs["env"]["TAUCETI_AUDIT_PUSH_TOKEN"], "ghs-app-token")
+        self.assertNotIn("ghs-app-token", " ".join(run.call_args.args[0]))
+        with (
+            patch.dict(sa.os.environ, {sa.APP_ENV: str(directory), "GH_TOKEN": "ghp-personal"}),
+            patch.object(sa, "app_token", side_effect=NoProgress("no App token")),
+            patch.object(sa.subprocess, "run") as run,
+            self.assertRaises(NoProgress),
+        ):
+            sa.push_cursor(Path("repo"), old, target)
+        run.assert_not_called()  # never falls back to the personal token
+
+    def test_audit_app_authority_and_dispatch(self):
+        directory = self.app_fixture()
+        installed = {"repositories": [{"full_name": "TauCetiProject/TauCeti"}]}
+        source = SimpleNamespace(granted_permissions=lambda: {"contents": "write", "metadata": "read"})
+        ok = SimpleNamespace(returncode=0, stdout=json.dumps(installed), stderr="")
+        with (
+            patch.dict(sa.os.environ, {sa.APP_ENV: str(directory), "GH_TOKEN": "ghp-personal"}),
+            patch.object(sa, "app_token", return_value="ghs-app-token"),
+            patch.object(sa, "_app_source", source),
+            patch.object(sa, "execute", return_value=ok) as call,
+        ):
+            self.assertEqual(sa.admin_login(), "tauceti-security-audit[bot]")
+            self.assertEqual(call.call_args.kwargs["env"]["GH_TOKEN"], "ghs-app-token")
+            self.assertNotIn("graphql", call.call_args.args[0])
+            call.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            sa.dispatch_advanced(Path("unused"), "d" * 40)
+            self.assertIn(f"repos/{sa.TAUCETI}/dispatches", call.call_args.args[0])
+            self.assertEqual(call.call_args.kwargs["env"]["GH_TOKEN"], "ghs-app-token")
+        for repositories, granted in (([], {"contents": "write"}), (installed["repositories"], {"contents": "read"})):
+            with (
+                self.subTest(repositories=repositories, granted=granted),
+                patch.dict(sa.os.environ, {sa.APP_ENV: str(directory)}),
+                patch.object(sa, "app_token", return_value="ghs-app-token"),
+                patch.object(sa, "_app_source", SimpleNamespace(granted_permissions=lambda g=granted: g)),
+                patch.object(
+                    sa,
+                    "execute",
+                    return_value=SimpleNamespace(
+                        returncode=0, stdout=json.dumps({"repositories": repositories}), stderr=""
+                    ),
+                ),
+                self.assertRaises(Die),
+            ):
+                sa.admin_login()
+
+    def test_audit_app_bypasses_only_the_cursor_ruleset(self):
+        directory = self.app_fixture()
+        with patch.dict(sa.os.environ, {sa.APP_ENV: str(directory)}):
+            rules = {r["name"]: r["bypass_actors"] for r in sa.protections()}
+        admin = {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "always"}
+        self.assertEqual(
+            rules["security-audit-admins"],
+            [admin, {"actor_type": "Integration", "actor_id": 42, "bypass_mode": "always"}],
+        )
+        self.assertEqual(rules["toolchain-tags-admins"], [admin])
+
     def test_invalid_verdict_is_never_approval(self):
         batch = {"input_digest": "digest", "commits": [{"sha": "a" * 40}]}
         good = {"input_digest": "digest", "commits": ["a" * 40], "verdict": "pass", "findings": []}
