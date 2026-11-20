@@ -6,8 +6,8 @@ before it. On a large batch after a big change to ``main`` most of that time is 
 conflicts one after another. Most of those conflicts are between one member and ``main``, so they do
 not depend on the prefix.
 
-When the replay first conflicts, the worker starts a ``Lookahead``: up to ``parallel_agents - 1``
-helpers, each resolving a later member's commit on ``onto`` alone, in a worktree of its own and a child
+When the replay first conflicts, the worker starts a ``Lookahead``: up to ``lookahead_helpers``
+helpers (``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 8), each resolving a later member's commit on ``onto`` alone, in a worktree of its own and a child
 process (``python -m tauceti_queue.repair_lookahead run <job>``, as ``repair_parallel``'s group agents
 run, since the agent path keeps per-process state). A helper runs ``repair_task.resolve_one``, the
 serial path's own code for one conflict: the numproj pre-pass, then the agent with its attempts and
@@ -27,9 +27,14 @@ resolution is (conflict markers, review size, no-repair members, absorbed later 
 the replay); one that does not merge or is not acceptable is resolved by the serial agent as before.
 The submitted chain goes through the queue's checks and staging as any other.
 
-Builds: every helper's agent build script takes the task worktree's build lock, the one the serial
-agent's builds take, so the task runs one Lean build at a time however many agents are thinking. The
-helpers run no other build; the numproj pre-pass only elaborates its own tool on the conflicting files.
+Builds: each helper's worktree has its own build lock, so the helpers' scoped builds run concurrently
+(about half of an agent's time is its builds). An agent's scoped build is small: on batch 457 a repair
+unit running three agents peaked at about 4 GB of anonymous memory, against 55 to 64 GiB for the
+worker's whole-library verification build, and the worker refuses an agent's whole-library build.
+The repair slice's shared memory ceiling is the backstop for the rare large ``--dependents`` build.
+Helpers share the task's ``.lake/packages`` read-only, so before the first helper starts the task
+worktree replays the dependencies' build once (``_cache_packages``), the one step of a replay that
+writes there.
 """
 
 from __future__ import annotations
@@ -40,15 +45,25 @@ import contextlib
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
-from tauceti_queue import repair, repair_audit, repair_parallel
+from tauceti_queue import repair, repair_audit, repair_parallel, repair_sandbox, repair_tools
 from tauceti_queue.repair import git
 
 DEPENDENCY_FILES = ("lean-toolchain", "lake-manifest.json")
+DEFAULT_HELPERS = 8
+
+
+def helpers_default() -> int:
+    """``TAUCETI_QUEUE_LOOKAHEAD_HELPERS`` (default 8); 0 turns the lookahead off."""
+    try:
+        return max(0, int(os.environ.get("TAUCETI_QUEUE_LOOKAHEAD_HELPERS") or DEFAULT_HELPERS))
+    except ValueError:
+        return DEFAULT_HELPERS
 
 
 def log(message: str) -> None:
@@ -85,8 +100,10 @@ class Lookahead:
 
         self.providers, _skipped = repair_task.select_providers(cfg)
         self.pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, int(cfg.parallel_agents) - 1), thread_name_prefix="lookahead"
+            max_workers=max(1, int(cfg.lookahead_helpers)), thread_name_prefix="lookahead"
         )
+        if not cfg.seed_packages:
+            self._cache_packages()
         self.feeder = threading.Thread(target=self._feed, args=(after,), name="lookahead-feeder", daemon=True)
         self.feeder.start()
 
@@ -116,6 +133,33 @@ class Lookahead:
             ):
                 continue  # resolved already, on ``onto`` or on its prefix by an earlier run of the task
             yield commit
+
+    def _cache_packages(self) -> None:
+        """Replay the dependencies' build in the task worktree once (``lake build Mathlib``). Lake moves a
+        replayed artifact into its artifact cache, which writes in ``.lake/packages``; the helpers share
+        the task's packages read-only, so they replay nothing there themselves. It runs at ``onto``
+        before any agent builds, and the task's cancellation stops it. Never fails."""
+        from tauceti_worker.processes import owned_process
+
+        try:
+            # At the target, whose dependencies the helpers build against; the serial replay checks the
+            # worktree out at each conflict itself.
+            git(self.worktree, "checkout", "--quiet", "--force", "--detach", self.task.onto)
+            argv = repair_sandbox.sandboxed_lake([*self.cfg.lake, "build", "Mathlib"], self.worktree, self.env_lake)
+            with (
+                repair_tools.build_lock(self.worktree, log=lambda *a, **k: None),
+                (self.logdir / "lookahead-packages.log").open("ab") as output,
+                owned_process(
+                    argv, cwd=self.worktree, env=self.env_lake, stdin=subprocess.DEVNULL, stdout=output, stderr=output
+                ) as proc,
+            ):
+                while proc.poll() is None:
+                    if self.task_cancel.wait(0.5):
+                        proc.terminate()
+                        proc.wait()
+            log(f"task {self.task.task_id}: lookahead packages replayed, exit {proc.returncode}")
+        except Exception as error:  # noqa: BLE001 - the helpers' builds report what is missing
+            log(f"task {self.task.task_id}: lookahead packages not replayed: {type(error).__name__}: {error}")
 
     def _feed(self, after: str) -> None:
         try:
@@ -208,7 +252,6 @@ class Lookahead:
             "result": str(result_path),
             "env_lake": self.env_lake,
             "artifacts": self.artifacts,
-            "build_lock": str(repair_parallel.lock_path(self.worktree)),
             "providers": list(providers),
         }
         job_path = directory / "job.json"
@@ -294,7 +337,6 @@ def run_job(job_path: Path) -> int:
             agent_records=agents,
             accept=accept,
             label=f"lookahead-{commit[:12]}",
-            build_lock=Path(job["build_lock"]),
             providers=job["providers"],
         )
         record = {"status": result["status"], "tip": result.get("tip"), "reason": result.get("reason")}

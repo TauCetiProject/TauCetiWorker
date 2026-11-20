@@ -79,10 +79,9 @@ def take_lock(lock: Path, log=print) -> None:
 
 
 @contextlib.contextmanager
-def build_lock(worktree: Path, log=print, *, lock: Path | None = None):
-    """Hold the worktree's build lock (or ``lock``, one several worktrees share) around the body, the
-    way the agent's build script does."""
-    lock = lock or worktree / TOOLS_DIR / LOCK_DIR
+def build_lock(worktree: Path, log=print):
+    """Hold the worktree's build lock around the body, the way the agent's build script does."""
+    lock = worktree / TOOLS_DIR / LOCK_DIR
     take_lock(lock, log)
     try:
         yield lock

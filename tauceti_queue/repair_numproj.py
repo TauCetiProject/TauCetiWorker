@@ -10,7 +10,7 @@ against the worktree's build, so it runs in the build sandbox like every other b
 on copies of the two versions under ``.lake``; the worktree's sources are not touched until the merges
 are done. A rebase task's tree is not built when it is prepared (its artifacts are only in Lake's
 artifact cache), so the project modules the two versions import are built first (``lake build``,
-under the task's build lock), mostly restored from that cache.
+under the worktree's build lock), mostly restored from that cache.
 
 The result is mechanical only when every conflicting file merged cleanly and the tool rewrote C's
 versions completely (exit 0). Otherwise the merged files, clean or with conflict markers, are the
@@ -302,7 +302,6 @@ def _build_imports(
     log: Path,
     timeout: float,
     lake,
-    lock,
 ) -> bool:
     """Build the modules the tool needs to elaborate the files (``imported_modules``), with the clean
     prefix's version of every conflicting file in place of git's markers meanwhile (one of the modules
@@ -314,7 +313,7 @@ def _build_imports(
     if not modules:
         return True
     argv = repair_sandbox.sandboxed_lake([*lake, "build", *modules], worktree, env)
-    with repair_tools.build_lock(worktree, log=lambda *a, **k: None, lock=lock):
+    with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
         try:
             for path in paths:  # rewritten or not, any of them may be imported
                 clean = _blob(worktree, prefix, path, limit=None)
@@ -353,7 +352,6 @@ def prepass(
     *,
     timeout: float = TIMEOUT_SECONDS,
     lake: tuple[str, ...] = ("lake",),
-    build_lock: Path | None = None,
 ) -> Prepass | None:
     """Rewrite numeric projections in both sides of ``commit``'s conflicting Lean files and merge them
     onto the clean ``prefix``, writing the merged files into ``worktree`` (checked out by
@@ -392,7 +390,7 @@ def prepass(
     scratch, directory = None, None
     try:
         log = logdir / f"numproj-{commit[:12]}-imports.log"
-        if not _build_imports(worktree, prefix, commit, sides, paths, env, log, timeout, lake, build_lock):
+        if not _build_imports(worktree, prefix, commit, sides, paths, env, log, timeout, lake):
             return None
         cache = _private_dir(worktree / ".lake", SCRATCH, "cache")  # the compiled scanner, per toolchain
         scratch = _private_dir(worktree / ".lake", SCRATCH, f"run-{secrets.token_hex(6)}")
