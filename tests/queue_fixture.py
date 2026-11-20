@@ -456,8 +456,13 @@ class Repair(QueueFixture):
         self.assertEqual(task["kind"], "rebase_conflict")
         [second] = [d for d in task["diagnostics"] if d["kind"] == "conflict"]
         self.assertEqual((second["source_pr"], second["commit"]), (order[1], commits[order[1]]))
-        prefix = chain.chain_commits(self.repo.clone, canonical, second["clean_prefix_tip"])
-        self.assertEqual([c.sha for c in prefix], [resolved.tip], "the new prefix is the first resolution")
+        [first_commit] = chain.chain_commits(self.repo.clone, canonical, second["clean_prefix_tip"])
+        resolution = chain.read_commit(self.repo.clone, resolved.tip)
+        self.assertEqual(
+            (first_commit.tree, first_commit.message),
+            (resolution.tree, resolution.message),
+            "the next replay applies the accepted resolution",
+        )
         self.assertEqual(agent.tasks[-1].tip, head["tip"], "both tasks describe the head's own chain")
         adoption = agent.run(self.controller)
         self.assertEqual((adoption.accepted, adoption.reason), (True, "adopted"))
@@ -469,6 +474,39 @@ class Repair(QueueFixture):
         self.assertEqual(self.repo.file_at("main", "Other.lean"), "first changed by 104 and 105\nsecond\n")
         self.assertIn("Merged the line two edits", self.github.comments_for(102)[0]["body"])
         self.assertIn("Merged the first-line edits", self.github.comments_for(105)[0]["body"])
+
+    def test_an_accepted_resolution_survives_its_next_task_being_superseded(self):
+        """Accepted resolutions belong to the batch, not to a task: when main moves and the head is
+        replayed again, the replay applies them and the agent resolves only what is still open."""
+        self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})
+        self.approve(104, {"Other.lean": "first changed by 104\nsecond\n"})
+        self.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two changed by 102\nline three\n"})
+        self.approve(105, {"Other.lean": "first changed by 105\nsecond\n"})
+        self.tick()
+        self.run_ci()
+        self.tick(2)
+        resolutions = {
+            f"{PROJECT}#102": Resolution(
+                {"Shared.lean": "line one\nline two changed by 101 and 102\nline three\n"}, explanation="Merged 102."
+            ),
+            f"{PROJECT}#105": Resolution(
+                {"Other.lean": "first changed by 104 and 105\nsecond\n"}, explanation="Merged 105."
+            ),
+        }
+        agent = self.agent(script=lambda task: resolutions)
+        self.assertEqual(agent.run(self.controller).reason, "resolved-commit")
+        first = agent.tasks[-1].diagnostics[0]["source_pr"]
+        # main moves before anyone claims the next task: the head is replayed onto the new main.
+        self.repo.advance_main({"Unrelated.lean": "u\n"}, "unrelated (#999)")
+        self.tick(2)
+        task = self.controller.status()["head"]["task"]
+        [conflict] = [d for d in task["diagnostics"] if d["kind"] == "conflict"]
+        self.assertNotEqual(conflict["source_pr"], first, "the accepted resolution was applied, not asked again")
+        adoption = agent.run(self.controller)
+        self.assertEqual((adoption.accepted, adoption.reason), (True, "adopted"))
+        self.assertEqual(adoption.provenance, {f"{PROJECT}#102": "edited", f"{PROJECT}#105": "edited"})
+        self.assertEqual(len(agent.tasks), 2)
 
     def test_a_clean_finish_validates_the_whole_chain(self):
         self.approve(101, {"Shared.lean": "line one\nline two changed by 101\nline three\n"})

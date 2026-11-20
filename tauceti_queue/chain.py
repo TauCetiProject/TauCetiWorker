@@ -520,6 +520,7 @@ class CommitRecord:
     conflict_paths: tuple[str, ...] = ()
     landed_on_base: str | None = None  # the base's own commit that landed this PR outside the queue
     replayed: str | None = None  # `replay`'s conflicting record: the commit of the input chain that conflicted
+    resolution: str | None = None  # `replay`: the accepted resolution applied in place of the input commit
 
     def to_dict(self) -> dict[str, Any]:
         data = dataclasses.asdict(self)
@@ -674,8 +675,14 @@ def replay(
     chain_id: str | None = None,
     committer: tuple[str, str] = DEFAULT_COMMITTER,
     empty: Mapping[str, str] | None = None,
+    resolutions: Mapping[str, str] | None = None,
 ) -> ChainResult:
     """Rebase the chain `base..tip` onto `onto`, one commit per commit, under a new private ref.
+
+    `resolutions` maps a commit of the chain to an accepted resolution of its conflict: a commit whose
+    parent is the clean prefix it was resolved on. Its change from that prefix is applied instead of
+    the input commit's, with its message (the explanation appended) and author; when that no longer
+    applies, the input commit is reported as conflicting as usual.
 
     `empty` maps a member's `Source-PR` to a note: that member's commit is replaced by an empty one
     whose message is its own with the note appended (the controller's withdrawal of a member).
@@ -706,12 +713,17 @@ def replay(
     for index, commit in enumerate(commits):
         key = commit.source_pr or commit.sha
         landing = landing_of(commit)
+        used = None
         if empty and commit.source_pr in empty:
             outcome = MergeOutcome(tree=new_tip_tree)
             message = commit.message.rstrip() + "\n\n" + empty[commit.source_pr].strip() + "\n"
         elif landing:
             outcome = MergeOutcome(tree=new_tip_tree)
             message = landed_message(commit.message, landing)
+        elif resolutions and commit.sha in resolutions:
+            fix = read_commit(repo, used := resolutions[commit.sha])
+            outcome = merge_trees(repo, new_tip, fix.sha, merge_base=fix.parents[0])
+            message = fix.message
         else:
             outcome = merge_trees(repo, new_tip, commit.sha, merge_base=commit.parents[0])
             message = commit.message
@@ -743,7 +755,13 @@ def replay(
         )
         records.append(
             CommitRecord(
-                key, commit.accepted_head, sha, CLEAN, empty=outcome.tree == new_tip_tree, landed_on_base=landing
+                key,
+                commit.accepted_head,
+                sha,
+                CLEAN,
+                empty=outcome.tree == new_tip_tree,
+                landed_on_base=landing,
+                resolution=used,
             )
         )
         new_tip, new_tip_tree = sha, outcome.tree

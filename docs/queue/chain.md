@@ -81,8 +81,10 @@ unknown base or head, or an unsafe `chain_id` raise `ChainError`.
 `base..tip` onto `onto`, one commit per commit, with the message, author and author date copied
 verbatim (a cherry-pick of each commit onto the new tip, with the commit's own parent as merge base).
 Conflicts are reported as in `build`, and the conflicting record's `replayed` names the commit of
-the input chain that conflicted. A mechanical replay changes every hash; `compare` still reports
-it as clean.
+the input chain that conflicted. `resolutions` maps a commit of the chain to an accepted resolution
+of its conflict (a commit on the prefix it was resolved on): its change from that prefix, message and
+author replace the input commit's, and the record's `resolution` names it. A mechanical replay changes
+every hash; `compare` still reports it as clean.
 
 **`validate(repo, base, tip, members) -> ValidationReport`** lists every violation rather than
 stopping at the first. `members` may be `Member` records or `owner/repo#N` strings. Checks and their

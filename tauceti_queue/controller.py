@@ -2367,7 +2367,9 @@ class Controller:
                     explain = all(v.code == "explanation-required" for v in problems)
                     return reject("explanation-required" if explain else "invalid-chain", problems)
                 if replayed.status != chain.CLEAN:
-                    return self._next_conflict(task, claim, batch, resolved, replayed, worker_notes, retained, now)
+                    return self._accept_resolution(
+                        task, claim, batch, step, resolved, replayed, worker_notes, retained, now
+                    )
                 tip_sha = replayed.tip
             members = self._task_members(task)
             records = [self._chain_member(member) for member in members]
@@ -2521,6 +2523,7 @@ class Controller:
                 else:
                     adoption = self._adopt(task, claim, batch, tip_sha, comparison, report, worker_notes, retained, now)
                 if step is not None and adoption.accepted:
+                    self._record_resolution(task, step, resolved)
                     # In the adoption's transaction: the receipt a worker resending the same resolved
                     # commit after a lost response finds.
                     self.store.insert(
@@ -5909,8 +5912,7 @@ class Controller:
         onto = (self._state("emergency_preserved") or {}).get(str(task["id"]))
         if onto is None or task["state"] != TASK_OPEN:
             return None
-        # A task continuing a conflict sequence holds accepted resolutions: kept while unclaimed too.
-        if not self._continues(task) and not self._active_claims(task["batch_id"], task_id=task["id"]):
+        if not self._active_claims(task["batch_id"], task_id=task["id"]):
             return None
         return onto
 
@@ -6017,10 +6019,6 @@ class Controller:
             # Keep the batch open while its owner prepares or pre-rebases it. Adoption uses the
             # ordinary open-batch validation, and the next head keeps the completed work.
             return f"open batch {batch['id']} is claimed; sealing waits for the release", True
-        pending = self._open_pre_rebase_task(batch)
-        if pending is not None and self._continues(pending):
-            # Its clean prefix holds accepted resolutions, which sealing now would discard.
-            return f"open batch {batch['id']} waits for its pre-rebase task {pending['id']}", False
         return None
 
     def _seal_clean_prefix(self, batch: dict[str, Any], now: float) -> bool:
@@ -6273,7 +6271,14 @@ class Controller:
             claim = self._take_claim(head, "rebase", now)
         chain_id = f"rebase-{head['id']}-{secrets.token_hex(4)}"
         try:
-            result = chain.replay(self.clone, head["base"], head["tip"], canonical, chain_id=chain_id)
+            result = chain.replay(
+                self.clone,
+                head["base"],
+                head["tip"],
+                canonical,
+                chain_id=chain_id,
+                resolutions=self._resolutions(head["id"]),
+            )
         except chain.ChainError as error:
             with self.store.transaction():
                 self._release_claim(claim, "error", now)
@@ -6285,11 +6290,23 @@ class Controller:
         if result.status == chain.CLEAN:
             version = head["version"] + 1
             by_pr = {record.source_pr: record for record in result.commits}
+            edits = self._resolution_edits(head["id"], result)
             with self.store.transaction():
                 for member in self._members(head["id"]):
                     record = by_pr.get(member["source_pr"])
-                    if record is not None:
-                        self.store.update("members", {"id": member["id"]}, commit_sha=record.sha)
+                    if record is None:
+                        continue
+                    values: dict[str, Any] = {"commit_sha": record.sha}
+                    edit = edits.get(member["source_pr"])
+                    if edit:
+                        # An accepted resolution, applied by this replay (its task was superseded).
+                        values.update(
+                            provenance="edited",
+                            task_id=edit["task_id"],
+                            explanation=(member["explanation"] + "\n\n" + edit["explanation"]).strip(),
+                            edited_shas=dumps(loads(member["edited_shas"], []) + [record.sha]),
+                        )
+                    self.store.update("members", {"id": member["id"]}, **values)
                 self.store.update(
                     "batches", {"id": head["id"]}, version=version, base=canonical, tip=result.tip, expected_parent=None
                 )
@@ -6349,10 +6366,6 @@ class Controller:
             "clean_prefix_tip": result.tip,
             "landed_on_base": result.landed_on_base,
         }
-
-    def _continues(self, task: dict[str, Any]) -> bool:
-        """Whether a conflict task continues an accepted resolution (`_next_conflict`)."""
-        return bool((self._conflict_step(task) or {}).get("continues"))
 
     @staticmethod
     def _conflict_step(task: dict[str, Any]) -> dict[str, Any] | None:
@@ -6428,7 +6441,14 @@ class Controller:
             return None, problems
         chain_id = f"resolved-{task['id']}-{secrets.token_hex(4)}"
         try:
-            result = chain.replay(self.clone, step["commit"], task["tip"], resolved, chain_id=chain_id)
+            result = chain.replay(
+                self.clone,
+                step["commit"],
+                task["tip"],
+                resolved,
+                chain_id=chain_id,
+                resolutions=self._resolutions(task["batch_id"]),
+            )
             absorbed = self._absorbed_members(task, step, result, resolved)
         except chain.ChainError as error:
             return None, [chain.Violation("replay-failed", str(error), commit=resolved)]
@@ -6439,26 +6459,25 @@ class Controller:
     def _absorbed_members(
         self, task: dict[str, Any], step: dict[str, Any], result: chain.ChainResult, resolved: str
     ) -> list[chain.Violation]:
-        """Later members a resolution took into itself, replayed already or still pending: their change
-        is already in the resolved commit (applied there it changes nothing), though they did not land on
-        the base and it applies onto the clean prefix and changes it. Taking a later member's content is
-        replaying it by hand, which would leave that member an empty commit. A member that conflicts
-        with the prefix is not judged: commits between may legitimately cover it, and refusing such a
-        resolution would leave the task nothing it could submit."""
-        landed = {r.source_pr for r in result.commits if r.landed_on_base}
-        resolved_tree = chain.tree_of(self.clone, resolved)
+        """Later members a resolution took into itself: empty when replayed onto it, though they did not
+        land on the base and their change applies onto the clean prefix and changes it. Taking a later
+        member's content is replaying it by hand, which would leave that member an empty commit. A
+        member that conflicts with the prefix is not judged: commits between may legitimately empty it,
+        and refusing such a resolution would leave the task nothing it could submit."""
+        emptied = {
+            r.source_pr
+            for r in result.commits
+            if r.status == chain.CLEAN and r.empty and not r.landed_on_base and r.resolution is None
+        }
+        if not emptied:
+            return []
         prefix_tree = chain.tree_of(self.clone, step["clean_prefix_tip"])
         found = []
         for later in chain.chain_commits(self.clone, step["commit"], task["tip"]):
-            if later.source_pr in landed or later.tree == chain.tree_of(self.clone, later.parents[0]):
+            if later.source_pr not in emptied or later.tree == chain.tree_of(self.clone, later.parents[0]):
                 continue
-            onto_resolved = chain.merge_trees(self.clone, resolved, later.sha, merge_base=later.parents[0])
-            if not onto_resolved.clean or onto_resolved.tree != resolved_tree:
-                continue
-            onto_prefix = chain.merge_trees(
-                self.clone, step["clean_prefix_tip"], later.sha, merge_base=later.parents[0]
-            )
-            if onto_prefix.clean and onto_prefix.tree != prefix_tree:
+            outcome = chain.merge_trees(self.clone, step["clean_prefix_tip"], later.sha, merge_base=later.parents[0])
+            if outcome.clean and outcome.tree != prefix_tree:
                 found.append(
                     chain.Violation(
                         "absorbed-later-member",
@@ -6470,26 +6489,45 @@ class Controller:
                 )
         return found
 
-    def _next_conflict(
+    def _resolutions(self, batch_id: int) -> dict[str, str]:
+        """The batch's accepted conflict resolutions: input commit -> resolved commit, for `chain.replay`."""
+        return {sha: entry["commit"] for sha, entry in (self._state(f"resolutions:{batch_id}") or {}).items()}
+
+    def _resolution_edits(self, batch_id: int, result: chain.ChainResult) -> dict[str, dict[str, Any]]:
+        """The members a replay took from accepted resolutions, as `_set_pre_rebase` edits:
+        `{source_pr: {explanation, task_id}}`."""
+        stored = {
+            entry["commit"]: (sha, entry) for sha, entry in (self._state(f"resolutions:{batch_id}") or {}).items()
+        }
+        edits = {}
+        for record in result.commits:
+            if record.resolution in stored:
+                original, entry = stored[record.resolution]
+                explanation = chain.appended_text(
+                    chain.read_commit(self.clone, original).message,
+                    chain.read_commit(self.clone, record.resolution).message,
+                )
+                edits[record.source_pr] = {"explanation": explanation, "task_id": entry["task_id"]}
+        return edits
+
+    def _accept_resolution(
         self,
         task: dict[str, Any],
         claim: dict[str, Any],
         batch: dict[str, Any],
+        step: dict[str, Any],
         resolved: str,
         result: chain.ChainResult,
         worker_notes: str,
         retained: str,
         now: float,
     ) -> Adoption:
-        """Accept a resolved commit whose continued replay stopped at a later conflict: the task is done
-        and a task of the same kind resolves the next conflicting commit on the new clean prefix, which
-        already holds this resolution. Nothing is adopted into the batch until the replay finishes."""
-        step = self._conflict_diagnostic(batch["id"], result, task["onto"], "continuing the replay onto")
-        preserved_onto = self._preserved_onto(task)
-        step["continues"] = task["id"]  # it holds accepted resolutions: preserved across head rounds unclaimed
-        diagnostics = [step, *(d for d in loads(task["diagnostics"], []) if d.get("kind") != "conflict")]
-        # One transaction with the successor's creation: an accepted resolution always has its next task.
+        """Accept a resolved commit whose continued replay stopped at a later conflict. The resolution is
+        recorded for the batch (`_resolutions`), so every later replay of it, by the next tick or after
+        a reseal, a supersession or a moved head, applies it and stops at the next unresolved commit,
+        where the usual path opens the next task. Nothing is adopted until a replay finishes."""
         with self.store.transaction():
+            self._record_resolution(task, step, resolved)
             self.store.update(
                 "tasks",
                 {"id": task["id"]},
@@ -6517,25 +6555,16 @@ class Controller:
                 batch["id"],
                 task_id=task["id"],
                 resolved=resolved,
-                next_conflict=step["source_pr"],
-                clean_prefix_tip=result.tip,
+                next_conflict=result.conflict.source_pr if result.conflict else None,
             )
-            # The next task describes the same input chain as this one, whatever the batch did since.
-            chain_of = dict(batch, base=task["base"], tip=task["tip"], version=task["batch_version"])
-            successor = self._create_task(chain_of, task["kind"], task["onto"], diagnostics, now)
-            marker = self._eviction(batch)
-            if marker is not None and task["id"] in marker["task_ids"]:
-                # Like the task it continues, the successor is retained work of an evicted batch.
-                self._set_state(
-                    f"emergency_evicted:{batch['id']}", dict(marker, task_ids=[*marker["task_ids"], successor])
-                )
-            if preserved_onto is not None:
-                # Like the task it continues, the successor may submit onto the head's earlier tip.
-                preserved = self._state("emergency_preserved") or {}
-                self._set_state("emergency_preserved", {**preserved, str(successor): preserved_onto})
         self.report_inference(claim["worker"], True)
         self._wake.set()
         return Adoption(True, "resolved-commit", task["id"], batch["id"], None, resolved, retained, [])
+
+    def _record_resolution(self, task: dict[str, Any], step: dict[str, Any], resolved: str) -> None:
+        key = f"resolutions:{task['batch_id']}"
+        stored = self._state(key) or {}
+        self._set_state(key, {**stored, step["commit"]: {"commit": resolved, "task_id": task["id"]}})
 
     # --- background preparation of open batches ----------------------------------------------------
 
@@ -6868,7 +6897,7 @@ class Controller:
         head = self._head()
         if (
             head is None
-            or not (self._active_claims(batch["id"], task_id=task["id"]) or self._continues(task))
+            or not self._active_claims(batch["id"], task_id=task["id"])
             or not chain.is_ancestor(self.clone, task["tip"], batch["tip"])
             or self.store.row("batch_tips", {"batch_id": head["id"], "tip": task["onto"]}) is None
         ):
@@ -6930,7 +6959,9 @@ class Controller:
         def replay(base: str, tip: str, target: str) -> chain.ChainResult:
             chain_id = f"pre-rebase-{batch['id']}-{secrets.token_hex(4)}"
             refs.append(chain_id)
-            return chain.replay(self.clone, base, tip, target, chain_id=chain_id)
+            return chain.replay(
+                self.clone, base, tip, target, chain_id=chain_id, resolutions=self._resolutions(batch["id"])
+            )
 
         try:
             carried = self._carry_pre_rebase(batch, onto, replay)
@@ -6953,7 +6984,16 @@ class Controller:
         assert result is not None
         if result.status == chain.CLEAN:
             with self.store.transaction():
-                self._set_pre_rebase(batch, PRE_REBASE_CLEAN, now, tip=result.tip, onto=onto, source=batch["tip"])
+                edits = self._resolution_edits(batch["id"], result)
+                self._set_pre_rebase(
+                    batch,
+                    PRE_REBASE_ADOPTED if edits else PRE_REBASE_CLEAN,
+                    now,
+                    tip=result.tip,
+                    onto=onto,
+                    source=batch["tip"],
+                    edits=edits,
+                )
                 self._count("pre_rebases")
                 self.store.journal(now, "pre-rebased", batch["id"], onto=onto, tip=result.tip, carried=False)
             return

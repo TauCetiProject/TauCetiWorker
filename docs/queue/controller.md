@@ -152,9 +152,9 @@ I/O, below):
    exactly that commit, based there from the pre-rebased chain without a replay; otherwise replayed (`chain.replay`), a clean
    replay becoming the next version with provenance unchanged, a conflict becoming a
    `rebase_conflict` task that resolves only the conflicting commit onto the clean prefix (the
-   prefix kept under `conflict_ref`); the controller replays the rest of the chain onto the resolved
-   commit, adopting a replay that finishes and opening a task for the next conflicting commit
-   otherwise (docs/queue/repair-task.md, "Rebase conflicts: one commit at a time");
+   prefix kept under `conflict_ref`); the controller records each accepted resolution for the batch
+   and every replay applies them, so a replay that finishes is adopted and one that stops opens a task
+   for the next conflicting commit (docs/queue/repair-task.md, "Rebase conflicts: one commit at a time");
    a head with an open task waits for a worker; otherwise CI (below) and, on a pass, promotion
    through the outbox.
 6. Pre-rebase (below): supersede stale `pre_rebase` tasks; once the head's chain is submitted and

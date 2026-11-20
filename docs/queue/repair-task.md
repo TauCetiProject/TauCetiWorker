@@ -133,21 +133,25 @@ The controller's dedicated acceptance path (`Controller._continue_replay`) requi
 parent to be the clean prefix, its message to be the conflicting commit's with text appended and no
 other `Source-PR` or `Accepted-Head`, and a no-repair member to be left alone or emptied. It then
 replays the commits after the conflicting one onto it with `chain.replay`, and refuses the resolution
-(`absorbed-later-member`) when a later member, replayed already or still pending, did not land on the
-base, its change is already in the resolved commit, and it applies onto the clean prefix and changes
-it: a resolution that took in a later member's change is a replay by hand. A member that conflicts with the prefix is not judged, since commits between
-may legitimately empty it and refusing would leave the task nothing to submit; content moved between
-members in part is not detected mechanically, as for any repair. These are checked before the replay advances because a later task cannot undo them. A clean replay is the whole
+(`absorbed-later-member`) when a member that replay made empty did not land on the base and its
+change applies onto the clean prefix and changes it: a resolution that took in a later member's change
+is a replay by hand. A member that conflicts with the prefix is not judged, since commits between may
+legitimately empty it and refusing would leave the task nothing to submit; content moved between
+members in part, or into a member the replay has not reached, is not detected mechanically, as for any
+repair. These are checked before the resolution is accepted because a later task cannot undo them. A clean replay is the whole
 chain on `onto`: it goes through the ordinary validation and comparison and is adopted (the head's
 next version, or the batch's pre-rebase) as a submitted chain is, and the resolved commit is recorded
-as a receipt for a resend after a lost response. A replay that stops at a later conflict is accepted
-as `resolved-commit` (`Controller._next_conflict`): nothing is adopted, and a task of the same kind on
-the same chain resolves the next conflicting commit on the new clean prefix, which holds the earlier
-resolutions; it is created in the same transaction, and inherits an evicted batch's retained-task
-marker and a preserved pre-rebase task's preservation. Because it holds accepted resolutions
-(`continues` in its diagnostic), it is preserved across a head round even while unclaimed, and an
-open batch waiting on it is not sealed until it is resolved. Conflict tasks take
-no repair checkpoints.
+as a receipt for a resend after a lost response. An accepted resolution belongs to the batch, not to the task: the controller records it
+(`state:resolutions:<batch>`, conflicting commit to resolved commit) and every later replay of the batch
+(`_rebase_head`, `_pre_rebase`, the continued replay itself) applies it through `chain.replay`'s
+`resolutions`, the resolved commit's change from its own prefix in place of the input commit. A
+replay that stops at a later conflict accepts the commit as `resolved-commit`
+(`Controller._accept_resolution`) and adopts nothing; the next tick replays the batch again with the
+resolutions and the usual path opens a task for the next conflicting commit, whose clean prefix holds
+the earlier resolutions. So a supersession, a reseal or a moved head loses no accepted resolution, and
+no task needs to be held for it; a replay that finishes in the tick records the resolved members as
+edited with their explanations, as an adoption does. A resolution that no longer applies onto a
+changed prefix is a conflict at that commit again. Conflict tasks take no repair checkpoints.
 
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
 `violations` (chain tool findings, `{code, detail, commit, source_pr}`), `provenance`. The runner
