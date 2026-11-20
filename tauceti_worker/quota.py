@@ -620,6 +620,38 @@ def _claude_readings(payload: dict, now: float | None = None) -> list[Reading]:
     return [_claude_window_reading(payload, w, now) for w in ("session", "weekly")]
 
 
+def _claude_stream_payload(windows: object, observed_at: float) -> dict | None:
+    """Claude Code's `rate_limit_info.unifiedWindows`, rewritten in the usage endpoint's flat shape
+    (`five_hour` / `seven_day`, each `{utilization: percent, resets_at: ISO-8601}`), or None when it
+    does not describe BOTH windows that gate the worker with a usable figure and a live clock.
+
+    The stream states utilization as a 0-1 fraction and the reset as unix seconds, both copied from the
+    model response's rate-limit headers; the endpoint states a percentage and an ISO timestamp. A
+    window missing or unreadable here is not evidence that it is idle, so it rejects the whole reading.
+    So does a reset clock at or before `observed_at`: the endpoint classifier reads an elapsed clock as
+    the idle gap after a reset, which is right for a live endpoint answer but not for an event that may
+    describe a window that has since ended. A figure that is already a percentage would read 100 times
+    too high, which blocks rather than permits."""
+    if not isinstance(windows, dict) or not _finite_num(observed_at):
+        return None
+    from datetime import UTC, datetime
+
+    payload = {}
+    for key in ("five_hour", "seven_day"):
+        window = windows.get(key)
+        if not isinstance(window, dict):
+            return None
+        used, resets = window.get("utilization"), window.get("resetsAt")
+        if not _finite_num(used) or used < 0 or not _finite_num(resets) or resets <= observed_at:
+            return None
+        try:
+            resets_at = datetime.fromtimestamp(resets, UTC).isoformat()
+        except (ValueError, OverflowError, OSError):
+            return None
+        payload[key] = {"utilization": used * 100, "resets_at": resets_at}
+    return payload
+
+
 def _claude_valid_until(readings: list[Reading], observed_at: float) -> float | None:
     """Share well-formed active/idle observations until TTL or an original active reset.
 
@@ -1444,6 +1476,101 @@ class Quota:
             value = reader(source / "auth.json")
         return source, value
 
+    def claude_stream_identity(self, agent_env: dict) -> tuple[str, str] | None:
+        """(credential fingerprint, account key) from ONE credential snapshot, frozen at launch so a
+        later rotation or account switch cannot receive this run's readings. None when unavailable,
+        or when the agent's own credential is not tied to that account: an agent authenticating with
+        $CLAUDE_CODE_OAUTH_TOKEN, or a separate usage login whose account is not verified to be the
+        agents'. Never raises, since stream sharing must not become a launch dependency."""
+        try:
+            if str(agent_env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip() or (
+                claude_usage_credentials() is not None and not claude_usage_identity_verified(self.cfg)
+            ):
+                return None
+            oauth, _ = self._claude_creds()
+            fp = self._fingerprint((oauth or {}).get("accessToken"))
+            return (fp, self._claude_account_key(oauth)) if fp else None
+        except Exception:
+            return None
+
+    @contextmanager
+    def _try_usage_lock(self, account: str):
+        """The endpoint fetcher's lock (see _usage_lock), taken WITHOUT waiting: yields False when a
+        fetch or another writer holds it, or when no usage directory can be locked. Selects the same
+        shared fallback as _usage_lock when the credential directory is read-only."""
+        fd = None
+        for attempt in range(2):
+            try:
+                directory = self._usage_dir("claude")
+                directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+                fd = os.open(directory / f"fetch-{self._fingerprint(account)}.lock", os.O_CREAT | os.O_WRONLY, 0o600)
+                break
+            except OSError:
+                if attempt or getattr(self, "cfg", None) is None or hasattr(self, "_claude_usage_directory"):
+                    break
+                self._claude_usage_directory = self._claude_usage_fallback()
+        if fd is None:
+            yield False
+            return
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                yield False
+                return
+            yield True
+        finally:
+            os.close(fd)
+
+    def note_claude_stream_windows(
+        self, windows: object, identity: tuple[str, str] | None, observed_at: float | None = None
+    ) -> bool:
+        """Share a usage reading that a Claude agent's own stream reported, so the next pacing decision
+        need not ask the rate-limited usage endpoint. Returns whether it was stored.
+
+        `identity` comes from claude_stream_identity() at launch; the entry is keyed by that credential,
+        exactly like an endpoint reading for the same token. The reading must describe both gating
+        windows with clocks still running, and is then judged like an endpoint reading (TTL, resets,
+        pacing). It is written only under the endpoint fetcher's lock, never waiting for it, so the
+        stream keeps draining and a busy lock just skips this reading. Under that lock it never replaces
+        a reading observed later, never lowers a stored figure for the same window, and never recreates
+        an entry for a credential the endpoint rejected (HTTP 401): renewal must still see that
+        rejection. It does not end a usage-endpoint cooldown."""
+        if not identity:
+            return False
+        fp, account = identity
+        observed_at = time.time() if observed_at is None else observed_at
+        payload = _claude_stream_payload(windows, observed_at)
+        if payload is None:
+            return False
+        valid_until = _claude_valid_until(_claude_readings(payload, observed_at), observed_at)
+        if valid_until is None:
+            return False
+        with self._try_usage_lock(account or fp) as held:
+            if not held:
+                return False
+            rejection = _read_json_file(self._auth_refusal_path("claude", fp))
+            if isinstance(rejection, dict) and rejection.get("code") == 401:
+                return False
+            existing = _read_json_file(self._raw_path("claude", fp))
+            if isinstance(existing, dict) and existing.get("fp") == fp:
+                at = existing.get("fetched_at")
+                if _finite_num(at) and at >= observed_at:
+                    return False
+                if _finite_num(at) and isinstance(existing.get("payload"), dict):
+                    # Usage only rises inside a window, but an event can restate an agent's older
+                    # headers. Never lower a stored figure for the same window (same reset clock).
+                    for old in _claude_readings(existing["payload"], at):
+                        new = payload[_FLAT_KEY[old.window]]
+                        if (
+                            old.state == STATE_ACTIVE
+                            and old.used is not None
+                            and old.resets_at is not None
+                            and abs(old.resets_at - _parse_iso(new["resets_at"])) <= CLAUDE_RESET_SKEW_S
+                        ):
+                            new["utilization"] = max(new["utilization"], old.used)
+            return self._store_raw("claude", payload, fp, valid_until, observed_at, source="claude-stream")
+
     def _model_refusal_path(self, provider: str, credential: str) -> Path:
         return self._usage_dir(provider) / f"model-refusal-{provider}-{self._fingerprint(credential)}.json"
 
@@ -1624,18 +1751,22 @@ class Quota:
         fp: str | None,
         valid_until: float | None = None,
         fetched_at: float | None = None,
-    ) -> None:
+        source: str | None = None,
+    ) -> bool:
         # `fetched_at` is the instant the caller OBSERVED this payload, kept whole (not truncated to the
         # second) so that re-reading the entry reproduces the verdict the caller already acted on.
         path = self._raw_path(provider, fp)
         entry = {"fetched_at": time.time() if fetched_at is None else fetched_at, "fp": fp, "payload": payload}
         if valid_until is not None:
             entry["valid_until"] = valid_until
+        if source is not None:
+            entry["source"] = source  # diagnostics only; readers judge every entry the same way
         try:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             _write_json_atomic(path, entry)
         except OSError:
-            pass  # the successfully fetched reading is still usable by this caller
+            return False  # the successfully fetched reading is still usable by this caller
+        return True
 
     def _cooldown_path(self, provider: str, key: str | None) -> Path:
         return self._usage_dir(provider) / f"ratelimit-{provider}-{self._fingerprint(key) or 'none'}.json"

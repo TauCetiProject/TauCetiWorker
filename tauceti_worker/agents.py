@@ -1341,8 +1341,7 @@ def run_agent_proc(
     # of stdin. Otherwise close stdin explicitly: Bubble reaches the agent through a non-PTY SSH
     # channel, so an inherited terminal becomes a non-TTY stream there; Codex then treats it as
     # additional prompt input and waits forever for EOF.
-    renderer = AgentTranscriptRenderer(provider)
-    quota_reader, launch_credential = None, None
+    quota_reader, launch_credential, stream_identity = None, None, None
     if (
         quota_cfg is not None
         and provider in {"claude", "codex"}
@@ -1353,8 +1352,20 @@ def run_agent_proc(
         try:
             quota_reader = Quota(quota_cfg)
             launch_credential = quota_reader.launch_credential(provider)
+            if provider == "claude":
+                stream_identity = quota_reader.claude_stream_identity(env)
         except Exception:
             quota_reader = None  # optional failure evidence must never become a launch dependency
+    # Each Claude rate_limit_event restates both quota windows from the agent's own model responses;
+    # sharing them keeps the usage cache fresh without asking the rate-limited usage endpoint.
+    renderer = AgentTranscriptRenderer(
+        provider,
+        on_rate_limit=(
+            (lambda windows: quota_reader.note_claude_stream_windows(windows, stream_identity))
+            if quota_reader is not None and stream_identity is not None
+            else None
+        ),
+    )
     tail: deque[str] = deque(maxlen=20)
 
     def write_rendered(destination, rendered: str) -> None:

@@ -229,6 +229,7 @@ RUN_STDLIB=(
   review_sync_failure.py
   quota_claude_bootstrap.py
   quota_claude_windows.py
+  quota_claude_stream.py
   quota_launch_stage.py
   quota_codex_windows.py
   quota_reason.py
