@@ -552,6 +552,38 @@ def run_group_job(job_path: Path) -> int:
     return 0
 
 
+def run_child(module_args: list[str], log_path: Path, env: dict, stopping) -> tuple[bool, int | None]:
+    """Run ``python -m <module_args>`` as an owned child of the worker (``owned_process``: it and its
+    descendants end with the worker), its output appended to ``log_path``. ``stopping()`` is polled,
+    waiting briefly; once it is true the child is terminated. Returns whether it was stopped, and its
+    exit status."""
+    from tauceti_worker.processes import owned_process
+
+    stopped = False
+    with (
+        log_path.open("ab") as log,
+        owned_process(
+            [sys.executable, "-m", *module_args],
+            cwd=REPO_ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        ) as proc,
+    ):
+        while proc.poll() is None:
+            if stopping():
+                stopped = True
+                proc.terminate()
+                try:
+                    proc.wait(60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                break
+    return stopped, proc.returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m tauceti_queue.repair_parallel", description=__doc__.split("\n\n")[0]
@@ -793,32 +825,18 @@ def repair_groups(
         env = dict(os.environ)
         if cfg.api_key:
             env[API_KEY_ENV] = cfg.api_key
-        cancelled = False
-        with (group_logdir / "runner.log").open("ab") as log:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "tauceti_queue.repair_parallel", "run-group", str(job_path)],
-                cwd=REPO_ROOT,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-            while proc.poll() is None:
-                if group_cancels[group.name].wait(0.2):
-                    cancelled = True
-                    proc.terminate()
-                    try:
-                        proc.wait(60)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                    break
+        cancelled, returncode = run_child(
+            ["tauceti_queue.repair_parallel", "run-group", str(job_path)],
+            group_logdir / "runner.log",
+            env,
+            lambda: group_cancels[group.name].wait(0.2),
+        )
         if result_path.exists():
             group.agent = json.loads(result_path.read_text())
         elif cancelled:
             group.agent = {"status": "cancelled", "attempts": []}
         else:
-            group.agent = {"status": "failed", "reason": f"the group runner exited {proc.returncode}", "attempts": []}
+            group.agent = {"status": "failed", "reason": f"the group runner exited {returncode}", "attempts": []}
         status = group.agent["status"]
         if status == "ok":
             group.fixups, problem = collect_fixups(path, tip, group)

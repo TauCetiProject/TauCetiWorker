@@ -661,29 +661,46 @@ def commit_resolution(
 
 
 def recommit_resolution(
-    clone: Path, stored: str, prefix: str, commit: str, paths: list[str], large_refactors=frozenset()
+    clone: Path,
+    stored: str,
+    prefix: str,
+    commit: str,
+    paths: list[str],
+    large_refactors=frozenset(),
+    *,
+    made_on: str | None = None,
 ) -> tuple[str, dict] | None:
     """An earlier accepted resolution ``stored`` of ``commit``, committed again on the clean ``prefix``
     as ``commit_resolution`` would commit the same files and explanation: its tree and message, the
     conflicting commit's author and date. The worker's replay dates its commits when it runs, so a
     rerun's prefix has the same tree under another SHA. None when ``stored`` is not a resolution of
     ``commit`` on a prefix with ``prefix``'s tree (missing, foreign or otherwise mismatched); the report
-    is ``commit_resolution``'s. The worktree is not touched."""
+    is ``commit_resolution``'s. The worktree is not touched.
+
+    With ``made_on``, ``stored`` resolved ``commit`` on a commit with ``made_on``'s tree instead (the
+    rebase target, by the lookahead in ``repair_lookahead``): its change is merged onto ``prefix``, and
+    None when that merge conflicts."""
     try:
         resolved = chain_tool.read_commit(clone, stored)
         original = chain_tool.read_commit(clone, commit)
         parent_tree = chain_tool.tree_of(clone, resolved.parents[0]) if len(resolved.parents) == 1 else None
     except chain_tool.ChainError:
         return None
-    if parent_tree != chain_tool.tree_of(clone, prefix) or not resolved.message.startswith(
+    if parent_tree != chain_tool.tree_of(clone, made_on or prefix) or not resolved.message.startswith(
         original.message.rstrip() + "\n"
     ):
         return None
+    tree = resolved.tree
+    if made_on is not None:
+        merged = chain_tool.merge_trees(clone, prefix, stored, merge_base=resolved.parents[0])
+        if not merged.clean:
+            return None
+        tree = merged.tree
 
-    def recommit(parent: str) -> str:
+    def recommit(parent: str, tree: str) -> str:
         return chain_tool.commit_tree(
             clone,
-            resolved.tree,
+            tree,
             parent,
             resolved.message,
             (original.author_name, original.author_email),
@@ -693,9 +710,9 @@ def recommit_resolution(
 
     # Only a commit made exactly as the worker makes one (author, committer and dates) is reused, not
     # one an agent made with `git commit` and pointed a ref at.
-    if recommit(resolved.parents[0]) != stored:
+    if recommit(resolved.parents[0], resolved.tree) != stored:
         return None
-    sha = recommit(prefix)
+    sha = recommit(prefix, tree)
     explained = bool(chain_tool.appended_text(original.message, resolved.message).strip())
     return sha, resolution_report(clone, prefix, sha, original, paths, large_refactors, explained=explained)
 
