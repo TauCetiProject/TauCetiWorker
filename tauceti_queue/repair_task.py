@@ -1490,6 +1490,13 @@ def artifact_checkout(worktree: Path, task: Task, start_tip: str):
 HEAD_KINDS = ("repair", "rebase_conflict")  # the head's own tasks, which warm from the head's tips
 
 
+def background_task(task: Task) -> bool:
+    """Work for a later batch (``prepare``, ``pre_rebase``), whose builds yield the CPU to the head's
+    (``repair_sandbox.prioritized``). A proactive prediction repair is the head's own: when the head's
+    CI fails the controller turns that same task into its required repair."""
+    return task.kind in ("prepare", "pre_rebase")
+
+
 def describe_cache_revision(task: Task, artifacts: dict) -> str:
     """The restored revision and its relation to the task, for the worker log: ``85f3eb5579df (the rebase
     target)``, ``5f78b5307b93 (the batch base)``, ``67aa17161ba1 (3 commits behind the rebase target
@@ -2230,6 +2237,10 @@ def run_task(
     from tauceti_queue.repair_cleanup import worktree_lease
 
     require_task_execution(cfg=cfg, task=task)
+    if background_task(task):
+        os.environ[repair_sandbox.BACKGROUND_VARIABLE] = "1"
+    else:
+        os.environ.pop(repair_sandbox.BACKGROUND_VARIABLE, None)
     cache_root = task_cache(cfg.root, task.task_id)
     cache_cleanup = before_task(cache_root)
     if cache_cleanup["state"] != "busy":

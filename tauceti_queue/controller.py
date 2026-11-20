@@ -65,8 +65,10 @@ BUILD_CONTEXT = "build"
 VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
 LOG_GRACE_SECONDS = 600  # publication grace for a completed run's bound verdicts and failed-build log
 # A source-candidate run's GitHub job and step phases are read at most this often while it runs, and
-# once more when it completes; observation itself stays on `polling_interval_seconds`.
-SOURCE_PHASES_INTERVAL_SECONDS = 300
+# once more when it completes; observation itself stays on `polling_interval_seconds`. Only the head's
+# run is observed, and one read is a single jobs listing (one REST call with the GitHub App's
+# installation token), so this costs at most one call a minute.
+SOURCE_PHASES_INTERVAL_SECONDS = 60
 DISPATCH_EVENT = "tauceti-bors-staging"
 # How many of a batch's previous tips a CI dispatch names in `repair_outputs_revs`.
 REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
