@@ -212,6 +212,13 @@ class Confirmed(Tmp):
         )
         self.assertEqual(reconcile.names(text), {"x", "after", "y", "z", "s"})
         self.assertEqual(reconcile.names("theorem Ns.rank_biproduct.{w} : True := trivial\n"), {"rank_biproduct"})
+        public = "public theorem Matrix.single_mul_single_eq_ite : True := trivial\n"
+        self.assertEqual(reconcile.names(public), {"single_mul_single_eq_ite"})
+        (self.tmp / "public").mkdir()
+        (self.tmp / "public" / "Basis.lean").write_text(public)
+        git(self.tmp / "public", "init", "-q")
+        git(self.tmp / "public", "add", ".")
+        self.assertEqual(len(reconcile.declared(self.tmp / "public", "single_mul_single_eq_ite")), 1)
         self.assertEqual(reconcile.identity("./A//B.lean", "Ns.Deep.name"), "A/B.lean#name")
         for bad in ("Invented.", "Ns..name", ".name"):
             self.assertIsNone(reconcile.identity("A/B.lean", bad), bad)

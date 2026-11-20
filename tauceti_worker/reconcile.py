@@ -87,7 +87,7 @@ ATTEMPT_KEY = "reconcile-attempt-ts"
 _IDENTIFIER = re.compile(r"`([A-Za-z][A-Za-z0-9_'.]{3,})(?=[`\s(])")
 # POSIX ERE, since `git grep -E` has no \s, \b or \w on every platform.
 _DECLARATION = (
-    r"^[[:space:]]*(@\[[^]]*\][[:space:]]*)?((protected|private|noncomputable|scoped|unsafe|partial)[[:space:]]+)*"
+    r"^[[:space:]]*(@\[[^]]*\][[:space:]]*)?((public|protected|private|noncomputable|scoped|unsafe|partial)[[:space:]]+)*"
     r"(theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)[[:space:]]+"
     r"([^[:space:]]+\.)?(NAME)([^A-Za-z0-9_'.]|$)"
 )
@@ -471,7 +471,7 @@ def _fingerprint(checkout: Path, item: TargetItem, hits: dict[str, list[str]], a
 
 
 _LEAN_DECLARATION = re.compile(
-    r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:protected|private|noncomputable|scoped|unsafe|partial|nonrec)\s+)*"
+    r"^\s*(?:@\[[^\]]*\]\s*)?(?:(?:public|protected|private|noncomputable|scoped|unsafe|partial|nonrec)\s+)*"
     r"(?:theorem|lemma|def|abbrev|structure|class|instance|inductive|opaque)\s+((?:[^\s:({\[.]|\.(?!\{))+)"
 )
 
