@@ -2149,10 +2149,12 @@ WORKER_SLICE = "tauceti-workers.slice"
 # Resource limits on the worker slice cover the manager and every worker scope, as the service's own
 # cgroup did before workers moved into scopes. Values use systemd's syntax.
 SLICE_LIMITS = {"cpu_quota": "CPUQuota", "memory_high": "MemoryHigh", "memory_max": "MemoryMax"}
+# A size in bytes or with a base-1024 suffix, a percentage of physical memory, or no limit.
+_MEMORY = r"(?:[0-9]+(?:\.[0-9]+)?[KMGTPE]?|100(?:\.0+)?%|[0-9]{1,2}(?:\.[0-9]+)?%|infinity)"
 _SLICE_LIMIT_SYNTAX = {
-    "CPUQuota": re.compile(r"[1-9][0-9]*%"),
-    "MemoryHigh": re.compile(r"[1-9][0-9]*[KMGT]?|[1-9][0-9]?%|100%|infinity"),
-    "MemoryMax": re.compile(r"[1-9][0-9]*[KMGT]?|[1-9][0-9]?%|100%|infinity"),
+    "CPUQuota": re.compile(r"[0-9]+(?:\.[0-9]+)?%"),
+    "MemoryHigh": re.compile(_MEMORY),
+    "MemoryMax": re.compile(_MEMORY),
 }
 
 
@@ -2169,8 +2171,9 @@ def _installed_slice_limits() -> dict[str, str]:
     limits = {}
     for line in lines:
         key, _, value = line.partition("=")
-        if key in _SLICE_LIMIT_SYNTAX and _SLICE_LIMIT_SYNTAX[key].fullmatch(value):
-            limits[key] = value
+        if key in _SLICE_LIMIT_SYNTAX and value.strip():
+            # Kept as written, including a value this check would not accept, rather than dropped.
+            limits[key] = value.strip()
     return limits
 
 
