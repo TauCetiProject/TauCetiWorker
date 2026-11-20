@@ -935,6 +935,7 @@ class Run(unittest.TestCase):
             ("plan_batch", {"return_value": self.batch}),
             ("api", {"return_value": {"login": "admin"}}),
             ("admin_login", {"return_value": "admin"}),
+            ("human_admin_login", {"return_value": "admin"}),
         ):
             mock = patch.object(sa, name, **kwargs)
             mock.start()
