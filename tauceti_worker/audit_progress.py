@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 from .audit_reader_v3 import pages
@@ -78,36 +77,6 @@ def coverage(batch: dict, receipt: Path, *, protocol: int = 3) -> dict:
     ):
         raise Die("security-audit: invalid retained coverage receipt")
     return {**value, "missing": [i for i in range(count) if i not in seen]}
-
-
-def legacy_coverage_only(value, batch: dict, receipt: Path) -> bool:
-    """Version-2 compatibility: prove a coverage diagnostic from the actual gaps.
-
-    This recognizes a diagnostic grammar, never a commit, verdict waiver, or a
-    claim about inspected code. Unknown prose and additional findings stay held.
-    """
-    if not isinstance(value, dict) or set(value) != {"verdict", "findings", "read_token"}:
-        return False
-    if (
-        value.get("verdict") != "incomplete"
-        or not isinstance(value.get("findings"), list)
-        or len(value["findings"]) != 1
-        or not isinstance(value["findings"][0], str)
-    ):
-        return False
-    match = re.fullmatch(
-        r"Commit ([1-9][0-9]*): inspection is incomplete\. Pages ([0-9]+)[–-]([0-9]+) "
-        r"have not been reviewed, so the safety of all changed source files cannot be established\.",
-        value["findings"][0],
-    )
-    if not match or not 1 <= int(match[1]) <= len(batch["commits"]):
-        return False
-    proof = coverage(batch, receipt)
-    return (
-        bool(proof["read"])
-        and proof["missing"] == list(range(int(match[2]), int(match[3]) + 1))
-        and value["read_token"] == proof["last_token"]
-    )
 
 
 def continuation_prompt(batch: dict, receipt: Path, *, protocol: int = 3) -> str:
