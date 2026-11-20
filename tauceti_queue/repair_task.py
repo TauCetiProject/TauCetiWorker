@@ -95,6 +95,9 @@ from tauceti_queue.task_identity import (
 SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
 SUBMISSION_PREFIX = "refs/tauceti-queue/submissions"
+# A rebase task's accepted conflict resolutions, kept until the task is answered so a rerun resumes after
+# them: ``<prefix>/<task_id>/<conflicting commit>-<clean prefix tree>`` (``store_resolution``).
+RESOLUTION_PREFIX = "refs/tauceti-queue/resolutions"
 # ``prepare`` builds an open batch on its own base and repairs what fails before the batch is the head.
 TASK_KINDS = ("repair", *repair.REBASE_KINDS, "prepare")
 RELEASE_REASONS = (
@@ -2327,6 +2330,26 @@ def resolve_conflicts(
         chain_ids.append(chain_id)
         return chain_tool.replay(cfg.clone, base, task.tip, onto, chain_id=chain_id)
 
+    def accept(source_pr: str, prefix: str, commit: str, tip: str, report: dict) -> chain_tool.ChainResult | None:
+        """The rest of the chain replayed onto the resolved ``tip`` when the resolution is acceptable,
+        else None, with the problems added to ``report``."""
+        if not report["ok"] or report["unexplained"]:
+            return None
+        member = members.get(source_pr)
+        if (
+            member is not None
+            and (member.no_repair or member.withdrawn)
+            and chain_tool.tree_of(cfg.clone, tip) != chain_tool.tree_of(cfg.clone, prefix)
+        ):
+            report["problems"].append(
+                f"no-repair-edited: {source_pr} is never edited: reduce it to an empty commit whose "
+                "explanation names the interacting PR, file and finding"
+            )
+        rest = replay(commit, tip)
+        report["problems"] += absorbed_members(cfg.clone, prefix, commit, tip, task.tip, rest)
+        report["ok"] = not report["problems"]
+        return rest if report["ok"] else None
+
     try:
         result = replay(task.base, task.onto)
         while result.status != chain_tool.CLEAN:
@@ -2356,6 +2379,24 @@ def resolve_conflicts(
                 declaration_names={m.number: m.declaration_names for m in task.members},
                 edited_prs={m.number for m in task.members if m.provenance == "edited"},
             )
+            paths = list(conflict.conflict_paths)
+            stored = stored_resolution(cfg.clone, task.task_id, commit, prefix)
+            if stored is not None:
+                # An earlier run of this task (on any worker sharing the clone) accepted a resolution of
+                # this commit on this prefix; it goes through the same checks as a fresh one.
+                recommitted = repair.recommit_resolution(
+                    cfg.clone, stored, prefix, commit, paths, task.large_refactor_heads
+                )
+                if recommitted is not None:
+                    tip, report = recommitted
+                    rest = accept(source_pr, prefix, commit, tip, report)
+                    state.write("conflict_validated", conflict=source_pr, attempt=0, tip=tip, report=report)
+                    if rest is not None:
+                        log(f"task {task.task_id}: reusing the stored resolution of {source_pr}'s commit {commit[:12]}")
+                        resolved.append({"source_pr": source_pr, "commit": commit, "resolved": tip, "reused": True})
+                        result = rest
+                        continue
+                forget_resolutions(cfg.clone, task.task_id, stored)
             paths = repair.apply_conflict(worktree, prefix, commit)
             if cfg.mathlib_cache and cfg.seed_packages is None and dependencies_differ(worktree, task.onto):
                 # A member before or at this conflict changes the dependencies prepared at `onto`; the
@@ -2419,23 +2460,9 @@ def resolve_conflicts(
                     tip, report = repair.commit_resolution(
                         cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads
                     )
-                rest = None
-                if report["ok"] and not report["unexplained"]:
-                    member = members.get(source_pr)
-                    if (
-                        member is not None
-                        and (member.no_repair or member.withdrawn)
-                        and chain_tool.tree_of(cfg.clone, tip) != chain_tool.tree_of(cfg.clone, prefix)
-                    ):
-                        report["problems"].append(
-                            f"no-repair-edited: {source_pr} is never edited: reduce it to an empty commit whose "
-                            "explanation names the interacting PR, file and finding"
-                        )
-                    rest = replay(commit, tip)
-                    report["problems"] += absorbed_members(cfg.clone, prefix, commit, tip, task.tip, rest)
-                    report["ok"] = not report["problems"]
+                rest = accept(source_pr, prefix, commit, tip, report)
                 state.write("conflict_validated", conflict=source_pr, attempt=attempt, tip=tip, report=report)
-                if rest is not None and report["ok"]:
+                if rest is not None:
                     break
                 feedback = "Local validation of the previous attempt's resolution:\n" + format_report(report)
                 log(f"task {task.task_id}: the resolution of {source_pr} is not acceptable (attempt {attempt})")
@@ -2445,6 +2472,7 @@ def resolve_conflicts(
                     "reason": f"{source_pr}: the conflict stays unresolved\n{format_report(report)}",
                     "resolved": resolved,
                 }
+            store_resolution(cfg.clone, task.task_id, commit, prefix, tip)
             resolved.append({"source_pr": source_pr, "commit": commit, "resolved": tip})
             result = rest
         git(worktree, "checkout", "--quiet", "--force", "--detach", result.tip)
@@ -2453,6 +2481,42 @@ def resolve_conflicts(
         for chain_id in chain_ids:
             with contextlib.suppress(Exception):
                 chain_tool.delete_chain_ref(cfg.clone, chain_id)
+
+
+def resolution_ref(task_id: str, commit: str, prefix_tree: str) -> str:
+    return f"{RESOLUTION_PREFIX}/{task_id}/{commit}-{prefix_tree}"
+
+
+def stored_resolution(clone: Path, task_id: str, commit: str, prefix: str) -> str | None:
+    """The resolved commit an earlier run of task ``task_id`` accepted for ``commit`` on a clean prefix
+    with ``prefix``'s tree (``store_resolution``), or None. Keyed by the tree because the replay dates
+    its commits when it runs: a rerun reaches the same prefix tree under another SHA."""
+    ref = resolution_ref(task_id, commit, chain_tool.tree_of(clone, prefix))
+    sha = git(clone, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False).strip()
+    return sha or None
+
+
+def store_resolution(clone: Path, task_id: str, commit: str, prefix: str, resolved: str) -> None:
+    """Record an accepted resolution in the shared clone, so a rerun of the task after a stop resumes
+    after it (``stored_resolution``); the ref also keeps its objects. Never fails the task."""
+    try:
+        git(clone, "update-ref", resolution_ref(task_id, commit, chain_tool.tree_of(clone, prefix)), resolved)
+    except Exception as error:  # noqa: BLE001 - losing the record only costs the resume
+        log(f"task {task_id}: could not record the resolution of {commit[:12]}: {error}")
+
+
+def forget_resolutions(clone: Path, task_id: str, only: str | None = None) -> None:
+    """Delete task ``task_id``'s stored resolutions (``only``: the entries naming that commit). Never fails."""
+    try:
+        listing = git(
+            clone, "for-each-ref", "--format=%(refname) %(objectname)", f"{RESOLUTION_PREFIX}/{task_id}/", check=False
+        )
+        for line in listing.splitlines():
+            ref, _, sha = line.partition(" ")
+            if only is None or sha == only:
+                git(clone, "update-ref", "-d", ref, sha, check=False)
+    except Exception as error:  # noqa: BLE001
+        log(f"task {task_id}: could not delete its stored resolutions: {error}")
 
 
 def conflict_findings(task: Task, entry: dict, prs: set) -> dict:
@@ -3023,6 +3087,9 @@ def _run_task(
                     )
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
+                if rebasing:
+                    # A rerun would rebuild this chain from the stored resolutions without the agent.
+                    forget_resolutions(cfg.clone, task.task_id)
                 return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             parallel = outcome.get("parallel") or {}
             verified = (
@@ -3167,6 +3234,8 @@ def _run_task(
             except ServiceError as error:
                 return defer_delivery(f"result response unavailable: {error}")
             state.write("submitted", attempt=attempt, response=response)
+            if rebasing:
+                forget_resolutions(cfg.clone, task.task_id)  # the service has the chain: the task is answered
             outcome["response"] = response
             reason = str(response.get("reason") or "")
             if reason == REPAIR_CHECKPOINT:

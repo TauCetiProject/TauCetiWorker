@@ -154,6 +154,24 @@ controller is not sent back to the agent: the head's CI and repair tasks take a 
 build from there. A task with a retained repair checkpoint is already on the target and is repaired as
 a chain.
 
+**Resuming after a stop.** Each accepted resolution is recorded in the worker's clone as
+`refs/tauceti-queue/resolutions/<task_id>/<conflicting commit>-<clean prefix tree>`, naming the
+resolved commit (`repair_task.store_resolution`). The repair workers share one clone
+(`repair-clone`), so whichever worker claims the task next, after a stop (`worker-stopped`), a lost
+claim or a release such as `inference_unavailable`, finds them, and the ref keeps the objects. The
+key is the prefix's tree, not its SHA: the replay dates its commits when it runs, so a rerun reaches
+the same prefix tree under another SHA. At each conflict the worker looks the key up before running the
+agent; a stored resolution is committed again on the current prefix as `commit_resolution` would
+commit the same files and explanation (`repair.recommit_resolution`: its tree and message, the
+conflicting commit's author and date) and goes through every check above. When it passes, the replay
+continues from it and the agent is not run for that conflict (the outcome's `conflicts` entry has
+`reused: true`); an entry that is missing, names a commit that is not a resolution of this commit on a
+prefix with this tree, or fails a check is deleted and the conflict goes to the agent as before. The
+agent still sees one commit and never replays. The task's entries are deleted once the service has
+answered its submission, and when the whole chain fails the worker's local checks (a rerun would
+rebuild the same chain without the agent). Entries of a task that is never claimed again stay in the
+clone like its `refs/tauceti-queue/task/<id>/...` refs; they are a few commit objects.
+
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
 `violations` (chain tool findings, `{code, detail, commit, source_pr}`), `provenance`. The runner
 handles the reasons as follows:
@@ -736,7 +754,8 @@ and `worker.json` counts them per provider (`providers`) and repeats the last ta
 Tasks are all-or-nothing. The task record `tasks/<id>/task.json` (written with
 `runtime_status.atomic_json`) records the task, the claim token and expiry, the current phase and a
 history of phases; `session.json` records the provider session for follow-up turns within the same
-run (the explanation turn). Nothing continues a model session across runs.
+run (the explanation turn). Nothing continues a model session across runs; a rebase task's accepted
+conflict resolutions are the one thing a rerun reuses ([Resuming after a stop](#rebase-conflicts-one-commit-at-a-time)).
 
 A claim never outlives the worker that holds it. On SIGTERM, at any phase before the result is
 validated, the attempt is abandoned and the claim released with reason `worker-stopped` so the
