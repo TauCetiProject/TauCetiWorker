@@ -17,6 +17,11 @@ versions completely (exit 0). Otherwise the merged files, clean or with conflict
 agent's starting point and :attr:`Prepass.note` tells it what the worker did. Anything unexpected
 (the tool missing or failing, a rewrite that changes more than projections and layout, nothing
 rewritten) returns None and leaves the worktree as ``apply_conflict`` wrote it.
+
+The same tool serves repair and preparation tasks (``rewrite_chain``): before their agent runs, the
+files with a "Numeric projections are disallowed" finding are rewritten in every version along the
+chain and the chain recommitted, so each member's commit carries the rewritten form of its own
+change, and the agent gets only what a scoped build of those files still reports.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import bisect
 import dataclasses
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import secrets
@@ -312,16 +318,23 @@ def _build_imports(
     modules = imported_modules(worktree, sides)
     if not modules:
         return True
-    argv = repair_sandbox.sandboxed_lake([*lake, "build", *modules], worktree, env)
     with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
         try:
             for path in paths:  # rewritten or not, any of them may be imported
                 clean = _blob(worktree, prefix, path, limit=None)
                 if clean is not None and (worktree / path).is_file() and not (worktree / path).is_symlink():
                     _write(worktree / path, clean)
-            return repair.run_logged(argv, worktree, log, env=env, timeout=timeout)["rc"] == 0
+            return _lake_build(worktree, modules, env, log, timeout, lake)["rc"] == 0
         finally:
             repair.apply_conflict(worktree, prefix, commit)
+
+
+def _lake_build(worktree: Path, modules: list[str], env: dict, log: Path, timeout: float, lake) -> dict:
+    """``lake build`` of ``modules`` in the build sandbox; the caller holds the worktree's build lock."""
+    from tauceti_queue import repair
+
+    argv = repair_sandbox.sandboxed_lake([*lake, "build", *modules], worktree, env)
+    return repair.run_logged(argv, worktree, log, env=env, timeout=timeout)
 
 
 def _merge(ours: bytes, base: bytes, theirs: bytes, labels: tuple[str, str, str]) -> tuple[int, bytes] | None:
@@ -340,6 +353,75 @@ def _merge(ours: bytes, base: bytes, theirs: bytes, labels: tuple[str, str, str]
     if proc.returncode < 0 or proc.returncode > 127:
         return None
     return proc.returncode, proc.stdout
+
+
+@dataclasses.dataclass
+class Rewrite:
+    outputs: dict[str, list[bytes]]  # per group, the rewritten blobs in the order given
+    runs: dict[str, dict]  # per group, its tool run: rc, seconds, timed_out, log
+    copies: dict[str, list[str]]  # per group, the paths the tool was given (its log names them)
+
+
+def rewrite_blobs(
+    worktree: Path,
+    env: dict,
+    tool: Path,
+    fix,
+    groups: dict[str, list[bytes]],
+    logs: dict[str, Path],
+    timeout: float,
+) -> Rewrite | None:
+    """Rewrite the numeric projections in each group's blobs with the tool, one sandboxed run per
+    group, concurrently, on copies under the worktree's ``.lake``. None when a run fails (anything
+    but 0, everything rewritten, or 1, some sites left) or a rewrite changes more than projections
+    and layout (``rewrites_only``)."""
+    scratch, directory = None, None
+    try:
+        cache = _private_dir(worktree / ".lake", SCRATCH, "cache")  # the compiled scanner, per toolchain
+        scratch = _private_dir(worktree / ".lake", SCRATCH, f"run-{secrets.token_hex(6)}")
+        copy = scratch / "tool"
+        copy.mkdir()
+        for name in TOOL_FILES:
+            shutil.copyfile(tool / name, copy / name)
+        # Flat names in a directory held open: the reads after the runs go through no path the
+        # elaborated code could have swapped for a symlink. The tool takes any path; it names no module.
+        directory = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        files: dict[str, list[Path]] = {}
+        for group, blobs in groups.items():
+            files[group] = [scratch / f"{group}-{k}.lean" for k in range(len(blobs))]
+            for target, data in zip(files[group], blobs, strict=True):
+                target.write_bytes(data)
+
+        def run(group: str) -> dict:
+            return _run_tool(worktree, env, copy, files[group], cache, logs[group], timeout)
+
+        with ThreadPoolExecutor(max_workers=len(groups)) as pool:  # each group elaborates its own files
+            runs = dict(zip(groups, pool.map(run, groups), strict=True))
+        # 0: everything rewritten; 1: some sites left for the author. Anything else is a tool failure.
+        if any(runs[group].get("rc") not in (0, 1) for group in groups):
+            return None
+        outputs: dict[str, list[bytes]] = {}
+        for group, blobs in groups.items():
+            outputs[group] = []
+            for target, before in zip(files[group], blobs, strict=True):
+                after = _read(directory, target.name)
+                if len(after) > 2 * MAX_BYTES or not rewrites_only(
+                    before.decode(), after.decode(errors="replace"), fix
+                ):
+                    return None
+                outputs[group].append(after)
+        return Rewrite(
+            outputs=outputs,
+            runs={g: {k: runs[g].get(k) for k in ("rc", "seconds", "timed_out", "log")} for g in runs},
+            copies={g: [str(f) for f in files[g]] for g in files},
+        )
+    except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
+        return None
+    finally:
+        if directory is not None:
+            os.close(directory)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 def prepass(
@@ -387,50 +469,20 @@ def prepass(
             sides[path] = (ours, base, theirs)
     if not sides:
         return None
-    scratch, directory = None, None
     try:
         log = logdir / f"numproj-{commit[:12]}-imports.log"
         if not _build_imports(worktree, prefix, commit, sides, paths, env, log, timeout, lake):
             return None
-        cache = _private_dir(worktree / ".lake", SCRATCH, "cache")  # the compiled scanner, per toolchain
-        scratch = _private_dir(worktree / ".lake", SCRATCH, f"run-{secrets.token_hex(6)}")
-        copy = scratch / "tool"
-        copy.mkdir()
-        for name in TOOL_FILES:
-            shutil.copyfile(tool / name, copy / name)
-        # Flat names in a directory held open: the reads after the runs go through no path the
-        # elaborated code could have swapped for a symlink. The tool takes any path; it names no module.
-        directory = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        names = {path: f"{k}.lean" for k, path in enumerate(sides)}
-        files: dict[str, list[Path]] = {"parent": [], "commit": []}
-        for path, (_, base, theirs) in sides.items():
-            for side, data in (("parent", base), ("commit", theirs)):
-                target = scratch / f"{side}-{names[path]}"
-                target.write_bytes(data)
-                files[side].append(target)
-
-        def run(side: str) -> dict:
-            log = logdir / f"numproj-{commit[:12]}-{side}.log"
-            return _run_tool(worktree, env, copy, files[side], cache, log, timeout)
-
-        with ThreadPoolExecutor(max_workers=2) as pool:  # each side elaborates its own files
-            runs = dict(zip(files, pool.map(run, files), strict=True))
-        # 0: everything rewritten; 1: some sites left for the author. Anything else is a tool failure.
-        if any(runs[side].get("rc") not in (0, 1) for side in files):
+        groups = {"parent": [base for _, base, _ in sides.values()], "commit": [c for _, _, c in sides.values()]}
+        logs = {side: logdir / f"numproj-{commit[:12]}-{side}.log" for side in groups}
+        rewrite = rewrite_blobs(worktree, env, tool, fix, groups, logs, timeout)
+        if rewrite is None:
             return None
-        rewritten: dict[str, tuple[bytes, bytes]] = {}
-        changed = False
-        for path, (_, base, theirs) in sides.items():
-            new_base = _read(directory, f"parent-{names[path]}")
-            new_theirs = _read(directory, f"commit-{names[path]}")
-            if max(len(new_base), len(new_theirs)) > 2 * MAX_BYTES:
-                return None
-            for before, after in ((base, new_base), (theirs, new_theirs)):
-                if not rewrites_only(before.decode(), after.decode(errors="replace"), fix):
-                    return None
-            changed = changed or new_base != base or new_theirs != theirs
-            rewritten[path] = (new_base, new_theirs)
-        if not changed:
+        runs = rewrite.runs
+        rewritten = dict(
+            zip(sides, zip(rewrite.outputs["parent"], rewrite.outputs["commit"], strict=True), strict=True)
+        )
+        if all(rewritten[path] == (base, theirs) for path, (_, base, theirs) in sides.items()):
             return None
         labels = (prefix[:12], f"{parent[:12]} (projections rewritten)", f"{commit[:12]} (projections rewritten)")
         merged, remaining, outputs = [], [], {}
@@ -448,17 +500,18 @@ def prepass(
             merged=merged,
             remaining=remaining + untouched,
             note=_note(
-                clean, complete, merged, remaining, untouched, runs, {f"{scratch}/commit-{names[p]}": p for p in sides}
+                clean,
+                complete,
+                merged,
+                remaining,
+                untouched,
+                runs,
+                dict(zip(rewrite.copies["commit"], sides, strict=True)),
             ),
-            tool={side: {k: runs[side].get(k) for k in ("rc", "seconds", "timed_out", "log")} for side in runs},
+            tool=runs,
         )
     except (OSError, UnicodeDecodeError, RuntimeError, ValueError):
         return None
-    finally:
-        if directory is not None:
-            os.close(directory)
-        if scratch is not None:
-            shutil.rmtree(scratch, ignore_errors=True)
     try:
         for path, data in outputs.items():
             _write(worktree / path, data)
@@ -468,6 +521,303 @@ def prepass(
         repair.apply_conflict(worktree, prefix, commit)  # back to git's own conflict, as without the pre-pass
         return None
     return outcome
+
+
+# ----------------------------------------------------------------------------------------------
+# The findings of a repair: numeric projections along the chain
+
+
+LINT = "Numeric projections are disallowed"  # the rc1 linter's message (`linter.style.numericProjections`)
+EXPLANATION = "Numeric projections rewritten mechanically by the repair worker (tauceti-tools numproj)."
+
+
+@dataclasses.dataclass
+class ChainRewrite:
+    tip: str  # the rewritten chain, checked out in the worktree
+    paths: list[str]  # the files with rewritten versions
+    edited: list[str]  # the original commits whose own change was rewritten (their messages say so)
+    errors: list[dict]  # the scoped build's errors in ``paths`` (``repair_stream.parse_errors``)
+    tool: dict
+
+
+def _listing(worktree: Path, rev: str, paths: list[str]) -> dict[str, tuple[str, str]]:
+    """``path`` to ``(mode, blob id)`` at ``rev`` for those of ``paths`` that are regular files there."""
+    out = subprocess.run(
+        ["git", "-C", str(worktree), "ls-tree", "-z", rev, "--", *paths], capture_output=True, text=True, check=True
+    ).stdout
+    entries = {}
+    for row in out.split("\0"):
+        head, _, path = row.partition("\t")
+        fields = head.split()
+        if path in paths and len(fields) == 3 and fields[0] in ("100644", "100755") and fields[1] == "blob":
+            entries[path] = (fields[0], fields[2])
+    return entries
+
+
+def _git_bytes(worktree: Path, *args: str, data: bytes | None = None, env: dict | None = None) -> str:
+    return subprocess.run(
+        ["git", "-C", str(worktree), *args], input=data, capture_output=True, check=True, env=env
+    ).stdout.decode()
+
+
+def _with_entries(worktree: Path, tree: str, entries: dict[str, tuple[str, str]]) -> str:
+    """``tree`` with each path's entry replaced by ``(mode, blob id)``."""
+    with tempfile.TemporaryDirectory(prefix="numproj-index-") as scratch:
+        env = {**os.environ, "GIT_INDEX_FILE": str(Path(scratch) / "index")}
+        _git_bytes(worktree, "read-tree", tree, env=env)
+        rows = "".join(f"{mode} {blob}\t{path}\0" for path, (mode, blob) in entries.items())
+        _git_bytes(worktree, "update-index", "-z", "--index-info", data=rows.encode(), env=env)
+        return _git_bytes(worktree, "write-tree", env=env).strip()
+
+
+def _patch(worktree: Path, old: tuple[str, str] | None, new: tuple[str, str] | None) -> list[str]:
+    """The lines a change from blob ``old`` to blob ``new`` removes and adds (None: no file)."""
+    if old is None or new is None:  # git diffs two objects; the empty blob stands for a missing file
+        empty = _git_bytes(worktree, "hash-object", "-w", "--stdin", data=b"").strip()
+        old, new = old or ("", empty), new or ("", empty)
+    diff = _git_bytes(worktree, "diff", "-U0", old[1], new[1])
+    return [line for line in diff.splitlines() if line[:1] in ("+", "-") and line[:3] not in ("+++", "---")]
+
+
+def rewrite_chain(
+    worktree: Path,
+    base: str,
+    paths: list[str],
+    env: dict,
+    logdir: Path,
+    *,
+    frozen: frozenset[str] = frozenset(),
+    timeout: float = TIMEOUT_SECONDS,
+    lake: tuple[str, ...] = ("lake",),
+) -> ChainRewrite | None:
+    """Rewrite the numeric projections in every version of ``paths`` along the chain ``base..HEAD``
+    of ``worktree`` and recommit the chain, so that each member's own change becomes the rewritten
+    form of what it changed. Every distinct version (blob) is rewritten once, in one tool run; each
+    commit's tree gets the rewritten blob of each of its versions, and a commit whose own patch
+    changes gets ``EXPLANATION`` appended to its message, keeping its author and date. A file stays
+    as at ``base`` until a member changes it: that member takes the rewrite of what it inherits. A file that a ``frozen`` commit (a member never edited) changes is not rewritten.
+
+    The worktree is then checked out at the new tip and the rewritten modules built (``lake build``
+    under the build lock); ``errors`` are that build's errors in them. None when nothing is rewritten
+    or anything fails (the tool, a rewrite that is not projections only, the build without a single
+    error to show for its failure); the worktree is then at its original ``HEAD``."""
+    from tauceti_queue import chain as chain_tool
+    from tauceti_queue import repair, repair_stream, repair_tools
+    from tauceti_queue.diagnostics import module_of
+
+    tool = tool_dir()
+    paths = [p for p in dict.fromkeys(paths) if p.endswith(".lean")]
+    if tool is None or not paths:
+        return None
+    try:
+        fix = load_tool(tool)
+    except Exception:  # noqa: BLE001 - a tool that does not load is a tool that is unavailable
+        return None
+    try:
+        head = chain_tool.resolve_commit(worktree, "HEAD")
+        commits = chain_tool.chain_commits(worktree, base, head)
+        listings = {sha: _listing(worktree, sha, paths) for sha in (base, *(c.sha for c in commits))}
+    except (chain_tool.ChainError, subprocess.CalledProcessError):
+        return None
+    # A file a frozen member changes is left to the agent: rewriting the version before it would edit
+    # that member's change.
+    previous = listings[base]
+    for c in commits:
+        if c.sha in frozen:
+            paths = [p for p in paths if listings[c.sha].get(p) == previous.get(p)]
+        previous = listings[c.sha]
+    # The versions to rewrite: a file's from the first commit that changes it on (before that it is
+    # the base's, which stays as it is).
+    touched: dict[str, set[str]] = {}  # commit -> the paths changed by it or an earlier commit
+    seen: set[str] = set()
+    previous = listings[base]
+    for c in commits:
+        seen.update(p for p in paths if listings[c.sha].get(p) != previous.get(p))
+        touched[c.sha], previous = set(seen), listings[c.sha]
+    versions: dict[str, bytes] = {}  # blob id -> its content
+    for c in commits:
+        for path in touched[c.sha]:
+            entry = listings[c.sha].get(path)
+            if entry is None or entry[1] in versions:
+                continue
+            data = _blob(worktree, c.sha, path)
+            try:
+                if data is not None and CANDIDATE.search(data.decode()):
+                    versions[entry[1]] = data
+            except UnicodeDecodeError:
+                continue
+    if not versions:
+        return None
+    modules = {m for data in versions.values() for m in header_imports(data.decode())}
+    targets = {module_of(p) for p in paths}
+    imports = sorted(m for m in modules - targets if (worktree / module_path(m)).is_file())
+    stamp = head[:12]
+    try:
+        if imports:
+            with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
+                # A failure leaves the files importing the failed module incomplete; the tool says so.
+                _lake_build(worktree, imports, env, logdir / f"numproj-chain-{stamp}-imports.log", timeout, lake)
+    except OSError:
+        return None
+    blobs = list(versions)
+    rewrite = rewrite_blobs(
+        worktree,
+        env,
+        tool,
+        fix,
+        {"chain": [versions[b] for b in blobs]},
+        {"chain": logdir / f"numproj-chain-{stamp}.log"},
+        timeout,
+    )
+    if rewrite is None:
+        return None
+    try:
+        renamed = {
+            blob: _git_bytes(worktree, "hash-object", "-w", "--stdin", data=after).strip()
+            for blob, after in zip(blobs, rewrite.outputs["chain"], strict=True)
+            if after != versions[blob]
+        }
+        if not renamed:
+            return None
+        parent, edited, changed = chain_tool.resolve_commit(worktree, base), [], set()
+        before = {p: listings[base].get(p) for p in paths}  # the rewritten versions of the parent
+        previous = listings[base]
+        for c in commits:
+            listing = listings[c.sha]
+            after = {
+                p: (listing[p][0], renamed.get(listing[p][1], listing[p][1])) if p in touched[c.sha] else listing[p]
+                for p in paths
+                if p in listing
+            }
+            entries = {p: entry for p, entry in after.items() if entry != listing[p]}
+            changed.update(entries)
+            # Its own change is rewritten when its patch of a file differs from what it was.
+            own = any(
+                _patch(worktree, previous.get(p), listing.get(p)) != _patch(worktree, before.get(p), after.get(p))
+                for p in paths
+                if previous.get(p) != listing.get(p) and (p in entries or before.get(p) != previous.get(p))
+            )
+            before, previous = after, listing
+            if not entries and c.parents == (parent,):
+                parent = c.sha
+                continue
+            tree = _with_entries(worktree, c.tree, entries) if entries else c.tree
+            message = c.message
+            if own:
+                edited.append(c.sha)
+                if EXPLANATION not in message:
+                    message = message.rstrip() + "\n\n" + EXPLANATION + "\n"
+            parent = chain_tool.commit_tree(
+                worktree,
+                tree,
+                parent,
+                message,
+                (c.author_name, c.author_email),
+                author_date=c.author_date,
+                committer_date=c.author_date,
+            )
+        repair.git(worktree, "checkout", "--quiet", "--force", "--detach", parent)
+    except (chain_tool.ChainError, subprocess.CalledProcessError, RuntimeError, UnicodeDecodeError):
+        return None
+    rewritten = sorted(changed)
+    log = logdir / f"numproj-chain-{parent[:12]}-build.log"
+    try:
+        with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
+            build = _lake_build(worktree, [module_of(p) for p in rewritten], env, log, timeout, lake)
+        with log.open("rb") as handle:  # this pass's own log: one build per tip
+            text = handle.read().decode(errors="replace")
+    except OSError:
+        build, text = {"rc": None}, ""
+    errors = [e for e in repair_stream.parse_errors(text.splitlines()) if e["file"] in rewritten]
+    if build.get("rc") != 0 and not errors:
+        repair.git(worktree, "checkout", "--quiet", "--force", "--detach", head)
+        return None
+    return ChainRewrite(
+        tip=parent,
+        paths=rewritten,
+        edited=edited,
+        errors=errors,
+        tool=rewrite.runs["chain"]
+        | {"versions": len(renamed), "build": {k: build.get(k) for k in ("rc", "seconds", "log")}},
+    )
+
+
+def _file(path: str) -> str:
+    return path if path.endswith(".lean") else module_path(path)
+
+
+def lint_files(findings: dict, errors: list[dict] | None = None) -> list[str]:
+    """The files with a numeric projection finding among ``findings``' compiler errors and the
+    streaming build's ``errors`` (``repair_parallel.read_errors``)."""
+    files = [_file(str(e.get("path") or "")) for e in findings["compiler_errors"] if LINT in str(e.get("message"))]
+    files += [str(e["file"]) for e in errors or [] if e.get("file") and LINT in str(e.get("message"))]
+    return [f for f in dict.fromkeys(files) if f.startswith("TauCeti/")]
+
+
+def replace_findings(findings: dict, rewrite: ChainRewrite) -> dict:
+    """``findings`` with the rewritten files' compiler errors, failed modules and build failures
+    replaced by the scoped build's errors."""
+    from tauceti_queue.diagnostics import module_of
+
+    rewritten = set(rewrite.paths)
+    out = {**findings}
+    out["compiler_errors"] = [
+        e for e in findings["compiler_errors"] if _file(str(e.get("path") or "")) not in rewritten
+    ]
+    out["compiler_errors"] += [
+        {"path": e["file"], "line": e["line"], "column": e["column"], "message": e["message"]} for e in rewrite.errors
+    ]
+    failed = [m for m in findings["failed_modules"] if _file(str(m)) not in rewritten]
+    out["failed_modules"] = list(dict.fromkeys([*failed, *(module_of(e["file"]) for e in rewrite.errors)]))
+    out["other"] = [
+        f
+        for f in findings.get("other") or []
+        if not (f.get("kind") == "build" and _file(str(f.get("module"))) in rewritten)
+    ]
+    return out
+
+
+def replace_stream_errors(directory: Path, rewrite: ChainRewrite) -> None:
+    """The streaming build's error list in ``directory`` (``.tauceti-repair``) with the rewritten
+    files' compiler errors replaced by the scoped build's, and a line saying so."""
+    from tauceti_queue import repair_stream
+    from tauceti_queue.diagnostics import module_of
+
+    path = directory / repair_stream.ERRORS_FILE
+    if not path.is_file():
+        return
+    kept = []
+    for line in path.read_text(errors="replace").splitlines():
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            entry = None
+        if (
+            isinstance(entry, dict)
+            and entry.get("file") in rewrite.paths
+            and entry.get("kind") in (None, "compiler", repair_stream.RERUN)
+        ):
+            continue
+        kept.append(line)
+    count = len(rewrite.errors)
+    kept += [
+        json.dumps({"module": module_of(e["file"]), **{k: e[k] for k in ("file", "line", "column", "message")}})
+        for e in rewrite.errors
+    ]
+    kept.append(
+        json.dumps(
+            {
+                "event": "numproj",
+                "message": f"the worker rewrote the numeric projections in {len(rewrite.paths)} file(s) in the members "
+                f"that wrote them and rebuilt those files: {count} error{'s' if count != 1 else ''} left in them, "
+                "listed above; their earlier errors are gone",
+                "files": rewrite.paths,
+            }
+        )
+    )
+    scratch = path.with_name(path.name + ".numproj")
+    scratch.write_text("".join(f"{line}\n" for line in kept))
+    os.replace(scratch, path)
 
 
 def _quote(paths: list[str]) -> str:

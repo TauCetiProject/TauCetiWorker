@@ -90,8 +90,8 @@ TOKEN = "worker-token"
 LAKE = r'''#!/usr/bin/env python3
 """lake stub: `cache get` succeeds unless STUB_LAKE_CACHE_FAIL=1 or the `--rev` is listed in
 STUB_LAKE_CACHE_FAIL_REVS (comma separated); from the repair namespace (`--service tauceti-repair`)
-only the revisions in STUB_LAKE_REPAIR_REVS are published. `build` fails modules containing BROKEN
-and with `-o FILE` writes an output map naming one artifact in the pool. `cache put` records the
+only the revisions in STUB_LAKE_REPAIR_REVS are published. `build` fails modules containing BROKEN,
+and those named in STUB_LAKE_NUMPROJ (comma separated stems) with a numeric projection, and with `-o FILE` writes an output map naming one artifact in the pool. `cache put` records the
 key it was given in `lake-put-key` and fails when STUB_LAKE_PUT_FAIL=1; otherwise it uploads, as Lake
 does, each artifact the map names and then the map to `remote/` under STUB_DIR, logging each upload
 in `remote/uploads.log`, and with STUB_LAKE_PUT_FAIL=partial fails after the artifacts. `build --iofail` replays the
@@ -202,11 +202,25 @@ if args[:1] == ["build"]:
     with (stub / "lake-builds.jsonl").open("a") as handle:
         handle.write(json.dumps({"args": args, "cwd": os.getcwd(), "started": started, "finished": time.time()}) + "\n")
     rc = 0
+    linted = [n for n in os.environ.get("STUB_LAKE_NUMPROJ", "").split(",") if n]
     for index, path in enumerate(modules, 1):
         name = "TauCeti." + path.stem
+        import re
+        projections = [
+            (row, m.start())
+            for row, text in enumerate(path.read_text().splitlines(), 1)
+            for m in re.finditer(r"(?<=[\w)])\.\d+\b", text)
+        ] if path.stem in linted else []
         if "BROKEN" in path.read_text():
             print(f"✖ [{index}/{len(modules)}] Building {name}")
             print(f"error: {path}:1:1: unknown identifier BROKEN")
+            rc = 1
+        elif projections:
+            print(f"✖ [{index}/{len(modules)}] Building {name}")
+            for row, col in projections:
+                print(f"error: {path}:{row}:{col}: Numeric projections are disallowed.")
+                print("")
+                print("  [apply] Instead, use `.fst`.")
             rc = 1
         else:
             print(f"✔ [{index}/{len(modules)}] Built {name} (0.1s)")
@@ -1144,6 +1158,7 @@ class Fixture(unittest.TestCase):
         os.environ.pop("STUB_LAKE_REPAIR_REVS", None)
         os.environ.pop("STUB_LAKE_PUT_FAIL", None)
         os.environ.pop("STUB_LAKE_BUILD_SCRIPT", None)
+        os.environ.pop("STUB_LAKE_NUMPROJ", None)
         os.environ.pop("STUB_SLEEP", None)
         os.environ.pop("STUB_GH_FAIL", None)
         os.environ.pop("STUB_GH_ADMIN", None)
@@ -7524,6 +7539,149 @@ class NumprojPrepass(NumprojBase):
             for name in ("link", "fifo"):
                 with self.subTest(name=name), self.assertRaises(OSError):
                     repair_numproj._read(directory, name)
+
+
+class NumprojRepairBase(NumprojBase):
+    """A repair task on a chain whose members 2 and 3 wrote numeric projections that the rc1 linter
+    rejects (``TauCeti/P.lean`` and ``TauCeti/Q.lean``); member 1 has one in a file no finding names. The
+    streaming build reports them, and the worker rewrites each in the member that wrote it before any
+    agent runs (``repair_task.rewrite_projections``)."""
+
+    P_BASE = "def r : Nat := Nat.zero\n"
+    P_MEMBER = P_BASE + "def q (x : Nat × Nat) : Nat := x.2\n"
+    Q_MEMBER = "def s (x : Nat × Nat) : Nat := x.1\n"
+    KEEP = "def k (x : Nat × Nat) : Nat := x.1\n"
+    BASE_FILES = {"TauCeti/P.lean": P_BASE}
+    MEMBER_FILES = {
+        1: {"TauCeti/Keep.lean": KEEP},
+        2: {"TauCeti/P.lean": P_MEMBER},
+        3: {"TauCeti/Q.lean": Q_MEMBER},
+    }
+
+    def setUp(self):
+        super().setUp()
+        # The sandbox clears the environment: the lint's files travel with the bwrap stub's extras.
+        (BIN / "sandbox-env.json").write_text(json.dumps({"STUB_DIR": str(self.stub_dir), "STUB_LAKE_NUMPROJ": "P,Q"}))
+        raw = self.content.task(1)
+        raw["diagnostics"] = []
+        self.service.tasks = {1: raw}
+        self.seen = []
+        original = repair_task.run_repair_agent
+
+        def run_repair_agent(cfg, task, worktree, prompt, *args, **kwargs):
+            errors = worktree / repair.LISTINGS_DIR / repair_stream.ERRORS_FILE
+            self.seen.append({"prompt": prompt, "errors": errors.read_text() if errors.exists() else ""})
+            return original(cfg, task, worktree, prompt, *args, **kwargs)
+
+        patcher = patch.object(repair_task, "run_repair_agent", run_repair_agent)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def claim(self, **overrides) -> dict:
+        cfg = self.config(**overrides)
+        return repair_task.claim_and_run(cfg, self.client(cfg))
+
+    def pushed_chain(self) -> list:
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        return chain_tool.chain_commits(self.content.bare, self.content.base, pushed)
+
+    def show(self, sha: str, path: str) -> str:
+        return sh(self.content.bare, "show", f"{sha}:{path}") + "\n"
+
+
+class NumprojRepair(NumprojRepairBase):
+    def test_each_projection_is_rewritten_in_the_member_that_wrote_it(self):
+        outcome = self.claim()
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.seen, [], "nothing was left for an agent")
+        chain = self.pushed_chain()
+        original = chain_tool.chain_commits(self.content.bare, self.content.base, self.content.tip)
+        self.assertEqual(chain[0].sha, original[0].sha, "member 1 changes no rewritten file and is kept as is")
+        self.assertEqual(self.show(chain[0].sha, "TauCeti/P.lean"), self.P_BASE)
+        self.assertEqual(self.show(chain[1].sha, "TauCeti/P.lean"), self.P_MEMBER.replace("x.2", "x.snd"))
+        self.assertEqual(self.show(chain[2].sha, "TauCeti/Q.lean"), self.Q_MEMBER.replace("x.1", "x.fst"))
+        self.assertEqual(self.show(chain[2].sha, "TauCeti/Keep.lean"), self.KEEP, "no finding names it")
+        for member in chain[1:]:
+            self.assertIn(repair_numproj.EXPLANATION, member.message)
+            self.assertTrue(member.message.startswith(original[chain.index(member)].message.rstrip()))
+        for new, old in zip(chain, original, strict=True):
+            self.assertEqual((new.author_name, new.author_date), (old.author_name, old.author_date))
+        diff = sh(self.content.bare, "diff", "--name-only", chain[1].parents[0], chain[1].sha).split()
+        self.assertEqual(diff, ["TauCeti/P.lean", "TauCeti/Two.lean"], "member 2's own files only")
+        self.assertEqual(outcome["numproj"][0]["paths"], ["TauCeti/P.lean", "TauCeti/Q.lean"])
+        self.assertEqual(outcome["numproj"][0]["errors"], 0)
+
+    def test_the_task_s_own_findings_are_replaced_too(self):
+        self.service.tasks[1]["diagnostics"] = [
+            {
+                "kind": "compiler",
+                "module": "TauCeti.P",
+                "message": "TauCeti/P.lean:2:33: Numeric projections are disallowed.",
+            },
+            {"kind": "compiler", "module": "TauCeti.One", "message": "TauCeti/One.lean:1:1: unknown identifier X"},
+        ]
+        self.claim(agent_attempts=1, verify_retries=0, stream_repair=False)
+        self.assertEqual(len(self.seen), 1)
+        prompt = self.seen[0]["prompt"]
+        self.assertIn("unknown identifier X", prompt)
+        self.assertNotIn("Numeric projections", prompt)
+
+    def test_a_rewrite_that_is_not_projections_only_is_refused(self):
+        self.use_tool(edit="lambda text: text.replace('Nat.zero', 'Nat.one')")
+        outcome = self.claim(agent_attempts=1, verify_retries=0)
+        self.assertNotIn("numproj", outcome)
+        self.assertEqual(len(self.seen), 1, "the agent gets the findings as they were")
+        self.assertIn("Numeric projections are disallowed", self.seen[0]["errors"])
+        self.assertNotIn('"event": "numproj"', self.seen[0]["errors"])
+
+
+class NumprojRepairLeftover(NumprojRepairBase):
+    """Member 3 also wrote a projection the tool cannot rewrite (the stand-in renames `.1` and `.2` only)."""
+
+    MEMBER_FILES = {
+        **NumprojRepairBase.MEMBER_FILES,
+        3: {"TauCeti/Q.lean": NumprojRepairBase.Q_MEMBER + "def t (x : Nat × Nat) : Nat := x.3\n"},
+    }
+
+    def test_what_the_rewrite_leaves_reaches_the_agent(self):
+        """The scoped build's error replaces the rewritten files' earlier ones in the error list the
+        agent reads."""
+        outcome = self.claim(agent_attempts=1, verify_retries=0)
+        self.assertEqual(len(self.seen), 1)
+        errors = [json.loads(line) for line in self.seen[0]["errors"].splitlines()]
+        located = [(e["file"], e["line"]) for e in errors if "file" in e]
+        self.assertEqual(located, [("TauCeti/Q.lean", 2)], "P is clean, and so is Q's first line")
+        self.assertEqual(errors[-1]["event"], "numproj")
+        self.assertEqual(outcome["numproj"][0]["errors"], 1)
+
+
+class NumprojRepairSharedFile(NumprojRepairBase):
+    """Members 2 and 3 both change ``TauCeti/P.lean``: member 2 adds a projection at its end, member 3
+    changes its first line without one."""
+
+    P_BASE = "def r : Nat := Nat.zero\n\n\n\n\ndef z : Nat := 0\n"
+    BASE_FILES = {"TauCeti/P.lean": P_BASE}
+    MEMBER_FILES = {
+        2: {"TauCeti/P.lean": P_BASE + "def q (x : Nat × Nat) : Nat := x.2\n"},
+        3: {"TauCeti/P.lean": P_BASE.replace("Nat.zero", "Nat.succ 0")},
+    }
+
+    def test_only_the_member_whose_patch_is_rewritten_is_edited(self):
+        outcome = self.claim()
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.seen, [])
+        chain = self.pushed_chain()
+        original = chain_tool.chain_commits(self.content.bare, self.content.base, self.content.tip)
+        expected = self.P_BASE.replace("Nat.zero", "Nat.succ 0") + "def q (x : Nat × Nat) : Nat := x.snd\n"
+        self.assertEqual(self.show(chain[2].sha, "TauCeti/P.lean"), expected)
+        self.assertIn(repair_numproj.EXPLANATION, chain[1].message)
+        self.assertEqual(chain[2].message, original[2].message, "member 3's own patch is unchanged")
+        patch_of = lambda c: sh(self.content.bare, "diff", c.parents[0], c.sha)  # noqa: E731
+        self.assertEqual(
+            [line for line in patch_of(chain[2]).splitlines() if line[:1] in ("+", "-")],
+            [line for line in patch_of(original[2]).splitlines() if line[:1] in ("+", "-")],
+        )
+        self.assertEqual(outcome["numproj"][0]["edited"], [original[1].sha])
 
 
 if __name__ == "__main__":

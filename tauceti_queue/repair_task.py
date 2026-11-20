@@ -2065,6 +2065,83 @@ def _expire_attempt(expired: threading.Event, cancel: threading.Event) -> None:
     cancel.set()
 
 
+def rewrite_projections(
+    cfg: RunnerConfig,
+    task: Task,
+    worktree: Path,
+    findings: dict,
+    stream: repair_stream.StreamingBuild | None,
+    logdir: Path,
+    cancel: threading.Event,
+    env_lake: dict,
+) -> tuple[dict, dict] | None:
+    """Rewrite the numeric projections the findings report, in the members that wrote them
+    (``repair_numproj.rewrite_chain``), before an agent sees them. ``stream`` is the task's streaming
+    build when its error list counts too: when the lint is among the errors it has reported so far, this
+    waits for that build to end, so that its later projections are rewritten too and the rewrite's own
+    build can take the build lock. Otherwise the agent starts at the stream's first error as before, and
+    projections the stream reports later are rewritten after a failed verification. Returns the findings with those files' errors replaced by
+    what a scoped build of them still reports (the error list is updated the same way) and the record
+    for the outcome; None when there is nothing to rewrite or the rewrite does not apply, with the
+    worktree and findings as they were."""
+    directory = repair.listings_path(worktree).parent
+    errors = repair_parallel.read_errors(directory) if stream is not None else None
+    if not repair_numproj.lint_files(findings, errors):
+        return None
+    if stream is not None:
+        while not stream.finished.wait(0.5):
+            if cancel.is_set():
+                return None
+        errors = repair_parallel.read_errors(directory)
+    files = repair_numproj.lint_files(findings, errors)
+    tip = git(worktree, "rev-parse", "HEAD").strip()
+    never_edited = {m.number for m in task.members if m.no_repair or m.withdrawn}
+    frozen = frozenset(c.sha for c in read_chain(cfg.clone, task.validation_base, tip) if c.pr in never_edited)
+    started = time.monotonic()
+    rewrite = repair_numproj.rewrite_chain(
+        worktree,
+        task.validation_base,
+        files,
+        env_lake,
+        logdir,
+        frozen=frozen,
+        timeout=cfg.build_timeout,
+        lake=tuple(cfg.lake),
+    )
+    if rewrite is None:
+        log(f"task {task.task_id}: numeric projections in {len(files)} file(s) left to the agent")
+        return None
+    repair_numproj.replace_stream_errors(directory, rewrite)
+    record = {
+        "from": tip,
+        "tip": rewrite.tip,
+        "paths": rewrite.paths,
+        "edited": rewrite.edited,
+        "errors": len(rewrite.errors),
+        "seconds": round(time.monotonic() - started, 1),
+        "tool": rewrite.tool,
+    }
+    log(
+        f"task {task.task_id}: rewrote numeric projections in {len(rewrite.paths)} file(s) across "
+        f"{len(rewrite.edited)} commit(s); {len(rewrite.errors)} error(s) left in them"
+    )
+    return repair_numproj.replace_findings(findings, rewrite), record
+
+
+def findings_left(findings: dict, worktree: Path, streamed: bool) -> bool:
+    """Whether anything is left for an agent: findings, or the streaming build's errors."""
+    if (
+        findings["compiler_errors"]
+        or findings["lint"]["findings"]
+        or findings["duplicate_declarations"]
+        or findings["import_collisions"]
+        or findings["failed_modules"]
+        or findings.get("other")
+    ):
+        return True
+    return streamed and bool(repair_parallel.read_errors(repair.listings_path(worktree).parent))
+
+
 def run_parallel_groups(
     cfg: RunnerConfig,
     task: Task,
@@ -2939,19 +3016,19 @@ def _run_task(
                 )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
         prompt_chain = read_chain(cfg.clone, task.validation_base, start_tip) if continuation else chain_before
-        # A rebase task computes the context of each conflict's own commits (`resolve_conflicts`).
-        ownership = (
-            None
-            if rebasing
-            else repair_context.compute(
+
+        def compute_ownership(chain: list) -> repair_context.RepairContext:
+            return repair_context.compute(
                 cfg.clone,
-                chain_before,
+                chain,
                 task.validation_base,
                 worktree,
                 declaration_names={m.number: m.declaration_names for m in task.members},
                 edited_prs={m.number for m in task.members if m.provenance == "edited"},
             )
-        )
+
+        # A rebase task computes the context of each conflict's own commits (`resolve_conflicts`).
+        ownership = None if rebasing else compute_ownership(chain_before)
         if ownership is not None:
             outcome["repair_context"] = ownership.summary()
         tools_root = cfg.root / repair_audit.TOOLS_DIR
@@ -3048,10 +3125,43 @@ def _run_task(
         agent_records: list[dict] = list(outcome.get("agent", []))
         agent = {"status": "ok"}
         skip_agent = bool(pending_delivery)
+        # Numeric projections are rewritten mechanically before an agent sees them: the first findings
+        # (the stream's too) and those of each failed verification (`rewrite_projections`).
+        projections_due = (
+            task.kind in ("repair", "prepare")
+            and not resuming
+            and not continuation
+            and not (outcome.get("artifacts") or {}).get("cold")
+        )
         while True:
             attempt += 1
             if cancel.is_set() or stopping():
                 return cancelled("cancelled before the agent started")
+            if projections_due:
+                projections_due = False
+                rewritten = rewrite_projections(
+                    cfg, task, worktree, findings, stream if attempt == 1 else None, logdir, cancel, env_lake
+                )
+                if cancel.is_set():
+                    return cancelled("cancelled while numeric projections were rewritten")
+                if rewritten is not None:
+                    findings, record = rewritten
+                    outcome.setdefault("numproj", []).append(record)
+                    chain_before = prompt_chain = read_chain(cfg.clone, task.validation_base, record["tip"])
+                    ownership = compute_ownership(chain_before)
+                    outcome["repair_context"] = ownership.summary()
+                    if feedback:  # a verification's: the findings it lists are superseded
+                        feedback = (
+                            "The worker's verification of the chain failed. The worker then rewrote the numeric "
+                            "projections in "
+                            + ", ".join(f"`{p}`" for p in record["paths"])
+                            + " with `tauceti-tools numproj`, in the members that wrote them, and rebuilt those files. "
+                            "What is left is listed as diagnostics and in "
+                            f"`{repair.LISTINGS_DIR}/{repair_audit.ERRORS_FILE}`."
+                        )
+                    if not findings_left(findings, worktree, stream is not None and attempt == 1):
+                        log(f"task {task.task_id}: nothing left for the agent after the numeric projection rewrite")
+                        skip_agent = True
             if (
                 attempt == 1
                 and not resuming
@@ -3276,6 +3386,7 @@ def _run_task(
                     elif verify_rounds < cfg.verify_retries:
                         verify_rounds += 1
                         findings = repair.findings_from_diagnostics(verification["diagnostics"])
+                        projections_due = task.kind in ("repair", "prepare") and not continuation
                         feedback = (
                             detail
                             + "\n\nThe findings are listed above as diagnostics and appended to "
