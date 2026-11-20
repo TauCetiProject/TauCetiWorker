@@ -29,7 +29,7 @@ admission predictions; the worker's verification audits and the candidate's CI r
 ```sh
 uv run python -m tauceti_queue.repair_task --service https://queue.example [--once | --check] [--worker ID]
     [--clone PATH] [--root PATH] [--repository owner/repo] [--poll SECONDS]
-    [--agent-timeout S] [--build-timeout S] [--keep-worktree] [--seed-packages PATH] [--no-resume]
+    [--agent-session-seconds S] [--build-timeout S] [--keep-worktree] [--seed-packages PATH] [--no-resume]
     [--providers claude,codex,api] [--rate T:B[,T:B...]] [--parallel-agents N]
 ```
 
@@ -218,10 +218,21 @@ with a stale-claim code end the task the same way. While a `result` or `release`
 the heartbeat treats a refused renewal as the service having already accepted the submission (it
 frees the claim on adoption and release) and simply ends; the submission's own response decides.
 
-The worker also caps one agent attempt at `agent_timeout` (3 h by default, the experiment's cap).
-That cap is the worker's, not the task's: an attempt that exceeds it is an ordinary agent failure
-(`agent_failed` after the bounded retry), never a lost claim, and the plan's rule that no repair task
-has a time budget holds because the service re-exposes the task.
+The worker times each agent session, and nothing else: preparation, the worker's builds and
+verification run outside the timer. When a session reaches `agent_session_seconds` (an hour by
+default, `--agent-session-seconds`), the worker stops it and starts a fresh session, with the same
+provider, in the same worktree, under the same claim. This is a continuation, not a failure: the
+edits, commits, any rebase or merge in progress and the build outputs all stay, the lease keeps
+renewing the claim throughout, and nothing is released or reported. There is no limit on the
+number of continuations, and the task itself has no time budget.
+
+Every agent prompt asks the agent to keep a short handoff note in `.tauceti-repair/handoff.md`
+(ignored by Git, like the rest of that directory): what it has found, what it has done and what it
+plans next. The fresh session's prompt says that it continues an earlier session, includes that
+note (the first 20,000 characters), and then repeats the task's prompt as first given; the
+diagnostics files under `.tauceti-repair` are the current ones. A run that starts without resuming
+a session deletes any note an earlier round left. The attempt record of a session that was
+continued has `continued: true`, and each continuation's prompt is kept under the task's `logs/`.
 
 ## Phases
 
@@ -750,9 +761,8 @@ run, `retry_deliveries(cfg, client)` for pending deliveries and abandoned claims
 - activity accounting from the outcome record (`status`, `agent[*].attempts[*].seconds` and
   `estimated_cost_usd`, `lease.renewals`, `response`), and the `agent-<provider>-*-telemetry.json` files
   the host agent writes under `tasks/<id>/logs/`;
-- the round's own deadline: the task sets `TAUCETI_ROUND_DEADLINE` from `agent_timeout` for the
-  agent's shell limits, and a loop that owns the round should pass its remaining time as
-  `agent_timeout`.
+- the session's own deadline: the task sets `TAUCETI_ROUND_DEADLINE` from
+  `agent_session_seconds` for each session's shell limits.
 
 The service's `repair_concurrency` setting bounds live claims across distinct tasks. Each task has
 one live owner: one worker repairs the head while another prepares the next eligible batch. A spare
@@ -773,8 +783,9 @@ prompt, leaves fixup commits). It covers adoption on the happy path, claim expir
 stop it, `invalid-chain` retried once with its violations, `explanation-required` resubmitted from
 the same session, a terminal rejection, a superseded claim at submission, a locally invalid chain
 retried with the local report, the local explanation follow-up turn, artifacts unavailable with and
-without a `release` route, inference unavailable after bounded retries, an ordinary agent failure
-and the worker's attempt cap released as `agent_failed`, a second claimant and a stale token refused,
+without a `release` route, inference unavailable after bounded retries, an ordinary agent failure,
+a session that reaches `agent_session_seconds` continued in a fresh session on the same claim and
+tree from its handoff note, a second claimant and a stale token refused,
 abandonment of a stopped task, the task record and prompt for a rebase conflict, the
 provider chain (the same stub installed as `codex`: chain order, a subscription over pace or
 unmeasurable skipped, a launch failure or a refusal before any work handed to the next provider, the

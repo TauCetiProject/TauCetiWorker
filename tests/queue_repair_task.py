@@ -442,6 +442,21 @@ elif mode == "auth-error":
 elif mode == "work-then-fail":
     print(json.dumps({"type": "item.completed", "item": {"id": "c1", "type": "command_execution", "command": "ls", "exit_code": 0}} if agent == "codex" else {"type": "assistant", "session_id": session, "message": {"id": "m0", "model": "claude-opus-5-5", "usage": {"input_tokens": 1, "output_tokens": 1, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}, "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]}}), flush=True)
     refuse("the provider dropped the connection after the first tool call")
+elif mode == "handoff":
+    # Leave work in progress (a committed fix, an uncommitted edit), write the handoff note, then outlive
+    # the session.
+    rebuild()
+    Path("wip.txt").write_text("half-done\n")
+    repair_dir.mkdir(exist_ok=True)
+    (repair_dir / "handoff.md").write_text("HANDOFF-MARKER: fixed #2; next, check the build\n")
+    time.sleep(float(os.environ.get("STUB_SLEEP", "30")))
+    finish()
+elif mode == "continue":
+    # A fresh session that finds the previous session's tree intact.
+    if resume is not None or not Path("wip.txt").exists() or "BROKEN" in Path("TauCeti/Two.lean").read_text():
+        finish("the previous session's work is gone", rc=3)
+    Path("wip.txt").unlink()
+    finish()
 elif mode == "noop":
     finish("nothing to do")
 elif mode == "resume-only":
@@ -1158,7 +1173,7 @@ class Fixture(unittest.TestCase):
             worker="worker-a@test",
             repository=PROJECT,
             token=TOKEN,
-            agent_timeout=60,
+            agent_session_seconds=60,
             build_timeout=60,
             inference_delays=(0.0,),
             service_delays=(0.0,),
@@ -2107,7 +2122,10 @@ class LongPrompt(Fixture):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["prompt_via"], "stdin")
         self.assertGreater(calls[0]["prompt_chars"], PROMPT_ARGV_LIMIT)
-        self.assertTrue(calls[0]["prompt"].endswith("x" * 99 + "\n"), "the whole prompt arrived, in order")
+        self.assertTrue(
+            calls[0]["prompt"].endswith("x" * 99 + "\n" + repair_task.HANDOFF_INSTRUCTION),
+            "the whole prompt arrived, in order",
+        )
         self.assertIn(repair.AGENT_INSTRUCTION, calls[0]["prompt"])
         self.assertEqual(calls[0]["argv"][:3], ["-p", "--output-format", "stream-json"])
         self.assertEqual(len(self.service.results), 1)
@@ -2235,7 +2253,10 @@ class Providers(Fixture):
         self.assertEqual([c["agent"] for c in calls], ["codex"])
         self.assertEqual(calls[0]["prompt_via"], "stdin")
         self.assertEqual(calls[0]["argv"][-2:], ["--skip-git-repo-check", "-"])
-        self.assertTrue(calls[0]["prompt"].endswith("x" * 99 + "\n"), "the whole prompt arrived, in order")
+        self.assertTrue(
+            calls[0]["prompt"].endswith("x" * 99 + "\n" + repair_task.HANDOFF_INSTRUCTION),
+            "the whole prompt arrived, in order",
+        )
 
     def test_a_rate_limited_subscription_is_skipped(self):
         self.statuses["claude"] = (False, "session ahead of pace (70% elapsed: used 61% > 55% pace budget), 39% left")
@@ -2563,19 +2584,58 @@ class QueueCacheNote(Fixture):
         self.assertEqual(captured[1], "queue")
 
 
-class AgentTimeout(Fixture):
-    def test_the_worker_cap_is_an_agent_failure_not_a_lost_claim(self):
-        os.environ["STUB_AGENT_MODE"] = "sleep"
+class AgentSessionContinuation(Fixture):
+    def test_a_long_session_continues_in_a_fresh_one_on_the_same_claim_and_tree(self):
+        os.environ["STUB_AGENT_MODES"] = "handoff,continue"
         os.environ["STUB_SLEEP"] = "30"
-        cfg = self.config(agent_timeout=2, agent_attempts=1)
+        # Longer than the claim's five-second lifetime: the lease must keep renewing across the switch.
+        cfg = self.config(agent_session_seconds=6, agent_attempts=1)
         started = time.monotonic()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
-        self.assertLess(time.monotonic() - started, 20)
-        self.assertEqual(outcome["status"], "released", outcome)
-        self.assertEqual(outcome["reason"], "agent_failed")
-        self.assertIn("cap", outcome["detail"])
-        self.assertFalse(outcome["lease"]["lost"], "the claim itself was never lost")
-        self.assertEqual([r["reason"] for r in self.service.releases], ["agent_failed"])
+        self.assertLess(time.monotonic() - started, 25)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertFalse(outcome["lease"]["lost"])
+        self.assertGreater(outcome["lease"]["renewals"], 25, "renewed through both sessions")
+        self.assertEqual(len(self.service.claims), 1, "one claim throughout")
+        self.assertEqual(self.service.releases, [])
+        first, second = self.agent_calls()
+        self.assertEqual(first["cwd"], second["cwd"], "the same worktree")
+        self.assertIsNone(second["resume"], "a fresh session, not a resume")
+        self.assertIn("handoff.md", first["prompt"], "the agent is told to keep the note")
+        self.assertIn("HANDOFF-MARKER: fixed #2; next, check the build", second["prompt"])
+        self.assertIn("This continues a repair session", second["prompt"])
+        self.assertIn(first["prompt"], second["prompt"], "the task's prompt follows the note")
+        attempts = outcome["agent"][0]["attempts"]
+        self.assertEqual([a.get("continued", False) for a in attempts], [True, False])
+        self.assertEqual(outcome["agent"][0]["status"], "ok")
+
+    def test_the_session_clock_starts_at_launch(self):
+        cancel = threading.Event()
+        session = repair_task._SessionCancel(cancel, 0.2)
+        time.sleep(0.3)  # the worker's preparation, before run_agent_proc's first poll
+        self.assertFalse(session.is_set(), "preparation is not timed")
+        time.sleep(0.3)
+        self.assertTrue(session.is_set())
+        self.assertTrue(session.expired)
+        lost = repair_task._SessionCancel(cancel, 60)
+        cancel.set()
+        self.assertTrue(lost.is_set())
+        self.assertFalse(lost.expired, "a lost claim is not the end of a session")
+
+    def test_a_fresh_round_does_not_inherit_an_earlier_note(self):
+        task = repair_task.Task.from_json(
+            {**self.content.task(), "claim_token": "t", "expires_at": time.time() + 60, "renew_after": 1}
+        )
+        state = repair_task.TaskState(self.root / "t", task)
+        worktree = self.root / "tree"
+        (worktree / ".tauceti-repair").mkdir(parents=True)
+        (worktree / repair_task.HANDOFF_NOTE).write_text("stale\n")
+        cfg = self.config(providers=())
+        result = repair_task.run_repair_agent(
+            cfg, state.task, worktree, "p", self.root / "logs", threading.Event(), state, {}, preselected=[]
+        )
+        self.assertEqual(result["status"], "inference_unavailable")
+        self.assertFalse((worktree / repair_task.HANDOFF_NOTE).exists())
 
 
 class Abandon(Fixture):

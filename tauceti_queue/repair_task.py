@@ -1063,7 +1063,10 @@ class RunnerConfig:
     rate: str | None = None
     api_key: str | None = dataclasses.field(default=None, repr=False)  # ANTHROPIC_API_KEY for ``api``
     token: str | None = None
-    agent_timeout: float = 3 * 3600
+    # One agent session's length. When it passes, the session is replaced by a fresh one on the same claim
+    # and worktree, which starts from the agent's handoff note (``continuation_prompt``). A continuation is
+    # never a failure and there is no limit on how many a task has.
+    agent_session_seconds: float = 3600.0
     # The agent's foreground shell limit (``TAUCETI_SHELL_LIMIT_SECONDS``): a repair runs whole-library
     # builds in the foreground, so it gets two hours where the fleet's authoring rounds keep ten minutes.
     shell_limit: float = repair.SHELL_LIMIT_SECONDS
@@ -1765,6 +1768,16 @@ _NO_EXECUTABLE = re.compile(
     r"(?:FileNotFoundError|PermissionError|OSError):.*(?:No such file or directory|Permission denied)"
 )
 LAUNCH_FAILURE = "could not start"
+# The agent's own handoff note, in the worktree's Git-ignored ``.tauceti-repair``: a fresh session that
+# continues a long one starts from it (``continuation_prompt``).
+HANDOFF_NOTE = f"{repair.LISTINGS_DIR}/handoff.md"
+HANDOFF_SHOWN = 20_000  # characters of the note put in the continuation prompt
+HANDOFF_INSTRUCTION = (
+    f"\n\nHandoff note: keep a short note in `{HANDOFF_NOTE}` (ignored by Git) of what you have found, what you "
+    "have done and what you plan next, and update it after every build and every significant step. A long "
+    "session is replaced by a fresh one in this same worktree, with your edits, any rebase in progress and the "
+    "build outputs intact, and the fresh session starts from that note."
+)
 
 
 def prework_failure(provider: str, rc: int, run: dict | None, infra_reason: str | None) -> str | None:
@@ -1822,6 +1835,11 @@ def run_repair_agent(
     ``status``, ``reason``, ``seconds``). When the whole chain fails before any work the pass is retried
     after ``inference_delays`` up to ``inference_attempts`` times.
 
+    Each agent session is timed, and nothing else is: a session that reaches ``agent_session_seconds`` is
+    stopped and a fresh one is started with the same provider, in the same worktree, under the same claim
+    (the caller's lease keeps renewing it), from ``continuation_prompt``. Its attempt record says
+    ``continued``. A continuation is not a failure, restarts the inference retries, and has no limit.
+
     Returns ``{"status": "ok"}`` on a clean exit, ``"cancelled"`` when the claim was lost, ``"failed"``
     for the agent's own failure, ``"inference_unavailable"`` after the bounded retries,
     ``"agent_launch_failed"`` when no provider's process could be created at all (a missing executable,
@@ -1850,6 +1868,10 @@ def run_repair_agent(
     attempts: list[dict] = []
     reason = None
     provider = None
+    task_prompt = prompt = prompt + HANDOFF_INSTRUCTION
+    if not resume:
+        (worktree / HANDOFF_NOTE).unlink(missing_ok=True)  # an earlier round's note does not describe this one
+    continuations = 0
     prompt_path = logdir / f"prompt-{label}-{time.strftime('%Y%m%d-%H%M%S')}.md"
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt)
@@ -1871,15 +1893,18 @@ def run_repair_agent(
             **fields,
         }
 
-    for index in range(1, cfg.inference_attempts + 1):
+    index = 0
+    while index < cfg.inference_attempts:
+        index += 1
         launch_failures = 0
+        continued = False
         for provider in eligible:
             if cancel.is_set():
                 return result("cancelled")
             profile = provider_profile(cfg, provider)
             telemetry_provider = getattr(profile, "provider", "claude")
             changes = repair.isolation_env(cfg.root, env_lake, provider, api_key=cfg.api_key)
-            changes["TAUCETI_ROUND_DEADLINE"] = str(time.time() + cfg.agent_timeout)
+            changes["TAUCETI_ROUND_DEADLINE"] = str(time.time() + cfg.agent_session_seconds)
             changes["TAUCETI_SHELL_LIMIT_SECONDS"] = str(int(cfg.shell_limit))
             started = time.monotonic()
             session_resume = sessions.get(provider)
@@ -1891,11 +1916,8 @@ def run_repair_agent(
                 prompt=str(prompt_path),
                 resume=session_resume,
             )
-            # The worker's cap on one attempt; the plan gives the task itself no time budget.
-            expired = threading.Event()
-            timer = threading.Timer(cfg.agent_timeout, _expire_attempt, args=(expired, cancel))
-            timer.daemon = True
-            timer.start()
+            # Only the agent session is timed; when it ends, a fresh session continues on this claim and tree.
+            session_cancel = _SessionCancel(cancel, cfg.agent_session_seconds)
             run = None
             prework = None
             try:
@@ -1905,7 +1927,7 @@ def run_repair_agent(
                         prompt,
                         profile,
                         logdir,
-                        cancel_event=cancel,
+                        cancel_event=session_cancel,
                         resume=session_resume,
                         session_path=state.session_path,
                         session_actor="queue-repair-task",
@@ -1923,7 +1945,7 @@ def run_repair_agent(
                 # Killed for private build bytes: the agent's own failure, not a reason to try another.
                 return result("failed", reason=str(error))
             except NoProgress as error:
-                if cancel.is_set() and not expired.is_set():
+                if cancel.is_set():
                     return result("cancelled")
                 rc, reason = 75, f"agent could not start: {error}"
                 prework = reason
@@ -1931,12 +1953,9 @@ def run_repair_agent(
                 reason = take_last_agent_infra_failure()
                 run = take_last_agent_run()
                 prework = prework_failure(provider, rc, run, reason)
-            finally:
-                timer.cancel()
             seconds = round(time.monotonic() - started, 1)
-            if expired.is_set():
-                cancel.clear()  # the lease is still live; only this attempt is over
-            if prework is not None and not expired.is_set():
+            expired = session_cancel.expired
+            if prework is not None and not expired:
                 if prework.startswith(LAUNCH_FAILURE):
                     launch_failures += 1
                     reason = prework
@@ -1972,11 +1991,20 @@ def run_repair_agent(
                 telemetry_provider, getattr(profile, "model", None), usage
             )
             attempts.append(record)
-            if expired.is_set():
-                record["timed_out"] = True
-                return result("failed", session=session, rc=rc, timed_out=True)
             if cancel.is_set():
                 return result("cancelled", session=session)
+            if expired:
+                # Not a failure: the work stays in the tree and a fresh session takes it up from the handoff note.
+                record["continued"] = True
+                continuations += 1
+                log(f"agent session {continuations} reached {cfg.agent_session_seconds:.0f}s; continuing in a fresh one")
+                prompt = continuation_prompt(worktree, task_prompt, cfg.agent_session_seconds)
+                prompt_path = logdir / f"prompt-{label}-continuation-{continuations}-{time.strftime('%Y%m%d-%H%M%S')}.md"
+                prompt_path.write_text(prompt)
+                sessions[provider] = None
+                eligible = [provider, *(p for p in eligible if p != provider)]
+                continued = True
+                break
             if rc == 0:
                 return result("ok", session=session)
             if not reason:
@@ -1990,6 +2018,9 @@ def run_repair_agent(
             if launch_failures == len(eligible):
                 return result("agent_launch_failed", reason=reason)
             log(f"every provider failed before any work; attempt {index}/{cfg.inference_attempts}")
+        if continued:
+            index = 0  # the agent worked: its inference retries start again
+            continue
         if index < cfg.inference_attempts:
             delay = cfg.inference_delays[min(index - 1, len(cfg.inference_delays) - 1)] if cfg.inference_delays else 0
             if cancel.wait(delay):
@@ -1997,9 +2028,51 @@ def run_repair_agent(
     return result("inference_unavailable", reason=reason)
 
 
-def _expire_attempt(expired: threading.Event, cancel: threading.Event) -> None:
-    expired.set()
-    cancel.set()
+class _SessionCancel:
+    """The agent's ``cancel_event``: set once the claim is lost (``cancel``) or the session has run for
+    ``seconds`` (then ``expired``). The clock starts at the first poll, which ``run_agent_proc`` makes just
+    before it launches the agent, so the worker's preparation in ``run_agent_host`` is not timed."""
+
+    def __init__(self, cancel: threading.Event, seconds: float):
+        self.cancel = cancel
+        self.seconds = seconds
+        self.started: float | None = None
+        self.expired = False
+
+    def is_set(self) -> bool:
+        if self.cancel.is_set():
+            return True
+        now = time.monotonic()
+        if self.started is None:
+            self.started = now
+        elif now - self.started >= self.seconds:
+            self.expired = True
+        return self.expired
+
+
+def continuation_prompt(worktree: Path, prompt: str, seconds: float) -> str:
+    """The prompt of a fresh session that takes over from one that reached ``agent_session_seconds``: the
+    agent's handoff note, then the task's prompt as first given."""
+    try:
+        note = (worktree / HANDOFF_NOTE).read_text(errors="replace").strip()
+    except OSError:
+        note = ""
+    if len(note) > HANDOFF_SHOWN:
+        note = note[:HANDOFF_SHOWN] + f"\n[truncated; the whole note is in `{HANDOFF_NOTE}`]"
+    handoff = (
+        f"Its handoff note (`{HANDOFF_NOTE}`):\n\n{note}\n\n"
+        if note
+        else f"It left no handoff note in `{HANDOFF_NOTE}`; work out where it stopped from the tree.\n\n"
+    )
+    return (
+        f"This continues a repair session that worked in this worktree for {seconds / 60:.0f} minutes and was then "
+        "replaced by you, a fresh session on the same task. Everything it did is still here: its edits and "
+        "commits, any rebase, merge or cherry-pick in progress, and the build outputs. Start with `git status` "
+        "and `git log`, then continue from where it stopped rather than starting over. "
+        + handoff
+        + "The task as first given follows.\n\n"
+        + prompt
+    )
 
 
 def run_parallel_groups(
@@ -2922,6 +2995,8 @@ def _run_task(
                     return release_task(
                         cfg, client, task, state, follow["status"], follow.get("reason"), outcome, lease
                     )
+                if follow.get("session"):  # a later turn resumes the latest session, continued or not
+                    agent = {**agent, "session": follow["session"], "provider": follow["provider"]}
                 tip = git(worktree, "rev-parse", "HEAD").strip()
                 git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
                 report = repair.chain_report(
@@ -2945,9 +3020,7 @@ def _run_task(
             )
             if not acceptable:
                 detail = format_report(report)
-                if agent.get("timed_out"):
-                    detail = f"agent exceeded the worker's {cfg.agent_timeout:.0f}s cap\n{detail}"
-                elif agent["status"] == "failed":
+                if agent["status"] == "failed":
                     detail = f"agent exited {agent.get('rc')}\n{detail}"
                 if attempt < cfg.agent_attempts and not rebasing:
                     feedback = (
@@ -3145,6 +3218,8 @@ def _run_task(
                     return release_task(
                         cfg, client, task, state, follow["status"], follow.get("reason"), outcome, lease
                     )
+                if follow.get("session"):  # a later turn resumes the latest session, continued or not
+                    agent = {**agent, "session": follow["session"], "provider": follow["provider"]}
                 attempt -= 1  # the resubmission continues this attempt
                 feedback = None
                 resubmit = True
@@ -3924,7 +3999,7 @@ def main(argv: list[str] | None = None) -> int:
         default=float(os.environ.get("TAUCETI_QUEUE_POLL_SECONDS") or 60.0),
         help="seconds between claims when nothing is claimable ($TAUCETI_QUEUE_POLL_SECONDS)",
     )
-    parser.add_argument("--agent-timeout", type=float, default=3 * 3600)
+    parser.add_argument("--agent-session-seconds", type=float, default=3600.0)
     parser.add_argument("--build-timeout", type=float, default=3 * 3600)
     parser.add_argument("--keep-worktree", action="store_true")
     parser.add_argument(
@@ -3983,7 +4058,7 @@ def main(argv: list[str] | None = None) -> int:
         root=args.root,
         worker=args.worker,
         repository=args.repository,
-        agent_timeout=args.agent_timeout,
+        agent_session_seconds=args.agent_session_seconds,
         build_timeout=args.build_timeout,
         keep_worktree=args.keep_worktree,
         seed_packages=args.seed_packages,

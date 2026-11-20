@@ -218,7 +218,7 @@ class ShellEnvironment(unittest.TestCase):
                 clone=checkout,
                 root=root / "state",
                 api_key="local-test-key",
-                agent_timeout=45,
+                agent_session_seconds=45,
                 inference_attempts=1,
                 providers=("api",),
             )
