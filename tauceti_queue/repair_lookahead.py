@@ -16,8 +16,9 @@ explanation follow-up. An acceptable resolution is recorded under the task's sto
 
 The members given to helpers are those whose commit, cherry-picked onto ``onto``, conflicts in a path
 that ``main`` changed since the chain's base (a conflict only with an earlier member's lines is the
-serial replay's), that did not land on ``main`` and that do not change the dependencies (a helper
-shares the task's packages and never fetches its own). They are taken in chain order.
+serial replay's) and that did not land on ``main``, in chain order. Helpers share the task's packages,
+prepared at ``onto``, and never fetch their own, so a chain in which a member changes the dependencies
+gets no lookahead (``changes_dependencies``).
 
 At each conflict the serial replay asks for the member (``wait``): a member no helper has started is
 the serial path's own; a running one is waited for. A stored lookahead resolution is merged onto the
@@ -54,6 +55,13 @@ def log(message: str) -> None:
     from tauceti_queue import repair_task
 
     repair_task.log(message)
+
+
+def changes_dependencies(clone: Path, task) -> bool:
+    """Whether a member of the task's chain changes ``lean-toolchain`` or ``lake-manifest.json``. The
+    helpers share the task's packages, prepared at ``onto``, which the serial path re-fetches at such a
+    member; a chain like that is resolved serially only."""
+    return bool(git(clone, "log", "--format=%H", f"{task.base}..{task.tip}", "--", *DEPENDENCY_FILES).strip())
 
 
 class Lookahead:
@@ -102,8 +110,6 @@ class Lookahead:
                 continue
             merged = chain_tool.merge_trees(clone, task.onto, commit.sha, merge_base=parent)
             if merged.clean or not changed.intersection(merged.conflict_paths):
-                continue
-            if git(clone, "diff", "--name-only", parent, commit.sha, "--", *DEPENDENCY_FILES).strip():
                 continue
             if repair_task.stored_resolution(clone, task.task_id, commit.sha, task.onto) is not None:
                 continue

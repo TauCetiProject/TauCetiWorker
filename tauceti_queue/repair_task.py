@@ -2378,7 +2378,11 @@ def resolve_conflicts(
             if conflict is None or conflict.replayed is None:
                 raise RuntimeError(f"the replay stopped without a conflicting commit: {result.status}")
             prefix, commit, source_pr = result.tip, conflict.replayed, conflict.source_pr
-            if lookahead is None and cfg.parallel_agents > 1:
+            if (
+                lookahead is None
+                and cfg.parallel_agents > 1
+                and not repair_lookahead.changes_dependencies(cfg.clone, task)
+            ):
                 lookahead = repair_lookahead.Lookahead(
                     cfg, task, worktree, logdir, cancel, env_lake, artifacts, after=commit
                 )
@@ -2597,7 +2601,8 @@ def resolve_one(
                 resume=agent.get("session"),
                 resume_provider=agent.get("provider"),
                 label=f"{label}-attempt-{attempt}-explanation",
-                preselected=providers,
+                # The resolving session's provider first, so its session is the one continued.
+                preselected=providers and [p for p in dict.fromkeys([agent.get("provider"), *providers]) if p],
             )
             agent_records.append(follow)
             if follow["status"] == "cancelled" or follow["status"] in RELEASED_AGENT_STATUSES:

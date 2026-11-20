@@ -25,6 +25,7 @@ the lock behave as the prompt says, and ``--no-stream-repair`` restores the sequ
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -1734,6 +1735,19 @@ class RebaseArtifacts(Fixture):
             self.assertNotIn("<<<<<<<", sh(self.content.bare, "show", f"{three.sha}:{path}"))
         self.assertEqual(sh(self.content.clone, "for-each-ref", repair_task.RESOLUTION_PREFIX), "")
         self.assertEqual(list((cfg.root / "worktrees").glob("task-1-lookahead-*")), [])
+
+    def test_a_chain_that_changes_the_dependencies_gets_no_lookahead(self):
+        """Helpers share packages prepared at ``onto``: a member changing ``lake-manifest.json`` turns them off."""
+        from tauceti_queue import repair_lookahead
+
+        clone = self.content.clone
+        sh(clone, "fetch", "--quiet", str(self.content.bare), self.onto, self.content.tip)
+        task = repair_task.Task.from_json(
+            {**self.raw, "claim_token": "x", "expires_at": time.time() + 60, "extra": {"claim_id": 1}}
+        )
+        self.assertFalse(repair_lookahead.changes_dependencies(clone, task))
+        bumped = commit_on(clone, self.content.tip, {"lake-manifest.json": "{}\n"})
+        self.assertTrue(repair_lookahead.changes_dependencies(clone, dataclasses.replace(task, tip=bumped)))
 
     def test_a_lookahead_resolution_that_does_not_merge_onto_the_prefix_is_not_used(self):
         """``recommit_resolution`` with ``made_on`` merges the resolution's change onto the prefix and
