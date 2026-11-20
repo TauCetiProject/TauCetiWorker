@@ -302,6 +302,11 @@ NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py retention.py
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.
 DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py target_list.py)
+# Modules whose code under test scans every process of the user (/proc, pgrep) and fails closed
+# or holds back when another process is busy or uninspectable. Concurrent modules (their sandboxed
+# children, a detached `git gc`) can disturb that scan, so with -j above 1 these run one at a
+# time after the parallel batch.
+HOST_PROCESSES=(legacy_data_root.py queue_install_releases.py)
 
 pass=0; fail=0; failed=()
 
@@ -326,8 +331,8 @@ if ((${#unclassified[@]})); then
   printf '  - %s\n' "${unclassified[@]}" >&2
   exit 2
 fi
-for t in "${NATIVE_FS[@]}" "${DOCS_CONTRACT[@]}"; do
-  [[ "${known[*]}" == *" $t "* ]] || { echo "ERROR: $t is in NATIVE_FS/DOCS_CONTRACT but not a known test" >&2; exit 2; }
+for t in "${NATIVE_FS[@]}" "${DOCS_CONTRACT[@]}" "${HOST_PROCESSES[@]}"; do
+  [[ "${known[*]}" == *" $t "* ]] || { echo "ERROR: $t is in NATIVE_FS/DOCS_CONTRACT/HOST_PROCESSES but not a known test" >&2; exit 2; }
 done
 # A test that asserts on the repository's documentation must be in DOCS_CONTRACT, or a docs-only
 # change could break it without CI running it.
@@ -402,7 +407,12 @@ export RUN_ROOT FAIL_FAST
 
 # --- run ------------------------------------------------------------------------------------------
 echo "run-all: ${#selected[@]} modules, group $GROUP, $JOBS at a time, python $PY"
-printf '%s\n' "${selected[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+parallel=(); alone=()
+for t in "${selected[@]}"; do
+  if [ "$JOBS" -gt 1 ] && in_list "$t" "${HOST_PROCESSES[@]}"; then alone+=("$t"); else parallel+=("$t"); fi
+done
+((${#parallel[@]})) && printf '%s\n' "${parallel[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+for t in "${alone[@]}"; do bash -c 'run_one "$1"' _ "$t"; done
 
 for t in "${selected[@]}"; do
   d="$RUN_ROOT/${t%.*}"
