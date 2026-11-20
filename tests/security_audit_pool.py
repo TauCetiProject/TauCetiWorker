@@ -125,10 +125,30 @@ class PoolFixture(unittest.TestCase):
                 self.launches.append((self.index(batch), provider, claude_credential, "resume_from" in kwargs))
             return inspect(batch, attempt)
 
+        stop = stop or self.settled
+        passes = [0]
+
+        def bounded(p):
+            # A pool that never settles is a failing test, never an unbounded run filling the disk.
+            passes[0] += 1
+            if passes[0] > 400:
+                raise AssertionError("the pool did not settle")
+            return stop(p)
+
         with patch.object(sa, "inspect", side_effect=fake):
             p = pool.Pool(self.state, parallel=parallel, chooser=pool.Chooser(None, pin=pin))
-            p.serve(stop=stop or self.settled)
+            p.serve(stop=bounded)
         return p
+
+    def not_judged(self, attempt, *, engaged=True):
+        """An attempt whose reviewer ran and returned no judgment; `engaged` if it answered at all."""
+        (attempt / "execution.json").write_text(sa.serialize({"argv": ["claude", "-p"], "paged": False}))
+        if engaged:
+            use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "unfinished", "findings": []}}
+            (attempt / "model-transcript.jsonl").write_text(
+                sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+            )
+        raise NotJudged("security-audit: inspection unfinished")
 
     def settled(self, p):
         """The pool no longer exits at a block: stop once nothing can run or advance."""
@@ -181,18 +201,52 @@ class Ordering(PoolFixture):
         self.assertEqual(self.calls.count(1), 1)
         self.assertEqual(len(self.advanced), 1)
 
-    def test_operational_failures_retry_fresh_twice_then_block(self):
+    def test_a_range_with_no_judgment_is_split_into_complete_halves(self):
         def inspect(batch, attempt):
-            if self.index(batch) == 0:
-                raise NotJudged("security-audit: codex failed; see model-stderr.txt")
+            if batch["from_sha"] == self.shas[0] and len(batch["commits"]) > 1:
+                self.not_judged(attempt)
             return self.verdict(batch)
 
-        self.serve(inspect, stop=self.settled)
-        self.assertEqual(self.calls.count(0), 1 + pool.MAX_RETRIES)
-        self.assertEqual(self.advanced, [])
-        blocked = json.loads((self.state / "blocked.json").read_text())
-        self.assertTrue(blocked["pool_retries_exhausted"])
-        self.assertEqual(blocked["from_sha"], self.shas[0])
+        self.serve(inspect)
+        splits = [r for r in self.ledger() if "split" in r]
+        self.assertEqual([(r["from_sha"], r["to_sha"]) for r in splits], [(self.shas[0], self.shas[2])])
+        self.assertEqual(
+            self.advanced,
+            [
+                (self.shas[0], self.shas[1]),
+                (self.shas[1], self.shas[2]),
+                (self.shas[2], self.shas[4]),
+                (self.shas[4], self.shas[6]),
+            ],
+        )
+        self.assertFalse((self.state / "blocked.json").exists())
+
+    def test_a_single_commit_with_no_judgment_is_retried_afresh_by_the_other_reviewer(self):
+        seen = []
+
+        def inspect(batch, attempt):
+            seen.append((batch["from_sha"], len(batch["commits"]), self.launches[-1][1]))
+            if batch["from_sha"] == self.shas[0] and len(seen) < 4:
+                self.not_judged(attempt)
+            return self.verdict(batch)
+
+        self.serve(inspect, parallel=1)
+        left = [provider for frm, n, provider in seen if frm == self.shas[0]]
+        # The whole range and its fresh left half on the default reviewer, then the half's retry on the other.
+        self.assertEqual(left[:3], ["codex", "codex", "claude"])
+        self.assertEqual(len(self.advanced), 4)
+        self.assertFalse((self.state / "blocked.json").exists())
+
+    def test_a_launch_where_no_reviewer_engaged_retries_the_same_range(self):
+        def inspect(batch, attempt):
+            if self.index(batch) == 0 and self.calls.count(0) == 1:
+                self.not_judged(attempt, engaged=False)
+            return self.verdict(batch)
+
+        self.serve(inspect)
+        self.assertEqual(self.calls.count(0), 2)
+        self.assertFalse([r for r in self.ledger() if "split" in r])
+        self.assertEqual(len(self.advanced), 3)
 
     def test_held_block_alert_is_offered_again_on_later_passes(self):
         # A failed DM is retried from its receipts; the pool must keep offering the block.
@@ -327,49 +381,6 @@ class Providers(PoolFixture):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.advanced, [])
 
-    def test_a_batch_keeps_its_provider_and_claude_may_move_to_the_api_key(self):
-        self.pace["codex"] = False
-        failures = []
-
-        def inspect(batch, attempt):
-            if self.index(batch) == 0 and not failures:
-                failures.append(1)
-                # Codex comes back under pace and Claude's subscription goes over pace.
-                self.pace.update(codex=True, claude=False)
-                self.key = "sk-ant-fixture-secret"
-                raise NotJudged("security-audit: reviewer failed")
-            return self.verdict(batch)
-
-        self.serve(inspect, parallel=1)
-        first = [(p, c) for i, p, c, _ in self.launches if i == 0]
-        self.assertEqual(first, [("claude", "subscription"), ("claude", "api-key")])
-        self.assertIn(("codex", None), {(p, c) for i, p, c, _ in self.launches if i > 0})
-
-    def test_codex_retry_continues_the_retained_session_when_one_exists(self):
-        stopped = []
-
-        def inspect(batch, attempt):
-            if self.index(batch) == 0 and not stopped:
-                stopped.append(attempt)
-                raise NotJudged("security-audit: inspection unfinished")
-            return self.verdict(batch)
-
-        retained = []
-
-        def fake_retained(work, previous):
-            retained.append(previous["attempt"])
-            batch = json.loads(Path(previous["attempt"], "input.json").read_text())
-            return Path(previous["attempt"]), batch, {"paged": True}, False
-
-        with (
-            patch("tauceti_worker.audit_recovery.retained", side_effect=fake_retained),
-            patch("tauceti_worker.audit_progress.continuable", return_value=True),
-        ):
-            self.serve(inspect)
-        self.assertEqual(retained, [str(stopped[0])])
-        first = [(p, resumed) for i, p, _, resumed in self.launches if i == 0]
-        self.assertEqual(first, [("codex", False), ("codex", True)])
-
     def test_haiku_retry_is_refused_when_the_stopped_transcript_holds_a_finding(self):
         self.pace["codex"] = False
 
@@ -480,39 +491,6 @@ class Ownership(PoolFixture):
         self.serve(lambda batch, attempt: self.verdict(batch))
         self.assertEqual(len(self.advanced), 3)
         self.assertTrue(list(self.state.glob("superseded-by-pool-block-*.json")))
-
-    def test_worker_codex_block_continues_in_its_session_even_over_pace(self):
-        # The Worker's batch was planned against an older main, so its input differs
-        # from what the pool would plan now; it must still be continued, on Codex.
-        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-2])
-        attempt = self.state / "attempt-1"
-        attempt.mkdir()
-        (attempt / "input.json").write_text(sa.serialize(batch))
-        block = {
-            "from_sha": self.shas[0],
-            "to_sha": batch["commits"][-1]["sha"],
-            "reason": "security-audit: inspection unfinished; retained for same-session continuation",
-            "attempt": str(attempt),
-        }
-        (self.state / "blocked.json").write_text(sa.serialize(block))
-        self.pace["codex"] = False
-        self.key = "sk-ant-fixture-secret"
-        retained = []
-
-        def fake_retained(work, previous):
-            retained.append(previous["attempt"])
-            return Path(previous["attempt"]), batch, {"argv": ["codex", "exec"], "paged": True}, False
-
-        with (
-            patch("tauceti_worker.audit_recovery.retained", side_effect=fake_retained),
-            patch("tauceti_worker.audit_progress.continuable", return_value=True),
-        ):
-            self.serve(lambda b, a: self.verdict(b))
-        self.assertIn(str(attempt), retained)
-        head = [(p, resumed) for i, p, _, resumed in self.launches if i == 0]
-        self.assertEqual(head, [("codex", True)])
-        self.assertTrue(all(p == "claude" for i, p, _, _ in self.launches if i != 0))
-        self.assertEqual(len(self.advanced), 3)
 
 
 class BindingJudgments(PoolFixture):
@@ -671,14 +649,18 @@ class DurableRanges(PoolFixture):
     def test_retry_state_and_reviewer_survive_a_restart(self):
         def first(batch, attempt):
             if self.index(batch) == 0:
-                raise NotJudged("security-audit: reviewer failed")
+                self.not_judged(attempt, engaged=False)
             return self.verdict(batch)
 
-        with patch.object(pool.Chooser, "retry", lambda chooser, slot: None):
+        with patch.object(pool, "RETRY_SECONDS", 1000):
             self.serve(first, stop=lambda p: not p.running and p.slots[0].failures == 1)
-        saved = json.loads((self.state / "pool" / pool.RANGES).read_text())["ranges"]
+        path = self.state / "pool" / pool.RANGES
+        saved = json.loads(path.read_text())["ranges"]
         self.assertEqual([r["status"] for r in saved], ["planned", "pass", "pass"])
-        self.assertEqual((saved[0]["failures"], saved[0]["provider"]), (1, "codex"))
+        self.assertEqual((saved[0]["failures"], saved[0]["avoid"]), (1, "codex"))
+        self.assertGreater(saved[0]["retry_at"], 0)
+        saved[0]["retry_at"] = 0  # The persisted backoff has elapsed.
+        path.write_text(json.dumps({"ranges": saved}))
         self.launches.clear()
         self.calls.clear()
         self.serve(lambda batch, attempt: self.verdict(batch))

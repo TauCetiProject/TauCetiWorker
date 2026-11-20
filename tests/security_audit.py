@@ -2515,7 +2515,7 @@ class Run(unittest.TestCase):
         }
         (work / "blocked.json").write_text(sa.serialize(block))
 
-        def inspection(*args, protocol):
+        def inspection(*args, **kwargs):
             archived = list(work.glob("superseded-size-block-*.json"))
             self.assertEqual(len(archived), 1)
             self.assertEqual(json.loads(archived[0].read_text()), block)

@@ -233,6 +233,23 @@ If the Worker dies without saving a transcript, the launch's new reads are repla
 Earlier findings and uncertainty are preserved;
 partial progress never substitutes for a final safety judgment.
 
+New inspections use judgment protocol 5 (the same served reader as protocol 4). The
+reviewer returns exactly `pass`, `finding` or `unfinished`; there is no `incomplete`.
+Genuine uncertainty about whether a construct is safe, or where it comes from, is a
+`finding`: a concern for human review, not necessarily a demonstrated vulnerability.
+Unread pages, lost context or running out of time are never findings: the reviewer
+returns `unfinished` with no findings. A fresh attempt continues its own session while
+it has no judgment, within one budget: three charged launches, where a launch that
+served new pages is not charged; a timeout ends it. Native goal tools are not offered.
+Codex registers its MCP resource helpers (`list_mcp_resources`,
+`list_mcp_resource_templates`, `read_mcp_resource`) whenever any MCP server is
+configured, and nothing turns them off: the model catalog describes them as unavailable,
+and calls to them are inert (the only server, the audit reader, serves no resources, so
+they read nothing and count as no coverage). New inspections never fall back to
+protocol 3 or 4: until a client is verified for protocol 5 they wait, and the cursor
+watchdog reports a long stall. The delivery check also confirms that Codex receives the
+helpers' unavailable descriptions. Retained protocol 1 to 4 attempts keep their own rules.
+
 Protocol 4 trusts the verified client to deliver successful tool responses intact.
 Served coverage proves neither model receipt nor understanding. The same isolated
 Luna/Haiku conversation may compact and reread source, then returns only `verdict`
@@ -457,8 +474,17 @@ update, one batch at a time and only past validated passes, so a later batch tha
 finishes first waits for its predecessors. Each attempt's outcome is the shared
 classification above. A finding or unreadable evidence is binding: the batch is never
 inspected again, nothing beyond it advances, and the usual block and alert are
-recorded. An attempt that is not a judgment gets at most two more attempts before
-blocking. A block left at the cursor by an ordinary round whose evidence binds nothing
+recorded. An attempt that is not a judgment never binds; it is retried autonomously by
+bisection. If the reviewer engaged with the range (it answered or was served input) and
+the range has several commits, the range is replaced, in one durable update, by its two
+halves: consecutive slices of its exact commit list, the second starting at the first's
+last commit, each a complete fresh inspection with full per-commit input. Pages or
+partial approvals from different attempts are never combined. A single commit, or a
+range whose reviewer never engaged (a provider or setup failure), is inspected afresh,
+preferring the other reviewer when one is available, with a persisted backoff of up to
+an hour that never gives up; the cursor watchdog reports a long stall. A recorded concern
+about any commit binds every range containing it, however the commits are later split
+or planned. A block left at the cursor by an ordinary round whose evidence binds nothing
 is archived and inspected afresh; source findings never are.
 The pool's whole scheduling state is one ordered list of active ranges,
 `pool/ranges.json`, replaced atomically on every change: each range's exact commits,
@@ -479,14 +505,11 @@ Each new batch gets the first available reviewer: Codex `gpt-6-luna` while the C
 subscription is under pace, then Haiku on the Claude subscription while that is under
 pace, then Haiku billed to the API key in `TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE`
 regardless of pace. With none available, new batches wait. Pacing is the ordinary
-`work` verdict, and `--ignore-quota` overrides soft pacing only. A batch keeps its
-provider for life, and retries continue the reviewer's own session: Codex resumes its
-native rollout, and protocol-4 Haiku resumes its Claude session (`claude -p --resume`),
-which the Worker retains under the attempt's `claude-projects/`. Haiku may return
-`unfinished` with no findings to continue reading, exactly as Luna does. Only an
-attempt classified as no judgment is retried, so a retry never discards a concern; a
-fresh Haiku attempt starts when no valid session is retained. Claude retries prefer the same credential, moving from the
-subscription to the API key when the subscription goes over pace. `--agent codex` or
+`work` verdict, and `--ignore-quota` overrides soft pacing only. Within one attempt,
+Codex continues its native rollout and Haiku its Claude session (`claude -p --resume`),
+which the Worker retains under the attempt's `claude-projects/`. Every retry is a fresh
+attempt, and only an attempt classified as no judgment is retried, so a retry never
+discards a concern. `--agent codex` or
 `--agent claude` pins one provider. The ledger and `pool/` result files record each
 review's provider, model and credential kind, never the key.
 
