@@ -222,7 +222,7 @@ names of the form `<sha>-<time>` are collected; hand-made worktrees in that dire
 own release directory.** Never use systemd drop-ins (`~/.config/systemd/user/tauceti-queue*.service.d/*.conf`)
 for queue units: they silently override the installed unit and each other, so the release
 directories, `release.sh status` and the installers stop describing what runs. `install.sh`,
-`install-repair.sh` and `install-monitoring.sh` ([monitoring.md](monitoring.md)) refuse to run while
+`install-repair.sh`, `install-monitoring.sh` ([monitoring.md](monitoring.md)) and `install-security-audit.sh` refuse to run while
 one exists for a unit they install. Settings belong in `~/.config/tauceti-queue/environment` (or
 `repair-environment*`, `monitoring-environment`) or in the unit files in this repository.
 
