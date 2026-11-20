@@ -7655,5 +7655,34 @@ class NumprojRepairLeftover(NumprojRepairBase):
         self.assertEqual(outcome["numproj"][0]["errors"], 1)
 
 
+class NumprojRepairSharedFile(NumprojRepairBase):
+    """Members 2 and 3 both change ``TauCeti/P.lean``: member 2 adds a projection at its end, member 3
+    changes its first line without one."""
+
+    P_BASE = "def r : Nat := Nat.zero\n\n\n\n\ndef z : Nat := 0\n"
+    BASE_FILES = {"TauCeti/P.lean": P_BASE}
+    MEMBER_FILES = {
+        2: {"TauCeti/P.lean": P_BASE + "def q (x : Nat × Nat) : Nat := x.2\n"},
+        3: {"TauCeti/P.lean": P_BASE.replace("Nat.zero", "Nat.succ 0")},
+    }
+
+    def test_only_the_member_whose_patch_is_rewritten_is_edited(self):
+        outcome = self.claim()
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.seen, [])
+        chain = self.pushed_chain()
+        original = chain_tool.chain_commits(self.content.bare, self.content.base, self.content.tip)
+        expected = self.P_BASE.replace("Nat.zero", "Nat.succ 0") + "def q (x : Nat × Nat) : Nat := x.snd\n"
+        self.assertEqual(self.show(chain[2].sha, "TauCeti/P.lean"), expected)
+        self.assertIn(repair_numproj.EXPLANATION, chain[1].message)
+        self.assertEqual(chain[2].message, original[2].message, "member 3's own patch is unchanged")
+        patch_of = lambda c: sh(self.content.bare, "diff", c.parents[0], c.sha)  # noqa: E731
+        self.assertEqual(
+            [line for line in patch_of(chain[2]).splitlines() if line[:1] in ("+", "-")],
+            [line for line in patch_of(original[2]).splitlines() if line[:1] in ("+", "-")],
+        )
+        self.assertEqual(outcome["numproj"][0]["edited"], [original[1].sha])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

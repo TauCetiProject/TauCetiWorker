@@ -2077,21 +2077,22 @@ def rewrite_projections(
 ) -> tuple[dict, dict] | None:
     """Rewrite the numeric projections the findings report, in the members that wrote them
     (``repair_numproj.rewrite_chain``), before an agent sees them. ``stream`` is the task's streaming
-    build when its error list counts too; the rewrite then waits for that build to end, since it builds
-    the rewritten files under the build lock. Returns the findings with those files' errors replaced by
+    build when its error list counts too: this waits for that build to end, so that the projections it
+    reports late are rewritten too and the rewrite's own build can take the build lock (since rc1 the
+    lint is in nearly every repair, so the agent would rarely start before that anyway). Returns the findings with those files' errors replaced by
     what a scoped build of them still reports (the error list is updated the same way) and the record
     for the outcome; None when there is nothing to rewrite or the rewrite does not apply, with the
     worktree and findings as they were."""
     directory = repair.listings_path(worktree).parent
-    errors = repair_parallel.read_errors(directory) if stream is not None else None
-    if not repair_numproj.lint_files(findings, errors):
-        return None
+    errors = None
     if stream is not None:
         while not stream.finished.wait(0.5):
             if cancel.is_set():
                 return None
         errors = repair_parallel.read_errors(directory)
     files = repair_numproj.lint_files(findings, errors)
+    if not files:
+        return None
     tip = git(worktree, "rev-parse", "HEAD").strip()
     never_edited = {m.number for m in task.members if m.no_repair or m.withdrawn}
     frozen = frozenset(c.sha for c in read_chain(cfg.clone, task.validation_base, tip) if c.pr in never_edited)
@@ -2133,6 +2134,7 @@ def findings_left(findings: dict, worktree: Path, streamed: bool) -> bool:
         or findings["lint"]["findings"]
         or findings["duplicate_declarations"]
         or findings["import_collisions"]
+        or findings["failed_modules"]
         or findings.get("other")
     ):
         return True
@@ -3147,12 +3149,14 @@ def _run_task(
                     chain_before = prompt_chain = read_chain(cfg.clone, task.validation_base, record["tip"])
                     ownership = compute_ownership(chain_before)
                     outcome["repair_context"] = ownership.summary()
-                    if feedback:  # a verification's findings: some of them are gone now
-                        feedback += (
-                            "\n\nThe worker then rewrote the numeric projections in "
+                    if feedback:  # a verification's: the findings it lists are superseded
+                        feedback = (
+                            "The worker's verification of the chain failed. The worker then rewrote the numeric "
+                            "projections in "
                             + ", ".join(f"`{p}`" for p in record["paths"])
-                            + " with `tauceti-tools numproj`, in the members that wrote them, and rebuilt those "
-                            "files; the diagnostics list what is left."
+                            + " with `tauceti-tools numproj`, in the members that wrote them, and rebuilt those files. "
+                            "What is left is listed as diagnostics and in "
+                            f"`{repair.LISTINGS_DIR}/{repair_audit.ERRORS_FILE}`."
                         )
                     if not findings_left(findings, worktree, stream is not None and attempt == 1):
                         log(f"task {task.task_id}: nothing left for the agent after the numeric projection rewrite")

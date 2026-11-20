@@ -570,6 +570,15 @@ def _with_entries(worktree: Path, tree: str, entries: dict[str, tuple[str, str]]
         return _git_bytes(worktree, "write-tree", env=env).strip()
 
 
+def _patch(worktree: Path, old: tuple[str, str] | None, new: tuple[str, str] | None) -> list[str]:
+    """The lines a change from blob ``old`` to blob ``new`` removes and adds (None: no file)."""
+    if old is None or new is None:  # git diffs two objects; the empty blob stands for a missing file
+        empty = _git_bytes(worktree, "hash-object", "-w", "--stdin", data=b"").strip()
+        old, new = old or ("", empty), new or ("", empty)
+    diff = _git_bytes(worktree, "diff", "-U0", old[1], new[1])
+    return [line for line in diff.splitlines() if line[:1] in ("+", "-") and line[:3] not in ("+++", "---")]
+
+
 def rewrite_chain(
     worktree: Path,
     base: str,
@@ -584,10 +593,9 @@ def rewrite_chain(
     """Rewrite the numeric projections in every version of ``paths`` along the chain ``base..HEAD``
     of ``worktree`` and recommit the chain, so that each member's own change becomes the rewritten
     form of what it changed. Every distinct version (blob) is rewritten once, in one tool run; each
-    commit's tree gets the rewritten blob of each of its versions, and a commit whose own change is
-    rewritten gets ``EXPLANATION`` appended to its message, keeping its author and date. A file's
-    version at ``base`` stays as it is: the next member to change the file takes the rewrite of what
-    it inherits. A file that a ``frozen`` commit (a member never edited) changes is not rewritten.
+    commit's tree gets the rewritten blob of each of its versions, and a commit whose own patch
+    changes gets ``EXPLANATION`` appended to its message, keeping its author and date. A file stays
+    as at ``base`` until a member changes it: that member takes the rewrite of what it inherits. A file that a ``frozen`` commit (a member never edited) changes is not rewritten.
 
     The worktree is then checked out at the new tip and the rewritten modules built (``lake build``
     under the build lock); ``errors`` are that build's errors in them. None when nothing is rewritten
@@ -618,9 +626,17 @@ def rewrite_chain(
         if c.sha in frozen:
             paths = [p for p in paths if listings[c.sha].get(p) == previous.get(p)]
         previous = listings[c.sha]
-    versions: dict[str, bytes] = {}  # blob id -> its content, for the versions to rewrite
+    # The versions to rewrite: a file's from the first commit that changes it on (before that it is
+    # the base's, which stays as it is).
+    touched: dict[str, set[str]] = {}  # commit -> the paths changed by it or an earlier commit
+    seen: set[str] = set()
+    previous = listings[base]
     for c in commits:
-        for path in paths:
+        seen.update(p for p in paths if listings[c.sha].get(p) != previous.get(p))
+        touched[c.sha], previous = set(seen), listings[c.sha]
+    versions: dict[str, bytes] = {}  # blob id -> its content
+    for c in commits:
+        for path in touched[c.sha]:
             entry = listings[c.sha].get(path)
             if entry is None or entry[1] in versions:
                 continue
@@ -630,8 +646,6 @@ def rewrite_chain(
                     versions[entry[1]] = data
             except UnicodeDecodeError:
                 continue
-    for _, blob in listings[base].values():
-        versions.pop(blob, None)  # the base's version stays wherever it appears
     if not versions:
         return None
     modules = {m for data in versions.values() for m in header_imports(data.decode())}
@@ -665,20 +679,29 @@ def rewrite_chain(
         }
         if not renamed:
             return None
-        parent, previous, edited, changed = chain_tool.resolve_commit(worktree, base), listings[base], [], set()
+        parent, edited, changed = chain_tool.resolve_commit(worktree, base), [], set()
+        before = {p: listings[base].get(p) for p in paths}  # the rewritten versions of the parent
+        previous = listings[base]
         for c in commits:
             listing = listings[c.sha]
-            entries = {p: (mode, renamed[blob]) for p, (mode, blob) in listing.items() if blob in renamed}
+            after = {
+                p: (listing[p][0], renamed.get(listing[p][1], listing[p][1])) if p in touched[c.sha] else listing[p]
+                for p in paths
+                if p in listing
+            }
+            entries = {p: entry for p, entry in after.items() if entry != listing[p]}
             changed.update(entries)
+            # Its own change is rewritten when its patch of a file differs from what it was.
+            own = any(
+                _patch(worktree, previous.get(p), listing.get(p)) != _patch(worktree, before.get(p), after.get(p))
+                for p in paths
+                if previous.get(p) != listing.get(p) and (p in entries or before.get(p) != previous.get(p))
+            )
+            before, previous = after, listing
             if not entries and c.parents == (parent,):
-                parent, previous = c.sha, listing
+                parent = c.sha
                 continue
             tree = _with_entries(worktree, c.tree, entries) if entries else c.tree
-            own = any(
-                listing.get(p) != previous.get(p)
-                and (listing.get(p, ("", ""))[1] in renamed or previous.get(p, ("", ""))[1] in renamed)
-                for p in paths
-            )
             message = c.message
             if own:
                 edited.append(c.sha)
@@ -693,7 +716,6 @@ def rewrite_chain(
                 author_date=c.author_date,
                 committer_date=c.author_date,
             )
-            previous = listing
         repair.git(worktree, "checkout", "--quiet", "--force", "--detach", parent)
     except (chain_tool.ChainError, subprocess.CalledProcessError, RuntimeError, UnicodeDecodeError):
         return None
@@ -773,7 +795,7 @@ def replace_stream_errors(directory: Path, rewrite: ChainRewrite) -> None:
         if (
             isinstance(entry, dict)
             and entry.get("file") in rewrite.paths
-            and entry.get("kind") in (None, repair_stream.RERUN)
+            and entry.get("kind") in (None, "compiler", repair_stream.RERUN)
         ):
             continue
         kept.append(line)
