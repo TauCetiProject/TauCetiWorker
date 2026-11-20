@@ -346,6 +346,20 @@ all notes. There are no independent partial approvals. A later passing answer
 cannot discard an earlier source finding or explained code uncertainty, including
 one retained only in native history.
 
+Every attempt, however it ends, gets one shared classification of its evidence
+(`audit_evidence.classify`). It reads the retained session, every captured client
+output (including archived earlier launches), the attempts it continued and the
+ledger's verdicts for the same input. A concern recorded anywhere is a **finding**
+and binds, even when the final answer is `unfinished` or `pass`, or the client timed
+out or failed: a concern is a judgment's nonempty findings, or a `finding` label. An
+`incomplete` label with no findings names no concern. Otherwise, evidence that
+cannot be read (a row cut off where an answer could have been, or text mentioning a
+judgment that cannot be parsed) holds the range for a human like a finding. Otherwise
+the attempt is a **pass** only when its last launch ended normally with a valid
+complete pass and only the inspection's tools were used. Everything else
+(unfinished, malformed output, a provider failure, an unexpected tool) is **not a
+judgment** and never binds.
+
 Coverage continuations, recognized provider failures and mechanical output repairs
 share at most three charged launches per invocation, with 5- and 10-second delays.
 A protocol-4 coverage turn that serves new pages is not charged, so reading continues
@@ -384,13 +398,10 @@ checks still precede advancement; the ledger records reuse of the original attem
 and its evidence and block remain preserved until the ref update is confirmed.
 
 Reviewed version-1 and version-2 launcher profiles can migrate in their original
-native session. Version-2 coverage-only incompletes are recognized only by a closed
-diagnostic grammar whose claimed unread range and final token match the retained
-receipt. Their original native final and ledger record must agree; findings and
-unknown prose remain blocked. This migration is a protocol rule, with no exception
-for a particular commit SHA. Original evidence stays on record. Source findings,
-explained uncertainty about code, unauthorized tools, unknown profiles and
-mismatched evidence remain blocked. Private alerts retain their usual deduplication.
+native session. Findings written about unread pages are findings like any other:
+they bind. Original evidence stays on record. Source findings, explained
+uncertainty about code, unknown profiles and mismatched evidence remain blocked.
+Private alerts retain their usual deduplication.
 
 The `retry-service` and `repair-output` administrative commands remain for their
 restricted historical recovery profiles; automatic protocol-v3 recovery uses the
@@ -440,11 +451,12 @@ The pool plans a window of consecutive batches ahead of the cursor, each exactly
 `work` would plan it from that batch's start, and inspects them concurrently in
 separate attempt directories. The cursor advances only through the ordinary admin
 update, one batch at a time and only past validated passes, so a later batch that
-finishes first waits for its predecessors. A finding or incomplete verdict is
-binding: it is never inspected again, nothing beyond it advances, and the usual
-block and alert are recorded. Operational failures with no recorded judgment get
-at most two more attempts before blocking. An operational block left at the cursor
-by an ordinary round is archived and inspected afresh; source findings never are.
+finishes first waits for its predecessors. Each attempt's outcome is the shared
+classification above. A finding or unreadable evidence is binding: the batch is never
+inspected again, nothing beyond it advances, and the usual block and alert are
+recorded. An attempt that is not a judgment gets at most two more attempts before
+blocking. A block left at the cursor by an ordinary round whose evidence binds nothing
+is archived and inspected afresh; source findings never are.
 Passing results persist under `pool/` and are reused after a restart only when the
 rebuilt input is byte-identical and still the next main prefix. While the pool
 holds `pool.lock`, ordinary audit rounds for that state defer to it. A GitHub rate
@@ -458,10 +470,9 @@ regardless of pace. With none available, new batches wait. Pacing is the ordinar
 provider for life, and retries continue the reviewer's own session: Codex resumes its
 native rollout, and protocol-4 Haiku resumes its Claude session (`claude -p --resume`),
 which the Worker retains under the attempt's `claude-projects/`. Haiku may return
-`unfinished` with no findings to continue reading, exactly as Luna does. Any earlier
-finding or uncertainty in the session or the captured stream-json output binds the
-batch, and a fresh Haiku attempt starts only when no valid session is retained and
-that output holds none. Claude retries prefer the same credential, moving from the
+`unfinished` with no findings to continue reading, exactly as Luna does. Only an
+attempt classified as no judgment is retried, so a retry never discards a concern; a
+fresh Haiku attempt starts when no valid session is retained. Claude retries prefer the same credential, moving from the
 subscription to the API key when the subscription goes over pace. `--agent codex` or
 `--agent claude` pins one provider. The ledger and `pool/` result files record each
 review's provider, model and credential kind, never the key.

@@ -1,0 +1,343 @@
+"""One reading of an inspection attempt's evidence, shared by every caller.
+
+Every finished, failed or interrupted attempt is exactly one outcome, in this precedence:
+
+- FINDING: a judgment recorded anywhere names a concern. "Anywhere" is the reviewer's
+  retained session, every captured client output (including archived earlier launches),
+  the attempts this one continued, and the ledger's verdicts for the same input. It binds
+  whatever the final answer says, and even if the attempt later failed.
+- UNREADABLE: no concern was found, but some evidence cannot be read, so the absence of a
+  concern is not established. It holds the range for a human, exactly like a finding.
+- PASS: the last launch completed normally, its final answer is a valid pass of the exact
+  batch with complete coverage, and the whole history used only the inspection's tools.
+- NOT_JUDGED: everything else (unfinished, malformed output, a provider failure or timeout,
+  an unexpected tool). It never binds.
+
+A concern is a judgment's nonempty findings, or a `finding` label even without findings.
+An `incomplete` label alone, with no findings, names no concern. Concerns are collected
+before any validation, so an invalid attempt can never discard one.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from .config import Die
+
+FINDING, UNREADABLE, PASS, NOT_JUDGED = "finding", "unreadable", "pass", "not-judged"
+
+# A client killed mid-write leaves a partial row. JSON escapes every quote inside a string, so
+# these `"type": "..."`/`"role": "..."` pairs are the row's own structure, never reviewer text.
+STRUCTURE = re.compile(r'"(?:type|role)":\s*"([^"\\]+)"')
+# Rows of these kinds never hold a judgment: tool calls' outputs, reasoning, progress and input.
+HARMLESS = frozenset(
+    {
+        "function_call_output",
+        "custom_tool_call_output",
+        "mcp_tool_call",
+        "tool_result",
+        "reasoning",
+        "item.started",
+        "item.updated",
+        "event_msg",
+        "user",
+    }
+)
+ANSWERS = frozenset({"assistant", "agent_message", "result"})
+# Text that mentions a judgment key must contain a readable judgment.
+TEXT_MARKERS = ('"verdict"', '"findings"')
+READ_PAGE = "read_page"
+GOAL_TOOLS = frozenset({"get_goal", "create_goal", "update_goal"})
+
+
+class NotJudged(Die):
+    """The attempt recorded no concern and no valid complete judgment. It never binds."""
+
+
+class Unreadable(Die):
+    """The attempt's evidence cannot establish the absence of a concern. It holds for a human."""
+
+
+@dataclass(frozen=True)
+class Outcome:
+    kind: str
+    verdict: dict | None = None  # PASS or FINDING: the verdict bound to the exact batch.
+    reason: str = ""  # NOT_JUDGED or UNREADABLE: why.
+
+
+@dataclass
+class Evidence:
+    judgments: list = field(default_factory=list)  # Every judgment-shaped value, in recorded order.
+    tools: list[str] = field(default_factory=list)  # Every tool request, normalized.
+    unreadable: list[str] = field(default_factory=list)  # Why some evidence could not be read.
+    damaged: list[str] = field(default_factory=list)  # Unreadable rows that cannot have held a judgment.
+
+    def concerns(self) -> list[tuple[str, list[str]]]:
+        return [(j.get("verdict"), c) for j in self.judgments if (c := concern(j))]
+
+
+def concern(value) -> list[str]:
+    """The concern a recorded judgment names, as strings; empty when it names none."""
+    if not isinstance(value, dict):
+        return []
+    findings = value.get("findings")
+    if isinstance(findings, list):
+        texts = [f if isinstance(f, str) else json.dumps(f, sort_keys=True) for f in findings]
+    elif findings in (None, "", {}):
+        texts = []
+    else:
+        texts = [findings if isinstance(findings, str) else json.dumps(findings, sort_keys=True)]
+    texts = [t for t in texts if t.strip()]
+    if not texts and value.get("verdict") == "finding":
+        texts = ["The reviewer returned a finding without an explanation."]
+    return texts
+
+
+def judgments_in(text: str, evidence: Evidence, where: str) -> list:
+    """Every judgment-shaped JSON object in a reviewer's text, wherever it appears."""
+    if not isinstance(text, str):
+        evidence.unreadable.append(f"{where}: unreadable reviewer text")
+        return []
+    if not any(marker in text for marker in TEXT_MARKERS):
+        return []
+    decoder, found, i = json.JSONDecoder(), [], text.find("{")
+    while i != -1:
+        try:
+            value, _ = decoder.raw_decode(text, i)
+        except ValueError:
+            value = None
+        if isinstance(value, dict) and ("verdict" in value or "findings" in value):
+            found.append(value)
+        i = text.find("{", i + 1)
+    if not found:
+        evidence.unreadable.append(f"{where}: reviewer text mentions a judgment that cannot be read")
+    evidence.judgments.extend(found)
+    return found
+
+
+def tool_name(name) -> str:
+    return READ_PAGE if name in ("read_page", "mcp__audit__read_page", "audit.read_page") else str(name)
+
+
+def rows(path: Path, evidence: Evidence):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        evidence.unreadable.append(f"{path}: {exc}")
+        return
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            row = None
+        if not isinstance(row, dict):
+            # A partial row that visibly cannot hold a judgment only prevents a pass. Any other
+            # row could have held one, so it is unreadable evidence.
+            kinds = set(STRUCTURE.findall(line))
+            harmless = kinds & HARMLESS and not kinds & ANSWERS
+            (evidence.damaged if harmless else evidence.unreadable).append(f"{path}:{number}: unreadable row")
+            continue
+        yield f"{path}:{number}", row
+
+
+def read_row(row: dict, evidence: Evidence, where: str) -> None:
+    """One row of a Codex native rollout, a Codex exec stream, or a Claude session or stream."""
+    kind = row.get("type")
+    if kind == "response_item":  # Codex native rollout: what a resume loads.
+        item = row.get("payload")
+        if not isinstance(item, dict):
+            evidence.unreadable.append(f"{where}: unreadable native item")
+        elif item.get("type") == "message" and item.get("role") == "assistant":
+            parts = item.get("content")
+            if not isinstance(parts, list) or any(not isinstance(p, dict) for p in parts):
+                evidence.unreadable.append(f"{where}: unreadable native message")
+                return
+            judgments_in(
+                "".join(str(p.get("text", "")) for p in parts if p.get("type") == "output_text"), evidence, where
+            )
+        elif str(item.get("type", "")).endswith("_call"):
+            evidence.tools.append(tool_name(item.get("name") or item.get("type")))
+    elif kind in ("item.started", "item.updated", "item.completed"):  # Codex exec stream.
+        item = row.get("item")
+        if not isinstance(item, dict):
+            evidence.unreadable.append(f"{where}: unreadable client item")
+        elif item.get("type") == "agent_message":
+            if kind == "item.completed":  # Earlier updates hold partial text of the same message.
+                judgments_in(item.get("text", ""), evidence, where)
+        elif item.get("type") == "mcp_tool_call":
+            server, tool = item.get("server"), item.get("tool")
+            evidence.tools.append(tool_name(tool) if server == "audit" else f"{server}.{tool}")
+        elif item.get("type") not in ("reasoning", "context_compaction"):
+            evidence.tools.append(str(item.get("type")))
+    elif kind == "assistant":  # Claude session or stream-json.
+        message = row.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        if not isinstance(content, list) or any(not isinstance(item, dict) for item in content):
+            evidence.unreadable.append(f"{where}: unreadable assistant message")
+            return
+        for item in content:
+            if item.get("type") == "tool_use" and item.get("name") == "StructuredOutput":
+                evidence.judgments.append(item.get("input"))
+            elif item.get("type") == "tool_use":
+                evidence.tools.append(tool_name(item.get("name")))
+            elif item.get("type") == "text":
+                judgments_in(item.get("text", ""), evidence, where)
+    elif kind == "result" and row.get("structured_output") is not None:  # Claude's final result.
+        evidence.judgments.append(row["structured_output"])
+
+
+def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] | None = None) -> Evidence:
+    """Everything the attempt and the attempts it continued recorded."""
+    from . import security_audit as sa
+
+    evidence = Evidence() if evidence is None else evidence
+    attempt = attempt.resolve()
+    seen = set() if seen is None else seen
+    if attempt in seen:
+        evidence.unreadable.append(f"{attempt}: cyclic continuation lineage")
+        return evidence
+    seen.add(attempt)
+    sources = [
+        *sa.native_rollouts(attempt),
+        *sa.claude_sessions(attempt),
+        attempt / "model-transcript.jsonl",
+        *sorted(attempt.glob("*/model-transcript.jsonl")),  # Archived earlier launches.
+    ]
+    for path in sources:
+        if path.is_file():
+            for where, row in rows(path, evidence):
+                read_row(row, evidence, where)
+    previous = attempt / "previous-block.json"
+    if previous.exists():
+        try:
+            parent = Path(json.loads(previous.read_text())["attempt"]).resolve()
+            if parent.parent != attempt.parent or not parent.name.startswith("attempt-"):
+                raise ValueError("continuation lineage is outside this audit state")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            evidence.unreadable.append(f"{previous}: {exc}")
+        else:
+            collect(parent, evidence, seen=seen)
+    return evidence
+
+
+def recorded(state: Path, digest: str, evidence: Evidence | None = None) -> Evidence:
+    """The ledger's verdicts for exactly this input."""
+    evidence = Evidence() if evidence is None else evidence
+    ledger = state / "ledger.jsonl"
+    try:
+        lines = ledger.read_text(encoding="utf-8", errors="replace").splitlines() if ledger.exists() else []
+    except OSError as exc:
+        evidence.unreadable.append(f"{ledger}: {exc}")
+        return evidence
+    for number, line in enumerate(lines, 1):
+        try:
+            row = json.loads(line) if line.strip() else {}
+        except ValueError:
+            row = None
+        if not isinstance(row, dict):
+            # The ledger is shared by every range: only a damaged row that names this input
+            # can have held its verdict.
+            if digest in line:
+                evidence.unreadable.append(f"{ledger}:{number}: unreadable row")
+        elif row.get("batch") == digest and "verdict" in row:
+            evidence.judgments.append(row["verdict"])
+    return evidence
+
+
+def finding(batch: dict, evidence: Evidence) -> dict | None:
+    """The binding verdict for every recorded concern, or None."""
+    concerns = evidence.concerns()
+    if not concerns:
+        return None
+    findings = list(dict.fromkeys(text for _, texts in concerns for text in texts))
+    # An explained legacy `incomplete` keeps its label; any other concern is a finding.
+    label = "incomplete" if all(verdict == "incomplete" for verdict, _ in concerns) else "finding"
+    return {
+        "input_digest": batch["input_digest"],
+        "commits": [c["sha"] for c in batch["commits"]],
+        "verdict": label,
+        "findings": findings,
+    }
+
+
+def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
+    """The last launch's valid complete pass; raises with the reason when there is none."""
+    from . import security_audit as sa
+
+    if evidence.unreadable or evidence.damaged:
+        raise Die("security-audit: retained history has unreadable rows")
+    execution = json.loads((attempt / "execution.json").read_text())
+    provider = "claude" if execution["argv"][0] == "claude" else "codex"
+    paged, protocol = execution["paged"], max(3, execution.get("protocol_version", 1))
+    allowed = ({READ_PAGE} if paged else set()) | (GOAL_TOOLS if provider == "codex" else set())
+    if unexpected := sorted(set(evidence.tools) - allowed):
+        raise Die(f"security-audit: reviewer attempted an unauthorized tool call: {', '.join(unexpected)}")
+    transcript = (attempt / "model-transcript.jsonl").read_text()
+    if provider == "claude":
+        events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
+        if not paged and any(e.get("type") == "system" and e.get("subtype") == "compact_boundary" for e in events):
+            raise Die("security-audit: inline source was compacted without a reader")
+        value = sa.claude_result(transcript).get("structured_output")
+    else:
+        if len(sa.native_rollouts(attempt)) != 1:
+            raise Die("security-audit: retained native history is missing or ambiguous")
+        value = sa.codex_final(transcript, paged)
+    if paged and isinstance(value, dict) and value.get("verdict") == "unfinished":
+        raise Die("security-audit: inspection unfinished")
+    token = value.pop("read_token", None) if protocol < 4 and paged and isinstance(value, dict) else None
+    verdict = sa.bind_verdict(value, batch)
+    if verdict["verdict"] != "pass":
+        raise Die(f"security-audit: {verdict['verdict']} without a recorded concern")
+    sa.validate_reads(verdict, batch, (attempt / "read-receipt.json").resolve(), paged, token, protocol=protocol)
+    return verdict
+
+
+def classify(state: Path, attempt: Path, batch: dict, failure: BaseException | str | None = None) -> Outcome:
+    """The attempt's outcome. `failure` is why its last launch did not complete normally."""
+    evidence = recorded(state, batch["input_digest"], collect(attempt))
+    verdict = finding(batch, evidence)
+    if verdict is not None:
+        return Outcome(FINDING, verdict=verdict)
+    if evidence.unreadable:
+        return Outcome(UNREADABLE, reason="security-audit: unreadable evidence: " + "; ".join(evidence.unreadable[:3]))
+    if failure is not None:
+        return Outcome(NOT_JUDGED, reason=failure_reason(failure))
+    if not (attempt / "execution.json").exists():
+        return Outcome(NOT_JUDGED, reason="security-audit: no reviewer was launched")
+    try:
+        return Outcome(PASS, verdict=completed_pass(attempt, batch, evidence))
+    except (Die, OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+        return Outcome(NOT_JUDGED, reason=failure_reason(exc))
+
+
+def failure_reason(failure: BaseException | str) -> str:
+    if isinstance(failure, subprocess.TimeoutExpired):
+        return "security-audit: reviewer timed out"
+    text = str(failure) or type(failure).__name__
+    return text if text.startswith("security-audit: ") else "security-audit: " + text
+
+
+def concerns_recorded(state: Path, digest: str) -> bool:
+    """Whether the ledger already holds a concern, or unreadable rows, for this exact input."""
+    evidence = recorded(state, digest)
+    return bool(evidence.concerns() or evidence.unreadable)
+
+
+def holds(state: Path, attempt: Path) -> bool:
+    """Whether a stopped attempt binds its range: a recorded concern, or evidence that cannot be read."""
+    if not attempt.exists():
+        return False  # Never created: nothing was recorded.
+    try:
+        digest = json.loads((attempt / "input.json").read_text())["input_digest"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+    evidence = recorded(state, digest, collect(attempt))
+    return bool(evidence.concerns() or evidence.unreadable)
