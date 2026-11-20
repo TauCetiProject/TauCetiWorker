@@ -7249,6 +7249,7 @@ class NumprojPrepass(Fixture):
             ("ab", "a\nb"),
             ("x.1", "(x.fst"),
             ("1.5", "(1).toFloat"),
+            ("do returnh.1", "do return(h).fst"),
         ]:
             with self.subTest(before=before, after=after):
                 self.assertIsNone(edits(before, after))

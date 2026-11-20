@@ -41,6 +41,7 @@ TIMEOUT_SECONDS = 1800.0
 # The host-side check of a rewrite is near-linear but not strictly so (the tool's lexer and line
 # copies); a larger Lean file is left to the agent. TauCeti's largest sources are well below this.
 MAX_BYTES = 256_000
+LOG_BYTES = 64_000  # of a tool log, for the sites it reports to the agent
 JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
@@ -143,7 +144,9 @@ def projection_edits(before: str, after: str) -> set[tuple[int, int, str, tuple[
         elif j < len(after) and after[j] == ")" and opened is not None and _NUMERIC.match(before, i):
             # An identifier chain, `$h` or `℘s`: never digits first, which would be a literal (`1.5`).
             receiver = _RECEIVER.fullmatch(before, opened, i)
-            if not receiver or before[opened].isdigit() or place(opened)[0] != place(i)[0]:
+            # The whole receiver: `returnh.1` may not become `return(h).fst`.
+            joined = opened > 0 and _RECEIVER.fullmatch(before, opened - 1, opened) is not None
+            if not receiver or joined or before[opened].isdigit() or place(opened)[0] != place(i)[0]:
                 return None
             span = (place(opened)[1], place(i)[1])
             opened, j = None, j + 1
@@ -416,9 +419,15 @@ def _note(
         )
         log = Path(runs["commit"].get("log") or "")
         reported = []
-        for line in log.read_text(errors="replace").splitlines() if log.is_file() else []:
+        text = ""
+        if log.is_file():
+            with log.open("rb") as handle:  # the sandboxed run's output: read a bounded head
+                text = handle.read(LOG_BYTES).decode(errors="replace")
+        for line in text.splitlines():
+            if len(reported) == 20:
+                break
             for copy, path in copies.items():
                 if line.startswith(f"numproj: {copy}:"):
-                    reported.append(f"numproj: {path}{line[len('numproj: ') + len(copy) :]}")
+                    reported.append(f"numproj: {path}{line[len('numproj: ') + len(copy) :]}"[:300])
         lines += [f"    {line}" for line in reported[:20]]
     return "\n".join(lines)
