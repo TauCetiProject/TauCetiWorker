@@ -26,6 +26,13 @@ class Ends(unittest.TestCase):
         self.assertTrue(excerpt.endswith("project-setup.md"))
         self.assertIn(" … ", excerpt)
 
+    def test_bytes_and_small_limits(self):
+        # A timed-out subprocess can return bytes even in text mode.
+        self.assertEqual(ends(b"start " + b"x" * 400 + b" end\xff", 20), "start xx … xxxx end\ufffd")
+        for limit in (-1, 0, 1, 4):
+            self.assertLessEqual(len(ends("abcdefghij", limit)), max(limit, 0))
+        self.assertEqual(ends("abcdefghij", 5), "a … j")
+
 
 if __name__ == "__main__":
     unittest.main()
