@@ -261,9 +261,9 @@ working tree, which the not yet migrated units still run, is not changed:
 git clone -q https://github.com/TauCetiProject/TauCetiWorker.git /tmp/tcq-bootstrap
 ~/TauCetiQueue/services/queue/backup.sh               # as before any controller install
 /tmp/tcq-bootstrap/services/queue/install.sh
-/tmp/tcq-bootstrap/services/queue/install-repair.sh                # each right after its worker.json reports idle
-/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 2
-/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 3
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --when-idle    # each once it is between tasks
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 2 --when-idle
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 3 --when-idle
 /tmp/tcq-bootstrap/services/queue/install-monitoring.sh
 /tmp/tcq-bootstrap/services/queue/install-repair-cleanup.sh --database ... --clone ... --root ...   # the arguments in "Terminal repair worktree cleanup"
 /tmp/tcq-bootstrap/services/queue/release.sh status
@@ -731,6 +731,7 @@ had 0.154.0, which failed this way; 0.166.0 answers normally on the same Pro acc
 ~/TauCetiQueue/services/queue/install-repair.sh                   # origin/main (clones ~/TauCetiQueue when absent)
 ~/TauCetiQueue/services/queue/install-repair.sh --revision <sha>  # a pinned revision
 ~/TauCetiQueue/services/queue/install-repair.sh --instance 2      # another worker
+~/TauCetiQueue/services/queue/install-repair.sh --instance 2 --when-idle   # restart once it holds no claim
 ```
 
 The rules in [Install and update](#install-and-update) apply here too: no drop-ins, and origin/main HEAD
@@ -748,6 +749,26 @@ itself serving at the release's revision in `<task root>/worker.json`. Exit 0 me
 `journalctl --user -u tauceti-queue-repair -n 50`. `--no-restart` installs without interrupting a
 running task. The queue service, its backup timer, the other workers and the fleet units are not
 touched.
+
+`--when-idle` waits for the worker to be between tasks before restarting it, so updating a worker
+needs no ad hoc waiter. The signal is the queue's own record: the installer opens the controller's
+database (`~/TauCetiQueue-data/queue.sqlite3`, read-only, so it runs on the controller's host) and
+waits while `claims` has a row for the running worker with `released_at` unset. An expired claim
+counts until the controller releases it (on its next tick), because a renewal waiting for the
+controller's lock keeps it. The worker's name (for example `repair-2@tauchonki2`) is the `TAUCETI_QUEUE_WORKER` of the
+unit's running process, read from its environment, so an environment file edited since the worker
+started does not misname it; a unit with no running process has nothing to wait for. It prints the
+claims it is waiting for, checks every 60 seconds, and waits for as long as it takes unless
+`--idle-timeout SECONDS` is given, after which it exits 3 without restarting. Anything it cannot read
+counts as busy. It waits before choosing the revision, so a long wait installs origin/main as it is
+when the wait ends, and checks once more right before the restart, without holding the releases lock.
+This is best effort: the worker has no switch to stop claiming, so a claim made between the last
+check and the restart is interrupted like any restart (below). Neither the unit's processes nor
+`worker.json` tell idle from busy: between rounds of a task the worker runs for minutes with no child
+process, and `worker.json` stays `claiming` while a claimed task runs. `--when-idle` is parsed by the
+copy of the installer you start, so start one that has it (fast-forward `~/TauCetiQueue` with
+`git -C ~/TauCetiQueue pull --ff-only` when its working tree is older); an older copy stops with
+`unknown argument`.
 
 An instance uses `tauceti-queue-repair@NAME.service` and `repair-environment-NAME`. When that file
 is absent, the installer copies the singleton's provider/cache configuration and supplies a distinct
