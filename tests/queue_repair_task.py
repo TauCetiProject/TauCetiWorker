@@ -316,7 +316,17 @@ def refuse(message):
 
 
 def rebuild(explain=True, drop=None):
-    """Replay HEAD's chain onto its base, fixing the broken member in place."""
+    """Replay HEAD's chain onto its base, fixing the broken member in place. For a conflict task, fix the
+    working tree only and write the explanation file: the worker makes the commit."""
+    if "## Resolving the commit" in prompt or "is missing or empty" in prompt:
+        for path in Path("TauCeti").glob("*.lean"):
+            text = path.read_text()
+            if "BROKEN" in text or "<<<<<<<" in text:
+                lines = [l for l in text.replace("BROKEN", "trivial").splitlines() if not l.startswith(("<<<<<<<", "=======", ">>>>>>>"))]
+                path.write_text("\n".join(lines) + "\n")
+        if explain:
+            (repair_dir / "explanation.md").write_text("Repair: replaced the unknown identifier with `trivial`; the batch-mate #1 renamed it.\n")
+        return
     match = re.search(r"linear chain on `([0-9a-f]{12})`", prompt)
     base = git("rev-parse", match.group(1))
     retained = re.search(r"retained at `(refs/[^`]+)`", prompt)
@@ -388,6 +398,30 @@ elif mode == "repair":
     finish()
 elif mode == "no-explanation":
     rebuild(explain=resume is not None)
+    finish()
+elif mode == "explain-only":
+    # Resolve the conflict markers by keeping both sides, and change nothing else.
+    for path in Path("TauCeti").glob("*.lean"):
+        text = path.read_text()
+        if "<<<<<<<" in text:
+            path.write_text("\n".join(l for l in text.splitlines() if not l.startswith(("<<<<<<<", "=======", ">>>>>>>"))) + "\n")
+    (repair_dir / "explanation.md").write_text("Kept both sides of the conflict.\n")
+    finish()
+elif mode == "absorb":
+    rebuild()
+    Path("TauCeti/Three.lean").write_text("theorem three : True := trivial\n")
+    finish()
+elif mode == "move-history":
+    # Resolve, then try to finish the replay by hand: commit, cherry-pick what follows, move HEAD.
+    rebuild()
+    git("add", "-A")
+    git("commit", "--quiet", "-m", "agent's own commit")
+    own = git("rev-parse", "HEAD")
+    for sha in os.environ.get("STUB_LATER_COMMITS", "").split():
+        git("cherry-pick", "--allow-empty", "--keep-redundant-commits", sha)
+    git("update-ref", "refs/heads/agent-replay", "HEAD")
+    git("reset", "--quiet", "--hard", own)
+    git("reset", "--quiet", "--soft", os.environ["STUB_MOVE_HEAD_TO"])
     finish()
 elif mode == "drop-member":
     rebuild(drop=None if call > 1 else "TauCetiProject/TauCeti#3")
@@ -715,24 +749,32 @@ class Content:
             "extra": {"canonical_branch": "main"},
         }
 
-    def rebase_task(self, task_id: int = 1) -> dict:
-        """A rebase-conflict task: main moved past the batch base, so ``onto`` differs from ``base``."""
+    def rebase_task(self, task_id: int = 1, kind: str = "rebase_conflict") -> dict:
+        """A rebase-conflict task: main moved past the batch base, so ``onto`` differs from ``base``, and
+        added its own ``TauCeti/Two.lean``, so replaying the chain puts member 1 on ``onto`` (the clean
+        prefix) and conflicts at member 2's commit. The worker replays the chain itself."""
         seed = self.bare.parent / "seed"
         sh(seed, "checkout", "--quiet", "--detach", self.base)
-        onto = commit(seed, "main moved", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+        onto = commit(
+            seed,
+            "main moved",
+            {"TauCeti/A.lean": "theorem a : True := by trivial\n", "TauCeti/Two.lean": "-- two, on main\n"},
+        )
+        prefix = chain_tool.replay(seed, self.base, self.members[0]["commit"], onto, chain_id="prefix").tip
         sh(seed, "push", "--quiet", "origin", f"{onto}:refs/heads/queue/batch-1/onto")
-        task = self.task(task_id, kind="rebase_conflict")
+        task = self.task(task_id, kind=kind)
         task["onto"] = onto
         task["retained_refs"] = [*task["retained_refs"], "refs/heads/queue/batch-1/onto"]
         task["diagnostics"] = [
             {
                 "kind": "conflict",
                 "source_pr": f"{PROJECT}#2",
+                "commit": self.members[1]["commit"],
                 "paths": ["TauCeti/Two.lean"],
                 "onto": onto,
                 "message": f"replaying the chain onto {onto[:12]} conflicts at {PROJECT}#2",
                 "pending": [f"{PROJECT}#3"],
-                "clean_prefix_tip": self.members[0]["commit"],
+                "clean_prefix_tip": prefix,
             }
         ]
         return task
@@ -1146,6 +1188,12 @@ class Fixture(unittest.TestCase):
     def client(self, cfg: repair_task.RunnerConfig, worker: str | None = None) -> repair_task.TaskClient:
         return repair_task.TaskClient(cfg.service, TOKEN, worker or cfg.worker)
 
+    def pre_rebase_task(self) -> dict:
+        """Task 1 as a ``pre_rebase`` task whose replay conflicts at member 2's commit (``rebase_task``)."""
+        task = self.content.rebase_task(1, kind="pre_rebase")
+        self.service.tasks[1] = task
+        return task
+
     def agent_calls(self) -> list[dict]:
         path = self.stub_dir / "agent-calls.jsonl"
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
@@ -1533,6 +1581,16 @@ class RebaseArtifacts(Fixture):
     def fetches(self) -> list[str]:
         return [c.split("--rev=")[1] for c in self.lake_calls() if c.startswith("cache get")]
 
+    def submitted_chain(self) -> list:
+        """The chain the worker pushed, checked as the queue checks it: every member on ``onto``."""
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        members = [m["source_pr"] for m in self.content.members]
+        report = chain_tool.validate(self.content.bare, self.onto, pushed, members)
+        self.assertTrue(report.ok, report)
+        comparison = chain_tool.compare(self.content.bare, self.content.base, self.content.tip, self.onto, pushed)
+        self.assertTrue(comparison.ok, comparison)
+        return chain_tool.chain_commits(self.content.bare, self.onto, pushed)
+
     def test_explanation_follow_up_preserves_the_new_rebase_target(self):
         self.raw["kind"] = "pre_rebase"
         os.environ["STUB_AGENT_MODE"] = "no-explanation"
@@ -1542,17 +1600,38 @@ class RebaseArtifacts(Fixture):
         calls = self.agent_calls()
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[1]["resume"], "sess-1")
-        self.assertIn(f"chain on `{self.onto[:12]}`", calls[1]["prompt"])
-        self.assertNotIn(f"chain on `{self.content.base[:12]}`", calls[1]["prompt"])
-        described = re.search(re.escape(f"{PROJECT}#2") + r": `([0-9a-f]{12})`", calls[1]["prompt"])
-        self.assertIsNotNone(described)
-        sh(cfg.clone, "merge-base", "--is-ancestor", self.onto, described[1])
-        self.assertNotIn("BROKEN", sh(cfg.clone, "show", f"{described[1]}:TauCeti/Two.lean"))
-        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
-        comparison = chain_tool.compare(self.content.bare, self.content.base, self.content.tip, self.onto, pushed)
-        self.assertTrue(comparison.ok, comparison)
+        self.assertIn(f"Your resolution of {PROJECT}#2's commit is in the working tree", calls[1]["prompt"])
+        self.assertIn("explanation.md` is missing or empty", calls[1]["prompt"])
+        one, two, three = self.submitted_chain()
+        self.assertNotIn("BROKEN", sh(self.content.bare, "show", f"{two.sha}:TauCeti/Two.lean"))
+        self.assertIn("Repair: replaced the unknown identifier", two.message)
+        self.assertTrue(
+            chain_tool.same_change(
+                self.content.bare, chain_tool.read_commit(self.content.bare, self.content.members[2]["commit"]), three
+            )
+        )
+        self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2"])
 
-    def test_service_explanation_retry_preserves_the_new_rebase_target(self):
+    def test_the_agent_cannot_replay_or_move_history(self):
+        """The agent commits its resolution, cherry-picks the next member and moves HEAD: the worker
+        commits only the working tree on the clean prefix with the member's message, and replays
+        member 3 itself."""
+        os.environ["STUB_AGENT_MODE"] = "move-history"
+        os.environ["STUB_LATER_COMMITS"] = self.content.members[2]["commit"]
+        os.environ["STUB_MOVE_HEAD_TO"] = self.content.tip
+        self.addCleanup(os.environ.pop, "STUB_LATER_COMMITS", None)
+        self.addCleanup(os.environ.pop, "STUB_MOVE_HEAD_TO", None)
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        one, two, three = self.submitted_chain()
+        self.assertEqual(two.parents, (one.sha,))
+        self.assertIn(f"Source-PR: {PROJECT}#2", two.message)
+        self.assertNotIn("agent's own commit", two.message)
+        self.assertNotEqual(three.tree, two.tree, "member 3 keeps its own content")
+
+    def test_a_service_rejection_of_a_rebased_chain_is_not_sent_back_to_the_agent(self):
+        """The agent only ever sees one conflicting commit: a rejection of the whole chain ends the task."""
         self.service.result_script = [
             {
                 "accepted": False,
@@ -1562,12 +1641,42 @@ class RebaseArtifacts(Fixture):
         ]
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual((outcome["status"], outcome["reason"]), ("not_adopted", "explanation-required"))
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(len(self.agent_calls()), 1)
+
+    def test_every_conflict_is_resolved_on_one_claim(self):
+        """Main also changed member 3's file: the worker resolves member 2, replays on, stops at member 3
+        and resolves it in the same task, then submits the whole chain once."""
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        moved = commit(seed, "main moved again", {"TauCeti/Three.lean": "-- three, on main\n"})
+        sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        self.raw["onto"] = self.onto = moved
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assertEqual(len(self.service.results), 2)
+        self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2", f"{PROJECT}#3"])
         calls = self.agent_calls()
         self.assertEqual(len(calls), 2)
-        self.assertIn(f"chain on `{self.onto[:12]}`", calls[1]["prompt"])
-        self.assertNotIn(f"chain on `{self.content.base[:12]}`", calls[1]["prompt"])
+        self.assertNotIn(f"{PROJECT}#3", calls[0]["prompt"], "the first round does not see the later commit")
+        self.assertIn(f"PR #3's commit `{self.content.members[2]['commit'][:12]}`", calls[1]["prompt"])
+        self.assertEqual(len(self.service.results), 1, "one submission: the whole chain")
+        one, two, three = self.submitted_chain()
+        self.assertEqual(three.parents, (two.sha,), "the second round starts from the first resolution")
+        for path in ("TauCeti/Two.lean", "TauCeti/Three.lean"):
+            self.assertNotIn("<<<<<<<", sh(self.content.bare, "show", f"{three.sha}:{path}"))
+
+    def test_a_resolution_that_takes_in_a_later_member_is_refused(self):
+        """Replaying member 3 by hand inside member 2's resolution is refused before the replay continues."""
+        os.environ["STUB_AGENT_MODE"] = "absorb"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "released", outcome)
+        self.assertEqual(self.service.releases[-1]["reason"], "agent_failed")
+        self.assertIn("absorbed-later-member", self.service.releases[-1]["error"])
+        self.assertIn("absorbed-later-member", self.agent_calls()[1]["prompt"], "the retry is told why")
+        self.assertEqual(self.service.results, [])
 
     def observe_log(self) -> list[str]:
         lines: list[str] = []
@@ -1582,9 +1691,11 @@ class RebaseArtifacts(Fixture):
         seed = self.content.bare.parent / "seed"
         sh(seed, "checkout", "--quiet", "--detach", self.onto)
         moved = commit(seed, "main moved again", {"TauCeti/B.lean": "theorem b : True := trivial\n"})
+        prefix = chain_tool.replay(seed, self.content.base, self.content.members[0]["commit"], moved).tip
         sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        sh(seed, "push", "--quiet", "--force", "origin", f"{prefix}:refs/heads/queue/batch-1/conflict")
         self.raw["onto"] = moved
-        self.raw["diagnostics"][0]["onto"] = moved
+        self.raw["diagnostics"][0].update(onto=moved, clean_prefix_tip=prefix)
         self.service.tasks = {1: self.raw}
         return moved
 
@@ -1635,7 +1746,7 @@ class RebaseArtifacts(Fixture):
         prompt = self.agent_calls()[0]["prompt"]
         self.assertIn("The worker owns final verification", prompt)
         self.assertIn("The worker owns final verification", prompt)
-        self.assertIn("finish all conflicts", prompt)
+        self.assertIn("The worker checks the downstream closure of your edits", prompt)
         self.assertNotIn("every module of this batch that compiled are already built", prompt)
         self.assertNotIn("The build is cold", prompt)
         env = self.agent_calls()[0]["env"]
@@ -1657,7 +1768,7 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(self.service.releases, [])
         prompt = self.agent_calls()[0]["prompt"]
         self.assertIn("The worker owns final verification", prompt)
-        self.assertIn("finish all conflicts", prompt)
+        self.assertIn("The worker checks the downstream closure of your edits", prompt)
         self.assertTrue(self.state()["report"]["ok"], "the resulting chain still goes through ordinary validation")
 
     def test_a_pre_rebase_cache_miss_still_runs_the_agent_cold(self):
@@ -4752,6 +4863,7 @@ class Records(unittest.TestCase):
                 "paths": ["TauCeti/Two.lean"],
                 "onto": onto,
                 "message": "replaying the open batch onto the head's tip conflicts",
+                "commit": content.members[1]["commit"],
                 "pending": [f"{PROJECT}#3"],
                 "clean_prefix_tip": content.members[0]["commit"],
             },
@@ -4783,7 +4895,7 @@ class Records(unittest.TestCase):
         self.assertIn(f"onto the tip `{onto[:12]}` of the head batch ahead of it with git", prompt)
         self.assertIn(f"The target is not `main`: `{onto[:12]}` is what `main` becomes when the head lands", prompt)
         self.assertIn(f"- target, the head's tip: `{onto[:12]}`", prompt)
-        self.assertIn(f"--onto {onto[:12]} {content.base[:12]}", prompt)
+        self.assertIn(f"- clean prefix, HEAD: `{content.members[0]['commit'][:12]}`", prompt)
         self.assertIn("## Predicted ripples from the head", prompt)
         self.assertIn(
             "- `foo_bar` is removed by the head's position 4 (PR #40, `TauCeti/X.lean`, renamed to `foo_baz`) and used "
@@ -4821,22 +4933,95 @@ class Records(unittest.TestCase):
         context = repair_task.prompt_context(plain, None, listings=repair.listings_path(seed))
         self.assertNotIn("Do not edit", repair.compose_prompt(context, repair_task.task_findings(plain), chain, seed))
 
+    def test_a_conflict_prompt_shows_only_findings_about_its_own_commits(self):
+        """Each conflict's prompt keeps the head's ripples into the prefix and the conflicting commit, and
+        drops those into later members and the batch-wide predictions and preparation errors."""
+        ripple = {"file": "TauCeti/X.lean", "position": 3, "pr": 3, "lines": [1]}
+        raw = {
+            "task_id": 1,
+            "kind": "pre_rebase",
+            "repository": PROJECT,
+            "batch_id": 7,
+            "batch_version": 1,
+            "base": "a" * 40,
+            "tip": "b" * 40,
+            "onto": "c" * 40,
+            "members": [],
+            "diagnostics": [
+                {"kind": "admission_predictions", "proactive": True},
+                {"kind": "prepare_errors", "task_id": 4, "errors": [{"module": "TauCeti/X.lean", "message": "boom"}]},
+                {
+                    "kind": "cross_batch",
+                    "removed_used": [
+                        {"name": "foo", "removed_by": [], "references": [dict(ripple, pr=2), ripple]},
+                        {"name": "bar", "removed_by": [], "references": [ripple]},
+                    ],
+                    "added_by_both": [
+                        {"name": "baz", "head": [], "next": [{"pr": 3}]},
+                        {"name": "qux", "head": [], "next": [{"pr": 1}, {"pr": 3}]},
+                    ],
+                },
+            ],
+            "claim_token": "x",
+            "expires_at": time.time() + 60,
+        }
+        task = repair_task.Task.from_json(raw)
+        entry = {"kind": "conflict", "source_pr": f"{PROJECT}#2", "commit": "d" * 40, "paths": []}
+        findings = repair_task.conflict_findings(task, entry, {1, 2})
+        self.assertEqual(findings["conflict"]["commit"], "d" * 40)
+        self.assertIsNone(findings["admission_predictions"])
+        self.assertIsNone(findings.get("prepare_errors"))
+        self.assertEqual(
+            [(i["name"], [r["pr"] for r in i["references"]]) for i in findings["cross_batch"]["removed_used"]],
+            [("foo", [2])],
+        )
+        self.assertEqual(
+            [(i["name"], i["next"]) for i in findings["cross_batch"]["added_by_both"]], [("qux", [{"pr": 1}])]
+        )
+        repair_task.prompt_context(task, None, findings)
+        self.assertIsNone(findings["admission_predictions"], "the task's predictions are not put back")
+
+    def test_ownership_spans_the_replayed_prefix_and_the_input_commit(self):
+        """A conflict's chain is the replayed prefix followed by the input chain's conflicting commit, which
+        are not one history: each commit is judged against its own parent."""
+        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        shared = "".join(f"line {i}\n" for i in range(10))
+        content = Content(
+            root,
+            base_files={"TauCeti/S.lean": shared},
+            member_files={
+                1: {"TauCeti/S.lean": shared.replace("line 0", "line zero")},
+                2: {"TauCeti/S.lean": shared.replace("line 9", "line nine")},
+            },
+        )
+        seed = root / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", content.base)
+        onto = commit(seed, "main moved", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+        prefix = chain_tool.replay(seed, content.base, content.members[0]["commit"], onto).tip
+        conflicting = content.members[1]["commit"]
+        chain = [*repair.read_chain(seed, onto, prefix), *repair.read_chain(seed, f"{conflicting}^", conflicting)]
+        self.assertEqual(repair.owners_of(seed, chain, "TauCeti/S.lean"), [1, 2])
+        self.assertEqual(repair.owners_of(seed, chain, "TauCeti/One.lean"), [1])
+        self.assertEqual(repair.owners_of(seed, chain, "TauCeti/A.lean"), [])
+
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)
         raw = content.task(9, kind="rebase_conflict")
         seed = root / "seed"
         onto = commit(seed, "main moved", {"TauCeti/A.lean": "theorem a : True := by trivial\n"})
+        prefix = chain_tool.replay(seed, content.base, content.members[0]["commit"], onto).tip
         raw["onto"] = onto
         raw["diagnostics"] = [
             {
                 "kind": "conflict",
                 "source_pr": f"{PROJECT}#2",
+                "commit": content.members[1]["commit"],
                 "paths": ["TauCeti/Two.lean"],
                 "onto": onto,
                 "message": f"replaying the chain onto {onto[:12]} conflicts at {PROJECT}#2",
                 "pending": [f"{PROJECT}#3"],
-                "clean_prefix_tip": content.members[0]["commit"],
+                "clean_prefix_tip": prefix,
             }
         ]
         task = repair_task.Task.from_json(
@@ -4846,225 +5031,130 @@ class Records(unittest.TestCase):
         self.assertEqual(task.member_keys, [f"{PROJECT}#1", f"{PROJECT}#2", f"{PROJECT}#3"])
         self.assertEqual(task.submission_ref, "refs/tauceti-queue/submissions/9/5")
         self.assertEqual(repair_task.Task.from_json(task.to_json()), task)
-        chain = repair.read_chain(seed, content.base, content.tip)
+        # The worker's chain: the clean prefix, then the one conflicting commit; never the commits after it.
+        chain = [
+            *repair.read_chain(seed, onto, prefix),
+            *repair.read_chain(seed, f"{content.members[1]['commit']}^", content.members[1]["commit"]),
+        ]
         listings = repair.listings_path(seed)
         context = repair_task.prompt_context(task, None, listings=listings)
         prompt = repair.compose_prompt(context, repair_task.task_findings(task), chain, seed)
-        self.assertTrue(prompt.startswith(repair.AGENT_INSTRUCTION))
+        self.assertTrue(prompt.startswith(repair.RESOLUTION_INSTRUCTION))
         self.assertLess(len(prompt), 10_000, f"prompt is {len(prompt)} bytes")
-        # What happened, in plain words and before anything else, with the git refs named once.
         self.assertIn("## What happened", prompt)
         self.assertLess(prompt.index("## What happened"), prompt.index("## Conflict evidence"))
+        conflicting = content.members[1]["commit"][:12]
         self.assertIn(
-            f"The queue replayed this batch of 3 squash commits, one per pull request, from its base "
-            f"`{content.base[:12]}` onto the current `main` commit `{onto[:12]}` with git. The replay stopped at "
-            f"PR #2's commit `{chain[1].sha[:12]}` with conflicts in `TauCeti/Two.lean`. The 1 commit before it "
-            f"replayed cleanly and is at commit `{chain[0].sha[:12]}`. Your job is to finish that replay so the "
-            f"whole batch sits on `{onto[:12]}`.",
+            f"from its base `{content.base[:12]}` onto the current `main` commit `{onto[:12]}` with git. The replay "
+            f"stopped at PR #2's commit `{conflicting}` with conflicts in `TauCeti/Two.lean`. The 1 commit before it "
+            f"replayed cleanly and is at `{prefix[:12]}`. Your job is to resolve that one commit",
             prompt,
         )
-        self.assertIn(f"- conflicting commit: `{chain[1].sha[:12]}` (PR #2, position 2 of 3: feat: add 2)", prompt)
-        self.assertIn(f"- clean prefix: `{chain[0].sha[:12]}` (position 1 replayed onto the target)", prompt)
-        self.assertIn(f"- base, the batch's previous base: `{content.base[:12]}`", prompt)
+        self.assertIn(f"HEAD is `{prefix[:12]}`, and the working tree holds PR #2's commit", prompt)
+        self.assertIn(f"- conflicting commit: `{conflicting}` (PR #2, position 2: feat: add 2)", prompt)
+        self.assertIn(f"- clean prefix, HEAD: `{prefix[:12]}` (position 1 replayed onto the target)", prompt)
         self.assertIn(f"- target, the current `main`: `{onto[:12]}`", prompt)
-        self.assertIn(
-            f"- `TauCeti/Two.lean`: PR #2's commit `{chain[1].sha[:12]}` modifies this file, and `main` has changed it "
-            "since the batch's base",
-            prompt,
-        )
-        self.assertIn("- not yet replayed: 1 commit after it (position 3)", prompt)
-        self.assertIn(".tauceti-repair/members.jsonl", prompt)
+        self.assertIn(f"`TauCeti/Two.lean`: PR #2's commit `{conflicting}` modifies this file", prompt)
+        self.assertIn("Do not commit, rebase, reset, cherry-pick or create branches", prompt)
+        self.assertIn("`.tauceti-repair/explanation.md`", prompt)
+        # Nothing hands the agent the replay: no rebase recipe, no step script, no later commit.
+        third = content.members[2]["commit"][:12]
         for phrase in (
-            "scripted rebase conflicted",
-            "exposed it as",
-            "Nothing you do here is published",
-            "do not push",
-            "Do not edit `lakefile.toml`",
-            "retaining their source PR identities",
-            "is changed by PR",
-            "not yet replayed after it",
-            "One workable recipe",
-            "Any method is fine",
-            "scripts/lint-env.sh",
-            "duplicate declarations there is no light local audit",
-            "Do not weaken anything",
-            "maxHeartbeats",
-            "ten-minute",
-            "## Constituent commits",
-            "## Recorded members",
-            "members.md",
-            "what failed",
+            "git rebase",
+            "REBASE_HEAD",
+            ".tauceti-repair/step",
+            "--autosquash",
+            "not yet replayed",
+            third,
+            "#3",
         ):
             self.assertNotIn(phrase, prompt, phrase)
-        # The result, the rebase instruction, the check and the build.
-        self.assertIn(
-            f"a linear chain on `{onto[:12]}` with one commit per PR in the same order as now, each squash commit "
-            "keeping its `Source-PR:` and `Accepted-Head:` trailers and its subject ending in ` (#N)`",
-            prompt,
-        )
-        self.assertIn("nothing to push, publish or report anywhere else, and `gh` is not needed", prompt)
-        self.assertIn(
-            "Do not introduce changes to `lakefile.toml`, `lake-manifest.json`, `lean-toolchain`, `scripts/`, "
-            "`.github/` or anything under `.lake/`; a constituent commit that itself modifies such a file keeps its "
-            "change.",
-            prompt,
-        )
-        self.assertIn(
-            f"Run `git rebase --keep-empty --empty=keep --reapply-cherry-picks --onto {onto[:12]} {content.base[:12]}`.",
-            prompt,
-        )
-        self.assertIn("`bash .tauceti-repair/step` does this stepping for you", prompt)
-        self.assertNotIn("## Already on main", prompt, "nothing landed outside the queue")
-        self.assertIn(
-            "`git add` them, `git commit --allow-empty -C REBASE_HEAD` (the commit's own message and author, kept even "
-            "when the resolution leaves it empty), then `GIT_EDITOR=true git rebase --continue`",
-            prompt,
-        )
-        self.assertIn('`git commit --allow-empty --squash=<sha> -m "<explanation>"`', prompt)
-        self.assertIn(
-            f"`GIT_EDITOR=true GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash --keep-empty --empty=keep {onto[:12]}`",
-            prompt,
-        )
-        self.assertIn("`python3 .tauceti-repair/check` verifies the chain", prompt)
-        self.assertIn("It prints the first problem, or `ok`.", prompt)
-        self.assertIn("Artifacts are warm", prompt)
-        self.assertIn("Long builds are fine to run in the foreground: shell commands have a two-hour limit", prompt)
-        self.assertLess(prompt.index("as its author intended, compiled and checked"), prompt.index("no `sorry`"))
-        self.assertIn("no `set_option` (banned throughout Tau Ceti), no silenced linters", prompt)
-        self.assertTrue(
-            prompt.rstrip().endswith(
-                "Finish with a short summary of what you changed in which PR's commit and the exit status of the "
-                "final `lake build --iofail`."
-            ),
-            prompt[-300:],
-        )
-        # The listings file: one JSON object per member in chain order, with the replay state.
+        self.assertNotIn("python3 .tauceti-repair/check", prompt, "the chain check is not the agent's")
+        self.assertFalse((listings.parent / "step").exists())
+        self.assertFalse((listings.parent / "check").exists())
         records = [json.loads(line) for line in listings.read_text().splitlines()]
-        self.assertEqual(
-            records,
-            [
-                {
-                    "position": i + 1,
-                    "commit": c.sha,
-                    "pr": i + 1,
-                    "title": f"feat: add {i + 1}",
-                    "accepted_head": content.members[i]["accepted_head"],
-                    "provenance": "clean",
-                    "landed_on_main": None,
-                    "state": ("replayed", "conflicting", "pending")[i],
-                }
-                for i, c in enumerate(chain)
-            ],
-        )
+        self.assertEqual([(r["pr"], r["state"]) for r in records], [(1, "replayed"), (2, "conflicting")])
         self.assertEqual(sh(seed, "status", "--porcelain"), "", "the listings are excluded from Git")
-        self.assertEqual(sh(seed, "check-ignore", str(listings)), str(listings))
-        custom = repair_task.Task.from_json({**task.to_json(), "instruction": "Custom instruction."})
-        custom_prompt = repair.compose_prompt(
-            repair_task.prompt_context(custom, None), repair_task.task_findings(custom), chain, seed
-        )
-        self.assertTrue(custom_prompt.startswith("Custom instruction."), "the service's instruction is used verbatim")
-        self.assertIn("## Constituent commits", custom_prompt, "without a listings path the listings are inline")
         with self.assertRaises(ValueError):
             repair_task.Task.from_json({**raw, "kind": "mystery", "claim_token": "x", "expires_at": 1})
 
-    def landed_fixture(self, prefix: str) -> tuple[Content, Path, str, list, repair_task.Task]:
-        """A rebase conflict where PR 1 landed on ``main`` with a different patch (its file conflicts),
-        ``main`` also added PR 2's file (the real conflict) and PR 3 landed with an identical patch."""
-        root = Path(tempfile.mkdtemp(prefix=prefix, dir=TMP))
+    def test_the_worker_commits_the_working_tree_and_discards_what_the_agent_did_to_history(self):
+        """The agent resolves one commit; whatever it does to HEAD, the index, refs or history, the result is
+        the working tree committed by the worker on the clean prefix, with the member's own message."""
+        root = Path(tempfile.mkdtemp(prefix="resolve-", dir=TMP))
         content = Content(root)
         seed = root / "seed"
-        chain = repair.read_chain(seed, content.base, content.tip)
         sh(seed, "checkout", "--quiet", "--detach", content.base)
-        landed_one = commit(seed, "feat: add 1 (#1)", {"TauCeti/One.lean": "theorem one : True := by trivial\n"})
-        commit(seed, "main moved", {"TauCeti/Two.lean": "theorem two : True := by trivial\n"})
-        sh(seed, "cherry-pick", chain[2].sha)
-        sh(seed, "commit", "--quiet", "--amend", "-m", "feat: add 3 (#3)")
-        onto = sh(seed, "rev-parse", "HEAD")
-        sh(seed, "checkout", "--quiet", "--detach", content.tip)
-        raw = content.task(9, kind="rebase_conflict")
-        raw["onto"] = onto
-        raw["diagnostics"] = [
-            {
-                "kind": "conflict",
-                "source_pr": f"{PROJECT}#1",
-                "paths": ["TauCeti/One.lean"],
-                "onto": onto,
-                "message": f"replaying the chain onto {onto[:12]} conflicts at {PROJECT}#1",
-                "pending": [f"{PROJECT}#2", f"{PROJECT}#3"],
-                "clean_prefix_tip": None,
-            }
-        ]
-        task = repair_task.Task.from_json({**raw, "claim_token": "x", "expires_at": time.time() + 60})
-        return content, seed, onto, [landed_one, onto], task
-
-    def test_members_already_on_main_are_listed_and_the_step_script_keeps_them_empty(self):
-        content, seed, onto, (landed_one, landed_three), task = self.landed_fixture("landed-")
-        chain = repair.read_chain(seed, content.base, content.tip)
-        listings = repair.listings_path(seed)
-        prompt = repair.compose_prompt(
-            repair_task.prompt_context(task, None, listings=listings), repair_task.task_findings(task), chain, seed
+        onto = commit(seed, "main adds Two", {"TauCeti/Two.lean": "theorem two : True := by trivial\n"})
+        prefix = chain_tool.replay(seed, content.base, content.members[0]["commit"], onto).tip
+        conflicting = content.members[1]["commit"]
+        worktree = root / "worktree"
+        repair.create_worktree(seed, prefix, worktree)
+        repair.listings_path(worktree).parent.mkdir(parents=True, exist_ok=True)
+        stale = worktree / repair.LISTINGS_DIR / repair.EXPLANATION_FILE
+        stale.write_text("an earlier task's explanation\n")
+        paths = repair.apply_conflict(worktree, prefix, conflicting)
+        self.assertEqual(paths, ["TauCeti/Two.lean"])
+        self.assertFalse(stale.exists(), "no explanation is inherited")
+        self.assertEqual(sh(worktree, "rev-parse", "HEAD"), prefix)
+        self.assertIn("<<<<<<<", (worktree / "TauCeti" / "Two.lean").read_text())
+        self.assertFalse(Path(sh(worktree, "rev-parse", "--git-path", "rebase-merge")).exists())
+        # Conflict markers left in place are reported.
+        tip, report = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
+        self.assertFalse(report["ok"])
+        self.assertIn("conflict-markers: `TauCeti/Two.lean` still contains conflict markers", report["problems"])
+        self.assertEqual(report["unexplained"], [f"{PROJECT}#2"])
+        # The agent resolves the file, then tries to replay and rewrite history itself.
+        (worktree / "TauCeti" / "Two.lean").write_text(
+            "theorem two : True := by trivial\ntheorem two' : True := trivial\n"
         )
-        self.assertLess(len(prompt), 10_000, f"prompt is {len(prompt)} bytes")
-        self.assertIn("## Already on main", prompt)
-        self.assertLess(prompt.index("## Conflict evidence"), prompt.index("## Already on main"))
-        self.assertLess(prompt.index("## Already on main"), prompt.index("## The result"))
-        self.assertIn("2 of the 3 members' PRs have landed on `main` outside the queue", prompt)
-        self.assertIn(f"- PR #1: feat: add 1, landed as `{landed_one[:12]}`", prompt)
-        self.assertIn(f"- PR #3: feat: add 3, landed as `{landed_three[:12]}`", prompt)
-        self.assertNotIn("- PR #2:", prompt)
-        self.assertIn("a conflict in one of them is resolved by taking `main`'s version", prompt)
-        self.assertIn("It is the first commit of the batch, so nothing replayed before it.", prompt)
-        records = [json.loads(line) for line in listings.read_text().splitlines()]
-        self.assertEqual([r["landed_on_main"] for r in records], [landed_one, None, landed_three])
-        self.assertEqual([r["state"] for r in records], ["conflicting", "pending", "pending"])
-        # The service's own flag, once it exists, is used as given and the history is not consulted.
-        flagged = repair_task.prompt_context(task, None, listings=listings)
-        flagged.members[1]["landed_externally"] = True
-        flagged_prompt = repair.compose_prompt(flagged, repair_task.task_findings(task), chain, seed)
-        self.assertIn("1 of the 3 members' PRs have landed", flagged_prompt)
-        self.assertIn("- PR #2: feat: add 2\n", flagged_prompt)
-        # The step script: PR 1's conflict is taken from main, PR 2's is real, PR 3 is kept empty.
-        repair.compose_prompt(
-            repair_task.prompt_context(task, None, listings=listings), repair_task.task_findings(task), chain, seed
-        )
-        step, check = listings.parent / "step", listings.parent / "check"
-        self.assertTrue(os.access(step, os.X_OK))
-        self.assertLess(len(step.read_text().splitlines()), 40)
-
-        def run(script: Path) -> tuple[int, str]:
-            result = subprocess.run(
-                ["bash" if script is step else sys.executable, str(script)], cwd=seed, text=True, capture_output=True
-            )
-            return result.returncode, (result.stdout + result.stderr).strip()
-
-        rc, out = run(step)
-        self.assertEqual(rc, 1, out)
+        (worktree / "TauCeti" / "Extra.lean").write_text("theorem extra : True := trivial\n")
+        stale.write_text("Kept main's proof of `two` and added the PR's statement as `two'`.\n")
+        sh(worktree, "add", "-A")
+        sh(worktree, "commit", "--quiet", "-m", "agent commit without trailers")
+        sh(worktree, "update-ref", "refs/heads/agent", "HEAD")
+        sh(worktree, "reset", "--quiet", "--soft", content.tip)  # HEAD on the old chain's tip, files kept
+        (worktree / ".lake").mkdir(exist_ok=True)
+        (worktree / ".lake" / "junk").write_text("build output\n")
+        tip, report = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
+        self.assertTrue(report["ok"], report)
+        # A project whose `.gitignore` ignores `.lake`, as TauCeti's does, commits the same tree.
+        (worktree / ".gitignore").write_text(".lake\n")
+        ignored, _ = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
         self.assertEqual(
-            out, f"stopped at PR #2, commit {chain[1].sha[:12]}: resolve the conflict in\nTauCeti/Two.lean"
+            sorted(sh(seed, "diff", "--name-only", tip, ignored).split()), [".gitignore"], "only the new .gitignore"
         )
-        self.assertEqual(run(check)[1], "a rebase is still in progress: finish it with `git rebase --continue`")
-        (seed / "TauCeti" / "Two.lean").write_text("theorem two : True := trivial\n")
-        sh(seed, "add", "TauCeti/Two.lean")
-        rc, out = run(step)
-        self.assertEqual(rc, 0, out)
-        self.assertTrue(out.startswith(f"rebase finished: 3 commits on {onto[:12]}"), out)
-        self.assertEqual(run(check), (0, "ok"))
-        result = repair.read_chain(seed, onto, sh(seed, "rev-parse", "HEAD"))
-        self.assertEqual([c.pr for c in result], [1, 2, 3])
-        self.assertEqual([c.empty for c in result], [True, False, True], "landed members are empty commits")
+        (worktree / ".gitignore").unlink()
+        tip, report = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["unexplained"], [])
+        resolved = chain_tool.read_commit(seed, tip)
+        original = chain_tool.read_commit(seed, conflicting)
+        self.assertEqual(resolved.parents, (prefix,), "the parent is the clean prefix, not the agent's HEAD")
+        self.assertEqual(sh(seed, "rev-list", "--count", f"{onto}..{tip}"), "2", "the prefix and one commit")
+        self.assertFalse(chain_tool.is_ancestor(seed, content.tip, tip), "the agent's HEAD is not an ancestor")
+        self.assertEqual(sh(worktree, "rev-parse", "HEAD"), tip)
         self.assertEqual(
-            sh(seed, "show", "HEAD~1:TauCeti/One.lean"), "theorem one : True := by trivial", "main's version"
+            sorted(sh(seed, "diff", "--name-only", prefix, tip).split()),
+            ["TauCeti/Extra.lean", "TauCeti/Two.lean"],
+            "the working tree is the resolution, without .lake or the listings",
         )
+        self.assertTrue(resolved.message.startswith(original.message.rstrip()))
         self.assertEqual(
-            sh(seed, "log", "-1", "--format=%an", result[0].sha), sh(seed, "log", "-1", "--format=%an", chain[0].sha)
+            chain_tool.appended_text(original.message, resolved.message),
+            "Kept main's proof of `two` and added the PR's statement as `two'`.",
         )
-        # Run again when nothing is in progress: HEAD is already on the target, so nothing is replayed.
-        rc, out = run(step)
-        self.assertEqual((rc, out), (0, f"HEAD is already on {onto[:12]}; nothing to replay (run check)"))
-        self.assertEqual(run(check), (0, "ok"))
+        self.assertEqual((resolved.author_name, resolved.author_date), (original.author_name, original.author_date))
+        self.assertEqual(resolved.source_pr, f"{PROJECT}#2")
+        again, _ = repair.commit_resolution(seed, worktree, prefix, conflicting, paths)
+        self.assertEqual(again, tip, "the same files and explanation make the same commit")
 
     def test_the_check_script_judges_the_chain(self):
-        content, seed, onto, _, task = self.landed_fixture("check-")
+        root = Path(tempfile.mkdtemp(prefix="check-", dir=TMP))
+        content = Content(root)
+        seed = root / "seed"
+        onto = content.base
+        task = repair_task.Task.from_json({**content.task(9), "claim_token": "x", "expires_at": time.time() + 60})
         chain = repair.read_chain(seed, content.base, content.tip)
         listings = repair.listings_path(seed)
         repair.compose_prompt(
@@ -5077,12 +5167,8 @@ class Records(unittest.TestCase):
             result = subprocess.run([sys.executable, str(check)], cwd=seed, text=True, capture_output=True)
             return result.returncode, result.stdout.strip()
 
-        self.assertEqual(run(), (1, f"HEAD is not on top of the target commit {onto[:12]}"))
         env = {"GIT_EDITOR": "true", "GIT_SEQUENCE_EDITOR": ":"}
-        subprocess.run(["bash", str(listings.parent / "step")], cwd=seed, capture_output=True)
-        (seed / "TauCeti" / "Two.lean").write_text("theorem two : True := trivial\n")
-        sh(seed, "add", "TauCeti/Two.lean")
-        subprocess.run(["bash", str(listings.parent / "step")], cwd=seed, capture_output=True, check=True)
+        sh(seed, "checkout", "--quiet", "--detach", content.tip)
         self.assertEqual(run(), (0, "ok"))
         # The prompt's explanation recipe keeps the message as a prefix and passes.
         second = sh(seed, "rev-list", "--reverse", f"{onto}..HEAD").split()[1]
@@ -5171,6 +5257,7 @@ class Records(unittest.TestCase):
                     "paths": [f"TauCeti/M{conflicting}.lean"],
                     "onto": onto,
                     "message": f"replaying the chain onto {onto[:12]} conflicts at {PROJECT}#{conflicting}",
+                    "commit": members[conflicting - 1]["commit"],
                     "pending": [f"{PROJECT}#{n}" for n in range(conflicting + 1, count + 1)],
                     "clean_prefix_tip": members[conflicting - 2]["commit"],
                 }
@@ -5183,8 +5270,9 @@ class Records(unittest.TestCase):
             "expires_at": time.time() + 60,
         }
         task = repair_task.Task.from_json(raw)
-        chain = repair.read_chain(seed, base, tip)
-        self.assertEqual(len(chain), count)
+        # What the worker hands the prompt: the clean prefix and the conflicting commit.
+        chain = repair.read_chain(seed, base, members[conflicting - 1]["commit"])
+        self.assertEqual(len(chain), conflicting)
         listings = repair.listings_path(seed)
         artifacts = {
             "available": False,
@@ -5198,18 +5286,15 @@ class Records(unittest.TestCase):
         self.assertIn(
             f"The replay stopped at PR #{conflicting}'s commit `{conflict_sha}` with conflicts in "
             f"`TauCeti/M{conflicting}.lean`. The {conflicting - 1} commits before it replayed cleanly and are at "
-            f"commit `{members[conflicting - 2]['commit'][:12]}`.",
+            f"`{members[conflicting - 2]['commit'][:12]}`.",
             prompt,
         )
         self.assertIn(
-            f"- conflicting commit: `{conflict_sha}` (PR #{conflicting}, position {conflicting} of {count}: "
+            f"- conflicting commit: `{conflict_sha}` (PR #{conflicting}, position {conflicting}: "
             f"feat: add {conflicting})",
             prompt,
         )
-        self.assertIn(
-            f"- not yet replayed: {count - conflicting} commits after it (positions {conflicting + 1} to {count})",
-            prompt,
-        )
+        self.assertNotIn("not yet replayed", prompt)
         self.assertNotIn("#10: feat: add 10", prompt, "members are left to the listings file")
         self.assertNotIn(f"{PROJECT}#{conflicting + 1}", prompt, "the pending list is in the file, not the prompt")
         self.assertIn("The build is cold", prompt)
@@ -5218,17 +5303,14 @@ class Records(unittest.TestCase):
         self.assertIn("Long builds are fine to run in the foreground: shell commands have a two-hour limit", prompt)
         # The file holds everything in chain order and Git ignores it.
         records = [json.loads(line) for line in listings.read_text().splitlines()]
-        self.assertEqual(len(records), count)
-        self.assertEqual([r["position"] for r in records], list(range(1, count + 1)))
-        self.assertEqual([r["pr"] for r in records], list(range(1, count + 1)))
+        self.assertEqual(len(records), conflicting, "the commits after the conflicting one are not listed")
+        self.assertEqual([r["position"] for r in records], list(range(1, conflicting + 1)))
+        self.assertEqual([r["pr"] for r in records], list(range(1, conflicting + 1)))
         self.assertEqual(records[conflicting - 1]["state"], "conflicting")
         self.assertEqual({r["state"] for r in records[: conflicting - 1]}, {"replayed"})
-        self.assertEqual({r["state"] for r in records[conflicting:]}, {"pending"})
         self.assertEqual(records[9]["commit"], members[9]["commit"])
         self.assertEqual(records[9]["accepted_head"], f"{10:040x}")
-        self.assertTrue(os.access(listings.parent / "check", os.X_OK))
-        self.assertIn(f"TARGET = {onto!r}", (listings.parent / "check").read_text())
-        self.assertTrue(os.access(listings.parent / "build", os.X_OK), "the scoped build script is written too")
+        self.assertTrue(os.access(listings.parent / "build", os.X_OK), "the scoped build script is written")
         self.assertIn("Check a fix with `.tauceti-repair/build <Module.Name>` first", prompt)
         self.assertIn("Run the whole-library `lake build --iofail` only as the final verdict.", prompt)
         self.assertEqual(sh(seed, "status", "--porcelain"), "", "the listings are excluded from Git")
@@ -5244,7 +5326,7 @@ class Records(unittest.TestCase):
             repair_task.prompt_context(task, None), repair_task.task_findings(task), chain, seed
         )
         self.assertIn("#10: feat: add 10", inline)
-        self.assertNotIn(".tauceti-repair", inline)
+        self.assertNotIn("members.jsonl", inline)
 
     def test_the_shell_limit_is_the_repair_task_s_own(self):
         from tauceti_worker import agents
@@ -5295,11 +5377,6 @@ class Records(unittest.TestCase):
         self.assertTrue(any("unknown-member" in p for p in short["problems"]))
 
     def test_an_admin_labelled_large_refactor_member_is_measured_without_the_size_caps(self):
-        policy = repair.diff_guard.ci_git
-        added_cap = getattr(policy, "REVIEW_ADDED_LINE_CAP", None)
-        if added_cap is None:  # Older Tools used one cap for both directions.
-            added_cap = policy.REVIEW_LINE_CAP
-        lines_per_file = max(1, policy.NEW_FILE_LINE_CAP // 2)
         root = Path(tempfile.mkdtemp(prefix="large-refactor-", dir=TMP))
         content = Content(root)
         seed = root / "seed"
@@ -5308,9 +5385,13 @@ class Records(unittest.TestCase):
         for commit_ in chain:
             sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
             if commit_.pr == 2:
-                # Exceed the current total cap without violating the independent new-file cap.
-                for index in range(added_cap // lines_per_file + 1):
-                    lines = "".join(f"theorem r{index}_{i} : True := trivial\n" for i in range(lines_per_file))
+                # Exceed the shared added-line cap with new files each within the new-file cap, so only
+                # the size caps fail; TauCetiTools owns both numbers and has raised them before.
+                from tauceti_tools.assets.scripts import ci_git
+
+                per_file = ci_git.NEW_FILE_LINE_CAP
+                for index in range(ci_git.REVIEW_ADDED_LINE_CAP // per_file + 1):
+                    lines = "".join(f"theorem r{index}_{i} : True := trivial\n" for i in range(per_file))
                     (seed / "TauCeti" / f"Refactor{index}.lean").write_text(lines)
                 sh(seed, "add", "-A")
                 sh(seed, "commit", "--quiet", "--amend", "--no-edit")
@@ -5525,7 +5606,7 @@ class WorkerAudits(Fixture):
         self.assertEqual(self.service.results, [])
 
     def test_pre_rebase_retains_full_check_receipt(self):
-        self.service.tasks[1].update(kind="pre_rebase")
+        onto = self.pre_rebase_task()["onto"]
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
@@ -5535,7 +5616,7 @@ class WorkerAudits(Fixture):
             receipt,
             {
                 "tip": outcome["tip"],
-                "base": self.content.base,
+                "base": onto,
                 "tools": f"TauCetiProject/TauCetiTools@{TOOLS_REF}",
                 "scope": "full",
             },
@@ -5833,7 +5914,7 @@ class PreRebaseChecks(Fixture):
         self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
 
     def test_waiting_pre_rebase_runs_full_checks(self):
-        self.service.tasks[1].update(kind="pre_rebase")
+        self.pre_rebase_task()
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
@@ -5842,6 +5923,19 @@ class PreRebaseChecks(Fixture):
         self.assertEqual(checks["lint"]["scope"], "full")
         notes = json.loads(self.service.results[0]["worker_notes"])
         self.assertEqual(notes["pre_rebase_verification"]["scope"], "full")
+
+    def test_a_resolution_that_fails_verification_is_submitted_without_another_round(self):
+        """The resolved commit's tree is only a prefix of the chain, so a later member may fix what fails
+        there: the worker submits it after one agent turn and the whole chain's CI judges."""
+        self.pre_rebase_task()
+        os.environ["STUB_AGENT_MODE"] = "explain-only"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.agent_calls()), 1)
+        self.assertFalse(outcome["verification"][-1]["ok"])
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Two.lean"))
 
 
 class TargetedRepairChecks(Fixture):

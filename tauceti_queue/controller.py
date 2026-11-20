@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from typing import Any
 
-from . import admission_planning, attribution, chain, declaration_names, escalation, stuck_heads
+from . import admission_planning, chain, declaration_names, escalation, stuck_heads
 from .eligibility import KEEP as BLOCKING_LABELS
 from .mixed_identity import SourceNumber
 from .ports import (
@@ -177,35 +177,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # explanatory comment to its author (`_withdraw_member`). False defers the decision to landing,
     # where an empty final commit is rejected and its PR closed (`_enqueue_rejection_effects`).
     "withdraw_emptied_at_adoption": True,
-    # Loop termination (`docs/queue/escalation.md`). The queue never re-dispatches an unchanged
-    # candidate after the same failure: a head source failure goes to one repair; when the same
-    # failure fingerprint recurs on the batch this many times in all (2: the first repeat), or a repair
-    # task has had this many claims released without a submission, or the batch has failed this many
-    # times since its last escalation whatever the fingerprints, the controller escalates instead:
-    # it withdraws the members the failure names or that attribution finds (`attribution.py`), else
-    # bisects the head, else withdraws its last member. Every escalation raises a status alert and a
-    # Zulip direct message. 0 disables the check.
-    "failure_repeat_limit": 2,
-    "repair_fruitless_claim_limit": 3,
-    "source_failure_round_limit": 6,
-    # A member the source member review-size policy rejects by name, measured on its accepted head (a
-    # TauCetiTools before the batch-chain measure, or a member whose batch commit it could not identify),
-    # is withdrawn at its first failure: no repair can change that head. A rejection measured on the
-    # member's own commit in the batch chain is repairable and follows the ladder above.
-    "policy_rejection_withdraw": True,
-    # Attribution that implicates more members than this is not trusted (a systemic failure, such as a
-    # broken base, implicates many); the head is bisected instead. 0: no bound.
-    "attribution_max_members": 10,
     # Infrastructure failures of one head version re-dispatch with short backoff
     # (`infrastructure_retry_backoff_seconds`) this many times; then the queue backs off automatically,
     # `automatic_retry_seconds` doubling up to `automatic_retry_max_seconds` between re-dispatches,
     # indefinitely, with one direct message when the backoff starts and one on recovery. 0: no backoff.
     "infrastructure_failure_limit": 5,
-    # The automatic retry delay of the infrastructure backoff and of an escalation that failed to act:
-    # this long at first, doubling at each further retry up to the maximum.
+    # The automatic retry delay of the infrastructure backoff: this long at first, doubling at each
+    # further retry up to the maximum.
     "automatic_retry_seconds": 1800,
     "automatic_retry_max_seconds": 14400,
-    # How long an escalation stays among the status page's alerts.
+    # How long an escalation (an infrastructure backoff's start) stays among the status page's alerts.
     "escalation_alert_seconds": 86400,
     # Staging is dispatched only on a base whose exact Lake revision map (or that of an ancestor with
     # the same build inputs) is published at this public endpoint, the one `pr-build.yml` reads
@@ -256,14 +237,6 @@ PROBLEM_ANTICIPATED = "problem-anticipated"
 # The cancellation reason of a member whose final commit is empty: withdrawn when an adopted repair
 # empties it (`withdraw_emptied_at_adoption`), else rejected when its batch lands.
 EMPTY_COMMIT = "empty-commit"
-# The cancellation reason of a member the controller withdrew because a failure that names it kept
-# recurring, or because bisection isolated it (`_escalate`).
-QUEUE_WITHDRAWN = "queue-withdrawn"
-# Claim release reasons that are not a fruitless claim of a repair task: progress, or the queue's own
-# doing, or an inference outage (the inference hold answers for that).
-NOT_FRUITLESS_RELEASES = frozenset(
-    {"submitted", REPAIR_CHECKPOINT, "superseded", "landed", "inference_unavailable", "escalated"}
-)
 # How many escalations the controller keeps for the status page.
 ESCALATIONS_KEPT = 50
 # The most CI findings a withdrawal or rejection comment quotes.
@@ -6134,12 +6107,6 @@ class Controller:
                     self._update_prediction_verdict(head, active, attempt, now)
             self._reasons.append(f"head {head['id']} is claimed by {', '.join(c['worker'] for c in task_claims)}")
             return
-        # A moved base rebases first, which ends the hold, rather than retrying against the old base.
-        if head["base"] == canonical and self._retry_escalation(head, now):
-            return  # escalated again: the head changed, or holds longer
-        pending = self._open_task(head)
-        if pending is not None and self._fruitless_task(head, pending, now):
-            return  # escalated: the head changed, or holds
         if head["base"] != canonical:
             if not self._rebase_head(head, canonical, now):
                 self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase incomplete")
@@ -6224,6 +6191,8 @@ class Controller:
             {
                 "kind": "conflict",
                 "source_pr": conflict.source_pr if conflict else None,
+                # The input chain's conflicting commit, which the worker's own replay stops at.
+                "commit": conflict.replayed if conflict else None,
                 "paths": list(conflict.conflict_paths) if conflict else [],
                 "onto": canonical,
                 "message": f"replaying the chain onto {canonical[:12]} conflicts at {conflict.source_pr if conflict else '?'}",
@@ -6669,6 +6638,7 @@ class Controller:
             {
                 "kind": "conflict",
                 "source_pr": conflict.source_pr if conflict else None,
+                "commit": conflict.replayed if conflict else None,
                 "paths": list(conflict.conflict_paths) if conflict else [],
                 "onto": onto,
                 "message": (
@@ -7116,8 +7086,6 @@ class Controller:
 
     def _ci(self, head: dict[str, Any], now: float) -> None:
         attempt = self._current_attempt(head)
-        if attempt is None and self._unchanged_after_failure(head, now):
-            return
         if attempt is None or attempt["outcome"] == OUTCOME_SUPERSEDED:
             self._dispatch(head, now, retry=0)
             return
@@ -7154,12 +7122,12 @@ class Controller:
             self._dispatch(head, now, retry=retries)
         elif attempt["outcome"] == OUTCOME_SOURCE_FAILURE:
             self._infrastructure_recovered(head, attempt, now)
-            hold = self._escalation_hold(head, now)
-            if hold is not None:
-                self._reasons.append(f"head {head['id']} holds after escalation: {hold['detail']}")
-                return
-            if self._open_task(head) is None and not self._source_failure(head, attempt, now):
-                return  # escalated: the head changed, or holds
+            if self._open_task(head) is None:
+                # The exact findings, unchanged: they carry any member attribution CI reported
+                # (`source_pr`). However often a failure recurs, the head goes to repair again; only the
+                # agent may withdraw a member, by reducing its contribution to an empty commit.
+                diagnostics = loads(attempt["diagnostics"], [])
+                self._create_task(head, TASK_REPAIR, head["base"], diagnostics, now, ci_attempt_id=attempt["id"])
             self._reasons.append(f"head {head['id']} waits for a worker to claim its repair task")
         elif attempt["outcome"] == OUTCOME_PASS:
             self._infrastructure_recovered(head, attempt, now)
@@ -7256,9 +7224,9 @@ class Controller:
         """Operator: break apart every live batch (the head and the open batches) that holds a Forgejo
         member or a GitHub PR named in `withdraw`, for when the Forgejo source cannot be used.
 
-        Each such batch is removed (the head as `_dissolve_head` does: tasks superseded, claims released,
-        pre-rebases discarded, runs cancelled) and all its members go back to waiting at their original
-        age with their approvals kept (`_return_members`), so a Forgejo PR re-enters a batch by itself once
+        Each such batch is removed (tasks superseded, claims released, pre-rebases discarded, runs
+        cancelled) and all its members go back to waiting at their original age with their approvals kept
+        (`_return_members`), so a Forgejo PR re-enters a batch by itself once
         `forgejo_placement_enabled` is true again. GitHub-only batches are kept. A PR in `withdraw` then
         has its input cancelled as `bors r-` would (a new approval brings it back). Refused while
         `forgejo_placement_enabled` is true, since the returned Forgejo inputs would be placed again."""
@@ -8675,527 +8643,7 @@ class Controller:
             )
             return None
 
-    # --- loop termination: failure fingerprints and escalation ---------------------------------------
-
-    def _resolve_members(self, references: list[Any], members: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """The members of `members` that `references` name: a `Source-PR` value, a PR number when only
-        one member has it, or a policy record `{"head", "number", "source"}`, matched by accepted head and
-        number, else by number and source identity (`_policy_member`)."""
-        by_source = {m["source_pr"]: m for m in members}
-        by_number: dict[int, list[dict[str, Any]]] = {}
-        for member in members:
-            by_number.setdefault(int(member["number"]), []).append(member)
-        found: dict[int, dict[str, Any]] = {}
-        for reference in references:
-            if isinstance(reference, dict):
-                member = self._policy_member(reference, members)
-                if member is not None:
-                    found[member["id"]] = member
-                continue
-            if isinstance(reference, str) and reference in by_source:
-                found[by_source[reference]["id"]] = by_source[reference]
-                continue
-            text = str(reference).strip().lstrip("#")
-            if isinstance(reference, str) and "#" in text:
-                text = text.rsplit("#", 1)[1]
-            if text.isdigit() and len(by_number.get(int(text), [])) == 1:
-                member = by_number[int(text)][0]
-                found[member["id"]] = member
-        return [m for m in members if m["id"] in found]
-
-    @staticmethod
-    def _policy_member(reference: dict[str, Any], members: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """The one member a review-size policy record names. The accepted head identifies a member on
-        any forge; the number alone is ambiguous between a GitHub PR and a Forgejo pull, so without a
-        head match it must agree with the record's source identity too."""
-        number = reference.get("number")
-        number = number if type(number) is int else None
-        by_head = [
-            m
-            for m in members
-            if m["accepted_head"] == reference.get("head") and (number is None or int(m["number"]) == number)
-        ]
-        if len(by_head) == 1:
-            return by_head[0]
-        source = reference.get("source")
-        if number is None or not isinstance(source, dict):
-            return None
-        forge = source.get("forge")
-        github = isinstance(forge, dict) and forge.get("kind") == "github"
-        canonical = dumps(source)  # `mixed_identity.source_record`'s form
-        by_source = [
-            m
-            for m in members
-            if int(m["number"]) == number
-            and (m["source_identity"] == canonical or (github and not m["source_identity"]))
-        ]
-        return by_source[0] if len(by_source) == 1 else None
-
-    def _record_failure(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> dict[str, Any]:
-        """The `failures` row of a failed attempt, recorded once: its fingerprint over the verdict class,
-        the head members its findings name and its finding lines."""
-        existing = self.store.row("failures", {"attempt_id": attempt["id"]})
-        if existing is not None:
-            return existing
-        diagnostics = loads(attempt["diagnostics"], [])
-        named = self._resolve_members(
-            escalation.named_members(diagnostics) + attribution.policy_references(diagnostics),
-            self._members(head["id"]),
-        )
-        identity = escalation.fingerprint(
-            escalation.verdict_class(attempt["outcome_detail"] or "", loads(attempt["verdicts"], {})),
-            [m["source_pr"] for m in named],
-            escalation.finding_lines(diagnostics),
-        )
-        with self.store.transaction():
-            self.store.insert(
-                "failures",
-                batch_id=head["id"],
-                batch_version=attempt["batch_version"],
-                attempt_id=attempt["id"],
-                fingerprint=identity["fingerprint"],
-                verdict_class=identity["verdict_class"],
-                members=dumps(identity["members"]),
-                digest=identity["digest"],
-                lines=dumps(identity["lines"]),
-                at=now,
-            )
-        return self.store.row("failures", {"attempt_id": attempt["id"]}) or {}
-
-    def _last_escalation_at(self, batch_id: int) -> float:
-        rows = self.store.query(
-            "SELECT MAX(at) AS at FROM failures WHERE batch_id=? AND action IN ('withdraw', 'bisect', 'hold')",
-            (batch_id,),
-        )
-        return (rows[0]["at"] if rows else None) or 0.0
-
-    def _source_failure(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> bool:
-        """A head's CI source failure: a repair task with the exact findings, or, when the failure keeps
-        recurring, an escalation. True when a repair task was created."""
-        failure = self._record_failure(head, attempt, now)
-        same = self.store.count("failures", {"batch_id": head["id"], "fingerprint": failure["fingerprint"]})
-        since = self._last_escalation_at(head["id"])
-        rounds = len(
-            [
-                row
-                for row in self.store.rows("failures", {"batch_id": head["id"]})
-                if row["at"] > since or row["id"] == failure["id"]
-            ]
-        )
-        repeat_limit = int(self.setting("failure_repeat_limit"))
-        round_limit = int(self.setting("source_failure_round_limit"))
-        if self.setting("policy_rejection_withdraw"):
-            # Only a rejection measured on a member's accepted head is beyond repair. One measured on the
-            # member's own commit in the batch chain goes to repair like any other failure (a repair may
-            # split the change inside the batch), and the thresholds below withdraw it if that fails.
-            diagnostics = loads(attempt["diagnostics"], [])
-            active = [m for m in self._members(head["id"]) if not m["withdrawn"]]
-            unrepairable = [
-                reference
-                for reference in attribution.policy_references(diagnostics)
-                if reference["measured"] != "batch-commit"
-            ]
-            if self._resolve_members(unrepairable, active):
-                self._escalate(
-                    head,
-                    failure,
-                    "the member review-size policy rejected it, and the policy measured the accepted head, "
-                    "which no repair can change",
-                    now,
-                )
-                return False
-        if repeat_limit and same >= repeat_limit:
-            self._escalate(head, failure, f"the same failure occurred {same} times on batch {head['id']}", now)
-            return False
-        if round_limit and rounds >= round_limit:
-            self._escalate(
-                head, failure, f"{rounds} source failures on batch {head['id']} since its last escalation", now
-            )
-            return False
-        # The exact findings, unchanged: they carry any member attribution CI reported (`source_pr`).
-        # The agent instruction already lets an agent leave out a member it cannot repair.
-        diagnostics = loads(attempt["diagnostics"], [])
-        self._create_task(head, TASK_REPAIR, head["base"], diagnostics, now, ci_attempt_id=attempt["id"])
-        with self.store.transaction():
-            self.store.update("failures", {"id": failure["id"]}, action="repair")
-        return True
-
-    def _unchanged_after_failure(self, head: dict[str, Any], now: float) -> bool:
-        """Never dispatch content that already failed: when an adopted repair left the head's tree (on the
-        same base) as it was when CI failed, escalate that failure instead. True when it escalated."""
-        hold = self._escalation_hold(head, now)
-        if hold is not None:
-            self._reasons.append(f"head {head['id']} holds after escalation: {hold['detail']}")
-            return True
-        failures = self.store.rows("failures", {"batch_id": head["id"], "action": "repair"})
-        if not failures:
-            return False
-        # Only an adopted repair's version: an operator's `rebuild-head` or `retry-ci` may re-dispatch.
-        adopted = self.store.query(
-            "SELECT 1 FROM journal WHERE kind='adopted' AND batch_id=? AND json_extract(detail, '$.version')=? LIMIT 1",
-            (head["id"], head["version"]),
-        )
-        if not adopted:
-            return False
-        tree = chain.tree_of(self.clone, head["tip"])
-        for failure in failures:
-            attempt = self.store.row("ci_attempts", {"id": failure["attempt_id"]})
-            if (
-                attempt is not None
-                and attempt["base_sha"] == head["base"]
-                and chain.tree_of(self.clone, attempt["head_sha"]) == tree
-            ):
-                self._escalate(head, failure, "the adopted repair left the failed candidate's content unchanged", now)
-                return True
-        return False
-
-    def _fruitless_claims(self, task: dict[str, Any]) -> int:
-        """Claims of the task released (or expired) without an adopted submission."""
-        return sum(
-            1
-            for claim in self.store.rows("claims", {"task_id": task["id"]})
-            if claim["released_at"] is not None and claim["release_reason"] not in NOT_FRUITLESS_RELEASES
-        )
-
-    def _fruitless_task(self, head: dict[str, Any], task: dict[str, Any], now: float) -> bool:
-        """Escalate a head's repair or rebase-conflict task that workers keep giving back without a
-        result. True when it escalated (the head changed or holds)."""
-        limit = int(self.setting("repair_fruitless_claim_limit"))
-        if not limit or task["kind"] not in (TASK_REPAIR, TASK_REBASE_CONFLICT) or self._prediction_task(task):
-            return False
-        hold = self._escalation_hold(head, now)
-        if hold is not None:
-            self._reasons.append(f"head {head['id']} holds after escalation: {hold['detail']}")
-            return True
-        fruitless = self._fruitless_claims(task)
-        if fruitless < limit:
-            return False
-        cause = f"{task['kind'].replace('_', ' ')} task {task['id']} was claimed {fruitless} times without a result"
-        if task["kind"] == TASK_REPAIR and task["ci_attempt_id"] is not None:
-            attempt = self.store.row("ci_attempts", {"id": task["ci_attempt_id"]})
-            failure = self._record_failure(head, attempt, now) if attempt is not None else None
-        else:
-            failure = None
-        if failure is None:
-            # A rebase conflict names the member whose replay conflicts.
-            conflict = next((d for d in loads(task["diagnostics"], []) if d.get("kind") == "conflict"), {})
-            failure = {
-                "id": None,
-                "fingerprint": "",
-                "verdict_class": task["kind"],
-                "members": dumps([conflict["source_pr"]] if conflict.get("source_pr") else []),
-                "lines": dumps([conflict.get("message", "")] if conflict.get("message") else []),
-            }
-        with self.store.transaction():
-            self.store.update(
-                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="escalated"
-            )
-        self._escalate(head, failure, cause, now)
-        return True
-
-    def _escalation_hold(self, head: dict[str, Any], now: float | None = None) -> dict[str, Any] | None:
-        """The hold an escalation that failed to act put on this head version, while it lasts. A hold
-        expires at its `retry_at`: the next pass meets the same failure and escalates again."""
-        hold = self._state("escalation_hold")
-        if not hold or hold.get("batch_id") != head["id"] or hold.get("version") != head["version"]:
-            return None
-        if (self.clock() if now is None else now) >= hold.get("retry_at", float("inf")):
-            return None
-        return hold
-
-    def _retry_escalation(self, head: dict[str, Any], now: float) -> bool:
-        """Try a held escalation again once its hold expires (`_escalate`). A hold of an earlier head
-        version is dropped: the head changed, so the failure is met afresh. True when it retried."""
-        hold = self._state("escalation_hold")
-        if not hold:
-            return False
-        if hold.get("batch_id") != head["id"] or hold.get("version") != head["version"] or "failure" not in hold:
-            self._set_state("escalation_hold", None)
-            return False
-        if now < hold.get("retry_at", float("inf")):
-            return False
-        self.store.journal(now, "escalation-retry", head["id"], version=head["version"], retries=hold["retries"])
-        self._escalate(head, hold["failure"], hold["cause"], now)
-        return True
-
-    def _retry_delay(self, retries: int) -> float:
-        """The automatic retry delay after `retries` earlier retries: `automatic_retry_seconds`, doubling
-        each time, at most `automatic_retry_max_seconds`."""
-        initial = max(60, int(self.setting("automatic_retry_seconds")))  # never a retry every pass
-        return min(
-            initial * 2 ** min(20, max(0, retries)), max(initial, int(self.setting("automatic_retry_max_seconds")))
-        )
-
-    def _escalate(self, head: dict[str, Any], failure: dict[str, Any], cause: str, now: float) -> None:
-        """Act on a failure that repair did not resolve: withdraw the active members it names, else hold
-        while the base is known broken (`_base_health`), else withdraw the members attribution finds
-        (`_attribute`), else bisect the head, else withdraw its one active member, else (no active member
-        left) dissolve the head. A hold, or an escalation that raises, holds the head version and is
-        tried again after an automatic backoff. Every outcome is journaled, alerted on the
-        status page and sent to the operator."""
-        members = self._members(head["id"])
-        active = [m for m in members if not m["withdrawn"]]
-        named = self._resolve_members(loads(failure["members"], []), active)
-        lines = loads(failure["lines"], [])
-        original_cause = cause
-        health, evidence = "healthy", ""
-        try:
-            found = None
-            if not named and active:
-                health, evidence = self._base_health(head["base"])
-            if not named and len(active) > 1 and health != "broken":
-                try:
-                    found = self._attribute(head, failure, active)
-                except Exception as error:  # noqa: BLE001 - attribution is advisory; bisection still terminates
-                    self.log.exception("attribution on head %s failed", head["id"])
-                    found = attribution.Attribution(refused=f"attribution failed ({type(error).__name__})")
-                named = [m for m in active if m["source_pr"] in found.members]
-                if named:
-                    cause += "; attributed by " + found.summary(lambda key: self._member_label(key, active))
-                    self._count("attributed_withdrawals")
-            if health == "broken":
-                action = "hold"
-                detail = (
-                    f"main is broken at {head['base'][:12]}: {evidence}; not withdrawing or bisecting until main "
-                    "is fixed (fix main or re-run its CI; `rebuild-head` re-dispatches)"
-                )
-            elif named:
-                action, detail = "withdraw", self._withdraw_from_head(head, named, failure, cause, now)
-            elif len(active) > 1:
-                assert found is not None
-                cause += f"; attribution: {found.summary()}"
-                action, detail = "bisect", self._bisect(head, failure, cause, now)
-            elif active:
-                cause += "; this PR is the only member left on the batch, so the failure is its own"
-                action, detail = "withdraw", self._withdraw_from_head(head, active, failure, cause, now)
-            elif head["urgent"] == URGENT_EMERGENCY:
-                self._end_emergency(head, "dissolved", now)
-                action, detail = "dissolve", "no active member was left; the emergency batch ended"
-            else:
-                action, detail = "dissolve", self._dissolve_head(head, cause, now)
-        except Exception as error:  # noqa: BLE001 - a failed escalation must hold with an alert, not stall silently
-            self.log.exception("escalation of head %s failed", head["id"])
-            action, detail = "hold", f"escalation failed ({type(error).__name__}: {str(error)[:200]})"
-        if health == "unknown":
-            cause += f"; base health unknown ({evidence})"
-        retried = False
-        if action == "hold":
-            prior = self._state("escalation_hold") or {}
-            retried = prior.get("batch_id") == head["id"] and prior.get("version") == head["version"]
-            retries = int(prior.get("retries", -1)) + 1 if retried else 0
-            retry_at = now + self._retry_delay(retries)
-            detail += f"; retried automatically in {(retry_at - now) / 60:.0f} minutes"
-            self._set_state(
-                "escalation_hold",
-                {
-                    "batch_id": head["id"],
-                    "version": head["version"],
-                    "detail": detail,
-                    "at": prior.get("at", now) if retried else now,
-                    "retries": retries,
-                    "retry_at": retry_at,
-                    "failure": dict(failure),
-                    "cause": original_cause,
-                },
-            )
-        elif self._state("escalation_hold"):
-            self._set_state("escalation_hold", None)
-        if failure.get("id") is not None:
-            with self.store.transaction():
-                self.store.update("failures", {"id": failure["id"]}, action=action)
-        if retried:
-            # One alert and one message per held version; later retries are journaled only.
-            self.store.journal(now, "escalation-retry-failed", head["id"], version=head["version"], detail=detail)
-            return
-        self._record_escalation(
-            action,
-            head,
-            now,
-            cause=cause,
-            detail=detail,
-            fingerprint=failure.get("fingerprint", ""),
-            verdict_class=failure.get("verdict_class", ""),
-            lines=lines,
-        )
-
-    def _base_health(self, base: str) -> tuple[str, str]:
-        """Whether `base` builds, before a failure no finding names is blamed on a member: `healthy` when
-        it is the tip of a batch the queue promoted (it passed the same candidate CI; no API call), else
-        `healthy` or `broken` by the conclusion of main's `ci.yml` run for it, else `unknown` (no run,
-        not concluded, the lookup failed, or main is not on GitHub). Only `broken` changes the escalation;
-        `unknown` keeps today's attribution. The second value is the evidence, for the cause or detail."""
-        promoted = {"repository": self.repository, "state": BATCH_LANDED, "tip": base, "landed_how": "promoted"}
-        if self.store.row("batches", promoted) is not None:
-            return "healthy", "the queue landed it"
-        reader = getattr(self.execution, "main_ci_run", None)
-        if (
-            reader is None
-            or self.candidate_ci is not None
-            or self.native_source
-            or self.store.get_setting("mixed:primary", "github") != "github"
-        ):
-            return "unknown", "main CI is not read for this source"
-        try:
-            run = reader(self.repository, base)
-        except Exception as error:  # noqa: BLE001 - an unreadable base keeps today's attribution
-            self.log.warning("main CI lookup for %s failed: %s", base[:12], error)
-            return "unknown", f"main CI lookup failed ({type(error).__name__})"
-        if run is None:
-            return "unknown", f"no main CI run for {base[:12]}"
-        if run.status != "completed" or run.conclusion not in ("success", "failure"):
-            return "unknown", f"main CI run {run.html_url or run.run_id} is {run.conclusion or run.status}"
-        if run.conclusion == "success":
-            return "healthy", f"main CI run {run.html_url or run.run_id} passed"
-        return "broken", f"main CI run {run.html_url or run.run_id} failed"
-
-    @staticmethod
-    def _member_label(key: str, members: list[dict[str, Any]]) -> str:
-        member = next((m for m in members if m["source_pr"] == key), None)
-        return f"#{member['number']}" if member is not None else key
-
-    def _attribute(
-        self, head: dict[str, Any], failure: dict[str, Any], active: list[dict[str, Any]]
-    ) -> attribution.Attribution:
-        """Attribute a failure no finding names to the members whose changes it falls in or imports
-        (`attribution.attribute`), from the failed candidate's own chain: each commit's changed paths,
-        and the project imports of the candidate's tree. Members are keyed by `Source-PR`, so Forgejo
-        and GitHub members never collide."""
-        row = self.store.row("failures", {"id": failure["id"]}) if failure.get("id") is not None else None
-        attempt = self.store.row("ci_attempts", {"id": row["attempt_id"]}) if row is not None else None
-        if attempt is None:
-            return attribution.Attribution(refused="no CI attempt to attribute")
-        diagnostics = loads(attempt["diagnostics"], [])
-        try:
-            commits = chain.chain_commits(self.clone, attempt["base_sha"], attempt["head_sha"])
-        except (chain.ChainError, subprocess.SubprocessError) as error:
-            return attribution.Attribution(refused=f"the failed candidate's chain is unavailable: {error}"[:300])
-        planner = self._planner()
-        planner.load([c.sha for c in commits])
-        keys = {m["source_pr"] for m in active}
-        changes: dict[str, set[str]] = {}
-        for commit in commits:
-            if commit.source_pr in keys:
-                changes.setdefault(commit.source_pr, set()).update(p for p, _ in planner.changes.get(commit.sha, []))
-        graph: dict[str, set[str]] | None = None
-
-        def imports(path: str) -> set[str]:
-            nonlocal graph
-            if graph is None:
-                graph = {}
-                tree = chain.tree_of(self.clone, attempt["head_sha"])
-                for importer, module in admission_planning.grep_imports(planner, tree):
-                    graph.setdefault(importer, set()).add(module.replace(".", "/") + ".lean")
-            return graph.get(path, set())
-
-        order = [m["source_pr"] for m in active]
-        return attribution.attribute(
-            diagnostics, order, changes, imports, max_members=int(self.setting("attribution_max_members"))
-        )
-
-    def _dissolve_head(self, head: dict[str, Any], cause: str, now: float) -> str:
-        """Remove a head none of whose members is left to land: every one was withdrawn, so its content
-        is its base and there is nothing to promote. The next sealed batch takes its place."""
-        with self.store.transaction():
-            for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
-                self.store.update(
-                    "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="dissolved"
-                )
-            for claim in self._active_claims(head["id"]):
-                self._release_claim(claim, "escalated", now)
-            self._set_pre_rebase(head, "", now)
-            self._discard_pre_rebase("head-dissolved", now, head)
-            self.store.journal(now, "head-dissolved", head["id"], version=head["version"], cause=cause)
-        self._remove_batch(head, "dissolved", now)
-        self._wake.set()
-        return "no active member was left; the head was dissolved and the next batch takes its place"
-
-    def _withdrawal_note(self, failure: dict[str, Any], cause: str) -> str:
-        lines = loads(failure["lines"], [])
-        note = f"Withdrawn by the merge queue: {cause}"
-        if failure.get("verdict_class"):
-            note += f" ({failure['verdict_class']})"
-        if lines:
-            note += ". Finding: " + lines[0][:300]
-        return note + "."
-
-    def _withdraw_from_head(
-        self, head: dict[str, Any], named: list[dict[str, Any]], failure: dict[str, Any], cause: str, now: float
-    ) -> str:
-        """Replace the named members' commits with empty ones (their messages keep a note why) and withdraw
-        them (`_withdraw_member`, reason `queue-withdrawn`). A later member whose replay then conflicts goes
-        back to waiting with everything after it, as a bisection's second half does. Returns a summary."""
-        note = self._withdrawal_note(failure, cause)
-        empties = {m["source_pr"]: note for m in named}
-        chain_id = f"withdraw-{head['id']}-{secrets.token_hex(4)}"
-        try:
-            result = chain.replay(self.clone, head["base"], head["tip"], head["base"], chain_id=chain_id, empty=empties)
-        finally:
-            chain.delete_chain_ref(self.clone, chain_id)
-        by_pr = {record.source_pr: record for record in result.commits}
-        members = self._members(head["id"])
-        returned = [m for m in members if by_pr.get(m["source_pr"]) is None or by_pr[m["source_pr"]].sha is None]
-        with self.store.transaction():
-            for member in members:
-                record = by_pr.get(member["source_pr"])
-                if record is not None and record.sha is not None:
-                    self.store.update("members", {"id": member["id"]}, commit_sha=record.sha)
-            for member in named:
-                record = by_pr[member["source_pr"]]
-                explanation = (member["explanation"] + "\n\n" + note).strip()
-                self.store.update(
-                    "members",
-                    {"id": member["id"]},
-                    provenance="edited",
-                    explanation=explanation,
-                    edited_shas=dumps(loads(member["edited_shas"], []) + [record.sha]),
-                )
-                withdrawn = dict(member, commit_sha=record.sha, explanation=explanation)
-                self._withdraw_member(
-                    head,
-                    withdrawn,
-                    reason=QUEUE_WITHDRAWN,
-                    comment=self._queue_withdrawal_comment(head, withdrawn, failure, cause),
-                    journal_kind="queue-withdrawn",
-                    now=now,
-                    cause=cause,
-                    fingerprint=failure.get("fingerprint", ""),
-                )
-                self._count("queue_withdrawals")
-            self._return_members(head, returned, "withdrawal-conflict", now)
-            self._advance_head(head, result.tip, "escalated", now)
-        summary = "withdrew " + ", ".join(f"#{m['number']}" for m in named)
-        if returned:
-            summary += "; returned " + ", ".join(f"#{m['number']}" for m in returned) + " to waiting after a conflict"
-        return summary
-
-    def _bisect(self, head: dict[str, Any], failure: dict[str, Any], cause: str, now: float) -> str:
-        """Keep the first half of the head's active members; the rest go back to waiting at their original
-        age, to be inserted into the open batches again. Returns a summary."""
-        members = self._members(head["id"])
-        active = [m for m in members if not m["withdrawn"]]
-        keep = active[(len(active) + 1) // 2 - 1]
-        cut = next(index for index, member in enumerate(members) if member["id"] == keep["id"])
-        kept, moved = members[: cut + 1], members[cut + 1 :]
-        tip = kept[-1]["commit_sha"]
-        if len(chain.chain_commits(self.clone, head["base"], tip)) != len(kept):
-            raise ControllerError(
-                "chain-mismatch", f"head {head['id']} prefix at {tip} does not hold {len(kept)} members"
-            )
-        with self.store.transaction():
-            self._return_members(head, moved, "bisected", now)
-            self._advance_head(head, tip, "bisected", now)
-            self._count("bisections")
-            self.store.journal(
-                now,
-                "bisected",
-                head["id"],
-                kept=[m["number"] for m in kept if not m["withdrawn"]],
-                moved=[m["number"] for m in moved if not m["withdrawn"]],
-                cause=cause,
-                fingerprint=failure.get("fingerprint", ""),
-            )
-        kept_active = sum(1 for m in kept if not m["withdrawn"])
-        return f"kept {kept_active} of {len(active)} members; {len(active) - kept_active} returned to waiting"
+    # --- members leaving the head ----------------------------------------------------------------
 
     def _return_members(self, head: dict[str, Any], members: list[dict[str, Any]], reason: str, now: float) -> None:
         """Take members out of the head (`removed`); an input still inserted waits again at its original age.
@@ -9219,23 +8667,15 @@ class Controller:
                 )
             self.store.journal(now, "member-returned", head["id"], number=member["number"], reason=reason)
 
-    def _advance_head(self, head: dict[str, Any], tip: str, resolution: str, now: float) -> None:
-        """The head's next version at `tip` on the same base: open tasks superseded, pre-rebases onto the
-        old tip discarded, its live runs cancelled. Called inside the caller's transaction."""
-        version = head["version"] + 1
-        self.store.update("batches", {"id": head["id"]}, version=version, tip=tip, expected_parent=None)
-        self._record_tip(head["id"], version, tip, now)
-        self._retain(self.batch_ref(head["id"], version), tip)
-        for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
-            self.store.update(
-                "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
-            )
-        for claim in self._active_claims(head["id"]):
-            self._release_claim(claim, "escalated", now)
-        self._set_pre_rebase(head, "", now)
-        self._discard_pre_rebase("head-shrunk", now, head)
-        self._cancel_superseded_runs(head["id"], now, reason=f"head {resolution}")
-        self._wake.set()
+    # --- automatic retry backoff and operator notifications ----------------------------------------
+
+    def _retry_delay(self, retries: int) -> float:
+        """The automatic retry delay after `retries` earlier retries: `automatic_retry_seconds`, doubling
+        each time, at most `automatic_retry_max_seconds`."""
+        initial = max(60, int(self.setting("automatic_retry_seconds")))  # never a retry every pass
+        return min(
+            initial * 2 ** min(20, max(0, retries)), max(initial, int(self.setting("automatic_retry_max_seconds")))
+        )
 
     def _infrastructure_backoff(self, head: dict[str, Any], attempt: dict[str, Any], retries: int, now: float) -> bool:
         """Automatic backoff once a head's CI keeps failing on infrastructure: re-dispatch after
@@ -9301,10 +8741,8 @@ class Controller:
         *,
         cause: str,
         detail: str,
-        fingerprint: str = "",
-        verdict_class: str = "",
+        key: str,
         lines: list[str] | None = None,
-        key: str | None = None,
         counted: bool = True,
     ) -> None:
         """Keep the escalation for the status page's alerts, journal it, and send it to the operator.
@@ -9316,8 +8754,6 @@ class Controller:
             "version": head["version"],
             "cause": cause,
             "detail": detail,
-            "fingerprint": fingerprint,
-            "verdict_class": verdict_class,
             "lines": (lines or [])[:5],
         }
         with self.store.transaction():
@@ -9329,7 +8765,7 @@ class Controller:
             self.store.journal(
                 now, "escalated", head["id"], **{k: v for k, v in record.items() if k not in ("at", "batch_id")}
             )
-            self._notify(key or f"escalation:{head['id']}:{head['version']}:{action}:{fingerprint}", record)
+            self._notify(key, record)
 
     def _notify_stuck_heads(self, now: float) -> None:
         """Queue the one direct message of the current stuck period of the CI recovery report, once due."""
@@ -9364,10 +8800,6 @@ class Controller:
             f"Why: {escalation.quote(record['cause'], 500)}",
             f"What the queue did: {escalation.quote(record['detail'], 1000)}",
         ]
-        if record.get("verdict_class"):
-            lines.append(
-                f"Failure: {escalation.quote(record['verdict_class'], 200)} (fingerprint {record['fingerprint']})"
-            )
         if record.get("lines"):
             lines += ["", "```text", *(escalation.quote(line, 300) for line in record["lines"]), "```"]
         if self.public_url:
@@ -9775,39 +9207,6 @@ class Controller:
             "",
             f"What to do next: rebase onto `{self.canonical_branch}`, address the problem described above, push, "
             "and approve the PR again. A new approval brings it back into the queue.",
-        ]
-        return "\n".join(lines)
-
-    def _queue_withdrawal_comment(
-        self, batch: dict[str, Any], member: dict[str, Any], failure: dict[str, Any], cause: str
-    ) -> str:
-        """The notice of a member the queue withdrew because a failure naming it kept recurring, or because
-        bisection isolated it as the one member left failing."""
-        lines = [
-            f"The merge queue withdrew this PR from batch {batch['id']}: {cause}, and repair did not resolve it. "
-            "The PR was not merged and stays open; its approval was withdrawn.",
-            "",
-            "What failed:",
-        ]
-        if failure.get("verdict_class"):
-            lines.append(f"- verdict: `{failure['verdict_class']}`")
-        recorded = loads(failure["lines"], [])
-        for line in recorded[:COMMENT_FINDINGS]:
-            lines.append(f"- {' '.join(line.replace('|', ' ').split())[:300]}")
-        if not recorded:
-            lines.append("- no findings were recorded")
-        attempt = self.store.row("failures", {"id": failure["id"]}) if failure.get("id") is not None else None
-        attempt = self.store.row("ci_attempts", {"id": attempt["attempt_id"]}) if attempt is not None else None
-        if attempt is not None and attempt["html_url"]:
-            lines.append(f"- CI run: {attempt['html_url']}")
-        lines += ["", f"Accepted revision: `{member['accepted_head']}`."]
-        if failure.get("fingerprint"):
-            lines.append(f"Failure fingerprint: `{failure['fingerprint']}`.")
-        lines += [
-            "",
-            f"What to do next: reproduce the failure on your branch rebased onto `{self.canonical_branch}` (the CI "
-            "of this PR applies the same checks), fix it, push, and approve the PR again. A new approval brings it "
-            "back into the queue.",
         ]
         return "\n".join(lines)
 
@@ -10793,26 +10192,12 @@ class Controller:
                         f"escalation ({record['action']}) on batch {record['batch_id']} v{record['version']}: "
                         f"{record['cause']}; {record['detail']}"
                     )
-            if head is not None and (held := self._escalation_hold(head, now)) is not None:
-                alerts.append(f"head {head['id']} holds after escalation: {held['detail']}")
             backoff = self._state("infrastructure_backoff")
             if backoff:
                 alerts.append(
                     f"CI infrastructure backoff since {backoff['since']:.0f}: {backoff['retries']} automatic retries"
                 )
-            week = self.store.query(
-                "SELECT COUNT(*) AS n, MAX(at) AS last FROM journal WHERE kind='bisected' AND at>=?", (now - 7 * 86400,)
-            )[0]
-            loop_termination = {
-                # Bisection is the last resort (docs/queue/escalation.md); its frequency is watched here.
-                "bisections": counters.get("bisections", 0),
-                "bisections_last_7_days": week["n"],
-                "last_bisection_at": week["last"],
-                "attributed_withdrawals": counters.get("attributed_withdrawals", 0),
-                "queue_withdrawals": counters.get("queue_withdrawals", 0),
-                "infrastructure_backoff": backoff or None,
-                "escalation_hold": self._state("escalation_hold") or None,
-            }
+            loop_termination = {"infrastructure_backoff": backoff or None}
             if self.notifier_error:
                 alerts.append(f"escalation notifier unavailable: {self.notifier_error}")
             if any(e["attempts"] and e["kind"] == "notify" for e in pending):

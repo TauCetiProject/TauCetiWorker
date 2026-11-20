@@ -547,21 +547,6 @@ class Adapter(unittest.TestCase):
         self.assertEqual(a.pr_merge_base(TAUCETI, 42, HEAD), "d" * 40)
         self.assertIsNone(a.pr_merge_base(TAUCETI, 42, "e" * 40), "a moved head gets no merge base")
 
-    def test_main_ci_run_is_one_unretried_call(self):
-        transport = FakeTransport()
-        url = f"https://api.github.com/repos/{TAUCETI}/actions/workflows/ci.yml/runs?head_sha={BASE}&event=push&per_page=1"
-        run = {"id": 7, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/x/runs/7"}
-        transport.add("GET", url, 200, {"workflow_runs": [run]})
-        transport.add("GET", url.replace(BASE, HEAD), 200, {"workflow_runs": []})
-        transport.add("GET", url.replace(BASE, "d" * 40), 502, {})
-        a = adapter(transport)
-        found = a.main_ci_run(TAUCETI, BASE)
-        self.assertEqual((found.run_id, found.conclusion, found.html_url), ("7", "failure", run["html_url"]))
-        self.assertIsNone(a.main_ci_run(TAUCETI, HEAD))
-        with self.assertRaises(ga.GitHubError):
-            a.main_ci_run(TAUCETI, "d" * 40)
-        self.assertEqual(sum("/actions/workflows/ci.yml/" in call[1] for call in transport.calls), 3)
-
     def test_cancel_run(self):
         transport = FakeTransport()
         base = f"https://api.github.com/repos/{TAUCETI}/actions/runs"
