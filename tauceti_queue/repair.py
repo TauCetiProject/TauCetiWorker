@@ -617,7 +617,9 @@ def apply_conflict(worktree: Path, prefix: str, commit: str) -> list[str]:
     return list(outcome.conflict_paths)
 
 
-def commit_resolution(clone: Path, worktree: Path, prefix: str, commit: str, paths: list[str]) -> tuple[str, dict]:
+def commit_resolution(
+    clone: Path, worktree: Path, prefix: str, commit: str, paths: list[str], large_refactors=frozenset()
+) -> tuple[str, dict]:
     """The worker's own commit of an agent's conflict resolution, and the report on it.
 
     The tree is the worktree's files as ``git add --all`` stages them, read through a private index
@@ -657,7 +659,7 @@ def commit_resolution(clone: Path, worktree: Path, prefix: str, commit: str, pat
         blob = git(clone, "cat-file", "-p", f"{sha}:{path}", check=False)
         if CONFLICT_MARKER.search(blob):
             problems.append(f"conflict-markers: `{path}` still contains conflict markers")
-    review = review_size_violations(clone, prefix, sha)
+    review = review_size_violations(clone, prefix, sha, large_refactors)
     for entry in review:
         problems += [f"review-size: the resolved commit against its parent: {v}" for v in entry["violations"]]
     source_pr = original.source_pr or commit

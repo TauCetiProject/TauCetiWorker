@@ -2341,7 +2341,9 @@ def resolve_conflicts(
                 agent_records.append(agent)
                 if agent["status"] == "cancelled" or agent["status"] in RELEASED_AGENT_STATUSES:
                     return {"status": agent["status"], "reason": agent.get("reason"), "resolved": resolved}
-                tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths)
+                tip, report = repair.commit_resolution(
+                    cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads
+                )
                 if report["ok"] and report["unexplained"] and not cancel.is_set():
                     follow = run_repair_agent(
                         cfg,
@@ -2359,7 +2361,9 @@ def resolve_conflicts(
                     agent_records.append(follow)
                     if follow["status"] == "cancelled" or follow["status"] in RELEASED_AGENT_STATUSES:
                         return {"status": follow["status"], "reason": follow.get("reason"), "resolved": resolved}
-                    tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths)
+                    tip, report = repair.commit_resolution(
+                        cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads
+                    )
                 rest = None
                 if report["ok"] and not report["unexplained"]:
                     member = members.get(source_pr)
