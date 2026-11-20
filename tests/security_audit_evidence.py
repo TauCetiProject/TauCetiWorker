@@ -73,7 +73,7 @@ class Classification(unittest.TestCase):
     # Fixtures ----------------------------------------------------------------
     def codex(self, native, stream):
         (self.attempt / "execution.json").write_text(
-            sa.serialize({"argv": ["codex", "exec"], "paged": False, "protocol_version": 4})
+            sa.serialize({"argv": ["codex", "exec"], "paged": False, "protocol_version": 5})
         )
         jsonl(
             self.attempt / "native-sessions/2026/rollout.jsonl",
@@ -83,7 +83,7 @@ class Classification(unittest.TestCase):
 
     def claude(self, session, stream, tail=""):
         (self.attempt / "execution.json").write_text(
-            sa.serialize({"argv": ["claude", "-p"], "paged": False, "protocol_version": 4})
+            sa.serialize({"argv": ["claude", "-p"], "paged": False, "protocol_version": 5})
         )
         jsonl(self.attempt / sa.CLAUDE_SESSIONS / "project" / f"{THREAD}.jsonl", session)
         jsonl(self.attempt / "model-transcript.jsonl", stream, tail)

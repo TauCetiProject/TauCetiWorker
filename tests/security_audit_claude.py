@@ -18,7 +18,6 @@ from tauceti_worker import audit_client_check as check
 from tauceti_worker import audit_clients as clients
 from tauceti_worker import audit_evidence as evidence
 from tauceti_worker import audit_reader as ar
-from tauceti_worker import audit_recovery as recovery
 from tauceti_worker import security_audit as sa
 from tauceti_worker.config import NoProgress
 
@@ -42,7 +41,7 @@ class FakeHaiku:
     def __call__(self, argv, *, input, cwd, env, timeout, **kwargs):
         plan = self.launches.pop(0)
         self.calls.append(SimpleNamespace(argv=list(argv), prompt=input, home=Path(cwd), env=dict(env)))
-        session, resume = sa.claude_session_arg(argv)
+        session, resume = argv[-1], argv[-2] == "--resume"
         projects = Path(env["CLAUDE_CONFIG_DIR"]) / "projects"
         existing = list(projects.rglob(f"{session}.jsonl"))
         if resume and not existing:
@@ -143,7 +142,7 @@ class HaikuContinuation(unittest.TestCase):
         self.assertIn("unfinished", sa.JUDGMENT_PROMPT)
         self.assertIn("genuine uncertainty", sa.JUDGMENT_PROMPT)
         self.assertEqual(sa.JUDGMENT_SCHEMA["properties"]["verdict"]["enum"], ["pass", "finding", "unfinished"])
-        argv = sa.claude_launch(self.root, True, self.root / "r.json", protocol=sa.PROTOCOL, session=str(uuid.uuid4()))
+        argv = sa.claude_launch(self.root, True, self.root / "r.json", session=str(uuid.uuid4()))
         self.assertEqual(json.loads(argv[argv.index("--json-schema") + 1]), sa.JUDGMENT_SCHEMA)
         self.assertEqual(argv[argv.index("--append-system-prompt") + 1], sa.JUDGMENT_PROMPT + sa.JUDGMENT_COMPACTION)
         self.assertNotIn("--no-session-persistence", argv)
@@ -166,7 +165,15 @@ class HaikuContinuation(unittest.TestCase):
         self.assertEqual(first.home, second.home)
         self.assertTrue(second.prompt.startswith("The Worker has not received a judgment"))
         self.assertIn("next_unserved_page=2", second.prompt)
-        self.assertEqual(recovery.claude_finals(attempt), [UNFINISHED, PASS])
+        session = sa.claude_sessions(attempt)[0]
+        finals = [
+            item["input"]
+            for row in map(json.loads, session.read_text().splitlines())
+            if row.get("type") == "assistant"
+            for item in row["message"]["content"]
+            if item.get("name") == "StructuredOutput"
+        ]
+        self.assertEqual(finals, [UNFINISHED, PASS])
         # Each launch's own output is kept; nothing else is copied.
         self.assertEqual(
             sorted(p.name for p in (attempt / "launch-1").iterdir()),
