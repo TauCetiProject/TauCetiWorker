@@ -96,7 +96,7 @@ if [ -n "$INSTANCE" ]; then
 fi
 
 if [ -n "$IDLE_TIMEOUT" ]; then
-  [[ "$IDLE_TIMEOUT" =~ ^[0-9]+$ ]] || die "--idle-timeout takes a number of seconds"
+  [[ "$IDLE_TIMEOUT" =~ ^(0|[1-9][0-9]*)$ ]] || die "--idle-timeout takes a number of seconds"
   [ "$WHEN_IDLE" = 1 ] || die "--idle-timeout needs --when-idle"
 fi
 if [ "$WHEN_IDLE" = 1 ]; then
