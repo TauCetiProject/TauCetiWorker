@@ -394,6 +394,10 @@ class FakeGitHub:
                     run.conclusion = "success"
                     post("build", "success", "Build succeeded")
                     policy = {}
+                elif run.verdict == "incomplete":
+                    # The `sandboxed-build` runner died before its report step: the finalizer posts this.
+                    run.conclusion = "failure"
+                    post("build", "failure", "sandboxed merge-group build did not complete")
                 elif run.verdict == "cancel":
                     run.conclusion = "cancelled"
                 elif run.verdict == "no-status":
