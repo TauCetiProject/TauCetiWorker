@@ -309,7 +309,9 @@ def recorded(state: Path, batch: dict, evidence: Evidence | None = None) -> Evid
             # one of its commits can have held a verdict about it.
             if digest in line or any(sha in line for sha in commits):
                 evidence.unreadable.append(f"{ledger}:{number}: unreadable row")
-        elif "verdict" in row and (row.get("batch") == digest or commits & judged_commits(row["verdict"])):
+        elif isinstance(row.get("verdict"), dict) and (
+            row.get("batch") == digest or commits & (judged_commits(row["verdict"]) | judged_commits(row))
+        ):
             evidence.judgments.append(row["verdict"])
         elif row.get("outcome") == UNREADABLE and (row.get("batch") == digest or commits & judged_commits(row)):
             # A hold on evidence that could not be read binds its commits exactly like a concern.

@@ -780,6 +780,41 @@ class WorkerRounds(PoolFixture):
         self.assertEqual(len(self.calls), 5)
         self.assertFalse((self.state / "blocked.json").exists())
 
+    def test_a_legacy_block_whose_attempt_holds_a_concern_keeps_binding(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        attempt = self.state / "attempt-legacy"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        # The incident shape: an "unfinished" answer whose findings were not empty, never in the ledger.
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "unfinished", "findings": ["x"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        block = {
+            "from_sha": self.shas[0],
+            "to_sha": self.shas[2],
+            "attempt": str(attempt),
+            "reason": "malformed unfinished judgment",
+        }
+        (self.state / "blocked.json").write_text(sa.serialize(block))
+        with self.assertRaises(NoProgress):
+            for _ in range(4):
+                self.round(lambda b, a: self.verdict(b))
+        self.assertNotIn(0, self.calls)  # The held commits are never inspected afresh.
+        self.assertEqual(self.advanced, [])
+        self.assertEqual(json.loads((self.state / "blocked.json").read_text())["outcome"], "finding")
+
+    def test_a_legacy_block_without_a_concern_is_inspected_afresh(self):
+        block = {
+            "from_sha": self.shas[0],
+            "to_sha": self.shas[2],
+            "attempt": str(self.state / "attempt-gone"),
+            "reason": "model failed",
+        }
+        (self.state / "blocked.json").write_text(sa.serialize(block))
+        self.assertEqual(self.round(lambda b, a: self.verdict(b)), 0)
+        self.assertEqual(self.advanced, [(self.shas[0], self.shas[2])])
+
     def test_a_planning_failure_holds_and_reports(self):
         with patch.object(sa, "plan_batch", side_effect=Die("oversized")), self.assertRaises(NoProgress):
             self.round(lambda b, a: self.verdict(b))

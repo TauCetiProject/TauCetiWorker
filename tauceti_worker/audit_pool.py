@@ -240,41 +240,39 @@ class Pool:
         return False
 
     # Window ----------------------------------------------------------------
-    def settle_journal(self) -> None:
-        """Classify a sequential round that stopped mid-inspection before the pool plans over it.
+    def imported(self, main: str) -> None:
+        """Carry a block written before binding lived in the ranges and the ledger into the ledger.
 
-        Any hold its attempt recorded is written to the ledger against its commits, where it binds
-        every range containing them; then the journal is removed."""
-        running = self.work / "running.json"
-        if not running.exists():
+        Such a block's attempt may hold a concern, or unreadable evidence, that no ledger verdict
+        records. Its evidence is classified once and any hold is recorded against its commits, so
+        it binds every range containing them; the block is then marked with its outcome."""
+        path = self.work / "blocked.json"
+        try:
+            block = json.loads(path.read_text()) if path.exists() else {}
+        except ValueError:
+            block = {"reason": "security-audit: unreadable blocked.json"}
+        if "outcome" in block or not block:
             return
-        try:
-            attempt = Path(json.loads(running.read_text())["attempt"])
-            stopped = json.loads((attempt / "input.json").read_text())
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            # Its range is unknown, so nothing can bind it: hold the pool for review (the watchdog DMs).
-            raise NoProgress(
-                f"security-audit pool: {running} cannot be settled; preserve it for review: {exc}"
-            ) from exc
-        try:
-            hold = evidence.outcome_of(sa.judged(attempt, stopped, "security-audit: interrupted round"), None)
-        except NotJudged:
-            hold = None
-        except Unreadable as exc:
-            hold = {"outcome": "unreadable", "reason": str(exc)}
-        if hold is not None and hold["outcome"] != "not-judged":
-            sa.record(
-                self.work / "ledger.jsonl",
-                {
-                    "from_sha": stopped["from_sha"],
-                    "to_sha": stopped["commits"][-1]["sha"],
-                    "attempt": str(attempt),
-                    "batch": stopped["input_digest"],
-                    "commits": [c["sha"] for c in stopped["commits"]],
-                    **hold,
-                },
-            )
-        running.unlink()
+        outcome = {"outcome": "not-judged"}
+        if block.get("manual_inspection_required"):
+            outcome = {}  # A planning block is planned again, and blocks again if it still cannot be.
+        elif block.get("attempt") and Path(block["attempt"]).exists():  # A missing attempt recorded nothing.
+            attempt = Path(block["attempt"])
+            try:
+                batch = json.loads((attempt / "input.json").read_text())
+                outcome = evidence.outcome_of(sa.judged(attempt, batch, "security-audit: legacy block"), None)
+            except evidence.NotJudged:
+                pass
+            except Exception as exc:  # noqa: BLE001 - evidence that cannot be classified holds.
+                outcome = {"outcome": "unreadable", "reason": f"security-audit: legacy block evidence: {exc}"}
+        if outcome:
+            frm, to = block.get("from_sha"), block.get("to_sha")
+            commits = []
+            if frm and to:
+                history = sa.validate_history(self.repo, frm, main)
+                commits = history[: history.index(to) + 1] if to in history else []
+            sa.record(self.work / "ledger.jsonl", {"legacy_block": block, "commits": commits, **outcome})
+        save(path, {**block, **(outcome or {"outcome": "not-judged"})})
 
     def sync(self, cursor: str, main: str) -> None:
         """Align the window with the remote cursor, restoring the durable list after a restart."""
@@ -554,7 +552,7 @@ class Pool:
         except BaseException as exc:
             self.observation = exc
             raise
-        self.settle_journal()
+        self.imported(main)
         self.sync(cursor, main)
         # Binding ranges are the durable list and the ledger's recorded concerns, never blocked.json,
         # which only mirrors the block at the cursor for operators and alerts. Delivery is idempotent
