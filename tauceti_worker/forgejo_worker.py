@@ -55,7 +55,9 @@ class ForgejoWorkerSource(ForgejoReadSource):
         row = self.live_pull(candidate.pr)
         if row is None:
             return None
-        return actor is not None and row["user"]["id"] == int(actor.principal.native_id)
+        from .source_identity import maintains_author
+
+        return maintains_author(actor, self.repository.forge, row["user"]["id"])
 
     def writable_repository(self):
         """Use an explicit writable fork, or authorized same-repository branches."""

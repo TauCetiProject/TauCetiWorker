@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from tauceti_tools.forge import Incomplete, RepositoryRef
 
 from .constants import SURVEY_DETAIL_READS
-from .source_identity import SourceActor
+from .source_identity import SourceActor, maintains_author
 from .survey import PRInfo, Survey, bucket_status_labels, roadmap_open_count
 
 
@@ -43,7 +43,8 @@ class SourceSurvey(Survey):
         super().rescope_roadmap()
         self.next_auto_stage = None
 
-    def owns(self, pr: PRInfo) -> bool:
+    def authored(self, pr: PRInfo) -> bool:
+        """PRs this account opened itself; authoring pressure counts only these."""
         return bool(
             isinstance(pr, SourcePRInfo)
             and pr.source_repository.key == self.source_repository.key
@@ -51,13 +52,25 @@ class SourceSurvey(Survey):
             and pr.source_author == self.source_actor
         )
 
+    def owns(self, pr: PRInfo) -> bool:
+        """PRs this worker maintains: its own, plus those of adopted Forgejo authors."""
+        return bool(
+            isinstance(pr, SourcePRInfo)
+            and pr.source_repository.key == self.source_repository.key
+            and pr.source_author is not None
+            and maintains_author(
+                self.source_actor, pr.source_author.principal.forge, int(pr.source_author.principal.native_id)
+            )
+        )
+
     def owns_author(self, author: dict | None) -> bool:
         if self.source_actor is None:
             return False
         try:
-            return SourceActor.from_projection(self.source_repository.forge, author) == self.source_actor
+            actor = SourceActor.from_projection(self.source_repository.forge, author)
         except Incomplete:
             return False
+        return maintains_author(self.source_actor, actor.principal.forge, int(actor.principal.native_id))
 
 
 def source_pr_info(row, repository):
@@ -155,7 +168,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
     result.source_actor, result.me_login = actor, actor.login if actor else ""
     if count_all_roadmaps:
         result._automatic_open_count = roadmap_open_count(
-            [p for p in prs if not p.is_draft and result.owns(p)], "auto", skip
+            [p for p in prs if not p.is_draft and result.authored(p)], "auto", skip
         )
     if deep:
         prs = [
@@ -174,7 +187,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
         )
     ]
     result.n_open_nondraft = len(nondraft)
-    result._mine_open_prs = [p for p in nondraft if result.owns(p)]
+    result._mine_open_prs = [p for p in nondraft if result.authored(p)]
     result.rescope_roadmap()
     result.status_labels, result.n_status_unlabeled = bucket_status_labels(nondraft, result.me_login, owns=result.owns)
     # rescope_roadmap also chooses authoring for legacy surveys. This inventory

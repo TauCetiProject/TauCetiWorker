@@ -38,7 +38,9 @@ class SourceClaims(Claims):
         actor = self.source.authenticated_actor()
         if current is None or actor is None or current["head"]["sha"] != head:
             return False
-        if current["user"]["id"] != int(actor.principal.native_id):
+        from .source_identity import maintains_author
+
+        if not maintains_author(actor, self.source.repository.forge, current["user"]["id"]):
             return False
         repository = RepositoryRef(self.source.repository.forge, owner + "/" + repo)
         if current["head"]["repo"]["full_name"].casefold() != repository.name.casefold():

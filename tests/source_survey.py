@@ -122,6 +122,41 @@ class SourceSurveys(unittest.TestCase):
         self.assertTrue(owns_author(legacy, {"login": "author"}))
         self.assertFalse(owns_pr(legacy, SimpleNamespace(), casefold_legacy=True))
 
+    def test_adopted_forgejo_authors_are_maintained_but_not_counted_as_authored(self):
+        with patch.dict("os.environ", {"TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS": "3"}):
+            result = self.run_survey()
+            self.assertTrue(result.owns(result.open_prs[0]))
+            self.assertTrue(result.owns(result.open_prs[1]))
+            self.assertFalse(result.owns(result.open_prs[2]))
+            self.assertTrue(owns_author(result, {"id": self.forge.key + "/users/3", "login": "kim"}))
+            self.assertFalse(owns_author(result, {"id": "forgejo:https://other.example.org/users/3", "login": "kim"}))
+            # Authoring pressure still counts only the worker's own PRs.
+            self.assertEqual(result.n_mine_open, 1)
+            self.assertEqual([p.number for p in result._mine_open_prs], [1])
+
+    def test_adopted_author_ids_are_validated_and_forgejo_only(self):
+        from tauceti_worker.source_identity import adopted_author_ids, maintains_author
+
+        actor = SourceActor.from_native(self.forge, {"id": 9, "login": "bot"})
+        github_actor = SourceActor.from_native(Forge("github", "https://github.com"), {"id": 9, "login": "bot"})
+        with patch.dict("os.environ", {"TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS": " 3, 5 "}):
+            self.assertEqual(adopted_author_ids(), frozenset({3, 5}))
+            self.assertTrue(maintains_author(actor, self.forge, 9))
+            self.assertTrue(maintains_author(actor, self.forge, 3))
+            self.assertFalse(maintains_author(actor, self.forge, 4))
+            self.assertFalse(maintains_author(actor, self.forge, "3"))
+            self.assertFalse(maintains_author(None, self.forge, 3))
+            self.assertFalse(maintains_author(github_actor, github_actor.principal.forge, 3))
+            other = Forge("forgejo", "https://other.example.org")
+            self.assertFalse(maintains_author(actor, other, 3))
+            self.assertFalse(maintains_author(actor, other, 9))
+        with patch.dict("os.environ", {"TAUCETI_FORGEJO_ADOPTED_AUTHOR_IDS": "3,kim-em"}):
+            with self.assertRaises(ValueError):
+                adopted_author_ids()
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(adopted_author_ids(), frozenset())
+            self.assertFalse(maintains_author(actor, self.forge, 3))
+
     def test_held_source_automatic_bumps_follow_existing_nondraft_count_policy(self):
         from tauceti_worker.constants import BUMP_HEAD_PREFIX
 
