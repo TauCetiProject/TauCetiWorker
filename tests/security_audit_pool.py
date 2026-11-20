@@ -804,6 +804,22 @@ class WorkerRounds(PoolFixture):
         self.assertEqual(self.advanced, [])
         self.assertEqual(json.loads((self.state / "blocked.json").read_text())["outcome"], "finding")
 
+    def test_a_stopped_sequential_round_whose_attempt_holds_a_concern_keeps_binding(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        attempt = self.state / "attempt-stopped"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        (self.state / "running.json").write_text(sa.serialize({"attempt": str(attempt)}))
+        with self.assertRaises(NoProgress):
+            for _ in range(4):
+                self.round(lambda b, a: self.verdict(b))
+        self.assertNotIn(0, self.calls)
+        self.assertFalse((self.state / "running.json").exists())
+
     def test_a_legacy_block_without_a_concern_is_inspected_afresh(self):
         block = {
             "from_sha": self.shas[0],

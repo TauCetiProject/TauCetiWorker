@@ -241,11 +241,22 @@ class Pool:
 
     # Window ----------------------------------------------------------------
     def imported(self, main: str) -> None:
-        """Carry a block written before binding lived in the ranges and the ledger into the ledger.
+        """Carry records written before binding lived in the ranges and the ledger into the ledger.
 
-        Such a block's attempt may hold a concern, or unreadable evidence, that no ledger verdict
-        records. Its evidence is classified once and any hold is recorded against its commits, so
-        it binds every range containing them; the block is then marked with its outcome."""
+        A legacy block's attempt, or the attempt of a sequential round that stopped mid-inspection
+        (`running.json`), may hold a concern or unreadable evidence that no ledger verdict records.
+        Its evidence is classified once and any hold is recorded against its commits, so it binds
+        every range containing them; the block is then marked with its outcome."""
+        running = self.work / "running.json"  # A sequential round stopped mid-inspection.
+        if running.exists():
+            try:
+                attempt = json.loads(running.read_text())["attempt"]
+                stopped = json.loads((Path(attempt) / "input.json").read_text())
+                block = {"from_sha": stopped["from_sha"], "to_sha": stopped["commits"][-1]["sha"], "attempt": attempt}
+            except (OSError, ValueError, KeyError, TypeError, IndexError):
+                block = {"reason": "security-audit: unreadable running.json"}
+            self.import_block(block, main)
+            running.unlink()
         path = self.work / "blocked.json"
         try:
             block = json.loads(path.read_text()) if path.exists() else {}
@@ -253,6 +264,10 @@ class Pool:
             block = {"reason": "security-audit: unreadable blocked.json"}
         if "outcome" in block or not block:
             return
+        save(path, {**block, **self.import_block(block, main)})
+
+    def import_block(self, block: dict, main: str) -> dict:
+        """Record in the ledger what one legacy record's attempt holds; return its outcome."""
         outcome = {"outcome": "not-judged"}
         if block.get("manual_inspection_required"):
             outcome = {}  # A planning block is planned again, and blocks again if it still cannot be.
@@ -269,10 +284,13 @@ class Pool:
             frm, to = block.get("from_sha"), block.get("to_sha")
             commits = []
             if frm and to:
-                history = sa.validate_history(self.repo, frm, main)
+                try:
+                    history = sa.validate_history(self.repo, frm, main)
+                except Die:
+                    history = []  # Not on main's history: it cannot bind a range the pool plans.
                 commits = history[: history.index(to) + 1] if to in history else []
             sa.record(self.work / "ledger.jsonl", {"legacy_block": block, "commits": commits, **outcome})
-        save(path, {**block, **(outcome or {"outcome": "not-judged"})})
+        return outcome or {"outcome": "not-judged"}
 
     def sync(self, cursor: str, main: str) -> None:
         """Align the window with the remote cursor, restoring the durable list after a restart."""
