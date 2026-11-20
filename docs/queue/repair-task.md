@@ -170,12 +170,14 @@ the task's log directory.
 - Anything unexpected returns the conflict to the agent as before: an installed TauCetiTools without
   numproj, a tool failure or timeout, a sandbox error, a symlink under `.lake/numproj`, a rewritten
   copy that is a symlink or not a regular file, a failed write (the worker applies the conflict again),
-  nothing rewritten, or a rewrite with any edit `numproj_fix.py` does not make
-  (`repair_numproj.same_up_to_projections`): only digits after a `.` that follows an identifier or a
-  bracket may become a field name, a receiver of identifier characters may be parenthesized just before
-  its `.`, and a space may become a line break with indentation, never on a line with a string literal.
-  The elaborated member code can write the tool's copies, so this check bounds the mechanical result:
-  the most it can change is which name a numeric projection gets, which the later build verification
+  nothing rewritten, or a rewritten copy that is not exactly what the tool writes. The elaborated
+  member code can write the tool's copies, so the worker checks each one on the host
+  (`repair_numproj.rewrites_only`): it reads off the findings the rewrite implies (numeric projections
+  after an identifier or bracket given field names, receivers of identifier characters parenthesized
+  just before their `.`, `repair_numproj.projection_edits`), requires each to be in code by the
+  installed tool's own lexer (not a comment or string literal), applies them to the original with the
+  installed tool's own `apply` (which also rewraps) and requires the identical text. The most the
+  sandbox can change is which name a numeric projection gets, which the later build verification
   checks like any resolution.
 
 The controller's insertion probes of waiting PRs do not use the pre-pass: they are `git merge-tree`
@@ -873,7 +875,7 @@ abandonment of a stopped task, the task record and prompt for a rebase conflict,
 pre-pass with a stand-in tool (`NumprojPrepass`: a projection-only conflict resolved without the agent
 in two sandboxed runs, a real conflict and sites left by the tool handed to the agent from the
 rewritten merge, and a tool failure, a missing tool, a rewrite that changes more than projections, an
-already named field changed, a symlink planted under `.lake`, a failed write, an unacceptable mechanical
+edit the tool would not make, a symlink planted under `.lake`, a failed write, an unacceptable mechanical
 resolution and a cold tree all leaving git's own conflict to the agent), the
 provider chain (the same stub installed as `codex`: chain order, a subscription over pace or
 unmeasurable skipped, a launch failure or a refusal before any work handed to the next provider, the

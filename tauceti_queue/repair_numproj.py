@@ -20,6 +20,8 @@ rewritten) returns None and leaves the worktree as ``apply_conflict`` wrote it.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import importlib.util
 import os
 import re
 import secrets
@@ -38,13 +40,14 @@ TIMEOUT_SECONDS = 1800.0
 JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
-CANDIDATE = re.compile(r"[\w'\)\]⟩»]\.\d")
-# For `same_up_to_projections`: a numeric projection, the named field replacing it, an identifier's
-# last characters (to tell `h1.1` from the literal `1.5`), and a receiver the tool may parenthesize.
+CANDIDATE = re.compile(r"[\w'\)\]⟩»·]\.\d")
+# For `projection_edits`: a numeric projection, the named field replacing it, an identifier's last
+# characters (to tell `h1.1` from the literal `1.5`), and a receiver the tool may parenthesize.
 _NUMERIC = re.compile(r"\.\d+")
 _NAMED = re.compile(r"\.[^\W\d][\w'!?]*")
 _IDENT_END = re.compile(r"[\w']+$")
-_RECEIVER = re.compile(r"[\w'.$!?«»]+")
+_RECEIVER = re.compile(r"[\w'.$!?«»℘]+")
+_BEFORE_PROJECTION = ")]⟩»·"
 
 
 @dataclasses.dataclass
@@ -73,52 +76,89 @@ def _blob(worktree: Path, rev: str, path: str) -> bytes | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
-def same_up_to_projections(before: str, after: str) -> bool:
-    """Whether ``after`` is ``before`` with only the edits ``numproj_fix.py`` makes: a numeric
-    projection's digits after an identifier or bracket replaced by a field name (`h.1` to `h.fst`), a
-    receiver made of identifier characters parenthesized right before its `.` (`$h.1` to
-    `($h).fst`), and a space replaced by a line break and indentation (a rewrapped line). Anything
-    else means the tool, or the member code it elaborated (which can write the tool's files), did
-    something it should not. Edits are refused on a line with a string literal, whose contents must
-    not change. Which field a projection gets is not checked here; the build is."""
+def projection_edits(before: str, after: str) -> set[tuple[int, int, str, tuple[int, int] | None]] | None:
+    """The numproj findings that would turn ``before`` into ``after``, in ``numproj_fix.apply``'s
+    form ``(line, col, field, span)``: a numeric projection's digits after an identifier or bracket
+    replaced by a field name, with the receiver from ``span[0]`` to the `.` at ``span[1]``
+    parenthesized when a `)` is inserted right before it; spaces may become line breaks with
+    indentation (``apply`` rewraps). None when ``after`` has any other difference. ``rewrites_only``
+    then checks the findings by applying them with the tool's own code."""
+    edits: set[tuple[int, int, str, tuple[int, int] | None]] = set()
 
-    def literal(i: int) -> bool:
-        return '"' in before[before.rfind("\n", 0, i) + 1 : (before.find("\n", i) + 1 or len(before) + 1) - 1]
+    def place(i: int) -> tuple[int, int]:
+        return before.count("\n", 0, i) + 1, i - (before.rfind("\n", 0, i) + 1)
 
     i = j = 0
     opened: int | None = None  # where in ``before`` an inserted `(` stands
+    span: tuple[int, int] | None = None  # a receiver closed by an inserted `)`, for the next projection
     while i < len(before) or j < len(after):
         numeric = _NUMERIC.match(before, i)
         named = _NAMED.match(after, j)
-        if i < len(before) and j < len(after) and before[i] == after[j] and not (numeric and named):
-            i, j = i + 1, j + 1
-            continue
-        if literal(i):
-            return False
         if numeric and named and j > 0:
             # A projection follows a bracket or an identifier, as rewritten so far (`x.1.2` is
             # `x.fst.2` by now); digits alone before the `.` are a literal (`1.5`), unless they are
             # themselves a projection the tool kept (`x.1.2` to `x.1.snd`).
             ident = _IDENT_END.search(after, 0, j)
-            if after[j - 1] in ")]⟩»" or (
-                ident is not None and (not ident.group().isdigit() or after[ident.start() - 1 : ident.start()] == ".")
+            if after[j - 1] not in _BEFORE_PROJECTION and (
+                ident is None or (ident.group().isdigit() and after[ident.start() - 1 : ident.start()] != ".")
             ):
-                i, j = numeric.end(), named.end()
-                continue
-            return False
-        if j < len(after) and after[j] == "(" and opened is None:
+                return None
+            line, col = place(i)
+            edits.add((line, col + 1, named.group()[1:], span))
+            i, j, span = numeric.end(), named.end(), None
+        elif span is not None:
+            return None  # an inserted `)` belongs to the projection right after it
+        elif i < len(before) and j < len(after) and before[i] == after[j]:
+            i, j = i + 1, j + 1
+        elif j < len(after) and after[j] == "(" and opened is None:
             opened, j = i, j + 1
-        elif j < len(after) and after[j] == ")" and opened is not None and after[j + 1 : j + 2] == ".":
-            if not _RECEIVER.fullmatch(before, opened, i):
-                return False
+        elif j < len(after) and after[j] == ")" and opened is not None and _NUMERIC.match(before, i):
+            if not _RECEIVER.fullmatch(before, opened, i) or place(opened)[0] != place(i)[0]:
+                return None
+            span = (place(opened)[1], place(i)[1])
             opened, j = None, j + 1
         elif i < len(before) and before[i] == " " and after[j : j + 1] == "\n":
             i, j = i + 1, j + 1
             while j < len(after) and after[j] == " ":
                 j += 1
         else:
+            return None
+    return edits if opened is None and span is None else None
+
+
+def load_tool(tool: Path):
+    """The installed ``numproj_fix.py`` as a module, for its ``apply`` and lexer (stdlib only; its
+    command line is behind ``__main__``). This is the installed copy, never the sandbox's."""
+    path = tool / "numproj_fix.py"
+    name = "tauceti_numproj_fix_" + hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def rewrites_only(before: str, after: str, fix) -> bool:
+    """Whether ``after`` is exactly what the numproj tool ``fix`` (``load_tool``) writes for
+    ``before`` given some findings: numeric projections in code (by the tool's own lexer, so not in
+    comments or string literals) named, receivers of identifier characters parenthesized, and the
+    tool's own rewrapping. The elaborated member code can write the tool's files, so this bounds what
+    the sandbox can change: which field a numeric projection gets, which the build checks."""
+    edits = projection_edits(before, after)
+    if not edits:
+        return before == after
+    lines = before.split("\n")
+    lexes = fix.line_lexes(lines)
+    for line, col, _, span in edits:
+        kinds = lexes[line - 1][0]
+        if kinds[col] != fix.CODE or (span is not None and kinds[span[0]] != fix.CODE):
             return False
-    return opened is None
+    with tempfile.TemporaryDirectory(prefix="numproj-check-") as scratch:
+        path = Path(scratch) / "file.lean"
+        path.write_text(before, encoding="utf-8")
+        fix.apply({str(path): edits})
+        return path.read_text(encoding="utf-8") == after
 
 
 def _private_dir(lake: Path, *names: str) -> Path:
@@ -198,6 +238,10 @@ def prepass(
     tool = tool_dir()
     if tool is None:
         return None
+    try:
+        fix = load_tool(tool)
+    except Exception:  # noqa: BLE001 - a tool that does not load is a tool that is unavailable
+        return None
     parent = subprocess.run(
         ["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet", f"{commit}^"],
         capture_output=True,
@@ -255,7 +299,7 @@ def prepass(
             new_base = _read(directory, f"parent-{names[path]}")
             new_theirs = _read(directory, f"commit-{names[path]}")
             for before, after in ((base, new_base), (theirs, new_theirs)):
-                if not same_up_to_projections(before.decode(), after.decode(errors="replace")):
+                if not rewrites_only(before.decode(), after.decode(errors="replace"), fix):
                     return None
             changed = changed or new_base != base or new_theirs != theirs
             rewritten[path] = (new_base, new_theirs)

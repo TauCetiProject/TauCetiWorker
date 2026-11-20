@@ -6959,24 +6959,62 @@ class ToolsMainPin(unittest.TestCase):
                 repair_audit.tools_checkout(root / "checkouts", "TauCetiProject/TauCetiTools", "absent")
 
 
-# A stand-in for TauCetiTools' `numproj_fix.py`: renames `.1`/`.2` after an identifier or `)` to
-# `.fst`/`.snd` in the files it is given, logs its call, and exits with RC.
+# A stand-in for TauCetiTools' `numproj_fix.py`. Run, it renames `.1`/`.2` after an identifier or
+# `)` to `.fst`/`.snd` in the files it is given, logs its call and exits with RC. As a module it
+# offers what the worker checks a rewrite with: `apply`, and a lexer for `--` comments and strings.
 FAKE_NUMPROJ = r"""import os, re, sys
 from pathlib import Path
-files = [a for a in sys.argv[1:] if a.endswith(".lean")]
-with open(Path(os.environ["STUB_DIR"]) / "numproj-calls.log", "a") as log:
-    log.write(" ".join(sys.argv[1:]) + " cache=" + os.environ.get("TAUCETI_NUMPROJ_CACHE", "") + "\n")
-for name in files:
-    path = Path(name)
-    text = re.sub(r"(?<=[\w)])\.([12])\b", lambda m: ".fst" if m.group(1) == "1" else ".snd", path.read_text())
-    path.write_text(EDIT(text))
-for name in files:
-    print(f"numproj: {name}:2:3: not rewritten, as a test; rewrite it by hand") if RC == 1 else None
-sys.exit(RC)
+CODE = "c"
+
+
+def line_lexes(lines):
+    out = []
+    for line in lines:
+        kinds, quoted = [], False
+        for i, ch in enumerate(line):
+            quoted = quoted != (ch == '"')
+            kinds.append("m" if "--" in line[: i + 1] else "s" if quoted or ch == '"' else CODE)
+        out.append((kinds, set(), True))
+    return out
+
+
+def apply(findings):
+    for path, edits in findings.items():
+        lines = Path(path).read_text().split("\n")
+        for line, col, field, span in sorted(edits, key=lambda e: (e[0], -e[1])):
+            text = lines[line - 1]
+            digits = re.match(r"\d+", text[col:]).group(0)
+            text = text[:col] + field + text[col + len(digits) :]
+            if span:
+                text = text[: span[0]] + "(" + text[span[0] : span[1]] + ")" + text[span[1] :]
+            lines[line - 1] = text
+        Path(path).write_text("\n".join(lines))
+    return 0, []
+
+
+if __name__ == "__main__":
+    files = [a for a in sys.argv[1:] if a.endswith(".lean")]
+    with open(Path(os.environ["STUB_DIR"]) / "numproj-calls.log", "a") as log:
+        log.write(" ".join(sys.argv[1:]) + " cache=" + os.environ.get("TAUCETI_NUMPROJ_CACHE", "") + "\n")
+    for name in files:
+        path = Path(name)
+        text = re.sub(r"(?<=[\w)])\.([12])\b", lambda m: ".fst" if m.group(1) == "1" else ".snd", path.read_text())
+        path.write_text(EDIT(text))
+    for name in files:
+        print(f"numproj: {name}:2:3: not rewritten, as a test; rewrite it by hand") if RC == 1 else None
+    sys.exit(RC)
 """
 
 OLD_P = "theorem p (h : A ∧ B) : A := h.1\ndef q (x : Nat × Nat) : Nat := x.2\ndef r : Nat := Nat.zero\n"
 NEW_P = OLD_P.replace("h.1", "h.fst").replace("x.2", "x.snd")
+
+# The installed TauCetiTools' numproj, when it has one (TauCetiProject/TauCetiTools#314), for the checks
+# against the real tool's rewrites; TAUCETI_TEST_NUMPROJ_DIR names another copy of its scripts.
+REAL_NUMPROJ = (
+    Path(os.environ["TAUCETI_TEST_NUMPROJ_DIR"])
+    if os.environ.get("TAUCETI_TEST_NUMPROJ_DIR")
+    else repair_numproj.tool_dir()
+)
 
 
 class NumprojPrepass(Fixture):
@@ -7170,32 +7208,65 @@ class NumprojPrepass(Fixture):
         self.assertNotIn("partial", resolved)
 
     def test_the_rewrite_check(self):
-        """Only the edits `numproj_fix.py` makes pass; anything member code could add on top does not."""
-        cases = [
-            ("f x.1 y.2.1", "f x.fst y.snd.fst", True),
-            ("  exact foo (a b).1 c", "  exact foo (a b).fst\n      c", True),
-            ("$h.1", "($h).fst", True),
-            ("s.1.foo", "(s).val.foo", True),
-            ("h1.1", "h1.fst", True),
-            ("x.1.2", "x.1.snd", True),
-            ("a b", "a\n    b", True),
-            ("(x.1 + 2) * 3", "x.fst + 2 * 3", False),
-            ("a + b.1", "(a + b).fst", False),
-            ("1.5", "1.foo", False),
-            ("x.fst + y.1", "x.snd + y.fst", False),
-            ("Nat.succ", "Nat.pred", False),
-            ('def s := "x.1" ++ y.1', 'def s := "x.fst" ++ y.fst', False),
-            ("x.1", "x", False),
-            ("f x.1", "g x.fst", False),
-            ("ab", "a\nb", False),
-            ("x.1", "(x.fst", False),
-        ]
-        for before, after, accepted in cases:
+        """The findings a rewrite implies, or None for an edit `numproj_fix.py` never makes."""
+        edits = repair_numproj.projection_edits
+        self.assertEqual(
+            edits("f x.1 y.2.1", "f x.fst y.snd.fst"), {(1, 4, "fst", None), (1, 8, "snd", None), (1, 10, "fst", None)}
+        )
+        self.assertEqual(edits("a\n$h.1", "a\n($h).val"), {(2, 3, "val", (0, 2))})
+        self.assertEqual(edits("x.1.2", "x.1.snd"), {(1, 4, "snd", None)})
+        self.assertEqual(edits("(·.1)", "(·.val)"), {(1, 3, "val", None)})
+        self.assertEqual(edits("h1.1 a b", "h1.fst a\n    b"), {(1, 3, "fst", None)})
+        for before, after in [
+            ("(x.1 + 2) * 3", "x.fst + 2 * 3"),
+            ("a + b.1", "(a + b).fst"),
+            ("1.5", "1.foo"),
+            ("x.fst + y.1", "x.snd + y.fst"),
+            ("s.val + y.1", "(s).val + y.fst"),
+            ("Nat.succ", "Nat.pred"),
+            ("x.1", "x"),
+            ("f x.1", "g x.fst"),
+            ("ab", "a\nb"),
+            ("x.1", "(x.fst"),
+        ]:
             with self.subTest(before=before, after=after):
-                self.assertEqual(repair_numproj.same_up_to_projections(before, after), accepted)
+                self.assertIsNone(edits(before, after))
         self.assertTrue(repair_numproj.CANDIDATE.search("h.1"))
         self.assertTrue(repair_numproj.CANDIDATE.search("(f x).2"))
+        self.assertTrue(repair_numproj.CANDIDATE.search("(·.1)"))
         self.assertFalse(repair_numproj.CANDIDATE.search("theorem a : True := trivial\n"))
+
+    def test_a_rewrite_must_be_what_the_tool_writes(self):
+        """`rewrites_only` reapplies the implied findings with the tool's own code: comments and
+        string literals are not code, and only the tool's own layout passes."""
+        fix = repair_numproj.load_tool(repair_numproj.tool_dir())
+        same = repair_numproj.rewrites_only
+        self.assertTrue(same(OLD_P, NEW_P, fix))
+        self.assertTrue(same("x", "x", fix))
+        self.assertFalse(same("-- y.1 here\nx", "-- y.fst here\nx", fix), "a comment is not code")
+        self.assertFalse(same('def s := "y.1"', 'def s := "y.fst"', fix), "nor is a string")
+        self.assertFalse(same("a b x.1", "a\nb x.fst", fix), "a line break the tool did not make")
+
+    @unittest.skipUnless(REAL_NUMPROJ, "the installed TauCetiTools has no numproj")
+    def test_the_real_tool_s_rewrites_pass_and_injections_do_not(self):
+        fix = repair_numproj.load_tool(REAL_NUMPROJ)
+        same = repair_numproj.rewrites_only
+        line = "  exact ⟨fun x => (f x).1, by simpa using h.2, hs.1.2, $h.1, s.1.foo⟩"
+        self.assertTrue(
+            same(line, "  exact ⟨fun x => (f x).fst, by simpa using h.snd, hs.fst.snd, ($h).val, (s).val.foo⟩", fix)
+        )
+        long = "theorem foo (a : Nat × Nat) (b : Nat × Nat) (h : a.1 = b.2) (hh : a.2 = b.1) (hhh : a.1 + a.2 = b.1 + b.2) :\n    True := trivial\n"
+        wrapped = (
+            "theorem foo (a : Nat × Nat) (b : Nat × Nat) (h : a.fst = b.snd) (hh : a.snd = b.fst)\n"
+            "    (hhh : a.fst + a.snd = b.fst + b.snd) :\n    True := trivial\n"
+        )
+        self.assertTrue(same(long, wrapped, fix))
+        injected = "-- ignored def injected : Nat := 42\ndef q (x : Nat × Nat) : Nat := x.2\n"
+        self.assertFalse(
+            same(injected, "-- ignored\ndef injected : Nat := 42\ndef q (x : Nat × Nat) : Nat := x.snd\n", fix)
+        )
+        multiline = 'def s := "first\nx.1\nlast"\ndef q (x : Nat × Nat) : Nat := x.2\n'
+        self.assertFalse(same(multiline, multiline.replace("x.1", "x.fst").replace("x.2", "x.snd"), fix))
 
     def test_scratch_files_are_read_without_following_links_or_blocking(self):
         with tempfile.TemporaryDirectory(dir=self.root) as scratch:
