@@ -1353,7 +1353,7 @@ def run_agent_proc(
             quota_reader = Quota(quota_cfg)
             launch_credential = quota_reader.launch_credential(provider)
             if provider == "claude":
-                stream_identity = quota_reader.claude_stream_identity()
+                stream_identity = quota_reader.claude_stream_identity(env)
         except Exception:
             quota_reader = None  # optional failure evidence must never become a launch dependency
     # Each Claude rate_limit_event restates both quota windows from the agent's own model responses;

@@ -1476,11 +1476,17 @@ class Quota:
             value = reader(source / "auth.json")
         return source, value
 
-    def claude_stream_identity(self) -> tuple[str, str] | None:
+    def claude_stream_identity(self, agent_env: dict) -> tuple[str, str] | None:
         """(credential fingerprint, account key) from ONE credential snapshot, frozen at launch so a
-        later rotation or account switch cannot receive this run's readings. None when unavailable;
-        never raises, since stream sharing must not become a launch dependency."""
+        later rotation or account switch cannot receive this run's readings. None when unavailable,
+        or when the agent's own credential is not tied to that account: an agent authenticating with
+        $CLAUDE_CODE_OAUTH_TOKEN, or a separate usage login whose account is not verified to be the
+        agents'. Never raises, since stream sharing must not become a launch dependency."""
         try:
+            if str(agent_env.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip() or (
+                claude_usage_credentials() is not None and not claude_usage_identity_verified(self.cfg)
+            ):
+                return None
             oauth, _ = self._claude_creds()
             fp = self._fingerprint((oauth or {}).get("accessToken"))
             return (fp, self._claude_account_key(oauth)) if fp else None
@@ -1527,8 +1533,9 @@ class Quota:
         windows with clocks still running, and is then judged like an endpoint reading (TTL, resets,
         pacing). It is written only under the endpoint fetcher's lock, never waiting for it, so the
         stream keeps draining and a busy lock just skips this reading. Under that lock it never replaces
-        a reading observed later, and never recreates an entry for a credential the endpoint rejected
-        (HTTP 401): renewal must still see that rejection. It does not end a usage-endpoint cooldown."""
+        a reading observed later, never lowers a stored figure for the same window, and never recreates
+        an entry for a credential the endpoint rejected (HTTP 401): renewal must still see that
+        rejection. It does not end a usage-endpoint cooldown."""
         if not identity:
             return False
         fp, account = identity
@@ -1550,6 +1557,18 @@ class Quota:
                 at = existing.get("fetched_at")
                 if _finite_num(at) and at >= observed_at:
                     return False
+                if _finite_num(at) and isinstance(existing.get("payload"), dict):
+                    # Usage only rises inside a window, but an event can restate an agent's older
+                    # headers. Never lower a stored figure for the same window (same reset clock).
+                    for old in _claude_readings(existing["payload"], at):
+                        new = payload[_FLAT_KEY[old.window]]
+                        if (
+                            old.state == STATE_ACTIVE
+                            and old.used is not None
+                            and old.resets_at is not None
+                            and abs(old.resets_at - _parse_iso(new["resets_at"])) <= CLAUDE_RESET_SKEW_S
+                        ):
+                            new["utilization"] = max(new["utilization"], old.used)
             return self._store_raw("claude", payload, fp, valid_until, observed_at, source="claude-stream")
 
     def _model_refusal_path(self, provider: str, credential: str) -> Path:

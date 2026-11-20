@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -175,6 +176,65 @@ try:
 finally:
     quota_module._http_get_json = saved_http
 
+# Usage only rises inside a window, but an event can restate an agent's older headers after a newer
+# reading was stored. Within the same window (same reset clock, which the endpoint states with a
+# sub-second fraction) the higher figure stays; a new window's figure is taken as is.
+q = quota("monotone")
+reset = windows["five_hour"]["resetsAt"]
+
+
+def iso(t):
+    return datetime.fromtimestamp(t, UTC).isoformat()
+
+
+exhausted_endpoint = {
+    "five_hour": {"utilization": 100.0, "resets_at": iso(reset + 0.293)},
+    "seven_day": {"utilization": 5.0, "resets_at": iso(windows["seven_day"]["resetsAt"] + 0.293)},
+}
+q._store_raw("claude", exhausted_endpoint, "fp", reset, now - 20)
+check("a delayed lower reading is still stored", q.note_claude_stream_windows(windows, ID, now - 10), True)
+stored = q._cached_claude("fp")[0]
+check("but keeps the window's higher figure", stored["five_hour"]["utilization"], 100.0)
+check("and takes a higher figure it brings", round(stored["seven_day"]["utilization"], 6), 5.0)
+prov, _ = q._claude_pass("fp", "token", refresh=False, account=ID[1])
+check("so known exhaustion still blocks", prov.available, False)
+next_window = {**windows, "five_hour": {**windows["five_hour"], "resetsAt": reset + 5 * 3600}}
+q.note_claude_stream_windows(next_window, ID, reset + 1)
+check(
+    "a new window's figure is taken as is",
+    round(json.loads(q._raw_path("claude", "fp").read_text())["payload"]["five_hour"]["utilization"], 6),
+    27.0,
+)
+
+# A reading describes the agent's own account, so it is shared only when the agent's credential is
+# the paced one: not when the agent authenticates with $CLAUDE_CODE_OAUTH_TOKEN, and not when a
+# separate usage login paces it without a verified shared account.
+with tempfile.TemporaryDirectory() as directory:
+    root = Path(directory)
+    (root / ".claude").mkdir()
+    (root / ".claude/.credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": "agent-token"}}))
+    cfg = SimpleNamespace(home=root, wid="w", state=root / "state/w", quota_cache=root / "state/w/cache")
+    tied = quota_module.Quota(cfg)
+    tied._claude_creds = lambda: ({"accessToken": "agent-token"}, False)
+    tied._claude_creds_source = lambda: root / ".claude"
+    check("the agent's own credential is shared", tied.claude_stream_identity({}) is not None, True)
+    check(
+        "an environment token is not",
+        tied.claude_stream_identity({"CLAUDE_CODE_OAUTH_TOKEN": "other-account-token"}),
+        None,
+    )
+    usage_login = root / "usage/.credentials.json"
+    with (
+        patch.object(quota_module, "claude_usage_credentials", return_value=usage_login),
+        patch.object(quota_module, "claude_usage_identity_verified", return_value=False),
+    ):
+        check("an unverified separate usage login is not", tied.claude_stream_identity({}), None)
+    with (
+        patch.object(quota_module, "claude_usage_credentials", return_value=usage_login),
+        patch.object(quota_module, "claude_usage_identity_verified", return_value=True),
+    ):
+        check("a verified separate usage login is", tied.claude_stream_identity({}) is not None, True)
+
 # The point: a fresh stream reading answers the pacing read without asking the endpoint, even a forced
 # one, and also answers while a 429 cooldown holds.
 fetches = []
@@ -275,7 +335,8 @@ with tempfile.TemporaryDirectory() as directory:
     credentials.write_text(json.dumps({"claudeAiOauth": {"accessToken": "launch-token"}}))
     event = {**REAL_EVENT, "rate_limit_info": {**REAL_EVENT["rate_limit_info"], "unifiedWindows": windows}}
     script = f"import json; print(json.dumps({event!r}))"
-    env = {**os.environ, "HOME": str(root), "CLAUDE_CONFIG_DIR": str(credentials.parent)}
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_OAUTH_TOKEN"}
+    env.update(HOME=str(root), CLAUDE_CONFIG_DIR=str(credentials.parent))
     with (
         patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(credentials.parent)}),
         patch.object(quota_module.Quota, "_claude_creds_source", lambda self: root / ".claude"),
