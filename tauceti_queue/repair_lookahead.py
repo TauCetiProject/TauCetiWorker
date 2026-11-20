@@ -137,11 +137,14 @@ class Lookahead:
     def _cache_packages(self) -> None:
         """Replay the dependencies' build in the task worktree once (``lake build Mathlib``). Lake moves a
         replayed artifact into its artifact cache, which writes in ``.lake/packages``; the helpers share
-        the task's packages read-only, so they replay nothing there themselves. It runs before any agent
-        builds, and the task's cancellation stops it. Never fails."""
+        the task's packages read-only, so they replay nothing there themselves. It runs at ``onto``
+        before any agent builds, and the task's cancellation stops it. Never fails."""
         from tauceti_worker.processes import owned_process
 
         try:
+            # At the target, whose dependencies the helpers build against; the serial replay checks the
+            # worktree out at each conflict itself.
+            git(self.worktree, "checkout", "--quiet", "--force", "--detach", self.task.onto)
             argv = repair_sandbox.sandboxed_lake([*self.cfg.lake, "build", "Mathlib"], self.worktree, self.env_lake)
             with (
                 repair_tools.build_lock(self.worktree, log=lambda *a, **k: None),
