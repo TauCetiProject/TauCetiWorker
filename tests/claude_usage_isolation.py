@@ -234,7 +234,7 @@ class Isolation(unittest.TestCase):
             self.assertIn("expired", reader._claude_launch_credential_unusable())
             self.assertIsNone(quota.claude_usage_configuration_problem(self.cfg))
             with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "file"}):
-                self.assertIn("#682", reader._claude_launch_credential_unusable())
+                self.assertIn("expired", reader._claude_launch_credential_unusable())
         keychain.assert_not_called()
 
     def test_unsupported_review_file_flag_does_not_charge_the_pr(self):
