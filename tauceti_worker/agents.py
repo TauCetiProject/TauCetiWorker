@@ -1016,9 +1016,10 @@ def host_agent_argv(
         ):
             from .quota import claude_file_credential_problem, claude_file_keychain_problem
 
-            if problem := claude_file_credential_problem(
-                claude_dir(Path.home()) / ".credentials.json", renewable=False
-            ):
+            agent_directory = (
+                Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
+            )
+            if problem := claude_file_credential_problem(agent_directory / ".credentials.json", renewable=False):
                 raise Die(problem)
             if problem := claude_file_keychain_problem(env.get("CLAUDE_CONFIG_DIR")):
                 raise Die(problem)

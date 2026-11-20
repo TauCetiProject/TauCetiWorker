@@ -12,7 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from tauceti_worker import quota
+from tauceti_worker import agents, quota
+from tauceti_worker.config import Die
 
 
 class FileKeychain(unittest.TestCase):
@@ -89,6 +90,32 @@ class FileKeychain(unittest.TestCase):
             patch.object(quota.subprocess, "run", side_effect=AssertionError("cache-only Keychain read")),
         ):
             self.assertIsNone(reader._claude_launch_credential_unusable())
+
+    def test_native_host_builder_refuses_found_and_unknown_shadow(self):
+        blob = {"claudeAiOauth": {"accessToken": "synthetic-agent", "expiresAt": (time.time() + 3600) * 1000}}
+        for code in (0, 36):
+            with (
+                self.subTest(code=code),
+                patch.object(quota, "_read_json_file", return_value=blob),
+                patch.object(quota.subprocess, "run", return_value=types.SimpleNamespace(returncode=code)) as run,
+            ):
+                with self.assertRaises(Die):
+                    agents.host_agent_argv("do not launch", "claude")
+            self.assertNotIn("-w", run.call_args.args[0])
+            self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_normal_quota_read_refuses_shadow_before_usage_request(self):
+        cfg = types.SimpleNamespace(home=Path("/tmp/home"), quota_cache=Path("/tmp/cache"))
+        blob = {"claudeAiOauth": {"accessToken": "synthetic-agent", "expiresAt": (time.time() + 3600) * 1000}}
+        with (
+            patch.object(quota, "claude_usage_configuration_problem", return_value=None),
+            patch.object(quota, "_read_json_file", return_value=blob),
+            patch.object(quota.subprocess, "run", return_value=types.SimpleNamespace(returncode=0)),
+            patch.object(quota, "_http_get_json", side_effect=AssertionError("usage read before route refusal")),
+        ):
+            provider = quota.Quota(cfg).claude()
+        self.assertFalse(provider.available)
+        self.assertIn("shadows", provider.error)
 
     def test_default_service_is_explicit_and_unhashed(self):
         with patch.object(quota.subprocess, "run", return_value=types.SimpleNamespace(returncode=44)) as run:
