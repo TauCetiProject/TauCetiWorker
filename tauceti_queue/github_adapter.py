@@ -1378,14 +1378,16 @@ class GitHubAdapter:
             self.clone_dir, pull.head_sha, lambda path: self.client.get_json(path)[1], repo, number, pull.labels
         )
         measured = local or exempt
-        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if measured else ()
+        guard = (
+            diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if measured else ()
+        )
         return local, guard, exempt
 
     def bump_guard(self, repo: str, head: str) -> bool:
         """The trusted Mathlib-bump check (`check-bump.sh` on main's tip, the merge base and `head`),
         as self-tested bump eligibility runs it. Raises `GitHubUnavailable` when its inputs could not
         be read, so the evaluation stays pending rather than deciding either way."""
-        from tauceti_tools.self_tested import _ReadAPI, _bump_policy
+        from tauceti_tools.self_tested import _bump_policy, _ReadAPI
 
         verdict, output = _bump_policy().check_bump(_ReadAPI(lambda path: self.client.get_json(path)[1]), repo, head)
         if verdict is None:

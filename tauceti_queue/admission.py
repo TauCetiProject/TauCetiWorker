@@ -806,9 +806,7 @@ class AdmissionPoller:
             disposition = "waiting"
             pull = snapshot.pull
             current = self.controller._input_for(work["number"])
-            if (human_review or large_refactor_review) and approval_binding(current) != approval_binding(
-                current_input
-            ):
+            if (human_review or large_refactor_review) and approval_binding(current) != approval_binding(current_input):
                 self.state.dirty(work["number"], urgent=True)
                 return
             self._sync_large_refactor(current, pull.head_sha, snapshot.large_refactor)
