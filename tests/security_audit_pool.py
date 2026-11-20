@@ -715,6 +715,17 @@ class StoppedSequentialRound(PoolFixture):
         self.assertFalse((self.state / "running.json").exists())
 
 
+class RestoredPass(PoolFixture):
+    def test_a_restored_pass_does_not_advance_over_a_hold_recorded_after_it(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        p = pool.Pool(self.state, parallel=1, chooser=pool.Chooser(None))
+        p.slots = [pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex")]
+        p.persist()
+        sa.record(self.state / "ledger.jsonl", {"outcome": "unreadable", "commits": self.shas[1:2], "reason": "x"})
+        self.serve(lambda b, a: self.verdict(b), stop=self.settled)
+        self.assertEqual(self.advanced, [])
+
+
 class Lookahead(PoolFixture):
     commits = 12
 

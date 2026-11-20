@@ -247,8 +247,14 @@ class Pool:
         running = self.work / "running.json"
         if not running.exists():
             return
-        attempt = Path(json.loads(running.read_text())["attempt"])
-        stopped = json.loads((attempt / "input.json").read_text())
+        try:
+            attempt = Path(json.loads(running.read_text())["attempt"])
+            stopped = json.loads((attempt / "input.json").read_text())
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            # Its range is unknown, so nothing can bind it: hold the pool for review (the watchdog DMs).
+            raise NoProgress(
+                f"security-audit pool: {running} cannot be settled; preserve it for review: {exc}"
+            ) from exc
         try:
             hold = evidence.outcome_of(sa.judged(attempt, stopped, "security-audit: interrupted round"), None)
         except NotJudged:
@@ -316,6 +322,26 @@ class Pool:
         log(f"security-audit pool: cannot plan a batch from {frm[:12]}: {exc}")
 
     # Inspection ------------------------------------------------------------
+    def refused(self, slot: Slot) -> bool:
+        """Block a range the ledger already binds: a recorded concern or hold about any of its commits."""
+        recorded = evidence.recorded(self.work, slot.batch)
+        if not (recorded.concerns() or recorded.unreadable):
+            return False
+        refused = "security-audit: this batch already has a binding judgment; it is never inspected again"
+        slot.status = "blocked"
+        verdict = evidence.finding(slot.batch, recorded)
+        failure = {
+            "from_sha": slot.batch["from_sha"],
+            "to_sha": slot.target,
+            "reason": refused,
+            "outcome": "finding" if verdict else "unreadable",
+            "verdict": verdict,
+        }
+        sa.record(self.work / "ledger.jsonl", failure)
+        self.block(slot, failure, head=slot.batch["from_sha"] == self.slots[0].batch["from_sha"])
+        log(f"security-audit pool: {slot.batch['from_sha'][:12]}..{slot.target[:12]} {refused}")
+        return True
+
     def submit(self, executor) -> None:
         busy = len(self.running)
         now = time.time()
@@ -324,21 +350,7 @@ class Pool:
                 return
             if slot.status != "planned" or slot.retry_at > now:
                 continue
-            recorded = evidence.recorded(self.work, slot.batch)
-            if recorded.concerns() or recorded.unreadable:
-                refused = "security-audit: this batch already has a binding judgment; it is never inspected again"
-                slot.status = "blocked"
-                verdict = evidence.finding(slot.batch, recorded)
-                failure = {
-                    "from_sha": slot.batch["from_sha"],
-                    "to_sha": slot.target,
-                    "reason": refused,
-                    "outcome": "finding" if verdict else "unreadable",
-                    "verdict": verdict,
-                }
-                sa.record(self.work / "ledger.jsonl", failure)
-                self.block(slot, failure, head=slot.batch["from_sha"] == self.slots[0].batch["from_sha"])
-                log(f"security-audit pool: {slot.batch['from_sha'][:12]}..{slot.target[:12]} {refused}")
+            if self.refused(slot):
                 continue
             choice = self.chooser.choose(avoid=slot.avoid)
             if choice is None:
@@ -513,6 +525,8 @@ class Pool:
         landed = None
         while self.slots and self.slots[0].status == "pass" and self.slots[0].batch["from_sha"] == cursor:
             slot = self.slots[0]
+            if self.refused(slot):
+                break  # A hold recorded for its commits after it passed binds it.
             if not self.admin():
                 break
             result = self.github(lambda slot=slot: sa.advance(self.repo, slot.batch))
