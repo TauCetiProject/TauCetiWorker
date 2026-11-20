@@ -820,6 +820,25 @@ class WorkerRounds(PoolFixture):
         self.assertNotIn(0, self.calls)
         self.assertFalse((self.state / "running.json").exists())
 
+    def test_a_persisted_pass_does_not_advance_over_an_imported_hold(self):
+        batch = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        p = pool.Pool(self.state, parallel=1, chooser=pool.Chooser(None))
+        p.slots = [pool.Slot(batch, status="pass", verdict=self.verdict(batch), provider="codex")]
+        p.persist()
+        attempt = self.state / "attempt-legacy"
+        attempt.mkdir()
+        (attempt / "input.json").write_text(sa.serialize(batch))
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        (attempt / "model-transcript.jsonl").write_text(
+            sa.serialize({"type": "assistant", "message": {"content": [use]}}) + "\n"
+        )
+        block = {"from_sha": self.shas[0], "to_sha": self.shas[2], "attempt": str(attempt), "reason": "finding"}
+        (self.state / "blocked.json").write_text(sa.serialize(block))
+        with self.assertRaises(NoProgress):
+            for _ in range(4):
+                self.round(lambda b, a: self.verdict(b))
+        self.assertEqual(self.advanced, [])
+
     def test_a_legacy_block_without_a_concern_is_inspected_afresh(self):
         block = {
             "from_sha": self.shas[0],
