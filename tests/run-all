@@ -100,6 +100,7 @@ RUN_STDLIB=(
   bump_integration.py
   claude_config_dir.py
   claude_keychain.py
+  claude_usage_isolation.py
   claims_repo.py
   codex_account.py
   codex_fallback.py

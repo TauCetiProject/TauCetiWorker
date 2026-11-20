@@ -85,7 +85,6 @@ from .constants import (
     EXPLICIT_TASKS,
     OPENROUTER_MODELS,
     PR_TASKS,
-    SANDBOX_DEFAULT,
     TAUCETI,
     WORK_TASKS,
 )
@@ -99,9 +98,13 @@ from .quota import (
     Quota,
     _claude_keychain_creds,
     _safe_exists,
+    claude_agent_credential_route,
     claude_dir,
+    claude_usage_configuration_problem,
     claude_usage_credentials,
+    claude_usage_identity_verified,
     codex_dir,
+    normalize_claude_usage_credentials,
     parse_pace_curve,
 )
 from .review_state import ReviewState
@@ -516,20 +519,6 @@ def parse_only(values: list[str], flag: str = "--only") -> list[str]:
                 )  # exit 1; argparse uses 2
             tasks.append(tok)
     return tasks
-
-
-def claude_agent_credential_route(only: list[str], *, bubble: bool) -> str:
-    """How the Claude agents these phases can launch authenticate, strictest first:
-    "access-only" — security-audit runs its agent in a private home with a copy of the credential file
-    stripped of its refresh token; "file" — a Bubble agent, and a TauCetiReview rubric reviewer, which
-    runs in a clean home seeded with the file, are given the file and not $CLAUDE_CODE_OAUTH_TOKEN;
-    "environment" — every launch inherits the worker's environment, token included."""
-    phases = only or ALLOWED_TASKS
-    if "security-audit" in phases:
-        return "access-only"
-    if "review" in phases or (bubble and any(SANDBOX_DEFAULT.get(phase, False) for phase in phases)):
-        return "file"
-    return "environment"
 
 
 def resolve_tasks(only_vals: list[str], skip_vals: list[str]) -> list[str]:
@@ -1387,6 +1376,7 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             "--host is now the default (the agent runs directly on the host); it is a no-op. "
             "Pass --bubble to run inside the sandbox instead"
         )
+    normalize_claude_usage_credentials()
     # The pacer reads this to know which Claude credential the agents receive; loop children re-pin it.
     os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"] = claude_agent_credential_route(
         only, bubble=getattr(args, "bubble", False)
@@ -1524,9 +1514,13 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     from .activity import pin_root
 
     pin_root()
+    if problem := claude_usage_configuration_problem(Config.resolve(wid)):
+        raise Die(problem)
     if wid != "default" or getattr(args, "isolate_home", False):
         isolate_home(wid)
     cfg = Config.resolve(wid)
+    if problem := claude_usage_configuration_problem(cfg):
+        raise Die(problem)
     # Tee this process's log() output to a per-worker file so a `work --loop` started in a bare terminal
     # still leaves an on-disk record to monitor. The loop driver picks one session file and exports its
     # path; the _round children it spawns inherit TAUCETI_LOG_FILE and append to the SAME file.
@@ -1771,7 +1765,19 @@ def cmd_host_doctor(args) -> int:
         )
     usage_creds = claude_usage_credentials()
     if usage_creds is not None:
-        rows.append(("claude usage", _safe_exists(usage_creds), f"{usage_creds} (read for usage only)"))
+        problem = claude_usage_configuration_problem(cfg)
+        assertion = (
+            "local account fields agree"
+            if claude_usage_identity_verified(cfg)
+            else ("same-account identity is an operator assertion; no comparable local identity")
+        )
+        rows.append(
+            (
+                "claude usage",
+                _safe_exists(usage_creds) and not problem,
+                problem or f"{usage_creds} (usage only; {assertion}; agent phases checked by work)",
+            )
+        )
     kiro_db = kiro_data_dir(cfg.home) / "data.sqlite3"
     rows.append(
         (

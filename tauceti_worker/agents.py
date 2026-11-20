@@ -974,6 +974,8 @@ def host_agent_argv(
     from .build_resources import defaults
 
     env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
+    env.pop("TAUCETI_CLAUDE_USAGE_CREDENTIALS", None)
+    env.pop("TAUCETI_CLAUDE_USAGE_OPERATOR_HOME", None)
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))
     profile = _authoring_profile(profile)
@@ -2517,7 +2519,7 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
     the private directory as the same fallback the old in-place handoff provided.
 
     With a usage login (claude_usage_credentials) the configured file is the agents' credential and is
-    staged without a Keychain read.
+    staged without a Keychain password read or unlock; metadata can reject a shadowing item.
 
     The caller owns and must remove the returned directory."""
     if sys.platform != "darwin":
@@ -2530,18 +2532,20 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
 
     source = claude_dir(cfg.home) / ".credentials.json"
     if claude_usage_credentials() is not None:
-        from .quota import claude_file_keychain_problem
+        from .quota import claude_file_credential_problem, claude_file_keychain_problem
 
         if problem := claude_file_keychain_problem(cfg.home):
+            raise Die(problem)
+        if problem := claude_file_credential_problem(source, renewable=False):
             raise Die(problem)
         # The configured file is the agents' credential here; the Keychain item for the default config
         # directory is at most the operator's own sign-in.
         blob = _read_json_file(source)
-        if not (blob or {}).get("claudeAiOauth"):
-            raise Die(
-                f"no Claude credentials to seed the bubble: none in {source}, the file agents launch from "
-                "when $TAUCETI_CLAUDE_USAGE_CREDENTIALS names a usage login"
-            )
+        oauth = blob.get("claudeAiOauth") if isinstance(blob, dict) else None
+        if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+            raise Die(f"no Claude agent credentials to seed the bubble from {source}")
+        # This private copy cannot persist a renewal to the canonical source.
+        blob = {"claudeAiOauth": {key: value for key, value in oauth.items() if key != "refreshToken"}}
     else:
         blob = _claude_keychain_creds_interactive()
     if not (blob or {}).get("claudeAiOauth"):
@@ -3566,6 +3570,9 @@ def isolate_home(wid: str) -> Path:
     Returns the worker home. Children inherit the exported variables (and, off macOS, $HOME)."""
     import shutil
 
+    from .quota import normalize_claude_usage_credentials
+
+    normalize_claude_usage_credentials()
     home = _worker_iso_home(wid)
     iso_claude, iso_codex = home / ".claude", home / ".codex"
     iso_kiro_home, iso_kiro_data = home / ".kiro", kiro_data_dir(home, {})
@@ -3597,10 +3604,6 @@ def isolate_home(wid: str) -> Path:
             os.environ["TAUCETI_KIRO_XDG_DATA_HOME"] = str(iso_kiro_data.parent)
         return home
     real = Path(os.environ.get("HOME", os.path.expanduser("~")))
-    # A `~` in the usage login means the operator's home; pin it before $HOME moves below.
-    usage = os.environ.get("TAUCETI_CLAUDE_USAGE_CREDENTIALS", "").strip()
-    if usage:
-        os.environ["TAUCETI_CLAUDE_USAGE_CREDENTIALS"] = str(Path(usage).expanduser())
     real_claude = claude_dir(real)  # honors the operator's $CLAUDE_CONFIG_DIR before we repoint it
     real_kiro_data = kiro_data_dir(real)
     iso_claude.mkdir(parents=True, exist_ok=True)
