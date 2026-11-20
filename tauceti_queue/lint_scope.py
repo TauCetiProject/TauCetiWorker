@@ -69,10 +69,12 @@ IGNORED_SUFFIXES = (".md",)
 CANDIDATES = 20  # most recent matching records considered as the reference
 KEEP = 200  # records retained when the file is compacted
 COMPACT_AT = 400
-# Changed lines that may set an attribute or docstring on another module's declaration
-# (``attribute [..]``, ``to_additive existing``, ``add_decl_doc``). Matching the bare words over-matches
-# (a comment saying "existing"), which only costs a full lint.
+# Words of commands that may set an attribute or docstring on another module's declaration
+# (``attribute [..]``, ``to_additive existing``, ``add_decl_doc``), searched in both versions of each
+# changed file. Matching the bare words over-matches (a comment saying "existing"), which only costs a
+# full lint.
 ATTRIBUTE_LINE = re.compile(r"\battribute\b|\bexisting\b|\badd_decl_doc\b")
+MODULE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_']*(\.[A-Za-z_][A-Za-z0-9_']*)*")
 IMPORT_AFTER_HEADER = re.compile(r"(?m)^[ \t]*(?:public[ \t]+)?(?:meta[ \t]+)?import[ \t]")
 
 
@@ -237,8 +239,8 @@ def header_imports(text: str) -> list[str] | None:
             if i is None:
                 return None
             token, j = _token(text, i)
-        if not token or "«" in token or "»" in token:
-            return None
+        if not MODULE_NAME.fullmatch(token):
+            return None  # a quoted name, or a token running into the next command (`import A@[simp]`)
         imports.append(token)
         i = _skip_space_and_comments(text, j)
         if i is None:
@@ -266,18 +268,27 @@ def _import_after(text: str, i: int) -> bool:
 
 
 def import_graph(worktree: Path) -> tuple[dict[str, set[str]], str] | tuple[None, str]:
-    """``{module: TauCeti modules it imports}`` over every tracked TauCeti module, or None and why."""
+    """``{module: TauCeti modules it imports}`` over every TauCeti module, or None and why. The library
+    is what ``lint-env.sh``'s ``source-modules.sh`` finds on disk; every file must be tracked, so that
+    an ignored Lean file cannot change the library without changing the commit."""
     try:
         listed = _git(worktree, "ls-files", "-z", "--", ROOT)
     except (OSError, subprocess.TimeoutExpired) as error:
         return None, f"listing the library: {error}"
     if listed.returncode != 0:
         return None, "listing the library failed"
+    tracked = {raw.decode("utf-8", "surrogateescape") for raw in listed.stdout.split(b"\0") if raw}
+    on_disk = set()
+    for path in (worktree / ROOT).rglob("*"):
+        relative = str(path.relative_to(worktree))
+        if path.is_symlink():
+            return None, f"a symlinked source path: {relative}"
+        if path.is_file() and path.name.endswith(".lean"):
+            on_disk.add(relative)
+    if on_disk - tracked:
+        return None, f"an untracked Lean file: {sorted(on_disk - tracked)[0]}"
     graph: dict[str, set[str]] = {}
-    for raw in listed.stdout.split(b"\0"):
-        path = raw.decode("utf-8", "surrogateescape")
-        if not path.endswith(".lean"):
-            continue
+    for path in sorted(on_disk):
         if not MODULE_PATH.match(path):
             return None, f"a Lean file the module list cannot name: {path}"
         try:
@@ -398,27 +409,20 @@ def choose(worktree: Path, *, head: str | None, passes: Path, key: str) -> dict:
 
 
 def _attribute_change(worktree: Path, reference: str, paths: list[str]) -> str:
-    """Why a changed module may set an attribute on a declaration outside the closure, or ``""``."""
-    if not paths:
-        return ""
-    try:
-        proc = _git(
-            worktree, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "-U0", reference, "HEAD", "--", *paths
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return "the changed lines are unavailable"
-    if proc.returncode != 0:
-        return "the changed lines are unavailable"
-    path, header = "", False
-    for line in proc.stdout.decode("utf-8", "surrogateescape").splitlines():
-        if line.startswith("diff --git "):
-            path, header = line.rsplit(" b/", 1)[-1], True
-            continue
-        if header:
-            header = not line.startswith("@@")
-            continue
-        if line[:1] in "+-" and ATTRIBUTE_LINE.search(line):
-            return f"{path} changes a line that may set another module's attribute: {line[:120]}"
+    """Why a changed module may set an attribute on a declaration outside the closure, or ``""``. Both
+    versions of every changed file are searched whole, so a multi-line command counts however it was
+    edited."""
+    for path in paths:
+        for commit in (reference, "HEAD"):
+            try:
+                proc = _git(worktree, "cat-file", "blob", f"{commit}:{path}")
+            except (OSError, subprocess.TimeoutExpired):
+                return f"{path} at {commit[:12]} is unavailable"
+            if proc.returncode != 0:
+                continue  # added or deleted
+            match = ATTRIBUTE_LINE.search(proc.stdout.decode("utf-8", "surrogateescape"))
+            if match:
+                return f"{path} may set another module's attribute (`{match.group(0)}` at {commit[:12]})"
     return ""
 
 
@@ -444,10 +448,13 @@ class ReportError(ValueError):
 
 
 _HEADER = re.compile(
-    r"-- Found (\d+) errors? in \d+ declarations \(plus \d+ automatically generated ones\) "
-    r"in TauCeti with (\d+) linters"
+    r"-- Found ([0-9]+) errors? in [0-9]+ declarations \(plus [0-9]+ automatically generated ones\) "
+    r"in TauCeti with ([0-9]+) linters",
+    re.ASCII,
 )
-_SECTION = re.compile(r"^/- The `([^`]*)` linter reports:")
+# As lint-env.sh's awk in the C locale: greedy section names, ASCII whitespace, "\n"-separated lines.
+_SECTION = re.compile(r"^/- The `(.*)` linter reports:", re.ASCII)
+_BLOCK_END = re.compile(r"-/[ \t\r\n\v\f]*$", re.ASCII)
 
 
 def parse_report(output: str, *, tag: str, marker: str, linters: list[str], rc: int) -> set[tuple[str, str]]:
@@ -456,11 +463,11 @@ def parse_report(output: str, *, tag: str, marker: str, linters: list[str], rc: 
     reports errors), the per-run ``marker`` after it, an exit code that agrees with the count, sections
     only for requested linters and at most once each, and one closed ``#check`` block per violation.
     Anything else raises :class:`ReportError`."""
-    lines = output.splitlines()
+    lines = output.split("\n")
     headers = []
     for index, line in enumerate(lines):
         if line.startswith(tag + ":"):
-            rest = re.fullmatch(r"\d+:\d+: error: (.*)", line[len(tag) + 1 :])
+            rest = re.fullmatch(r"[0-9]+:[0-9]+: error: (.*)", line[len(tag) + 1 :])
             if rest and _HEADER.fullmatch(rest.group(1)):
                 headers.append((index, "error", _HEADER.fullmatch(rest.group(1))))
                 continue
@@ -484,7 +491,7 @@ def parse_report(output: str, *, tag: str, marker: str, linters: list[str], rc: 
         if in_block:
             if line.startswith("#check "):
                 raise ReportError("a #check block opened before the previous one closed")
-            if re.search(r"-/\s*$", line):
+            if _BLOCK_END.search(line):
                 in_block = False
             continue
         section = _SECTION.match(line)
@@ -497,9 +504,9 @@ def parse_report(output: str, *, tag: str, marker: str, linters: list[str], rc: 
         if line.startswith("#check "):
             if linter is None:
                 raise ReportError("a #check block before any section")
-            fields = line.split()
+            fields = re.split(r"[ \t]+", line)
             violations.append((linter, fields[1].removeprefix("@") if len(fields) > 1 else ""))
-            in_block = not re.search(r"-/\s*$", line)
+            in_block = not _BLOCK_END.search(line)
     if in_block:
         raise ReportError("an unterminated #check block")
     if len(violations) != count:

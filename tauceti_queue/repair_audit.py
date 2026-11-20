@@ -558,29 +558,17 @@ def global_lint(
     tag = str(work / f"GlobalLint-{nonce}.lean")
     threads = str(min(os.cpu_count() or 16, 16))
     linters = list(lint_scope.GLOBAL_LINTERS)
-    for _ in range(2):
-        argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s", driver]
-        argv += [tag, work / "marker.txt", work / "modules.txt", *linters]
-        run = _sandboxed(
-            argv,
-            worktree,
-            env,
-            {"LEAN_NUM_THREADS": threads},
-            log,
-            timeout,
-            read_only_build=True,
-        )
-        # Batteries' tacticAlt is newer than some pins; lint-env.sh approves both linter sets.
-        if "tacticAlt" in linters and "not a linter: tacticAlt" in run["output"]:
-            linters.remove("tacticAlt")
-            continue
-        break
+    # A pin whose Batteries lacks tacticAlt rejects it: that report does not parse, so the full lint runs.
+    argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s", driver]
+    argv += [tag, work / "marker.txt", work / "modules.txt", *linters]
+    run = _sandboxed(argv, worktree, env, {"LEAN_NUM_THREADS": threads}, log, timeout, read_only_build=True)
     summary = {k: v for k, v in run.items() if k != "output"} | {"linters": linters}
     try:
         violations = lint_scope.parse_report(run["output"], tag=tag, marker=marker, linters=linters, rc=run["rc"])
         baseline = set()
-        for line in (scripts / "lint-baseline.txt").read_text().splitlines():
-            if line.strip():
+        # Lines as comm(1) compares them in lint-env.sh: "\n"-separated, nothing stripped.
+        for line in (scripts / "lint-baseline.txt").read_bytes().decode("utf-8", "surrogateescape").split("\n"):
+            if line:
                 name, _, declaration = line.partition(" ")
                 baseline.add((name, declaration))
     except (lint_scope.ReportError, OSError) as error:

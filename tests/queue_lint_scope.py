@@ -78,6 +78,7 @@ class HeaderTest(unittest.TestCase):
             "import «TauCeti».A\n",
             "import\n",
             "import TauCeti.A\ndef x := 1\nimport TauCeti.B\n",
+            "import TauCeti.A@[inline] def f (n : Nat) := n\n",
         ):
             with self.subTest(text=text):
                 self.assertIsNone(lint_scope.header_imports(text))
@@ -142,12 +143,28 @@ class ScopeTest(unittest.TestCase):
                 self.commit({"TauCeti/E.lean": lean("TauCeti.D", body=line + "\n")}, line)
                 scope = self.choose()
                 self.assertEqual(scope["scope"], "full")
-                self.assertIn("TauCeti/E.lean changes a line that may set another module's attribute", scope["reason"])
+                self.assertIn("TauCeti/E.lean may set another module's attribute", scope["reason"])
         git(self.repo, "checkout", "--quiet", "--detach", self.verified)
         self.commit({"TauCeti/E.lean": None}, "a deleted file's attribute line counts too")
         self.assertEqual(self.choose()["scope"], "changed")
         self.commit({"TauCeti/D.lean": lean(body="-- attribute [simp] foo\n")}, "removed again")
         self.assertEqual(self.choose()["scope"], "full")
+
+    def test_an_edit_to_a_multi_line_attribute_command_means_the_full_lint(self):
+        # Only the target line changes; the command's first line is unchanged context.
+        self.commit({"TauCeti/E.lean": lean("TauCeti.D", body="attribute [deprecated]\n  TauCeti.t\n")}, "E")
+        self.record(git(self.repo, "rev-parse", "HEAD"))
+        self.commit({"TauCeti/E.lean": lean("TauCeti.D", body="attribute [deprecated]\n  TauCeti.u\n")}, "E'")
+        self.assertIn("may set another module's attribute", self.choose()["reason"])
+
+    def test_an_ignored_lean_file_means_the_full_lint(self):
+        # lint-env.sh lints every Lean file on disk; a clean status does not show an ignored one.
+        self.commit({".gitignore": "__pycache__/\n"}, "ignore")
+        self.record(git(self.repo, "rev-parse", "HEAD"))
+        hidden = self.repo / "TauCeti" / "__pycache__" / "Hidden.lean"
+        hidden.parent.mkdir()
+        hidden.write_text(lean())
+        self.assertIn("an untracked Lean file: TauCeti/__pycache__/Hidden.lean", self.choose()["reason"])
 
     def test_a_new_import_edge_is_followed(self):
         self.record()
@@ -279,6 +296,12 @@ class ReportTest(unittest.TestCase):
             ("unknown section", FAILED.replace("`simpNF` linter", "`docBlame` linter"), 1),
             ("two headers", CLEAN + CLEAN, 0),
             ("unclosed block", FAILED.replace("simp can prove this -/", "simp can prove this"), 1),
+            ("greedy section name", FAILED.replace("`simpNF` linter", "`bogus`x` linter"), 1),
+            (
+                "non-ASCII space after a block",
+                FAILED.replace("simp can prove this -/", "simp can prove this -/\u00a0"),
+                1,
+            ),
         ):
             with self.subTest(name), self.assertRaises(lint_scope.ReportError):
                 self.parse(output, rc)
