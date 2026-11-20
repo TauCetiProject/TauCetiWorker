@@ -5295,6 +5295,11 @@ class Records(unittest.TestCase):
         self.assertTrue(any("unknown-member" in p for p in short["problems"]))
 
     def test_an_admin_labelled_large_refactor_member_is_measured_without_the_size_caps(self):
+        policy = repair.diff_guard.ci_git
+        added_cap = getattr(policy, "REVIEW_ADDED_LINE_CAP", None)
+        if added_cap is None:  # Older Tools used one cap for both directions.
+            added_cap = policy.REVIEW_LINE_CAP
+        lines_per_file = max(1, policy.NEW_FILE_LINE_CAP // 2)
         root = Path(tempfile.mkdtemp(prefix="large-refactor-", dir=TMP))
         content = Content(root)
         seed = root / "seed"
@@ -5303,8 +5308,9 @@ class Records(unittest.TestCase):
         for commit_ in chain:
             sh(seed, "cherry-pick", "--allow-empty", "--keep-redundant-commits", commit_.sha)
             if commit_.pr == 2:
-                for index in range(3):
-                    lines = "".join(f"theorem r{index}_{i} : True := trivial\n" for i in range(700))
+                # Exceed the current total cap without violating the independent new-file cap.
+                for index in range(added_cap // lines_per_file + 1):
+                    lines = "".join(f"theorem r{index}_{i} : True := trivial\n" for i in range(lines_per_file))
                     (seed / "TauCeti" / f"Refactor{index}.lean").write_text(lines)
                 sh(seed, "add", "-A")
                 sh(seed, "commit", "--quiet", "--amend", "--no-edit")
