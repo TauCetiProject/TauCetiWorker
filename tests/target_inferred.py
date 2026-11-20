@@ -617,37 +617,37 @@ class Publication(Tmp):
 
     def test_a_tick_on_an_unchanged_basis_is_published_and_the_clone_follows(self):
         first = self.clone("first")
-        compute, check = self.inference(first)
-        self.assertEqual(reconcile.publish(first, compute, check=check), ["`zero-one`: n"])
+        plan = self.inference(first)
+        self.assertEqual(reconcile.publish(first, plan), ["`zero-one`: n"])
         self.assertEqual(t.parse_targets(self.remote()).find("zero-one").status, "done")
         self.assertEqual(first.read_text(), self.remote())
 
     def test_a_tick_is_not_published_once_the_remote_changed_what_it_was_given(self):
         first, second = self.clone("first"), self.clone("second")
-        compute, check = self.inference(first)
+        plan = self.inference(first)
         broadened = LIST.replace("a synthetic goal", "a broader synthetic goal")
         second.write_text(broadened)
         git(second.parent, "commit", "-q", "-m", "goal", "targets.md")
         git(second.parent, "push", "-q", "origin", "HEAD:main")
-        self.assertEqual(reconcile.publish(first, compute, check=check), [])
+        self.assertEqual(reconcile.publish(first, plan), [])
         self.assertEqual((self.remote(), first.read_text()), (broadened, broadened))
 
     def test_a_tick_is_not_published_once_a_commit_hook_changes_what_it_was_given(self):
         first = self.clone("first")
-        compute, check = self.inference(first)
+        plan = self.inference(first)
         self.hook(
             first,
             "pre-commit",
             "sed 's/a synthetic goal/a rewritten goal/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
         )
-        self.assertIsNone(reconcile.publish(first, compute, check=check))
+        self.assertIsNone(reconcile.publish(first, plan))
         self.assertEqual(
             (self.remote(), first.read_text(), git(first.parent, "status", "--porcelain")), (LIST, LIST, "")
         )
 
     def test_a_refused_push_leaves_nothing_even_after_a_hook_committed_on_top(self):
         first = self.clone("first")
-        compute, check = self.inference(first)
+        plan = self.inference(first)
         by_hand = LIST.replace("- [ ] `aside`", "- [~] `aside`")
         first.write_text(by_hand)
         self.hook(
@@ -657,7 +657,7 @@ class Publication(Tmp):
             "echo '> operator note' >> targets.md && git commit -q -m note -- targets.md\n"
             "git remote set-url --push origin /nonexistent/remote.git\n",
         )
-        self.assertIsNone(reconcile.publish(first, compute, check=check))
+        self.assertIsNone(reconcile.publish(first, plan))
         self.assertEqual(self.remote(), LIST)
         self.assertEqual(git(first.parent, "rev-list", "--count", "@{upstream}..HEAD"), "0")
         self.assertEqual(first.read_text(), by_hand)
@@ -670,12 +670,12 @@ class Publication(Tmp):
         git(first.parent, "add", "other.md")
         git(first.parent, "commit", "-q", "-m", "other")
         git(first.parent, "push", "-q", "origin", "HEAD:main")
-        compute, check = self.inference(first)
+        plan = self.inference(first)
         self.hook(first, "pre-push", "exit 1\n")
-        self.assertIsNone(reconcile.publish(first, compute, check=check))
+        self.assertIsNone(reconcile.publish(first, plan))
         (first.parent / ".git" / "hooks" / "pre-push").unlink()
-        other_compute, other_check = self.inference(other)
-        self.assertEqual(reconcile.publish(other, other_compute, check=other_check), ["`zero-one`: n"])
+        other_plan = self.inference(other)
+        self.assertEqual(reconcile.publish(other, other_plan), ["`zero-one`: n"])
         self.assertEqual(self.remote(), LIST)
 
     def test_a_list_named_with_a_space_is_published(self):
@@ -684,8 +684,8 @@ class Publication(Tmp):
         git(first.parent, "mv", "targets.md", named.name)
         git(first.parent, "commit", "-q", "-m", "rename")
         git(first.parent, "push", "-q", "origin", "HEAD:main")
-        compute, check = self.inference(named)
-        self.assertEqual(reconcile.publish(named, compute, check=check), ["`zero-one`: n"])
+        plan = self.inference(named)
+        self.assertEqual(reconcile.publish(named, plan), ["`zero-one`: n"])
         committed = git(self.tmp / "remote.git", "show", "main:target list.md")
         self.assertEqual(t.parse_targets(committed).find("zero-one").status, "done")
 

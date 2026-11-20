@@ -898,9 +898,9 @@ def _unchanged(path: Path, targets: Targets, items: list[TargetItem]):
 
 
 def _inference_plan(path: Path, targets: Targets, verdicts: list[Change]):
-    """The inferred ticks `verdicts`, made on `targets`, as a plan for any later text of the list,
-    and the check for the list as committed: a verdict holds for the goal and item line it was
-    given, so a list where either changed gets none of them, and an item no longer open is left."""
+    """The inferred ticks `verdicts`, made on `targets`, as a plan for any later text of the list:
+    a verdict holds for the goal and item line it was given, so a list where either changed gets
+    none of them, and an item no longer open is left. `publish` then pushes exactly that text."""
     check = _unchanged(path, targets, [change.item for change in verdicts])
 
     def plan(listed: Targets) -> list[Change]:
@@ -909,7 +909,7 @@ def _inference_plan(path: Path, targets: Targets, verdicts: list[Change]):
         now = [(listed.find(v.item.slug), v) for v in verdicts]
         return [Change(it, v.status, v.note, v.drop, v.add) for it, v in now if it.status == "open"]
 
-    return plan, check
+    return plan
 
 
 def _reconcile(w, c, path: Path, profile) -> int | None:
@@ -930,7 +930,6 @@ def _reconcile(w, c, path: Path, profile) -> int | None:
     roadmap = _roadmap(w) if infer else None
     written = 0
     for tier in ("settle", "audit", "infer") if infer else ("settle",):
-        check = None
         if tier == "settle":
 
             def plan(listed: Targets) -> list[Change]:
@@ -946,12 +945,12 @@ def _reconcile(w, c, path: Path, profile) -> int | None:
 
         else:
             verdicts = _infer(w, profile, overlay_live(targets, observed["seen"].open_keys, set()), roadmap)
-            plan, check = _inference_plan(path, targets, verdicts)
+            plan = _inference_plan(path, targets, verdicts)
 
         if not plan(targets):
             continue
         try:
-            notes = publish(path, plan, check=check)
+            notes = publish(path, plan)
         except (GitHubError, SourceUnavailable) as error:
             notes = None
             log(f"reconcile: pull requests could not be read again ({one_line(str(error))})")
