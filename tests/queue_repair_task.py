@@ -4791,6 +4791,52 @@ class Records(unittest.TestCase):
         context = repair_task.prompt_context(plain, None, listings=repair.listings_path(seed))
         self.assertNotIn("Do not edit", repair.compose_prompt(context, repair_task.task_findings(plain), chain, seed))
 
+    def test_a_conflict_prompt_shows_only_findings_about_its_own_commits(self):
+        """Each conflict's prompt keeps the head's ripples into the prefix and the conflicting commit, and
+        drops those into later members and the batch-wide predictions and preparation errors."""
+        ripple = {"file": "TauCeti/X.lean", "position": 3, "pr": 3, "lines": [1]}
+        raw = {
+            "task_id": 1,
+            "kind": "pre_rebase",
+            "repository": PROJECT,
+            "batch_id": 7,
+            "batch_version": 1,
+            "base": "a" * 40,
+            "tip": "b" * 40,
+            "onto": "c" * 40,
+            "members": [],
+            "diagnostics": [
+                {"kind": "admission_predictions", "proactive": True},
+                {"kind": "prepare_errors", "task_id": 4, "errors": [{"module": "TauCeti/X.lean", "message": "boom"}]},
+                {
+                    "kind": "cross_batch",
+                    "removed_used": [
+                        {"name": "foo", "removed_by": [], "references": [dict(ripple, pr=2), ripple]},
+                        {"name": "bar", "removed_by": [], "references": [ripple]},
+                    ],
+                    "added_by_both": [
+                        {"name": "baz", "head": [], "next": [{"pr": 3}]},
+                        {"name": "qux", "head": [], "next": [{"pr": 1}]},
+                    ],
+                },
+            ],
+            "claim_token": "x",
+            "expires_at": time.time() + 60,
+        }
+        task = repair_task.Task.from_json(raw)
+        entry = {"kind": "conflict", "source_pr": f"{PROJECT}#2", "commit": "d" * 40, "paths": []}
+        findings = repair_task.conflict_findings(task, entry, {1, 2})
+        self.assertEqual(findings["conflict"]["commit"], "d" * 40)
+        self.assertIsNone(findings["admission_predictions"])
+        self.assertIsNone(findings.get("prepare_errors"))
+        self.assertEqual(
+            [(i["name"], [r["pr"] for r in i["references"]]) for i in findings["cross_batch"]["removed_used"]],
+            [("foo", [2])],
+        )
+        self.assertEqual([i["name"] for i in findings["cross_batch"]["added_by_both"]], ["qux"])
+        repair_task.prompt_context(task, None, findings)
+        self.assertIsNone(findings["admission_predictions"], "the task's predictions are not put back")
+
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
         root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
         content = Content(root)

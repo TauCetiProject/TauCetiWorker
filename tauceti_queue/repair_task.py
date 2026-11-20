@@ -115,6 +115,7 @@ IN_FLIGHT_STATES = (
     "artifacts_unavailable",
     "agent_running",
     "validated",
+    "conflict_validated",  # a rebase task between conflicts: nothing to deliver yet
     "delivery_pending",
     "verifying",
     "pushed",
@@ -2294,9 +2295,9 @@ def resolve_conflicts(
                 "clean_prefix_tip": prefix,
                 "landed_on_base": result.landed_on_base,
             }
-            findings = {**task_findings(task), "conflict": repair.findings_from_diagnostics([entry])["conflict"]}
             # The clean prefix and the one conflicting commit: the commits after it are the worker's to replay.
             chain_before = [*read_chain(cfg.clone, task.onto, prefix), *read_chain(cfg.clone, f"{commit}^", commit)]
+            findings = conflict_findings(task, entry, {c.pr for c in chain_before if c.pr is not None})
             ownership = repair_context.compute(
                 cfg.clone,
                 chain_before,
@@ -2385,6 +2386,30 @@ def resolve_conflicts(
         for chain_id in chain_ids:
             with contextlib.suppress(Exception):
                 chain_tool.delete_chain_ref(cfg.clone, chain_id)
+
+
+def conflict_findings(task: Task, entry: dict, prs: set) -> dict:
+    """The findings one conflict's prompt shows: the conflict, and a pre-rebase's predicted ripples from
+    the head that reference the members in ``prs`` (the clean prefix and the conflicting commit). The
+    batch-wide admission predictions and preparation errors, which name later members, are left out:
+    the agent resolves this one commit and never sees the commits after it."""
+    findings = repair.findings_from_diagnostics([entry])
+    findings["admission_predictions"] = None  # not taken from the task by `prompt_context` either
+    ripples = task_findings(task).get("cross_batch")
+    if ripples:
+        removed = []
+        for item in ripples.get("removed_used") or []:
+            references = [r for r in item.get("references") or [] if r.get("pr") in prs]
+            if references:
+                removed.append({**item, "references": references})
+        added = [
+            item
+            for item in ripples.get("added_by_both") or []
+            if any(n.get("pr") in prs for n in item.get("next") or [])
+        ]
+        if removed or added:
+            findings["cross_batch"] = {**ripples, "removed_used": removed, "added_by_both": added}
+    return findings
 
 
 def absorbed_members(
@@ -2652,15 +2677,21 @@ def _run_task(
                 )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
         prompt_chain = read_chain(cfg.clone, task.validation_base, start_tip) if continuation else chain_before
-        ownership = repair_context.compute(
-            cfg.clone,
-            chain_before,
-            task.validation_base,
-            worktree,
-            declaration_names={m.number: m.declaration_names for m in task.members},
-            edited_prs={m.number for m in task.members if m.provenance == "edited"},
+        # A rebase task computes the context of each conflict's own commits (`resolve_conflicts`).
+        ownership = (
+            None
+            if rebasing
+            else repair_context.compute(
+                cfg.clone,
+                chain_before,
+                task.validation_base,
+                worktree,
+                declaration_names={m.number: m.declaration_names for m in task.members},
+                edited_prs={m.number for m in task.members if m.provenance == "edited"},
+            )
         )
-        outcome["repair_context"] = ownership.summary()
+        if ownership is not None:
+            outcome["repair_context"] = ownership.summary()
         tools_root = cfg.root / repair_audit.TOOLS_DIR
         repair_publish.write_early_settings(
             worktree,

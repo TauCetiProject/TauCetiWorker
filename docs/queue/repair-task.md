@@ -119,7 +119,10 @@ the replay computed it (`repair.apply_conflict`: `git merge-tree` with the commi
 base, written to the working tree with `git read-tree -u --reset`), so the conflicting files carry
 git's markers, HEAD stays at the prefix and no rebase, cherry-pick or merge is in progress. The agent
 edits files and writes its explanation to `.tauceti-repair/explanation.md`; it gets no rebase recipe,
-no step script and no reference to the commits after the conflicting one.
+no step script and no reference to the commits after the conflicting one: its findings are the
+conflict and a pre-rebase's predicted ripples from the head into the prefix and that commit, without
+the batch-wide admission predictions and preparation errors (`repair_task.conflict_findings`), and
+the ownership context is computed for those commits only.
 
 The worker then makes the commit itself (`repair.commit_resolution`): the tree is the worktree's files
 as `git add --all` stages them (without `.lake` and `.tauceti-repair`), read through a private index
