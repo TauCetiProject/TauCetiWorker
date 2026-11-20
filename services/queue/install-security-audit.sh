@@ -88,6 +88,9 @@ release_enter "$0"
 release_build "$RELEASE" "$target"
 
 # --- configuration --------------------------------------------------------------------------------
+for name in github-app.json github-private-key.pem; do
+  [ -f "$HOME/.config/tauceti-security-audit/$name" ] || die "$HOME/.config/tauceti-security-audit/$name is missing (the security-audit GitHub App)"
+done
 [ -f "$CONFIG_DIR/security-audit-zulip.json" ] || die "$CONFIG_DIR/security-audit-zulip.json is missing (README.md, private Zulip alerts)"
 mkdir -p "$HOME/TauCetiQueue-data/security-audit-pool/state/pool/security-audit"
 

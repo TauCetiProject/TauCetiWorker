@@ -388,6 +388,9 @@ class Releases(unittest.TestCase):
         self.run_script("install-monitoring.sh", "--wait", "0")
         monitoring_pid = self.pid("tauceti-queue-monitoring.service")
         (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
+        (self.home / ".config/tauceti-security-audit").mkdir(exist_ok=True)
+        for name in ("github-app.json", "github-private-key.pem"):
+            (self.home / ".config/tauceti-security-audit" / name).write_text("{}")
         second = self.commit("second")
         self.run_script("install-security-audit.sh", "--wait", "0")
         [release] = self.release_dirs(second)
@@ -418,6 +421,9 @@ class Releases(unittest.TestCase):
 
     def test_security_audit_drop_in_is_refused(self):
         (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
+        (self.home / ".config/tauceti-security-audit").mkdir(exist_ok=True)
+        for name in ("github-app.json", "github-private-key.pem"):
+            (self.home / ".config/tauceti-security-audit" / name).write_text("{}")
         dropins = self.units / "tauceti-queue-security-audit.service.d"
         dropins.mkdir(parents=True)
         (dropins / "override.conf").write_text("[Service]\n")

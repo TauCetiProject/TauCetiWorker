@@ -373,8 +373,8 @@ On the queue host, `services/queue/install-security-audit.sh` runs the pool as
 units (`docs/queue/operations.md`, "Install and update"): `--parallel 16 --ignore-quota` on
 `~/TauCetiQueue-data/security-audit-pool/state/pool/security-audit` (worker `pool` under the data root
 `~/TauCetiQueue-data/security-audit-pool`), with alerts configured by
-`~/.config/tauceti-queue/security-audit-zulip.json`. The account's active gh credential must be a
-TauCeti admin.
+`~/.config/tauceti-queue/security-audit-zulip.json`, and cursor updates use the security-audit GitHub
+App in `~/.config/tauceti-security-audit`.
 
 The pool plans a window of consecutive batches ahead of the cursor, each exactly as
 `work` would plan it from that batch's start, and inspects them concurrently in
