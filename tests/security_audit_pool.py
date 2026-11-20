@@ -38,6 +38,7 @@ class PoolFixture(unittest.TestCase):
         self.advanced = []
         self.lock = threading.Lock()
         self.calls = []
+        self.calls_from = []
 
         def advance(repo, batch):
             with self.lock:
@@ -120,6 +121,7 @@ class PoolFixture(unittest.TestCase):
         def fake(batch, provider, attempt, *, protocol=None, claude_credential=None, **kwargs):
             with self.lock:
                 self.calls.append(self.index(batch))
+                self.calls_from.append(batch["from_sha"])
                 self.launches.append((self.index(batch), provider, claude_credential, "resume_from" in kwargs))
             return inspect(batch, attempt)
 
@@ -596,6 +598,47 @@ class DurableRanges(PoolFixture):
         rows = [r for r in self.ledger() if r.get("batch") == batch["input_digest"] and "verdict" in r]
         self.assertEqual([r["verdict"]["findings"] for r in rows], [["IO"]])
         self.assertIn("IO", json.loads((self.state / "blocked.json").read_text())["reason"])
+
+    def test_an_interrupted_attempt_with_an_unreadable_input_is_still_classified(self):
+        use = {"type": "tool_use", "name": "StructuredOutput", "input": {"verdict": "finding", "findings": ["IO"]}}
+        self.interrupted([{"type": "assistant", "message": {"content": [use]}}])
+        (self.state / "attempt-1" / "input.json").write_text("{damaged")
+        self.serve(lambda b, a: self.verdict(b), stop=lambda p: not p.running and p.slots[0].status == "blocked")
+        self.assertNotIn(0, self.calls)
+        self.assertIn("IO", json.loads((self.state / "blocked.json").read_text())["reason"])
+
+    def test_an_attestation_inside_a_range_keeps_later_and_remaining_binding_ranges(self):
+        p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
+        head = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        later = sa.build_batch(self.repo, self.shas[2], self.shas[-1], self.shas[3:5])
+        block = {"from_sha": self.shas[2], "to_sha": self.shas[4], "reason": "security-audit: IO", "outcome": "finding"}
+        p.slots = [
+            pool.Slot(head, status="blocked", failure={**block, "from_sha": self.shas[0], "to_sha": self.shas[2]}),
+            pool.Slot(later, status="blocked", failure=block),
+        ]
+        p.persist()
+        self.cursor = self.shas[1]  # A human attested the first commit only.
+        self.serve(lambda b, a: self.verdict(b), stop=lambda p: not p.running and len(p.slots) >= 3)
+        # Both binding ranges hold, and nothing is re-planned over them; only the commits after them are new.
+        self.assertEqual([self.shas.index(c) for c in self.calls_from], [4])
+        saved = json.loads((self.state / "pool" / pool.RANGES).read_text())["ranges"]
+        self.assertEqual(
+            [(r["from_sha"], r["commits"], r["status"]) for r in saved[:2]],
+            [
+                (self.shas[1], self.shas[2:3], "blocked"),
+                (self.shas[2], self.shas[3:5], "blocked"),
+            ],
+        )
+
+    def test_a_passed_range_the_cursor_entered_is_inspected_again_for_its_rest(self):
+        p = pool.Pool(self.state, parallel=3, chooser=pool.Chooser(None))
+        head = sa.build_batch(self.repo, self.shas[0], self.shas[-1], self.shas[1:3])
+        p.slots = [pool.Slot(head, status="pass", verdict=self.verdict(head), provider="codex")]
+        p.persist()
+        self.cursor = self.shas[1]
+        self.serve(lambda b, a: self.verdict(b))
+        self.assertEqual(self.advanced[0], (self.shas[1], self.shas[2]))
+        self.assertEqual(len(self.launches), 3)  # The rest of the entered range, then the two after it.
 
     def test_an_interrupted_attempt_without_a_concern_is_retried(self):
         self.interrupted()

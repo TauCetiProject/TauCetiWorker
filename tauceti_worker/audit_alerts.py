@@ -77,6 +77,11 @@ def save(path: Path, value: dict) -> None:
             os.fsync(stream.fileno())  # Durable before it replaces the old state, not only atomic.
         temporary.chmod(0o600)
         temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)  # The rename itself survives a host crash.
+        finally:
+            os.close(directory)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise

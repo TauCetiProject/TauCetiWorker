@@ -122,25 +122,19 @@ class Pool:
         self.store.mkdir(parents=True, exist_ok=True)
         save(self.store / RANGES, {"ranges": [slot.record() for slot in self.slots]})
 
-    def restored(self, cursor: str, main: str) -> list[Slot]:
-        """The persisted ranges from the cursor that are still the next consecutive main prefix.
+    def restored(self) -> list[Slot]:
+        """The persisted ranges, inputs rebuilt from their exact commits; `aligned` places them.
 
-        Inputs are rebuilt from each range's commits. A pass whose rebuilt input differs is
-        inspected again; a block stays binding. A range left running by a stopped pool keeps
-        that status here and is settled from its attempt's own evidence (`settle_interrupted`)."""
+        A pass whose rebuilt input differs is inspected again; a block stays binding. A range
+        left running by a stopped pool keeps that status and is settled from its attempt's own
+        evidence (`settle_interrupted`) before anything else is admitted."""
         path = self.store / RANGES
         if not path.exists():
             return []
+        slots = []
         try:
-            records = json.loads(path.read_text())["ranges"]
-            pending = sa.validate_history(self.repo, cursor, main)
-            start = next((i for i, r in enumerate(records) if r["from_sha"] == cursor), len(records))
-            chain, frm, offset = [], cursor, 0
-            for record in records[start:]:
-                shas = record["commits"]
-                if record["from_sha"] != frm or pending[offset : offset + len(shas)] != shas:
-                    break
-                batch = sa.build_batch(self.repo, frm, record["main_sha"], shas)
+            for record in json.loads(path.read_text())["ranges"]:
+                batch = sa.build_batch(self.repo, record["from_sha"], record["main_sha"], record["commits"])
                 status = record["status"]
                 if status == "pass" and batch["input_digest"] != record["input_digest"]:
                     status = "planned"
@@ -161,27 +155,53 @@ class Pool:
                         raise ValueError("a passed range records a non-passing verdict")
                 if slot.status == "running" and not slot.attempts:
                     slot.status = "planned"  # Persisted before any attempt existed.
-                chain.append(slot)
-                frm, offset = shas[-1], offset + len(shas)
+                slots.append(slot)
         except (OSError, ValueError, KeyError, TypeError, IndexError, Die) as exc:
             # The durable record of binding ranges cannot be trusted or replaced: hold, and
             # let the cursor watchdog report the stall, rather than replan over a block.
             raise NoProgress(f"security-audit pool: {path} cannot be restored; preserve it for review: {exc}") from exc
-        return chain
+        return slots
+
+    def aligned(self, slots: list[Slot], cursor: str, main: str) -> list[Slot]:
+        """The ranges that are still the next consecutive main prefix from the cursor.
+
+        Ranges the cursor has passed are dropped. A range the cursor entered (a human attested
+        part of it) keeps only its remaining commits: a block, or an attempt in flight, still
+        binds them, and anything else is inspected afresh. The first range that does not continue
+        the prefix ends the window, and the commits after it are planned afresh."""
+        pending = sa.validate_history(self.repo, cursor, main)
+        waiting = set(pending)
+        kept, frm, offset = [], cursor, 0
+        for slot in slots:
+            shas = [c["sha"] for c in slot.batch["commits"]]
+            rest = [sha for sha in shas if sha in waiting]
+            if not rest:
+                continue
+            if pending[offset : offset + len(rest)] != rest:
+                break
+            if rest != shas:
+                slot.batch = sa.build_batch(self.repo, frm, slot.batch["main_sha"], rest)
+                if slot.status not in ("blocked", "running"):
+                    slot.status, slot.verdict = "planned", None
+            kept.append(slot)
+            frm, offset = rest[-1], offset + len(rest)
+        return kept
 
     def settle_interrupted(self, cursor: str) -> None:
-        """Classify every range left running by a stopped pool before admitting more work."""
+        """Classify every range left running by a stopped pool before admitting more work.
+
+        Its evidence is read with the range's own input: a recorded concern binds whatever the
+        attempt directory still holds, and only an attempt with no judgment is retried."""
         launched = {id(slot) for slot, _ in self.running.values()}
         for slot in [s for s in self.slots if s.status == "running" and id(s) not in launched]:
             attempt = Path(slot.attempts[-1])
             log(f"security-audit pool: settling interrupted attempt {attempt.name} from its evidence")
             try:
-                batch = json.loads((attempt / "input.json").read_text())
-                verdict = sa.judged(attempt, batch, "security-audit: interrupted when the pool stopped")
+                verdict = sa.judged(attempt, slot.batch, "security-audit: interrupted when the pool stopped")
             except Exception as exc:  # noqa: BLE001 - classified exactly like a finished attempt.
                 self.stopped(slot, attempt, exc, cursor)
             else:
-                self.concluded(slot, attempt, verdict, cursor, batch=batch)
+                self.concluded(slot, attempt, verdict, cursor)
 
     # GitHub ----------------------------------------------------------------
     def github(self, action):
@@ -225,24 +245,13 @@ class Pool:
 
     # Window ----------------------------------------------------------------
     def sync(self, cursor: str, main: str) -> None:
-        """Align the window with the remote cursor; discard it if the chain no longer applies."""
-        index = next((i for i, s in enumerate(self.slots) if s.batch["from_sha"] == cursor), None)
+        """Align the window with the remote cursor, restoring the durable list after a restart."""
         before = [slot.record() for slot in self.slots]
-        if index is None and self.slots:
-            log(f"security-audit pool: cursor {cursor[:12]} is outside the planned window; replanning")
-            self.slots = []
-        elif index:
-            self.slots = self.slots[index:]
         if not self.slots and not self.running:
-            self.slots = self.restored(cursor, main)
+            self.slots = self.restored()
             if self.slots:
                 log(f"security-audit pool: restored {len(self.slots)} persisted range(s)")
-        if self.slots:
-            pending = sa.validate_history(self.repo, cursor, main)
-            shas = [c["sha"] for s in self.slots for c in s.batch["commits"]]
-            if pending[: len(shas)] != shas:
-                log("security-audit pool: planned window is no longer the next main prefix; replanning")
-                self.slots = []
+        self.slots = self.aligned(self.slots, cursor, main)
         if [slot.record() for slot in self.slots] != before:
             self.persist()
         self.settle_interrupted(cursor)
@@ -505,6 +514,11 @@ class Pool:
             ),
         )
         slot.verdict = verdict
+        if verdict["verdict"] == "pass" and verdict["input_digest"] != slot.digest:
+            # The cursor entered this range while it ran; its remaining commits are inspected afresh.
+            slot.status, slot.verdict = "planned", None
+            self.persist()
+            return
         if verdict["verdict"] == "pass":
             slot.status = "pass"
             self.persist()

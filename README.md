@@ -466,7 +466,9 @@ status, verdict or block, attempts, reviewer, retry count and next retry time. E
 batch input is built by one function (`build_batch`) from a range's exact consecutive
 first-parent commits, with complete per-commit images and diffs. After a restart the
 list is restored while it is still the next main prefix; a pass is reused only when its
-rebuilt input is byte-identical, and a block stays binding. A range that was running
+rebuilt input is byte-identical, and a block stays binding. When a human attestation moves
+the cursor, ranges after it are kept, and a range it entered keeps only its remaining
+commits: still binding if blocked or in flight, otherwise inspected afresh. A range that was running
 when the pool stopped is first classified from its attempt's own evidence: a recorded
 concern binds, and only an attempt with no judgment is retried. An unreadable list
 holds the pool rather than replanning over a block. While the pool
