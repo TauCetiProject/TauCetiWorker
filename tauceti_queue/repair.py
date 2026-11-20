@@ -697,7 +697,7 @@ def recommit_resolution(
             return None
         tree = merged.tree
 
-    def recommit(parent: str, tree: str = resolved.tree) -> str:
+    def recommit(parent: str, tree: str) -> str:
         return chain_tool.commit_tree(
             clone,
             tree,
@@ -710,7 +710,7 @@ def recommit_resolution(
 
     # Only a commit made exactly as the worker makes one (author, committer and dates) is reused, not
     # one an agent made with `git commit` and pointed a ref at.
-    if recommit(resolved.parents[0]) != stored:
+    if recommit(resolved.parents[0], resolved.tree) != stored:
         return None
     sha = recommit(prefix, tree)
     explained = bool(chain_tool.appended_text(original.message, resolved.message).strip())

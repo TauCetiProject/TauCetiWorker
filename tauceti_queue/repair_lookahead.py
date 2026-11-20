@@ -39,7 +39,6 @@ import contextlib
 import json
 import os
 import signal
-import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -72,6 +71,11 @@ class Lookahead:
         self.free: list[Path] = []
         self.made: list[Path] = []
         self.agent_records: list[dict] = []
+        # Taken now, before the serial agent's run changes this process's environment for its provider.
+        self.environment = dict(os.environ)
+        from tauceti_queue import repair_task
+
+        self.providers, _skipped = repair_task.select_providers(cfg)
         self.pool = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, int(cfg.parallel_agents) - 1), thread_name_prefix="lookahead"
         )
@@ -128,12 +132,15 @@ class Lookahead:
             future.result()
 
     def _checkout(self) -> Path:
+        """A helper worktree at ``onto``, free of whatever an earlier member's agent left in it."""
         with self.lock:
             if self.free:
-                return self.free.pop()
-            path = self.cfg.root / "worktrees" / f"task-{self.task.task_id}-lookahead-{len(self.made) + 1}"
-            self.made.append(path)
-        repair.create_worktree(self.worktree, self.task.onto, path)
+                path = self.free.pop()
+            else:
+                path = self.cfg.root / "worktrees" / f"task-{self.task.task_id}-lookahead-{len(self.made) + 1}"
+                self.made.append(path)
+        if repair.checkout_worktree(self.worktree, self.task.onto, path):
+            return path
         packages = self.worktree / ".lake" / "packages"
         if self.cfg.seed_packages:
             repair.link_shared_packages(path, self.cfg.seed_packages)
@@ -153,9 +160,7 @@ class Lookahead:
             return
         from tauceti_queue import repair_task
 
-        eligible, _skipped = repair_task.select_providers(self.cfg)
-        if not eligible:
-            log(f"task {self.task.task_id}: no eligible provider for the lookahead of {commit[:12]}")
+        if not self.providers:
             return
         try:
             path = self._checkout()
@@ -163,7 +168,7 @@ class Lookahead:
             log(f"task {self.task.task_id}: no lookahead worktree for {commit[:12]}: {error}")
             return
         try:
-            result = self._run_child(path, commit, source_pr, eligible)
+            result = self._run_child(path, commit, source_pr, self.providers)
         finally:
             with self.lock:
                 self.free.append(path)
@@ -200,30 +205,18 @@ class Lookahead:
         }
         job_path = directory / "job.json"
         job_path.write_text(json.dumps(job, default=str))
-        env = dict(os.environ)
+        env = dict(self.environment)
         if self.cfg.api_key:
             env[repair_parallel.API_KEY_ENV] = self.cfg.api_key
-        with (logdir / "runner.log").open("ab") as output:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "tauceti_queue.repair_lookahead", "run", str(job_path)],
-                cwd=repair_parallel.REPO_ROOT,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-            )
-            while proc.poll() is None:
-                if self.stop.wait(0.2) or self.task_cancel.is_set():
-                    proc.terminate()
-                    try:
-                        proc.wait(60)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                    break
+        _stopped, returncode = repair_parallel.run_child(
+            ["tauceti_queue.repair_lookahead", "run", str(job_path)],
+            logdir / "runner.log",
+            env,
+            lambda: self.stop.wait(0.2) or self.task_cancel.is_set(),
+        )
         if result_path.exists():
             return json.loads(result_path.read_text())
-        return {"status": "failed", "reason": f"the lookahead runner exited {proc.returncode}"}
+        return {"status": "failed", "reason": f"the lookahead runner exited {returncode}"}
 
     def close(self) -> None:
         """Stop every helper (a running agent is terminated) and remove the worktrees."""
