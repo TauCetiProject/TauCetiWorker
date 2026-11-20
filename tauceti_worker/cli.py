@@ -1539,12 +1539,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     from .activity import pin_root
 
     pin_root()
-    if problem := claude_usage_configuration_problem(Config.resolve(wid)):
+    if problem := claude_usage_configuration_problem(Config.resolve(wid), check_identity=False):
         raise Die(problem)
     if wid != "default" or getattr(args, "isolate_home", False):
         isolate_home(wid)
     cfg = Config.resolve(wid)
-    if problem := claude_usage_configuration_problem(cfg):
+    if problem := claude_usage_configuration_problem(cfg, check_identity=False):
         raise Die(problem)
     # Tee this process's log() output to a per-worker file so a `work --loop` started in a bare terminal
     # still leaves an on-disk record to monitor. The loop driver picks one session file and exports its
