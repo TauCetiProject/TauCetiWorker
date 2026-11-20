@@ -261,7 +261,7 @@ working tree, which the not yet migrated units still run, is not changed:
 git clone -q https://github.com/TauCetiProject/TauCetiWorker.git /tmp/tcq-bootstrap
 ~/TauCetiQueue/services/queue/backup.sh               # as before any controller install
 /tmp/tcq-bootstrap/services/queue/install.sh
-/tmp/tcq-bootstrap/services/queue/install-repair.sh --when-idle    # each once it holds no claim
+/tmp/tcq-bootstrap/services/queue/install-repair.sh --when-idle    # each once it is between tasks
 /tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 2 --when-idle
 /tmp/tcq-bootstrap/services/queue/install-repair.sh --instance 3 --when-idle
 /tmp/tcq-bootstrap/services/queue/install-monitoring.sh
@@ -750,21 +750,24 @@ itself serving at the release's revision in `<task root>/worker.json`. Exit 0 me
 running task. The queue service, its backup timer, the other workers and the fleet units are not
 touched.
 
-`--when-idle` restarts the worker only between tasks, so updating a worker never needs an ad hoc
-waiter. The signal is the queue's own record: the installer opens the controller's database
-(`~/TauCetiQueue-data/queue.sqlite3`, read-only, so it runs on the controller's host) and waits while
-`claims` has a row for the worker's `TAUCETI_QUEUE_WORKER` (as its environment file sets it, for
-example `repair-2@tauchonki2`) with `released_at` unset and `expires_at` in the future. It prints the
+`--when-idle` waits for the worker to be between tasks before restarting it, so updating a worker
+needs no ad hoc waiter. The signal is the queue's own record: the installer opens the controller's
+database (`~/TauCetiQueue-data/queue.sqlite3`, read-only, so it runs on the controller's host) and
+waits while `claims` has a row for the running worker with `released_at` unset and `expires_at` in
+the future. The worker's name (for example `repair-2@tauchonki2`) is the `TAUCETI_QUEUE_WORKER` of the
+unit's running process, read from its environment, so an environment file edited since the worker
+started does not misname it; a unit with no running process has nothing to wait for. It prints the
 claims it is waiting for, checks every 60 seconds, and waits for as long as it takes unless
-`--idle-timeout SECONDS` is given, after which it exits 3 without restarting. It waits before choosing
-the revision, so a long wait installs origin/main as it is when the wait ends, and checks once more
-right before the restart. The window between that check and the restart is short but not closed: the
-worker has no switch to stop claiming, so a claim made in it is interrupted like any restart (below).
-An unreadable database counts as busy. Neither the unit's processes nor `worker.json` tell idle from
-busy: between rounds of a task the worker runs for minutes with no child process, and `worker.json`
-stays `claiming` while a claimed task runs. `--when-idle` is parsed by the copy of the installer you
-start, so start one that has it (fast-forward `~/TauCetiQueue` with `git -C ~/TauCetiQueue pull
---ff-only` when its working tree is older); an older copy stops with `unknown argument`.
+`--idle-timeout SECONDS` is given, after which it exits 3 without restarting. Anything it cannot read
+counts as busy. It waits before choosing the revision, so a long wait installs origin/main as it is
+when the wait ends, and checks once more right before the restart, without holding the releases lock.
+This is best effort: the worker has no switch to stop claiming, so a claim made between the last
+check and the restart is interrupted like any restart (below). Neither the unit's processes nor
+`worker.json` tell idle from busy: between rounds of a task the worker runs for minutes with no child
+process, and `worker.json` stays `claiming` while a claimed task runs. `--when-idle` is parsed by the
+copy of the installer you start, so start one that has it (fast-forward `~/TauCetiQueue` with
+`git -C ~/TauCetiQueue pull --ff-only` when its working tree is older); an older copy stops with
+`unknown argument`.
 
 An instance uses `tauceti-queue-repair@NAME.service` and `repair-environment-NAME`. When that file
 is absent, the installer copies the singleton's provider/cache configuration and supplies a distinct

@@ -61,15 +61,18 @@ def start(unit):
     if not unit.endswith(".service") or pid_of(unit):
         return
     cwd = setting(unit, "WorkingDirectory")
-    proc = subprocess.Popen(["sleep", "600"], cwd=cwd, start_new_session=True, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    (state / f"{unit}.pid").write_text(str(proc.pid))
-    if unit.startswith("tauceti-queue-repair") and not unit.startswith("tauceti-queue-repair-cleanup"):
-        env = {}
+    repair = unit.startswith("tauceti-queue-repair") and not unit.startswith("tauceti-queue-repair-cleanup")
+    env = {}
+    if repair:
         for line in Path(setting(unit, "EnvironmentFile")).read_text().splitlines():
             if "=" in line and not line.startswith("#"):
                 key, value = line.split("=", 1)
                 env[key] = value
+    # the process gets its unit's EnvironmentFile, as under systemd
+    proc = subprocess.Popen(["sleep", "600"], cwd=cwd, start_new_session=True, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, **env})
+    (state / f"{unit}.pid").write_text(str(proc.pid))
+    if repair:
         root = Path(env["TAUCETI_QUEUE_TASK_ROOT"])
         root.mkdir(parents=True, exist_ok=True)
         baked = Path(cwd) / "tauceti_queue/_revision.py"
@@ -385,11 +388,22 @@ class Releases(unittest.TestCase):
         log = self.run_script(
             "install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "1", "--wait", "10", expect=3
         )
-        self.assertIn("waiting for repair-2@host to finish", log)
+        self.assertIn("waiting before restarting tauceti-queue-repair@2.service: repair-2@host holds claim", log)
         self.assertIn("(task 7, repair, expires in", log)
         self.assertIn("was not restarted", log)
         self.assertEqual(self.pid("tauceti-queue-repair@2.service"), pid)
         self.assertEqual(len(self.release_dirs()), 1)
+
+    def test_when_idle_asks_about_the_identity_the_running_worker_has(self):
+        """An environment file edited since the worker started does not hide the running worker's claim."""
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        pid = self.pid("tauceti-queue-repair@2.service")
+        env_file = self.home / ".config/tauceti-queue/repair-environment-2"
+        env_file.write_text(env_file.read_text() + "TAUCETI_QUEUE_WORKER=renamed@host\n")
+        self.claims(("repair-2@host", time.time() + 900, None))
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "1", expect=3)
+        self.assertIn("repair-2@host holds claim", log)
+        self.assertEqual(self.pid("tauceti-queue-repair@2.service"), pid)
 
     def test_when_idle_ignores_released_expired_and_other_workers_claims(self):
         self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
@@ -400,7 +414,7 @@ class Releases(unittest.TestCase):
             ("repair-2@host", now + 900, now - 5), ("repair-2@host", now - 5, None), ("repair@host", now + 900, None)
         )
         log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--wait", "10")
-        self.assertEqual(log.count("repair-2@host holds no claim"), 2, log)  # before the install, before the restart
+        self.assertEqual(log.count("tauceti-queue-repair@2.service holds no claim"), 2, log)  # before the install, before the restart
         self.assertNotEqual(self.pid("tauceti-queue-repair@2.service"), pid)
         [release] = self.release_dirs(second)
         self.assertEqual(self.cwd("tauceti-queue-repair@2.service"), str(release))

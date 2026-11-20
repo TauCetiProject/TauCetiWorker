@@ -28,10 +28,11 @@
 #   --instance NAME  another worker, using repair-environment-NAME and its own task root.
 #   --no-restart     install files and the unit but leave a running worker alone (the next
 #                    restart picks up the new release).
-#   --when-idle      restart only once the queue shows the worker holding no claim: no row in the
-#                    controller's claims table (~/TauCetiQueue-data/queue.sqlite3, read-only) for its
-#                    TAUCETI_QUEUE_WORKER with released_at unset and expires_at in the future. It
-#                    checks every 60s before installing anything, and again right before the restart.
+#   --when-idle      restart only once the queue shows the running worker holding no claim: no row
+#                    in the controller's claims table (~/TauCetiQueue-data/queue.sqlite3, read-only)
+#                    for the TAUCETI_QUEUE_WORKER the unit's process runs as, with released_at unset
+#                    and expires_at in the future. It checks every 60s before installing anything,
+#                    and again right before the restart.
 #   --idle-timeout SECONDS  give up waiting after SECONDS (default: wait for as long as it takes).
 #   --wait SECONDS   how long to wait for the restarted worker to report serving (default: 60).
 #
@@ -75,7 +76,7 @@ while [ $# -gt 0 ]; do
     --wait) WAIT="$2"; shift 2 ;;
     --when-idle) WHEN_IDLE=1; shift ;;
     --idle-timeout) IDLE_TIMEOUT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,47p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
     *) echo "install-repair.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
@@ -102,50 +103,54 @@ if [ "$WHEN_IDLE" = 1 ]; then
   [ -f "$QUEUE_DB" ] || die "--when-idle reads the queue's claims from $QUEUE_DB, which does not exist on this host"
 fi
 
-# --when-idle: the worker's identity as the unit sees it (the last assignment in its environment
-# file wins, as for systemd; the worker's own default otherwise), and its live claims in the queue.
-worker_identity() {
-  [ -f "$ENV_FILE" ] || return 0
-  # shellcheck disable=SC1090
-  (set -a; . "$ENV_FILE" >/dev/null 2>&1; printf '%s' "${TAUCETI_QUEUE_WORKER:-${TAUCETI_WORKER_ID:-default}@$(hostname)}")
-}
+# --when-idle: the live claims, in the queue, of the worker the unit runs now. Its identity is read
+# from the running process's own environment, as the worker computes it (default_worker_identity
+# in tauceti_queue/repair_task.py), so an edited environment file cannot misname it. Prints
+# nothing when the unit has no running process; fails, and so counts as busy, when it cannot tell.
 live_claims() {
-  python3 - "$QUEUE_DB" "$1" <<'PY'
-import pathlib, sqlite3, sys, time
+  local pid
+  # Called as a condition, where errexit is off: a failed lookup must not read as "no process".
+  pid="$(systemctl --user show -p MainPID --value "$UNIT")" && [ -n "$pid" ] || return 1
+  python3 - "$QUEUE_DB" "$pid" <<'PY'
+import pathlib, socket, sqlite3, sys, time
+if sys.argv[2] == "0":
+    sys.exit(0)
+env = dict(
+    entry.split("=", 1)
+    for entry in pathlib.Path(f"/proc/{sys.argv[2]}/environ").read_text().split("\0")
+    if "=" in entry
+)
+worker = env.get("TAUCETI_QUEUE_WORKER") or f"{env.get('TAUCETI_WORKER_ID', 'default')}@{socket.gethostname()}"
 db = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
 now = time.time()
 rows = db.execute(
     "SELECT id, task_id, operation, expires_at FROM claims"
     " WHERE worker = ? AND released_at IS NULL AND expires_at > ? ORDER BY id",
-    (sys.argv[2], now),
+    (worker, now),
 ).fetchall()
-print("; ".join(f"claim {i} (task {t}, {op}, expires in {e - now:.0f}s)" for i, t, op, e in rows))
+if rows:
+    print(f"{worker} holds " + "; ".join(f"claim {i} (task {t}, {op}, expires in {e - now:.0f}s)" for i, t, op, e in rows))
 PY
 }
-# wait_until_idle: return once the queue shows no live claim for this worker. Never returns early
-# on an unreadable database; exits 3 after --idle-timeout.
+# wait_until_idle: return once the queue shows no live claim for the running worker. Never returns
+# early on anything it cannot read; exits 3 after --idle-timeout.
 wait_until_idle() {
-  local worker claims deadline="" left
-  worker="$(worker_identity)"
-  if [ -z "$worker" ]; then
-    log "no $ENV_FILE yet, so no worker to wait for"
-    return 0
-  fi
+  local claims deadline="" left
   [ -z "$IDLE_TIMEOUT" ] || deadline=$(( $(date +%s) + IDLE_TIMEOUT ))
   while :; do
-    if claims="$(live_claims "$worker")"; then
+    if claims="$(live_claims)"; then
       if [ -z "$claims" ]; then
-        log "$worker holds no claim in $QUEUE_DB"
+        log "$UNIT holds no claim in $QUEUE_DB"
         return 0
       fi
-      log "waiting for $worker to finish before restarting $UNIT: $claims"
+      log "waiting before restarting $UNIT: $claims"
     else
-      log "cannot read claims from $QUEUE_DB; treating $worker as busy"
+      log "cannot read $UNIT's claims from $QUEUE_DB; treating it as busy"
     fi
     if [ -n "$deadline" ]; then
       left=$(( deadline - $(date +%s) ))
       if [ "$left" -le 0 ]; then
-        log "$worker still holds a claim after ${IDLE_TIMEOUT}s; $UNIT was not restarted"
+        log "$UNIT still holds a claim after ${IDLE_TIMEOUT}s; it was not restarted"
         exit 3
       fi
       sleep $(( left < IDLE_POLL ? left : IDLE_POLL ))
@@ -253,8 +258,13 @@ systemctl --user reenable --quiet "$UNIT"
 
 if [ "$RESTART" = 1 ]; then
   # The wait above ended before the build and the host checks; check again with nothing left
-  # between the check and the restart. (The worker has no switch to stop claiming meanwhile.)
-  if [ "$WHEN_IDLE" = 1 ]; then wait_until_idle; fi
+  # between the check and the restart. (The worker has no switch to stop claiming meanwhile.) The
+  # unit file names the release now, so the release lock is not needed to keep it from collection,
+  # and is given up so that a long wait does not hold up other installs' collection.
+  if [ "$WHEN_IDLE" = 1 ]; then
+    flock -u 9 2>/dev/null || true
+    wait_until_idle
+  fi
   log "restarting $UNIT"
   systemctl --user restart "$UNIT"
 else
