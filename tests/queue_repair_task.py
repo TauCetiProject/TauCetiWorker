@@ -7684,5 +7684,42 @@ class NumprojRepairSharedFile(NumprojRepairBase):
         self.assertEqual(outcome["numproj"][0]["edited"], [original[1].sha])
 
 
+class RebasedChainRepair(Fixture):
+    """Member 3 is broken too, without conflicting: the rebased chain fails the worker's verification,
+    and the task then repairs it on ``onto`` as a repair task would."""
+
+    BROKEN = (2, 3)
+
+    def setUp(self):
+        super().setUp()
+        self.raw = self.content.rebase_task()
+        self.service.tasks = {1: self.raw}
+
+    def test_a_failed_verification_repairs_the_rebased_chain(self):
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertIn("## Resolving the commit", calls[0]["prompt"])
+        self.assertNotIn("## Resolving the commit", calls[1]["prompt"])
+        self.assertIn("unknown identifier BROKEN", calls[1]["prompt"])
+        self.assertEqual([v["ok"] for v in outcome["verification"]], [False, True])
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertNotIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Three.lean"))
+
+    def test_a_chain_the_repair_does_not_change_is_submitted_for_ci(self):
+        """The agent leaves the rebased chain as it is: it is submitted for CI as before, without
+        verifying it again."""
+        os.environ["STUB_AGENT_MODES"] = "repair,noop"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.agent_calls()), 2)
+        self.assertEqual([v["ok"] for v in outcome["verification"]], [False])
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Three.lean"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

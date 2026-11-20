@@ -2828,6 +2828,11 @@ def _run_task(
     # A rebase task's agent step is the worker's own replay, the agent resolving one conflict at a time
     # (`resolve_conflicts`); a retained repair checkpoint is already on the target and is repaired as is.
     rebasing = task.kind in repair.REBASE_KINDS and not continuation
+    # A rebased chain that fails verification is repaired like a repair task's (``rebasing`` turns
+    # off); ``rebased`` stays, and ``rebased_tip`` is that chain, submitted for CI if the repair fails.
+    rebased = rebasing
+    rebased_tip: str | None = None
+    rebased_report: dict = {}
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
     known_checks = bool(continuation) or known_check_failures(task)
@@ -3233,7 +3238,7 @@ def _run_task(
                     worker_verifies=cfg.worker_audits,
                 )
                 context.repair_context = ownership
-                if continuation:
+                if continuation or rebased:
                     context.kind = "repair"
                     context.check_findings_known = True
                 if context.worker_verifies:
@@ -3332,14 +3337,21 @@ def _run_task(
                     )
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
-                if rebasing:
-                    # A rerun would rebuild this chain from the stored resolutions without the agent.
-                    forget_resolutions(cfg.clone, task.task_id)
-                return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+                if rebased_tip is not None:
+                    log(f"task {task.task_id}: the repair of the rebased chain failed; submitting that chain for CI")
+                    git(worktree, "checkout", "--quiet", "--force", "--detach", rebased_tip)
+                    tip, report = rebased_tip, rebased_report
+                else:
+                    if rebased:
+                        # A rerun would rebuild this chain from the stored resolutions without the agent.
+                        forget_resolutions(cfg.clone, task.task_id)
+                    return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             parallel = outcome.get("parallel") or {}
             verified = (
-                parallel.get("verified_tip") == tip and "checks" in parallel
-            ) or pending_delivery == delivery_identity(cfg, task, tip)
+                (parallel.get("verified_tip") == tip and "checks" in parallel)
+                or pending_delivery == delivery_identity(cfg, task, tip)
+                or tip == rebased_tip
+            )
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
             if cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
                 outcome.pop("repair_checkpoint", None)
@@ -3379,14 +3391,17 @@ def _run_task(
                         verification["diagnostics"]
                     )
                     state.write("verification_failed", attempt=attempt, tip=tip, detail=detail)
-                    if rebasing:
-                        # The agent resolved conflicts and never saw the whole chain: the head's CI and repair
-                        # tasks take the build from here.
-                        log(f"task {task.task_id}: the rebased chain fails verification; submitting it for CI")
-                    elif verify_rounds < cfg.verify_retries:
+                    if verify_rounds < cfg.verify_retries:
+                        if rebasing:
+                            # The agent resolved conflicts and never saw the whole chain: repair the chain
+                            # on its target as a repair task would.
+                            log(f"task {task.task_id}: the rebased chain fails verification; repairing it")
+                            rebasing, rebased_tip, rebased_report = False, tip, report
+                            chain_before = prompt_chain = read_chain(cfg.clone, task.validation_base, tip)
+                            ownership = compute_ownership(chain_before)
                         verify_rounds += 1
                         findings = repair.findings_from_diagnostics(verification["diagnostics"])
-                        projections_due = task.kind in ("repair", "prepare") and not continuation
+                        projections_due = not continuation
                         feedback = (
                             detail
                             + "\n\nThe findings are listed above as diagnostics and appended to "
@@ -3394,6 +3409,9 @@ def _run_task(
                         )
                         log(f"attempt {attempt}: verification failed; running the agent on its findings")
                         continue
+                    elif rebased:
+                        # The retries are spent: the head's CI and repair tasks take the build from here.
+                        log(f"task {task.task_id}: the repaired chain still fails verification; submitting it for CI")
                     elif not (
                         task.extra.get("can_checkpoint_repair")
                         and verification.get("build", {}).get("rc") == 0
@@ -3480,7 +3498,7 @@ def _run_task(
             except ServiceError as error:
                 return defer_delivery(f"result response unavailable: {error}")
             state.write("submitted", attempt=attempt, response=response)
-            if rebasing:
+            if rebased:
                 forget_resolutions(cfg.clone, task.task_id)  # the service has the chain: the task is answered
             outcome["response"] = response
             reason = str(response.get("reason") or "")
