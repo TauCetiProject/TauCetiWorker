@@ -13,7 +13,7 @@ is free. When the build ends the worker appends a ``build finished, exit N, M er
 the error list and removes the lock. With worker-owned verification, the agent returns after
 scoped checks and the worker runs the final full suite; other callers retain the agent's final
 whole-library build advice. When the build is green and the worker gave it an ``audit`` callable
-(``repair_audit.check``), CI's audits and the changed-module environment lint run before the lock is
+(``repair_audit.check``), staging's audits and lints run before the lock is
 released, and their findings are appended to the error list like compiler errors (``kind`` ``audit`` or
 ``lint``, ``module``, ``file``, ``message``, ``member``, ``commit``). The lock is ``repair_tools``'s, the one the agent's build script takes, and
 the build runs in ``repair_sandbox``'s offline sandbox like every build of the worker.

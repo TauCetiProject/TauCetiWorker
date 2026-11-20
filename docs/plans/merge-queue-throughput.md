@@ -29,6 +29,6 @@ same staged data, workspace-free publication, archive reuse, changed-source rebu
 download rejection. The old bulk-unpack shortcut was removed: examined production runs fell back
 to ordinary Lake restoration, and the native fixture confirms restored archive reuse.
 
-Overlap requires matching measured audit/lint peaks and headroom; initial and uncertain runs stay
-serial. Per-linter profiling is optional because running linters separately changes batching cost.
+The worker's checks (audit, module system, environment, style and dot-notation lint) now always run
+at the same time, for every task kind. Per-linter profiling is optional because running linters separately changes batching cost.
 Legacy dispatch grace stays unchanged until duplicate deliveries demonstrably coalesce safely.
