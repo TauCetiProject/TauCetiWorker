@@ -206,15 +206,15 @@ class NativeReferences(unittest.TestCase):
 
 
 def tick(slug, clause="landed: #7"):
-    """A `publish` computation that ticks `slug` wherever it is still open."""
+    """A `publish` plan that ticks `slug` wherever it is still open."""
 
-    def compute(text):
-        item = t.parse_targets(text).find(slug)
+    def plan(listed):
+        item = listed.find(slug)
         if item is None or item.status == "done":
-            return text, []
-        return t.rewrite_item(text, item, "done", add=(clause,)), [f"`{slug}`: n"]
+            return []
+        return [reconcile.Change(item, "done", "n", (), (clause,))]
 
-    return compute
+    return plan
 
 
 class Publish(Tmp):
@@ -238,11 +238,11 @@ class Publish(Tmp):
         by_hand = EXAMPLE.replace("Goal: the strong law", "Goal: the weak law")
         seen = []
 
-        def edited_meanwhile(text):
+        def edited_meanwhile(listed):
             if not seen:
                 path.write_text(by_hand)
-            seen.append(text)
-            return tick("kolmogorov-zero-one")(text)
+            seen.append(listed)
+            return tick("kolmogorov-zero-one")(listed)
 
         path.write_text(EXAMPLE)
         self.assertEqual(len(reconcile.publish(path, edited_meanwhile)), 1)
@@ -274,13 +274,9 @@ class Publish(Tmp):
         git(second.parent, "commit", "-q", "-am", "rename the area")
         git(second.parent, "push", "-q", "origin", "HEAD:main")
 
-        def settle_probability(text):
-            item = next(
-                (it for it in t.parse_targets(text).areas.get("Probability", []) if it.slug == "strong-law"), None
-            )
-            if item is None:
-                return text, []
-            return t.rewrite_item(text, item, "done", add=("landed: #42",)), ["n"]
+        def settle_probability(listed):
+            item = next((it for it in listed.areas.get("Probability", []) if it.slug == "strong-law"), None)
+            return [] if item is None else [reconcile.Change(item, "done", "n", (), ("landed: #42",))]
 
         self.assertEqual(reconcile.publish(first, settle_probability), [])
         self.assertNotIn("landed: #42", self.remote())
@@ -310,9 +306,8 @@ class Publish(Tmp):
             pulls={1234: {"state": "MERGED", "body": marker("Probability", "truncation-bounds", partial=True)}}
         )
 
-        def compute(text):
-            changes = reconcile.settle(t.parse_targets(text), observed)
-            return reconcile.apply(text, changes), [c.note for c in changes]
+        def compute(listed):
+            return reconcile.settle(listed, observed)
 
         hook = self.hook(first, "pre-commit", "exit 1\n")
         self.assertIsNone(reconcile.publish(first, compute))
@@ -424,6 +419,78 @@ class Publish(Tmp):
         own = git(second.parent, "rev-parse", "HEAD")
         reconcile._sync(second)
         self.assertEqual(git(second.parent, "rev-parse", "HEAD"), own)
+
+
+class TrackedRound(Tmp):
+    """Whole looks on a list tracked on a remote branch, as the phase runs them."""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.clone("first")
+        (self.first.parent / "notes.md").write_text("notes\n")
+        git(self.first.parent, "add", "notes.md")
+        git(self.first.parent, "commit", "-q", "-m", "notes")
+        git(self.first.parent, "push", "-q", "origin", "HEAD:main")
+        self.second = self.clone("second")
+        env = patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": str(self.first), "HOME": str(self.tmp)})
+        env.start()
+        self.addCleanup(env.stop)
+        cfg = SimpleNamespace(state=self.tmp / "state", logdir=self.tmp / "logs", wid="worker3")
+        cfg.state.mkdir()
+        self.w = SimpleNamespace(cfg=cfg, counters=tc.Counters(cfg))
+        self.github()
+
+    def github(self, merged=(), states=None):
+        self.w.gh = SimpleNamespace(
+            merged_prs=lambda search, limit: [{"number": n, "body": body, "baseRefName": "main"} for n, body in merged],
+            open_prs=lambda: [],
+            pr_view=lambda number, fields: {"baseRefName": "main", **((states or {}).get(number) or {"state": "OPEN"})},
+        )
+
+    def look(self):
+        lock = self.first.with_name(".targets.md.lock")
+        if lock.exists():
+            os.utime(lock, (0, 0))
+        return reconcile.run(self.w, tc.Candidate(0, "", ""))
+
+    def remote(self, name="targets.md"):
+        return git(self.tmp / "remote.git", "show", f"main:{name}") + "\n"
+
+    def hook(self, directory, body):
+        directory.mkdir(exist_ok=True)
+        (directory / "pre-commit").write_text("#!/bin/sh\n" + body)
+        (directory / "pre-commit").chmod(0o755)
+
+    def test_a_look_observes_the_published_list_not_a_stale_clone(self):
+        self.first.write_text(EXAMPLE.replace("Goal: the strong law", "Goal (draft): the strong law"))
+        self.second.write_text(EXAMPLE.replace("in flight: #1234", "in flight: #43"))
+        git(self.second.parent, "commit", "-q", "-am", "moved")
+        git(self.second.parent, "push", "-q", "origin", "HEAD:main")
+        self.github(states={1234: {"state": "CLOSED"}, 43: {"state": "CLOSED"}})
+        self.assertEqual(self.look(), 0)
+        self.assertIn("(needs: none; closed: #43)", self.remote())
+
+    def test_a_relative_hook_directory_of_the_clone_still_runs(self):
+        git(self.first.parent, "config", "core.hooksPath", ".local-hooks")
+        self.hook(self.first.parent / ".local-hooks", "exit 1\n")
+        self.github(merged=[(7, marker("Probability", "strong-law"))])
+        self.assertIsNone(self.look())
+        self.assertEqual(self.remote(), EXAMPLE)
+
+    def test_a_hook_that_moves_the_item_to_another_area_is_not_pushed(self):
+        self.hook(
+            self.first.parent / ".git" / "hooks",
+            "sed 's/^## Probability$/## Statistics/' targets.md > t.tmp && mv t.tmp targets.md && git add targets.md\n",
+        )
+        self.github(merged=[(7, marker("Probability", "strong-law"))])
+        self.assertIsNone(self.look())
+        self.assertEqual(self.remote(), EXAMPLE)
+
+    def test_a_hook_that_stages_another_file_is_not_pushed(self):
+        self.hook(self.first.parent / ".git" / "hooks", "printf 'formatted notes\\n' > notes.md\ngit add '*.md'\n")
+        self.github(merged=[(7, marker("Probability", "strong-law"))])
+        self.assertIsNone(self.look())
+        self.assertEqual((self.remote(), self.remote("notes.md")), (EXAMPLE, "notes\n"))
 
 
 class Round(Tmp):

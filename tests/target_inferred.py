@@ -598,15 +598,7 @@ class Publication(Tmp):
         listed = t.parse_targets(text)
         item = listed.find("zero-one")
         clause = f"inferred: {TAIL}#a on 2026-01-02"
-        plan, check = reconcile._inference_plan(
-            path, listed, [reconcile.Change(item, "done", "n", ("in flight",), (clause,))]
-        )
-
-        def compute(text):
-            changes = plan(t.parse_targets(text))
-            return reconcile.apply(text, changes), [c.note for c in changes]
-
-        return compute, check
+        return reconcile._inference_plan(path, listed, [reconcile.Change(item, "done", "n", ("in flight",), (clause,))])
 
     def remote(self):
         return git(self.tmp / "remote.git", "show", "main:targets.md") + "\n"
@@ -619,7 +611,7 @@ class Publication(Tmp):
     def test_a_tick_on_an_unchanged_basis_is_published_and_the_clone_follows(self):
         first = self.clone("first")
         compute, check = self.inference(first)
-        self.assertEqual(reconcile.publish(first, compute, check=check), ["n"])
+        self.assertEqual(reconcile.publish(first, compute, check=check), ["`zero-one`: n"])
         self.assertEqual(t.parse_targets(self.remote()).find("zero-one").status, "done")
         self.assertEqual(first.read_text(), self.remote())
 
@@ -676,7 +668,7 @@ class Publication(Tmp):
         self.assertIsNone(reconcile.publish(first, compute, check=check))
         (first.parent / ".git" / "hooks" / "pre-push").unlink()
         other_compute, other_check = self.inference(other)
-        self.assertEqual(reconcile.publish(other, other_compute, check=other_check), ["n"])
+        self.assertEqual(reconcile.publish(other, other_compute, check=other_check), ["`zero-one`: n"])
         self.assertEqual(self.remote(), LIST)
 
     def test_a_list_named_with_a_space_is_published(self):
@@ -686,7 +678,7 @@ class Publication(Tmp):
         git(first.parent, "commit", "-q", "-m", "rename")
         git(first.parent, "push", "-q", "origin", "HEAD:main")
         compute, check = self.inference(named)
-        self.assertEqual(reconcile.publish(named, compute, check=check), ["n"])
+        self.assertEqual(reconcile.publish(named, compute, check=check), ["`zero-one`: n"])
         committed = git(self.tmp / "remote.git", "show", "main:target list.md")
         self.assertEqual(t.parse_targets(committed).find("zero-one").status, "done")
 

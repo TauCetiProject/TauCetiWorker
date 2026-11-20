@@ -17,7 +17,7 @@ completion" in the same document). The pieces:
     candidates(live)               the open items an inference look may ask about, most blocking first
     confirmed(checkout, verdict)   a model verdict reduced to declarations the checkout has (`identity`)
     reopen(slugs, seen, by)        take back inferred ticks a dependent's round found wanting
-    publish(path, compute)         compute the edits on the published list and publish them
+    publish(path, plan)            plan the edits on the published list and publish them
     run(w, c, profile)             one reconciliation, under the list's lock
 
 Only `ask` starts a model. Its answer reaches the list as file paths and declaration names that
@@ -736,43 +736,91 @@ def _write(path: Path, text: str) -> bool:
     return True
 
 
-def _in_place(path: Path, compute) -> list[str] | None:
-    """`publish` for a list that is not tracked on a remote: computed on the file as it is and
-    written by a rename, computed again if the file changed meanwhile."""
+def _edits(text: str, plan) -> tuple[str, list[Change]]:
+    changes = plan(parse_targets(text))
+    return apply(text, changes), changes
+
+
+def _notes(changes: list[Change]) -> list[str]:
+    return [f"`{change.item.slug}`: {change.note}" for change in changes]
+
+
+def _carries(text: str, changes: list[Change]) -> bool:
+    """Whether `text` holds each change as planned: the item under its area, with its status, the
+    clauses it added, and none it dropped and did not add back."""
+    try:
+        listed = parse_targets(text)
+    except Die:
+        return False
+    for change in changes:
+        it = listed.find(change.item.slug)
+        dropped = {key.strip().lower() for key in change.drop}
+        if it is None or (it.area, it.status) != (change.item.area, change.status):
+            return False
+        if not set(change.add) <= set(it.meta) or any(
+            m.partition(":")[0].strip().lower() in dropped and m not in change.add for m in it.meta
+        ):
+            return False
+    return True
+
+
+def _in_place(path: Path, plan) -> list[str] | None:
+    """`publish` for a list that is not tracked on a remote: planned on the file as it is and
+    written by a rename, planned again if the file changed meanwhile."""
     for _ in (1, 2):
         try:
             text = path.read_text()
         except (OSError, UnicodeDecodeError):
             return None
-        ours, notes = compute(text)
+        ours, changes = _edits(text, plan)
         if ours == text:
             return []
         if path.read_text() == text:
-            return notes if _write(path, ours) else None
+            return _notes(changes) if _write(path, ours) else None
     log(f"reconcile: {path.name} kept changing during this look; nothing written")
     return None
 
 
-def publish(path: Path, compute, *, check=None) -> list[str] | None:
-    """Apply `compute` to the list where it is published and return its notes, `[]` when it changes
-    nothing, or None when nothing could be published. Call with the lock held.
+def _snapshot(path: Path) -> str:
+    """The list as `publish` would start from: the remote branch its clone tracks, freshly fetched,
+    when it is tracked on one; the file otherwise."""
+    upstream = _upstream(path) if _tracked(path) else None
+    if upstream is not None:
+        _git(path, "fetch", "-q", upstream[0], timeout=300)
+        _sync(path)
+        name = _git(path, "ls-files", "-z", "--full-name", "--", _spec(path)).stdout.split("\0")[0]
+        for base in (upstream[2], "HEAD"):
+            shown = _git(path, "show", f"{base}:{name}")
+            if shown.returncode == 0:
+                return shown.stdout
+    return path.read_text()
 
-    `compute(text)` gives the list's new text and one note per edit; it is run on the text it will
-    replace, so every edit is checked against the list as it is there, never merged into it. A list
+
+def publish(path: Path, plan, *, check=None) -> list[str] | None:
+    """Apply `plan` to the list where it is published and return one note per edit, `[]` when it
+    changes nothing, or None when nothing could be published. Call with the lock held.
+
+    `plan(listed)` gives the edits for the parsed list it is handed; it is run on the text it will
+    replace, so every edit is made against the list as it is there, never merged into it. A list
     tracked on a remote is published from a throwaway worktree of the branch it tracks, as fetched
-    now: the commit (the list alone, through the clone's hooks) is pushed only if `check`, when
-    given, holds for the list as committed, and the worktree is then removed. A rejected commit,
-    check or push leaves nothing behind, and a later look computes again. The clone around the
-    list is then fast-forwarded when it is clean (`_sync`). Any other list is edited in place."""
+    now, committed through the clone's own hooks and pushed only if the commit changes the list
+    alone and the list as committed still carries every planned edit (`_carries`) and, when given,
+    satisfies `check`; the worktree is then removed. A rejected commit, check or push leaves nothing
+    behind, and a later look plans again. The clone around the list is then fast-forwarded when it
+    is clean (`_sync`). Any other list is edited in place."""
     upstream = _upstream(path) if _tracked(path) else None
     if upstream is None:
-        return _in_place(path, compute)
+        return _in_place(path, plan)
     remote, ref, tracking = upstream
     fetched = _git(path, "fetch", "-q", remote, timeout=300)
     if fetched.returncode != 0:
         log(f"reconcile: fetch from {remote} failed ({one_line(fetched.stderr)}); nothing published")
         return None
     name = _git(path, "ls-files", "-z", "--full-name", "--", _spec(path)).stdout.split("\0")[0]
+    top = Path(_git(path, "rev-parse", "--show-toplevel").stdout.strip())
+    # The clone's hooks, wherever `core.hooksPath` puts them; a relative one would otherwise be
+    # looked for inside the temporary worktree.
+    hooks = top / _git(path, "rev-parse", "--git-path", "hooks", cwd=top).stdout.strip()
     # A tracked branch the remote does not have yet starts from the clone's own commit.
     base = tracking if _git(path, "rev-parse", "-q", "--verify", tracking).returncode == 0 else "HEAD"
     with tempfile.TemporaryDirectory(prefix="reconcile-") as tmp:
@@ -781,30 +829,37 @@ def publish(path: Path, compute, *, check=None) -> list[str] | None:
             log(f"reconcile: no worktree of {base} could be made; nothing published")
             return None
         try:
-            return _publish_from(path, tree, name, compute, check, remote, ref)
+            return _publish_from(path, tree, name, hooks, plan, check, remote, ref)
         finally:
             _git(path, "worktree", "remove", "--force", str(tree))
             _git(path, "worktree", "prune")
             _sync(path)
 
 
-def _publish_from(path: Path, tree: Path, name: str, compute, check, remote: str, ref: str) -> list[str] | None:
+def _publish_from(path, tree: Path, name: str, hooks: Path, plan, check, remote: str, ref: str) -> list[str] | None:
     try:
         text = (tree / name).read_text()
     except (OSError, UnicodeDecodeError):
         log(f"reconcile: {remote} has no readable {name}; nothing published")
         return None
-    ours, notes = compute(text)
+    ours, changes = _edits(text, plan)
     if ours == text:
         return []
     (tree / name).write_text(ours)
+    notes = _notes(changes)
     message = f"Reconcile {path.name}: {len(notes)} item(s)\n\n" + "\n".join(f"- {note}" for note in notes)
-    committed = _git(path, "commit", "-q", "-m", message, "--", f":(literal){name}", cwd=tree)
+    committed = _git(
+        path, "-c", f"core.hooksPath={hooks}", "commit", "-q", "-m", message, "--", f":(literal){name}", cwd=tree
+    )
     if committed.returncode != 0:
         log(f"reconcile: commit failed ({one_line(committed.stderr or committed.stdout)}); a later look tries again")
         return None
+    touched = _git(path, "diff-tree", "--no-commit-id", "--name-only", "-r", "-z", "HEAD", cwd=tree)
+    if [p for p in touched.stdout.split("\0") if p] != [name]:
+        log(f"reconcile: the commit changes more than {name}; not pushed")
+        return None
     shown = _git(path, "show", f"HEAD:{name}", cwd=tree)
-    if check is not None and (shown.returncode != 0 or not check(shown.stdout)):
+    if shown.returncode != 0 or not _carries(shown.stdout, changes) or (check is not None and not check(shown.stdout)):
         log("reconcile: the list as committed is not what this look's edits were made for; not pushed")
         return None
     pushed = _git(path, "push", "-q", remote, f"HEAD:{ref}", timeout=300, cwd=tree)
@@ -861,18 +916,16 @@ def _inference_plan(path: Path, targets: Targets, verdicts: list[Change]):
 
 
 def _reconcile(w, c, path: Path, profile) -> int | None:
-    if _tracked(path):
-        if _upstream(path) is not None:
-            _git(path, "fetch", "-q", _upstream(path)[0], timeout=300)
-        _sync(path)
     try:
-        text = path.read_text()
+        text = _snapshot(path)
     except (OSError, UnicodeDecodeError) as error:
         raise Die(f"roadmap targets: {path}: {getattr(error, 'strerror', None) or error}") from None
     targets = _parsed(path, text)
     infer = inference_enabled()
+    read = sources(w)
+    observed = {"targets": targets}
     try:
-        seen = observe(targets, sources(w), open_listing=infer)
+        observed["seen"] = observe(targets, read, open_listing=infer)
     except (GitHubError, SourceUnavailable) as error:
         c.reason = f"pull requests could not be read ({one_line(str(error))})"
         log(f"reconcile: {c.reason}; the target list is left as it is")
@@ -884,7 +937,10 @@ def _reconcile(w, c, path: Path, profile) -> int | None:
         if tier == "settle":
 
             def plan(listed: Targets) -> list[Change]:
-                return settle(listed, seen)
+                # The list published may have moved since it was observed; its references are read afresh.
+                if listed != observed["targets"]:
+                    observed.update(targets=listed, seen=observe(listed, read, open_listing=infer))
+                return settle(listed, observed["seen"])
 
         elif tier == "audit":
 
@@ -892,17 +948,16 @@ def _reconcile(w, c, path: Path, profile) -> int | None:
                 return audit(listed, roadmap)
 
         else:
-            verdicts = _infer(w, profile, overlay_live(targets, seen.open_keys, set()), roadmap)
+            verdicts = _infer(w, profile, overlay_live(targets, observed["seen"].open_keys, set()), roadmap)
             plan, check = _inference_plan(path, targets, verdicts)
 
         if not plan(targets):
             continue
-
-        def compute(text: str, plan=plan) -> tuple[str, list[str]]:
-            changes = plan(_parsed(path, text))
-            return apply(text, changes), [f"`{change.item.slug}`: {change.note}" for change in changes]
-
-        notes = publish(path, compute, check=check)
+        try:
+            notes = publish(path, plan, check=check)
+        except (GitHubError, SourceUnavailable) as error:
+            notes = None
+            log(f"reconcile: pull requests could not be read again ({one_line(str(error))})")
         if notes is None:
             c.reason = "edits to the target list could not be published"
             log(f"reconcile: {c.reason}")
@@ -910,8 +965,7 @@ def _reconcile(w, c, path: Path, profile) -> int | None:
         written += len(notes)
         for note in notes:
             log(f"reconcile: {note}")
-        text = path.read_text()
-        targets = _parsed(path, text)
+        targets = _parsed(path, _snapshot(path))
     if written:
         return 0
     c.reason = "the target list is current"
@@ -979,21 +1033,20 @@ def reopen(slugs: Iterable[str], seen: dict[str, frozenset[str]], by: str, liste
                     return None
                 time.sleep(2)
 
-        def compute(text: str) -> tuple[str, list[str]]:
-            targets = _parsed(path, text)
+        def plan(listed: Targets) -> list[Change]:
             changes = []
             for slug in slugs:
-                item = targets.find(slug)
+                item = listed.find(slug)
                 tick = inferred(item) if item is not None else None
                 if tick is None or tick[0] != seen[slug]:
                     log(f"reconcile: `{slug}` is no longer the inferred tick the round saw; not reopened")
                     continue
                 clause = f"reopened: {_evidence(tick[0])} by {by}"
                 changes.append(Change(item, "open", f"reopened by {by}", ("inferred",), (clause,)))
-            return apply(text, changes), [f"`{change.item.slug}`: {change.note}" for change in changes]
+            return changes
 
         try:
-            notes = publish(path, compute)
+            notes = publish(path, plan)
         except (OSError, UnicodeDecodeError, Die) as error:
             log(f"reconcile: {path.name} cannot be read ({one_line(str(error))}); nothing reopened yet")
             return None
