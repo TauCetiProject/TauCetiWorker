@@ -284,9 +284,13 @@ def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] 
     return evidence
 
 
-def recorded(state: Path, digest: str, evidence: Evidence | None = None) -> Evidence:
-    """The ledger's verdicts for exactly this input."""
+def recorded(state: Path, batch: dict, evidence: Evidence | None = None) -> Evidence:
+    """The ledger's verdicts about this input or any of its commits.
+
+    A concern recorded for a range binds every range containing any of its commits, until the
+    cursor passes them: binding never depends on how ranges are later planned or split."""
     evidence = Evidence() if evidence is None else evidence
+    digest, commits = batch["input_digest"], {c["sha"] for c in batch["commits"]}
     ledger = state / "ledger.jsonl"
     try:
         lines = ledger.read_text(encoding="utf-8", errors="replace").splitlines() if ledger.exists() else []
@@ -299,13 +303,21 @@ def recorded(state: Path, digest: str, evidence: Evidence | None = None) -> Evid
         except ValueError:
             row = None
         if not isinstance(row, dict):
-            # The ledger is shared by every range: only a damaged row that names this input
-            # can have held its verdict.
-            if digest in line:
+            # The ledger is shared by every range: only a damaged row that names this input or
+            # one of its commits can have held a verdict about it.
+            if digest in line or any(sha in line for sha in commits):
                 evidence.unreadable.append(f"{ledger}:{number}: unreadable row")
-        elif row.get("batch") == digest and "verdict" in row:
+        elif "verdict" in row and (row.get("batch") == digest or commits & judged_commits(row["verdict"])):
             evidence.judgments.append(row["verdict"])
+        elif row.get("outcome") == UNREADABLE and (row.get("batch") == digest or commits & judged_commits(row)):
+            # A hold on evidence that could not be read binds its commits exactly like a concern.
+            evidence.unreadable.append(f"{ledger}:{number}: unreadable evidence holds these commits")
     return evidence
+
+
+def judged_commits(verdict) -> set[str]:
+    listed = verdict.get("commits") if isinstance(verdict, dict) else None
+    return {sha for sha in listed if isinstance(sha, str)} if isinstance(listed, list) else set()
 
 
 def finding(batch: dict, evidence: Evidence) -> dict | None:
@@ -358,7 +370,7 @@ def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
 
 def classify(state: Path, attempt: Path, batch: dict, failure: BaseException | str | None = None) -> Outcome:
     """The attempt's outcome. `failure` is why its last launch did not complete normally."""
-    evidence = recorded(state, batch["input_digest"], collect(attempt))
+    evidence = recorded(state, batch, collect(attempt))
     verdict = finding(batch, evidence)
     if verdict is not None:
         return Outcome(FINDING, verdict=verdict)
@@ -386,10 +398,10 @@ def holds(state: Path, attempt: Path) -> bool:
     if not attempt.exists():
         return False  # Never created: nothing was recorded.
     try:
-        digest = json.loads((attempt / "input.json").read_text())["input_digest"]
+        batch = json.loads((attempt / "input.json").read_text())
+        evidence = recorded(state, batch, collect(attempt))
     except (OSError, ValueError, KeyError, TypeError):
         return True
-    evidence = recorded(state, digest, collect(attempt))
     return bool(evidence.concerns() or evidence.unreadable)
 
 

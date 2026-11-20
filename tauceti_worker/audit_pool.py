@@ -33,6 +33,7 @@ RETRY_SECONDS = 60
 ADMIN_TTL = 300
 POLL_SECONDS = 300
 LOOKAHEAD = 8
+RANGES = "ranges.json"
 
 
 @dataclass
@@ -58,6 +59,24 @@ class Slot:
     @property
     def target(self) -> str:
         return self.batch["commits"][-1]["sha"]
+
+    def record(self) -> dict:
+        """The durable form: a range is its exact commits; its input is rebuilt from them."""
+        return {
+            "from_sha": self.batch["from_sha"],
+            "main_sha": self.batch["main_sha"],
+            "commits": [c["sha"] for c in self.batch["commits"]],
+            "input_digest": self.digest,
+            "status": self.status,
+            "failures": self.failures,
+            "retry_at": self.retry_at,
+            "verdict": self.verdict,
+            "failure": self.failure,
+            "attempts": self.attempts,
+            "provider": self.provider,
+            "model": sa.reviewer_model(self.provider) if self.provider else None,
+            "credential": self.credential,
+        }
 
 
 def operational(exc: BaseException) -> bool:
@@ -95,77 +114,94 @@ class Pool:
         self.observation: tuple[str, int] | BaseException = NoProgress("security-audit pool: not yet observed")
 
     # Persistence -----------------------------------------------------------
-    def persist(self, slot: Slot) -> None:
-        self.store.mkdir(parents=True, exist_ok=True)
-        (self.store / f"{slot.digest}.input.json").write_text(sa.serialize(slot.batch))
-        save(
-            self.store / f"{slot.digest}.json",
-            {
-                "input_digest": slot.digest,
-                "from_sha": slot.batch["from_sha"],
-                "to_sha": slot.target,
-                "status": "running" if slot.status == "running" else slot.status,
-                "failures": slot.failures,
-                "verdict": slot.verdict,
-                "failure": slot.failure,
-                "attempts": slot.attempts,
-                "provider": slot.provider,
-                "model": sa.reviewer_model(slot.provider) if slot.provider else None,
-                "credential": slot.credential,
-            },
-        )
+    def persist(self) -> None:
+        """Atomically replace the ordered list of active ranges: the pool's whole scheduling state.
 
-    def restored(self, cursor: str, main: str) -> list[Slot]:
-        """Reuse persisted passes only for byte-identical inputs that are still the next main prefix."""
-        if not self.store.is_dir():
+        Every change (planning, launch, result, retry, advancement) rewrites the list in one
+        step, so a restart never loses a range's status or reverts a replacement of ranges."""
+        self.store.mkdir(parents=True, exist_ok=True)
+        save(self.store / RANGES, {"ranges": [slot.record() for slot in self.slots]})
+
+    def restored(self) -> list[Slot]:
+        """The persisted ranges, inputs rebuilt from their exact commits; `aligned` places them.
+
+        A pass whose rebuilt input differs is inspected again; a block stays binding. A range
+        left running by a stopped pool keeps that status and is settled from its attempt's own
+        evidence (`settle_interrupted`) before anything else is admitted."""
+        path = self.store / RANGES
+        if not path.exists():
             return []
-        by_from = {}
-        for path in self.store.glob("*.input.json"):
-            try:
-                batch = json.loads(path.read_text())
-                meta = json.loads((self.store / path.name.replace(".input.json", ".json")).read_text())
-            except (OSError, ValueError):
-                continue
-            by_from.setdefault(batch["from_sha"], []).append((batch, meta))
-        chain, frm = [], cursor
+        slots = []
+        try:
+            for record in json.loads(path.read_text())["ranges"]:
+                batch = sa.build_batch(self.repo, record["from_sha"], record["main_sha"], record["commits"])
+                status = record["status"]
+                if status == "pass" and batch["input_digest"] != record["input_digest"]:
+                    status = "planned"
+                slot = Slot(
+                    batch,
+                    status=status,
+                    failures=record["failures"],
+                    retry_at=record["retry_at"],
+                    verdict=record["verdict"] if status != "planned" else None,
+                    failure=record["failure"],
+                    attempts=list(record["attempts"]),
+                    provider=record["provider"],
+                    credential=record["credential"],
+                )
+                if slot.status == "pass":
+                    sa.validate_verdict(slot.verdict, batch)
+                    if slot.verdict["verdict"] != "pass":
+                        raise ValueError("a passed range records a non-passing verdict")
+                if slot.status == "running" and not slot.attempts:
+                    slot.status = "planned"  # Persisted before any attempt existed.
+                slots.append(slot)
+        except (OSError, ValueError, KeyError, TypeError, IndexError, Die) as exc:
+            # The durable record of binding ranges cannot be trusted or replaced: hold, and
+            # let the cursor watchdog report the stall, rather than replan over a block.
+            raise NoProgress(f"security-audit pool: {path} cannot be restored; preserve it for review: {exc}") from exc
+        return slots
+
+    def aligned(self, slots: list[Slot], cursor: str, main: str) -> list[Slot]:
+        """The ranges that are still the next consecutive main prefix from the cursor.
+
+        Ranges the cursor has passed are dropped. A range the cursor entered (a human attested
+        part of it) keeps only its remaining commits: a block, or an attempt in flight, still
+        binds them, and anything else is inspected afresh. The first range that does not continue
+        the prefix ends the window, and the commits after it are planned afresh."""
         pending = sa.validate_history(self.repo, cursor, main)
-        offset = 0
-        while frm in by_from and len(chain) < self.window:
-            candidates = [(b, m) for b, m in by_from[frm] if m.get("status") in ("pass", "blocked")]
-            if len(candidates) != 1:
+        waiting = set(pending)
+        kept, frm, offset = [], cursor, 0
+        for slot in slots:
+            shas = [c["sha"] for c in slot.batch["commits"]]
+            rest = [sha for sha in shas if sha in waiting]
+            if not rest:
+                continue
+            if pending[offset : offset + len(rest)] != rest:
                 break
-            batch, meta = candidates[0]
-            shas = [c["sha"] for c in batch["commits"]]
-            if pending[offset : offset + len(shas)] != shas:
-                break
-            rebuilt = {
-                "from_sha": batch["from_sha"],
-                "main_sha": batch["main_sha"],
-                "commits": [sa.commit_input(self.repo, sha) for sha in shas],
-            }
-            rebuilt["input_digest"] = sa.hashlib.sha256(sa.serialize(rebuilt).encode()).hexdigest()
-            if rebuilt != batch or sa.serialize(rebuilt) != sa.serialize(batch):
-                break
-            slot = Slot(
-                batch,
-                status=meta["status"],
-                failures=meta.get("failures", 0),
-                verdict=meta.get("verdict"),
-                failure=meta.get("failure"),
-                provider=meta.get("provider"),
-                credential=meta.get("credential"),
-                attempts=list(meta.get("attempts") or []),
-            )
-            if slot.status == "pass" and (not slot.verdict or slot.verdict.get("verdict") != "pass"):
-                break
-            if slot.verdict is not None:
-                sa.validate_verdict(slot.verdict, batch)
-            chain.append(slot)
-            offset += len(shas)
-            frm = shas[-1]
-            if slot.status == "blocked":
-                break
-        return chain
+            if rest != shas:
+                slot.batch = sa.build_batch(self.repo, frm, slot.batch["main_sha"], rest)
+                if slot.status not in ("blocked", "running"):
+                    slot.status, slot.verdict = "planned", None
+            kept.append(slot)
+            frm, offset = rest[-1], offset + len(rest)
+        return kept
+
+    def settle_interrupted(self, cursor: str) -> None:
+        """Classify every range left running by a stopped pool before admitting more work.
+
+        Its evidence is read with the range's own input: a recorded concern binds whatever the
+        attempt directory still holds, and only an attempt with no judgment is retried."""
+        launched = {id(slot) for slot, _ in self.running.values()}
+        for slot in [s for s in self.slots if s.status == "running" and id(s) not in launched]:
+            attempt = Path(slot.attempts[-1])
+            log(f"security-audit pool: settling interrupted attempt {attempt.name} from its evidence")
+            try:
+                verdict = sa.judged(attempt, slot.batch, "security-audit: interrupted when the pool stopped")
+            except Exception as exc:  # noqa: BLE001 - classified exactly like a finished attempt.
+                self.stopped(slot, attempt, exc, cursor)
+            else:
+                self.concluded(slot, attempt, verdict, cursor)
 
     # GitHub ----------------------------------------------------------------
     def github(self, action):
@@ -209,23 +245,16 @@ class Pool:
 
     # Window ----------------------------------------------------------------
     def sync(self, cursor: str, main: str) -> None:
-        """Align the window with the remote cursor; discard it if the chain no longer applies."""
-        index = next((i for i, s in enumerate(self.slots) if s.batch["from_sha"] == cursor), None)
-        if index is None and self.slots:
-            log(f"security-audit pool: cursor {cursor[:12]} is outside the planned window; replanning")
-            self.slots = []
-        elif index:
-            self.slots = self.slots[index:]
-        if not self.slots:
-            self.slots = self.restored(cursor, main)
+        """Align the window with the remote cursor, restoring the durable list after a restart."""
+        before = [slot.record() for slot in self.slots]
+        if not self.slots and not self.running:
+            self.slots = self.restored()
             if self.slots:
-                log(f"security-audit pool: reusing {len(self.slots)} persisted batch result(s)")
-        if self.slots:
-            pending = sa.validate_history(self.repo, cursor, main)
-            shas = [c["sha"] for s in self.slots for c in s.batch["commits"]]
-            if pending[: len(shas)] != shas:
-                log("security-audit pool: planned window is no longer the next main prefix; replanning")
-                self.slots = []
+                log(f"security-audit pool: restored {len(self.slots)} persisted range(s)")
+        self.slots = self.aligned(self.slots, cursor, main)
+        if [slot.record() for slot in self.slots] != before:
+            self.persist()
+        self.settle_interrupted(cursor)
 
     def refill(self, cursor: str, main: str) -> None:
         # Batches beyond a binding block may be inspected; advance() never passes it.
@@ -241,6 +270,7 @@ class Pool:
             if batch["from_sha"] == cursor and sa.validate_history(self.repo, cursor, main)[: len(commits)] == commits:
                 slot = Slot(batch, provider=provider, credential=credential, resume=previous, inherited=True)
                 self.slots.append(slot)
+                self.persist()
                 frm = slot.target
                 log(
                     f"security-audit pool: continuing the Worker's {sa.reviewer_model(provider)} inspection"
@@ -257,6 +287,7 @@ class Pool:
                 return
             slot = Slot(batch)
             self.slots.append(slot)
+            self.persist()
             frm = slot.target
 
     def block_planning(self, frm: str, exc: BaseException, *, head: bool) -> None:
@@ -288,7 +319,7 @@ class Pool:
                 return
             if slot.status != "planned" or slot.retry_at > now:
                 continue
-            recorded = evidence.recorded(self.work, slot.digest)
+            recorded = evidence.recorded(self.work, slot.batch)
             if recorded.concerns() or recorded.unreadable:
                 refused = "security-audit: this batch already has a binding judgment; it is never inspected again"
                 slot.status = "blocked"
@@ -317,7 +348,7 @@ class Pool:
             (attempt / "input.json").write_text(sa.serialize(slot.batch))
             slot.status = "running"
             slot.attempts.append(str(attempt))
-            self.persist(slot)
+            self.persist()
             commits = len(slot.batch["commits"])
             resume = f" continuing {Path(slot.resume['attempt']).name}" if slot.resume else ""
             log(
@@ -427,55 +458,72 @@ class Pool:
 
     def finished(self, future, cursor: str) -> None:
         slot, attempt = self.running.pop(future)
-        span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
         try:
             verdict = future.result()
         except BaseException as exc:  # noqa: BLE001 - classified below; never silently dropped.
-            failure = {
-                "from_sha": slot.batch["from_sha"],
-                "to_sha": slot.target,
-                "reason": str(exc) or type(exc).__name__,
-                "attempt": str(attempt),
-                "outcome": "unreadable" if isinstance(exc, Unreadable) else "not-judged",
-                **self.reviewer(slot),
-            }
-            if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
-                failure["failure_kind"] = "provider-timeout"
-            sa.record(self.work / "ledger.jsonl", failure)
-            if operational(exc) and slot.failures < MAX_RETRIES:
-                slot.failures += 1
-                slot.status = "planned"
-                # Both reviewers continue the same retained session when it is valid.
-                slot.resume = failure
-                slot.retry_at = time.time() + RETRY_SECONDS * 2 ** (slot.failures - 1)
-                self.persist(slot)
-                log(
-                    f"security-audit pool: {span} operational failure on {slot.provider} ({exc}); "
-                    f"retry {slot.failures}/{MAX_RETRIES}"
-                )
-                return
-            if operational(exc):
-                failure["pool_retries_exhausted"] = True
-            slot.status = "blocked"
-            self.block(slot, failure, head=slot.batch["from_sha"] == cursor)
-            log(f"security-audit pool: {span} blocked: {exc}")
+            self.stopped(slot, attempt, exc, cursor)
+        else:
+            self.concluded(slot, attempt, verdict, cursor)
+
+    def stopped(self, slot: Slot, attempt: Path, exc: BaseException, cursor: str) -> None:
+        """An attempt that ended without a binding verdict: retry it, or block the range."""
+        span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
+        failure = {
+            "from_sha": slot.batch["from_sha"],
+            "to_sha": slot.target,
+            "reason": str(exc) or type(exc).__name__,
+            "attempt": str(attempt),
+            "outcome": "unreadable" if isinstance(exc, Unreadable) else "not-judged",
+            "batch": slot.digest,
+            "commits": [c["sha"] for c in slot.batch["commits"]],
+            **self.reviewer(slot),
+        }
+        if isinstance(exc, subprocess.TimeoutExpired) or isinstance(exc.__cause__, subprocess.TimeoutExpired):
+            failure["failure_kind"] = "provider-timeout"
+        sa.record(self.work / "ledger.jsonl", failure)
+        if operational(exc) and slot.failures < MAX_RETRIES:
+            slot.failures += 1
+            slot.status = "planned"
+            # Both reviewers continue the same retained session when it is valid.
+            slot.resume = failure
+            slot.retry_at = time.time() + RETRY_SECONDS * 2 ** (slot.failures - 1)
+            self.persist()
+            log(
+                f"security-audit pool: {span} operational failure on {slot.provider} ({exc}); "
+                f"retry {slot.failures}/{MAX_RETRIES}"
+            )
             return
+        if operational(exc):
+            failure["pool_retries_exhausted"] = True
+        slot.status = "blocked"
+        self.block(slot, failure, head=slot.batch["from_sha"] == cursor)
+        log(f"security-audit pool: {span} blocked: {exc}")
+
+    def concluded(self, slot: Slot, attempt: Path, verdict: dict, cursor: str, *, batch: dict | None = None) -> None:
+        """A binding verdict: a pass may advance; any recorded concern blocks the range for review."""
+        span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
+        launched = (attempt / "execution.json").exists()
         sa.record(
             self.work / "ledger.jsonl",
             sa.review_record(
                 self.actor or "",
                 slot.provider,
-                self.protocol(slot.provider),
-                slot.batch,
+                sa.attempt_protocol(attempt) if launched else self.protocol(slot.provider),
+                batch or slot.batch,
                 attempt,
                 verdict,
                 slot.credential,
             ),
         )
         slot.verdict = verdict
+        if verdict["verdict"] == "pass" and verdict["input_digest"] != slot.digest:
+            # The cursor entered this range while it ran; its remaining commits are inspected afresh.
+            slot.status, slot.verdict = "planned", None
+            self.persist()
+            return
         if verdict["verdict"] == "pass":
             slot.status = "pass"
-            self.persist(slot)
+            self.persist()
             log(f"security-audit pool: {span} pass")
             return
         slot.status = "blocked"
@@ -498,7 +546,7 @@ class Pool:
 
     def block(self, slot: Slot, failure: dict, *, head: bool) -> None:
         slot.failure = failure
-        self.persist(slot)
+        self.persist()
         if head:
             (self.work / "blocked.json").write_text(sa.serialize(failure))
         notify_block(self.work, failure)
@@ -515,8 +563,7 @@ class Pool:
                 break
             sa.record(self.work / "ledger.jsonl", {"actor": self.actor, "advanced": result, "from_sha": cursor})
             self.slots.pop(0)
-            (self.store / f"{slot.digest}.json").unlink(missing_ok=True)
-            (self.store / f"{slot.digest}.input.json").unlink(missing_ok=True)
+            self.persist()
             commits = len(slot.batch["commits"])
             self.advanced_commits += commits
             rate = self.advanced_commits / max((time.time() - self.started) / 3600, 1e-6)

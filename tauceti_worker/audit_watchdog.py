@@ -27,20 +27,17 @@ REMIND_SECONDS = 86400
 def admitted(work: Path, cursor: str) -> bool:
     """Work already started at this cursor stays due below the admission threshold.
 
-    That is a held block there, or any pool range starting there: its metadata is written at
-    launch and removed only when the cursor advances past it, so a passed range whose cursor
-    update keeps failing is still due. A remainder nobody has started waits for the threshold.
+    That is a held block there, or a pool range starting there: the pool's durable range list
+    keeps a range until the cursor advances past it, so a passed range whose cursor update keeps
+    failing is still due. A remainder nobody has started waits for the threshold.
     """
-    blocked = load(work / "blocked.json")
-    if blocked.get("from_sha") == cursor:
+    if load(work / "blocked.json").get("from_sha") == cursor:
         return True
-    for meta in (work / "pool").glob("*.json") if (work / "pool").is_dir() else ():
-        if meta.name.endswith(".input.json"):
-            continue
-        value = load(meta)
-        if value.get("from_sha") == cursor:
-            return True
-    return False
+    path = work / "pool" / "ranges.json"
+    ranges = load(path).get("ranges")
+    if path.exists() and not isinstance(ranges, list):
+        return True  # The pool holds on a list it cannot read: that stall is due work too.
+    return isinstance(ranges, list) and any(isinstance(r, dict) and r.get("from_sha") == cursor for r in ranges)
 
 
 def load(path: Path) -> dict:
