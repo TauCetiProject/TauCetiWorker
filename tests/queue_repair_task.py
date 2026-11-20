@@ -7266,7 +7266,6 @@ class NumprojImports(NumprojBase):
                 self.root / "imports.log",
                 60,
                 ("lake",),
-                None,
             )
         self.assertTrue(built)
         self.assertEqual(seen["Q"], "-- clean\n")
