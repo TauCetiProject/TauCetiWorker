@@ -15,6 +15,10 @@ the worker uses:
     render_assignment(targets, item)   the roadmap prompt's bullet assigning one item
     target_markers(item)               the item's complete and partial markers, one of which the
                                        pull request body must carry
+    rewrite_item(text, item, status)   the file's text with one item line changed, for the
+                                       `reconcile` phase
+    inferred(item), reopened(item)     the evidence of an inferred tick, and the evidence a
+                                       reopening found wanting (TAUCETI_ROADMAP_TARGETS_INFER)
 
 `parse_targets`, `marker_keys`, `landed`, `overlay_live`, `eligible_items` and `eligible_areas`
 are the pure pieces those are built from; none of them reads GitHub or the environment.
@@ -222,6 +226,17 @@ def _is_partial(clause: str) -> bool:
     return clause.partition(":")[0].strip().lower() == "partial"
 
 
+def inflight_ref(item: TargetItem) -> str | None:
+    """The pull request an item's `in flight:` clause names, as written: `#N` for a GitHub one, the
+    URL of a Forgejo one."""
+    for clause in item.meta:
+        key, _, value = clause.partition(":")
+        found = re.search(r"https?://[^\s,;]+|#\d+", value, re.I)
+        if key.strip().lower() == "in flight" and found:
+            return found.group(0)
+    return None
+
+
 def ref_key(ref: str) -> str:
     """What identifies a pull request reference: `#N` as written, a URL in any case and without a
     trailing slash, since a forge's owner and repository names are not case-sensitive."""
@@ -359,6 +374,50 @@ def github_history_enabled() -> bool:
     """TAUCETI_ROADMAP_TARGETS_GITHUB: whether a round with no GitHub source still reads the GitHub
     content repository's marked pull requests (`GitHubMarkerReads`). On unless set to 0."""
     return os.environ.get("TAUCETI_ROADMAP_TARGETS_GITHUB", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+_EVIDENCE_RE = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_./-]*\.lean)#([^\s,;#()]+)")
+_ON_RE = re.compile(r"\bon (\d{4}-\d{2}-\d{2})\s*$")
+_LAYER_RE = re.compile(r"(Layer [A-Za-z0-9.-]{1,33}),")
+
+
+def inference_enabled() -> bool:
+    """TAUCETI_ROADMAP_TARGETS_INFER: whether the `reconcile` phase may tick an item from the base
+    branch's source, and a roadmap round may report such a tick wanting. Off unless set to 1."""
+    return os.environ.get("TAUCETI_ROADMAP_TARGETS_INFER", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _clauses(item: TargetItem, key: str) -> list[str]:
+    return [c.partition(":")[2].strip() for c in item.meta if c.partition(":")[0].strip().lower() == key]
+
+
+def evidence_of(value: str) -> frozenset[str]:
+    """The `path#declaration` references a clause names."""
+    return frozenset(f"{path}#{name}" for path, name in _EVIDENCE_RE.findall(value))
+
+
+def inferred(item: TargetItem) -> tuple[frozenset[str], str | None] | None:
+    """The evidence and the date (`YYYY-MM-DD`, None when the clause has none) of an item ticked by
+    inference: done, with an `inferred:` clause naming evidence and no `landed:` clause. None for
+    any other item, a tick earned by a merged pull request in particular."""
+    if item.status != "done" or _clauses(item, "landed"):
+        return None
+    for value in _clauses(item, "inferred"):
+        if evidence := evidence_of(value):
+            on = _ON_RE.search(value)
+            return evidence, on.group(1) if on else None
+    return None
+
+
+def reopened(item: TargetItem) -> list[frozenset[str]]:
+    """The evidence each of an item's `reopened:` clauses found wanting."""
+    return [found for value in _clauses(item, "reopened") if (found := evidence_of(value))]
+
+
+def layer_of(item: TargetItem) -> str | None:
+    """The roadmap layer an item's description begins with (`Layer 3, ...`), exactly as written."""
+    found = _LAYER_RE.match(item.text)
+    return found.group(1) if found else None
 
 
 class GitHubMarkerReads:
@@ -547,6 +606,54 @@ def target_markers(item: TargetItem) -> tuple[str, str]:
     TAUCETI_TARGET_MARKER, they make gh-safe-pr-create refuse a body that carries neither."""
     ident = json.dumps({"focus": item.area, "id": item.slug}, separators=(",", ":"), ensure_ascii=False)[:-1]
     return f"<!--tauceti-target:v1 {ident}}}-->", f'<!--tauceti-target:v1 {ident},"partial":true}}-->'
+
+
+def rewrite_item(text: str, item: TargetItem, status: str, *, drop: Iterable[str] = (), add: Iterable[str] = ()) -> str:
+    """`text` with `item`'s line set to `status`, its clauses whose key is in `drop` removed and the
+    `add` clauses appended. Every other line is returned as it was, and so is the whole text when
+    it no longer has the item. A clause in `add` holds no `;` and no parentheses."""
+    dropped = {key.strip().lower() for key in drop}
+    lines = text.splitlines(keepends=True)
+    area = None
+    for n, line in enumerate(lines):
+        heading = _HEADING_RE.match(line)
+        if heading:
+            area = heading.group(1) if _AREA_RE.fullmatch(heading.group(1)) else None
+            continue
+        found = _parse_item(line, area) if area == item.area else None
+        if found is None or found.slug != item.slug:
+            continue
+        body = line.rstrip("\r\n")
+        box = _ITEM_RE.match(body)
+        body = body[: box.start(1)] + _BOX[status][1] + body[box.end(1) :]
+        clauses: list[str] = []
+        group = _META_RE.search(body)
+        if group:
+            clauses = [c for c in (c.strip() for c in group.group(1).split(";")) if c]
+            body = body[: group.start()]
+        clauses = [c for c in clauses if c.partition(":")[0].strip().lower() not in dropped] + list(add)
+        lines[n] = body.rstrip() + (f" ({'; '.join(clauses)})" if clauses else "") + line[len(line.rstrip("\r\n")) :]
+        break
+    return "".join(lines)
+
+
+def inferred_needs(targets: Targets, item: TargetItem) -> list[TargetItem]:
+    """The items `item` needs that are ticked by inference rather than by a merged pull request."""
+    return [dep for slug in item.needs if (dep := targets.find(slug)) is not None and inferred(dep) is not None]
+
+
+def render_report(targets: Targets, item: TargetItem, needs: list[TargetItem], path: str) -> str:
+    """The bullet, under the assignment, that lets the round report an inferred prerequisite
+    wanting: each such prerequisite's area and whole line, in any area, then how to report it."""
+    names = ", ".join(f"`{dep.slug}`" for dep in needs)
+    lines = "\n".join(f"  {dep.area}: {render_item(targets, dep)}" for dep in needs)
+    return f"""\
+  - {names} {"is" if len(needs) == 1 else "are"} marked `[x]` because the worker read the base branch's source, not because a pull request for {"it" if len(needs) == 1 else "them"} merged; each `inferred:` clause names the declarations taken as evidence:
+  ```
+{lines}
+  ```
+  If you find one of them missing, or present but unusable for `{item.slug}` (a different statement, too weak, or proved with `sorry`), write its slug on a line of its own to `{path}` and say in your final message what is missing. The worker opens such a prerequisite again; it reads nothing else from that file, and only these slugs.
+"""
 
 
 def render_assignment(targets: Targets, item: TargetItem) -> str:

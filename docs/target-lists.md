@@ -58,14 +58,22 @@ first `## ` heading is shown to the agent with the items of its area.
   This keeps them valid both in Git claim refs and in target markers.
 - A trailing parenthesised group holds `key: value` clauses separated by `;`,
   with no parentheses inside. `needs:` is a comma list of slugs from any area,
-  or `none`. `partial: #N, #M` names merged GitHub pull requests that did not
-  complete the item; a Forgejo pull request is named by its URL, in any case. Every other clause is passed to the agent as written.
+  or `none`. `partial: #N, #M` names merged pull requests that did not complete
+  the item. `in flight: #N` on a `[~]` item names the pull request it waits on,
+  which is how [reconciliation](#reconciliation) follows it. A GitHub pull
+  request is named `#N` in these clauses and a Forgejo one by its URL, in any
+  case. `inferred:` and `reopened:` are written by
+  [inferred completion](#inferred-completion). Every other clause is passed to
+  the agent as written.
 - Malformed item lines, empty/invalid or duplicate slugs, undefined `needs:`
   references and dependency cycles reject the list before any model starts.
   Prerequisites may appear later in the file or in another area.
 
 The file is read at the start of each roadmap round, so an edit takes effect on
-the next round. The worker never writes to it.
+the next round. A worker writes to it only in the `reconcile` phase, which is
+off unless a worker's `only` names it (see [Reconciliation](#reconciliation)),
+and, with [inferred completion](#inferred-completion) on, after a roadmap
+round that reports an inferred prerequisite wanting.
 
 ## Live statuses
 
@@ -100,7 +108,8 @@ window. Candidate items are also checked before assignment. These reads preserve
 partial-marker, explicit `partial:` and base-branch checks. Complete recent
 listings avoid these per-item reads, and completed/in-flight items do not trigger
 searches for their own prerequisites. Ticking `[x]` in the
-file records an operator completion and avoids repeated historical lookups.
+file, by hand or by [reconciliation](#reconciliation), records a completion and
+avoids repeated historical lookups.
 
 ## Selection
 
@@ -133,6 +142,171 @@ tried, plus one item search per unresolved prerequisite missing from the recent
 landings, and one claim push per candidate. The GitHub searches are shared
 between workers of one account on a host for two minutes.
 
+## Reconciliation
+
+The overlay above only moves an item forward and forgets landings older than
+its window. `reconcile` is a phase that writes into the file what the list's own
+pull requests have settled, so the file stays true without hand edits. It starts
+no model and judges no content: every edit follows from the state of a pull
+request that carries the item's marker or that its `in flight:` clause names.
+
+It is explicit: a round considers it only when the worker's `only` names it,
+for example `only = ["roadmap", "reconcile"]`, and only with a target list set.
+Such a round looks at the list first when a look is due, which is once every
+`TAUCETI_RECONCILE_GAP` seconds (six hours by default) for all the workers that
+share the file on one host. A look that changes the file is the round's work;
+after one that changes nothing the round goes on to its other phases. A round
+given `--pr` does not reconcile. One worker per list is enough. In a round over
+several sources the look runs once, ahead of either source's work, and reads
+every source surveyed that round: in GitHub's round when GitHub was surveyed,
+otherwise in the round of the forge new pull requests go to; a pause the look
+meets (admission, an unavailable forge) ends the round as such when no other
+work runs. A round with no GitHub source reads GitHub's marked pull requests as
+the roadmap round does (above): the same single listing of 200, the same
+fallback when GitHub cannot be read, and the same
+`TAUCETI_ROADMAP_TARGETS_GITHUB=0` to stop it. A `#N` clause there is settled
+only from that listing, so one naming a pull request outside it (older, or
+without a marker) is left as it is; so is a clause naming a pull request of a
+source the round did not read.
+
+A look makes these edits to items not yet `[x]`, each to one item line; every
+other line stays as it was:
+
+| What it finds | The item becomes |
+| --- | --- |
+| A merged pull request completes the item by its marker, under the rules of [Live statuses](#live-statuses) | `[x]`, with `landed: #N` (on Forgejo, its URL; likewise below) |
+| The pull request a `[~]` item names in `in flight: #N` merged into the content base (`TAUCETI_BASE_BRANCH`, `main` by default) | `[x]`, with `landed: #N` |
+| That pull request merged, but its marker for the item says `"partial":true` or the item's `partial:` clause names it | `[ ]`, with `#N` added to `partial:` |
+| That pull request closed unmerged | `[ ]`, with `#N` added to `closed:` |
+| That pull request is open, merged into another branch, or was not read | unchanged |
+
+A pull request the merge queue closed counts as merged only with the landing
+proof [Live statuses](#live-statuses) describes, read from its own forge; one
+whose proof is refused counts as closed unmerged, and one without proof leaves
+the item as it is. A round that selects only `reconcile` chooses no model and
+does not wait for one under pace, unless inferred completion (below) is on.
+
+An `in flight:` clause is removed when its item is settled. The `closed:` clause
+is passed to the next agent given the item, like any other clause. The merged
+side reads, on each forge, the 1000 most recent merged pull requests that carry
+a marker (on GitHub the most recently updated, on Forgejo the most recently
+created).
+
+**Writing.** A look holds `.<file name>.lock` beside the list from start to
+end, so two workers on a host never reconcile one file at once; the lock file's
+modification time is what shares the gap between them, and it is read again
+once the lock is held, so a worker that was due when its round began does not
+look again just after another one did. Every edit is computed on the very text
+it replaces, never merged into it: the look's observations are applied again to
+the list as it is where it is published, so an item whose line, area or status
+changed meanwhile gets the edit that list calls for, or none.
+
+When the list is tracked in a git repository on a branch that tracks a remote
+branch, the worker publishes it from a throwaway worktree, running git with the
+clone's own identity and credentials: it fetches that remote branch,
+checks it out in a temporary worktree, computes the edits on the list there,
+commits the list alone as `Reconcile <file name>: N item(s)` with one line per
+item, and pushes that commit by its id. The worker publishes its ticks without
+running the clone's git hooks, so validation belongs in the forge's checks. A
+list the remote branch holds as a symbolic link, or under one, is not
+published. The look reads the pull requests a list names from that remote
+branch too, not from the clone's file, and reads them again if the list there
+changes before it is published. A commit that fails, a push the remote
+refuses, or a fetch that fails publishes nothing and leaves nothing behind, and
+the next look computes again. The worktree is then removed
+and the clone is fast-forwarded to the remote branch when it has no
+uncommitted changes and no commits of its own; otherwise it is left for the
+operator. That is how workers on several hosts share one list: their edits meet
+on the remote. Neither the operator's working file nor their branch is ever
+written by a look, and their own commits are never pushed by it. Any other
+list, untracked or on a branch that tracks nothing, is edited in place and
+replaced by a rename, computed again if it changed while the look ran. Add the
+lock file to `.gitignore`.
+
+A look costs, on each forge it reads, one search for merged markers, plus one
+read per `in flight:` clause. It starts no model unless inferred completion
+(below) is on.
+
+## Inferred completion
+
+A milestone can land without a pull request that carries its marker, and then
+nothing above ticks it and the items that need it wait for ever. With
+`TAUCETI_ROADMAP_TARGETS_INFER=1` in the worker's environment (or its `env` in
+`workers.toml`), a `reconcile` look also asks a host agent which open items the
+base branch already has, and a roadmap round can report such a tick wrong.
+Without the setting none of this section happens: no model is started, no
+roadmap file is read and the authoring prompt is unchanged.
+
+**Inferred tick.** After the edits above, the look takes the open items, under
+the live view, that are eligible or that an item not yet done needs, and are
+not in flight on an open pull request. It orders them by how many items not
+yet done wait on them, directly or through others, then in file order, and puts
+up to `TAUCETI_ROADMAP_TARGETS_INFER_MAX` of them (12 by default) to one host
+agent with the worker's authoring model. The agent reads a fresh shallow
+checkout of the content base (`TAUCETI_BASE_BRANCH`, `main` by default) on
+GitHub, the item's line and the list's goal, and the roadmap's `README.md`,
+pointed at the item's layer, as the authoritative statement of the milestone;
+the README comes from the roadmap repository as authoring rounds attach it.
+Declarations of the Lean names the description quotes, and of the slug's words,
+are given as leads, but an item without any is asked about too. The agent is
+told that a proof containing `sorry` has not landed and that when unsure the
+answer is no. A yes names one to five declarations, each by file and name. The
+worker ticks the item only if each named file of that checkout declares a name
+with the same last component, read outside comments and strings; the namespace
+a name is spelled with is not checked. It records each as the normalized path
+and that last component, never the agent's words:
+
+```markdown
+- [x] `zero-one` — Layer 2, the zero-one law (needs: `tail-sigma`; inferred: TauCeti/Probability/Tail.lean#kolmogorov_zero_one on 2026-11-19)
+```
+
+The date is the day of the look, in UTC. An inferred tick counts as done for
+`needs:` like any other. An item found not landed is not asked about again for
+seven days unless its line, the goal, its README or a file its leads are in
+changes. The tick is computed, like every edit (see Writing, above), on the list
+where it is published, and is made only if the goal and the item's line there
+are still as the agent was given them and the item is still open. Otherwise
+nothing is published and the next look asks again.
+
+**Reopened by a dependent.** A roadmap round handed an item whose `needs:`
+include inferred ticks is told which they are, and that if one is missing or
+unusable for its item it writes that slug on a line of its own to a file the
+prompt names (in the worker's state, `target-report/prerequisites.txt`). After
+the round the worker reads at most 4 KiB of it, keeps only slugs that are
+inferred `needs:` of the item that round was handed, and opens each again: `[ ]`,
+its `inferred:` clause dropped and
+`reopened: <its evidence> by <item> round <round id>` added, but only while its
+`inferred:` clause still names the evidence that round was shown. It waits up to
+two minutes for the list's lock, and does not move the look gap; a report it
+cannot apply then is kept in the worker's state, with the list it was made
+against, and tried again on that list before each of that worker's later
+roadmap rounds. Each prerequisite is shown to the round
+with its area and whole line, whichever area it is in. A tick
+earned by a merged pull request (`landed:`, or an `[x]` without `inferred:`) is
+never opened this way.
+
+**Layer audit.** Items whose description begins `Layer N,` belong to that
+layer of the area's roadmap. When every such item of an area is ticked, and the
+area's own `tauceti-coverage:v1` header in the roadmap's `STATUS.md` names a
+layer with exactly that id in a state other than `done`, each inferred tick in
+the layer that is dated before the status header's date is opened again, with
+`reopened: <its evidence> by coverage <layer> <state> on <status date>`. A
+missing or unparseable header, a header whose `readme_sha` is not the SHA-256
+of the area's README as attached now, a second header for the area, no layer with that
+exact id, a status no later than the tick (both dates in UTC), or an inferred tick with no date
+changes nothing. Earned ticks are never opened this way.
+
+**Not again on the same evidence.** A `reopened:` clause stays on the item. A
+later yes for it is discarded unless it names a declaration that clause did not,
+compared by normalized path and last name component, so two declarations of one
+file that share a last component count as the same evidence;
+the agent sees the clause in the item's line.
+
+An inference look costs, besides the reads above, one listing of open pull
+requests on each forge, a shallow fetch of the content base, one `git grep` per
+quoted name and per slug, the roadmap attach the authoring round also makes,
+and one agent run when any item is to be asked about.
+
 ## What the agent sees
 
 The roadmap prompt gains one bullet at the top of "Choose a target": the
@@ -140,6 +314,8 @@ assigned slug and area, the instruction to author that item or a prerequisite
 inside the same roadmap and nothing else, the exact marker for the pull request
 body (with `"partial":true` when the pull request lands only part of the item),
 and the area's items with their live statuses under the file's preamble.
+With inferred completion on, it also names the item's inferred prerequisites
+and the file to report one wanting (see [Inferred completion](#inferred-completion)).
 `gh-safe-pr-create` refuses a body that does not carry the assigned item's
 marker; in a Forgejo round its `gh pr create` goes through the source-bound
 `gh`, so the check is the same on both forges.

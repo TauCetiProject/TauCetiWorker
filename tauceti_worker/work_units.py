@@ -72,6 +72,7 @@ from .constants import (
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    EXPLICIT_TASKS,
     MAX_FIX_ATTEMPTS,
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
@@ -131,6 +132,8 @@ from .targets import (
     Targets,
     candidates,
     github_history_enabled,
+    inference_enabled,
+    inferred_needs,
     inventory_keys,
     landed_pr,
     live_targets,
@@ -138,6 +141,7 @@ from .targets import (
     open_pr,
     overlay_live,
     render_assignment,
+    render_report,
     target_markers,
 )
 from .worker_sources import pull_url as source_pull_url
@@ -161,7 +165,7 @@ def want(only: list[str], task: str) -> bool:
             return False
         if task == "security-audit" and not project.feature("security_audit"):
             return False
-    if task == "security-audit":
+    if task in EXPLICIT_TASKS:
         return task in only
     return (not only) or (task in only)
 
@@ -730,6 +734,18 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     claim_collision = False
     from .state_repair import retry_key
 
+    # `reconcile` is about the operator's target list, not a pull request, so like `roadmap` it is
+    # dispatched outside the candidate lists and a `--pr` round does not do it. It goes first because
+    # its own gap keeps it to a few rounds a day and what it ticks decides what authoring may take. A
+    # look that changes nothing declines, and the round goes on.
+    reconciliation = Candidate(0, "", "")
+    if want(opts.only, "reconcile") and not getattr(opts, "prs", ()):
+        from .reconcile import due
+
+        reconcile_due, reconciliation.reason = due(w.counters)
+        if reconcile_due and (rc := dispatch("reconcile", w, sv, reconciliation, opts)) is not None:
+            return rc
+
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
     for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages)):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
@@ -812,6 +828,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     for stage in ("overlap-fix", "overlap-scan"):
         if stage in opts.only and sv.kind(stage).suppressed:
             raise NoProgress(f"{stage}: {sv.kind(stage).suppressed[0].reason}")
+    if set(opts.only) == {"reconcile"} and reconciliation.reason:
+        raise NoProgress(f"reconcile: {reconciliation.reason}")
     error = ClaimCollision if claim_collision or w.selection_changed else NoEligibleWork
     raise error(f"no eligible work this round under {scope}")
 
@@ -1111,7 +1129,7 @@ def _selected_pr_matches(stage: str, c: Candidate, live, *, explicit=False) -> b
 def _still_actionable(stage: str, w: Worker, sv: Survey, c: Candidate, *, explicit=False) -> bool | None:
     from tauceti_tools.forge import GITHUB, RepositoryRef
 
-    if not c.pr and stage in ("roadmap",):
+    if not c.pr and stage in ("roadmap", "reconcile"):
         return True  # no pull request to re-read or to authorize on any source
     source_repository = getattr(c, "source_repository", None)
     if source_repository is not None:
@@ -1335,7 +1353,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
         "progress": (PROGRESS_ERROR_KEY,),
     }.get(stage, ())
     before = {key: w.counters.read(key) for key in keys}
-    admission_keys = (*keys, "progress-attempt-ts") if stage == "progress" else keys
+    admission_keys = (*keys, f"{stage}-attempt-ts") if stage in ("progress", "reconcile") else keys
     admission_before = {key: w.counters.read(key) for key in admission_keys}
     foreign_receipt = (
         w.cfg.state / f"rebase-foreign-launch-{pr}.json"
@@ -1454,6 +1472,16 @@ def _build_cache_deferral(stage: str, c: Candidate) -> dict | None:
     return None
 
 
+def _model_free(stage: str) -> bool:
+    """Whether `stage` starts no agent, so dispatch neither resolves nor probes one for it."""
+    return stage == "reconcile" and not inference_enabled()
+
+
+def model_free_selection(only) -> bool:
+    """Whether every stage `only` selects starts no agent, so the round needs no model at all."""
+    return bool(only) and all(_model_free(stage) for stage in only)
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Return its rc, or None to decline this candidate and try another.
 
@@ -1508,7 +1536,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
         return _close_spent_pr(w, sv, c, explicit=explicit)
-    profile = _effective_authoring_profile(opts) if stage != "review" else None
+    model_free = _model_free(stage)
+    profile = _effective_authoring_profile(opts) if stage != "review" and not model_free else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
         kiro_probe_profile = resolve_authoring_profile("kiro", cli_model=_kiro_review_model("kiro"))
@@ -1522,7 +1551,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # would hit the identical failure, so it must not be charged to any single PR's error budget.
     # A default Codex authoring round also makes its read-only entitlement probe on the host before
     # entering Bubble, against the same mirrored subscription credential. Explicit Codex pins bypass it.
-    if not bubble or needs_codex_probe or needs_kiro_probe:
+    if (not bubble or needs_codex_probe or needs_kiro_probe) and not model_free:
         binname = (
             "codex"
             if needs_codex_probe
@@ -1541,7 +1570,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # Re-check --account here, immediately before the first thing that can spend: the entitlement probe
     # below already talks to the provider under this credential. run_round re-mirrors the operator's
     # credentials at the top of every round, so a rotation since preflight is visible by now.
-    if getattr(opts, "account", None):
+    if getattr(opts, "account", None) and not model_free:
         raise_on_account_mismatch(w.cfg, opts.account, opts.work_model, stage)
     # Last free check before the entitlement probe can spend a provider request. Everything above this line is local (a binary on PATH, the
     # configured account), so it stays ahead of a network read that only matters if we get this far.
@@ -1577,6 +1606,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         "lint-repair": do_lint_repair,
         "progress": do_progress,
         "roadmap": do_roadmap,
+        "reconcile": do_reconcile,
         "overlap-scan": do_overlap_scan,
         "overlap-fix": do_overlap_fix,
     }[stage]
@@ -1596,6 +1626,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         review_model = _claude_review_model(opts.work_model)
         if review_model:
             detail += f", model={review_model}"
+    elif model_free:
+        detail = "no model"
     else:
         profile = _effective_authoring_profile(opts)
         effort = profile.effort or "none"
@@ -1625,14 +1657,15 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
 
         stack.enter_context(admission_unit(w.cfg.wid if w is not None and hasattr(w, "cfg") else ""))
         try:
-            stack.enter_context(
-                api_context(
-                    w.cfg.wid if api_mode() else "",
-                    stage,
-                    host=not bubble or stage == "progress",
-                    model=profile.model if profile else (review_model if stage == "review" else None),
+            if not model_free:
+                stack.enter_context(
+                    api_context(
+                        w.cfg.wid if api_mode() else "",
+                        stage,
+                        host=not bubble or stage == "progress",
+                        model=profile.model if profile else (review_model if stage == "review" else None),
+                    )
                 )
-            )
         except (BudgetError, OSError) as error:
             if not api_mode():
                 raise
@@ -1730,6 +1763,12 @@ def do_overlap_fix(w, sv, c, opts, bubble):
     from .overlaps import do_fix
 
     return do_fix(w, sv, c, opts, bubble)
+
+
+def do_reconcile(w, sv, c, opts, bubble):
+    from .reconcile import run
+
+    return run(w, c, _effective_authoring_profile(opts) if inference_enabled() else None)
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
@@ -3273,11 +3312,23 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     only = c.reason or "any"
     skip = roadmap_skip()
     assignment = ""
+    report = None
     targets_path = roadmap_targets()
     if targets_path is not None:
+        if inference_enabled():
+            from .reconcile import retry_pending
+
+            retry_pending(w.cfg.state / "target-report-pending.json")
         live, item = assign_target(w, targets_path, only, skip)
         only = item.area
         assignment = render_assignment(live, item)
+        needs = inferred_needs(live, item) if inference_enabled() else []
+        if needs:
+            report = (w.cfg.state / "target-report", item, needs, targets_path.resolve())
+            shutil.rmtree(report[0], ignore_errors=True)
+            report[0].mkdir(parents=True)
+            shown = "/opt/target-report" if bubble else str(report[0])
+            assignment += render_report(live, item, needs, f"{shown}/prerequisites.txt")
         os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))
         report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
     elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
@@ -3367,7 +3418,9 @@ other contributors' claims, or the hard rules of the repo.
             mounts.append(f"{source_dir}:/opt/source:ro")
         if inventory_file is not None:
             mounts.append(f"{inventory_file}:/opt/source-targets.json:ro")
-        return run_in_bubble(
+        if report is not None:
+            mounts.append(f"{report[0]}:/opt/target-report:rw")
+        rc = run_in_bubble(
             w,
             TAUCETI,
             fill_prompt(
@@ -3396,6 +3449,8 @@ other contributors' claims, or the hard rules of the repo.
             mounts=mounts,
             allow_push=fork,  # bubble grants git fetch/push to the fork (kim-em/bubble#320)
         )
+        _reopen_reported(report)
+        return rc
     if not prepare_checkout(w.cfg, work="roadmap", roadmap=only or None):
         raise Die("checkout failed")
     prompt = fill_prompt(
@@ -3442,7 +3497,31 @@ other contributors' claims, or the hard rules of the repo.
     finally:
         from .self_tested_label import scoped_publications
 
+        _reopen_reported(report)
         if (w.cfg.checkout / ".git").exists() and (published := scoped_publications(w.cfg.checkout, push_scope)):
             if c.progress is None:
                 c.progress = {}
             c.progress.update(published_branches=published, published_owner=fork_owner)
+
+
+def _reopen_reported(report) -> None:
+    """Open again the inferred prerequisites a roadmap round reported wanting (render_report)."""
+    if report is None:
+        return
+    from .activity import current_round_id
+    from .reconcile import keep_pending, reopen, reported
+    from .targets import inferred
+
+    directory, item, needs, listed = report
+    seen = {dep.slug: tick[0] for dep in needs if (tick := inferred(dep)) is not None}
+    slugs = reported(directory / "prerequisites.txt", seen)
+    if not slugs:
+        return
+    by = f"{item.slug} round {(current_round_id() or str(int(time.time())))[:12]}"
+    try:
+        done = reopen(slugs, seen, by, listed)
+    except OSError as error:
+        log(f"target list: {', '.join(slugs)} not reopened ({error})")
+        done = None
+    if done is None:
+        keep_pending(directory.parent / "target-report-pending.json", listed, slugs, seen, by)

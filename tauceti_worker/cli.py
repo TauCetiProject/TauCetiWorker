@@ -116,7 +116,7 @@ from .runtime_status import report_failure, report_runtime
 from .survey import Counters, survey
 from .tui import cmd_tui, render_survey
 from .usage import kiro_data_dir, usage_snapshot
-from .work_units import RoundOpts, Worker, _bubble, raise_on_account_mismatch, run_round, want
+from .work_units import RoundOpts, Worker, _bubble, model_free_selection, raise_on_account_mismatch, run_round, want
 from .worker_manager import WorkersError, add_workers_parser, cmd_managed_runner, cmd_workers
 
 # ============================================================================
@@ -1365,6 +1365,24 @@ def cmd_status(args) -> int:
     return 1 if sv.github_failed else 0
 
 
+def round_work_model(cfg, only, agent, *, dry, ignore_quota, quota_cmd, fresh, already_paced) -> str:
+    """The provider a round's work runs with: `agent` itself when the selection starts no agent
+    (`model_free_selection`), Claude in API billing mode, otherwise the paced choice."""
+    if model_free_selection(only):
+        return agent
+    if api_mode():
+        return "claude"
+    return resolve_work_model(
+        cfg,
+        agent,
+        dry=dry,
+        ignore_quota=ignore_quota,
+        quota_cmd=quota_cmd,
+        fresh=fresh,
+        **({"already_paced": True} if already_paced else {}),
+    )
+
+
 def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[int, ...] = ()) -> int:
     if "security-audit" in only:
         from .security_audit import require_admin
@@ -1433,6 +1451,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         from .targets import load_targets
 
         load_targets(roadmap_targets())
+    if "reconcile" in only and roadmap_targets() is None:
+        raise Die("--only reconcile needs a target list: pass --roadmap-targets FILE")
     # Persist the operator's choice into loop children and recovery rounds.
     if getattr(args, "self_tested", None) is not None:
         os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
@@ -1607,18 +1627,16 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         # A `_round` child is spawned by a loop driver that forced a usage read moments ago, so it may
         # use that. A one-shot `tauceti work` has nothing recent behind it and must look for itself,
         # rather than refuse the round on a cached verdict that may be an hour old.
-        if api_mode():
-            work_model = "claude"
-        else:
-            work_model = resolve_work_model(
-                cfg,
-                agent,
-                dry=dry,
-                ignore_quota=ignore_quota,
-                quota_cmd=quota_cmd,
-                fresh=not one_round,
-                **({"already_paced": True} if one_round and getattr(args, "loop_paced", False) else {}),
-            )
+        work_model = round_work_model(
+            cfg,
+            only,
+            agent,
+            dry=dry,
+            ignore_quota=ignore_quota,
+            quota_cmd=quota_cmd,
+            fresh=not one_round,
+            already_paced=one_round and getattr(args, "loop_paced", False),
+        )
         authoring_profile = None
         if work_model != "auto":
             authoring_profile = resolve_authoring_profile(
@@ -1840,7 +1858,9 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
     # engine and never compiles (same reason it's excluded from the fork preflight below). Excluding it
     # keeps a host-default `--only review` worker from being falsely blocked on a machine with no toolchain.
     needs_host_build = any(
-        (not _bubble(s, opts)) for s in WORK_TASKS if want(opts.only, s) and s not in ("review", "overlap-scan")
+        (not _bubble(s, opts))
+        for s in WORK_TASKS
+        if want(opts.only, s) and s not in ("review", "overlap-scan", "reconcile")
     )
     if needs_host_build:
         from .agents import lake_cache_max_revs
