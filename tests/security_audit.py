@@ -711,6 +711,27 @@ class WorkerBoundJudgments(unittest.TestCase):
         self.replace_answer(value)
         return value
 
+    def test_recovery_never_continues_or_revalidates_evidence_that_holds(self):
+        value = self.unfinished_evidence()
+        value["verdict"] = "pass"
+        self.replace_answer(value)
+        # A malformed concern beside the pass cannot be read, so the block holds.
+        with (self.original / "model-rollout-0.jsonl").open("a") as f:
+            note = {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": '{"findings":["unsafe IO"],}'}],
+                },
+            }
+            f.write(json.dumps(note) + "\n")
+        with patch.object(sa, "inspect") as model, patch.object(sa, "advance") as advance:
+            self.assertFalse(recovery.recover(self.cfg, self.opts, self.block))
+        model.assert_not_called()
+        advance.assert_not_called()
+
     def test_unfinished_and_premature_pass_continue_but_never_bind_as_approval(self):
         value = self.unfinished_evidence()
         for verdict in ("unfinished", "pass"):

@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 
 from .audit_alerts import notify_block, save
-from .audit_evidence import NotJudged, outcome_of
+from .audit_evidence import NotJudged, holds, outcome_of
 from .audit_progress import continuable, coverage
 from .config import Die, NoProgress, log
 
@@ -508,6 +508,10 @@ def recover(cfg, opts, previous: dict) -> bool:
     from . import security_audit as sa
 
     work = cfg.state / sa.CURSOR
+    # The shared classification decides first: evidence holding a concern, or evidence that
+    # cannot be read, is never continued or revalidated as a pass.
+    if previous.get("outcome") in ("finding", "unreadable") or holds(work, Path(previous.get("attempt", ""))):
+        return False
     try:
         original, batch, execution, legacy = retained(work, previous)
         protocol = execution.get("protocol_version", 1)
