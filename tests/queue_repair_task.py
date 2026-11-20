@@ -7180,6 +7180,8 @@ class NumprojImports(NumprojBase):
             "import /- inline -/ TauCeti.A -- a comment\nmeta import all TauCeti.B\n\n/-! doc -/\n"
             "theorem t : True := trivial\nimport Not.Header\n"
         )
+        nested = "/- outer /- inner -/ outer -/\nimport TauCeti.A\n-- /- not a block\nimport TauCeti.B\n"
+        self.assertEqual(repair_numproj.header_imports(nested), ["TauCeti.A", "TauCeti.B"])
         self.assertEqual(repair_numproj.header_imports(text), ["Mathlib.Logic.Basic", "TauCeti.A", "TauCeti.B"])
 
     def test_a_conflicting_file_is_built_at_the_clean_prefix_and_restored(self):

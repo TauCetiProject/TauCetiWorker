@@ -242,12 +242,31 @@ def _run_tool(worktree: Path, env: dict, tool: Path, files: list[Path], cache: P
     return repair.run_logged(wrapped, worktree, log, env=run_env, timeout=timeout)
 
 
+def _without_comments(text: str) -> str:
+    """``text`` with Lean's line comments and (nested) block comments replaced by spaces."""
+    out, depth, i = [], 0, 0
+    while i < len(text):
+        two = text[i : i + 2]
+        if depth == 0 and two == "--":
+            end = text.find("\n", i)
+            i = len(text) if end < 0 else end
+        elif two == "/-":
+            depth, i = depth + 1, i + 2
+        elif depth and two == "-/":
+            depth, i = depth - 1, i + 2
+            out.append(" ")
+        else:
+            if depth == 0:
+                out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
 def header_imports(text: str) -> list[str]:
     """The modules a Lean file's header imports: its leading `module`, `prelude` and `import` lines with
     their modifiers, comments skipped, up to the first other token."""
-    text = re.sub(r"--[^\n]*", " ", re.sub(r"/-.*?-/", " ", text, flags=re.S))
     modules, expecting = [], False
-    for token in text.split():
+    for token in _without_comments(text).split():
         if expecting:
             if token != "all":
                 modules.append(token)
@@ -274,28 +293,25 @@ def module_path(module: str) -> str:
 
 
 def _build_imports(
-    worktree: Path, prefix: str, sides: dict, paths: list[str], env: dict, log: Path, timeout: float, lake, lock
+    worktree: Path, prefix: str, commit: str, sides: dict, env: dict, log: Path, timeout: float, lake, lock
 ) -> bool:
     """Build the modules the tool needs to elaborate the files (``imported_modules``), with the clean
     prefix's version of every conflicting file in place of git's markers meanwhile (one of the modules
-    may import one); False when the build fails, since the tool cannot elaborate the files then."""
+    may import one); the worktree is then back at ``repair.apply_conflict``'s state. False when the
+    build fails, since the tool cannot elaborate the files then."""
     from tauceti_queue import repair, repair_tools
 
     modules = imported_modules(worktree, sides)
     if not modules:
         return True
     argv = repair_sandbox.sandboxed_lake([*lake, "build", *modules], worktree, env)
-    marked = {p: (worktree / p).read_bytes() for p in paths if (worktree / p).is_file()}
-    clean = {p: _blob(worktree, prefix, p) for p in marked}
     with repair_tools.build_lock(worktree, log=lambda *a, **k: None, lock=lock):
         try:
-            for path, data in clean.items():
-                if data is not None:
-                    _write(worktree / path, data)
+            for path, (ours, _, _) in sides.items():
+                _write(worktree / path, ours)
             return repair.run_logged(argv, worktree, log, env=env, timeout=timeout)["rc"] == 0
         finally:
-            for path, data in marked.items():
-                _write(worktree / path, data)
+            repair.apply_conflict(worktree, prefix, commit)
 
 
 def _merge(ours: bytes, base: bytes, theirs: bytes, labels: tuple[str, str, str]) -> tuple[int, bytes] | None:
@@ -365,7 +381,7 @@ def prepass(
     scratch, directory = None, None
     try:
         log = logdir / f"numproj-{commit[:12]}-imports.log"
-        if not _build_imports(worktree, prefix, sides, paths, env, log, timeout, lake, build_lock):
+        if not _build_imports(worktree, prefix, commit, sides, env, log, timeout, lake, build_lock):
             return None
         cache = _private_dir(worktree / ".lake", SCRATCH, "cache")  # the compiled scanner, per toolchain
         scratch = _private_dir(worktree / ".lake", SCRATCH, f"run-{secrets.token_hex(6)}")
