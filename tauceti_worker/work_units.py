@@ -2206,7 +2206,9 @@ def _do_fixlike(
         PR=pr,
         HEAD=head,
         CLOSE_AUTHORITY=(
-            "You may close this PR only while its live author is the authenticated account on this source forge."
+            "You may close this PR only while its live author is the authenticated account on this source forge"
+            + _adopted_authors_note(sv)
+            + "."
             if may_close
             else "You may NOT close this PR: it is not your authored PR or has a special repair scope."
         ),
@@ -2352,6 +2354,20 @@ FINAL_ATTEMPT_INSTRUCTION = (
     "`quality-pass` report: there, update the description and reply on the finding's thread, "
     "and that completes the attempt.\n"
 )
+
+
+def _adopted_authors_note(sv) -> str:
+    """Name adopted Forgejo authors in a close authority, so the agent's live check matches `owns`."""
+    repository = getattr(sv, "source_repository", None)
+    if repository is None or repository.forge.kind != "forgejo":
+        return ""
+    from .source_identity import adopted_author_ids
+
+    ids = sorted(adopted_author_ids())
+    if not ids:
+        return ""
+    listed = ", ".join(str(i) for i in ids)
+    return f", or a PR from a branch of this repository whose live author has Forgejo user ID {listed}"
 
 
 def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:

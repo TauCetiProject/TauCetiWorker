@@ -1349,8 +1349,9 @@ class GitHubAdapter:
         )
 
     def _self_tested(self, repo, number, pull, paths, merge_base):
-        """Inline self-tested eligibility (live membership and bump reads) and, for an eligible head,
-        the PR-level diff guards PR CI would have run."""
+        """Inline self-tested eligibility (live membership and bump reads), whether an admin's
+        `large-refactor` label lifts the size caps, and, for an eligible head, the PR-level diff
+        guards PR CI would have run."""
         from tauceti_tools.self_tested import eligible, requested
 
         local = False
@@ -1371,8 +1372,11 @@ class GitHubAdapter:
                 member_read=self.team_member_read,
             )
         # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
-        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()
-        return local, guard
+        exempt = diff_guard.large_refactor(
+            self.clone_dir, pull.head_sha, lambda path: self.client.get_json(path)[1], repo, number, pull.labels
+        )
+        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if local else ()
+        return local, guard, exempt
 
     def admission_snapshot_single(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """The same snapshot as `admission_snapshot`, from one GraphQL read (decision 38 step 4, slice 5).
@@ -1438,7 +1442,7 @@ class GitHubAdapter:
             return self._full_snapshot(repo, number, generation)
         comments = tuple(_graphql_comment(comment) for comment in connection["nodes"])
         paths = self._admission_paths(merge_base, head)
-        local, guard = self._self_tested(repo, number, pull, paths, merge_base)
+        local, guard, exempt = self._self_tested(repo, number, pull, paths, merge_base)
         statuses = {
             s["context"]: str(s.get("state") or "").lower()
             for s in (commit.get("status") or {}).get("contexts", ())
@@ -1446,7 +1450,7 @@ class GitHubAdapter:
         }
         from tauceti_tools.self_tested import requested
 
-        if requested(pull.labels):
+        if requested(pull.labels) or exempt:
             # Membership and bump reads came after the response: fence them as the full read does.
             fresh, statuses = self._admission_fence(repo, number, pull)
             if (fresh.head_sha, fresh.base_sha, fresh.base_ref, fresh.state, fresh.draft, sorted(fresh.labels)) != (
@@ -1473,6 +1477,7 @@ class GitHubAdapter:
             self._diff_version(base, head),
             self_tested=local,
             diff_guard=guard,
+            large_refactor=exempt,
         )
 
     def _full_snapshot(self, repo, number, generation):
@@ -1521,7 +1526,7 @@ class GitHubAdapter:
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
-        local, guard = self._self_tested(repo, number, pull, paths, merge_base)
+        local, guard, exempt = self._self_tested(repo, number, pull, paths, merge_base)
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
@@ -1558,6 +1563,7 @@ class GitHubAdapter:
             self._diff_version(pull.base_sha, pull.head_sha),
             self_tested=local,
             diff_guard=guard,
+            large_refactor=exempt,
         )
 
     def _admission_fence(self, repo, number, pull, *, labels_progress=None):
