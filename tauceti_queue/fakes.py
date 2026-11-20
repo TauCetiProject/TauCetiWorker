@@ -761,10 +761,31 @@ class FakeGitHub:
         ) and allowed_paths(paths)
         from . import diff_guard
 
-        guard = diff_guard.violations(self.repo.clone, base, pull.head_sha) if local else ()
-        return AdmissionSnapshot(
-            pull, base, paths, tuple(source["comments"]), source["statuses"], base, self_tested=local, diff_guard=guard
+        exempt = pull.head_sha in getattr(self, "large_refactor_heads", set())
+        guard = (
+            diff_guard.violations(self.repo.clone, base, pull.head_sha, large_refactor=exempt)
+            if local or exempt
+            else ()
         )
+        return AdmissionSnapshot(
+            pull,
+            base,
+            paths,
+            tuple(source["comments"]),
+            source["statuses"],
+            base,
+            self_tested=local,
+            diff_guard=guard,
+            large_refactor=exempt,
+        )
+
+    def bump_guard(self, repo, head):
+        """`bump_verdicts[head]`: True or False is the verdict, None an unreadable input."""
+        self._call("bump_guard", head)
+        verdict = getattr(self, "bump_verdicts", {}).get(head, False)
+        if verdict is None:
+            raise GitHubUnavailable("fake bump-guard inputs unavailable")
+        return verdict
 
     def list_open_pull_requests(
         self, repo: str, *, review_app_id: int, admission=False, on_page=None
