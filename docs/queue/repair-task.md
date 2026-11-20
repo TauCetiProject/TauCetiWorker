@@ -133,9 +133,9 @@ The controller's dedicated acceptance path (`Controller._continue_replay`) requi
 parent to be the clean prefix, its message to be the conflicting commit's with text appended and no
 other `Source-PR` or `Accepted-Head`, and a no-repair member to be left alone or emptied. It then
 replays the commits after the conflicting one onto it with `chain.replay`, and refuses the resolution
-(`absorbed-later-member`) when a later member becomes empty although it did not land on the base and
-its change applies onto the clean prefix and changes it: a resolution that took in a later member's
-change is a replay by hand. A member that conflicts with the prefix is not judged, since commits between
+(`absorbed-later-member`) when a later member, replayed already or still pending, did not land on the
+base, its change is already in the resolved commit, and it applies onto the clean prefix and changes
+it: a resolution that took in a later member's change is a replay by hand. A member that conflicts with the prefix is not judged, since commits between
 may legitimately empty it and refusing would leave the task nothing to submit; content moved between
 members in part is not detected mechanically, as for any repair. These are checked before the replay advances because a later task cannot undo them. A clean replay is the whole
 chain on `onto`: it goes through the ordinary validation and comparison and is adopted (the head's
@@ -145,7 +145,8 @@ as `resolved-commit` (`Controller._next_conflict`): nothing is adopted, and a ta
 the same chain resolves the next conflicting commit on the new clean prefix, which holds the earlier
 resolutions; it is created in the same transaction, and inherits an evicted batch's retained-task
 marker and a preserved pre-rebase task's preservation. Because it holds accepted resolutions
-(`continues` in its diagnostic), it is preserved across a head round even while unclaimed. Conflict tasks take
+(`continues` in its diagnostic), it is preserved across a head round even while unclaimed, and an
+open batch waiting on it is not sealed until it is resolved. Conflict tasks take
 no repair checkpoints.
 
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,

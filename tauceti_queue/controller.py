@@ -6017,6 +6017,10 @@ class Controller:
             # Keep the batch open while its owner prepares or pre-rebases it. Adoption uses the
             # ordinary open-batch validation, and the next head keeps the completed work.
             return f"open batch {batch['id']} is claimed; sealing waits for the release", True
+        pending = self._open_pre_rebase_task(batch)
+        if pending is not None and self._continues(pending):
+            # Its clean prefix holds accepted resolutions, which sealing now would discard.
+            return f"open batch {batch['id']} waits for its pre-rebase task {pending['id']}", False
         return None
 
     def _seal_clean_prefix(self, batch: dict[str, Any], now: float) -> bool:
@@ -6435,25 +6439,26 @@ class Controller:
     def _absorbed_members(
         self, task: dict[str, Any], step: dict[str, Any], result: chain.ChainResult, resolved: str
     ) -> list[chain.Violation]:
-        """Later members a resolution took into itself: empty when replayed onto it, though they did not
-        land on the base and their change applies onto the clean prefix and changes it. Taking a later
-        member's content is replaying it by hand, which would leave that member an empty commit. A
-        member that conflicts with the prefix is not judged: commits between may legitimately empty it,
-        and refusing such a resolution would leave the task nothing it could submit."""
-        emptied = {
-            r.source_pr
-            for r in result.commits
-            if r.status == chain.CLEAN and r.empty and not r.landed_on_base and r.sha is not None
-        }
-        if not emptied:
-            return []
+        """Later members a resolution took into itself, replayed already or still pending: their change
+        is already in the resolved commit (applied there it changes nothing), though they did not land on
+        the base and it applies onto the clean prefix and changes it. Taking a later member's content is
+        replaying it by hand, which would leave that member an empty commit. A member that conflicts
+        with the prefix is not judged: commits between may legitimately cover it, and refusing such a
+        resolution would leave the task nothing it could submit."""
+        landed = {r.source_pr for r in result.commits if r.landed_on_base}
+        resolved_tree = chain.tree_of(self.clone, resolved)
         prefix_tree = chain.tree_of(self.clone, step["clean_prefix_tip"])
         found = []
         for later in chain.chain_commits(self.clone, step["commit"], task["tip"]):
-            if later.source_pr not in emptied or later.tree == chain.tree_of(self.clone, later.parents[0]):
+            if later.source_pr in landed or later.tree == chain.tree_of(self.clone, later.parents[0]):
                 continue
-            outcome = chain.merge_trees(self.clone, step["clean_prefix_tip"], later.sha, merge_base=later.parents[0])
-            if outcome.clean and outcome.tree != prefix_tree:
+            onto_resolved = chain.merge_trees(self.clone, resolved, later.sha, merge_base=later.parents[0])
+            if not onto_resolved.clean or onto_resolved.tree != resolved_tree:
+                continue
+            onto_prefix = chain.merge_trees(
+                self.clone, step["clean_prefix_tip"], later.sha, merge_base=later.parents[0]
+            )
+            if onto_prefix.clean and onto_prefix.tree != prefix_tree:
                 found.append(
                     chain.Violation(
                         "absorbed-later-member",
