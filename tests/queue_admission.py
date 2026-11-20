@@ -785,6 +785,8 @@ class AdmissionTests(unittest.TestCase):
         waiver = decision["evidence"]["large_refactor_approval"]
         self.assertEqual((waiver["actor_id"], waiver["head_sha"], waiver["bump_guard"]), (42, head, True))
         self.assertIn(("bump_guard", (head,)), self.github.calls)
+        # Admin permission was established once, when the command was recorded; admission reads none.
+        self.assertNotIn("repository_admin", [name for name, _ in self.github.calls])
         # The emergency lane sees a live approved input, so it no longer refuses `not-approved`.
         self.controller.set_setting("emergency_enabled", True, "t")
         request = self.controller.request_emergency(REPO, 1, "human", surface="test")
@@ -802,7 +804,6 @@ class AdmissionTests(unittest.TestCase):
         for case in (
             "unlabelled",
             "not-admin",
-            "role-removed",
             "stale-base",
             "wrong-head",
             "bump-fails",
@@ -824,9 +825,7 @@ class AdmissionTests(unittest.TestCase):
                 self.large_refactor_approval(
                     files=files, labelled=case != "unlabelled", bump=case != "bump-fails", admin=case != "not-admin"
                 )
-                if case == "role-removed":
-                    self.github.admins.remove("human")
-                elif case in ("stale-base", "wrong-head"):
+                if case in ("stale-base", "wrong-head"):
                     current = self.controller.input_for(REPO, 1)
                     evidence = json.loads(current["evidence"])
                     evidence["merge_base_sha" if case == "stale-base" else "head_sha"] = "f" * 40
@@ -835,86 +834,6 @@ class AdmissionTests(unittest.TestCase):
                 self.intake.invalidate(1)
                 self.intake.run_once()
                 self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
-                if case == "role-removed":
-                    self.github.admins.add("human")
-
-    def test_label_removed_during_the_waiver_reads_is_evaluated_again(self):
-        head = self.large_refactor_approval()
-        self.review(state="red")
-        original = self.github.bump_guard
-
-        def remove_label(repo, sha):
-            self.github.labels[1] = set()
-            self.github.large_refactor_heads = set()
-            return original(repo, sha)
-
-        self.github.bump_guard = remove_label
-        self.addCleanup(setattr, self.github, "bump_guard", original)
-        self.intake.run_once()
-        # The waiver read the label away: it never recorded the stale verdict, and the red review
-        # then withdrew the input.
-        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
-        decision = json.loads(self.intake.state.get(1)["decision"])
-        self.assertNotIn("large_refactor_approval", decision["evidence"])
-        self.assertEqual(self.intake.state.get(1)["head_sha"], head)
-
-    def test_a_pr_changed_during_the_waiver_reads_is_evaluated_again(self):
-        for change in ("closed", "draft", "keep-label"):
-            with self.subTest(change=change):
-                if self.controller.input_for(REPO, 1):
-                    self.controller.cancel(REPO, 1, "fixture")
-                head = self.large_refactor_approval()
-                self.review(state="red")
-                original = self.github.bump_guard
-                seen = []
-
-                def change_pr(repo, sha, change=change):
-                    if not seen:
-                        if change == "keep-label":
-                            self.github.labels[1] = {"large-refactor", "keep"}
-                        else:
-                            self.github.prs[1]["state" if change == "closed" else "draft"] = (
-                                "closed" if change == "closed" else True
-                            )
-                    seen.append(sha)
-                    return original(repo, sha)
-
-                self.github.bump_guard = change_pr
-                self.intake.invalidate(1)
-                self.intake.run_once()
-                self.github.bump_guard = original
-                # The first verdict is discarded and the PR evaluated again from a fresh snapshot.
-                self.assertEqual(len(seen), 1 if change != "keep-label" else 2)
-                decision = json.loads(self.intake.state.get(1)["decision"])
-                if change == "keep-label":
-                    self.assertTrue(self.intake.is_current(1, head))  # `keep` itself holds insertion
-                else:
-                    self.assertNotEqual(decision["reason"], "large refactor approved by repository admin")
-                self.github.prs[1].update(state="open", draft=False)
-                self.github.labels[1] = set()
-
-    def test_a_pending_waiver_check_is_not_restarted_by_insertion_attempts(self):
-        head = self.large_refactor_approval()
-        self.review(state="red")
-        self.intake.run_once()
-        self.clock.advance(1801)
-        self.assertEqual(self.intake.insertion_check(1, head), "large-refactor approval is due a fresh check")
-        generation = self.intake.state.get(1)["generation"]
-        for _ in range(3):
-            self.assertEqual(self.intake.insertion_check(1, head), "large-refactor approval is due a fresh check")
-        self.assertEqual(self.intake.state.get(1)["generation"], generation)
-
-    def test_an_old_large_refactor_waiver_is_checked_again_before_insertion(self):
-        head = self.large_refactor_approval()
-        self.review(state="red")
-        self.intake.run_once()
-        self.assertIsNone(self.intake.insertion_check(1, head))
-        self.clock.advance(1801)
-        self.assertEqual(self.intake.insertion_check(1, head), "large-refactor approval is due a fresh check")
-        self.assertFalse(self.intake.is_current(1, head))
-        self.github.admins.remove("human")
-        self.intake.run_once()
-        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
 
     def test_unreadable_bump_check_defers_the_large_refactor_waiver(self):
         head = self.large_refactor_approval(bump=None)

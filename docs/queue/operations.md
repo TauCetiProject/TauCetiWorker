@@ -986,14 +986,14 @@ A large refactor that machine review and PR CI cannot cover (a Mathlib bump comb
 mechanical rewrite of thousands of files) may likewise be carried by a repository admin's own
 exact-head `bors r+`, in place of a green scoreboard and green PR statuses. Intake keeps that
 approval, whatever any scoreboard says, only while all of these hold: an admin's `large-refactor`
-label is verified on the head (applied after the head's commit, no force push since); the
-approval's head and merge base still match and its account still has effective admin permission;
-every changed path is under the mathematics prefix or is `lake-manifest.json` or `lean-toolchain`;
-the diff guards the label does not lift (the new-file cap) pass; and, when a pin changes, the
-trusted `check-bump.sh` verdict, run live, passes. A failed permission or bump read leaves
-evaluation pending. Apply the label after the final push, then post `bors r+`; any later push
-cancels the input. The decision records the approval as `large_refactor_approval`. Staging's
-build, audit, pin and scope checks still apply before anything lands.
+label is verified on the head (applied after the head's commit, no force push since); command
+intake recorded the approval as an admin's own, and its head and merge base still match; every
+changed path is under the mathematics prefix or is `lake-manifest.json` or `lean-toolchain`; the
+diff guards the label does not lift (the new-file cap) pass; and, when a pin changes, the trusted
+`check-bump.sh` verdict, run live, passes. An unreadable bump check leaves evaluation pending.
+Apply the label after the final push, then post `bors r+`; any later push cancels the input. The
+decision records the approval as `large_refactor_approval`. Staging's build, audit, pin and scope
+checks still apply before anything lands.
 
 The existing approval-poll thread runs intake. Relevant authenticated webhooks persist dirty PRs
 in `admission_work` in the existing SQLite database before acknowledgment. Reads and git fetches

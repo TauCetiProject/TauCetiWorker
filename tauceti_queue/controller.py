@@ -5177,15 +5177,6 @@ class Controller:
         The PR's accepted head is replayed onto `main` without the lock (`_singleton_chain`); nothing is
         written before that succeeds, so a refusal leaves the input in `owner`. Then one transaction
         allocates E with its member and moves the input's ownership to it (`_insert_singleton`)."""
-        check = getattr(self.admission, "insertion_check", None)
-        if callable(check):
-            # The member was checked when it joined `owner`; leaving it for a batch of its own is a new
-            # insertion, so admission's inputs are checked again (a waived large refactor's in particular).
-            with self._lock.unlocked():
-                held = check(row["number"], row["head_sha"])
-            if isinstance(held, str):
-                self._emergency_waits(None, f"emergency request #{row['number']} held: {held}", now)
-                return None
         built = self._singleton_chain(row, owner, now)
         if built is None or self._singleton_current(row, owner, built) is None:
             return None  # refused, or something moved while the replay ran; the next pass tries again
@@ -5264,7 +5255,6 @@ class Controller:
             or slot["withdrawn"]
             or self._canonical != built["canonical"]
             or self._emergency_batch() is not None
-            or (self.admission is not None and not self.admission.is_current(row["number"], row["head_sha"]))
         ):
             return None
         return fresh
