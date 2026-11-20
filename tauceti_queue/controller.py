@@ -63,6 +63,11 @@ BUILD_CONTEXT = "build"
 # and `scope` the merge-policy verdict (restricted paths, diff size, oversized new files). A head
 # lands only when all three are bound to its run and `success`.
 VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
+# The `build` description pr-build.yml's finalizer (`finalize_batch.py`) posts when the
+# `sandboxed-build` job produced no build-state: its runner died or the job was cancelled or skipped
+# before its report step ran. The report step always writes its own description, so this text is
+# never a verdict on the source; a bound failed status carrying it is infrastructure.
+INCOMPLETE_BUILD_DESCRIPTION = "sandboxed merge-group build did not complete"
 LOG_GRACE_SECONDS = 600  # publication grace for a completed run's bound verdicts and failed-build log
 # A source-candidate run's GitHub job and step phases are read at most this often while it runs, and
 # once more when it completes; observation itself stays on `polling_interval_seconds`. Only the head's
@@ -8383,7 +8388,11 @@ class Controller:
                 self._reasons.append(f"head {head['id']}: run {run.run_id} failed, waiting for its log")
                 self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
                 return
-            if status.description.lower().startswith("infrastructure") or (infrastructure and not source):
+            # The finalizer's "did not complete" status says the build produced no verdict at all.
+            no_verdict = status.description.lower().startswith("infrastructure") or (
+                status.description == INCOMPLETE_BUILD_DESCRIPTION
+            )
+            if no_verdict or (infrastructure and not source):
                 values.update(
                     outcome=OUTCOME_INFRASTRUCTURE, outcome_detail=f"infrastructure-failure: {status.description}"
                 )
