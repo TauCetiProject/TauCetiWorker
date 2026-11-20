@@ -384,6 +384,30 @@ class Releases(unittest.TestCase):
         log = self.run_script("install-repair.sh", "--wait", "4", expect=2)
         self.assertIn("not tauceti-repair.slice", log)
 
+    def test_security_audit_install_moves_only_the_pool(self):
+        self.run_script("install-monitoring.sh", "--wait", "0")
+        monitoring_pid = self.pid("tauceti-queue-monitoring.service")
+        (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
+        second = self.commit("second")
+        self.run_script("install-security-audit.sh", "--wait", "0")
+        [release] = self.release_dirs(second)
+        unit = "tauceti-queue-security-audit.service"
+        self.assertEqual(self.setting(unit, "WorkingDirectory"), str(release))
+        exec_start = self.setting(unit, "ExecStart")
+        self.assertTrue(exec_start.startswith(f"{release}/.venv/bin/python -m tauceti_worker.security_audit pool "), exec_start)
+        self.assertIn("--state %h/TauCetiQueue-data/security-audit", exec_start)
+        self.assertEqual(self.cwd(unit), str(release))
+        self.assertEqual(self.pid("tauceti-queue-monitoring.service"), monitoring_pid)
+
+    def test_security_audit_drop_in_is_refused(self):
+        (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
+        dropins = self.units / "tauceti-queue-security-audit.service.d"
+        dropins.mkdir(parents=True)
+        (dropins / "override.conf").write_text("[Service]\n")
+        log = self.run_script("install-security-audit.sh", "--wait", "0", expect=1)
+        self.assertIn("drop-in", log)
+        self.assertFalse((self.units / "tauceti-queue-security-audit.service").exists())
+
     def test_repair_slice_drop_in_is_refused(self):
         dropins = self.units / "tauceti-repair.slice.d"
         dropins.mkdir()
