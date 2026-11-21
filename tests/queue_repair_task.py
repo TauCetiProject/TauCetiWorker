@@ -24,6 +24,7 @@ the lock behave as the prompt says, and ``--no-stream-repair`` restores the sequ
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import dataclasses
 import io
@@ -49,7 +50,32 @@ from unittest.mock import patch
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+
+def remove_tree(path: Path) -> None:
+    """Remove ``path``, making read-only directories writable when they stop removal."""
+
+    def writable(function, name, _error):
+        # Unlinking needs a writable parent; listing and emptying a directory need it writable too.
+        os.chmod(os.path.dirname(name), stat.S_IRWXU)
+        if os.path.isdir(name) and not os.path.islink(name):
+            os.chmod(name, stat.S_IRWXU)
+        function(name)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, ignore_errors=False, onexc=writable)
+    else:
+        shutil.rmtree(path, ignore_errors=False, onerror=writable)
+
+
+def scratch(test: unittest.TestCase, prefix: str) -> Path:
+    """A fresh directory under ``TMP`` that is removed when ``test`` finishes."""
+    root = Path(tempfile.mkdtemp(prefix=prefix, dir=TMP))
+    test.addCleanup(remove_tree, root)
+    return root
+
+
 TMP = Path(tempfile.mkdtemp(prefix="queue-repair-task-"))
+atexit.register(lambda: TMP.exists() and remove_tree(TMP))
 BIN = TMP / "bin"
 BIN.mkdir()
 HOME = TMP / "home"
@@ -1131,7 +1157,7 @@ class Fixture(unittest.TestCase):
     MEMBER_FILES: dict[int, dict[str, str]] | None = None  # more files in a member's commit, by number
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="case-", dir=TMP))
+        self.root = scratch(self, "case-")
         self.content = Content(
             self.root, broken=self.BROKEN, base_files=self.BASE_FILES, member_files=self.MEMBER_FILES
         )
@@ -5055,7 +5081,7 @@ class ErrorParsing(unittest.TestCase):
 
 class Records(unittest.TestCase):
     def test_a_pathless_verification_finding_reaches_the_next_repair_prompt(self):
-        root = Path(tempfile.mkdtemp(prefix="pathless-", dir=TMP))
+        root = scratch(self, "pathless-")
         content = Content(root)
         task = repair_task.Task.from_json({**content.task(12), "claim_token": "x", "expires_at": time.time() + 60})
         seed = root / "seed"
@@ -5070,7 +5096,7 @@ class Records(unittest.TestCase):
         self.assertIn("the repaired chain failed verification", prompt)
 
     def test_a_pre_rebase_prompt_lists_the_errors_its_preparation_left(self):
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         content = Content(root)
         raw = content.task(12, kind="pre_rebase")
         seed = root / "seed"
@@ -5089,7 +5115,7 @@ class Records(unittest.TestCase):
         self.assertIn("- `TauCeti/Two.lean:3:5`: unknown identifier `x`", prompt)
 
     def test_a_preparation_reports_the_errors_no_worker_build_showed_fixed(self):
-        worktree = Path(tempfile.mkdtemp(prefix="remaining-", dir=TMP))
+        worktree = scratch(self, "remaining-")
         listings = repair.listings_path(worktree).parent
         listings.mkdir(parents=True)
         (listings / repair_stream.ERRORS_FILE).write_text(
@@ -5111,7 +5137,7 @@ class Records(unittest.TestCase):
         )
 
     def test_task_record_and_prompt_for_a_pre_rebase(self):
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         content = Content(root)
         raw = content.task(11, kind="pre_rebase")
         seed = root / "seed"
@@ -5175,7 +5201,7 @@ class Records(unittest.TestCase):
         )
 
     def test_a_no_repair_member_is_listed_under_do_not_edit(self):
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         content = Content(root)
         raw = content.task(12)
         raw["members"] = [dict(m, no_repair=m["number"] == 2) for m in raw["members"]]
@@ -5245,7 +5271,7 @@ class Records(unittest.TestCase):
     def test_ownership_spans_the_replayed_prefix_and_the_input_commit(self):
         """A conflict's chain is the replayed prefix followed by the input chain's conflicting commit, which
         are not one history: each commit is judged against its own parent."""
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         shared = "".join(f"line {i}\n" for i in range(10))
         content = Content(
             root,
@@ -5266,7 +5292,7 @@ class Records(unittest.TestCase):
         self.assertEqual(repair.owners_of(seed, chain, "TauCeti/A.lean"), [])
 
     def test_task_record_and_prompt_for_a_rebase_conflict(self):
-        root = Path(tempfile.mkdtemp(prefix="records-", dir=TMP))
+        root = scratch(self, "records-")
         content = Content(root)
         raw = content.task(9, kind="rebase_conflict")
         seed = root / "seed"
@@ -5342,7 +5368,7 @@ class Records(unittest.TestCase):
     def test_the_worker_commits_the_working_tree_and_discards_what_the_agent_did_to_history(self):
         """The agent resolves one commit; whatever it does to HEAD, the index, refs or history, the result is
         the working tree committed by the worker on the clean prefix, with the member's own message."""
-        root = Path(tempfile.mkdtemp(prefix="resolve-", dir=TMP))
+        root = scratch(self, "resolve-")
         content = Content(root)
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -5411,7 +5437,7 @@ class Records(unittest.TestCase):
         self.assertEqual(again, tip, "the same files and explanation make the same commit")
 
     def test_the_check_script_judges_the_chain(self):
-        root = Path(tempfile.mkdtemp(prefix="check-", dir=TMP))
+        root = scratch(self, "check-")
         content = Content(root)
         seed = root / "seed"
         onto = content.base
@@ -5467,7 +5493,7 @@ class Records(unittest.TestCase):
         self.assertEqual(run(), (1, f"2 commits on {onto[:12]} for 3 recorded members"))
 
     def test_a_large_batch_prompt_stays_short(self):
-        root = Path(tempfile.mkdtemp(prefix="large-", dir=TMP))
+        root = scratch(self, "large-")
         seed = root / "seed"
         subprocess.run(["git", "init", "--quiet", "-b", "main", str(seed)], check=True)
         sh(seed, "config", "user.name", "Fixture")
@@ -5618,7 +5644,7 @@ class Records(unittest.TestCase):
             os.environ.pop("STUB_GH_ADMIN", None)
 
     def test_chain_report_flags_unexplained_edits(self):
-        root = Path(tempfile.mkdtemp(prefix="report-", dir=TMP))
+        root = scratch(self, "report-")
         content = Content(root)
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -5640,7 +5666,7 @@ class Records(unittest.TestCase):
         self.assertTrue(any("unknown-member" in p for p in short["problems"]))
 
     def test_an_admin_labelled_large_refactor_member_is_measured_without_the_size_caps(self):
-        root = Path(tempfile.mkdtemp(prefix="large-refactor-", dir=TMP))
+        root = scratch(self, "large-refactor-")
         content = Content(root)
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -5693,7 +5719,7 @@ class Records(unittest.TestCase):
         self.assertEqual((rc, json.loads(measured)["large_refactor"]), (0, True))
 
     def test_the_review_size_policy_measures_each_commit_against_its_parent_and_accepts_a_split(self):
-        root = Path(tempfile.mkdtemp(prefix="review-size-", dir=TMP))
+        root = scratch(self, "review-size-")
         content = Content(root)
         seed = root / "seed"
         sh(seed, "checkout", "--quiet", "--detach", content.base)
@@ -6539,7 +6565,7 @@ class BuildScript(unittest.TestCase):
     }
 
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="scoped-build-", dir=TMP))
+        self.root = scratch(self, "scoped-build-")
         for name, text in self.LIBRARY.items():
             (self.root / name).parent.mkdir(parents=True, exist_ok=True)
             (self.root / name).write_text(text)
@@ -6661,7 +6687,7 @@ class RepairContextTests(unittest.TestCase):
     def chain_repo(self, prefix: str, base_files: dict[str, str], members: dict[int, dict[str, str]]):
         """A repository whose ``main`` is ``base_files`` and then one squash commit per member, in
         number order, checked out detached at the tip; ``(repo, base, chain)``."""
-        repo = Path(tempfile.mkdtemp(prefix=prefix, dir=TMP)) / "repo"
+        repo = scratch(self, prefix) / "repo"
         subprocess.run(["git", "init", "--quiet", "-b", "main", str(repo)], check=True)
         sh(repo, "config", "user.name", "Fixture")
         sh(repo, "config", "user.email", "fixture@example.invalid")
