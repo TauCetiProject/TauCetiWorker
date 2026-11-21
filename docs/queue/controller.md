@@ -130,17 +130,18 @@ I/O, below):
    repairs enter the new head through ordinary validation. Unclaimed background offers are
    superseded (resolution `sealed`); the new head keeps what its preparations adopted.
    The exception is a batch whose pre-rebase is a conflict that no worker has claimed
-   (`_seal_clean_prefix`). A claimed `pre_rebase` task still open at this point was made on the tip
-   that landed, or on an earlier tip of that head that the seal carries onto the canonical commit
-   (`_supersede_stale_pre_rebase` has dropped any other), so the seal waits for it like any other
-   owner and the next head starts from its resolution. Without an owner, resolving the conflict
-   takes hours, so the batch is replayed onto the canonical commit and the members before the
-   conflicting one move to a new batch that becomes the head at once (`clean-prefix-sealed` in the
-   journal). The conflicting member and those after it stay in the batch, now based on the last
-   moved member's own commit, so they keep their approvals, their age and the batch's place as the
-   next head; the batch's unclaimed `pre_rebase` task is superseded (resolution `clean-prefix`) and
-   the next pre-rebase onto the new head creates a fresh task. A conflict at the first member leaves
-   the batch as before; a replay that is now clean seals the whole batch.
+   (`_seal_clean_prefix`). A `pre_rebase` task still claimed at this point is current (made on the
+   tip that landed) or explicitly preserved (`_supersede_stale_pre_rebase` has dropped any other),
+   so it may still submit and the seal waits for it like any other owner; the next head reuses its
+   result when the carry onto the canonical commit, the extension and the membership checks of
+   `_seal_from_pre_rebase` succeed. Without an owner, resolving the conflict takes hours, so the
+   batch is replayed onto the canonical commit and the members before the conflicting one move to a
+   new batch that becomes the head at once (`clean-prefix-sealed` in the journal). The conflicting
+   member and those after it stay in the batch, now based on the last moved member's own commit, so
+   they keep their approvals, their age and the batch's place as the next head; the batch's
+   unclaimed `pre_rebase` task is superseded (resolution `clean-prefix`) and the next pre-rebase
+   onto the new head creates a fresh task. A conflict at the first member leaves the batch as
+   before; a replay that is now clean seals the whole batch.
    While fewer than two active batches are sealed (counting the head), seal the oldest unsealed batch once it has
    `sealed_successor_min_members` members (default 100; 0 disables new successor sealing). A larger
    later batch never overtakes a smaller first one. Successor sealing preserves active background

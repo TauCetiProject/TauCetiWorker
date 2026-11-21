@@ -5986,8 +5986,8 @@ class Controller:
         """Seal the members of `batch` that replay cleanly onto `main`, when its pre-rebase is a conflict.
 
         The slot is free and no worker owns the conflict (`_seal_blocked` waits for a claimed
-        `pre_rebase` task: it was made on the tip that landed, or on an earlier tip of that head that
-        `_seal_from_pre_rebase` carries onto `main`, and is usually well under way). Rather than wait
+        `pre_rebase` task: it is current or preserved, so it may still submit, and
+        `_seal_from_pre_rebase` reuses its result when the carry and extension apply). Rather than wait
         for a worker to start, or seal everything and hand the head a `rebase_conflict` task, the
         members before the conflict move to a new batch that becomes the head. The conflicting member
         and those after it stay in `batch`, now based on the last moved member's commit, so it keeps its
