@@ -24,7 +24,6 @@ the lock behave as the prompt says, and ``--no-stream-repair`` restores the sequ
 
 from __future__ import annotations
 
-import atexit
 import contextlib
 import dataclasses
 import io
@@ -51,31 +50,18 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
 
-def remove_tree(path: Path) -> None:
-    """Remove ``path``, making read-only directories writable when they stop removal."""
-
-    def writable(function, name, _error):
-        # Unlinking needs a writable parent; listing and emptying a directory need it writable too.
-        os.chmod(os.path.dirname(name), stat.S_IRWXU)
-        if os.path.isdir(name) and not os.path.islink(name):
-            os.chmod(name, stat.S_IRWXU)
-        function(name)
-
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(path, ignore_errors=False, onexc=writable)
-    else:
-        shutil.rmtree(path, ignore_errors=False, onerror=writable)
+# TemporaryDirectory removes its tree when it is closed or at exit, read-only parts included.
+# Every other temporary directory this process makes, the worker's own included, lies inside it.
+SCRATCH = tempfile.TemporaryDirectory(prefix="queue-repair-task-", ignore_cleanup_errors=True)
+TMP = Path(SCRATCH.name)
+tempfile.tempdir = str(TMP)
 
 
 def scratch(test: unittest.TestCase, prefix: str) -> Path:
     """A fresh directory under ``TMP`` that is removed when ``test`` finishes."""
-    root = Path(tempfile.mkdtemp(prefix=prefix, dir=TMP))
-    test.addCleanup(remove_tree, root)
-    return root
+    return Path(test.enterContext(tempfile.TemporaryDirectory(prefix=prefix, ignore_cleanup_errors=True)))
 
 
-TMP = Path(tempfile.mkdtemp(prefix="queue-repair-task-"))
-atexit.register(lambda: TMP.exists() and remove_tree(TMP))
 BIN = TMP / "bin"
 BIN.mkdir()
 HOME = TMP / "home"
