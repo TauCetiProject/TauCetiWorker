@@ -12,8 +12,9 @@ batch's rebase onto ``main``, so the head's task comes first), each resolving a 
 process (``python -m tauceti_queue.repair_lookahead run <job>``, as ``repair_parallel``'s group agents
 run, since the agent path keeps per-process state). A helper runs ``repair_task.resolve_one``, the
 serial path's own code for one conflict: the numproj pre-pass, then the agent with its attempts and
-explanation follow-up. An acceptable resolution is recorded under the task's stored resolutions
-(``repair_task.store_resolution``) keyed by ``onto``'s tree, so a rerun of the task also finds it.
+explanation follow-up. An acceptable resolution is recorded under the batch's stored resolutions
+(``repair_task.store_resolution``) keyed by ``onto``'s tree, so a rerun of the task, or a later task
+of the batch whose prefix has the same inputs, also finds it.
 
 The members given to helpers are those whose commit, cherry-picked onto ``onto``, conflicts in a path
 that ``main`` changed since the chain's base (a conflict only with an earlier member's lines is the
@@ -138,10 +139,8 @@ class Lookahead:
             merged = chain_tool.merge_trees(clone, task.onto, commit.sha, merge_base=parent)
             if merged.clean or not changed.intersection(merged.conflict_paths):
                 continue
-            if git(
-                clone, "for-each-ref", "--count=1", f"{repair_task.RESOLUTION_PREFIX}/{task.task_id}/{commit.sha}-*"
-            ):
-                continue  # resolved already, on ``onto`` or on its prefix by an earlier run of the task
+            if repair_task.applicable_resolution(clone, task.batch_id, commit.sha, task.onto):
+                continue  # resolved already from the same inputs, by an earlier run or task of the batch
             yield commit
 
     def _cache_packages(self) -> None:
@@ -237,7 +236,7 @@ class Lookahead:
         with self.lock:
             self.agent_records.extend(result.get("agents") or [])
         if result.get("status") == "ok" and not self.stopped():
-            repair_task.store_resolution(self.cfg.clone, self.task.task_id, commit, self.task.onto, result["tip"])
+            repair_task.store_resolution(self.cfg.clone, self.task.batch_id, commit, self.task.onto, result["tip"])
             log(f"task {self.task.task_id}: lookahead resolved {source_pr}'s commit {commit[:12]} on the target")
         else:
             log(

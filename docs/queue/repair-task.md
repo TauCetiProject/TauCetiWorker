@@ -197,7 +197,7 @@ build from there. A task with a retained repair checkpoint is already on the tar
 a chain.
 
 **Resuming after a stop.** Each accepted resolution is recorded in the worker's clone as
-`refs/tauceti-queue/resolutions/<task_id>/<conflicting commit>-<clean prefix tree>`, naming the
+`refs/tauceti-queue/batch-resolutions/<batch_id>/<conflicting commit>-<clean prefix tree>`, naming the
 resolved commit (`repair_task.store_resolution`). The repair workers share one clone
 (`repair-clone`), so whichever worker claims the task next, after a stop (`worker-stopped`), a lost
 claim or a release such as `inference_unavailable`, finds them, and the ref keeps the objects. The
@@ -211,10 +211,19 @@ continues from it and the agent is not run for that conflict (the outcome's `con
 prefix with this tree, was not made exactly as the worker makes one (author, committer and dates, so
 not a commit an agent made with `git commit`), or fails a check is deleted and the conflict goes to the
 agent as before. The agent still sees one commit and never replays. A worker whose claim was lost
-records nothing. The task's entries are deleted once the service has
-answered its submission, and when the whole chain fails the worker's local checks (a rerun would
-rebuild the same chain without the agent). Entries of a task that is never claimed again stay in the
-clone like its `refs/tauceti-queue/task/<id>/...` refs; they are a few commit objects.
+records nothing.
+
+The entries belong to the batch, not the task, so a later task of the batch reuses them too: a
+pre-rebase superseded at the head's landing, or released, leaves its resolutions for the task that
+replaces it onto another tip. The conflicting commit in the key fixes the member's change and its
+parent; an entry made on another prefix is reused only when that prefix has the current prefix's
+content in every path the commit or the resolution changes (`repair_task.applicable_resolution`), so
+the conflict it resolved is this one. Its change is merged onto the current prefix and checked as
+above. The lookahead skips a member with such an entry on `onto`. The batch's entries are deleted once
+the service has answered a submission of one of its rebase tasks, and when the whole chain fails the
+worker's local checks (a rerun would rebuild the same chain without the agent). Entries of a batch
+that is never claimed again stay in the clone like its `refs/tauceti-queue/task/<id>/...` refs; they
+are a few commit objects.
 
 `Adoption`: `accepted`, `reason`, `task_id`, `batch_id`, `version`, `tip`, `retained_ref`,
 `violations` (chain tool findings, `{code, detail, commit, source_pr}`), `provenance`. The runner
