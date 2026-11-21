@@ -607,6 +607,49 @@ class Records(Fixture):
         self.assertEqual(c.format_identity("@ann"), ("ann", "ann@users.noreply.github.com"))
 
 
+class Reading(Fixture):
+    def test_read_commits_matches_read_commit(self):
+        """One `cat-file --batch` reads what one `cat-file commit` per commit reads: multi-byte messages,
+        a message without a trailing newline, an empty commit and a multi-line header included."""
+        self.write({"A.lean": "a\n"})
+        first = self.commit("é première\n\nκαλημέρα ✓", author="Zoë <zoe@example.invalid>")
+        second = self.commit("empty on purpose")
+        tree = self.git("rev-parse", f"{second}^{{tree}}")
+        signed = self.git(
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            "--stdin",
+            input=(
+                f"tree {tree}\nparent {second}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n"
+                "gpgsig -----BEGIN-----\n line\n -----END-----\n\nno trailing newline"
+            ),
+        )
+        shas = [first, second, signed, first]
+        self.assertEqual(c.read_commits(self.repo, shas), [c.read_commit(self.repo, sha) for sha in shas])
+        self.assertEqual(c.read_commits(self.repo, []), [])
+        with self.assertRaises(c.ChainError):
+            c.read_commits(self.repo, [first, "0" * 40])
+        with self.assertRaises(c.ChainError):
+            c.read_commits(self.repo, [tree])
+
+    def test_commit_paths_lists_each_commits_changes(self):
+        (self.repo / "Dir").mkdir()
+        self.write({"A.lean": "a\n", "Dir/B.lean": "b\n"})
+        added = self.commit("add A and Dir/B")
+        empty = self.commit("nothing")
+        (self.repo / "A.lean").unlink()
+        self.write({"Shared.lean": "changed\n", "C.lean": "c\n"})
+        mixed = self.commit("delete A, modify Shared, add C")
+        paths = c.commit_paths(self.repo, [mixed, added, empty, added])
+        self.assertEqual(list(paths), [mixed, added, empty])
+        self.assertEqual(paths[added], {"A.lean", "Dir/B.lean"})
+        self.assertEqual(paths[empty], frozenset())
+        self.assertEqual(paths[mixed], {"A.lean", "Shared.lean", "C.lean"})
+        self.assertEqual(c.commit_paths(self.repo, [empty]), {empty: frozenset()}, "served from the cache")
+
+
 class CLI(Fixture):
     def run_cli(self, *args, expect=0):
         env = dict(os.environ, PYTHONPATH=str(REPO))
