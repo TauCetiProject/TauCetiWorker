@@ -560,7 +560,8 @@ for name, text in (
 # policy files, as the real setup step does. The driver builders write stand-in executables; the
 # ``audit-driver`` prints the lines of ``$STUB_DIR/audit-findings`` once (the file is then renamed, as if the
 # agent's fix removed the duplicate) or of ``$STUB_DIR/audit-findings-always`` on every run, exiting 1 when
-# it printed any; ``lint-env.sh`` records its scope (also appended to ``lint-runs.log``) and does the same with ``lint-findings``. ``lint-style.sh``
+# it printed any; ``lint-env.sh`` records its scope (also appended to ``lint-runs.log``) and does the same with ``lint-findings``,
+# printing ``lint-driver-failure`` and failing on every changed-only run while that file exists. ``lint-style.sh``
 # and ``lint-dot-notation.py`` print ``$STUB_DIR/style-findings`` and ``$STUB_DIR/dot-notation-findings``.
 
 TOOLS_MAIN = r"""
@@ -633,6 +634,8 @@ TOOLS_SCRIPTS = {
         'else find TauCeti -name "*.lean" | sort | sed "s|/|.|g;s|.lean$||" > "$STUB_DIR/lint-scope.txt"; fi\n'
         'echo "${LINT_CHANGED_ONLY:-0}" $(cat "$STUB_DIR/lint-scope.txt") >> "$STUB_DIR/lint-runs.log"\n'
         'test -x "$LINT_DRIVER_EXE" || { echo "LINT-ENV: FAIL no driver"; exit 1; }\n'
+        'if [ "${LINT_CHANGED_ONLY:-0}" = 1 ] && [ -f "$STUB_DIR/lint-driver-failure" ]; then '
+        'cat "$STUB_DIR/lint-driver-failure"; exit 1; fi\n'
         'if [ -f "$STUB_DIR/lint-findings" ]; then cat "$STUB_DIR/lint-findings"; mv "$STUB_DIR/lint-findings" '
         '"$STUB_DIR/lint-findings.reported"; echo "LINT-ENV: FAIL"; exit 1; fi\n'
         'echo "LINT-ENV: PASS"\n'
@@ -6219,6 +6222,61 @@ class WorkerAudits(Fixture):
             ],
         )
 
+    def test_a_changed_only_driver_failure_falls_back_to_the_whole_library_lint(self):
+        # Batch 465's tip: the changed-only docstring-scan driver could not compile its module list.
+        self.findings(
+            "lint-driver-failure",
+            "DocScanDriver.lean:3436:0: error: maximum recursion depth reached in the code generator\n"
+            "::error::lint-env: driver failure: the docstring-scan driver did not elaborate cleanly\n"
+            "LINT-ENV: FAIL \u2014 driver failure: the docstring-scan driver did not elaborate cleanly",
+        )
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.service.results), 1, outcome)
+        [verification] = outcome["verification"]
+        self.assertTrue(verification["ok"], verification)
+        checks = verification["checks"]
+        self.assertEqual(checks["lint"]["scope"], "full")
+        self.assertEqual(checks["lint"]["findings"], 0)
+        self.assertEqual(
+            (checks["changed_lint"]["rc"], checks["changed_lint"]["modules"], checks["changed_lint"]["skipped"]),
+            (1, 3, "driver_failure"),
+        )
+        self.assertEqual(
+            (self.stub_dir / "lint-runs.log").read_text().splitlines(),
+            ["1 TauCeti.One TauCeti.Three TauCeti.Two", "0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two"],
+        )
+
+    def test_the_driver_failure_fallback_runs_even_when_another_check_fails(self):
+        self.findings("lint-driver-failure", "LINT-ENV: FAIL \u2014 driver failure: report parsing failed")
+        self.findings("audit-findings", DUPLICATE_LINE)
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        first = outcome["verification"][0]["checks"]
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual((first["lint"]["scope"], first["lint"]["findings"]), ("full", 0))
+        # The agent sees the duplicate, not a lint failure it cannot act on.
+        prompt = self.agent_calls()[1]["prompt"]
+        self.assertIn(DUPLICATE_LINE, prompt)
+        self.assertNotIn("driver failure", prompt)
+
+    def test_a_changed_lint_too_large_for_the_driver_runs_the_whole_library_lint_instead(self):
+        with patch.object(repair_audit, "CHANGED_LINT_MODULE_LIMIT", 2):
+            cfg = self.config()
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        [verification] = outcome["verification"]
+        self.assertTrue(verification["ok"], verification)
+        self.assertEqual(verification["checks"]["lint"]["scope"], "full")
+        self.assertEqual(verification["checks"]["changed_lint"], {"skipped": "module_limit", "modules": 3})
+        # One lint, the whole library's: the changed-only driver never ran.
+        self.assertEqual(
+            (self.stub_dir / "lint-runs.log").read_text().splitlines(),
+            ["0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two"],
+        )
+
     def test_a_finding_that_persists_is_never_submitted(self):
         self.findings("audit-findings-always", DUPLICATE_LINE)
         cfg = self.config()
@@ -6608,6 +6666,9 @@ class StreamAudits(WorkerAudits):
     test_a_finding_that_persists_is_never_submitted = None
     test_without_the_setting_nothing_is_checked = None
     test_the_build_helper_runs_the_audits_after_a_green_whole_library_build = None
+    test_a_changed_only_driver_failure_falls_back_to_the_whole_library_lint = None
+    test_the_driver_failure_fallback_runs_even_when_another_check_fails = None
+    test_a_changed_lint_too_large_for_the_driver_runs_the_whole_library_lint_instead = None
 
 
 class BuildScript(unittest.TestCase):
