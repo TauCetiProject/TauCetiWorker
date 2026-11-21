@@ -1764,9 +1764,9 @@ class PreRebase(ControllerCase):
             "no new rebase",
         )
 
-    def test_a_pre_rebase_in_flight_is_kept_when_main_is_past_the_landed_tip(self):
-        """`main` moved on past the head's tip before the landing was observed: the claimed task, made
-        on that tip, is preserved rather than superseded, and its result is carried onto `main`."""
+    def assert_pre_rebase_kept_past_the_landed_tip(self, land):
+        """`main` is past the head's tip when the next head seals: the claimed task, made on that tip, is
+        preserved rather than superseded, and its result is carried onto `main`."""
         self.conflicting_batch()
         batch = self.open_batch()
         resolved = "line one\nline two by 101 and 102\nline three\n"
@@ -1779,12 +1779,7 @@ class PreRebase(ControllerCase):
         )
         task = agent.claim(self.controller)
         self.assertEqual(task.kind, "pre_rebase")
-        self.github.complete_runs()
-        for context in VERDICT_CONTEXTS:
-            self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
-        self.controller.tick()  # promotes the head
-        self.repo.advance_main({"Other.lean": "other\n"})
-        self.controller.tick()  # observes the landing, with `main` one commit past the head's tip
+        land(self.controller._head())
         self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
         self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
         self.assertEqual(
@@ -1799,6 +1794,28 @@ class PreRebase(ControllerCase):
         self.assertEqual(self.repo.file_at(head["tip"], "Shared.lean"), resolved)
         self.assertEqual(self.repo.file_at(head["tip"], "Other.lean"), "other\n")
         self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+
+    def test_a_pre_rebase_in_flight_is_kept_when_main_moves_on_after_the_landing(self):
+        def land(head):
+            self.github.complete_runs()
+            for context in VERDICT_CONTEXTS:
+                self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+            self.controller.tick()  # promotes the head and records the landing
+            self.repo.advance_main({"Other.lean": "other\n"})
+            self.controller.tick()
+
+        self.assert_pre_rebase_kept_past_the_landed_tip(land)
+
+    def test_a_pre_rebase_in_flight_is_kept_when_the_landing_is_observed_past_the_tip(self):
+        def land(head):
+            # The head lands outside the controller, with a commit on top of it.
+            self.repo.commit_branch(
+                {"Other.lean": "other\n"}, "admin change", start=head["tip"], push_to="refs/heads/main"
+            )
+            self.assertEqual(self.controller.store.journal_entries("landing-preserved"), [])
+            self.controller.tick()
+
+        self.assert_pre_rebase_kept_past_the_landed_tip(land)
 
     def batch_conflicting_in_the_middle(self):
         """A head waiting on CI and an open batch [103, 102, 104] whose member 102 conflicts with it."""
