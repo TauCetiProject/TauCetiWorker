@@ -1106,9 +1106,8 @@ def run(args, stop, facts, opener, publisher):
                             429: "rate_limit",
                             503: "receiver_unavailable",
                         }
-                        raise PublicationRejected(
-                            error.code, result.get("code") or codes.get(error.code, "invalid_snapshot")
-                        ) from None
+                        code = result.get("code") if isinstance(result, dict) else None
+                        raise PublicationRejected(error.code, code or codes.get(error.code)) from None
 
                 publisher.publish(observation, send)
                 retry_seconds = args.interval

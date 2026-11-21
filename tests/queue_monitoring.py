@@ -763,6 +763,60 @@ class PublisherCadence(unittest.TestCase):
                 publisher.publish.assert_called_once()
                 stop.wait.assert_called_once_with(expected_wait)
 
+    def test_receiver_errors_without_a_code_are_not_reported_as_invalid_snapshots(self):
+        import urllib.error
+
+        from tauceti_queue.monitoring_protocol import PublicationRejected
+
+        for status, body, expected in [
+            (500, b"Internal Server Error", "server_error"),
+            (500, b'{"error":"Internal"}', "server_error"),
+            (502, b'{"code":"not_a_known_code"}', "server_error"),
+            (507, b'{"code":"storage_full"}', "storage_full"),
+            (503, b"", "receiver_unavailable"),
+            (400, b"[]", "invalid_snapshot"),
+            (400, b'{"code":"missing_batch"}', "missing_batch"),
+        ]:
+            with self.subTest(status=status, body=body), tempfile.TemporaryDirectory() as directory:
+                token = Path(directory) / "token"
+                token.write_text("test-telemetry-only-token")
+                args = SimpleNamespace(
+                    interval=10,
+                    follow=False,
+                    status_url="http://status",
+                    database="unused",
+                    worker_root=[],
+                    public_repository=[],
+                    output=None,
+                    publish_url="https://receiver",
+                    token_file=token,
+                )
+                opener = Mock()
+                opener.open.side_effect = urllib.error.HTTPError(
+                    "https://receiver", status, "error", {}, io.BytesIO(body)
+                )
+                raised = []
+
+                def publish(_observation, send, raised=raised):
+                    try:
+                        send({})
+                    except PublicationRejected as error:
+                        raised.append(error)
+                        raise
+
+                publisher = Mock()
+                publisher.publish.side_effect = publish
+                with (
+                    patch.object(monitoring.urllib.request, "urlopen", return_value=io.BytesIO(b"{}")),
+                    patch.object(monitoring, "project", return_value={}),
+                    patch("sys.stderr", new=io.StringIO()) as stderr,
+                ):
+                    self.assertEqual(
+                        monitoring.run(args, Mock(is_set=Mock(return_value=False)), None, opener, publisher), 1
+                    )
+                self.assertEqual([(e.status, e.code) for e in raised], [(status, expected)])
+                self.assertIn(f"HTTP {status} {expected}", stderr.getvalue())
+
 
 def trim_one_batch_at_a_time(observation, budget):
     """The previous trimming loop, one full encoding per removed batch, as the reference result."""
