@@ -292,5 +292,14 @@ client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body":
 client.ensure_stuck_issue(1388, "another peer failed", diagnostic.replace("claude", "codex"))
 check("equally specific peers do not churn", len(client.calls), 1)
 
+os.environ["TAUCETI_STUCK_ISSUES"] = "0"
+client = FakeGitHub()
+client.ensure_stuck_issue(1388, "its review errored", diagnostic)
+check("TAUCETI_STUCK_ISSUES=0 neither searches nor creates", client.calls, [])
+client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": "old"}])
+client.ensure_stuck_issue(1388, "its review errored", diagnostic)
+check("...and leaves an existing issue as it is", client.calls, [])
+del os.environ["TAUCETI_STUCK_ISSUES"]
+
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
