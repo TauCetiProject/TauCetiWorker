@@ -3469,12 +3469,14 @@ def _run_task(
                 for result in reversed(outcome.get("verification", [])):
                     checks = result.get("checks") or {}
                     if result.get("tip") == tip and result.get("ok") is True and checks.get("status") == "passed":
-                        notes["pre_rebase_verification"] = {
-                            "tip": tip,
-                            "base": task.validation_base,
-                            "tools": checks.get("tools"),
-                            "scope": "full",
-                        }
+                        scope = (checks.get("lint") or {}).get("scope")
+                        if scope == "full":
+                            notes["pre_rebase_verification"] = {
+                                "tip": tip,
+                                "base": task.validation_base,
+                                "tools": checks.get("tools"),
+                                "scope": scope,
+                            }
                         break
             if task.kind == "prepare":
                 notes["remaining_errors"] = prepare_remaining_errors(outcome.get("parallel"), findings, worktree)
