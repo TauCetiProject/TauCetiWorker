@@ -301,7 +301,9 @@ except a claimed task whose `onto` is an earlier tip of the current head (a repa
 moved it, `_preserve_across_head_round`): resolving a conflict outlasts a head round, so the task is
 recorded in `state:emergency_preserved` (`pre-rebase-preserved` in the journal) like the claimed
 successor work of an emergency head (below), its owner submits onto that tip, and the next
-`_pre_rebase` carries the adopted result onto the head's tip by replay. A
+`_pre_rebase` carries the adopted result onto the head's tip by replay. Landing the head records
+the same preservation for claimed successor work made on any of its tips (`landing-preserved`), so a
+task stays open when `main` is already past the landed tip when the landing is observed. A
 rebuild of the head or a repair that empties a head member discards every pre-rebase. When the head
 lands and the canonical commit equals `pre_rebase_onto`, or the pre-rebase carries onto it by a clean
 replay (a preserved task that resolved onto an earlier tip of the landed head), the sealed head takes the pre-rebased chain
