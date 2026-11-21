@@ -361,6 +361,7 @@ def shared_read(
     lock_timeout: float = 30,
     generation_scope=None,
     coalesce_failures: bool = False,
+    keep_base: bool = False,
 ):
     """Coalesce a complete logical read under a per-key lock. Never cache failures.
 
@@ -369,6 +370,8 @@ def shared_read(
     Explicit generation scopes use invalidate_shared rather than unrelated GitHub writes.
     Opt-in completion markers share unavailable reads only with existing waiters, and a waiter
     whose lock wait expires behind a running leader is unavailable rather than a second fetch.
+    With `keep_base`, a value that a write invalidated while it was fetched is still stored, under
+    the generation it began in, so it never answers a read but stays a base for stored_shared.
     The default invokes each caller's fetch after failures, preserving fetch side effects.
     """
     identity = identity or scope()
@@ -465,13 +468,13 @@ def shared_read(
                 value = fetch()
                 saved = False
                 generation_current = immutable or current_generation() == epoch
-                if value is not None and generation_current:
+                if value is not None and (generation_current or keep_base):
                     try:
                         atomic(
                             path,
                             {"time": time.time(), "generation": epoch, "revision": _revision.get(), "value": value},
                         )
-                        saved = True
+                        saved = generation_current
                     except OSError:
                         pass
                 if saved:

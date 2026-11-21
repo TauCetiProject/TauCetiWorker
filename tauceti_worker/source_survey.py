@@ -142,6 +142,8 @@ def discovery_inventory(source, *, numbers=None):
         lock_timeout=300,
         generation_scope=discovery_scope(source),
         coalesce_failures=True,
+        # A full listing outlasts many writes; once stored, a refresh brings it up to date.
+        keep_base=True,
     )
     return None if value is None else value["rows"]
 
