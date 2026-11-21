@@ -23,6 +23,7 @@ from .constants import (
     EX_CLAIM_COLLISION,
     EX_DOCUMENTATION_WAIT,
     EX_GITHUB_WAIT,
+    EX_HALTED,
     EX_NOPROGRESS,
     GH_MIN_BUDGET,
     INTERROUND,
@@ -308,6 +309,10 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
                 rc = run_round_subprocess(tail)
             finally:
                 drain["in_round"] = False
+            if rc == EX_HALTED:
+                # The round recorded why in halt.json; another round would ask the forge the same question.
+                log("round halted on a forge identity — stopping the loop")
+                return EX_HALTED
             if drain["requested"]:
                 log(f"round finished (rc={rc}); restart requested, exiting at the round boundary")
                 raise _LoopDrained
