@@ -615,6 +615,20 @@ class SharedDiscovery(unittest.TestCase):
         self.assertIsNone(self.read())
         self.assertEqual(self.read(), [dict(number=3)])
 
+    def test_an_expired_wait_behind_a_running_leader_is_unavailable_not_a_second_fetch(self):
+        from tauceti_worker import github_transport as transport
+
+        key, identity = ["listing"], self.source.cache_namespace
+        fetch = Mock(return_value=[dict(number=1)])
+        with transport.locked(transport._shared_path(key, identity).with_suffix(".lock")):
+            self.assertIsNone(
+                transport.shared_read(key, fetch, identity=identity, lock_timeout=0.1, coalesce_failures=True)
+            )
+            fetch.assert_not_called()
+            # Without coalescing, a caller still makes its own fetch, as before.
+            self.assertEqual(transport.shared_read(key, fetch, identity=identity, lock_timeout=0.1), [dict(number=1)])
+        self.assertEqual(fetch.call_count, 1)
+
     def concurrent(self, outcome="success"):
         context = multiprocessing.get_context("fork")
         start, fallback = context.Barrier(4), context.Barrier(4 if outcome == "storage" else 3)
