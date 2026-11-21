@@ -483,10 +483,17 @@ has a time budget holds because the service re-exposes the task.
    where the worker does not own final verification, the agent's full-library helper) it runs every check
    staging runs, all at once: the `audit-driver` under `lake env timeout 3000s` (import of every TauCeti
    module, duplicate declarations, axioms), the module-system check (`ModuleSystem.lean`), `lint-env.sh`
-   with the `lint-env-driver` over the full library, `lint-style.sh` (Mathlib's text linters and the
+   with the `lint-env-driver`, `lint-style.sh` (Mathlib's text linters and the
    header check) and `lint-dot-notation.py` against its baseline. Every task, head or background, gets
-   the same set; there is no check owner and nothing is deferred to staging. Without a frozen
-   GitHub scope-policy snapshot the worker uses staging's conservative full-lint fallback. The sources are the TauCetiTools pin
+   the same set; there is no check owner and nothing is deferred to staging. The environment lint
+   first covers only the TauCeti modules changed since the base (`LINT_ONLY_MODULES` with
+   `LINT_CHANGED_ONLY=1`, an ordinary PR's preflight scope), whose time follows the changed
+   declarations rather than the whole library's 20 minutes. When that round finds nothing in any
+   check, the whole-library lint runs before the checks pass, so `passed` always includes it, and
+   `lint.scope` is `changed` only in a
+   failed round (`changed_lint` records the changed-module run of a passing one). A finding outside
+   the changed modules, such as a new simp lemma breaking an unchanged declaration's simp normal
+   form, therefore surfaces in that final lint and costs another round. The sources are the TauCetiTools pin
    the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into
    `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and the worktree's
    `scripts/` as policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
@@ -932,6 +939,6 @@ chain and records it as a retained submission without adopting it. A new claim o
 starts from that tip and receives the outstanding findings. It runs full verification before final
 submission. The old worktree is removed once the checkpoint receipt is confirmed.
 
-When a pre-rebase passes full verification, the worker reports the verified tip, parent and tools
-pin with its submission. A matching result counts as preparation for that tip. A changed chain
-gets its own preparation and staging still makes the landing decision.
+When a pre-rebase passes full verification, including the whole-library lint, the worker reports
+the verified tip, parent and tools pin with its submission. A matching result counts as
+preparation for that tip. A changed chain gets its own preparation and staging still makes the landing decision.

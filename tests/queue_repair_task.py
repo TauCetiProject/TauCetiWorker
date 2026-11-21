@@ -548,7 +548,7 @@ for name, text in (
 # policy files, as the real setup step does. The driver builders write stand-in executables; the
 # ``audit-driver`` prints the lines of ``$STUB_DIR/audit-findings`` once (the file is then renamed, as if the
 # agent's fix removed the duplicate) or of ``$STUB_DIR/audit-findings-always`` on every run, exiting 1 when
-# it printed any; ``lint-env.sh`` records its scope and does the same with ``lint-findings``. ``lint-style.sh``
+# it printed any; ``lint-env.sh`` records its scope (also appended to ``lint-runs.log``) and does the same with ``lint-findings``. ``lint-style.sh``
 # and ``lint-dot-notation.py`` print ``$STUB_DIR/style-findings`` and ``$STUB_DIR/dot-notation-findings``.
 
 TOOLS_MAIN = r"""
@@ -619,6 +619,7 @@ TOOLS_SCRIPTS = {
     "lint-env.sh": (
         'if [ -n "$LINT_ONLY_MODULES" ]; then cp "$LINT_ONLY_MODULES" "$STUB_DIR/lint-scope.txt"; '
         'else find TauCeti -name "*.lean" | sort | sed "s|/|.|g;s|.lean$||" > "$STUB_DIR/lint-scope.txt"; fi\n'
+        'echo "${LINT_CHANGED_ONLY:-0}" $(cat "$STUB_DIR/lint-scope.txt") >> "$STUB_DIR/lint-runs.log"\n'
         'test -x "$LINT_DRIVER_EXE" || { echo "LINT-ENV: FAIL no driver"; exit 1; }\n'
         'if [ -f "$STUB_DIR/lint-findings" ]; then cat "$STUB_DIR/lint-findings"; mv "$STUB_DIR/lint-findings" '
         '"$STUB_DIR/lint-findings.reported"; echo "LINT-ENV: FAIL"; exit 1; fi\n'
@@ -6119,6 +6120,19 @@ class WorkerAudits(Fixture):
         self.assertEqual(outcome["verification"][0]["checks"]["lint"]["findings"], 1)
         prompt = self.agent_calls()[1]["prompt"]
         self.assertIn("- linter `simpNF`: `two` in `TauCeti/Two.lean` (PR #2's commit", prompt)
+        # The failed round linted the changed modules only; the passing one added the whole library.
+        self.assertEqual(outcome["verification"][0]["checks"]["lint"]["scope"], "changed")
+        self.assertEqual(outcome["verification"][-1]["checks"]["lint"]["scope"], "full")
+        changed = outcome["verification"][-1]["checks"]["changed_lint"]
+        self.assertEqual((changed["rc"], changed["modules"]), (0, 3))
+        self.assertEqual(
+            (self.stub_dir / "lint-runs.log").read_text().splitlines(),
+            [
+                "1 TauCeti.One TauCeti.Three TauCeti.Two",
+                "1 TauCeti.One TauCeti.Three TauCeti.Two",
+                "0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two",
+            ],
+        )
 
     def test_a_finding_that_persists_is_never_submitted(self):
         self.findings("audit-findings-always", DUPLICATE_LINE)
