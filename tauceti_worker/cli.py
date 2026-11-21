@@ -149,6 +149,7 @@ examples:
   tauceti work --pr 412                 whatever the cascade wants to do to PR #412
   tauceti work --pr 412,415 --only review,fix   only those two PRs, only those two units
   tauceti work --only roadmap --roadmap-only ReductiveGroups
+  tauceti work --loop --full-quality --roadmap-only GRH   an umbrella: every area one goal needs
   tauceti work --loop --roadmap-skip OneParameterSemigroups   leave that area to other workers
   tauceti work --only roadmap --extra-roadmap-prompt "Work on the material relevant to Higher Topos Theory"
   tauceti work --only review --agent claude --bubble
@@ -163,7 +164,7 @@ multiple workers (share a host and coordinate through GitHub; a distinct id name
 environment (each flag overrides its matching variable; full reference linked below):
   TAUCETI_AGENT          default for --agent
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
-  TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
+  TAUCETI_ROADMAP_ONLY   single roadmap area or umbrella (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_EXTRA_ROADMAP_PROMPT   extra guidance for roadmap rounds; default for --extra-roadmap-prompt
   TAUCETI_ROADMAP_TARGETS        operator target list for roadmap rounds; default for --roadmap-targets
@@ -359,6 +360,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="for roadmap rounds, the single roadmap area to steer toward: a subdirectory of "
         "the TauCetiRoadmap repo. List them by opening the dashboard (bare `tauceti`) and "
         "expanding the roadmap row, or browse github.com/TauCetiProject/TauCetiRoadmap. "
+        "Or an umbrella, a named set of areas defined by umbrellas/NAME.toml in that repo "
+        "(docs/umbrellas.md): each round then authors in one member area drawn by weight and "
+        "maintains PRs in all of them; an area of the same name wins. "
         "Empty string = all areas; omit entirely (and leave $TAUCETI_ROADMAP_ONLY "
         "unset) to pick a fresh random area each round. Overrides "
         "$TAUCETI_ROADMAP_ONLY for this run",
@@ -1336,10 +1340,12 @@ def cmd_status(args) -> int:
 
         worker = Worker(cfg, gh, rs, counters, None, None)
         options = RoundOpts(only=[], agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
-        sources = collect(worker, options)
+        sources = collect(worker, options, display=True)
         sv = next((item[2] for item in sources if item[0] == "github"), sources[0][2])
     else:
-        sv = survey(cfg, gh, rs, counters, deep=True)
+        from .umbrellas import display_umbrella
+
+        sv = survey(cfg, gh, rs, counters, deep=True, umbrella=display_umbrella(gh))
     _, quota_snap = Quota(cfg).choose(None)
 
     if getattr(args, "json", False):

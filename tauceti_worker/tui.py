@@ -88,6 +88,8 @@ def _roadmap_note(sv: Survey, esc=lambda s: s) -> tuple[str, str]:
     markup-interpreting Rich renderer; the Textual renderer passes them through unchanged."""
     skip_note = f"  (skip: {esc(', '.join(sv.roadmap_skip))})" if sv.roadmap_skip else ""
     only = esc(sv.roadmap_only)
+    if (umbrella := getattr(sv, "umbrella", None)) is not None:
+        only += f" (umbrella of {len(umbrella.scope)} areas)"
     if sv.roadmap_backpressure:
         return "⛔", f"backpressure: {sv.n_mine_open}/{sv.max_open_prs} open in scope  (only: {only}){skip_note}"
     return "∞", f"only: {only}{skip_note}"
@@ -101,12 +103,14 @@ def _expansion_rows(sv: Survey, name: str, titles: dict, areas: list | None) -> 
         if not areas:
             return [("    └ (areas unavailable)", "")]
         skip = set(sv.roadmap_skip)
+        umbrella = getattr(sv, "umbrella", None)
+        members = umbrella.scope if umbrella is not None else frozenset()
         rows = []
         # In "auto" mode no area is pinned (a random one is picked per round), so no row is marked
-        # "← only" — the intended display.
+        # "← only" — the intended display. An umbrella marks its members outside the skip list.
         for a in ["(all areas)"] + list(areas):
             active = a == sv.roadmap_only or (a == "(all areas)" and sv.roadmap_only in ("", "any"))
-            tag = "← only" if active else ("(skipped)" if a in skip else "")
+            tag = "← only" if active else ("← umbrella" if a in members else ("(skipped)" if a in skip else ""))
             rows.append((f"    └ {a}", tag))
         return rows
     wk = sv.kind(name)
@@ -932,7 +936,9 @@ def dashboard_survey(cfg, gh):
         from .multi_source import display_survey
 
         return display_survey(cfg, gh)
-    return survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+    from .umbrellas import display_umbrella
+
+    return survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True, umbrella=display_umbrella(gh))
 
 
 def cmd_tui(args) -> int:

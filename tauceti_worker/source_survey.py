@@ -148,13 +148,12 @@ def discovery_inventory(source, *, numbers=None):
     return None if value is None else value["rows"]
 
 
-def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps):
-    from .survey_facts import in_scope
-
+def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps, umbrella=None):
     repository = source.repository
     if not isinstance(repository, RepositoryRef) or repository.forge.kind != "forgejo":
         raise ValueError("source survey requires an explicit Forgejo repository")
     result = SourceSurvey(worker_id=cfg.wid, roadmap_only=roadmap, roadmap_skip=skip, source_repository=repository)
+    result._umbrella = umbrella
 
     def unavailable(operation, failure=None):
         result.github_failed = True  # existing callers' dependency-failure gate
@@ -187,11 +186,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
             [p for p in prs if not p.is_draft and result.authored(p)], "auto", skip
         )
     if deep:
-        prs = [
-            p
-            for p in prs
-            if (p.number in numbers if numbers else in_scope(p.labels, p.target_focuses, p.head_ref, roadmap, skip))
-        ]
+        prs = [p for p in prs if (p.number in numbers if numbers else result.covers(p))]
     result.open_prs = prs
     nondraft = [
         p
@@ -313,7 +308,9 @@ def spend_detail_reads(cfg, source, rs, budget, order):
     return resolved
 
 
-def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps):
+def worker_survey(
+    cfg, source, rs, counters, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps, umbrella=None
+):
     """Schedule review and owned-branch repair without asserting native CI authority."""
     from .survey import classify_survey
 
@@ -326,6 +323,7 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
         stages=(),
         numbers=numbers,
         count_all_roadmaps=count_all_roadmaps,
+        umbrella=umbrella,
     )
     if result.github_failed:
         return result
@@ -334,12 +332,10 @@ def worker_survey(cfg, source, rs, counters, *, roadmap, skip, deep, stages, num
         result.errors.append("Forgejo discovery is public; native work requires an authenticated Forgejo account")
         return result
     if deep:
-        from .survey_facts import in_scope
-
         result.open_prs = (
             [pr for pr in result.open_prs if pr.number in numbers]
             if numbers
-            else [pr for pr in result.open_prs if in_scope(pr.labels, pr.target_focuses, pr.head_ref, roadmap, skip)]
+            else [pr for pr in result.open_prs if result.covers(pr)]
         )
     rs.observe(result.open_prs)
     from contextlib import nullcontext

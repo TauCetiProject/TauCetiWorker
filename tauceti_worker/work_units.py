@@ -140,6 +140,7 @@ from .targets import (
     render_assignment,
     target_markers,
 )
+from .umbrellas import UmbrellaRound, umbrella_prompt, umbrella_scope
 from .worker_sources import pull_url as source_pull_url
 from .worker_sources import repository_url as source_repository_url
 
@@ -274,6 +275,8 @@ class Worker:
     rc: RoundContext
     claims: Claims
     selection_changed: bool = False
+    # Set by round_scope: the umbrella this round's --roadmap-only names (docs/umbrellas.md), if any.
+    umbrella: UmbrellaRound | None = None
 
 
 def _bubble(stage: str, opts: RoundOpts) -> bool:
@@ -485,12 +488,19 @@ class NoEligibleWork(NoProgress):
     """Selection exhausted its candidates without launching a paid unit."""
 
 
-def round_scope(w, opts, use_fleet_focus=True):
+def round_scope(w, opts, use_fleet_focus=True, *, display=False):
+    """This round's roadmap scope (scope, global_pick, focused_round), leaving in `w.umbrella` the
+    umbrella an explicit --roadmap-only names, if any. `display` (status, the dashboard) resolves the
+    umbrella without drawing an area or failing on a broken file."""
     scope = roadmap_only()
     global_pick = focused_round = False
+    w.umbrella = None
     if getattr(opts, "prs", ()):
         scope = "any"  # explicit targets override the ambient roadmap
     else:
+        # An umbrella is an explicit choice like a pinned area, so it takes no fleet focus either:
+        # the scope stays its name, and its member areas widen the survey (Survey.covers).
+        w.umbrella = umbrella_round(w, opts, scope, display=display)
         # A target list names its own areas, so its worker takes no fleet focus.
         if use_fleet_focus and scope in (None, "auto") and roadmap_targets() is None:
             from .fleet_capacity import roadmap_focus
@@ -507,6 +517,48 @@ def round_scope(w, opts, use_fleet_focus=True):
         # loop clears it between rounds and a fallback round clears it here.
         report_runtime(roadmap_focus=scope if focused_round else None)
     return scope, global_pick, focused_round
+
+
+def umbrella_round(w, opts, scope, *, display=False) -> UmbrellaRound | None:
+    """The umbrella `scope` names (docs/umbrellas.md), or None for an area or any other value. A round
+    that may author draws its member area now, before any model starts; with a target list the list
+    chooses, and a round without the roadmap phase only maintains the members' pull requests."""
+    umbrella = umbrella_scope(w.gh, scope, display=display)
+    if umbrella is None or display:
+        return umbrella
+    if getattr(opts, "source", None) is not None:
+        raise Die(
+            f"--source needs one roadmap area, and {scope} is an umbrella of {len(umbrella.umbrella.members)} areas"
+        )
+    if not want(opts.only, "roadmap") or roadmap_targets() is not None:
+        return umbrella
+    return replace(umbrella, area=random_umbrella_area(w, umbrella))
+
+
+def random_umbrella_area(w, umbrella: UmbrellaRound) -> str:
+    """Draw an umbrella round's member area at random by weight, among the members that are roadmap
+    areas now and not in --roadmap-skip: the operator's own focus list, beside random_roadmap_area's
+    Fleet focus. Members whose roadmaps have not merged are skipped silently; NoProgress when none is
+    eligible."""
+    members = umbrella.umbrella.members
+    areas = set(roadmap_areas(w.gh))
+    eligible = [m for m in members if m.area in umbrella.scope and m.area in areas]
+    name = umbrella.umbrella.name
+    if not eligible:
+        skipped = [m.area for m in members if m.area not in umbrella.scope]
+        missing = [m.area for m in members if m.area in umbrella.scope]
+        why = "; ".join(
+            part
+            for part in (
+                f"in --roadmap-skip: {', '.join(skipped)}" if skipped else "",
+                f"not roadmap areas now: {', '.join(missing)}" if missing else "",
+            )
+            if part
+        )
+        raise NoProgress(f"roadmap: no member of umbrella {name} is eligible ({why}) — nothing to work on")
+    area = random.choices([m.area for m in eligible], weights=[m.weight for m in eligible])[0]
+    log(f"ROADMAP area: {area} (umbrella {name}: picked from {len(eligible)} of {len(members)} members)")
+    return area
 
 
 def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_survey=None) -> int:
@@ -595,6 +647,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             # An expanded scan must not create per-PR hydration demand or
             # silently fall back to thousands of direct comment requests.
             cached_only=global_pick and github_state_enabled(),
+            umbrella=getattr(w, "umbrella", None),
         )
     if sv.dependency_wait:
         # Unknown global coverage is neither an empty backlog nor a failed round. Nothing is selected,
@@ -785,7 +838,10 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             if scope in (None, "auto") and not opts.dry_run and roadmap_targets() is None:
                 sv.roadmap_only = random_roadmap_area(w, focus=[])
                 log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
-        rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
+        # An umbrella round authors in its drawn member; under a target list the list chooses.
+        umbrella = getattr(sv, "umbrella", None)
+        area = umbrella.area if umbrella is not None and umbrella.area else sv.roadmap_only
+        rc = dispatch("roadmap", w, sv, Candidate(0, "", area), opts)
         if rc is not None:
             return rc
 
@@ -1479,6 +1535,17 @@ def _build_cache_deferral(stage: str, c: Candidate) -> dict | None:
     return None
 
 
+def roadmap_round_target(sv, c) -> str:
+    """What a roadmap round's log line and runtime status name as its target; an umbrella round also
+    names its umbrella, and leaves the area to a target list when one chooses it."""
+    umbrella = getattr(sv, "umbrella", None)
+    if umbrella is None:
+        return f"new PR (area: {c.reason or 'any'})"
+    if umbrella.area is None:
+        return f"new PR (umbrella {umbrella.umbrella.name})"
+    return f"new PR (area: {umbrella.area}, umbrella {umbrella.umbrella.name})"
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Return its rc, or None to decline this candidate and try another.
 
@@ -1615,7 +1682,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if c.pr:
         what = f"PR #{c.pr}  {source_pull_url(c.pr)}"
     elif stage == "roadmap":
-        what = f"new PR (area: {c.reason or 'any'})"
+        what = roadmap_round_target(sv, c)
     elif stage == "progress":
         what = c.reason or "roadmap progress report"
     else:
@@ -3251,9 +3318,10 @@ def _open_link(item, source) -> str | None:
     return _pull_link(source, open_pr(item, source))
 
 
-def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, TargetItem]:
+def assign_target(w, path: Path, only: str, skip: list[str], within=None) -> tuple[Targets, TargetItem]:
     """Choose and claim this round's item of the operator's target list (docs/target-lists.md).
-    Returns the list under its live statuses and the item; NoProgress when there is none to take."""
+    Returns the list under its live statuses and the item; NoProgress when there is none to take.
+    `within` restricts the list to an umbrella's areas, which `only` then names (targets.candidates)."""
     from .config import SourceUnavailable
 
     listed = load_targets(path)
@@ -3266,7 +3334,7 @@ def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, T
         live = live_targets(listed, sources[0], sources[1:])
         # A multi-source round's inventory also names the other forge's open pull requests.
         live = overlay_live(live, inventory_keys(getattr(w, "cross_source_targets", None) or ()), set())
-        offered = candidates(live, only, skip)
+        offered = candidates(live, only, skip, within)
         for item in offered[:MAX_TARGET_TRIES]:
             name = f"{item.area}/{item.slug}"
             merged = next((link for source in sources if (link := _landed_link(item, source)) is not None), None)
@@ -3303,12 +3371,17 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     skip = roadmap_skip()
     assignment = ""
     targets_path = roadmap_targets()
+    # An umbrella round (docs/umbrellas.md) brings the member it drew as `c.reason`; a target list
+    # chooses among the umbrella's areas instead. Either way the area is then treated as pinned.
+    umbrella = getattr(sv, "umbrella", None)
     if targets_path is not None:
-        live, item = assign_target(w, targets_path, only, skip)
+        live, item = assign_target(w, targets_path, only, skip, None if umbrella is None else umbrella.scope)
         only = item.area
         assignment = render_assignment(live, item)
         os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))
         report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
+    elif umbrella is not None:
+        only = umbrella.area or random_umbrella_area(w, umbrella)
     elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         only = random_roadmap_area(w, focus=[])
         log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")
@@ -3388,6 +3461,7 @@ other contributors' claims, or the hard rules of the repo.
 {guidance}
 
 """
+    umbrella_text = umbrella_prompt(umbrella, only, assigned=targets_path is not None)
     if bubble:
         mounts = [f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"]
         if bundle is not None:
@@ -3416,6 +3490,7 @@ other contributors' claims, or the hard rules of the repo.
                 ),
                 SOURCE_GUIDANCE=source_guidance,
                 EXTRA_ROADMAP_PROMPT=extra_guidance,
+                UMBRELLA=umbrella_text,
                 TARGET_LIST=assignment,
                 LOCAL_VERIFICATION=local_verification("ordinary", bubble),
                 QUALITY_SCOPE=quality_scope(),
@@ -3440,6 +3515,7 @@ other contributors' claims, or the hard rules of the repo.
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
         EXTRA_ROADMAP_PROMPT=extra_guidance,
+        UMBRELLA=umbrella_text,
         TARGET_LIST=assignment,
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         QUALITY_SCOPE=quality_scope(),

@@ -247,6 +247,7 @@ RUN_STDLIB=(
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
+  roadmap_umbrella.py
   roadmap_claim_namespace.py
   round_crash_reasons.py
   round_file_changes.py
@@ -301,7 +302,7 @@ NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py retention.py
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.
-DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py target_list.py)
+DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py target_list.py roadmap_umbrella.py)
 # Modules whose code under test scans every process of the user (/proc, pgrep) and fails closed
 # or holds back when another process is busy or uninspectable. Concurrent modules (their sandboxed
 # children, a detached `git gc`) can disturb that scan, so with -j above 1 these run one at a

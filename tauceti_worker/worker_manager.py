@@ -2529,7 +2529,7 @@ def add_workers_parser(subparsers) -> None:
     )
     add.add_argument("--self-tested", action="store_true", help="apply the self-tested label after local verification")
     add.add_argument("--full-quality", action="store_true", help="run all five quality-pass checks, not Q1, Q2, Q5")
-    add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
+    add.add_argument("--roadmap-only", help="pin roadmap rounds to one area or umbrella")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
     add.add_argument("--roadmap-targets", metavar="FILE", help="operator target list that roadmap rounds author from")
     add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")

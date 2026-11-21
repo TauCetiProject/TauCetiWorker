@@ -461,8 +461,19 @@ Roadmap rounds steer toward one area, a subdirectory of the
 - `--roadmap-only <area>` pins it. An empty value means all areas. With nothing
   set, each round picks a fresh random area, so an unpinned `--loop` roams the
   whole roadmap over time.
+- `--roadmap-only <umbrella>` names an [umbrella](docs/umbrellas.md) instead: a
+  set of areas, everything one goal needs, defined by `umbrellas/<NAME>.toml` in
+  the roadmap repository. Each round authors in one member area, drawn by weight
+  among those that exist now, and maintains your pull requests in all of them.
+  An area of the same name always wins.
+
+  ```bash
+  uv tool install git+https://github.com/TauCetiProject/TauCetiWorker
+  tauceti work --loop --full-quality --roadmap-only GRH
+  ```
 - `--roadmap-skip <area>[,<area>...]` excludes areas from both the random pick
-  and the all-areas case. `--roadmap-only` wins on overlap.
+  and the all-areas case. `--roadmap-only` wins on overlap; from an umbrella the
+  skip list removes those members.
 - `--extra-roadmap-prompt <text>` adds operator guidance to the roadmap prompt, for
   example `--extra-roadmap-prompt "Work on the material relevant to Higher Topos Theory"`.
   It steers the choice of target within the designated roadmap, and the choice

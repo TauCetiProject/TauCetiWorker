@@ -436,6 +436,25 @@ class Survey:
         # a `--pr` round can explain a target the throttles took, instead of reporting the survey found
         # it no work.
         self._review_throttled: dict[int, str] = {}
+        # The umbrella round (docs/umbrellas.md) when roadmap_only names an umbrella; not a field, so
+        # `status --json` keeps its shape. Read it through `umbrella`.
+        self._umbrella = None
+
+    @property
+    def umbrella(self):
+        """The umbrella round this survey's roadmap_only names, or None. A dashboard dial that moves
+        roadmap_only elsewhere drops it until the next survey."""
+        umbrella = self._umbrella
+        return umbrella if umbrella is not None and umbrella.umbrella.name == self.roadmap_only else None
+
+    def covers(self, pr: PRInfo) -> bool:
+        """Whether a PR is in this survey's roadmap scope. An umbrella covers a PR in any of its member
+        areas outside --roadmap-skip; PRs with no roadmap area stay in every scope, as in_scope keeps them."""
+        umbrella = self.umbrella
+        if umbrella is None:
+            return in_scope(pr.labels, pr.target_focuses, pr.head_ref, self.roadmap_only, self.roadmap_skip)
+        areas = roadmap_focuses(pr.labels, pr.target_focuses, pr.head_ref)
+        return not areas or bool(areas & umbrella.scope)
 
     def owns(self, pr: PRInfo) -> bool:
         # Qualified source records cannot fall back to a GitHub display login.
@@ -461,10 +480,16 @@ class Survey:
     def rescope_roadmap(self) -> None:
         """Recompute authoring pressure after roadmap-only/skip changes, including live TUI dials."""
         automatic = getattr(self, "_automatic_open_count", None)
+        umbrella = self.umbrella
         self.n_mine_open = (
             automatic
             if automatic is not None
-            else roadmap_open_count(self._mine_open_prs, self.roadmap_only, self.roadmap_skip)
+            else roadmap_open_count(
+                self._mine_open_prs,
+                self.roadmap_only,
+                self.roadmap_skip,
+                within=None if umbrella is None else umbrella.scope,
+            )
         )
         self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs
         self.next_auto_stage = _next_auto_stage(self)
@@ -526,7 +551,7 @@ def bucket_status_labels(nondraft: list[PRInfo], me_login: str, *, owns=None) ->
     return buckets, unlabeled
 
 
-def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str]) -> int:
+def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str], within=None) -> int:
     """Count open roadmap PRs in the current authoring scope.
 
     ``only`` is the survey's normalized value: a concrete area, ``auto`` (a random eligible area
@@ -535,11 +560,15 @@ def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str]) -> int:
     labels are authoritative when present; a concrete synchronous target-marker focus
     is the fallback during label lag. ``roadmap/none`` is not roadmap work, while an Unknown label
     or an unresolved ``roadmap/`` branch counts in every scope so the safety limit cannot fail open.
-    A PR is counted once.
+    A PR is counted once. ``within``, for an umbrella (docs/umbrellas.md), is its member areas
+    outside the skip list: a PR in any of them counts, and ``only`` (the umbrella's name) does not.
     """
 
     def focuses(p: PRInfo):
         return roadmap_focuses(p.labels, p.target_focuses, p.head_ref)
+
+    if within is not None:
+        return sum((areas := focuses(p)) is None or bool(areas & within) for p in prs)
 
     if only not in ("", "any", "auto"):
         return sum((areas := focuses(p)) is None or only in areas for p in prs)
@@ -797,6 +826,31 @@ def bust_progress_cache(cfg: Config) -> None:
         pass
 
 
+def _umbrella_reader(read_survey, umbrella):
+    """A github_state.read_survey for an umbrella (docs/umbrellas.md): one scoped read per member area
+    in scope, merged by PR. The service is asked exactly what one worker pinned to each member asks,
+    so an umbrella creates no history demand outside its areas. Unavailable if any read is, or when
+    --roadmap-skip leaves no member, so the survey keeps its direct-inventory fallback."""
+
+    def read(repo, _roadmap, skip, **kwargs):
+        from .github_state import SurveyRows
+
+        if not umbrella.scope:
+            return False, None
+        rows, counts, cached = {}, None, False
+        for area in sorted(umbrella.scope):
+            available, part = read_survey(repo, area, skip, **kwargs)
+            if not available:
+                return False, None
+            for row in part:
+                rows.setdefault(row["pr"]["number"], row)
+            counts = getattr(part, "author_counts", None) if counts is None else counts
+            cached = cached or getattr(part, "cached", False)
+        return True, SurveyRows(list(rows.values()), counts, cached=cached)
+
+    return read
+
+
 def survey(
     cfg: Config,
     gh: GitHub,
@@ -809,13 +863,15 @@ def survey(
     numbers=(),
     count_all_roadmaps=False,
     cached_only=False,
+    umbrella=None,
 ) -> Survey:
     """Classify relevant open PRs per enabled work-kind, without writes or model work.
 
     Local cache and verified rebase-progress checkpoints may be updated.
 
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
-    always uses deep=True.
+    always uses deep=True. `umbrella` is the umbrella round (docs/umbrellas.md) the selected roadmap
+    names, whose member areas form the scope.
     """
     began = time.monotonic()
     _f = selected_roadmap if selected_roadmap is not None else roadmap_only()
@@ -827,6 +883,7 @@ def survey(
         roadmap_only=("auto" if _f is None else (_f or "any")),
         roadmap_skip=roadmap_skip(),
     )
+    sv._umbrella = umbrella
     if getattr(gh, "direct_source", False) is True:
         from .source_survey import inventory_survey, worker_survey
 
@@ -841,6 +898,7 @@ def survey(
             stages=enabled,
             numbers=numbers,
             count_all_roadmaps=count_all_roadmaps,
+            umbrella=umbrella,
             **runtime,
         )
     compact = []
@@ -849,6 +907,9 @@ def survey(
     try:
         from .github_state import read_survey
 
+        if sv.umbrella is not None:
+            # The service scopes by one area: read each member as a worker pinned there would.
+            read_survey = _umbrella_reader(read_survey, sv.umbrella)
         available, compact = (
             read_survey(
                 gh.repo,
@@ -904,15 +965,7 @@ def survey(
             )
         )
     if deep:
-        prs = [
-            p
-            for p in prs
-            if (
-                p.number in numbers
-                if numbers
-                else in_scope(p.labels, p.target_focuses, p.head_ref, sv.roadmap_only, sv.roadmap_skip)
-            )
-        ]
+        prs = [p for p in prs if (p.number in numbers if numbers else sv.covers(p))]
     sv.open_prs = prs
     # Hand ReviewState this pass's clocks BEFORE any per-PR read below: they are what let it skip the
     # comment fetch for a PR that has not moved since the last round looked at it. A shallow survey
