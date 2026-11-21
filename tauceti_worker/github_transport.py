@@ -338,6 +338,19 @@ def update_shared(key, mutate, *, identity, generation_scope, lock_timeout: floa
         return False
 
 
+def stored_shared(key, *, identity):
+    """The value last stored under `key`, whatever its age or generation, as the base of an
+    incremental refresh, never as an answer. None when there is none or this context bypasses
+    the shared cache."""
+    if not identity or _fresh.get() or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1":
+        return None
+    try:
+        cached = json.loads(_shared_path(key, identity).read_text())
+        return cached["value"] if cached.get("revision", "") == _revision.get() else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def shared_read(
     key,
     fetch,

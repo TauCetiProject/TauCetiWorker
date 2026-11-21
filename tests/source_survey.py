@@ -348,6 +348,28 @@ class BudgetedSurveys(unittest.TestCase):
         self.reviewed = {}  # PR -> head its scoreboard reviewed; verdicts in self.states
         self.states = {}
         self.api.pulls.side_effect = lambda *args, **kwargs: [self.row(n) for n in sorted(self.heads, reverse=True)]
+        self.pages = []  # paths of single listing pages and issue index reads
+
+        def request(method, path, *args, **kwargs):
+            from urllib.parse import parse_qsl, urlsplit
+
+            if not path.startswith(f"repos/{self.repo.name}/pulls?"):
+                return {"id": 3, "login": "worker"}
+            self.pages.append(path)
+            query = dict(parse_qsl(urlsplit(path).query))
+            rows = self.api.pulls.side_effect()
+            if query.get("sort") == "recentupdate":
+                rows.sort(key=lambda row: row["updated_at"], reverse=True)
+            page = int(query["page"])
+            return rows[(page - 1) * 50 : page * 50]
+
+        def pages(path):
+            self.pages.append(path)
+            if "state=open" in path:
+                yield [{"number": n, "pull_request": {"merged": False}} for n in self.heads]
+
+        self.api.request.side_effect = request
+        self.api.pages.side_effect = pages
         self.detail = []  # (endpoint, PR) for every per-PR read
 
         def comments(repository, number):
@@ -487,10 +509,12 @@ class BudgetedSurveys(unittest.TestCase):
 
         invalidate_shared(discovery_scope(self.source))
         result = self.survey(seed=5)
+        self.assertEqual(self.api.pulls.call_count, 1, "an invalidated listing is refreshed, not listed again")
         self.assertEqual(self.read_prs(), {7})
         self.assertEqual([c.pr for c in result.needs_fix.actionable], [7])
-        # A push to another PR is a new head: review work, again for one read.
+        # A push to another PR is a new head (and moves its clock): review work, again for one read.
         self.heads[8] = "b" * 40
+        self.updated[8] = "2026-11-08T00:00:00Z"
         invalidate_shared(discovery_scope(self.source))
         result = self.survey(seed=6)
         self.assertEqual(self.read_prs(), {8})

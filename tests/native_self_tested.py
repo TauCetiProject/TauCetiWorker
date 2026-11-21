@@ -629,6 +629,32 @@ class SharedDiscovery(unittest.TestCase):
             self.assertEqual(transport.shared_read(key, fetch, identity=identity, lock_timeout=0.1), [dict(number=1)])
         self.assertEqual(fetch.call_count, 1)
 
+    def test_an_expired_or_invalidated_listing_is_refreshed_from_the_stored_one(self):
+        from tauceti_worker import github_transport as transport
+        from tauceti_worker.source_identity import discovery_scope
+
+        bases = []
+
+        def inventory(previous):
+            bases.append(previous)
+            return {"rows": [dict(number=len(bases))], "since": 1.0, "sweep": len(bases)}
+
+        self.source = type("Source", (SimpleNamespace,), {"inventory": lambda _, previous: inventory(previous)})(
+            **vars(self.source)
+        )
+        self.assertEqual(self.read(), [dict(number=1)])
+        self.assertEqual(self.read(), [dict(number=1)], "a current listing is shared as before")
+        transport.invalidate_shared(discovery_scope(self.source))
+        self.assertEqual(self.read(), [dict(number=2)])
+        with patch("tauceti_worker.github_transport.time.time", return_value=time.time() + 61):
+            self.assertEqual(self.read(), [dict(number=3)])
+        with transport.read_context(fresh=True):
+            self.assertEqual(self.read(), [dict(number=4)])
+        self.assertEqual(
+            [base and base["sweep"] for base in bases], [None, 1, 2, None], "a fresh read lists without a base"
+        )
+        self.source.open_prs.assert_not_called()
+
     def concurrent(self, outcome="success"):
         context = multiprocessing.get_context("fork")
         start, fallback = context.Barrier(4), context.Barrier(4 if outcome == "storage" else 3)
