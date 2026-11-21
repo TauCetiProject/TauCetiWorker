@@ -872,9 +872,13 @@ class IncrementalInventory(unittest.TestCase):
         def stamp(value):
             return datetime.fromtimestamp(value, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        def native(n):
+        def native(n, stat=True):
             pr = self.prs[n]
             return {
+                # Forgejo's diff stat, zero under the TauCeti fork's `stat=false`.
+                "additions": 3 if stat else 0,
+                "deletions": 1 if stat else 0,
+                "changed_files": 1 if stat else 0,
                 "number": n,
                 "title": "Proof",
                 "body": "",
@@ -918,7 +922,8 @@ class IncrementalInventory(unittest.TestCase):
                 if query.get("sort") == "recentupdate":
                     numbers.sort(key=lambda n: self.prs[n]["updated"], reverse=True)
             page, limit = int(query["page"]), int(query["limit"])
-            return [native(n) for n in numbers[(page - 1) * limit : page * limit]]
+            stat = query.get("stat") != "false"
+            return [native(n, stat) for n in numbers[(page - 1) * limit : page * limit]]
 
         self.client.request = request
         self.source = ForgejoReadSource(self.repo, self.client)
@@ -966,6 +971,13 @@ class IncrementalInventory(unittest.TestCase):
         rows = self.source._fields_reader(["number", "title"]).pulls(self.repo, ["number", "title"], state="open")
         self.assertEqual(len(rows), 120)
         self.assertTrue(self.calls and all(stat(path) == ["false"] for path in self.calls))
+        self.assertFalse([path for path in self.calls if "/files" in path or "/git/refs" in path], "no stat recovery")
+        self.calls.clear()
+        rows = self.source._fields_reader(["number", "additions"]).pulls(
+            self.repo, ["number", "additions"], state="open"
+        )
+        self.assertEqual({row["additions"] for row in rows}, {3})
+        self.assertTrue(self.calls and all(stat(path) is None for path in self.calls))
 
     def test_the_sweep_sees_unmoved_changes_and_drops_closures_the_index_missed(self):
         inventory = self.source.inventory(None)
