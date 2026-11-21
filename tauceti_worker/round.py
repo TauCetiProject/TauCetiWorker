@@ -419,6 +419,26 @@ RENEW_TIMEOUT_S = 60
 RENEW_EXPIRY_MARGIN_S = RENEW_TIMEOUT_S + 30
 
 
+def _renew(key: str) -> int | None:
+    """One `claim.sh renew`, bounded by RENEW_TIMEOUT_S; None when it could not finish. A renewal
+    that times out is killed with its whole process group, so retries do not pile up Git children."""
+    try:
+        p = subprocess.Popen(
+            [CLAIM_SH, "renew", key], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+        )
+    except OSError:
+        return None
+    try:
+        return p.wait(RENEW_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.wait()
+        return None
+
+
 def cmd_heartbeat(args) -> int:
     """Internal: renew a claim lease every CLAIM_HEARTBEAT_S until the parent dies (pipe EOF) or the
     lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext).
@@ -455,12 +475,7 @@ def cmd_heartbeat(args) -> int:
         attempted = time.time()
         if attempted + RENEW_EXPIRY_MARGIN_S >= renewed + ttl:
             return HEARTBEAT_LOST  # no renewal can finish inside the lease that is still ours
-        try:
-            rc = subprocess.run([CLAIM_SH, "renew", key], capture_output=True, timeout=RENEW_TIMEOUT_S).returncode
-        except subprocess.TimeoutExpired:
-            rc = None
-        except OSError:
-            rc = None
+        rc = _renew(key)
         if rc == 0:
             renewed, interval = attempted, CLAIM_HEARTBEAT_S
             continue

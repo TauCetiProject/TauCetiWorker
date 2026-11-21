@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -290,22 +291,20 @@ def run_heartbeat(renewals, ttl=1500, durations=None, started=None):
     attempts = []
     codes = iter(renewals)
     spans = iter(durations or [])
-    real = (round_mod.subprocess.run, round_mod.time.sleep, round_mod.time.time, round_mod.log)
+    real = (round_mod._renew, round_mod.time.sleep, round_mod.time.time, round_mod.log)
 
-    def fake_run(cmd, *, capture_output=False, timeout=None, **_kwargs):
-        assert cmd[1:] == ["renew", "branch/143"] and timeout == round_mod.RENEW_TIMEOUT_S
+    def fake_renew(key):
+        assert key == "branch/143"
         attempts.append(clock[0] - 1000)
         code = next(codes)
         clock[0] += next(spans, 0)
-        if code == "timeout":
-            raise subprocess.TimeoutExpired(cmd, timeout)
-        return SimpleNamespace(returncode=code)
+        return None if code == "timeout" else code
 
     def fake_sleep(seconds):
         assert seconds >= 0
         clock[0] += seconds
 
-    round_mod.subprocess.run = fake_run
+    round_mod._renew = fake_renew
     round_mod.time.sleep = fake_sleep
     round_mod.time.time = lambda: clock[0]
     round_mod.log = lambda _message: None
@@ -315,7 +314,7 @@ def run_heartbeat(renewals, ttl=1500, durations=None, started=None):
     try:
         rc = round_mod.cmd_heartbeat(SimpleNamespace(key="branch/143", ppipe=None))
     finally:
-        round_mod.subprocess.run, round_mod.time.sleep, round_mod.time.time, round_mod.log = real
+        round_mod._renew, round_mod.time.sleep, round_mod.time.time, round_mod.log = real
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -351,6 +350,29 @@ def heartbeat_dates_the_lease_from_its_acquisition():
     rc, attempts = run_heartbeat([2] * 100, started=-400)
     assert rc == round_mod.HEARTBEAT_LOST
     assert attempts and attempts[-1] + round_mod.RENEW_TIMEOUT_S < 1100, attempts
+
+
+def renewal_timeout_kills_its_process_group():
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "child.pid"
+        script = Path(tmp) / "claim.sh"
+        script.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {marker}\nwait\n")
+        script.chmod(0o755)
+        real = (round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S)
+        round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S = str(script), 1
+        try:
+            assert round_mod._renew("branch/143") is None
+        finally:
+            round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S = real
+        child = int(marker.read_text())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the renewal's child outlived its timeout")
 
 
 def source_claim_setup_failure_is_unavailable_not_lost():
@@ -393,6 +415,7 @@ fails = sum(
         ),
         ("a heartbeat dates the lease from its acquisition", heartbeat_dates_the_lease_from_its_acquisition),
         ("a claim-source setup failure is unavailable, not lost", source_claim_setup_failure_is_unavailable_not_lost),
+        ("a renewal that times out is killed with its children", renewal_timeout_kills_its_process_group),
     )
 )
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
