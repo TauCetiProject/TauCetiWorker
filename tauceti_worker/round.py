@@ -434,12 +434,21 @@ def _renew(key: str) -> int | None:
     """One `claim.sh renew`, bounded by RENEW_TIMEOUT_S; None when it could not finish. A renewal
     that times out is killed with its whole process group, so retries do not pile up Git children."""
     global _renewal
+    # Hold SIGTERM until the child is recorded, so the handler can never miss a renewal it started.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
     try:
         _renewal = subprocess.Popen(
-            [CLAIM_SH, "renew", key], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True
+            [CLAIM_SH, "renew", key],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            # The child inherits the blocked mask; the renewal itself must stay terminable.
+            preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM}),
         )
     except OSError:
         return None
+    finally:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGTERM})
     try:
         return _renewal.wait(RENEW_TIMEOUT_S)
     except subprocess.TimeoutExpired:
