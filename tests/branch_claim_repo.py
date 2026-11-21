@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -283,6 +284,150 @@ def safe_push_scopes_claim_repo():
         assert claim_log.read_text().splitlines() == [f"{CLAIMS}|holds"]
 
 
+def run_heartbeat(renewals, ttl=1500, durations=None, started=None):
+    """Drive cmd_heartbeat with a fake wall clock: each sleep advances it, each renewal returns the
+    next code after taking its duration. Returns (exit code, renewal start times)."""
+    clock = [1000.0]
+    attempts = []
+    codes = iter(renewals)
+    spans = iter(durations or [])
+    real = (round_mod._renew, round_mod.time.sleep, round_mod.time.time, round_mod.log)
+
+    def fake_renew(key):
+        assert key == "branch/143"
+        attempts.append(clock[0] - 1000)
+        code = next(codes)
+        clock[0] += next(spans, 0)
+        return None if code == "timeout" else code
+
+    def fake_sleep(seconds):
+        assert seconds >= 0
+        clock[0] += seconds
+
+    real_sigterm = round_mod.signal.getsignal(round_mod.signal.SIGTERM)
+    round_mod._renew = fake_renew
+    round_mod.time.sleep = fake_sleep
+    round_mod.time.time = lambda: clock[0]
+    round_mod.log = lambda _message: None
+    saved = {k: os.environ.get(k) for k in ("CLAIM_TTL", "CLAIM_LEASE_STARTED")}
+    os.environ["CLAIM_TTL"] = str(ttl)
+    os.environ["CLAIM_LEASE_STARTED"] = repr(1000.0 if started is None else 1000.0 + started)
+    try:
+        rc = round_mod.cmd_heartbeat(SimpleNamespace(key="branch/143", ppipe=None))
+    finally:
+        round_mod._renew, round_mod.time.sleep, round_mod.time.time, round_mod.log = real
+        round_mod.signal.signal(round_mod.signal.SIGTERM, real_sigterm)
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return rc, attempts
+
+
+def heartbeat_lost_lease_cancels_at_once():
+    rc, attempts = run_heartbeat([0, 1])
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts == [300, 600], attempts
+
+
+def heartbeat_retries_a_renewal_error_while_the_lease_lasts():
+    # Two failed renewals (a forge outage) followed by a success keep the lease and the round.
+    rc, attempts = run_heartbeat([2, "timeout", 0, 1])
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts == [300, 330, 360, 660], attempts
+
+
+def heartbeat_gives_up_before_an_unrenewed_lease_can_expire():
+    # The last good renewal began at 0, so the lease ends by 1500; no attempt may run past it,
+    # however long each one takes.
+    rc, attempts = run_heartbeat([2] * 100, durations=[round_mod.RENEW_TIMEOUT_S] * 100)
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts[0] == 300, attempts
+    assert attempts[-1] + round_mod.RENEW_TIMEOUT_S < 1500, attempts
+
+
+def heartbeat_dates_the_lease_from_its_acquisition():
+    # An acquisition that started 400s before the heartbeat leaves only that much less lease.
+    rc, attempts = run_heartbeat([2] * 100, started=-400)
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts and attempts[-1] + round_mod.RENEW_TIMEOUT_S < 1100, attempts
+
+
+def renewal_timeout_kills_its_process_group():
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "child.pid"
+        script = Path(tmp) / "claim.sh"
+        script.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {marker}\nwait\n")
+        script.chmod(0o755)
+        real = (round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S)
+        round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S = str(script), 1
+        try:
+            assert round_mod._renew("branch/143") is None
+        finally:
+            round_mod.CLAIM_SH, round_mod.RENEW_TIMEOUT_S = real
+        child = int(marker.read_text())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the renewal's child outlived its timeout")
+
+
+def terminated_heartbeat_kills_its_renewal():
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "child.pid"
+        script = Path(tmp) / "claim.sh"
+        script.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {marker}\nwait\n")
+        script.chmod(0o755)
+        code = (
+            "import sys, types; sys.path.insert(0, sys.argv[1]); from tauceti_worker import round as r; "
+            "r.CLAIM_SH = sys.argv[2]; r.CLAIM_HEARTBEAT_S = 0; "
+            "r.cmd_heartbeat(types.SimpleNamespace(key='branch/143', ppipe=None))"
+        )
+        hb = subprocess.Popen([sys.executable, "-c", code, str(REPO), str(script)])
+        try:
+            for _ in range(100):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("the renewal never started")
+            hb.terminate()
+            assert hb.wait(10) == 0
+        finally:
+            hb.kill()
+        child = int(marker.read_text())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the renewal's child outlived the heartbeat")
+
+
+def source_claim_setup_failure_is_unavailable_not_lost():
+    from tauceti_tools.forge import ForgeError
+
+    from tauceti_worker import source_claims
+
+    real = source_claims._main
+
+    def failing():
+        raise ForgeError("Forgejo GET returned HTTP 502", status=502)
+
+    source_claims._main = failing
+    try:
+        assert source_claims.main() == 2
+    finally:
+        source_claims._main = real
+
+
 fails = sum(
     check(name, case)
     for name, case in (
@@ -295,6 +440,19 @@ fails = sum(
         ("simultaneous claim creation has one winner and one collision", simultaneous_claim_creates_select_one_worker),
         ("heartbeat child inherits the selected repository", heartbeat_child_uses_selected_repo),
         ("git-safe-push scopes its lease check to the selected repository", safe_push_scopes_claim_repo),
+        ("a heartbeat whose lease was taken reports it lost at once", heartbeat_lost_lease_cancels_at_once),
+        (
+            "a heartbeat retries renewal errors while the lease lasts",
+            heartbeat_retries_a_renewal_error_while_the_lease_lasts,
+        ),
+        (
+            "a heartbeat gives up before an unrenewed lease can expire",
+            heartbeat_gives_up_before_an_unrenewed_lease_can_expire,
+        ),
+        ("a heartbeat dates the lease from its acquisition", heartbeat_dates_the_lease_from_its_acquisition),
+        ("a claim-source setup failure is unavailable, not lost", source_claim_setup_failure_is_unavailable_not_lost),
+        ("a renewal that times out is killed with its children", renewal_timeout_kills_its_process_group),
+        ("a terminated heartbeat kills its renewal", terminated_heartbeat_kills_its_renewal),
     )
 )
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
