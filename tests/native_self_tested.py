@@ -649,6 +649,26 @@ class SharedDiscovery(unittest.TestCase):
             self.assertEqual(transport.shared_read(key, fetch, identity=identity, lock_timeout=0.1), [dict(number=1)])
         self.assertEqual(fetch.call_count, 1)
 
+    def test_a_listing_invalidated_while_it_was_fetched_is_a_base_but_never_an_answer(self):
+        from tauceti_worker import github_transport as transport
+        from tauceti_worker.source_identity import discovery_scope
+
+        bases = []
+
+        def inventory(previous):
+            bases.append(previous)
+            if len(bases) == 1:
+                transport.invalidate_shared(discovery_scope(self.source))  # a write during the listing
+            return {"rows": [dict(number=len(bases))], "since": 1.0, "sweep": len(bases)}
+
+        self.source = type("Source", (SimpleNamespace,), {"inventory": lambda _, previous: inventory(previous)})(
+            **vars(self.source)
+        )
+        self.assertEqual(self.read(), [dict(number=1)], "the caller still gets its own listing")
+        self.assertEqual(self.read(), [dict(number=2)], "the next read does not answer from it")
+        self.assertEqual([base and base["sweep"] for base in bases], [None, 1], "but refreshes it")
+        self.assertEqual(self.read(), [dict(number=2)])
+
     def test_an_expired_or_invalidated_listing_is_refreshed_from_the_stored_one(self):
         from tauceti_worker import github_transport as transport
         from tauceti_worker.source_identity import discovery_scope
