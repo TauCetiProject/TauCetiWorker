@@ -283,6 +283,60 @@ def safe_push_scopes_claim_repo():
         assert claim_log.read_text().splitlines() == [f"{CLAIMS}|holds"]
 
 
+def run_heartbeat(renewals, ttl=1500):
+    """Drive cmd_heartbeat with a fake clock: each sleep advances it, each renew returns the next code.
+    Returns (exit code, renew attempt times)."""
+    clock = [0.0]
+    attempts = []
+    codes = iter(renewals)
+    real = (round_mod.subprocess.run, round_mod.time.sleep, round_mod.time.monotonic, round_mod.log)
+
+    def fake_run(cmd, *, capture_output=False, **_kwargs):
+        assert cmd[1:] == ["renew", "branch/143"]
+        attempts.append(clock[0])
+        return SimpleNamespace(returncode=next(codes))
+
+    def fake_sleep(seconds):
+        clock[0] += seconds
+
+    round_mod.subprocess.run = fake_run
+    round_mod.time.sleep = fake_sleep
+    round_mod.time.monotonic = lambda: clock[0]
+    round_mod.log = lambda _message: None
+    saved = os.environ.get("CLAIM_TTL")
+    os.environ["CLAIM_TTL"] = str(ttl)
+    try:
+        rc = round_mod.cmd_heartbeat(SimpleNamespace(key="branch/143", ppipe=None))
+    finally:
+        round_mod.subprocess.run, round_mod.time.sleep, round_mod.time.monotonic, round_mod.log = real
+        if saved is None:
+            os.environ.pop("CLAIM_TTL", None)
+        else:
+            os.environ["CLAIM_TTL"] = saved
+    return rc, attempts
+
+
+def heartbeat_lost_lease_cancels_at_once():
+    rc, attempts = run_heartbeat([0, 1])
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts == [300, 600], attempts
+
+
+def heartbeat_retries_a_renewal_error_while_the_lease_lasts():
+    # Two failed renewals (a forge outage) followed by a success keep the lease and the round.
+    rc, attempts = run_heartbeat([2, 2, 0, 1])
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts == [300, 330, 360, 660], attempts
+
+
+def heartbeat_gives_up_before_an_unrenewed_lease_can_expire():
+    # The last good renewal was at 0; the lease expires at 1500 and no attempt may land after it.
+    rc, attempts = run_heartbeat([2] * 100)
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts[0] == 300 and attempts[-1] < 1500, attempts
+    assert attempts[-1] + round_mod.RENEW_ERROR_RETRY_S >= 1500, attempts
+
+
 fails = sum(
     check(name, case)
     for name, case in (
@@ -295,6 +349,15 @@ fails = sum(
         ("simultaneous claim creation has one winner and one collision", simultaneous_claim_creates_select_one_worker),
         ("heartbeat child inherits the selected repository", heartbeat_child_uses_selected_repo),
         ("git-safe-push scopes its lease check to the selected repository", safe_push_scopes_claim_repo),
+        ("a heartbeat whose lease was taken reports it lost at once", heartbeat_lost_lease_cancels_at_once),
+        (
+            "a heartbeat retries renewal errors while the lease lasts",
+            heartbeat_retries_a_renewal_error_while_the_lease_lasts,
+        ),
+        (
+            "a heartbeat gives up before an unrenewed lease can expire",
+            heartbeat_gives_up_before_an_unrenewed_lease_can_expire,
+        ),
     )
 )
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")

@@ -404,18 +404,30 @@ class Claims:
 
 
 HEARTBEAT_LOST = 3
+# claim.sh renew: 0 renewed, 1 lost (taken over or gone), anything else an error that says nothing
+# about who holds the lease.
+RENEW_LOST = 1
+RENEW_ERROR_RETRY_S = 30
 
 
 def cmd_heartbeat(args) -> int:
     """Internal: renew a claim lease every CLAIM_HEARTBEAT_S until the parent dies (pipe EOF) or the
-    lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext)."""
+    lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext).
+
+    Only a renewal that reports the lease taken or gone loses it at once. A renewal that errors (the
+    forge or its Git transport briefly unavailable) is retried sooner, because the lease it renewed
+    last is still ours until it expires; the claim is given up only when the next attempt could
+    come after that expiry, where a peer may take it over."""
     import select
 
     key = args.key
     ppipe = args.ppipe
+    ttl = int(os.environ.get("CLAIM_TTL") or CLAIM_TTL_S)
+    renewed = time.monotonic()  # the caller starts the heartbeat right after acquiring
+    interval = CLAIM_HEARTBEAT_S
     while True:
         if ppipe is not None:
-            r, _, _ = select.select([ppipe], [], [], CLAIM_HEARTBEAT_S)
+            r, _, _ = select.select([ppipe], [], [], interval)
             if r:  # readable ⇒ EOF (we never write to the pipe) ⇒ parent gone
                 try:
                     if os.read(ppipe, 1) == b"":
@@ -423,9 +435,18 @@ def cmd_heartbeat(args) -> int:
                 except OSError:
                     return 0
         else:
-            time.sleep(CLAIM_HEARTBEAT_S)
-        if subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode != 0:
+            time.sleep(interval)
+        attempted = time.monotonic()
+        rc = subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode
+        if rc == 0:
+            renewed, interval = attempted, CLAIM_HEARTBEAT_S
+            continue
+        if rc == RENEW_LOST:
             return HEARTBEAT_LOST  # stop renewing so it can expire, and tell the round
+        interval = min(CLAIM_HEARTBEAT_S, RENEW_ERROR_RETRY_S)
+        if time.monotonic() + interval >= renewed + ttl:
+            return HEARTBEAT_LOST
+        log(f"claim {key}: renewal unavailable (rc={rc}); retrying in {interval}s")
 
 
 def run_round_subprocess(argv_tail: list[str], timeout: int = ROUND_TIMEOUT) -> int:
