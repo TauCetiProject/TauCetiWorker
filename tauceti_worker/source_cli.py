@@ -125,13 +125,18 @@ def list_command(command, source):
     if command.args or "json" not in options or set(options) - {"json", "jq", "limit", "state", "repo"}:
         return None
     host_repo = urlsplit(source.repository.forge.url).netloc + "/" + source.repo
-    if options.get("repo", source.repo) not in (source.repo, source.repository.url, host_repo):
+    # Only an explicitly selected source repository: without one, Tools picks the repository of
+    # the working directory's checkout, which may be another.
+    if (options.get("repo") or os.environ.get("GH_REPO")) not in (source.repo, source.repository.url, host_repo):
         return None
     fields, state, limit = options["json"].split(","), options.get("state", "open"), int(options.get("limit", "30"))
     if state == "open" and set(fields) <= set(source.inventory_fields):
         from .source_survey import discovery_inventory
 
         source.shared_inventory = True
+        # The inventory keeps PR-number order (a corrected row is reinserted by number), which is
+        # gh's newest-first order: only imported PRs can be created out of number order, and the
+        # native listing of every open PR showed none (21 Nov: no inversion among 1,272).
         rows = discovery_inventory(source)
         if rows is None:
             raise ForgeError("Forgejo open inventory unavailable")
