@@ -1180,6 +1180,24 @@ class StalledRepair(QueueFixture):
         self.assertIn("The agent's own conclusion", target.messages[0])
         self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
 
+    def test_turning_the_head_alert_off_clears_an_active_one(self):
+        self.tick()
+        self.clock.advance(3 * 3600)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+        self.controller.set_setting("head_progress_alert_seconds", 0, "test")
+        self.tick()
+        self.assertFalse(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+        self.assertIsNone(self.controller.status()["loop_termination"]["head_progress"])
+
+    def test_revisions_from_a_long_identical_run_are_all_remembered(self):
+        for n in range(25):
+            self.clock.advance(4 * 3600)
+            self.checkpoint(revision=f"{n:040x}")
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(len(stall["revisions"]), 25)
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision=f"{0:040x}"))
+
     def test_a_restart_starts_the_head_progress_period_again(self):
         self.tick()
         self.clock.advance(4 * 3600)  # the controller was down

@@ -9059,8 +9059,7 @@ class Controller:
         rows = self.store.rows(
             "submissions",
             {"task_id": task["id"], "reason": REPAIR_CHECKPOINT},
-            order="id DESC",
-            limit=max(limit, 1) + 50,
+            order="id DESC",  # the whole history: every revision of the current identical run has tried the task
         )
         signatures = [repair_stall.checkpoint_signature(row["tip"], row["worker_notes"]) for row in rows]
         latest = signatures[0] if signatures else None
@@ -9101,7 +9100,7 @@ class Controller:
                 "checkpoints": run,
                 "retries": 0,
                 "retry_at": now + delay,
-                "revisions": revisions[-20:],
+                "revisions": revisions,
                 "tools": tools_seen[-20:],
                 "findings": repair_stall.describe_findings(findings),
                 "conclusion": conclusion,
@@ -9137,7 +9136,7 @@ class Controller:
             self.setting("repair_stall_retry_max_seconds"),
         )
         current["retry_at"] = now + delay
-        current["revisions"] = list(dict.fromkeys([*current.get("revisions", []), *revisions]))[-20:]
+        current["revisions"] = list(dict.fromkeys([*current.get("revisions", []), *revisions]))
         current["tools"] = list(dict.fromkeys([*current.get("tools", []), *tools_seen]))[-20:]
         if conclusion:
             current["conclusion"] = conclusion
@@ -9233,6 +9232,10 @@ class Controller:
             if state and not state.get("alerted_at"):
                 state = dict(state, since=max(state["since"], now))
                 self._set_state("head_progress", state)
+        if not int(self.setting("head_progress_alert_seconds")):
+            if state:  # turned off: no alert stays active, and a later re-enable starts a fresh period
+                self._set_state("head_progress", None)
+            return
         fingerprint = self._head_progress_fingerprint(head) if head is not None else None
         if state and state.get("fingerprint") == fingerprint:
             limit = int(self.setting("head_progress_alert_seconds"))
