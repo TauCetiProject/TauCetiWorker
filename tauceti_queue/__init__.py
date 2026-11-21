@@ -22,7 +22,6 @@ Everything here is stdlib plus `git` subprocesses; the worker-side modules also 
 `tauceti_worker` harness.
 """
 
-
 _RUST_MIN_STACK = 256 * 1024 * 1024
 
 

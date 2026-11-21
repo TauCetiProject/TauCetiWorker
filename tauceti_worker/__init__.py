@@ -18,7 +18,6 @@ a function on the module that actually looks it up.
 
 from __future__ import annotations
 
-
 _RUST_MIN_STACK = 256 * 1024 * 1024
 
 

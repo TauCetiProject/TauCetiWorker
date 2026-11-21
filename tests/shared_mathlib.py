@@ -416,7 +416,6 @@ class StackLimitTests(unittest.TestCase):
         child = subprocess.run(["sh", "-c", "ulimit -s"], capture_output=True, text=True, check=True).stdout.strip()
         self.assertEqual(child, "unlimited" if hard == resource.RLIM_INFINITY else str(hard // 1024))
 
-
     def test_both_packages_size_rust_thread_stacks_for_children(self):
         # leantar unpacks a multi-archive batch on Rust threads, which RLIMIT_STACK does not size.
         import os
@@ -439,6 +438,7 @@ class StackLimitTests(unittest.TestCase):
                 os.environ["RUST_MIN_STACK"] = "1048576"
                 package._raise_stack_limit()
                 self.assertEqual(os.environ["RUST_MIN_STACK"], "1048576")
+
 
 class SignatureTests(Fixture):
     def key(self):
