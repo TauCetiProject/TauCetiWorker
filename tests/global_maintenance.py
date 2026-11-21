@@ -5,6 +5,7 @@ import importlib
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -236,7 +237,11 @@ class GlobalMaintenance(unittest.TestCase):
             bust=Mock(),
         )
         self.w.claims = SimpleNamespace(
-            begin_branch_work=Mock(return_value=True), release=Mock(), stop_heartbeat=Mock()
+            begin_branch_work=Mock(return_value=True),
+            release=Mock(),
+            stop_heartbeat=Mock(),
+            held=("branch/10", "org/claims"),
+            lost=threading.Event(),
         )
         return sv, work.Candidate(10, HEAD, final_resolution=True), live
 
@@ -293,6 +298,155 @@ class GlobalMaintenance(unittest.TestCase):
         with patch.object(work, "gh_run") as mutation:
             self.assertIsNone(work._close_spent_pr(self.w, sv, c))
         mutation.assert_not_called()
+
+    def test_spent_owned_rebase_is_selected_for_closure(self):
+        from tauceti_worker.survey import MAX_REBASE_ATTEMPTS
+
+        self.opts.only = ["rebase"]
+        flags = []
+        self.counter_values["rebase-pr-10"] = MAX_REBASE_ATTEMPTS
+        self.run_round(
+            [row(10, "Other", mergeable="CONFLICTING")], lambda stage, c: flags.append(c.final_resolution) or 0
+        )
+        self.assertEqual(self.calls[0][:2], ("rebase", 10))
+        self.assertEqual(flags, [True])
+        self.counter_values["rebase-pr-10"] = MAX_REBASE_ATTEMPTS - 1
+        self.run_round(
+            [row(10, "Other", mergeable="CONFLICTING")], lambda stage, c: flags.append(c.final_resolution) or 0
+        )
+        self.assertEqual(flags, [True, False])
+
+    def rebase_fixture(self, author="science", **changes):
+        from tauceti_worker.survey import MAX_REBASE_ATTEMPTS, Counters
+
+        sv, _, live = self.spent_fixture(**{"mergeable": "CONFLICTING", "baseRefName": "main", **changes})
+        sv.open_prs = [PRInfo.from_json(row(10, "Other", author=author, mergeable="CONFLICTING")["pr"])]
+        self.w.counters = Counters(self.w.cfg)
+        key = self.w.counters.rebase_budget_key(10)
+        self.w.counters.write(key, MAX_REBASE_ATTEMPTS)
+        return sv, work.Candidate(10, HEAD, rebase_budget_key=key, final_resolution=True), live
+
+    def test_spent_rebase_budget_closes_without_another_model_call(self):
+        sv, c, live = self.rebase_fixture()
+
+        def close(*args, **kwargs):
+            live["state"] = "CLOSED"
+            return SimpleNamespace(returncode=0)
+
+        with patch.object(work, "gh_run", side_effect=close) as mutation:
+            self.assertEqual(work._close_spent_pr(self.w, sv, c, stage="rebase"), 0)
+        comment = mutation.call_args.args[0][-1]
+        self.assertIn(f"could not bring this branch up to date with `main` at head `{HEAD}`", comment)
+        self.assertIn("The branch is retained", comment)
+        self.w.claims.release.assert_called_once()
+        self.assertEqual(self.w.counters.read(c.rebase_budget_key), 3)
+
+    def test_spent_rebase_closure_not_confirmed_raises(self):
+        sv, c, _ = self.rebase_fixture()
+        with patch.object(work, "gh_run") as mutation:
+            with self.assertRaisesRegex(NoProgress, "closure not confirmed"):
+                work._close_spent_pr(self.w, sv, c, stage="rebase")
+        mutation.assert_called_once()
+        self.w.claims.release.assert_called_once()
+
+    def test_spent_rebase_closure_guards_leave_the_pr_open(self):
+        from tauceti_worker.survey import MAX_REBASE_ATTEMPTS
+
+        cases = {
+            "label": ({"labels": [{"name": "do-not-close"}]}, None),
+            "draft": ({"isDraft": True}, None),
+            "moved head": ({"headRefOid": "b" * 40}, None),
+            "live author": ({"author": {"login": "peer"}}, None),
+            "now mergeable": ({"mergeable": "MERGEABLE"}, None),
+            "requested handoff": (
+                {"mergeable": "MERGEABLE", "labels": [{"name": "needs-rebase"}]},
+                lambda sv, c: setattr(self.w.gh, "rebase_requested", lambda *a: True),
+            ),
+            "surveyed author": (
+                {},
+                lambda sv, c: setattr(sv, "open_prs", [PRInfo.from_json(row(10, "Other", author="peer")["pr"])]),
+            ),
+            "bump": (
+                {},
+                lambda sv, c: setattr(
+                    sv, "open_prs", [SimpleNamespace(number=10, author="science", automatic_bump=True)]
+                ),
+            ),
+            "foreign base": ({}, lambda sv, c: setattr(c, "foreign_repair_base", "c" * 40)),
+            "not spent": ({}, lambda sv, c: self.w.counters.write(c.rebase_budget_key, MAX_REBASE_ATTEMPTS - 1)),
+            "checkpoint renewed": (
+                {},
+                lambda sv, c: (self.w.cfg.state / "rebase-progress-10.json").write_text(
+                    '{"schema":"tauceti-rebase-progress/v1","checkpoint":{"head":"' + "b" * 40 + '"}}'
+                ),
+            ),
+        }
+        for name, (changes, adjust) in cases.items():
+            with self.subTest(name):
+                (self.w.cfg.state / "rebase-progress-10.json").unlink(missing_ok=True)
+                sv, c, _ = self.rebase_fixture(**changes)
+                if adjust:
+                    adjust(sv, c)
+                with (
+                    patch("tauceti_worker.state_repair.repair_selected"),
+                    patch.object(work, "gh_run") as mutation,
+                ):
+                    self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="rebase"))
+                mutation.assert_not_called()
+
+    def test_spent_rebase_closure_requires_a_held_claim(self):
+        from tauceti_worker.round import Claims
+
+        sv, c, _ = self.rebase_fixture()
+        self.w.claims = Claims(self.w.cfg, SimpleNamespace(add_cleanup=Mock()))
+        with (
+            patch.dict(os.environ),
+            patch("tauceti_worker.round.claims_repo", return_value="org/claims"),
+            patch("tauceti_worker.round.subprocess.run", return_value=SimpleNamespace(returncode=2)),
+            patch.object(work, "gh_run") as mutation,
+        ):
+            self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="rebase"))
+        self.assertIsNone(self.w.claims.held)
+        mutation.assert_not_called()
+        sv, c, _ = self.rebase_fixture()
+        self.w.claims.lost.set()
+        with patch.object(work, "gh_run") as mutation:
+            self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="rebase"))
+        mutation.assert_not_called()
+
+    def test_spent_rebase_closure_rechecks_the_budget_after_claim_and_reads(self):
+        from dataclasses import replace
+
+        for during in ("claim", "live read"):
+            with self.subTest(during=during):
+                (self.w.cfg.state / "rebase-progress-10.json").unlink(missing_ok=True)
+                sv, c, live = self.rebase_fixture()
+                healthy = replace(
+                    sv.open_prs[0], mergeable="MERGEABLE", build_success=True, build_failed=False, build_status_at=100
+                )
+
+                def renew(*args, healthy=healthy, **kwargs):
+                    self.w.counters.observe_rebase_progress(healthy, handoff=False)
+                    return True
+
+                if during == "claim":
+                    self.w.claims.begin_branch_work.side_effect = renew
+                else:
+                    self.w.gh.pr_view = lambda *a, live=live, renew=renew: renew() and dict(live)
+                with patch.object(work, "gh_run") as mutation:
+                    self.assertIsNone(work._close_spent_pr(self.w, sv, c, stage="rebase"))
+                mutation.assert_not_called()
+                self.assertNotEqual(self.w.counters.rebase_budget_key(10), c.rebase_budget_key)
+
+    def test_spent_rebase_dispatch_goes_to_closure(self):
+        sv, c, _ = self.rebase_fixture()
+        with (
+            patch("tauceti_worker.github_outbox.pending_for", return_value=False),
+            patch.object(work, "_check_stage_read_quota"),
+            patch.object(work, "_close_spent_pr", return_value=0) as close,
+        ):
+            self.assertEqual(work.dispatch("rebase", self.w, sv, c, self.opts), 0)
+        self.assertEqual(close.call_args.kwargs["stage"], "rebase")
 
     def test_other_roadmap_maintenance_and_claim_fallthrough(self):
         # Model an independent worker's shuffled order. Claimed and contested
