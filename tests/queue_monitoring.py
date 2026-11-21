@@ -429,6 +429,35 @@ url = "https://private.invalid"
             ],
         )
 
+    def test_a_stalled_repair_and_a_head_without_progress_are_conditions_without_private_detail(self):
+        head = self.controller.status()["head"]
+        since = self.clock() - 3600
+        stall = {
+            "batch_id": head["id"],
+            "task_id": 15,
+            "since": since,
+            "tip": "c" * 40,
+            "findings": ["lint: PRIVATE_FINDING"],
+            "conclusion": "PRIVATE_CONCLUSION: a human has to fix lint-env.sh",
+        }
+        alerts = [
+            "repair stalled: batch 1 repair task 15 retained tip cccccccccccc with the same findings 3 times; "
+            "agent: PRIVATE_CONCLUSION",
+            f"head batch {head['id']} made no progress since Sun 22 Nov 06:00 AEDT",
+        ]
+        progress = {"fingerprint": [head["id"], 2], "since": since, "alerted_at": self.clock()}
+        loop = {"repair_stalls": [stall, dict(stall, batch_id=999999)], "head_progress": progress}
+        value = self.export(status={"loop_termination": loop, "alerts": alerts})
+        self.assertEqual(
+            value["conditions"],
+            [
+                {"kind": "repair_stalled", "since": monitoring.iso(since), "batch_id": str(head["id"])},
+                {"kind": "head_no_progress", "since": monitoring.iso(since), "batch_id": str(head["id"])},
+            ],
+            "an unknown batch is not published, and the alerts add no source_condition",
+        )
+        self.assertNotIn("PRIVATE", json.dumps(value))
+
     def test_a_public_commit_link_cannot_point_to_an_arbitrary_origin(self):
         with self.assertRaises(ValueError):
             monitoring.public_url("https://private.example", "commit", "a" * 40)

@@ -5978,7 +5978,12 @@ class WorkerAudits(Fixture):
         cfg = self.config(poll_seconds=0, verify_retries=0)
         client = self.client(cfg)
         finding = {"kind": "lint", "path": "TauCeti/Two.lean", "message": "unused argument"}
-        failed = {"ok": False, "build": {"rc": 0}, "checks": {"status": "failed"}, "diagnostics": [finding]}
+        failed = {
+            "ok": False,
+            "build": {"rc": 0},
+            "checks": {"status": "failed", "tools": "org/Tools@main", "tools_commit": "org/Tools@" + "e" * 40},
+            "diagnostics": [finding],
+        }
         submit = client.submit
 
         def lost(*args, **kwargs):
@@ -5995,6 +6000,11 @@ class WorkerAudits(Fixture):
         tip = pending["repair_checkpoint"]["tip"]
         self.assertEqual(self.service.done, set())
         self.assertEqual(len(self.service.results), 1)
+        # What the queue's stall detection reads: the code that produced the checkpoint and the agent's own word.
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        self.assertEqual(notes["worker_revision"], repair_task.STARTUP_REVISION)
+        self.assertEqual(notes["tools_revision"], "org/Tools@" + "e" * 40)
+        self.assertEqual(notes["agent_conclusion"], "done")
         before = (len(self.agent_calls()), len(self.lake_calls()))
         [saved] = repair_task.retry_deliveries(cfg, client)
         self.assertEqual(saved["reason"], "repair-checkpoint", saved)

@@ -1,8 +1,9 @@
-# Loop termination: repair, infrastructure backoff and notifications
+# Loop termination: repair, infrastructure backoff, stalled repair and notifications
 
 A failing head is repaired by agents however often it fails. The queue never withdraws, bisects,
-evicts or holds a member of the head on its own: there is no eviction cap, no count of repeated
-failures or fruitless claims, and no human in the repair loop.
+evicts or holds a member of the head on its own: there is no eviction cap and no human in the
+repair loop. It does notice a repair that keeps producing the same result, slows its retries and
+alerts ("Stalled repair" below), but it never stops repairing.
 
 ## Repair
 
@@ -61,6 +62,59 @@ The operator gets one direct message when the backoff starts and one on recovery
 retry. While it lasts the status page shows an alert and `loop_termination.infrastructure_backoff`
 (start, retries).
 
+## Stalled repair
+
+A repair checkpoint (a claim that ends with the chain retained for the next claim, because the
+build passed and only audit or lint findings remain) does not change the head, so a task can
+checkpoint forever without progress. Batch 465's repair task 1415 did: 47 claims over about 12
+hours retained tip `cc0e44e2` with the same lint driver failure, which no source change could fix,
+and every agent session wrote that a human had to intervene (the operator's batch 465 postmortem,
+ref-143).
+
+**Detection.** Each checkpoint has a failure signature (`tauceti_queue/repair_stall.py`): its tip
+and its findings, each reduced to the failing check (kind and check name), where it points (module
+or file) and its message with commit hashes, temporary paths, numbers and spacing removed, in any
+order. When the task's last `repair_stall_checkpoints` (default 3) checkpoints have the same
+signature, the task is stalled. The worker and TauCetiTools revisions are not part of the signature:
+new code that fails the same way has not made progress either.
+
+**On a stall** the controller:
+
+- journals `escalated` (action `repair-stalled`) and raises one progress alert (below) with the
+  findings and the agent's own conclusion: the passage of its last message that says why it could
+  not make progress, from the `agent_conclusion` the worker sends with each checkpoint;
+- shows the stall among the status `alerts` (`repair stalled: batch B repair task T retained tip ...
+  since <AEDT time>; next claim at <AEDT time>; agent: ...`), in `loop_termination.repair_stalls`
+  and in the head's `repair_stall`, and publishes a `repair_stalled` condition (its start and batch
+  only) that `tauceti-fleet status` shows. The head's `task_unclaimed` alert is suppressed while the
+  task waits on purpose;
+- offers the task again only after `repair_stall_retry_seconds` (30 minutes), and after each further
+  identical checkpoint waits twice as long, up to `repair_stall_retry_max_seconds` (4 hours), with a
+  `repair-stall-backoff` journal entry each time. It never stops offering it.
+
+**Resuming.** The stall ends, with one `repair-stall-ended` progress message, when the inputs
+change: a checkpoint with another signature (another tip or other findings), or the task leaving
+the open state (adopted, or replaced by a new batch version, a new base or new members). A worker
+whose revision has not produced one of the stalled checkpoints (it sends `revision` with its claim)
+is offered the task at once, so installing a fix does not wait for the backoff
+(`repair-stall-claimed`, reason `new-worker-revision`). A TauCetiTools change takes effect at the
+next claim the backoff allows.
+
+**A head without progress.** Independently, once the head's version, tip, base, current CI attempt
+(and its outcome) and open task have all stayed the same for `head_progress_alert_seconds` (3
+hours), the controller journals `head-no-progress`, raises one progress alert naming the stage (and
+the stalled task and its agent's conclusion, if there is one) and publishes a `head_no_progress`
+condition. Claims of the same task are not progress. When any of those change, it sends one
+`head-progress-resumed` message. After a controller restart the clock starts at the first pass.
+
+**Where progress alerts go.** They use their own outbox kind, `progress-alert`, never the
+escalation direct messages. Their target is the Zulip configuration that
+`TAUCETI_QUEUE_PROGRESS_ALERT_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names: the
+format of TauCetiFleet's `tauceti-fleet fleet-alert --zulip-config` (mode 0600; `stream` and
+`topic`, or `recipient_id`), so one file chosen by decision 135 serves both. Unset, the entry
+completes as `journal-only` and the whole message is written to the service log (`journalctl
+--user -u tauceti-queue`), as the fleet alert does without its configuration.
+
 ## Alerts and notifications
 
 The start of an infrastructure backoff and its recovery (the recovery is a message and a journal
@@ -113,3 +167,7 @@ that report (`tauceti_queue/stuck_heads.py`):
 | `automatic_retry_seconds` | `1800` | first delay of the infrastructure backoff |
 | `automatic_retry_max_seconds` | `14400` | the most that delay doubles to |
 | `escalation_alert_seconds` | `86400` | how long an escalation stays among the status alerts |
+| `repair_stall_checkpoints` | `3` | identical checkpoints in a row that make a repair task stalled; 0: off |
+| `repair_stall_retry_seconds` | `1800` | first wait before a stalled task is offered again |
+| `repair_stall_retry_max_seconds` | `14400` | the most that wait doubles to |
+| `head_progress_alert_seconds` | `10800` | how long the head may stay unchanged before its progress alert; 0: off |

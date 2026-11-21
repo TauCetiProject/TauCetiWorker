@@ -9,7 +9,7 @@ tip's build outputs to the workers' own cache namespace (``repair_publish``), wh
 Task protocol (``docs/queue/repair-task.md``), all JSON over HTTP with
 ``Authorization: Bearer <GitHub token of the worker's account>``:
 
-- ``POST /tasks/claim`` ``{worker}`` returns 204 when nothing is claimable, else the controller's
+- ``POST /tasks/claim`` ``{worker, revision}`` returns 204 when nothing is claimable, else the controller's
   ``Task`` record (``tauceti_queue/ports.py``: ``task_id``, ``kind``, ``base``, ``tip``, ``onto``,
   ``members``, ``diagnostics``, ``retained_refs``, ``submission_ref``, ``claim_token``, ``expires_at``,
   ``instruction``);
@@ -529,6 +529,8 @@ class TaskClient:
 
     def claim(self) -> Task | None:
         body = {"worker": self.worker}
+        if re.fullmatch(r"[0-9a-f]{7,64}", STARTUP_REVISION or ""):
+            body["revision"] = STARTUP_REVISION  # a stalled repair is offered at once to code that has not tried it
         if self.binding is None:
             from .mixed_tasks import SCHEMA
 
@@ -1711,6 +1713,16 @@ def rejected_members(response: dict) -> list[str]:
     return members
 
 
+def last_agent_conclusion(agent_records: list[dict], limit: int = 2000) -> str | None:
+    """The last agent attempt's final message (what it concluded about the task), cut to ``limit``."""
+    for record in reversed(agent_records or []):
+        for attempt in reversed((record or {}).get("attempts") or []):
+            text = (attempt or {}).get("final_text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()[:limit]
+    return None
+
+
 def read_telemetry(logdir: Path, provider: str) -> dict:
     from tauceti_worker.runtime_status import read_json
 
@@ -2030,6 +2042,7 @@ def run_repair_agent(
                 "session": session,
                 "infrastructure_failure": reason,
                 "telemetry": read_telemetry(logdir, telemetry_provider),
+                "final_text": (run or {}).get("final_text"),
             }
             usage = (record["telemetry"] or {}).get("usage") or {}
             record["estimated_cost_usd"] = repair.price_usage(
@@ -3473,6 +3486,7 @@ def _run_task(
                                 {**finding, "message": finding["message"][:2000]}
                                 for finding in verification["diagnostics"][:20]
                             ],
+                            "tools": checks.get("tools_commit") or checks.get("tools"),
                         }
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
@@ -3531,6 +3545,14 @@ def _run_task(
             submit_options = {"checkpoint": True} if saving_checkpoint else {}
             if saving_checkpoint:
                 notes["repair_checkpoint"] = checkpoint["diagnostics"]
+                # What the queue's stall detection reads (docs/queue/escalation.md, "Stalled repair"): the
+                # code that produced the checkpoint and the agent's own conclusion about it.
+                notes["worker_revision"] = STARTUP_REVISION
+                if checkpoint.get("tools"):
+                    notes["tools_revision"] = checkpoint["tools"]
+                conclusion = last_agent_conclusion(agent_records)
+                if conclusion:
+                    notes["agent_conclusion"] = conclusion
             lease.submitting.set()
             try:
                 response = with_retries(

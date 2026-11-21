@@ -978,6 +978,10 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `automatic_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
 | `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
+| `repair_stall_checkpoints` | `3` | integer, at least 0; 0 disables stalled-repair detection ([escalation.md](escalation.md), "Stalled repair") |
+| `repair_stall_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
+| `repair_stall_retry_max_seconds` | `14400` | integer, at least 0 |
+| `head_progress_alert_seconds` | `10800` | integer, at least 0; 0 disables the head-progress alert |
 | `emergency_enabled` | `false` | `true` or `false`; accept `bors emergency` requests (below, after Rebuilding the head) |
 | `emergency_evict` | `false` | `true` or `false`; let the emergency batch take the head from a running head that is neither about to land nor publishing its final oleans |
 | `forgejo_placement_enabled` | `true` | `true` or `false`; `false` keeps waiting Forgejo inputs out of insertion while Forgejo is unavailable ([mixed-sources.md](mixed-sources.md), "Landing GitHub work while Forgejo is unavailable") |
@@ -987,7 +991,9 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 
 Escalations (the start and end of an infrastructure backoff) are sent as Zulip direct messages when
 `TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
-configuration file; see [escalation.md](escalation.md), "Alerts and notifications".
+configuration file; see [escalation.md](escalation.md), "Alerts and notifications". Progress
+alerts (a stalled repair, a head without progress) are journal-only until
+`TAUCETI_QUEUE_PROGRESS_ALERT_ZULIP_CONFIG` names a target ([escalation.md](escalation.md), "Stalled repair").
 
 
 ## Primary admission

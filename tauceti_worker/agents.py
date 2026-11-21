@@ -1291,7 +1291,8 @@ _LAST_AGENT_RUN: dict | None = None
 
 def take_last_agent_run() -> dict | None:
     """The renderer's record of the last agent subprocess (``provider``, ``rc``, ``saw_work``,
-    ``terminal_failure``, ``rate_limit_status``, ``usage``, the last lines of its ``tail``), or None.
+    ``terminal_failure``, ``rate_limit_status``, ``usage``, the last lines of its ``tail``, its
+    ``final_text``), or None.
     Reads AND CLEARS, like ``take_last_agent_infra_failure``."""
     global _LAST_AGENT_RUN
     record, _LAST_AGENT_RUN = _LAST_AGENT_RUN, None
@@ -1479,6 +1480,7 @@ def run_agent_proc(
             "rate_limit_status": renderer.rate_limit_status,
             "usage": dict(renderer.usage),
             "tail": list(tail)[-6:],  # the guardian's fixed diagnostic when the executable cannot start
+            "final_text": (renderer.final_text or "")[:4000] or None,  # the agent's own last word
         }
         if provider in {"codex", "claude"} and not renderer.active:
             write_rendered(destination, f"[warning] no structured {provider} events were recognized\n")

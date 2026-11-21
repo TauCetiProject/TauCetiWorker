@@ -377,6 +377,7 @@ def check(
         record["tools"] = f"{repo}@{ref}"
         checkout = tools_checkout(tools_root, repo, ref)
         ref = checkout.name  # the exact commit, which keys the compiled drivers
+        record["tools_commit"] = f"{repo}@{ref}"
         record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
         materialize_started = time.monotonic()
         scripts = materialize(checkout, worktree, work / "scripts")
