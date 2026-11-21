@@ -94,6 +94,11 @@ def checkpoint_signature(tip: str, worker_notes: str | None) -> str | None:
     return signature(tip, findings)
 
 
+def revision(value: Any) -> str:
+    """A worker revision as the claim endpoint accepts it (a hex commit id), else empty."""
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{7,64}", value) else ""
+
+
 def conclusion(text: str | None, limit: int = CONCLUSION_LIMIT) -> str:
     """The agent's own conclusion from its last message: the paragraphs that say why it could not make
     progress (a human has to intervene, no source change can fix it), else the message's opening, cut

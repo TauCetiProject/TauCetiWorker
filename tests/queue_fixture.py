@@ -6,6 +6,7 @@ a controllable clock and no inference. The tests are named after the acceptance 
 `docs/redesign/specs/ai-merge-queue.md`; the mapping is in `docs/queue/controller.md`.
 """
 
+import io
 import json
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import time
 import types
 import unittest
 import unittest.mock
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -697,10 +699,6 @@ class ProgressAlertNotifier(unittest.TestCase):
     def test_a_stream_topic_target_posts_there_and_reconciles_in_that_topic(self):
         calls = []
 
-        def request(config, method, params):
-            calls.append((method, params))
-            return {"messages": []} if method == "GET" else {"id": 7}
-
         config = {
             "site": "https://z.example",
             "email": "bot@z",
@@ -709,10 +707,33 @@ class ProgressAlertNotifier(unittest.TestCase):
             "topic": "fleet health",
         }
         notifier = escalation.ZulipNotifier(config, streams=True)
-        with patch("tauceti_worker.audit_alerts.request", request):
+
+        class Opener:
+            def open(self, req, timeout):
+                calls.append((req.get_method(), req.full_url, req.data))
+                body = (
+                    {"result": "success", "messages": []}
+                    if req.get_method() == "GET"
+                    else {"result": "success", "id": 7}
+                )
+                return io.BytesIO(json.dumps(body).encode())
+
+        calls = []
+        # Through the real transport: a stream target names no recipient and still passes its checks.
+        with patch("tauceti_worker.audit_alerts.urllib.request.build_opener", lambda *_: Opener()):
             self.assertEqual(notifier.send("m1", "hello m1", reconcile=True), "zulip 7")
-        self.assertIn('"operand": "ops"', calls[0][1]["narrow"])
-        self.assertEqual(calls[1][1], {"type": "stream", "to": "ops", "topic": "fleet health", "content": "hello m1"})
+        self.assertIn("ops", urllib.parse.unquote(calls[0][1]))
+        posted = urllib.parse.parse_qs(calls[1][2].decode())
+        self.assertEqual(
+            posted, {"type": ["stream"], "to": ["ops"], "topic": ["fleet health"], "content": ["hello m1"]}
+        )
+        from tauceti_worker import audit_alerts
+
+        with (
+            self.assertRaises(ValueError),
+            patch("tauceti_worker.audit_alerts.urllib.request.build_opener", lambda *_: Opener()),
+        ):
+            audit_alerts.request(config, "POST", {})  # audit direct messages still need a recipient
         with self.assertRaises(ValueError):
             escalation.ZulipNotifier({k: v for k, v in config.items() if k != "stream"}, streams=True)
 
@@ -1121,6 +1142,35 @@ class StalledRepair(QueueFixture):
             self.checkpoint()
         self.assertEqual(self.escalated("repair-stalled"), [])
 
+    def test_turning_detection_off_releases_a_stall_at_once(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+        self.tick()
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+
+    def test_every_revision_in_the_identical_run_has_tried_the_task(self):
+        self.checkpoint(revision="b" * 40)
+        self.checkpoint()
+        self.checkpoint()
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(stall["revisions"], ["b" * 40, self.REVISION])
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40))
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision="c" * 64))
+
+    def test_a_stall_that_recurs_is_told_again(self):
+        other = ({"kind": "lint", "module": "TauCeti.A", "message": "simpNF"},)
+        for findings in ((DRIVER_FAILURE,), other, (DRIVER_FAILURE,)):
+            for _ in range(3):
+                self.clock.advance(4 * 3600)
+                self.checkpoint(findings=findings)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stalled")), 3)
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "progress-alert"}), 5, "3 starts, 2 ends")
+
     def test_a_configured_target_receives_the_progress_alert(self):
         target = self.controller.progress_notifier = RecordingNotifier()
         for _ in range(3):
@@ -1129,6 +1179,16 @@ class StalledRepair(QueueFixture):
         self.assertEqual(len(target.messages), 1)
         self.assertIn("The agent's own conclusion", target.messages[0])
         self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
+
+    def test_a_restart_starts_the_head_progress_period_again(self):
+        self.tick()
+        self.clock.advance(4 * 3600)  # the controller was down
+        self.controller._head_progress_anchored = False
+        self.tick()
+        self.assertEqual(self.escalated("head-no-progress"), [])
+        self.clock.advance(3 * 3600)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
 
     def test_a_head_without_progress_alerts_once_and_recovers(self):
         self.controller.set_setting("repair_stall_checkpoints", 0, "test")

@@ -50,6 +50,8 @@ class ZulipNotifier:
             )
         self.config = dict(config)
         self.stream = streams and bool(config.get("stream") and config.get("topic"))
+        if self.stream and not all(isinstance(config[k], str) for k in ("stream", "topic")):
+            raise ValueError("Zulip stream and topic must be text")
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> ZulipNotifier:
@@ -58,7 +60,7 @@ class ZulipNotifier:
     def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         from tauceti_worker.audit_alerts import request
 
-        return request(self.config, method, params)
+        return request(self.config, method, params, require_recipient=not self.stream)
 
     def send(self, marker: str, content: str, *, reconcile: bool) -> str:
         """Send `content` (which carries `marker`) unless an earlier attempt already delivered it: an

@@ -748,6 +748,7 @@ class Controller:
         # names, in the format of TauCetiFleet's `fleet-alert --zulip-config`. Unset, they stay
         # journal-only, like the fleet alert without its configuration.
         self.progress_notifier_error = ""
+        self._head_progress_anchored = False  # `_watch_head_progress` restarts its period once per process
         self.progress_notifier: escalation.Notifier | None = None
         try:
             self.progress_notifier = escalation.progress_notifier_from_environment()
@@ -9068,11 +9069,17 @@ class Controller:
             if value is None or value != latest:
                 break
             run += 1
-        revision = str(notes.get("worker_revision") or "")[:40]
-        tools = str(notes.get("tools_revision") or "")[:80]
+        # Every revision that produced a checkpoint of this run has tried the task and failed the same way.
+        run_notes = [repair_stall.notes_of(row["worker_notes"]) for row in rows[:run]]
+        revisions = list(
+            dict.fromkeys(r for n in reversed(run_notes) if (r := repair_stall.revision(n.get("worker_revision"))))
+        )
+        tools_seen = list(
+            dict.fromkeys(str(n["tools_revision"])[:120] for n in reversed(run_notes) if n.get("tools_revision"))
+        )
         conclusion = repair_stall.conclusion(notes.get("agent_conclusion"))
         findings = notes.get("repair_checkpoint") or []
-        if current is not None and current.get("signature") != latest:
+        if current is not None and (current.get("signature") != latest or not limit):
             self._end_repair_stall(task, batch, current, now, "a checkpoint with other findings or another tip")
             stalls.pop(key, None)
             self._set_state("repair_stalls", stalls)
@@ -9094,8 +9101,8 @@ class Controller:
                 "checkpoints": run,
                 "retries": 0,
                 "retry_at": now + delay,
-                "revisions": [r for r in (revision,) if r],
-                "tools": [t for t in (tools,) if t],
+                "revisions": revisions[-20:],
+                "tools": tools_seen[-20:],
                 "findings": repair_stall.describe_findings(findings),
                 "conclusion": conclusion,
             }
@@ -9116,7 +9123,7 @@ class Controller:
                     "a new tip, new members or a worker on a revision that has not tried it is offered the task at once"
                 ),
                 lines=current["findings"],
-                key=f"repair-stalled:{task['id']}:{latest}",
+                key=f"repair-stalled:{task['id']}:{latest}:{now}",
                 counted=False,
                 channel="progress-alert",
                 extra={"task_id": task["id"], "tip": tip, "signature": latest, "conclusion": conclusion},
@@ -9130,10 +9137,8 @@ class Controller:
             self.setting("repair_stall_retry_max_seconds"),
         )
         current["retry_at"] = now + delay
-        current["revisions"] = list(dict.fromkeys([*current.get("revisions", []), *([revision] if revision else [])]))[
-            -20:
-        ]
-        current["tools"] = list(dict.fromkeys([*current.get("tools", []), *([tools] if tools else [])]))[-20:]
+        current["revisions"] = list(dict.fromkeys([*current.get("revisions", []), *revisions]))[-20:]
+        current["tools"] = list(dict.fromkeys([*current.get("tools", []), *tools_seen]))[-20:]
         if conclusion:
             current["conclusion"] = conclusion
         stalls[key] = current
@@ -9163,7 +9168,7 @@ class Controller:
                 f"the stall that began at {repair_stall.clock(stall['since'])} ended after "
                 f"{repair_stall.duration(now - stall['since'])} and {stall.get('retries', 0)} backed-off claims"
             ),
-            key=f"repair-stall-ended:{stall['task_id']}:{stall['signature']}",
+            key=f"repair-stall-ended:{stall['task_id']}:{stall['signature']}:{stall['since']}",
             counted=False,
             channel="progress-alert",
             extra={"task_id": stall["task_id"]},
@@ -9175,22 +9180,29 @@ class Controller:
         stalls = self._repair_stalls()
         if not stalls:
             return
-        ended = False
-        for key, stall in list(stalls.items()):
-            task = self.store.row("tasks", {"id": int(key)})
-            if task is not None and task["state"] == TASK_OPEN:
-                continue
-            batch = self.store.row("batches", {"id": stall["batch_id"]})
-            why = "the task was " + ((task["resolution"] or task["state"]) if task is not None else "removed")
-            self._end_repair_stall(task, batch, stall, now, why)
-            stalls.pop(key)
-            ended = True
-        if ended:
-            self._set_state("repair_stalls", stalls)
+        disabled = not int(self.setting("repair_stall_checkpoints"))
+        with self.store.transaction():
+            ended = False
+            for key, stall in list(stalls.items()):
+                task = self.store.row("tasks", {"id": int(key)})
+                if task is not None and task["state"] == TASK_OPEN and not disabled:
+                    continue
+                batch = self.store.row("batches", {"id": stall["batch_id"]})
+                if disabled and task is not None and task["state"] == TASK_OPEN:
+                    why = "stalled-repair detection was turned off"
+                else:
+                    why = "the task was " + ((task["resolution"] or task["state"]) if task is not None else "removed")
+                self._end_repair_stall(task, batch, stall, now, why)
+                stalls.pop(key)
+                ended = True
+            if ended:
+                self._set_state("repair_stalls", stalls)
 
     def _stall_holds(self, task: dict[str, Any], now: float, worker_revision: str | None) -> bool:
         """Whether a stalled task waits out its backoff for this claim: a worker on a revision that has
         not produced one of the stalled checkpoints is offered it at once."""
+        if not int(self.setting("repair_stall_checkpoints")):
+            return False
         stall = self._repair_stalls().get(str(task["id"]))
         if stall is None or now >= stall.get("retry_at", 0):
             return False
@@ -9215,6 +9227,12 @@ class Controller:
         same task are not progress. One message when it moves again (or another batch is head)."""
         head = self._head()
         state = self._state("head_progress")
+        if not self._head_progress_anchored:
+            # Time the controller did not observe proves nothing: a restart starts the period again.
+            self._head_progress_anchored = True
+            if state and not state.get("alerted_at"):
+                state = dict(state, since=max(state["since"], now))
+                self._set_state("head_progress", state)
         fingerprint = self._head_progress_fingerprint(head) if head is not None else None
         if state and state.get("fingerprint") == fingerprint:
             limit = int(self.setting("head_progress_alert_seconds"))
@@ -9223,29 +9241,34 @@ class Controller:
             stall = next((s for s in self._repair_stalls().values() if s.get("batch_id") == head["id"]), None)
             stage = self._head_stage(head)
             state["alerted_at"] = now
-            self._set_state("head_progress", state)
-            self._count("head_progress_alerts")
-            self._record_escalation(
-                "head-no-progress",
-                head,
-                now,
-                cause=(
-                    f"head batch {head['id']} {HEAD_NO_PROGRESS_TEXT} for {repair_stall.duration(now - state['since'])} "
-                    f"(since {repair_stall.clock(state['since'])}), at stage {stage}"
-                ),
-                detail=(
-                    f"repair task {stall['task_id']} is stalled: {stall['checkpoints']} identical checkpoints at "
-                    f"{stall['tip'][:12]}; next claim at {repair_stall.clock(stall['retry_at'])}"
-                    if stall
-                    else "nothing was changed; one more message when the head moves again"
-                ),
-                lines=(stall or {}).get("findings") or [],
-                key=f"head-no-progress:{head['id']}:{state['since']}",
-                counted=False,
-                channel="progress-alert",
-                extra={"conclusion": (stall or {}).get("conclusion") or ""},
-            )
+            with self.store.transaction():
+                self._set_state("head_progress", state)
+                self._count("head_progress_alerts")
+                self._record_escalation(
+                    "head-no-progress",
+                    head,
+                    now,
+                    cause=(
+                        f"head batch {head['id']} {HEAD_NO_PROGRESS_TEXT} for {repair_stall.duration(now - state['since'])} "
+                        f"(since {repair_stall.clock(state['since'])}), at stage {stage}"
+                    ),
+                    detail=(
+                        f"repair task {stall['task_id']} is stalled: {stall['checkpoints']} identical checkpoints at "
+                        f"{stall['tip'][:12]}; next claim at {repair_stall.clock(stall['retry_at'])}"
+                        if stall
+                        else "nothing was changed; one more message when the head moves again"
+                    ),
+                    lines=(stall or {}).get("findings") or [],
+                    key=f"head-no-progress:{head['id']}:{state['since']}",
+                    counted=False,
+                    channel="progress-alert",
+                    extra={"conclusion": (stall or {}).get("conclusion") or ""},
+                )
             return
+        with self.store.transaction():
+            self._head_progress_moved(head, state, fingerprint, now)
+
+    def _head_progress_moved(self, head, state, fingerprint, now: float) -> None:
         if state and state.get("alerted_at"):
             previous = self.store.row("batches", {"id": state["fingerprint"][0]}) or {
                 "id": state["fingerprint"][0],
