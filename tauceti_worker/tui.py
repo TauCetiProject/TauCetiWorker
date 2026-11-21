@@ -18,6 +18,7 @@ from .config import (
     roadmap_only,
     roadmap_skip,
     roadmap_targets,
+    roadmap_targets_fallback,
 )
 from .constants import ALLOWED_TASKS, KIND_BY_NAME, KIND_KEYS, TAUCETI
 from .github import GitHub
@@ -192,6 +193,7 @@ def launch_cmd(
     github_account: str | None = None,
     extra_roadmap_prompt: str | None = None,
     roadmap_targets: Path | None = None,
+    roadmap_targets_fallback: bool = False,
 ) -> list[str]:
     """Build the exact `tauceti work` command a TUI action runs/spawns (also shown via 'copy command').
     `roadmap_only`/`roadmap_skip` (the raw env values for the current roadmap dials) are embedded as
@@ -219,6 +221,8 @@ def launch_cmd(
         cmd.append(f"--extra-roadmap-prompt={extra_roadmap_prompt}")  # one argument: the text may start with `-`
     if roadmap_targets is not None:
         cmd += ["--roadmap-targets", str(Path(roadmap_targets).expanduser().resolve())]
+        if roadmap_targets_fallback:
+            cmd.append("--roadmap-targets-fallback")
     return cmd
 
 
@@ -845,6 +849,7 @@ def _dashboard_app(cfg, loader=None):
                     skip,
                     extra_roadmap_prompt=guidance,
                     roadmap_targets=roadmap_targets(),
+                    roadmap_targets_fallback=roadmap_targets_fallback(),
                 )
             )
             loop = " ".join(
@@ -858,6 +863,7 @@ def _dashboard_app(cfg, loader=None):
                     skip,
                     extra_roadmap_prompt=guidance,
                     roadmap_targets=roadmap_targets(),
+                    roadmap_targets_fallback=roadmap_targets_fallback(),
                 )
             )
             copied = True
@@ -886,6 +892,7 @@ def _dashboard_app(cfg, loader=None):
                         github_account=os.environ.get("TAUCETI_GITHUB_ACCOUNT"),
                         extra_roadmap_prompt=guidance,
                         roadmap_targets=str(targets) if (targets := roadmap_targets()) is not None else None,
+                        roadmap_targets_fallback=roadmap_targets_fallback(),
                     )
                     self.notify(
                         f"saved {spec.id} in {self.workers_config}\nmanager will keep it running",

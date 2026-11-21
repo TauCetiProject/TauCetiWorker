@@ -8,6 +8,7 @@ the worker uses:
                                        of `gh` and of the other sources a round sees
     inventory_keys(rows)               the items a multi-source round's open-PR inventory names
     candidates(targets, only, skip)    the eligible items, in the order a worker tries to claim them
+    NothingOffered                     what `candidates` raises when the list, once read, has none
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
     open_pr(item, gh)                  an open pull request for an item that a bounded listing missed
     GitHubMarkerReads()                the GitHub repository's marked pull requests, for a round
@@ -58,6 +59,11 @@ class MergedPRs(list):
     def __init__(self, rows=(), *, complete=False):
         super().__init__(rows)
         self.complete = complete
+
+
+class NothingOffered(NoProgress):
+    """The list was read, and under its live statuses it has no item this round can take. A list
+    that cannot be read, or pull requests that cannot be, raise something else."""
 
 
 @dataclass(frozen=True)
@@ -514,7 +520,7 @@ def candidates(targets: Targets, only: str, skip: Iterable[str]) -> list[TargetI
     """The eligible items in claim order. `only` is the round's roadmap area, or `auto`, `any` or
     empty for none: a pinned area is taken alone, even when `skip` names it; otherwise every area
     outside `skip`, shuffled so that workers started together spread out, in file order within an
-    area. NoProgress, saying why, when the list offers nothing."""
+    area. NothingOffered, saying why, when the list offers nothing."""
     pinned = only not in ("auto", "any", "")
     eligible = eligible_areas(targets)
     areas = [a for a in eligible if (a == only if pinned else a not in skip)]
@@ -528,7 +534,7 @@ def candidates(targets: Targets, only: str, skip: Iterable[str]) -> list[TargetI
         why = f"{waiting} open item(s) wait on needs that have not landed"
     else:
         why = "no open items"
-    raise NoProgress(f"roadmap: the target list offers nothing to author{f' in {only}' if pinned else ''} ({why})")
+    raise NothingOffered(f"roadmap: the target list offers nothing to author{f' in {only}' if pinned else ''} ({why})")
 
 
 def render_item(targets: Targets, item: TargetItem) -> str:

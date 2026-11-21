@@ -971,6 +971,120 @@ class ForgejoRound(unittest.TestCase):
         self.claims.begin_target_work.assert_not_called()
 
 
+class OpenFallback(unittest.TestCase):
+    """--roadmap-targets-fallback: a round the list offers nothing authors as a worker without one."""
+
+    author = Round.author
+
+    def setUp(self):
+        Round.setUp(self)
+        os.environ["TAUCETI_ROADMAP_TARGETS_FALLBACK"] = "1"
+        os.environ["TAUCETI_TARGET_MARKER"] = marker("Probability", "stale")
+
+    def assert_open_work(self, prompt, area):
+        self.assertIn(f"## Choose a target\n- **Choose a concrete target.** Start with `{area}`", prompt)
+        self.assertNotIn("Your target is assigned", prompt)
+        self.assertNotIn("TAUCETI_TARGET_MARKER", os.environ)
+        state = json.loads(self.status.read_text())
+        self.assertIsNone(state["roadmap_target"])
+        self.assertTrue(state["target"].startswith("new PR (open work: "), state)
+
+    def test_off_by_default(self):
+        os.environ.pop("TAUCETI_ROADMAP_TARGETS_FALLBACK")
+        self.assertFalse(tc.roadmap_targets_fallback())
+        with self.assertRaisesRegex(t.NothingOffered, "offers nothing to author in Probability"):
+            self.author("Probability")
+        self.assertEqual(self.prompts, [])
+
+    def test_an_offered_item_is_still_targeted(self):
+        prompt = self.author()
+        self.assertIn("Your target is assigned: `kolmogorov-zero-one` in `MeasureTheory`", prompt)
+        self.claims.begin_target_work.assert_called_once_with("MeasureTheory", "kolmogorov-zero-one")
+        self.assertIn('"id":"kolmogorov-zero-one"', os.environ["TAUCETI_TARGET_MARKER"])
+
+    def test_a_round_the_list_offers_nothing_authors_open_work(self):
+        with patch.object(work, "log") as log:
+            prompt = self.author("Probability")
+        self.assert_open_work(prompt, "Probability")
+        self.assertIn(
+            "→ ROADMAP open work (--roadmap-targets-fallback): the target list offers nothing to author in "
+            "Probability (1 open item(s) wait on needs that have not landed)",
+            [c.args[0] for c in log.call_args_list],
+        )
+        self.claims.begin_target_work.assert_not_called()
+
+    def test_an_unpinned_round_whose_candidates_are_all_taken_draws_an_area(self):
+        self.claims.begin_target_work.return_value = 1
+        with patch.object(work, "roadmap_areas", return_value=["Topology"]) as areas:
+            prompt = self.author("auto")
+        areas.assert_called_once()
+        self.assert_open_work(prompt, "Topology")
+        self.claims.begin_target_work.return_value = 0
+        self.assertIn("Your target is assigned", self.author("auto"))
+
+    def test_an_unreadable_list_or_listing_does_not_fall_back(self):
+        def unreadable():
+            raise tc.GitHubError("HTTP 504")
+
+        gh = self.w.gh
+        self.w.gh = SimpleNamespace(open_prs=unreadable, merged_prs=gh.merged_prs)
+        with self.assertRaisesRegex(tc.NoProgress, "cannot read pull requests for the target list"):
+            self.author("Probability")
+        self.w.gh = gh
+        self.path.write_text("## Probability\n- [ ] `a` — no marker\n")
+        with self.assertRaisesRegex(tc.Die, "not a target list"):
+            self.author("Probability")
+        self.path.unlink()
+        with self.assertRaisesRegex(tc.Die, "roadmap targets: "):
+            self.author("Probability")
+        self.assertEqual(self.prompts, [])
+
+    def test_open_work_is_admitted_under_max_open_prs(self):
+        opts = work.RoundOpts(only=["roadmap"], agent="claude", work_model="claude", sandbox_host=True, dry_run=False)
+        cfg = SimpleNamespace(wid="worker3", sbcache=self.tmp / "sb", store_dir=self.tmp / "review", state=self.tmp)
+        w = SimpleNamespace(
+            cfg=cfg, gh=SimpleNamespace(repo="org/repo"), claims=SimpleNamespace(), rs=None, counters=None
+        )
+        seen = []
+        for mine in (0, 2):
+            with (
+                patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://state.test", "TAUCETI_MAX_OPEN_PRS": "2"}),
+                patch.object(work, "roadmap_only", return_value=None),
+                patch.object(work, "mirror_creds"),
+                patch("tauceti_worker.survey.me", return_value="science"),
+                patch(
+                    "tauceti_worker.github_state.read_survey", return_value=(True, SurveyRows([], {"science": mine}))
+                ),
+                patch.object(work, "dispatch", side_effect=lambda stage, _w, _sv, c, _o: seen.append(stage) or 0),
+            ):
+                if mine:
+                    with self.assertRaisesRegex(tc.NoProgress, r"2 open PRs in selected scope \(>= 2\)"):
+                        work.run_round(w, opts)
+                else:
+                    work.run_round(w, opts)
+        self.assertEqual(seen, ["roadmap"])
+
+
+class ForgejoOpenFallback(unittest.TestCase):
+    author = Round.author
+    setUp = ForgejoRound.setUp
+
+    def test_open_work_on_a_forgejo_source(self):
+        self.forgejo.open_prs.return_value = [
+            {"number": 4, "body": marker("Algebra", "first")},
+            {"number": 5, "body": marker("Algebra", "third")},
+        ]
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS_FALLBACK": "1"}):
+            prompt = self.author("Algebra")
+            self.assertIn("## Choose a target\n- **Choose a concrete target.** Start with `Algebra`", prompt)
+            self.assertNotIn("Your target is assigned", prompt)
+            self.claims.begin_target_work.assert_not_called()
+            self.forgejo.open_prs.return_value = None
+            with self.assertRaisesRegex(tc.NoProgress, "cannot read pull requests for the target list"):
+                self.author("Algebra")
+        self.assertEqual(len(self.prompts), 1)
+
+
 class LandingBase(unittest.TestCase):
     """A marked pull request completes its item only when it merged into the worker's base branch."""
 
@@ -1204,6 +1318,49 @@ class Wiring(unittest.TestCase):
             wm.WorkerSpec.from_dict({"id": "w", "roadmap_targets": "targets.md"}, 0)
         lines = wm._worker_configuration_lines({"spec": spec.as_dict()}, 100)
         self.assertTrue(any("targets: /srv/targets.md" in line for line in lines), lines)
+
+    def test_fallback_setting(self):
+        parser = tc.build_parser()
+        self.assertTrue(parser.parse_args(["work", "--roadmap-targets-fallback"]).roadmap_targets_fallback)
+        self.assertFalse(parser.parse_args(["_round", "--no-roadmap-targets-fallback"]).roadmap_targets_fallback)
+        self.assertIsNone(parser.parse_args(["work"]).roadmap_targets_fallback)
+        for raw, on in (("1", True), ("0", False), ("", False)):
+            with patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS_FALLBACK": raw}):
+                self.assertEqual(tc.roadmap_targets_fallback(), on)
+        listed = {"id": "w", "only": ["roadmap"], "roadmap_targets": "/srv/targets.md"}
+        spec = wm.WorkerSpec.from_dict({**listed, "roadmap_targets_fallback": True}, 0)
+        self.assertTrue(spec.as_dict()["roadmap_targets_fallback"])
+        argv = spec.work_argv()
+        self.assertIn("--roadmap-targets-fallback", argv)
+        self.assertTrue(tc.build_parser().parse_args(argv[3:]).roadmap_targets_fallback)
+        plain = wm.WorkerSpec.from_dict(listed, 0)
+        self.assertNotIn("roadmap_targets_fallback", plain.as_dict())
+        self.assertNotIn("--roadmap-targets-fallback", plain.work_argv())
+        self.assertNotEqual(spec.fingerprint(), plain.fingerprint())
+        with self.assertRaisesRegex(wm.WorkersError, r"workers\[0\].roadmap_targets_fallback"):
+            wm.WorkerSpec.from_dict({**listed, "roadmap_targets_fallback": "yes"}, 0)
+        lines = wm._worker_configuration_lines({"spec": spec.as_dict()}, 100)
+        self.assertTrue(any("open work when the list offers none" in line for line in lines), lines)
+        tui = importlib.import_module("tauceti_worker.tui")
+        command = tui.launch_cmd(None, "auto", False, True, roadmap_targets="/srv/t.md", roadmap_targets_fallback=True)
+        self.assertEqual(command[-3:], ["--roadmap-targets", "/srv/t.md", "--roadmap-targets-fallback"])
+        self.assertNotIn("--roadmap-targets-fallback", tui.launch_cmd(None, "auto", False, True))
+
+    def test_the_fallback_reaches_loop_children(self):
+        cli = importlib.import_module("tauceti_worker.cli")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "targets.md"
+            path.write_text(EXAMPLE)
+            argv = ["work", "--roadmap-targets", str(path), "--roadmap-targets-fallback", "--only", "roadmap"]
+            with (
+                patch.dict(os.environ),
+                patch.object(cli, "configure_api"),
+                patch.object(cli, "resolve_review_throttle", side_effect=RuntimeError("past the checks")),
+            ):
+                os.environ.pop("TAUCETI_ROADMAP_TARGETS_FALLBACK", None)
+                with self.assertRaisesRegex(RuntimeError, "past the checks"):
+                    cli.main([*argv, "--agent", "claude"])
+                self.assertEqual(os.environ["TAUCETI_ROADMAP_TARGETS_FALLBACK"], "1")
 
 
 if __name__ == "__main__":
