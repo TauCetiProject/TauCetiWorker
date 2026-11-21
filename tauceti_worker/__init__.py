@@ -19,10 +19,19 @@ a function on the module that actually looks it up.
 from __future__ import annotations
 
 
+_RUST_MIN_STACK = 256 * 1024 * 1024
+
+
 def _raise_stack_limit() -> None:
     # leantar 0.1.21 (Lean v4.37.0-rc1) overflows the default 8 MiB stack on a large olean (exit 139).
     # Every process of this package raises its soft stack limit to the hard limit on import, so the
     # Lake builds, cache staging and restores it starts inherit it, whatever its entry point.
+    # RLIMIT_STACK sizes only the main thread: leantar unpacks a multi-archive batch on Rust threads,
+    # whose stacks default to 2 MiB whatever the rlimit, and abort with "has overflowed its stack".
+    # RUST_MIN_STACK sizes those; it reserves address space, and only touched pages use memory.
+    import os
+
+    os.environ.setdefault("RUST_MIN_STACK", str(_RUST_MIN_STACK))
     try:
         import resource
 
