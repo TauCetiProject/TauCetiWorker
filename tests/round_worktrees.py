@@ -51,7 +51,9 @@ def settled(tree, timeout=60):
     """Wait until no process uses ``tree``. A commit or fetch leaves git's detached auto-maintenance
     running in it for a moment, and a round end rightly defers removing a tree that is in use."""
     deadline = time.monotonic() + timeout
-    while live_use.live_users(tree) and time.monotonic() < deadline:
+    while users := live_use.live_users(tree):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{tree} is still in use after {timeout}s: {', '.join(users)}")
         time.sleep(0.05)
 
 
@@ -104,6 +106,7 @@ def main():
         (one.checkout / ".lake/build").mkdir(parents=True)
         (one.checkout / ".lake/build/A.olean").write_text("warm build")
         os.environ["TAUCETI_ROUND_WORKTREES"] = "1"
+        settled(one.checkout)
         # A live round holds its worker's round lock, as RoundContext does.
         live = (one.state / "round.lock").open("a+")
         fcntl.flock(live, fcntl.LOCK_EX)
