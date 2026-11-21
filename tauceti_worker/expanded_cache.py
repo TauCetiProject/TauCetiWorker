@@ -351,7 +351,7 @@ def foreign_inputs(download, cwd):
     if not own or not paths:
         return set()
     try:
-        # One batch lookup: a revision this checkout lacks reports "missing" and stays native.
+        # One batch lookup: a revision this checkout lacks reports "missing".
         out = subprocess.run(
             ["git", "cat-file", "--batch"],
             cwd=cwd,
@@ -370,13 +370,15 @@ def foreign_inputs(download, cwd):
         if len(parts) == 3:
             size = int(parts[2])
             toolchain, out = out[:size].decode(errors="replace").strip(), out[size + 1 :]
+        if toolchain is None:
+            continue  # A revision this checkout lacks proves neither toolchain.
         try:
             lines = path.read_text().splitlines()[1:]
         except OSError:
             continue
         for line in lines:
             with contextlib.suppress(ValueError, TypeError, IndexError):
-                (foreign if toolchain is not None and toolchain != own else native).add(json.loads(line)[0])
+                (native if toolchain == own else foreign).add(json.loads(line)[0])
     return foreign - native
 
 

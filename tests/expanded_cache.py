@@ -529,8 +529,9 @@ class Cache(unittest.TestCase):
         download = self.root / "download"
         revisions = download / "revisions/TauCeti"
         revisions.mkdir(parents=True)
-        # "b" is the checkout's; "c" only main's; "f" both list; an unknown revision's "9" stays.
-        listed = {head: ["b", "f"], main: ["c", "f"], "0" * 40: ["9"]}
+        # "b" is the checkout's; "c" only main's; "f" both list. A revision the checkout lacks
+        # proves nothing: its "9" stays expandable, and its "c" does not make main's expandable.
+        listed = {head: ["b", "f"], main: ["c", "f"], "0" * 40: ["9", "c"]}
         for revision, keys in listed.items():
             lines = ['"2026-03-17"', *(json.dumps([key * 16, key * 16 + ".ltar"]) for key in keys)]
             (revisions / (revision + ".jsonl")).write_text("\n".join(lines) + "\n")
