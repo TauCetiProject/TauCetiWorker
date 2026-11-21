@@ -3487,6 +3487,8 @@ def _run_task(
                                 for finding in verification["diagnostics"][:20]
                             ],
                             "tools": checks.get("tools_commit") or checks.get("tools"),
+                            # The code that produced it, kept if a later process delivers it.
+                            "worker_revision": STARTUP_REVISION,
                         }
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
@@ -3547,7 +3549,7 @@ def _run_task(
                 notes["repair_checkpoint"] = checkpoint["diagnostics"]
                 # What the queue's stall detection reads (docs/queue/escalation.md, "Stalled repair"): the
                 # code that produced the checkpoint and the agent's own conclusion about it.
-                notes["worker_revision"] = STARTUP_REVISION
+                notes["worker_revision"] = checkpoint.get("worker_revision") or STARTUP_REVISION
                 if checkpoint.get("tools"):
                     notes["tools_revision"] = checkpoint["tools"]
                 conclusion = last_agent_conclusion(agent_records)
