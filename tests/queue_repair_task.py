@@ -693,6 +693,38 @@ def commit_on(repo: Path, parent: str, files: dict[str, str]) -> str:
     return sh(repo, "commit-tree", tree, "-p", parent, "-m", "fixture")
 
 
+class ApplicableResolution(unittest.TestCase):
+    """``applicable_resolution`` reuses a stored resolution only for the same conflict."""
+
+    def test_a_directory_rename_on_the_new_prefix_is_another_conflict(self):
+        """The member adds ``old/new`` and conflicts in ``X.lean``. The stored resolution's prefix deleted
+        ``old/a``; the new prefix moved it to ``new/a``, so cherry-picking the member there moves
+        ``old/new`` too. The prefixes agree in every path the member and the resolution change, yet
+        the conflict differs, and the entry is not reused. A prefix that differs elsewhere reuses it."""
+        repo = Path(tempfile.mkdtemp(prefix="applicable-resolution-"))
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        sh(repo, "init", "--quiet")
+        sh(repo, "config", "user.email", "test@example.com")
+        sh(repo, "config", "user.name", "test")
+        base = commit(repo, "base", {"old/a": "a\n", "X.lean": "x\n", "Y.lean": "y\n"})
+        member = commit(repo, "member", {"old/new": "new\n", "X.lean": "x, member\n"})
+
+        def prefix(message: str, files: dict[str, str], remove: tuple[str, ...] = ()) -> str:
+            sh(repo, "checkout", "--quiet", "--detach", base)
+            for path in remove:
+                sh(repo, "rm", "--quiet", path)
+            return commit(repo, message, {"X.lean": "x, main\n", **files})
+
+        made_on = prefix("main deletes old/a", {}, remove=("old/a",))
+        resolved = commit(repo, "resolution", {"X.lean": "x, main and member\n"})
+        sh(repo, "update-ref", repair_task.resolution_ref("7", member, chain_tool.tree_of(repo, made_on)), resolved)
+        renamed = prefix("main moves old/a", {"new/a": "a\n"}, remove=("old/a",))
+        self.assertIsNone(repair_task.applicable_resolution(repo, "7", member, renamed))
+        elsewhere = prefix("main changes Y.lean", {"Y.lean": "y, main\n"}, remove=("old/a",))
+        self.assertEqual(repair_task.applicable_resolution(repo, "7", member, elsewhere), resolved)
+        self.assertIsNone(repair_task.applicable_resolution(repo, "8", member, elsewhere), "another batch's")
+
+
 class Content:
     """A bare content repository, a seed clone that built the chain, and the worker's clone."""
 
@@ -1812,8 +1844,9 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(sh(clone, "show", f"{sha}:TauCeti/Other.lean"), "-- elsewhere")
 
     def test_the_lookahead_skips_a_member_an_earlier_run_resolved(self):
-        """After a restart a member resolved on its prefix by the earlier run is the replay's to reuse:
-        no helper resolves it again on ``onto``."""
+        """After a restart a member resolved by an earlier run or task of the batch, on a prefix with
+        ``onto``'s content in the paths it and its resolution change, is the replay's to reuse: no
+        helper resolves it again on ``onto``. One resolved from other content is not."""
         from tauceti_queue import repair_lookahead
 
         seed = self.content.bare.parent / "seed"
@@ -1833,12 +1866,14 @@ class RebaseArtifacts(Fixture):
             return [c.sha for c in repair_lookahead.Lookahead.candidates(lookahead, self.content.members[1]["commit"])]
 
         self.assertEqual(candidates(), [three])
-        sh(
-            clone,
-            "update-ref",
-            repair_task.resolution_ref("1", three, chain_tool.tree_of(clone, self.onto) + "x"),
-            three,
-        )
+
+        def store(prefix: str) -> None:
+            resolved = commit_on(clone, prefix, {"TauCeti/Three.lean": "-- three, resolved\n"})
+            sh(clone, "update-ref", repair_task.resolution_ref("7", three, chain_tool.tree_of(clone, prefix)), resolved)
+
+        store(commit_on(clone, self.onto, {"TauCeti/Three.lean": "-- three, elsewhere\n"}))
+        self.assertEqual(candidates(), [three], "resolved from another Three.lean")
+        store(commit_on(clone, self.onto, {"TauCeti/Two.lean": "-- an earlier member\n"}))
         self.assertEqual(candidates(), [])
 
     def test_a_stopped_task_resumes_after_its_last_resolution(self):
@@ -1910,6 +1945,44 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(contents(outcome["tip"]), contents(reference[-1].sha), "the same chain")
         self.assertEqual(stored(), [])
 
+    def test_a_later_task_of_the_batch_reuses_a_resolution_from_the_same_inputs(self):
+        """Task 1 resolves member 2 and is superseded with its resolution stored. Task 2 of the batch
+        rebases onto a target that moved in another file: member 2's conflict has the same inputs, so
+        the resolution is merged onto the new prefix and checked, and the agent is not run. Task 3's
+        target moved in member 2's file: the conflict differs and goes to the agent."""
+        cfg = self.config()
+        clone = self.content.clone
+        two = self.content.members[1]["commit"]
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        resolved = outcome["conflicts"][0]["resolved"]
+        left = repair_task.resolution_ref("7", two, chain_tool.tree_of(clone, f"{resolved}^"))
+        sh(clone, "update-ref", left, resolved)  # what a superseded task leaves
+        seed = self.content.bare.parent / "seed"
+
+        def rerun(task_id: int, files: dict[str, str]) -> dict:
+            sh(seed, "checkout", "--quiet", "--detach", self.onto)
+            moved = commit(seed, f"main moved for task {task_id}", files)
+            sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+            self.service.tasks = {task_id: {**self.raw, "task_id": task_id, "onto": moved}}
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+            self.assertEqual(outcome["status"], "adopted", outcome)
+            return outcome
+
+        outcome = rerun(2, {"TauCeti/Other.lean": "-- elsewhere on main\n"})
+        self.assertEqual(len(self.agent_calls()), 1, "task 2 runs no agent")
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True])
+        self.assertEqual(sh(clone, "for-each-ref", repair_task.RESOLUTION_PREFIX), "")
+        reused = outcome["conflicts"][0]["resolved"]
+        self.assertEqual(
+            sh(clone, "show", f"{reused}:TauCeti/Two.lean"), sh(clone, "show", f"{resolved}:TauCeti/Two.lean")
+        )
+
+        sh(clone, "update-ref", left, resolved)
+        outcome = rerun(3, {"TauCeti/Two.lean": "-- two, on main again\n"})
+        self.assertEqual(len(self.agent_calls()), 2, "task 3's conflict goes to the agent")
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [False])
+
     def test_a_stored_resolution_that_does_not_match_is_not_used(self):
         """An entry naming another commit's resolution under this commit's key is not reused: the agent
         resolves the conflict and the entry is dropped."""
@@ -1918,7 +1991,7 @@ class RebaseArtifacts(Fixture):
         sh(clone, "fetch", "--quiet", str(self.content.bare), self.onto, self.content.tip)
         prefix = chain_tool.replay(clone, self.content.base, self.content.members[0]["commit"], self.onto).tip
         conflicting = self.content.members[1]["commit"]
-        ref = repair_task.resolution_ref("1", conflicting, chain_tool.tree_of(clone, prefix))
+        ref = repair_task.resolution_ref("7", conflicting, chain_tool.tree_of(clone, prefix))
         sh(clone, "update-ref", ref, self.content.members[2]["commit"])
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
