@@ -946,6 +946,27 @@ class IncrementalInventory(unittest.TestCase):
         )
         self.assertEqual(sum("sort=recentupdate" in path for path in self.calls), 1)
 
+    def test_listings_ask_forgejo_to_skip_the_diff_stat(self):
+        from urllib.parse import parse_qs, urlsplit
+
+        def stat(path):
+            return parse_qs(urlsplit(path).query).get("stat")
+
+        full = self.source.inventory(None)
+        self.source.inventory(full)
+        pulls = [path for path in self.calls if urlsplit(path).path.endswith("/pulls")]
+        self.assertEqual(len(pulls), 6, "the full listing's four pages and the refresh's two")
+        self.assertTrue(all(stat(path) == ["false"] for path in pulls), pulls)
+        self.assertTrue(all(stat(path) is None for path in self.calls if path not in pulls))
+
+        # A projection that reads the diff stat keeps it; one that does not drops it.
+        self.assertIs(self.source._fields_reader(["number", "additions"]), self.source.reader)
+        self.assertIs(self.source._fields_reader(None), self.source.reader)
+        self.calls.clear()
+        rows = self.source._fields_reader(["number", "title"]).pulls(self.repo, ["number", "title"], state="open")
+        self.assertEqual(len(rows), 120)
+        self.assertTrue(self.calls and all(stat(path) == ["false"] for path in self.calls))
+
     def test_the_sweep_sees_unmoved_changes_and_drops_closures_the_index_missed(self):
         inventory = self.source.inventory(None)
         self.prs[15]["mergeable"] = False  # on the last page; its update time does not move
@@ -995,6 +1016,43 @@ class IncrementalInventory(unittest.TestCase):
         self.calls.clear()
         self.assertEqual(len(self.source.inventory(full)["rows"]), 120)
         self.assertEqual(sum("/pulls?" in path and "sort" not in path for path in self.calls), 4)
+
+
+class ListingWithoutStat(unittest.TestCase):
+    def test_only_pull_listings_gain_stat_false(self):
+        from tauceti_tools.forge import Forgejo
+
+        from tauceti_worker.forgejo_reads import _page_retrying, needs_stat, without_listing_stat
+
+        client = Forgejo(Forge("forgejo", "https://git.example.org"), token="t" * 8)
+        calls = []
+        client.request = lambda method, path, *args, **kwargs: calls.append((method, path)) or []
+        view = without_listing_stat(_page_retrying(client))
+        self.assertEqual(list(view.pages("repos/one/project/pulls?state=open")), [])
+        view.request("GET", "/repos/one/project/pulls")
+        view.request("GET", "repos/one/project/pulls?stat=true")
+        view.request("GET", "repos/one/project/pulls/7")
+        view.request("GET", "repos/one/project/issues?type=pulls")
+        view.request("POST", "repos/one/project/pulls")
+        self.assertEqual(
+            calls,
+            [
+                ("GET", "repos/one/project/pulls?state=open&limit=50&page=1&stat=false"),
+                ("GET", "/repos/one/project/pulls?stat=false"),
+                ("GET", "repos/one/project/pulls?stat=true"),
+                ("GET", "repos/one/project/pulls/7"),
+                ("GET", "repos/one/project/issues?type=pulls"),
+                ("POST", "repos/one/project/pulls"),
+            ],
+        )
+        calls.clear()
+        client.request("GET", "repos/one/project/pulls")
+        self.assertEqual(calls, [("GET", "repos/one/project/pulls")], "the client itself is unchanged")
+        double = Mock()
+        self.assertIs(without_listing_stat(double), double, "other clients pass through unchanged")
+        self.assertTrue(needs_stat(None))
+        self.assertTrue(needs_stat(["number", "files"]))
+        self.assertFalse(needs_stat(["number", "headRefOid", "statusCheckRollup"]))
 
 
 class ListingPageRetries(unittest.TestCase):
