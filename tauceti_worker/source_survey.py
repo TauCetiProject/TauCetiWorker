@@ -108,7 +108,7 @@ def discovery_key(source):
     """The shared listing's cache key; refresh_pr_state corrects one row under it."""
     from .source_identity import discovery_scope
 
-    return [*discovery_scope(source), list(source.inventory_fields)]
+    return [*discovery_scope(source), list(source.inventory_fields), "inventory"]
 
 
 def discovery_inventory(source, *, numbers=None):
@@ -117,23 +117,33 @@ def discovery_inventory(source, *, numbers=None):
     A shared list can lag writes for 60 seconds after its completed fetch. It
     never supplies a claim, review verdict or permission to publish; dispatch
     still validates the selected PR through its source. Selected-state corrections
-    invalidate the qualified discovery generation.
+    invalidate the qualified discovery generation. A source with `inventory`
+    refreshes the last stored listing, whatever its age, instead of listing again.
     """
     if getattr(source, "shared_inventory", False) is not True or numbers:
         return source.open_prs()
     from . import github_transport as transport
     from .source_identity import discovery_scope
 
-    scope = discovery_scope(source)
-    return transport.shared_read(
-        discovery_key(source),
-        lambda: source.open_prs(fresh=True),
-        identity=source.cache_namespace,
+    key, identity = discovery_key(source), source.cache_namespace
+    inventory = getattr(type(source), "inventory", None)
+
+    def fetch():
+        if inventory is not None:
+            return inventory(source, transport.stored_shared(key, identity=identity))
+        rows = source.open_prs(fresh=True)
+        return None if rows is None else {"rows": rows}
+
+    value = transport.shared_read(
+        key,
+        fetch,
+        identity=identity,
         ttl=60,
         lock_timeout=300,
-        generation_scope=scope,
+        generation_scope=discovery_scope(source),
         coalesce_failures=True,
     )
+    return None if value is None else value["rows"]
 
 
 def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count_all_roadmaps):
