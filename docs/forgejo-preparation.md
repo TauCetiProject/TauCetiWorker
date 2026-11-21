@@ -312,6 +312,13 @@ moves no update time, such as mergeability after `main` moves, within one pass o
 pages (about 26 refreshes); at the end of a pass, PRs the issue index no longer lists as
 open are dropped. A refresh reads about four pages where a full listing reads 27.
 
+A round's agent answers `gh pr list --json ...` from the same shared listing when it asks
+for open PRs and only fields the listing holds. Other states (or other fields) come from
+the issue index, which Forgejo serves without per-PR git work; there `merged` includes PRs
+the queue landed (closed under the `[Merged by Bors] - ` prefix), and `closed` excludes
+them. Filters such as `--author` or `--label`, other fields and table output still go
+through the native pull listing.
+
 Native `build` statuses are excluded from source survey CI classification. Native
 false mergeability remains unknown. This inventory provides no verified execution,
 claim or publication authority: its queues and next automatic stage remain empty,

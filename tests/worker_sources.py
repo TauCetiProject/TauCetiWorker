@@ -272,6 +272,90 @@ class Sources(unittest.TestCase):
         self.source.review_comments.assert_called_once_with(1)
         self.source.api.collection.assert_not_called()
 
+    def run_cli(self, args):
+        from tauceti_worker.source_cli import main
+
+        with (
+            patch("tauceti_worker.source_cli.load_source", return_value=self.source),
+            patch.dict(os.environ, TAUCETI_SOURCE_GH_CONF="/fixture/project.toml"),
+            patch("tauceti_tools.forge_cli.run", return_value=0) as run,
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            self.assertEqual(main(args), 0)
+        return output.getvalue(), run
+
+    def test_agent_open_listing_is_the_shared_survey_inventory(self):
+        self.source.shared_inventory = False
+        self.source.cache_namespace = "e" * 64
+        self.source.inventory_fields = tuple(self.row())
+        self.source.open_prs.return_value = [self.row(3), self.row(2)]
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=str(self.root / "shared")):
+            listing = ["pr", "list", "--repo", "one/project", "--limit", "1000", "--json", "number,title"]
+            output, run = self.run_cli(listing)
+            self.assertEqual(json.loads(output), [dict(number=3, title="Proposal"), dict(number=2, title="Proposal")])
+            with patch.dict(os.environ, GH_REPO="git.example.org/one/project"):
+                output, _ = self.run_cli(["pr", "list", "-L", "1", "--json", "number", "--jq", ".[].number"])
+            self.assertEqual(output, "3\n")
+        run.assert_not_called()
+        self.assertEqual(self.source.open_prs.call_count, 1, "agents share the host's listing")
+
+    def test_agent_closed_listings_read_the_issue_index_without_pull_rendering(self):
+        def issue(number, merged):
+            return dict(
+                number=number,
+                title=f"PR {number}",
+                body="",
+                state="closed",
+                user=dict(id=3, login="worker"),
+                labels=[],
+                created_at="2026-11-01T00:00:00Z",
+                updated_at="2026-11-02T00:00:00Z",
+                closed_at="2026-11-02T00:00:00Z",
+                pull_request=dict(merged=merged, merged_at="2026-11-02T00:00:00Z" if merged else None),
+            )
+
+        self.source.api.pages.return_value = iter(
+            [[issue(5, True), issue(4, False)], [issue(4, False), issue(3, True)]]
+        )
+        output, run = self.run_cli(
+            ["pr", "list", "-R", "one/project", "--state", "merged", "--limit", "5000", "--json", "number,state,url"]
+        )
+        self.assertEqual(
+            json.loads(output),
+            [dict(number=n, state="MERGED", url=self.repo.pull_url(n)) for n in (5, 3)],
+        )
+        self.assertEqual(self.source.api.pages.call_args.args, ("repos/one/project/issues?type=pulls&state=closed",))
+        landed = issue(6, False) | dict(title="[Merged by Bors] - feat: landed")
+        self.source.api.pages.return_value = iter([[landed, issue(5, True), issue(4, False), issue(3, True)]])
+        output, _ = self.run_cli(
+            ["pr", "list", "-R", "one/project", "--state", "merged", "--limit", "2", "--json", "number,mergedAt"]
+        )
+        self.assertEqual(
+            json.loads(output),
+            [dict(number=6, mergedAt="2026-11-02T00:00:00Z"), dict(number=5, mergedAt="2026-11-02T00:00:00Z")],
+            "a PR the queue landed counts as merged",
+        )
+        self.source.api.pages.return_value = iter([[landed, issue(5, True), issue(4, False), issue(3, True)]])
+        output, _ = self.run_cli(["pr", "list", "-R", "one/project", "--state", "closed", "--json", "number,state"])
+        self.assertEqual(json.loads(output), [dict(number=4, state="CLOSED")], "landed PRs are not closed")
+        self.source.api.pulls.assert_not_called()
+        run.assert_not_called()
+
+    def test_agent_listings_the_inventory_and_index_cannot_answer_go_to_tools(self):
+        self.source.inventory_fields = ("number",)
+        for args in (
+            ["pr", "list", "-R", "one/project"],
+            ["pr", "list", "-R", "one/project", "--json", "number,headRefOid", "--state", "merged"],
+            ["pr", "list", "-R", "one/project", "--json", "number", "--author", "worker"],
+            ["pr", "list", "--json", "number", "--repo", "other/project"],
+            ["pr", "list", "--json", "number"],  # the checkout's repository, which Tools resolves
+        ):
+            with self.subTest(args=args):
+                _, run = self.run_cli(args)
+                run.assert_called_once()
+        self.source.api.pages.assert_not_called()
+        self.source.open_prs.assert_not_called()
+
     def test_cli_qualifies_exact_native_repository_endpoints(self):
         from tauceti_worker.source_cli import main
 
