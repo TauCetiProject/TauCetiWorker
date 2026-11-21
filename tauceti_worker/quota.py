@@ -16,6 +16,7 @@ import sys
 import textwrap
 import time
 import tomllib
+import unicodedata
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -965,7 +966,7 @@ def claude_agent_credentials(cfg) -> tuple[Path, ...]:
 
 def claude_agent_file_route_supported() -> bool:
     """Whether separate-usage agent file routes are implemented on this platform."""
-    return sys.platform != "darwin"  # macOS file selection is implemented separately in #682.
+    return True  # Includes the explicit macOS file route and its native-host launch checks.
 
 
 def claude_file_credential_problem(path: Path, *, renewable: bool) -> str | None:
@@ -1010,7 +1011,7 @@ def _claude_identity(oauth: dict) -> dict[str, set[str]]:
 def claude_usage_identity_verified(cfg) -> bool:
     """Whether available local account fields corroborate the two credentials; never probes a provider."""
     usage = claude_usage_credentials()
-    if usage is None or sys.platform == "darwin":
+    if usage is None:
         return False
     measured = _as_dict(_as_dict(_read_json_file(usage)).get("claudeAiOauth"))
     agent = _as_dict(_as_dict(_read_json_file(claude_agent_credentials(cfg)[0])).get("claudeAiOauth"))
@@ -1047,14 +1048,74 @@ def claude_usage_configuration_problem(cfg, *, check_identity: bool = True) -> s
     environment_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if environment_token and environment_token == measured.get("accessToken"):
         return "Claude usage login must be a separate login from the agents' environment token"
-    if not check_identity or sys.platform == "darwin":
-        return None  # Identity follows mirroring; macOS agent selection changes separately.
+    if not check_identity:
+        return None  # Identity follows mirroring of the selected file route.
     agent = _as_dict(_as_dict(_read_json_file(claude_agent_credentials(cfg)[0])).get("claudeAiOauth"))
     if route == "environment" and environment_token and environment_token != agent.get("accessToken"):
         return None  # Opaque setup tokens offer no account field to compare; operator asserts identity.
     first, second = _claude_identity(measured), _claude_identity(agent)
     if any(first[kind] and second[kind] and first[kind].isdisjoint(second[kind]) for kind in first):
         return "Claude usage login and agent credential identify different accounts"
+    return None
+
+
+def claude_file_store_problem(env: dict) -> str | None:
+    """A file launch must not inherit an override selecting another credential store."""
+    if "CLAUDE_SECURESTORAGE_CONFIG_DIR" in env:
+        return (
+            "Claude agent file routes do not support CLAUDE_SECURESTORAGE_CONFIG_DIR; "
+            "unset it so the CLI uses the configured agent file"
+        )
+    return None
+
+
+def claude_saved_api_key_problem(config_dir: str | None) -> str | None:
+    """An explicit host file route must not fall back to a saved Console login.
+
+    Production Claude Code 2.1.329 selects .config.json inside its config directory, or
+    the legacy .claude.json (under HOME when the config directory is unset). Refuse a
+    key in either candidate rather than duplicate the CLI's migration choice.
+    """
+    directory = Path(config_dir) if config_dir else Path.home() / ".claude"
+    legacy = directory / ".claude.json" if config_dir else Path.home() / ".claude.json"
+    for path in (directory / ".config.json", legacy):
+        if _as_dict(_read_json_file(path)).get("primaryApiKey"):
+            return f"saved Console API key in {path}; use an agent config directory without a Console login"
+    return None
+
+
+def claude_file_keychain_problem(config_dir: str | None, *, env: dict | None = None) -> str | None:
+    """Refuse native OAuth or legacy API credentials that can replace the selected file.
+
+    Claude Code 2.1.329 hashes the NFC-normalized config string, without resolving aliases.
+    Read metadata only: never retrieve a password, unlock the Keychain, or mutate it.
+    """
+    if sys.platform != "darwin" or claude_usage_credentials() is None:
+        return None
+    if problem := claude_file_store_problem(os.environ if env is None else env):
+        return problem
+    suffix = (
+        "-" + hashlib.sha256(unicodedata.normalize("NFC", config_dir).encode()).hexdigest()[:8] if config_dir else ""
+    )
+    # Both the OAuth JSON store and the /login managed API-key store are read by the native CLI.
+    for service in ("Claude Code-credentials" + suffix, "Claude Code" + suffix):
+        try:
+            result = subprocess.run(
+                ["/usr/bin/security", "find-generic-password", "-s", service],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return "cannot verify the Claude file route against the macOS Keychain; no agent was launched"
+        if result.returncode == 44:  # errSecItemNotFound; check the other credential store too.
+            continue
+        if result.returncode == 0:
+            return (
+                "a Claude Keychain entry shadows the configured agent credential file; use a dedicated "
+                "CLAUDE_CONFIG_DIR with no sign-in entry (the worker does not remove Keychain items)"
+            )
+        return "cannot verify the Claude file route against the macOS Keychain; no agent was launched"
     return None
 
 
@@ -1173,8 +1234,11 @@ def mirror_creds(cfg: Config) -> None:
     — so returning early for the whole function left an isolated macOS worker pinned to whatever account
     was seeded, forever: never re-synced after an operator account switch, and still holding the real
     refresh token the once-only seed copied verbatim, which is exactly what this function exists to
-    strip."""
-    if sys.platform != "darwin":
+    strip.
+
+    With a usage login (claude_usage_credentials) the agents' Claude credential is a file on macOS as
+    well, the one isolate_home seeded from, and it is mirrored there as on every other platform."""
+    if sys.platform != "darwin" or claude_usage_credentials() is not None:
         iso_claude = claude_dir(cfg.home)
         src_claude = _read_marker(iso_claude / ".tauceti-creds-source")
         if src_claude:
@@ -2353,24 +2417,33 @@ class Quota:
     def _claude_launch_credential_unusable(self) -> str | None:
         """Why the agents cannot launch, when a usage login answers for them and their own credential
         is known to be unusable: the file in $CLAUDE_CONFIG_DIR is missing, or it holds a token past
-        its expiry that the agents cannot renew. None otherwise, and always off this route, on macOS,
-        where agents read the Keychain first, and with $CLAUDE_CODE_OAUTH_TOKEN set where the agents
-        inherit it and authenticate with it ahead of the file. `work` records in
-        $TAUCETI_CLAUDE_AGENT_CREDENTIAL what its phases' launches receive
+        its expiry that the agents cannot renew. None otherwise, always without a usage login, and with
+        $CLAUDE_CODE_OAUTH_TOKEN set where the agents inherit it and authenticate with it ahead of the
+        file. `work` records in $TAUCETI_CLAUDE_AGENT_CREDENTIAL what its phases' launches receive
         (cli.claude_agent_credential_route). Only an "environment" launch uses the file in place and keeps
-        a renewal; the other routes hand the agent a copy, so their file needs a live access token."""
+        a renewal; the other routes hand the agent a copy, so their file needs a live access token. macOS
+        is no exception: there the usage login is what makes that file the agents' credential
+        (mirror_creds, the bubble seed); without one they use the Keychain."""
         route = os.environ.get("TAUCETI_CLAUDE_AGENT_CREDENTIAL", "environment")
         if claude_usage_credentials() is None or (
             os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip() and route == "environment"
         ):
             return None
+        if route == "environment":
+            if problem := claude_file_store_problem(os.environ):
+                return problem
+            if problem := claude_saved_api_key_problem(os.environ.get("CLAUDE_CONFIG_DIR")):
+                return problem
         if not claude_agent_file_route_supported():
-            if route == "environment":
-                return None  # Preserve the native macOS Keychain agent route.
-            return "Claude file-only agent routes with a separate usage login need macOS file-route support (#682)"
-        return claude_file_credential_problem(
-            claude_dir(self.cfg.home) / ".credentials.json", renewable=route == "environment"
-        )
+            return "Claude agent file routes are unavailable on this platform"
+        if problem := claude_file_credential_problem(
+            claude_dir(self.cfg.home) / ".credentials.json",
+            renewable=route == "environment" and sys.platform != "darwin",
+        ):
+            return problem
+        if route == "environment" and not getattr(self, "_cache_only", False):
+            return claude_file_keychain_problem(os.environ.get("CLAUDE_CONFIG_DIR"))
+        return None
 
     def _claude_pass(
         self, fp: str | None, tok: str | None, *, refresh: bool = False, account: str | None = None

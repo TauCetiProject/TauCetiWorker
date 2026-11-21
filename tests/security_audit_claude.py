@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -19,7 +20,7 @@ from tauceti_worker import audit_clients as clients
 from tauceti_worker import audit_evidence as evidence
 from tauceti_worker import audit_reader as ar
 from tauceti_worker import security_audit as sa
-from tauceti_worker.config import NoProgress
+from tauceti_worker.config import Die, NoProgress
 
 UNFINISHED = {"verdict": "unfinished", "findings": []}
 PASS = {"verdict": "pass", "findings": []}
@@ -94,7 +95,7 @@ class HaikuContinuation(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.root = Path(tmp.name)
+        self.root = Path(tmp.name).resolve()
         self.work = self.root / "security-audit"
         self.work.mkdir()
         (self.root / ".credentials.json").write_text('{"claudeAiOauth":{"accessToken":"fixture"}}')
@@ -146,6 +147,85 @@ class HaikuContinuation(unittest.TestCase):
         self.assertEqual(json.loads(argv[argv.index("--json-schema") + 1]), sa.JUDGMENT_SCHEMA)
         self.assertEqual(argv[argv.index("--append-system-prompt") + 1], sa.JUDGMENT_PROMPT + sa.JUDGMENT_COMPACTION)
         self.assertNotIn("--no-session-persistence", argv)
+
+    def test_separate_usage_login_missing_agent_file_never_uses_keychain(self):
+        (self.root / ".credentials.json").unlink()
+        from tauceti_worker import quota
+
+        with (
+            patch.dict(os.environ, TAUCETI_CLAUDE_USAGE_CREDENTIALS=str(self.root / "usage.json")),
+            patch.object(
+                quota, "_claude_keychain_creds", side_effect=AssertionError("wrong account fallback")
+            ) as keychain,
+            patch.object(sa, "run_process") as launch,
+        ):
+            with self.assertRaisesRegex(Die, "refusing Keychain fallback"):
+                sa.inspect(self.batch, "claude", self.attempt("missing-credential"), claude_credential="subscription")
+        keychain.assert_not_called()
+        launch.assert_not_called()
+
+    def test_separate_usage_login_expired_agent_is_refused_before_launch(self):
+        (self.root / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": {"accessToken": "expired", "expiresAt": 1, "refreshToken": "source-owned"}})
+        )
+        with (
+            patch.dict(os.environ, TAUCETI_CLAUDE_USAGE_CREDENTIALS=str(self.root / "usage.json")),
+            patch.object(sa, "run_process") as launch,
+        ):
+            with self.assertRaisesRegex(Die, "expired"):
+                sa.inspect(self.batch, "claude", self.attempt("expired-credential"), claude_credential="subscription")
+        launch.assert_not_called()
+
+    def test_live_usage_route_mirrors_only_agent_access_and_ignores_parent_setup_token(self):
+        from tauceti_worker import quota
+
+        source = self.root / ".credentials.json"
+        source.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "agent-file",
+                        "refreshToken": "agent-owned",
+                        "expiresAt": (time.time() + 3600) * 1000,
+                    }
+                }
+            )
+        )
+        before = source.read_bytes()
+        home = self.root / "private-reviewer"
+        with (
+            patch.dict(
+                os.environ,
+                TAUCETI_CLAUDE_USAGE_CREDENTIALS=str(self.root / "usage.json"),
+                CLAUDE_CODE_OAUTH_TOKEN="parent-token",
+                CLAUDE_SECURESTORAGE_CONFIG_DIR="parent-keychain-store",
+            ),
+            patch.object(sys, "platform", "darwin"),
+            patch.object(
+                quota, "_claude_keychain_creds", side_effect=AssertionError("private route queried Keychain")
+            ) as keychain,
+        ):
+            env = sa.client_env(home, "claude", "subscription")
+        copied = json.loads((home / ".claude/.credentials.json").read_text())["claudeAiOauth"]
+        self.assertEqual(copied["accessToken"], "agent-file")
+        self.assertNotIn("refreshToken", copied)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
+        self.assertNotIn("CLAUDE_SECURESTORAGE_CONFIG_DIR", env)
+        self.assertNotIn("TAUCETI_CLAUDE_USAGE_CREDENTIALS", env)
+        self.assertEqual(source.read_bytes(), before)
+        keychain.assert_not_called()
+
+    def test_api_credential_bypasses_unused_subscription_file(self):
+        (self.root / ".credentials.json").unlink()
+        from tauceti_worker import quota
+
+        with (
+            patch.dict(os.environ, TAUCETI_CLAUDE_USAGE_CREDENTIALS=str(self.root / "usage.json")),
+            patch.object(sa, "anthropic_api_key", return_value="synthetic-api-key"),
+            patch.object(quota, "_claude_keychain_creds", side_effect=AssertionError("API queried Keychain")),
+        ):
+            env = sa.client_env(self.root / "private-api-reviewer", "claude", "api-key")
+        self.assertEqual(env["ANTHROPIC_API_KEY"], "synthetic-api-key")
 
     def test_unfinished_turn_resumes_the_same_session_to_a_pass(self):
         fake = FakeHaiku(

@@ -16,7 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker.budget import Budget, BudgetError, process_identity
 from tauceti_worker.usage_accounting import UsageJournal, read_usage
-from tauceti_worker.usage_lifecycle import alive, durable, identity, resolve
+from tauceti_worker.usage_lifecycle import alive, darwin_boot, durable, identity, resolve
 from tauceti_worker.usage_supervisor import (
     definitely_dead,
     ensure_supervisor,
@@ -30,6 +30,18 @@ from tauceti_worker.usage_supervisor import (
 )
 
 MODEL = "claude-opus-5-5"
+
+
+class DarwinBootIdentity(unittest.TestCase):
+    def test_boot_identity_uses_system_binary_without_path(self):
+        darwin_boot.cache_clear()
+        self.addCleanup(darwin_boot.cache_clear)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("subprocess.check_output", return_value="fixture-boot-uuid\n") as run,
+        ):
+            self.assertEqual(darwin_boot(), "fixture-boot-uuid")
+        run.assert_called_once_with(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], text=True)
 
 
 @unittest.skipUnless(sys.platform == "linux", "Linux birth identities and namespace process fixtures")

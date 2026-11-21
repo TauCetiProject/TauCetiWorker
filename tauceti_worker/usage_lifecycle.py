@@ -39,7 +39,7 @@ def durable(path, value):
 def darwin_boot():
     import subprocess
 
-    return subprocess.check_output(["sysctl", "-n", "kern.bootsessionuuid"], text=True).strip()
+    return subprocess.check_output(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"], text=True).strip()
 
 
 def darwin_process(pid):

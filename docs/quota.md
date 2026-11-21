@@ -165,11 +165,7 @@ dashboard read Claude usage with that login, and `tauceti doctor` shows it as
 `claude usage`. Agents never receive it. They keep launching from
 `$CLAUDE_CONFIG_DIR`, whose `.credentials.json` holds the setup-token as
 `claudeAiOauth.accessToken` (with its `expiresAt` and `scopes`, and no
-`refreshToken`), and off macOS that file is mirrored into isolated workers as
-before. On macOS the native host environment route keeps the existing Keychain
-behavior. Separate-usage file-only phases (Review, Bubble and security audit)
-remain unavailable until macOS file-route support (#682) is present; they do not
-fall back to the usage login or repeatedly charge a PR for missing support.
+`refreshToken`), and that file is mirrored into isolated workers as before.
 
 ```toml
 [[workers]]
@@ -204,6 +200,29 @@ plain file on every platform: on macOS the Keychain is not consulted for it and
 `--auto-refresh` applies to it. It must not be a copy of a login that another
 `claude` also uses.
 
+On macOS the variable also makes the token file the agents' credential for the
+worker, as it is elsewhere: the file is mirrored into isolated workers, and a
+bubble round is seeded from it, so the worker reads no Claude credential from the
+Keychain. The native CLI can also consult directory-specific OAuth and legacy
+managed API-key items. Before a host file launch, Worker checks metadata for both
+`Claude Code-credentials-<hash>` and `Claude Code-<hash>` and refuses a found or
+unknown result; each read is bounded to five seconds and never asks for a password
+or unlock. Claude Code 2.1.329 hashes the NFC-normalized exported config string,
+without resolving aliases. The token directory and isolated Worker copy must
+have neither item. `CLAUDE_SECURESTORAGE_CONFIG_DIR` (including an empty override)
+is unsupported for explicit host file routes on every platform because it can
+select a different credential store. The selected host config directory must also
+have no saved Console `primaryApiKey` in `.config.json` or `.claude.json`; Worker
+refuses either candidate instead of risking a fallback to API billing. With no
+config directory set, the legacy global file is `~/.claude.json`. These checks
+support the production OAuth configuration; custom/staging OAuth stores are not
+covered by this route. Private copied reviewers drop that override and do not query
+the host Keychain; cache-only status reads also avoid metadata subprocesses.
+See [the native acceptance packet](macOS-setup-token-acceptance.md) for the tested
+versions and outstanding real replacement/usage-login limitations. Local
+`claude auth status` reports source presence even for a garbage token; it does
+not establish authentication or same-account identity.
+
 Workers naming the same usage login share its observations, fetch lock and
 cooldowns under `<usage login directory>/.tauceti-quota/usage/`, exactly as
 workers sharing a credential source do. Model-limit refusals are recorded against
@@ -219,8 +238,8 @@ unknown flag before inference instead of silently choosing another login.
 Status and dashboard readings describe host credential inspection; they do not
 certify every possible agent phase. `work` chooses the strictest credential route
 for its selected phases and repeats the credential check when selecting work.
-The usage login says nothing about the agents' own token, so off macOS the
-worker also reads that file before Claude work starts, without a request: a
+The usage login says nothing about the agents' own token, so on this configured
+file route the worker also reads that file before Claude work starts, without a request: a
 missing file, or a token past its `expiresAt` with no refresh token, makes Claude
 unavailable whatever the usage login reports. With `CLAUDE_CODE_OAUTH_TOKEN` set
 the file is not checked: host agents inherit that variable and authenticate with
@@ -306,3 +325,13 @@ costs something: sitting exactly on the budget
 
 If usage cannot be read at all, the provider is treated as unavailable rather
 than assumed free.
+
+### macOS file-route checks
+
+With a separate usage login, use a dedicated agent `CLAUDE_CONFIG_DIR` with no Claude sign-in
+Keychain entry for that directory. Before a host CLI launch that uses the file, the worker checks item metadata without retrieving the
+password or unlocking/deleting any Keychain item. Cache-only observations do not poll the Keychain;
+private reviewer/container launches validate the access-only copy rather than querying the host login. A matching entry or an unavailable check
+blocks the file route; choose a fresh dedicated directory rather than deleting an operator's
+login. Native CLI acceptance must verify the directory-service convention for the tested
+Claude version. The usage login is never a fallback inference credential.
