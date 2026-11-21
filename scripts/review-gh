@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""`gh` for commands run in Bubble with run_in_bubble(inner_cmd=...), such as the review engine.
+
+Bubble's auth proxy serves only /repos/{owner}/{repo}/... REST paths, so `gh api user` fails, and the
+review engine (TauCetiReview#229) will not publish without the login it returns. The worker passes the
+login the proxy acts as in TAUCETI_BUBBLE_LOGIN; that exact query is answered from it, and every other
+call is plain gh.
+"""
+
+import os
+import shutil
+import sys
+
+here = os.path.dirname(os.path.abspath(__file__))
+rest = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if p and os.path.abspath(p) != here)
+login = os.environ.get("TAUCETI_BUBBLE_LOGIN")
+if login and sys.argv[1:] in (["api", "user", "--jq", ".login"], ["api", "/user", "--jq", ".login"]):
+    print(login)
+    sys.exit(0)
+real = shutil.which("gh", path=rest)
+if real is None:
+    sys.exit("review-gh: no gh on PATH")
+os.execv(real, [real, *sys.argv[1:]])
