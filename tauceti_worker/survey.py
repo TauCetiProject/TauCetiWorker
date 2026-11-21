@@ -264,6 +264,9 @@ class PRInfo:
     # A failed `scope` status on this head. For a self-tested head, which skips PR CI, PR status
     # posts it when the diff fails PR CI's size guards; queue admission refuses that head too.
     scope_failed: bool = False
+    # Every `build` status on this head is FAILURE. ERROR and the other BUILD_FAIL states may be
+    # infrastructure, so only this is evidence for retiring a PR without a model call.
+    build_failure_only: bool = False
     work_targets: tuple[str, ...] = ()
     origin_pr: str = ""
 
@@ -323,6 +326,7 @@ class PRInfo:
             author_is_bot=bool((d.get("author") or {}).get("is_bot")),
             build_success=bool(build_states) and all(s == "SUCCESS" for s in build_states),
             build_failed=any(s in BUILD_FAIL for s in build_states),
+            build_failure_only=bool(build_states) and all(s == "FAILURE" for s in build_states),
             labels=tuple((lb.get("name") or "") for lb in (d.get("labels") or [])),
             build_status_at=max([t for t in posted if t is not None], default=None),
             updated_at=str(d.get("updatedAt") or ""),
@@ -351,7 +355,7 @@ class Candidate:
     foreign_repair_base: str = ""  # explicit one-PR operator scope; never adds the fork to other stages
     bump_integration_failure: bool = False
     bump_pending: bool = False  # an automatic bump taken before its build finished
-    final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
+    final_resolution: bool = False  # existing own-PR fix, rebase or fix-ci budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
     source_repository: RepositoryRef | None = None
     source_repository_id: int | None = None
@@ -1091,6 +1095,7 @@ def classify_survey(
         if foreign:
             c.foreign_repair_base = integration
             c.reason = "explicitly scoped foreign-fork integration repair"
+        unreadable = False
         try:
             if budget_error:
                 raise RebaseBudgetUnavailable(budget_error)
@@ -1104,7 +1109,14 @@ def classify_survey(
         except RebaseBudgetUnavailable as error:
             c.reason = f"{reason}; {error}"
             c.attempts = MAX_REBASE_ATTEMPTS
+            unreadable = True
         c.budget = 1 if foreign else MAX_REBASE_ATTEMPTS
+        if c.attempts >= c.budget and not (foreign or handoff or unreadable) and sv.owns(p):
+            # Dispatch closes it after re-reading the budget, the claim and the live PR.
+            c.final_resolution = True
+            c.reason = "rebase attempts spent; close the authored PR"
+            sv.rebaseable.actionable.append(c)
+            continue
         (sv.rebaseable.suppressed if c.attempts >= c.budget else sv.rebaseable.actionable).append(c)
 
     # 2) review: non-draft, build-green. Eligible when the head is NOT cleanly reviewed (a new commit
@@ -1298,6 +1310,12 @@ def classify_survey(
         per_pr = counters.read(f"ci-pr-{p.number}")
         c.attempts, c.budget = per_head, MAX_CI_ATTEMPTS
         if per_head >= MAX_CI_ATTEMPTS or per_pr >= MAX_CI_PR_ATTEMPTS:
+            if sv.owns(p) and not p.automatic_bump and p.build_failure_only:
+                # Dispatch closes it after re-reading the budgets, the claim and the live build status.
+                c.final_resolution = True
+                c.reason = "fix-ci attempts spent; close the authored PR"
+                sv.red_ci.actionable.append(c)
+                continue
             sv.red_ci.suppressed.append(c)
         else:
             sv.red_ci.actionable.append(c)
