@@ -1002,6 +1002,28 @@ def _description_repaired(w: Worker, c: Candidate, pre: dict, st: dict) -> bool 
     return repair(c.pr, pre["edited"], pre["ncomments"]) if repair else False
 
 
+def _published_branch_pr(w: Worker, c: Candidate, pre: dict) -> bool:
+    """Whether a branch this round published heads a new open PR carrying a tauceti-target marker.
+
+    git-safe-push records each branch a roadmap round pushes (`published_branches`), so the PR it
+    opened is one narrow head lookup away. That answer does not depend on listing every open PR,
+    which on a large source is many pages long and fails whenever any page does. False means only
+    that this lookup found nothing; the caller still compares the open PR listings."""
+    progress = getattr(c, "progress", None) or pre
+    owner = str(progress.get("published_owner") or "")
+    if not owner:
+        return False
+    before = pre.get("prs") or set()
+    for branch in sorted(progress.get("published_branches") or {}):
+        number = w.gh.pull_for_head(owner, branch)
+        if number is None or number in before:
+            continue
+        view = w.gh.pr_view(number, ["body"])
+        if view is not None and TARGET_MARKER_RE.search(view.get("body") or ""):
+            return True
+    return False
+
+
 def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
     # This post-spend acknowledgement can run before the write's webhook arrives.
     # Ordinary surveys still use the freshest mirrored data without age gates.
@@ -1018,7 +1040,8 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
     """True if the round left an observable mark (push / new PR / new issue-or-review comment).
     Missing evidence stays unknown; it never becomes an admission dependency."""
     if pre is None:
-        return None
+        # A roadmap round's own published branch still identifies its PR without a baseline.
+        return True if not c.pr and getattr(c, "progress", None) and _published_branch_pr(w, c, {}) else None
     if c.pr:
         if pre.get("published"):
             return True
@@ -1039,6 +1062,8 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
             # taken after the branch claim; unclaimed work stays unattributed.
             return True if pre.get("claimed_bubble") else None
         return False
+    if _published_branch_pr(w, c, pre):
+        return True
     now = _open_pr_numbers(w)
     if now is None:
         return None
