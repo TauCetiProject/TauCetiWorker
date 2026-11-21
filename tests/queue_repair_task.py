@@ -740,6 +740,46 @@ class ApplicableResolution(unittest.TestCase):
         self.assertIsNone(repair_task.applicable_resolution(repo, "8", member, elsewhere), "another batch's")
 
 
+class AbsorbedMembers(unittest.TestCase):
+    """``absorbed_members`` judges only the later members that change a path the resolution changes."""
+
+    def test_only_members_on_the_resolutions_paths_are_merged(self):
+        """Member 1 conflicts with main in ``Shared.lean``; member 2 adds ``B.lean`` and member 3 edits
+        ``X.lean``. A resolution that also writes member 3's ``X.lean`` absorbs it, and only member 3 is
+        merged to find that out; a resolution of ``Shared.lean`` alone merges no later member at all."""
+        repo = Path(tempfile.mkdtemp(prefix="absorbed-members-"))
+        self.addCleanup(shutil.rmtree, repo, ignore_errors=True)
+        sh(repo, "init", "--quiet")
+        sh(repo, "config", "user.email", "test@example.com")
+        sh(repo, "config", "user.name", "test")
+        base = commit(repo, "base", {"Shared.lean": "shared\n", "X.lean": "x\n"})
+        one = commit(repo, "one\n\nSource-PR: o/r#1", {"Shared.lean": "shared, one\n"})
+        commit(repo, "two\n\nSource-PR: o/r#2", {"B.lean": "b\n"})
+        tip = commit(repo, "three\n\nSource-PR: o/r#3", {"X.lean": "x, three\n"})
+        sh(repo, "checkout", "--quiet", "--detach", base)
+        prefix = commit(repo, "main", {"Shared.lean": "shared, main\n"})
+        clean = commit_on(repo, prefix, {"Shared.lean": "shared, main and one\n"})
+        absorbing = commit_on(repo, prefix, {"Shared.lean": "shared, main and one\n", "X.lean": "x, three\n"})
+        rest = chain_tool.ChainResult(
+            status=chain_tool.CLEAN, chain_id="t", ref="t", base=prefix, tip=clean, commits=[]
+        )
+        merged: list[str] = []
+        original = chain_tool.merge_trees
+
+        def counting(repo_, ours, theirs, merge_base=None):
+            merged.append(theirs)
+            return original(repo_, ours, theirs, merge_base=merge_base)
+
+        with patch.object(chain_tool, "merge_trees", counting):
+            self.assertEqual(repair_task.absorbed_members(repo, prefix, one, clean, tip, rest), [])
+            self.assertEqual(merged, [], "no later member changes Shared.lean")
+            problems = repair_task.absorbed_members(repo, prefix, one, absorbing, tip, rest)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("o/r#3", problems[0])
+        self.assertEqual(set(merged), {tip}, "member 2 is never merged")
+        self.assertEqual(repair_task.absorbed_members(repo, prefix, one, prefix, tip, rest), [], "an empty resolution")
+
+
 class Content:
     """A bare content repository, a seed clone that built the chain, and the worker's clone."""
 

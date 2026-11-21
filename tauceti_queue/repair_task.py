@@ -2810,16 +2810,29 @@ def absorbed_members(
     the clean ``prefix`` and changes it, the resolved commit already holds it (applying it there
     changes nothing), and the conflicting commit did not carry it in the input chain. Taking a later
     member's content is replaying it by hand, and would leave that member an empty commit. A member
-    that conflicts with the prefix is not judged; content moved in part is not detected mechanically."""
-    landed = {r.source_pr for r in rest.commits if r.landed_on_base}
+    that conflicts with the prefix is not judged; content moved in part is not detected mechanically.
+
+    Only a later member that changes a path the resolution changes on the prefix is judged: where the
+    prefix and the resolved commit agree on every path a member changes, applying it changes both
+    alike, so one cannot hold it while the other does not. (Git's rename detection could carry a
+    member's edit to a path the resolution added; like content moved in part, that is not judged.)
+    Merging every later member instead took about 20 s per conflict on a 1,014-member batch, about
+    half an hour over its 212 conflicts."""
     prefix_tree = chain_tool.tree_of(clone, prefix)
     resolved_tree = chain_tool.tree_of(clone, resolved)
+    if resolved_tree == prefix_tree:
+        return []  # the resolution leaves the prefix as it is, so applying a member changes both alike
     original_tree = chain_tool.tree_of(clone, commit)
+    touched = set(chain_tool.git(clone, "diff", "--name-only", "--no-renames", "-z", prefix, resolved).split("\0"))
+    touched.discard("")
+    landed = {r.source_pr for r in rest.commits if r.landed_on_base}
+    later_commits = chain_tool.chain_commits(clone, commit, tip)
+    paths = chain_tool.commit_paths(clone, [c.sha for c in later_commits])
     problems = []
-    for later in chain_tool.chain_commits(clone, commit, tip):
+    for later in later_commits:
+        if later.source_pr in landed or paths[later.sha].isdisjoint(touched):
+            continue  # landed, empty, or applies alike onto the prefix and the resolution
         parent = later.parents[0]
-        if later.source_pr in landed or later.tree == chain_tool.tree_of(clone, parent):
-            continue
         onto_prefix = chain_tool.merge_trees(clone, prefix, later.sha, merge_base=parent)
         if not onto_prefix.clean or onto_prefix.tree == prefix_tree:
             continue
