@@ -141,6 +141,10 @@ def note_cache_hit():
     _cache_hit.set(True)
 
 
+class LockWaitExpired(OSError):
+    """Another process held a shared lock for the whole wait."""
+
+
 @contextlib.contextmanager
 def locked(path: Path, *, timeout: float = 30):
     import fcntl
@@ -154,7 +158,7 @@ def locked(path: Path, *, timeout: float = 30):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise OSError("shared GitHub lock wait expired") from None
+                    raise LockWaitExpired("shared GitHub lock wait expired") from None
                 time.sleep(0.05)
         yield
 
@@ -350,7 +354,8 @@ def shared_read(
     Network/parser exceptions propagate; unavailable storage merely disables caching. Generation
     checks prevent an overlapping write from publishing a pre-write result after invalidation.
     Explicit generation scopes use invalidate_shared rather than unrelated GitHub writes.
-    Opt-in completion markers share unavailable reads only with existing waiters.
+    Opt-in completion markers share unavailable reads only with existing waiters, and a waiter
+    whose lock wait expires behind a running leader is unavailable rather than a second fetch.
     The default invokes each caller's fetch after failures, preserving fetch side effects.
     """
     identity = identity or scope()
@@ -390,6 +395,12 @@ def shared_read(
     try:
         cm = locked(path.with_suffix(".lock"), timeout=lock_timeout)
         cm.__enter__()
+    except LockWaitExpired:
+        if coalesce_failures:
+            # The leader is still fetching. A second fetch would only compete with it (every
+            # waiter of a slow full listing would start its own), so this wait is unavailable.
+            return None
+        return fetch()
     except OSError:
         return fetch()
     try:
