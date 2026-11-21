@@ -1,0 +1,13 @@
+[Unit]
+Description=Share identical Tau Ceti Lake artifact blocks
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env python3 %h/.local/share/tauceti-fleet/bin/dedupe-lake-caches --seconds 600
+Nice=15
+CPUQuota=100%
+IOWeight=10
+MemoryMax=256M
+TimeoutStartSec=660
+StandardOutput=truncate:%t/tauceti-lake-cache-dedupe.log
+StandardError=inherit

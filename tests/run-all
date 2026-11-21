@@ -78,6 +78,7 @@ RUN_STDLIB=(
   expanded_cache.py
   canonical_store.py
   cache_storage.py
+  lake_cache_dedupe.py
   local_lint.py
   lean_pressure.py
   repair_pressure.py
