@@ -1098,7 +1098,8 @@ def run(args, stop, facts, opener, publisher):
                             result = json.loads(error.read(65536))
                         except (OSError, ValueError):
                             result = {}
-                        if error.code == 409 and result.get("code") == "resync":
+                        code = result.get("code") if isinstance(result, dict) else None
+                        if error.code == 409 and code == "resync":
                             raise ResyncRequired("receiver requires full state") from None
                         codes = {
                             401: "authentication",
@@ -1106,7 +1107,6 @@ def run(args, stop, facts, opener, publisher):
                             429: "rate_limit",
                             503: "receiver_unavailable",
                         }
-                        code = result.get("code") if isinstance(result, dict) else None
                         raise PublicationRejected(error.code, code or codes.get(error.code)) from None
 
                 publisher.publish(observation, send)

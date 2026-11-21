@@ -775,6 +775,7 @@ class PublisherCadence(unittest.TestCase):
             (507, b'{"code":"storage_full"}', "storage_full"),
             (503, b"", "receiver_unavailable"),
             (400, b"[]", "invalid_snapshot"),
+            (409, b"[]", "invalid_snapshot"),
             (400, b'{"code":"missing_batch"}', "missing_batch"),
         ]:
             with self.subTest(status=status, body=body), tempfile.TemporaryDirectory() as directory:
