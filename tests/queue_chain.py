@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -626,8 +627,19 @@ class Reading(Fixture):
                 "gpgsig -----BEGIN-----\n line\n -----END-----\n\nno trailing newline"
             ),
         )
-        shas = [first, second, signed, first]
+        crlf = self.git(
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            "--stdin",
+            input=f"tree {tree}\nparent {second}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nSubject\r\n\r\nBody\rline\r\n",
+        )
+        shas = [first, second, signed, crlf, first]
         self.assertEqual(c.read_commits(self.repo, shas), [c.read_commit(self.repo, sha) for sha in shas])
+        self.assertEqual(
+            c.read_commits(self.repo, [crlf])[0].message, "Subject\n\nBody\nline\n", "newlines as text mode"
+        )
         self.assertEqual(c.read_commits(self.repo, []), [])
         with self.assertRaises(c.ChainError):
             c.read_commits(self.repo, [first, "0" * 40])
@@ -648,6 +660,11 @@ class Reading(Fixture):
         self.assertEqual(paths[empty], frozenset())
         self.assertEqual(paths[mixed], {"A.lean", "Shared.lean", "C.lean"})
         self.assertEqual(c.commit_paths(self.repo, [empty]), {empty: frozenset()}, "served from the cache")
+        c._COMMIT_PATHS.clear()
+        c.commit_paths(self.repo, [added])
+        with unittest.mock.patch.object(c, "_COMMIT_PATHS_LIMIT", 1):
+            both = c.commit_paths(self.repo, [added, empty])  # the cache is full: it is emptied, not read
+        self.assertEqual(both, {added: {"A.lean", "Dir/B.lean"}, empty: frozenset()})
 
 
 class CLI(Fixture):

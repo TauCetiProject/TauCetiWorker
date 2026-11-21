@@ -416,7 +416,9 @@ def read_commits(repo: str | os.PathLike[str], shas: Sequence[str]) -> list[Chai
             raise ChainError(f"not a commit in {os.fspath(repo)}: {sha} ({' '.join(header[1:])})")
         start = end + 1
         size = int(header[2])
-        commits.append(_parse_commit(sha, out[start : start + size].decode("utf-8", errors="surrogateescape")))
+        raw = out[start : start + size].decode("utf-8", errors="surrogateescape")
+        # As `git`'s text mode reads it (universal newlines), so both readers see the same message.
+        commits.append(_parse_commit(sha, raw.replace("\r\n", "\n").replace("\r", "\n")))
         offset = start + size + 1
     return commits
 
@@ -462,10 +464,9 @@ def commit_paths(repo: str | os.PathLike[str], shas: Sequence[str]) -> dict[str,
     """The paths each of `shas` (single-parent commits) changes from its parent, without rename
     detection, read with one `git diff-tree --stdin` for those not seen before in this process. An
     empty commit changes none."""
-    missing = [sha for sha in dict.fromkeys(shas) if sha not in _COMMIT_PATHS]
+    known = {sha: _COMMIT_PATHS[sha] for sha in dict.fromkeys(shas) if sha in _COMMIT_PATHS}
+    missing = [sha for sha in dict.fromkeys(shas) if sha not in known]
     if missing:
-        if len(_COMMIT_PATHS) + len(missing) > _COMMIT_PATHS_LIMIT:
-            _COMMIT_PATHS.clear()
         records = git(
             repo,
             "diff-tree",
@@ -492,9 +493,11 @@ def commit_paths(repo: str | os.PathLike[str], shas: Sequence[str]) -> dict[str,
                 if current is None:
                     raise ChainError(f"git diff-tree named an unexpected commit {record!r}")
             index += 1
+        if len(_COMMIT_PATHS) + len(found) > _COMMIT_PATHS_LIMIT:
+            _COMMIT_PATHS.clear()
         for sha, changed in found.items():
-            _COMMIT_PATHS[sha] = frozenset(changed)
-    return {sha: _COMMIT_PATHS[sha] for sha in shas}
+            known[sha] = _COMMIT_PATHS[sha] = frozenset(changed)
+    return {sha: known[sha] for sha in shas}
 
 
 # --- writing commits ------------------------------------------------------------------------------
