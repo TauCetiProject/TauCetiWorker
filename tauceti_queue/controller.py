@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from typing import Any
 
-from . import admission_planning, chain, declaration_names, escalation, stuck_heads
+from . import admission_planning, chain, declaration_names, escalation, repair_stall, stuck_heads
 from .eligibility import KEEP as BLOCKING_LABELS
 from .mixed_identity import SourceNumber
 from .ports import (
@@ -193,6 +193,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "automatic_retry_max_seconds": 14400,
     # How long an escalation (an infrastructure backoff's start) stays among the status page's alerts.
     "escalation_alert_seconds": 86400,
+    # Stalled repair (docs/queue/escalation.md): a repair task whose last this many checkpoints have the
+    # same tip and the same failure signature is stalled. The queue then alerts once and offers the task
+    # again only after `repair_stall_retry_seconds`, doubling at each further identical checkpoint up to
+    # `repair_stall_retry_max_seconds`, or at once to a worker on a revision that has not tried it. 0: off.
+    "repair_stall_checkpoints": 3,
+    "repair_stall_retry_seconds": 1800,
+    "repair_stall_retry_max_seconds": 14400,
+    # A head whose version, tip, base, CI attempt and open task have all stayed the same this long has
+    # made no progress: one alert, and one message when it moves again. 0: off.
+    "head_progress_alert_seconds": 10800,
     # Staging is dispatched only on a base whose exact Lake revision map (or that of an ancestor with
     # the same build inputs) is published at this public endpoint, the one `pr-build.yml` reads
     # (`LAKE_CACHE_REVISION_ENDPOINT_PUBLIC`). Empty disables the requirement. A base found
@@ -242,6 +252,8 @@ PROBLEM_ANTICIPATED = "problem-anticipated"
 # The cancellation reason of a member whose final commit is empty: withdrawn when an adopted repair
 # empties it (`withdraw_emptied_at_adoption`), else rejected when its batch lands.
 EMPTY_COMMIT = "empty-commit"
+# The head-progress alert's wording, which the public observation recognises (`monitoring.py`).
+HEAD_NO_PROGRESS_TEXT = repair_stall.HEAD_ALERT_TEXT
 # How many escalations the controller keeps for the status page.
 ESCALATIONS_KEPT = 50
 # The most CI findings a withdrawal or rejection comment quotes.
@@ -731,6 +743,18 @@ class Controller:
                 self.notifier_error = f"{type(error).__name__}: {error}"[:300]
                 self.log.warning("escalation notifier unavailable: %s", self.notifier_error)
         self.notifier = notifier
+        # Where progress alerts (a stalled repair, a head without progress) are posted besides the
+        # journal and the status page: the Zulip target `TAUCETI_QUEUE_PROGRESS_ALERT_ZULIP_CONFIG`
+        # names, in the format of TauCetiFleet's `fleet-alert --zulip-config`. Unset, they stay
+        # journal-only, like the fleet alert without its configuration.
+        self.progress_notifier_error = ""
+        self._head_progress_anchored = False  # `_watch_head_progress` restarts its period once per process
+        self.progress_notifier: escalation.Notifier | None = None
+        try:
+            self.progress_notifier = escalation.progress_notifier_from_environment()
+        except (OSError, ValueError, TypeError) as error:
+            self.progress_notifier_error = f"{type(error).__name__}: {error}"[:300]
+            self.log.warning("progress alert notifier unavailable: %s", self.progress_notifier_error)
         # The service's public URL (configuration `public_url`), linked from notifications when set.
         self.public_url = ""
         # The CI recovery pass's stuck-head report (configuration `ci_recovery_report`), read for the
@@ -1909,7 +1933,14 @@ class Controller:
         )
 
     def claim_task(
-        self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None, mixed_capable=False
+        self,
+        worker_identity: str,
+        github_login: str,
+        *,
+        source_access=None,
+        expected_binding=None,
+        mixed_capable=False,
+        worker_revision: str | None = None,
     ) -> Task | None:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
@@ -1928,6 +1959,10 @@ class Controller:
 
         The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
         lock's priority lane, so a claim answers while a tick is running.
+
+        A stalled repair task (`_observe_repair_stall`) is not offered until its backoff ends, except
+        to a worker whose `worker_revision` (the code it runs, as its claim reports it) has not
+        produced one of the stalled checkpoints.
         """
         if expected_binding is not None and self.candidate_ci is None:
             raise TaskError("not-authorized", "qualified task binding requires a native source controller")
@@ -1949,7 +1984,9 @@ class Controller:
                 self.store.journal(now, "claim-refused", worker=worker_identity, login=github_login, reason=reason)
                 return None
             concurrency = int(self.setting("repair_concurrency"))
-            claimable = self._claimable_tasks()
+            claimable = [
+                pair for pair in self._claimable_tasks() if not self._stall_holds(pair[0], now, worker_revision)
+            ]
             if not mixed_capable:
                 claimable = [
                     pair
@@ -2001,7 +2038,19 @@ class Controller:
                     task_kind=task["kind"],
                     worker=worker_identity,
                     claim_id=claim_id,
+                    **({"worker_revision": worker_revision} if worker_revision else {}),
                 )
+                stall = self._repair_stalls().get(str(task["id"]))
+                if stall is not None:
+                    self.store.journal(
+                        now,
+                        "repair-stall-claimed",
+                        batch["id"],
+                        task_id=task["id"],
+                        claim_id=claim_id,
+                        reason="backoff-elapsed" if now >= stall["retry_at"] else "new-worker-revision",
+                        worker_revision=worker_revision,
+                    )
             return self._task_record(task, batch, claim_id, token, now + int(self.setting("claim_ttl_seconds")))
 
     def _choose_task(
@@ -2453,6 +2502,7 @@ class Controller:
                 with self.store.transaction():
                     result = reject(REPAIR_CHECKPOINT)
                     self._release_claim(claim, REPAIR_CHECKPOINT, now)
+                    self._observe_repair_stall(task, batch, tip_sha, notes if isinstance(notes, dict) else {}, now)
                 self._wake.set()
                 return result
             if tip_sha == task["tip"] and knowledge.get("was_proactive"):
@@ -3689,6 +3739,8 @@ class Controller:
         self._expire_claims(now)
         # Before anything that can end the pass early: the message depends only on the report.
         self._notify_stuck_heads(now)
+        self._settle_repair_stalls(now)
+        self._watch_head_progress(now)
         if self.mixed is not None and self.mixed.mode == "admit" and self.setting("publication_enabled"):
             sync_key = f"mixed-sync:startup:{self.mixed.generation}:{self.revision}"
             self._enqueue("mixed-sync", sync_key, {})
@@ -8955,9 +9007,13 @@ class Controller:
         key: str,
         lines: list[str] | None = None,
         counted: bool = True,
+        channel: str = "notify",
+        extra: dict[str, Any] | None = None,
     ) -> None:
         """Keep the escalation for the status page's alerts, journal it, and send it to the operator.
-        An uncounted record (a recovery) is journaled and sent but is neither an alert nor an escalation."""
+        An uncounted record (a recovery) is journaled and sent but is neither an alert nor an escalation.
+        `channel` `progress-alert` sends it where progress alerts go (`_progress_alert`) instead of the
+        operator's direct messages."""
         record = {
             "at": now,
             "action": action,
@@ -8966,6 +9022,7 @@ class Controller:
             "cause": cause,
             "detail": detail,
             "lines": (lines or [])[:5],
+            **(extra or {}),
         }
         with self.store.transaction():
             if counted:
@@ -8976,7 +9033,292 @@ class Controller:
             self.store.journal(
                 now, "escalated", head["id"], **{k: v for k, v in record.items() if k not in ("at", "batch_id")}
             )
-            self._notify(key, record)
+            if channel == "progress-alert":
+                self._progress_alert(key, record)
+            else:
+                self._notify(key, record)
+
+    # --- stalled repair and head progress (docs/queue/escalation.md, "Stalled repair") ------------
+
+    def _repair_stalls(self) -> dict[str, dict[str, Any]]:
+        """The stalled repair tasks by task id (`state:repair_stalls`)."""
+        return dict(self._state("repair_stalls", {}) or {})
+
+    def _observe_repair_stall(
+        self, task: dict[str, Any], batch: dict[str, Any], tip: str, notes: dict[str, Any], now: float
+    ) -> None:
+        """After a checkpoint: when the task's last `repair_stall_checkpoints` checkpoints share one
+        failure signature (`repair_stall.signature`: the tip and the normalized findings), the task is
+        stalled. The first time, journal it and raise one progress alert quoting the agent's own
+        conclusion; each further identical checkpoint lengthens the backoff before the next claim. A
+        checkpoint with another signature is progress and ends the stall."""
+        limit = int(self.setting("repair_stall_checkpoints"))
+        stalls = self._repair_stalls()
+        key = str(task["id"])
+        current = stalls.get(key)
+        rows = self.store.rows(
+            "submissions",
+            {"task_id": task["id"], "reason": REPAIR_CHECKPOINT},
+            order="id DESC",  # the whole history: every revision of the current identical run has tried the task
+        )
+        signatures = [repair_stall.checkpoint_signature(row["tip"], row["worker_notes"]) for row in rows]
+        latest = signatures[0] if signatures else None
+        run = 0
+        for value in signatures:
+            if value is None or value != latest:
+                break
+            run += 1
+        # Every revision that produced a checkpoint of this run has tried the task and failed the same way.
+        run_notes = [repair_stall.notes_of(row["worker_notes"]) for row in rows[:run]]
+        revisions = list(
+            dict.fromkeys(r for n in reversed(run_notes) if (r := repair_stall.revision(n.get("worker_revision"))))
+        )
+        tools_seen = list(
+            dict.fromkeys(str(n["tools_revision"])[:120] for n in reversed(run_notes) if n.get("tools_revision"))
+        )
+        conclusion = repair_stall.conclusion(notes.get("agent_conclusion"))
+        findings = notes.get("repair_checkpoint") or []
+        if current is not None and (current.get("signature") != latest or not limit):
+            self._end_repair_stall(task, batch, current, now, "a checkpoint with other findings or another tip")
+            stalls.pop(key, None)
+            self._set_state("repair_stalls", stalls)
+            current = None
+        if not limit or latest is None or run < limit:
+            return
+        if current is None:
+            delay = repair_stall.retry_delay(
+                0, self.setting("repair_stall_retry_seconds"), self.setting("repair_stall_retry_max_seconds")
+            )
+            current = {
+                "task_id": task["id"],
+                "batch_id": batch["id"],
+                "version": task["batch_version"],
+                "kind": task["kind"],
+                "since": now,
+                "signature": latest,
+                "tip": tip,
+                "checkpoints": run,
+                "retries": 0,
+                "retry_at": now + delay,
+                "revisions": revisions,
+                "tools": tools_seen[-20:],
+                "findings": repair_stall.describe_findings(findings),
+                "conclusion": conclusion,
+            }
+            stalls[key] = current
+            self._set_state("repair_stalls", stalls)
+            self._count("repair_stalls")
+            self._record_escalation(
+                "repair-stalled",
+                batch,
+                now,
+                cause=(
+                    f"{task['kind']} task {task['id']} retained tip {tip[:12]} with the same findings "
+                    f"{run} times in a row"
+                ),
+                detail=(
+                    f"next claim at {repair_stall.clock(now + delay)} at the earliest, then the wait doubles at each "
+                    f"identical checkpoint up to {repair_stall.duration(self.setting('repair_stall_retry_max_seconds'))}; "
+                    "a new tip, new members or a worker on a revision that has not tried it is offered the task at once"
+                ),
+                lines=current["findings"],
+                key=f"repair-stalled:{task['id']}:{latest}:{now}",
+                counted=False,
+                channel="progress-alert",
+                extra={"task_id": task["id"], "tip": tip, "signature": latest, "conclusion": conclusion},
+            )
+            return
+        current["checkpoints"] = run
+        current["retries"] = int(current.get("retries", 0)) + 1
+        delay = repair_stall.retry_delay(
+            current["retries"],
+            self.setting("repair_stall_retry_seconds"),
+            self.setting("repair_stall_retry_max_seconds"),
+        )
+        current["retry_at"] = now + delay
+        current["revisions"] = list(dict.fromkeys([*current.get("revisions", []), *revisions]))
+        current["tools"] = list(dict.fromkeys([*current.get("tools", []), *tools_seen]))[-20:]
+        if conclusion:
+            current["conclusion"] = conclusion
+        stalls[key] = current
+        self._set_state("repair_stalls", stalls)
+        self.store.journal(
+            now,
+            "repair-stall-backoff",
+            batch["id"],
+            task_id=task["id"],
+            tip=tip,
+            checkpoints=run,
+            retries=current["retries"],
+            retry_at=current["retry_at"],
+        )
+
+    def _end_repair_stall(
+        self, task: dict[str, Any] | None, batch: dict[str, Any] | None, stall: dict[str, Any], now: float, why: str
+    ) -> None:
+        """Journal the end of a stall and send its one recovery message."""
+        head = batch or {"id": stall["batch_id"], "version": stall["version"]}
+        self._record_escalation(
+            "repair-stall-ended",
+            head,
+            now,
+            cause=f"task {stall['task_id']}: {why}",
+            detail=(
+                f"the stall that began at {repair_stall.clock(stall['since'])} ended after "
+                f"{repair_stall.duration(now - stall['since'])} and {stall.get('retries', 0)} backed-off claims"
+            ),
+            key=f"repair-stall-ended:{stall['task_id']}:{stall['signature']}:{stall['since']}",
+            counted=False,
+            channel="progress-alert",
+            extra={"task_id": stall["task_id"]},
+        )
+
+    def _settle_repair_stalls(self, now: float) -> None:
+        """End the stalls of tasks that are no longer open: adopted, superseded by a new batch version
+        (new members, a new base) or replaced by another task."""
+        stalls = self._repair_stalls()
+        if not stalls:
+            return
+        disabled = not int(self.setting("repair_stall_checkpoints"))
+        with self.store.transaction():
+            ended = False
+            for key, stall in list(stalls.items()):
+                task = self.store.row("tasks", {"id": int(key)})
+                if task is not None and task["state"] == TASK_OPEN and not disabled:
+                    continue
+                batch = self.store.row("batches", {"id": stall["batch_id"]})
+                if disabled and task is not None and task["state"] == TASK_OPEN:
+                    why = "stalled-repair detection was turned off"
+                else:
+                    why = "the task was " + ((task["resolution"] or task["state"]) if task is not None else "removed")
+                self._end_repair_stall(task, batch, stall, now, why)
+                stalls.pop(key)
+                ended = True
+            if ended:
+                self._set_state("repair_stalls", stalls)
+
+    def _stall_holds(self, task: dict[str, Any], now: float, worker_revision: str | None) -> bool:
+        """Whether a stalled task waits out its backoff for this claim: a worker on a revision that has
+        not produced one of the stalled checkpoints is offered it at once."""
+        if not int(self.setting("repair_stall_checkpoints")):
+            return False
+        stall = self._repair_stalls().get(str(task["id"]))
+        if stall is None or now >= stall.get("retry_at", 0):
+            return False
+        return not (worker_revision and worker_revision not in stall.get("revisions", []))
+
+    def _head_progress_fingerprint(self, head: dict[str, Any]) -> list[Any]:
+        attempt = self._current_attempt(head)
+        task = self._open_task(head)
+        return [
+            head["id"],
+            head["version"],
+            head["tip"],
+            head["base"],
+            attempt["id"] if attempt is not None else None,
+            attempt["outcome"] if attempt is not None else None,
+            task["id"] if task is not None else None,
+        ]
+
+    def _watch_head_progress(self, now: float) -> None:
+        """One alert once the head has made no progress for `head_progress_alert_seconds`: its version,
+        tip, base, current CI attempt and its outcome, and its open task all unchanged. Claims of the
+        same task are not progress. One message when it moves again (or another batch is head)."""
+        head = self._head()
+        state = self._state("head_progress")
+        if not self._head_progress_anchored:
+            # Time the controller did not observe proves nothing: a restart starts the period again.
+            self._head_progress_anchored = True
+            if state and not state.get("alerted_at"):
+                state = dict(state, since=max(state["since"], now))
+                self._set_state("head_progress", state)
+        if not int(self.setting("head_progress_alert_seconds")):
+            if state:  # turned off: no alert stays active, and a later re-enable starts a fresh period
+                self._set_state("head_progress", None)
+            return
+        fingerprint = self._head_progress_fingerprint(head) if head is not None else None
+        if state and state.get("fingerprint") == fingerprint:
+            limit = int(self.setting("head_progress_alert_seconds"))
+            if head is None or not limit or state.get("alerted_at") or now - state["since"] < limit:
+                return
+            stall = next((s for s in self._repair_stalls().values() if s.get("batch_id") == head["id"]), None)
+            stage = self._head_stage(head)
+            state["alerted_at"] = now
+            with self.store.transaction():
+                self._set_state("head_progress", state)
+                self._count("head_progress_alerts")
+                self._record_escalation(
+                    "head-no-progress",
+                    head,
+                    now,
+                    cause=(
+                        f"head batch {head['id']} {HEAD_NO_PROGRESS_TEXT} for {repair_stall.duration(now - state['since'])} "
+                        f"(since {repair_stall.clock(state['since'])}), at stage {stage}"
+                    ),
+                    detail=(
+                        f"repair task {stall['task_id']} is stalled: {stall['checkpoints']} identical checkpoints at "
+                        f"{stall['tip'][:12]}; next claim at {repair_stall.clock(stall['retry_at'])}"
+                        if stall
+                        else "nothing was changed; one more message when the head moves again"
+                    ),
+                    lines=(stall or {}).get("findings") or [],
+                    key=f"head-no-progress:{head['id']}:{state['since']}",
+                    counted=False,
+                    channel="progress-alert",
+                    extra={"conclusion": (stall or {}).get("conclusion") or ""},
+                )
+            return
+        with self.store.transaction():
+            self._head_progress_moved(head, state, fingerprint, now)
+
+    def _head_progress_moved(self, head, state, fingerprint, now: float) -> None:
+        if state and state.get("alerted_at"):
+            previous = self.store.row("batches", {"id": state["fingerprint"][0]}) or {
+                "id": state["fingerprint"][0],
+                "version": state["fingerprint"][1],
+            }
+            self._record_escalation(
+                "head-progress-resumed",
+                previous,
+                now,
+                cause=f"head batch {previous['id']} moved after {repair_stall.duration(now - state['since'])} without progress",
+                detail="the head is progressing again",
+                key=f"head-progress-resumed:{previous['id']}:{state['since']}",
+                counted=False,
+                channel="progress-alert",
+            )
+        if state or head is not None:
+            self._set_state("head_progress", None if head is None else {"fingerprint": fingerprint, "since": now})
+
+    def _head_stage(self, head: dict[str, Any]) -> str:
+        task = self._open_task(head)
+        if task is not None:
+            return task["kind"]
+        attempt = self._current_attempt(head)
+        return "dispatch" if attempt is None else f"ci ({attempt['outcome']})"
+
+    def _progress_alerts(self, now: float) -> list[str]:
+        """The status alerts of stalled repairs and of a head without progress, with times in AEDT."""
+        alerts = []
+        for stall in self._repair_stalls().values():
+            line = (
+                f"{repair_stall.ALERT_TEXT}: batch {stall['batch_id']} {stall['kind']} task {stall['task_id']} "
+                f"retained tip {stall['tip'][:12]} with the same findings {stall['checkpoints']} times since "
+                f"{repair_stall.clock(stall['since'])}; next claim at {repair_stall.clock(stall['retry_at'])}"
+                if now < stall["retry_at"]
+                else f"{repair_stall.ALERT_TEXT}: batch {stall['batch_id']} {stall['kind']} task {stall['task_id']} "
+                f"retained tip {stall['tip'][:12]} with the same findings {stall['checkpoints']} times since "
+                f"{repair_stall.clock(stall['since'])}; claimable again"
+            )
+            if stall.get("conclusion"):
+                line += f"; agent: {stall['conclusion']}"
+            alerts.append(line)
+        state = self._state("head_progress")
+        if state and state.get("alerted_at"):
+            alerts.append(
+                f"head batch {state['fingerprint'][0]} {HEAD_NO_PROGRESS_TEXT} since {repair_stall.clock(state['since'])}"
+            )
+        return alerts
 
     def _notify_stuck_heads(self, now: float) -> None:
         """Queue the one direct message of the current stuck period of the CI recovery report, once due."""
@@ -9004,6 +9346,21 @@ class Controller:
     def _notify(self, key: str, record: dict[str, Any]) -> None:
         """Queue a direct message to the operator about `record` (outbox kind `notify`, sent once)."""
         marker = "tauceti-queue-" + hashlib.sha256(key.encode()).hexdigest()[:24]
+        self._enqueue("notify", f"notify:{key}", {"marker": marker, "content": self._notice_content(record, marker)})
+
+    def _progress_alert(self, key: str, record: dict[str, Any]) -> None:
+        """Queue a progress alert about `record` (outbox kind `progress-alert`, sent once): posted where
+        `TAUCETI_QUEUE_PROGRESS_ALERT_ZULIP_CONFIG` says once it is set, and until then written only to
+        the service's journal (`journalctl --user -u tauceti-queue`), like TauCetiFleet's fleet alert
+        before decision 135 chooses its target."""
+        marker = "tauceti-queue-" + hashlib.sha256(key.encode()).hexdigest()[:24]
+        self._enqueue(
+            "progress-alert",
+            f"progress-alert:{key}",
+            {"marker": marker, "content": self._notice_content(record, marker)},
+        )
+
+    def _notice_content(self, record: dict[str, Any], marker: str) -> str:
         lines = [
             f"**Tau Ceti merge queue: {record['action']} on head batch {record['batch_id']} "
             f"(version {record['version']})**",
@@ -9013,10 +9370,12 @@ class Controller:
         ]
         if record.get("lines"):
             lines += ["", "```text", *(escalation.quote(line, 300) for line in record["lines"]), "```"]
+        if record.get("conclusion"):
+            lines += ["", f"The agent's own conclusion: {escalation.quote(record['conclusion'], 1000)}"]
         if self.public_url:
             lines += ["", f"Status: {self.public_url.rstrip('/')}/status"]
         lines += ["", f"Alert ID: {marker}"]
-        self._enqueue("notify", f"notify:{key}", {"marker": marker, "content": "\n".join(lines)})
+        return "\n".join(lines)
 
     # --- promotion and landing ---------------------------------------------------------------------
 
@@ -9980,7 +10339,7 @@ class Controller:
         try:
             with self._lock.unlocked():
                 payload = loads(current["payload"], {})
-                if current["kind"] == "notify":
+                if current["kind"] in ("notify", "progress-alert"):
                     payload["_retry"] = current["attempts"] > 0
                 result = self._perform(current["kind"], payload, now)
         except Exception as caught:  # noqa: BLE001 - every adapter failure is recorded and retried
@@ -10112,6 +10471,14 @@ class Controller:
                 title = pull.title if pull.title.startswith(MERGED_TITLE_PREFIX) else MERGED_TITLE_PREFIX + pull.title
             self.source.close_pr(repo, payload["number"], title)
             return "closed"
+        if kind == "progress-alert":
+            if self.progress_notifier is None:
+                # Journal-only until a target is configured: the service log carries the whole alert.
+                self.log.warning("progress alert (journal only): %s", payload["content"])
+                return "journal-only" + (f": {self.progress_notifier_error}" if self.progress_notifier_error else "")
+            return self.progress_notifier.send(
+                payload["marker"], payload["content"], reconcile=bool(payload.get("_retry"))
+            )
         if kind == "notify":
             if self.notifier is None:
                 return "notifier-unconfigured" + (f": {self.notifier_error}" if self.notifier_error else "")
@@ -10411,11 +10778,20 @@ class Controller:
                 alerts.append(
                     f"CI infrastructure backoff since {backoff['since']:.0f}: {backoff['retries']} automatic retries"
                 )
-            loop_termination = {"infrastructure_backoff": backoff or None}
+            alerts.extend(self._progress_alerts(now))
+            loop_termination = {
+                "infrastructure_backoff": backoff or None,
+                "repair_stalls": list(self._repair_stalls().values()),
+                "head_progress": self._state("head_progress"),
+            }
             if self.notifier_error:
                 alerts.append(f"escalation notifier unavailable: {self.notifier_error}")
             if any(e["attempts"] and e["kind"] == "notify" for e in pending):
                 alerts.append("escalation notification delivery is failing; see outbox history")
+            if self.progress_notifier_error:
+                alerts.append(f"progress alert notifier unavailable: {self.progress_notifier_error}")
+            if any(e["attempts"] and e["kind"] == "progress-alert" for e in pending):
+                alerts.append("progress alert delivery is failing; see outbox history")
             stuck = stuck_heads.read(self.stuck_heads_report, now, self.repository)
             if (stuck_alert := stuck_heads.alert(stuck, now)) is not None:
                 alerts.append(stuck_alert)
@@ -10845,7 +11221,11 @@ class Controller:
                             alerts.append(
                                 f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
                             )
-        if task is not None and not info["task"]["active_claims"]:
+        stall = self._repair_stalls().get(str(task["id"])) if task is not None else None
+        info["repair_stall"] = stall
+        if stall is not None and now < stall["retry_at"]:
+            pass  # backed off on purpose: the stalled-repair alert says so
+        elif task is not None and not info["task"]["active_claims"]:
             unclaimed_at = task["created_at"]
             for claim in self.store.rows("claims", {"task_id": task["id"]}):
                 ended_at = claim["expires_at"]
@@ -10853,6 +11233,8 @@ class Controller:
                     ended_at = min(ended_at, claim["released_at"])
                 if ended_at <= now:
                     unclaimed_at = max(unclaimed_at, ended_at)
+            if stall is not None:
+                unclaimed_at = max(unclaimed_at, stall["retry_at"])  # unclaimed only once offered again
             silence = now - unclaimed_at
             interval = int(settings["stall_interval_seconds"])
             if silence >= interval:

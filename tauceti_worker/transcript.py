@@ -190,6 +190,11 @@ class AgentTranscriptRenderer:
         # refusal such as `rejected`); None until one is seen. Codex has no equivalent event.
         self.rate_limit_status: str | None = None
 
+    @property
+    def final_text(self) -> str | None:
+        """The agent's last top-level message (or its result text), as the transcript shows it."""
+        return self._last_assistant
+
     def render_line(self, raw: str) -> str:
         if self.provider not in {"codex", "claude"}:
             return raw

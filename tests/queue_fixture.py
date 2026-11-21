@@ -6,6 +6,7 @@ a controllable clock and no inference. The tests are named after the acceptance 
 `docs/redesign/specs/ai-merge-queue.md`; the mapping is in `docs/queue/controller.md`.
 """
 
+import io
 import json
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import time
 import types
 import unittest
 import unittest.mock
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +27,7 @@ from tauceti_queue import (  # noqa: E402
     escalation,
     feeds,
     monitoring,
+    repair_stall,
     stuck_heads,
 )
 from tauceti_queue import runtime as rt  # noqa: E402
@@ -690,6 +693,67 @@ class EscalationNotifier(unittest.TestCase):
                 escalation.notifier_from_environment({escalation.ZULIP_CONFIG_ENV: str(path)})
 
 
+class ProgressAlertNotifier(unittest.TestCase):
+    """The progress alert target reads TauCetiFleet's `fleet-alert --zulip-config` format."""
+
+    def test_a_stream_topic_target_posts_there_and_reconciles_in_that_topic(self):
+        calls = []
+
+        config = {
+            "site": "https://z.example",
+            "email": "bot@z",
+            "api_key": "k",
+            "stream": "ops",
+            "topic": "fleet health",
+        }
+        notifier = escalation.ZulipNotifier(config, streams=True)
+
+        class Opener:
+            def open(self, req, timeout):
+                calls.append((req.get_method(), req.full_url, req.data))
+                body = (
+                    {"result": "success", "messages": []}
+                    if req.get_method() == "GET"
+                    else {"result": "success", "id": 7}
+                )
+                return io.BytesIO(json.dumps(body).encode())
+
+        calls = []
+        # Through the real transport: a stream target names no recipient and still passes its checks.
+        with patch("tauceti_worker.audit_alerts.urllib.request.build_opener", lambda *_: Opener()):
+            self.assertEqual(notifier.send("m1", "hello m1", reconcile=True), "zulip 7")
+        self.assertIn("ops", urllib.parse.unquote(calls[0][1]))
+        posted = urllib.parse.parse_qs(calls[1][2].decode())
+        self.assertEqual(
+            posted, {"type": ["stream"], "to": ["ops"], "topic": ["fleet health"], "content": ["hello m1"]}
+        )
+        from tauceti_worker import audit_alerts
+
+        with (
+            self.assertRaises(ValueError),
+            patch("tauceti_worker.audit_alerts.urllib.request.build_opener", lambda *_: Opener()),
+        ):
+            audit_alerts.request(config, "POST", {})  # audit direct messages still need a recipient
+        with self.assertRaises(ValueError):
+            escalation.ZulipNotifier({k: v for k, v in config.items() if k != "stream"}, streams=True)
+
+    def test_the_target_comes_from_its_own_variable_and_must_be_private(self):
+        self.assertIsNone(escalation.progress_notifier_from_environment({}))
+        self.assertIsNone(
+            escalation.progress_notifier_from_environment({escalation.ZULIP_CONFIG_ENV: "/nonexistent"}),
+            "the escalation direct messages' configuration is not a progress alert target",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "fleet-alert-zulip.json"
+            path.write_text(json.dumps({"site": "https://z.example", "email": "e", "api_key": "k", "recipient_id": 5}))
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                escalation.progress_notifier_from_environment({escalation.PROGRESS_ALERT_CONFIG_ENV: str(path)})
+            path.chmod(0o600)
+            notifier = escalation.progress_notifier_from_environment({escalation.PROGRESS_ALERT_CONFIG_ENV: str(path)})
+            self.assertFalse(notifier.stream)
+
+
 class LoopTermination(QueueFixture):
     """A failing head is repaired by agents however often it fails: the queue never withdraws, bisects
     or evicts a member on its own (docs/queue/escalation.md). Infrastructure failures back off
@@ -795,7 +859,14 @@ class LoopTermination(QueueFixture):
         status = self.controller.status()
         self.assertEqual(status["head"]["stage"], "repair")
         self.assertFalse(any("holds after escalation" in alert for alert in status["alerts"]), status["alerts"])
-        self.assertEqual(status["loop_termination"], {"infrastructure_backoff": None})
+        self.assertEqual(
+            status["loop_termination"],
+            {
+                "infrastructure_backoff": None,
+                "repair_stalls": [],
+                "head_progress": status["loop_termination"]["head_progress"],
+            },
+        )
 
     def test_repeated_infrastructure_failures_back_off_automatically_and_recover(self):
         self.controller.set_setting("infrastructure_failure_limit", 2, "test")
@@ -890,6 +961,272 @@ class LoopTermination(QueueFixture):
         self.assertEqual((entry["state"], entry["result"]), ("done", "notifier-unconfigured"))
         alerts = self.controller.status()["alerts"]
         self.assertTrue(any("escalation (infrastructure-backoff)" in a for a in alerts), alerts)
+
+
+# The agent's last message on batch 465's repair task 1415, one of the 109 that said a human was needed.
+TASK_1415_CONCLUSION = """I made no changes to the batch: HEAD is still `cc0e44e29450`, the same chain the queue already rejected. No content change in the PRs will fix this failure, so the queue will reject this chain again. The batch has to be split, or `lint-env.sh` fixed, which a human has to do because `scripts/` is human-owned.
+
+**Why it fails.** It is the same LINT-ENV failure as every earlier attempt on this task:
+- `tasks/1415/logs/lint-env.log` shows `DocScanDriver.lean:3436/3437:0: error: maximum recursion depth reached in the code generator`.
+
+**Focused checks:**
+- `python3 .tauceti-repair/check`: `ok` (linear on `b608709b45f2`, trailers and subjects intact, clean tree)."""
+
+DRIVER_FAILURE = {
+    "kind": "lint",
+    "message": "LINT-ENV: FAIL — driver failure: the docstring-scan driver did not elaborate cleanly — see output above",
+    "module": "",
+}
+
+
+class StallSignature(unittest.TestCase):
+    """The failure signature and the agent's conclusion (`tauceti_queue/repair_stall.py`)."""
+
+    def test_identical_failures_share_a_signature_whatever_varies_between_runs(self):
+        first = {
+            "kind": "lint",
+            "module": "TauCeti.A",
+            "message": "A.lean:3436:0: error at deadbeef1 after 31.2s in /tmp/x1/y",
+        }
+        again = {
+            "kind": "lint",
+            "module": "TauCeti.A",
+            "message": "A.lean:12:0:  error at cafe0042 after 30.9s in /tmp/z9/y",
+        }
+        other = {"kind": "audit", "module": "TauCeti.A", "message": first["message"]}
+        elsewhere = dict(first, module="TauCeti.B")
+        tip = "c" * 40
+        self.assertEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [again]))
+        self.assertEqual(
+            repair_stall.signature(tip, [first, DRIVER_FAILURE]), repair_stall.signature(tip, [DRIVER_FAILURE, again])
+        )
+        self.assertNotEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [other]), "another check")
+        self.assertNotEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [elsewhere]))
+        self.assertNotEqual(
+            repair_stall.signature(tip, [first]), repair_stall.signature("d" * 40, [first]), "a new tip"
+        )
+        self.assertNotEqual(
+            repair_stall.signature(tip, [first]),
+            repair_stall.signature(tip, [dict(first, message="unused variable `x`")]),
+            "another message",
+        )
+
+    def test_the_conclusion_keeps_why_the_agent_cannot_progress(self):
+        text = repair_stall.conclusion(TASK_1415_CONCLUSION)
+        self.assertIn("a human has to do", text)
+        self.assertIn("No content change in the PRs will fix this failure", text)
+        self.assertNotIn("Focused checks", text)
+        self.assertLessEqual(len(text), repair_stall.CONCLUSION_LIMIT)
+        self.assertEqual(repair_stall.conclusion("Fixed the import.\n\nAll checks pass."), "Fixed the import.")
+        self.assertEqual(repair_stall.conclusion(None), "")
+
+    def test_the_backoff_doubles_up_to_its_maximum(self):
+        self.assertEqual(
+            [repair_stall.retry_delay(n, 1800, 14400) for n in range(6)], [1800, 3600, 7200, 14400, 14400, 14400]
+        )
+
+
+class StalledRepair(QueueFixture):
+    """A head repair that keeps checkpointing the same tip with the same findings is stalled: one
+    journal-only progress alert quoting the agent, a backoff before the next claim, and a resume when
+    its inputs change (docs/queue/escalation.md, "Stalled repair")."""
+
+    REVISION = "a" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+        self.github.ci_policy = lambda head, _base, _members: (
+            ("fail", [DRIVER_FAILURE]) if self.repo.file_at(head, "Bad.lean") is not None else ("pass", [])
+        )
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+
+    def checkpoint(self, revision=REVISION, findings=(DRIVER_FAILURE,), conclusion=TASK_1415_CONCLUSION):
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision=revision)
+        self.assertIsNotNone(task, "the task is offered")
+        notes = {"repair_checkpoint": list(findings), "worker_revision": revision, "agent_conclusion": conclusion}
+        result = self.controller.submit_task(
+            task.task_id, task.claim_token, task.tip, json.dumps(notes), checkpoint=True
+        )
+        self.assertEqual(result.reason, "repair-checkpoint")
+        self.clock.advance(780)  # each of 1415's claims took about 13 minutes
+        return task
+
+    def escalated(self, action):
+        return [e for e in self.controller.store.journal_entries("escalated") if e["detail"]["action"] == action]
+
+    def test_three_identical_checkpoints_alert_once_journal_only_and_back_off(self):
+        task = self.checkpoint()
+        self.checkpoint()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.checkpoint()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.tick()
+        # Journal-only until decision 135 configures a target: nothing goes to the operator's direct messages.
+        self.assertEqual(self.notifier.messages, [])
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "notify"}), 0)
+        entry = self.controller.store.row("outbox", {"kind": "progress-alert"})
+        self.assertEqual((entry["state"], entry["result"]), ("done", "journal-only"))
+        content = json.loads(entry["payload"])["content"]
+        self.assertIn("repair-stalled", content)
+        self.assertIn("a human has to do", content)
+        self.assertIn("driver failure", content)
+        status = self.controller.status()
+        alerts = [a for a in status["alerts"] if a.startswith("repair stalled")]
+        self.assertEqual(len(alerts), 1, status["alerts"])
+        self.assertIn(f"task {task.task_id}", alerts[0])
+        self.assertIn("AEDT", alerts[0])
+        self.assertIn("agent: ", alerts[0])
+        self.assertFalse(any("unclaimed for" in a for a in status["alerts"]), "backed off on purpose")
+        self.assertEqual(status["head"]["repair_stall"]["checkpoints"], 3)
+        # Backed off: the same code is not offered the task for 30 minutes, then 60, ...
+        self.assertIsNone(self.controller.claim_task("repair-3", "admin-worker", worker_revision=self.REVISION))
+        self.clock.advance(1800 - 780 - 60)
+        self.tick()
+        self.assertIsNone(self.controller.claim_task("repair", "admin-worker", worker_revision=self.REVISION))
+        self.clock.advance(60)
+        self.checkpoint()
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual((stall["checkpoints"], stall["retries"]), (4, 1))
+        self.assertEqual(stall["retry_at"] - (self.clock() - 780), 3600)
+        self.assertEqual(len(self.escalated("repair-stalled")), 1, "one alert per stall")
+        self.assertEqual(len(self.controller.store.journal_entries("repair-stall-backoff")), 1)
+
+    def test_a_worker_on_new_code_is_offered_the_stalled_task_at_once(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.assertIsNone(self.controller.claim_task("repair-3", "admin-worker", worker_revision=self.REVISION))
+        self.assertIsNone(self.controller.claim_task("old", "admin-worker"), "an unknown revision waits too")
+        # The fix is installed on one unit: its revision has not tried the task.
+        self.checkpoint(revision="b" * 40)
+        claimed = self.controller.store.journal_entries("repair-stall-claimed")
+        self.assertEqual(claimed[-1]["detail"]["reason"], "new-worker-revision")
+        # Same failure on the new code: still stalled, and both revisions now wait for the backoff.
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(stall["revisions"], [self.REVISION, "b" * 40])
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40))
+
+    def test_other_findings_end_the_stall_with_one_recovery_message(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.checkpoint(revision="b" * 40, findings=({"kind": "lint", "module": "TauCeti.A", "message": "simpNF"},))
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.assertFalse(any(a.startswith("repair stalled") for a in self.controller.status()["alerts"]))
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+
+    def test_a_new_head_version_ends_the_stall(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.clock.advance(1800)
+        self.tick()
+        task = self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        resolution = Resolution({"Bad.lean": "good\n"}, explanation="Fixed.")
+        agent = self.agent(script=lambda _task: {f"{PROJECT}#101": resolution})
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_disabled_stall_detection_keeps_offering_the_task(self):
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        for _ in range(5):
+            self.checkpoint()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+
+    def test_turning_detection_off_releases_a_stall_at_once(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+        self.tick()
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+
+    def test_every_revision_in_the_identical_run_has_tried_the_task(self):
+        self.checkpoint(revision="b" * 40)
+        self.checkpoint()
+        self.checkpoint()
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(stall["revisions"], ["b" * 40, self.REVISION])
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40))
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision="c" * 64))
+
+    def test_a_stall_that_recurs_is_told_again(self):
+        other = ({"kind": "lint", "module": "TauCeti.A", "message": "simpNF"},)
+        for findings in ((DRIVER_FAILURE,), other, (DRIVER_FAILURE,)):
+            for _ in range(3):
+                self.clock.advance(4 * 3600)
+                self.checkpoint(findings=findings)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stalled")), 3)
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "progress-alert"}), 5, "3 starts, 2 ends")
+
+    def test_a_configured_target_receives_the_progress_alert(self):
+        target = self.controller.progress_notifier = RecordingNotifier()
+        for _ in range(3):
+            self.checkpoint()
+        self.tick()
+        self.assertEqual(len(target.messages), 1)
+        self.assertIn("The agent's own conclusion", target.messages[0])
+        self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
+
+    def test_turning_the_head_alert_off_clears_an_active_one(self):
+        self.tick()
+        self.clock.advance(3 * 3600)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+        self.controller.set_setting("head_progress_alert_seconds", 0, "test")
+        self.tick()
+        self.assertFalse(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+        self.assertIsNone(self.controller.status()["loop_termination"]["head_progress"])
+
+    def test_revisions_from_a_long_identical_run_are_all_remembered(self):
+        for n in range(25):
+            self.clock.advance(4 * 3600)
+            self.checkpoint(revision=f"{n:040x}")
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(len(stall["revisions"]), 25)
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision=f"{0:040x}"))
+
+    def test_a_restart_starts_the_head_progress_period_again(self):
+        self.tick()
+        self.clock.advance(4 * 3600)  # the controller was down
+        self.controller._head_progress_anchored = False
+        self.tick()
+        self.assertEqual(self.escalated("head-no-progress"), [])
+        self.clock.advance(3 * 3600)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+
+    def test_a_head_without_progress_alerts_once_and_recovers(self):
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        self.tick()
+        for _ in range(3 * 3600 // 780 + 1):
+            self.checkpoint()
+            self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+        self.assertTrue(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+        self.tick(3)
+        self.assertEqual(len(self.escalated("head-no-progress")), 1, "one alert per period")
+        task = self.controller.claim_task("w", "admin-worker")
+        self.github.ci_policy = lambda *_: ("pass", [])
+        agent = self.agent(
+            script=lambda _task: {f"{PROJECT}#101": Resolution({"Bad.lean": "ok\n"}, explanation="Fixed.")}
+        )
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task)).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-progress-resumed")), 1)
+        self.assertFalse(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
 
 
 class WithdrawnAtAdoption(QueueFixture):

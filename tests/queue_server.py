@@ -74,8 +74,10 @@ class FakeController(FakeSource):
     def set_priority(self, repo, pr, priority):
         self.calls.append(("set_priority", repo, pr, priority))
 
-    def claim_task(self, worker_identity, github_login):
-        self.calls.append(("claim_task", worker_identity, github_login))
+    def claim_task(self, worker_identity, github_login, worker_revision=None):
+        self.calls.append(
+            ("claim_task", worker_identity, github_login, *([worker_revision] if worker_revision else []))
+        )
         if self.fail_with:
             raise self.fail_with
         return {"task": "repair-2650", "claim_token": "t1"} if worker_identity != "idle" else None
@@ -425,6 +427,16 @@ class ServerTest(unittest.TestCase):
 
     def bearer(self, token):
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+    def test_a_claim_passes_the_worker_revision_for_stall_detection(self):
+        revision = "0123456789abcdef0123456789abcdef01234567"
+        body = {"worker": "w1", "revision": revision}
+        self.assertEqual(self.request("POST", "/tasks/claim", body, self.bearer("ghp_worker"))[0], 200)
+        self.assertEqual(self.controller.calls[-1], ("claim_task", "w1", "worker-login", revision))
+        for bad in ("unknown", "x" * 40, 7, None):
+            body = {"worker": "w1", "revision": bad}
+            self.assertEqual(self.request("POST", "/tasks/claim", body, self.bearer("ghp_worker"))[0], 200)
+            self.assertEqual(self.controller.calls[-1], ("claim_task", "w1", "worker-login"))
 
     def test_worker_endpoints_need_a_github_token(self):
         self.assertEqual(self.request("POST", "/tasks/claim", {"worker": "w1"})[0], 401)

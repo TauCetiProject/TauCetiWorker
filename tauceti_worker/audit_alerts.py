@@ -20,7 +20,9 @@ from .constants import TAUCETI
 from .paths import ensure_ssl_cert_file
 
 
-def request(config: dict, method: str, params: dict) -> dict:
+def request(config: dict, method: str, params: dict, *, require_recipient: bool = True) -> dict:
+    """One Zulip messages API call as the configured bot. `require_recipient` False is for a caller
+    that posts to a stream topic, which names no user (the queue's progress alerts)."""
     site = config["site"].rstrip("/")
     url = urllib.parse.urlsplit(site)
     if (
@@ -33,7 +35,7 @@ def request(config: dict, method: str, params: dict) -> dict:
         or url.fragment
     ):
         raise ValueError("Zulip site must be an HTTPS origin")
-    if type(config["recipient_id"]) is not int or config["recipient_id"] <= 0:
+    if require_recipient and (type(config.get("recipient_id")) is not int or config["recipient_id"] <= 0):
         raise ValueError("Zulip recipient must be a positive user ID")
     encoded = urllib.parse.urlencode(params).encode()
     endpoint = site + "/api/v1/messages"
