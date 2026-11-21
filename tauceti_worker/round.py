@@ -285,6 +285,7 @@ class Claims:
         self.lost = threading.Event()
         self._stopped = threading.Event()
         self.collisions = 0
+        self.lease_started: float | None = None
 
     def begin_branch_work(self, pr: int, head: str, refname: str, owner: str, repo: str) -> bool:
         """Take the branch claim and set the push-arbiter env. Returns False if claimed elsewhere
@@ -297,6 +298,7 @@ class Claims:
         key = f"branch/{pr}"
         claim_repo = claims_repo()
         claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
+        self.lease_started = time.time()  # claim.sh dates the lease's expiry from no earlier than this
         rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
         if rc == 1:
             self.collisions += 1
@@ -338,6 +340,7 @@ class Claims:
         key = f"author/{area}/{slug}"
         claim_repo = claims_repo()
         claim_env = {**os.environ, "CLAIM_REPO": claim_repo}
+        self.lease_started = time.time()  # claim.sh dates the lease's expiry from no earlier than this
         rc = subprocess.run([CLAIM_SH, "acquire", key, str(CLAIM_TTL_S)], capture_output=True, env=claim_env).returncode
         if rc == 0:
             self.held = (key, claim_repo)
@@ -355,6 +358,7 @@ class Claims:
                 "CLAIM_REPO": claim_repo,
                 "TAUCETI_CLAIM_SH": CLAIM_SH,
                 "CLAIM_TTL": str(CLAIM_TTL_S),
+                "CLAIM_LEASE_STARTED": repr(self.lease_started or time.time()),
             }
         )
         self._hb = subprocess.Popen(cmd, pass_fds=[rfd], env=env)
@@ -366,7 +370,8 @@ class Claims:
         self._stopped = stopped = threading.Event()
 
         def watch(hb=self._hb):
-            if hb.wait(None) == HEARTBEAT_LOST and not stopped.is_set():
+            # Any other exit (a crash, a signal) also leaves the lease unrenewed until it expires.
+            if hb.wait(None) != 0 and not stopped.is_set():
                 branch = key.startswith("branch/")
                 log(
                     f"claim {key}: lease lost; "
@@ -408,6 +413,10 @@ HEARTBEAT_LOST = 3
 # about who holds the lease.
 RENEW_LOST = 1
 RENEW_ERROR_RETRY_S = 30
+RENEW_TIMEOUT_S = 60
+# Give up this long before the last renewed lease expires: the slack covers a renewal's own
+# duration and peers' clocks.
+RENEW_EXPIRY_MARGIN_S = RENEW_TIMEOUT_S + 30
 
 
 def cmd_heartbeat(args) -> int:
@@ -415,17 +424,24 @@ def cmd_heartbeat(args) -> int:
     lease is lost. Never runs the round's cleanup (default signal disposition, no RoundContext).
 
     Only a renewal that reports the lease taken or gone loses it at once. A renewal that errors (the
-    forge or its Git transport briefly unavailable) is retried sooner, because the lease it renewed
-    last is still ours until it expires; the claim is given up only when the next attempt could
-    come after that expiry, where a peer may take it over."""
+    forge or its Git transport briefly unavailable, or a renewal that times out) is retried sooner,
+    because the lease renewed last is still ours until it expires. The heartbeat gives up while a
+    margin of that lease remains, so no renewal attempt can outlast it. Times are wall-clock, the
+    clock claim.sh dates `expires_at` by; a renewal's expiry is dated from no earlier than when it
+    was started."""
     import select
 
     key = args.key
     ppipe = args.ppipe
     ttl = int(os.environ.get("CLAIM_TTL") or CLAIM_TTL_S)
-    renewed = time.monotonic()  # the caller starts the heartbeat right after acquiring
+    try:
+        renewed = float(os.environ["CLAIM_LEASE_STARTED"])
+    except (KeyError, ValueError):
+        renewed = time.time()
     interval = CLAIM_HEARTBEAT_S
     while True:
+        if time.time() + interval + RENEW_EXPIRY_MARGIN_S >= renewed + ttl:
+            interval = max(0, renewed + ttl - RENEW_EXPIRY_MARGIN_S - time.time())
         if ppipe is not None:
             r, _, _ = select.select([ppipe], [], [], interval)
             if r:  # readable ⇒ EOF (we never write to the pipe) ⇒ parent gone
@@ -436,16 +452,21 @@ def cmd_heartbeat(args) -> int:
                     return 0
         else:
             time.sleep(interval)
-        attempted = time.monotonic()
-        rc = subprocess.run([CLAIM_SH, "renew", key], capture_output=True).returncode
+        attempted = time.time()
+        if attempted + RENEW_EXPIRY_MARGIN_S >= renewed + ttl:
+            return HEARTBEAT_LOST  # no renewal can finish inside the lease that is still ours
+        try:
+            rc = subprocess.run([CLAIM_SH, "renew", key], capture_output=True, timeout=RENEW_TIMEOUT_S).returncode
+        except subprocess.TimeoutExpired:
+            rc = None
+        except OSError:
+            rc = None
         if rc == 0:
             renewed, interval = attempted, CLAIM_HEARTBEAT_S
             continue
         if rc == RENEW_LOST:
             return HEARTBEAT_LOST  # stop renewing so it can expire, and tell the round
         interval = min(CLAIM_HEARTBEAT_S, RENEW_ERROR_RETRY_S)
-        if time.monotonic() + interval >= renewed + ttl:
-            return HEARTBEAT_LOST
         log(f"claim {key}: renewal unavailable (rc={rc}); retrying in {interval}s")
 
 

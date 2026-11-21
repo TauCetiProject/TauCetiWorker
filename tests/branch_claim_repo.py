@@ -283,36 +283,44 @@ def safe_push_scopes_claim_repo():
         assert claim_log.read_text().splitlines() == [f"{CLAIMS}|holds"]
 
 
-def run_heartbeat(renewals, ttl=1500):
-    """Drive cmd_heartbeat with a fake clock: each sleep advances it, each renew returns the next code.
-    Returns (exit code, renew attempt times)."""
-    clock = [0.0]
+def run_heartbeat(renewals, ttl=1500, durations=None, started=None):
+    """Drive cmd_heartbeat with a fake wall clock: each sleep advances it, each renewal returns the
+    next code after taking its duration. Returns (exit code, renewal start times)."""
+    clock = [1000.0]
     attempts = []
     codes = iter(renewals)
-    real = (round_mod.subprocess.run, round_mod.time.sleep, round_mod.time.monotonic, round_mod.log)
+    spans = iter(durations or [])
+    real = (round_mod.subprocess.run, round_mod.time.sleep, round_mod.time.time, round_mod.log)
 
-    def fake_run(cmd, *, capture_output=False, **_kwargs):
-        assert cmd[1:] == ["renew", "branch/143"]
-        attempts.append(clock[0])
-        return SimpleNamespace(returncode=next(codes))
+    def fake_run(cmd, *, capture_output=False, timeout=None, **_kwargs):
+        assert cmd[1:] == ["renew", "branch/143"] and timeout == round_mod.RENEW_TIMEOUT_S
+        attempts.append(clock[0] - 1000)
+        code = next(codes)
+        clock[0] += next(spans, 0)
+        if code == "timeout":
+            raise subprocess.TimeoutExpired(cmd, timeout)
+        return SimpleNamespace(returncode=code)
 
     def fake_sleep(seconds):
+        assert seconds >= 0
         clock[0] += seconds
 
     round_mod.subprocess.run = fake_run
     round_mod.time.sleep = fake_sleep
-    round_mod.time.monotonic = lambda: clock[0]
+    round_mod.time.time = lambda: clock[0]
     round_mod.log = lambda _message: None
-    saved = os.environ.get("CLAIM_TTL")
+    saved = {k: os.environ.get(k) for k in ("CLAIM_TTL", "CLAIM_LEASE_STARTED")}
     os.environ["CLAIM_TTL"] = str(ttl)
+    os.environ["CLAIM_LEASE_STARTED"] = repr(1000.0 if started is None else 1000.0 + started)
     try:
         rc = round_mod.cmd_heartbeat(SimpleNamespace(key="branch/143", ppipe=None))
     finally:
-        round_mod.subprocess.run, round_mod.time.sleep, round_mod.time.monotonic, round_mod.log = real
-        if saved is None:
-            os.environ.pop("CLAIM_TTL", None)
-        else:
-            os.environ["CLAIM_TTL"] = saved
+        round_mod.subprocess.run, round_mod.time.sleep, round_mod.time.time, round_mod.log = real
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     return rc, attempts
 
 
@@ -324,17 +332,42 @@ def heartbeat_lost_lease_cancels_at_once():
 
 def heartbeat_retries_a_renewal_error_while_the_lease_lasts():
     # Two failed renewals (a forge outage) followed by a success keep the lease and the round.
-    rc, attempts = run_heartbeat([2, 2, 0, 1])
+    rc, attempts = run_heartbeat([2, "timeout", 0, 1])
     assert rc == round_mod.HEARTBEAT_LOST
     assert attempts == [300, 330, 360, 660], attempts
 
 
 def heartbeat_gives_up_before_an_unrenewed_lease_can_expire():
-    # The last good renewal was at 0; the lease expires at 1500 and no attempt may land after it.
-    rc, attempts = run_heartbeat([2] * 100)
+    # The last good renewal began at 0, so the lease ends by 1500; no attempt may run past it,
+    # however long each one takes.
+    rc, attempts = run_heartbeat([2] * 100, durations=[round_mod.RENEW_TIMEOUT_S] * 100)
     assert rc == round_mod.HEARTBEAT_LOST
-    assert attempts[0] == 300 and attempts[-1] < 1500, attempts
-    assert attempts[-1] + round_mod.RENEW_ERROR_RETRY_S >= 1500, attempts
+    assert attempts[0] == 300, attempts
+    assert attempts[-1] + round_mod.RENEW_TIMEOUT_S < 1500, attempts
+
+
+def heartbeat_dates_the_lease_from_its_acquisition():
+    # An acquisition that started 400s before the heartbeat leaves only that much less lease.
+    rc, attempts = run_heartbeat([2] * 100, started=-400)
+    assert rc == round_mod.HEARTBEAT_LOST
+    assert attempts and attempts[-1] + round_mod.RENEW_TIMEOUT_S < 1100, attempts
+
+
+def source_claim_setup_failure_is_unavailable_not_lost():
+    from tauceti_tools.forge import ForgeError
+
+    from tauceti_worker import source_claims
+
+    real = source_claims._main
+
+    def failing():
+        raise ForgeError("Forgejo GET returned HTTP 502", status=502)
+
+    source_claims._main = failing
+    try:
+        assert source_claims.main() == 2
+    finally:
+        source_claims._main = real
 
 
 fails = sum(
@@ -358,6 +391,8 @@ fails = sum(
             "a heartbeat gives up before an unrenewed lease can expire",
             heartbeat_gives_up_before_an_unrenewed_lease_can_expire,
         ),
+        ("a heartbeat dates the lease from its acquisition", heartbeat_dates_the_lease_from_its_acquisition),
+        ("a claim-source setup failure is unavailable, not lost", source_claim_setup_failure_is_unavailable_not_lost),
     )
 )
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
