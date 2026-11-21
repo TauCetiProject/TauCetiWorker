@@ -304,6 +304,7 @@ def run_heartbeat(renewals, ttl=1500, durations=None, started=None):
         assert seconds >= 0
         clock[0] += seconds
 
+    real_sigterm = round_mod.signal.getsignal(round_mod.signal.SIGTERM)
     round_mod._renew = fake_renew
     round_mod.time.sleep = fake_sleep
     round_mod.time.time = lambda: clock[0]
@@ -315,6 +316,7 @@ def run_heartbeat(renewals, ttl=1500, durations=None, started=None):
         rc = round_mod.cmd_heartbeat(SimpleNamespace(key="branch/143", ppipe=None))
     finally:
         round_mod._renew, round_mod.time.sleep, round_mod.time.time, round_mod.log = real
+        round_mod.signal.signal(round_mod.signal.SIGTERM, real_sigterm)
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -375,6 +377,40 @@ def renewal_timeout_kills_its_process_group():
             raise AssertionError("the renewal's child outlived its timeout")
 
 
+def terminated_heartbeat_kills_its_renewal():
+    with tempfile.TemporaryDirectory() as tmp:
+        marker = Path(tmp) / "child.pid"
+        script = Path(tmp) / "claim.sh"
+        script.write_text(f"#!/bin/sh\nsleep 30 &\necho $! > {marker}\nwait\n")
+        script.chmod(0o755)
+        code = (
+            "import sys, types; sys.path.insert(0, sys.argv[1]); from tauceti_worker import round as r; "
+            "r.CLAIM_SH = sys.argv[2]; r.CLAIM_HEARTBEAT_S = 0; "
+            "r.cmd_heartbeat(types.SimpleNamespace(key='branch/143', ppipe=None))"
+        )
+        hb = subprocess.Popen([sys.executable, "-c", code, str(REPO), str(script)])
+        try:
+            for _ in range(100):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                time.sleep(0.1)
+            else:
+                raise AssertionError("the renewal never started")
+            hb.terminate()
+            assert hb.wait(10) == 0
+        finally:
+            hb.kill()
+        child = int(marker.read_text())
+        for _ in range(50):
+            try:
+                os.kill(child, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            raise AssertionError("the renewal's child outlived the heartbeat")
+
+
 def source_claim_setup_failure_is_unavailable_not_lost():
     from tauceti_tools.forge import ForgeError
 
@@ -416,6 +452,7 @@ fails = sum(
         ("a heartbeat dates the lease from its acquisition", heartbeat_dates_the_lease_from_its_acquisition),
         ("a claim-source setup failure is unavailable, not lost", source_claim_setup_failure_is_unavailable_not_lost),
         ("a renewal that times out is killed with its children", renewal_timeout_kills_its_process_group),
+        ("a terminated heartbeat kills its renewal", terminated_heartbeat_kills_its_renewal),
     )
 )
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
