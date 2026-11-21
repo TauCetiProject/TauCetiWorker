@@ -47,6 +47,12 @@ AUDIT_TIMEOUT_SECONDS = 3000  # sandbox-build.sh's liveness budget for the audit
 # TauCeti module names). Half that keeps a margin for longer names and toolchain changes.
 CHANGED_LINT_MODULE_LIMIT = 1500
 DRIVER_FAILURE = "LINT-ENV: FAIL \u2014 driver failure"  # lint-env.sh's fail() line for its own drivers
+# Driver processes for the whole-library lint (lint-env.sh's LINT_SHARDS; scoped lints ignore it).
+# Each imports the whole library and lints every second declaration. On chungus2 two shards took
+# the linters phase from 514 s to 234 s, and four to 177 s. Up to three repair workers share
+# tauchonki2's 96 cores with a staging guest, so two shards of 16 threads keep three concurrent
+# full lints within the host.
+LINT_SHARDS = "2"
 MODULE_PATH = re.compile(r"^TauCeti(/[A-Za-z_][A-Za-z0-9_']*)+\.lean$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -411,6 +417,7 @@ def check(
         **project,
         "LINT_DRIVER_EXE": drivers / "lint-env-driver",
         "LINT_ONLY_MODULES": "",
+        "LINT_SHARDS": LINT_SHARDS,
         "TAUCETI_LINT_PROFILE": env.get("TAUCETI_LINT_PROFILE", "0"),
     }
     # The first lint covers the changed modules (staging's PR preflight scope). It misses findings

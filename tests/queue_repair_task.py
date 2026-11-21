@@ -633,6 +633,7 @@ TOOLS_SCRIPTS = {
         'if [ -n "$LINT_ONLY_MODULES" ]; then cp "$LINT_ONLY_MODULES" "$STUB_DIR/lint-scope.txt"; '
         'else find TauCeti -name "*.lean" | sort | sed "s|/|.|g;s|.lean$||" > "$STUB_DIR/lint-scope.txt"; fi\n'
         'echo "${LINT_CHANGED_ONLY:-0}" $(cat "$STUB_DIR/lint-scope.txt") >> "$STUB_DIR/lint-runs.log"\n'
+        'echo "${LINT_SHARDS:-unset}" >> "$STUB_DIR/lint-shards.log"\n'
         'test -x "$LINT_DRIVER_EXE" || { echo "LINT-ENV: FAIL no driver"; exit 1; }\n'
         'if [ "${LINT_CHANGED_ONLY:-0}" = 1 ] && [ -f "$STUB_DIR/lint-driver-failure" ]; then '
         'cat "$STUB_DIR/lint-driver-failure"; exit 1; fi\n'
@@ -6271,6 +6272,7 @@ class WorkerAudits(Fixture):
                 "0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two",
             ],
         )
+        self.assertEqual((self.stub_dir / "lint-shards.log").read_text().split(), ["2", "2", "2"])
 
     def test_a_changed_only_driver_failure_falls_back_to_the_whole_library_lint(self):
         # Batch 465's tip: the changed-only docstring-scan driver could not compile its module list.
