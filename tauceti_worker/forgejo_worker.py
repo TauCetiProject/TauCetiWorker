@@ -107,11 +107,20 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return self._read("live_pull", [pr], lambda: self.api.pull(self.repository, pr), fresh=True, number=pr)
 
     def pr_list(self, fields, *, author=None, state="open"):
-        rows = self._read(
-            "pr_list",
-            [fields, author, state],
-            lambda: self.reader.pulls(self.repository, fields, state=state, author=author),
-        )
+        def fetch():
+            if list(fields) != ["number"] or author is not None or state != "open":
+                return self.reader.pulls(self.repository, fields, state=state, author=author)
+            # A roadmap round's baseline needs only numbers: the issue index lists them without
+            # the per-PR git work (head, base, diff stat) of a pull listing.
+            numbers = []
+            for batch in self.api.pages(f"repos/{self.repository.name}/issues?type=pulls&state=open"):
+                for row in batch:
+                    if not isinstance(row, dict) or type(row.get("number")) is not int or not row.get("pull_request"):
+                        raise Incomplete("issue index did not identify a PR")
+                    numbers.append(row["number"])
+            return [{"number": number} for number in dict.fromkeys(numbers)]
+
+        rows = self._read("pr_list", [fields, author, state], fetch)
         if rows is None:
             raise Incomplete("Forgejo PR listing is unavailable")
         return rows

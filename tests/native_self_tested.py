@@ -61,6 +61,26 @@ class NativeSelfTested(unittest.TestCase):
         self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
         self.assertEqual(self.source.reader.pulls.call_count, 5)
 
+    def test_open_pr_numbers_come_from_the_issue_index_without_a_pull_listing(self):
+        from tauceti_worker.github_transport import read_context
+
+        pull = {"merged": False}
+        self.source.api.pages = Mock(
+            return_value=iter([[dict(number=3, pull_request=pull), dict(number=1, pull_request=pull)]])
+        )
+        self.source.reader.pulls = Mock(return_value=[dict(number=3, title="Proof")])
+        with read_context(fresh=True, direct=True, retry=False):
+            self.assertEqual(self.source.pr_list(["number"]), [dict(number=3), dict(number=1)])
+            self.source.api.pages.assert_called_once_with(
+                "repos/" + self.source.repository.name + "/issues?type=pulls&state=open"
+            )
+            self.source.reader.pulls.assert_not_called()
+            # Other fields still come from the pull listing.
+            self.assertEqual(self.source.pr_list(["number", "title"]), [dict(number=3, title="Proof")])
+            self.source.api.pages.return_value = iter([[dict(number=2)]])
+            with self.assertRaises(ForgeError):
+                self.source.pr_list(["number"])
+
     def inventory_row(self, number, head="a" * 40):
         return {field: None for field in self.source.inventory_fields} | dict(number=number, headRefOid=head)
 
