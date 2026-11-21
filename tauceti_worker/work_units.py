@@ -1009,7 +1009,7 @@ def _published_branch_pr(w: Worker, c: Candidate, pre: dict) -> bool:
     opened is one narrow head lookup away. That answer does not depend on listing every open PR,
     which on a large source is many pages long and fails whenever any page does. False means only
     that this lookup found nothing; the caller still compares the open PR listings."""
-    progress = c.progress or pre
+    progress = getattr(c, "progress", None) or pre
     owner = str(progress.get("published_owner") or "")
     if not owner:
         return False
@@ -1041,7 +1041,7 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
     Missing evidence stays unknown; it never becomes an admission dependency."""
     if pre is None:
         # A roadmap round's own published branch still identifies its PR without a baseline.
-        return True if not c.pr and c.progress and _published_branch_pr(w, c, {}) else None
+        return True if not c.pr and getattr(c, "progress", None) and _published_branch_pr(w, c, {}) else None
     if c.pr:
         if pre.get("published"):
             return True
