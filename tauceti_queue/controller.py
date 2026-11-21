@@ -5852,23 +5852,26 @@ class Controller:
             if result not in ("cancelled", "already-completed"):
                 self.log.warning("cancel intent %s: cancelling CI run %s %s", attempt_id, run_id, result)
 
-    # Claimed successor work across the emergency batch becoming the head.
+    # Claimed successor work across the emergency or lane batch becoming the head, or a landing.
 
-    def _preserve_successor_tasks(self, now: float) -> None:
+    def _preserve_successor_tasks(self, now: float, tips: set[str] | None = None) -> None:
         """Record `{task: onto}` for every claimed `pre_rebase` task and claimed pre-rebased `prepare`
-        task of an ordinary open batch, as the emergency batch becomes the head: their intended parent
-        (the previous head's tip) is no longer `_pre_rebase_target`, but their owner may still submit
-        onto it (`_preserved_onto`); the next `_pre_rebase` then carries the result onto the new head."""
+        task of an ordinary open batch (with `tips`, those whose `onto` is one of them): as the
+        emergency or lane batch becomes the head, or a head lands while `main` is already past its tip,
+        their intended parent is no longer `_pre_rebase_target`, but their owner may still submit onto
+        it (`_preserved_onto`); the next `_pre_rebase`, or the seal (`_seal_from_pre_rebase`), then
+        carries the result onto the new target by replay."""
         preserved = {}
         for batch in self._staging_batches():
             for claim in self._active_claims(batch["id"]):
                 task = self.store.row("tasks", {"id": claim["task_id"]}) if claim["task_id"] is not None else None
-                if task is not None and task["state"] == TASK_OPEN:
+                if task is not None and task["state"] == TASK_OPEN and (tips is None or task["onto"] in tips):
                     if task["kind"] == TASK_PRE_REBASE or self._pre_rebased_prepare(task):
                         preserved[str(task["id"])] = task["onto"]
-        self._set_state("emergency_preserved", preserved)
         if preserved:
-            self.store.journal(now, "emergency-preserved", tasks=sorted(int(task_id) for task_id in preserved))
+            self._set_state("emergency_preserved", {**(self._state("emergency_preserved") or {}), **preserved})
+            kind = "emergency-preserved" if tips is None else "landing-preserved"
+            self.store.journal(now, kind, tasks=sorted(int(task_id) for task_id in preserved))
 
     def _preserved_onto(self, task: dict[str, Any]) -> str | None:
         """The parent a preserved task may still submit onto, while it is open and claimed."""
@@ -9121,6 +9124,9 @@ class Controller:
             # An emptied emergency member returns to its live displaced slot instead of being rejected.
             rejected = [member for member in rejected if not self._emergency_exit(batch, member, now)]
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_LANDED, landed_at=now, landed_how=how)
+            self._preserve_successor_tasks(
+                now, {row["tip"] for row in self.store.rows("batch_tips", {"batch_id": batch["id"]})} | {batch["tip"]}
+            )
             if batch["urgent"] == URGENT_EMERGENCY:
                 self.store.journal(
                     now, "emergency-landed", batch["id"], tip=batch["tip"], members=[m["number"] for m in members]
