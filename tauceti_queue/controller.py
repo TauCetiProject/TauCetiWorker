@@ -5957,7 +5957,7 @@ class Controller:
         if batch is None or not self._members(batch["id"]):
             return
         blocked = self._seal_blocked(batch)
-        if (blocked is None or blocked[1]) and self._seal_clean_prefix(batch, now):
+        if blocked is None and self._seal_clean_prefix(batch, now):
             self._seal_successor(now)
             return
         if blocked is not None:
@@ -5985,15 +5985,17 @@ class Controller:
     def _seal_clean_prefix(self, batch: dict[str, Any], now: float) -> bool:
         """Seal the members of `batch` that replay cleanly onto `main`, when its pre-rebase is a conflict.
 
-        The slot is free, but resolving the conflict (a `pre_rebase` task, claimed or not) takes hours:
-        rather than wait for it, or seal everything and hand the head a `rebase_conflict` task, the
+        The slot is free and no worker owns the conflict (`_seal_blocked` waits for a claimed
+        `pre_rebase` task: it is current or preserved, so it may still submit, and
+        `_seal_from_pre_rebase` reuses its result when the carry and extension apply). Rather than wait
+        for a worker to start, or seal everything and hand the head a `rebase_conflict` task, the
         members before the conflict move to a new batch that becomes the head. The conflicting member
         and those after it stay in `batch`, now based on the last moved member's commit, so it keeps its
         place as the next batch and its members their approvals and age; a return to waiting would
-        instead cancel a member that conflicts with `main`. The batch's `pre_rebase` tasks are
-        superseded (resolution `clean-prefix`) and their claims released; the next pre-rebase onto the
-        new head creates a fresh task. False (nothing changed) for the emergency or control-file lane
-        batch, a claim that is not a `pre_rebase` task's, a conflict at the first member, or a replay error.
+        instead cancel a member that conflicts with `main`. The batch's unclaimed `pre_rebase` task is
+        superseded (resolution `clean-prefix`); the next pre-rebase onto the new head creates a fresh
+        task. False (nothing changed) for the emergency or control-file lane batch, a conflict at the
+        first member, or a replay error.
         """
         if (
             batch["pre_rebase_state"] != PRE_REBASE_CONFLICT
@@ -6002,10 +6004,6 @@ class Controller:
             or self._canonical is None
         ):
             return False
-        for claim in self._active_claims(batch["id"]):
-            task = self.store.row("tasks", {"id": claim["task_id"]}) if claim["task_id"] is not None else None
-            if task is None or task["kind"] != TASK_PRE_REBASE:
-                return False
         chain_id = f"clean-prefix-{batch['id']}-{secrets.token_hex(4)}"
         try:
             result = chain.replay(self.clone, batch["base"], batch["tip"], self._canonical, chain_id=chain_id)

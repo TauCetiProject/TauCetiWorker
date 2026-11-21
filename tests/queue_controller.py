@@ -1819,15 +1819,44 @@ class PreRebase(ControllerCase):
         self.assertEqual((task["onto"], task["base"]), (head["tip"], left["base"]))
         return head
 
-    def test_a_claimed_pre_rebase_conflict_seals_the_clean_prefix_when_the_head_lands(self):
+    def test_a_claimed_pre_rebase_conflict_is_kept_when_the_head_lands(self):
+        """The claimed task was made on the tip that landed: the seal waits for it rather than splitting
+        off the clean prefix, and the whole batch becomes the head from its resolution."""
+        batch = self.batch_conflicting_in_the_middle()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution({"Shared.lean": resolved}, explanation="Kept both edits.")},
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        self.assertEqual(self.controller.store.journal_entries("clean-prefix-sealed"), [])
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual((head["id"], head["base"]), (batch["id"], self.repo.main_sha()))
+        self.assertEqual([m["number"] for m in self.controller.members(head["id"])], [103, 102, 104])
+        self.assertEqual(self.repo.file_at(head["tip"], "Shared.lean"), resolved)
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+
+    def test_a_released_pre_rebase_conflict_seals_the_clean_prefix(self):
         batch = self.batch_conflicting_in_the_middle()
         task = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(task.kind, "pre_rebase")
         self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the claim")
+        self.controller.release_task(task.task_id, task.claim_token, "worker-stopped")
+        self.controller.tick()
         self.assert_clean_prefix_sealed(batch)
         row = self.controller.store.row("tasks", {"id": task.task_id})
         self.assertEqual((row["state"], row["resolution"]), ("superseded", "clean-prefix"))
-        self.assertFalse(self.controller.submit_task(task.task_id, task.claim_token, task.tip).accepted)
 
     def test_an_unclaimed_pre_rebase_conflict_seals_the_clean_prefix_too(self):
         batch = self.batch_conflicting_in_the_middle()
