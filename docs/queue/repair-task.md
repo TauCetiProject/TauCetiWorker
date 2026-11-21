@@ -500,7 +500,12 @@ has a time budget holds because the service re-exposes the task.
    declarations rather than the whole library's 20 minutes. When that round finds nothing in any
    check, the whole-library lint runs before the checks pass, so `passed` always includes it, and
    `lint.scope` is `changed` only in a
-   failed round (`changed_lint` records the changed-module run of a passing one). A finding outside
+   failed round (`changed_lint` records the changed-module run of a passing one). The whole-library
+   lint takes the changed-only run's place in two cases, recorded as `changed_lint.skipped`: more than
+   `CHANGED_LINT_MODULE_LIMIT` (1,500) changed modules (`module_limit`), since `lint-env.sh` writes the
+   selected modules into one array literal that Lean's code generator rejects a little under 3,000
+   elements, and a changed-only run that ends in a `lint-env.sh` driver failure (`LINT-ENV: FAIL` naming `driver failure`) with no finding
+   naming a module (`driver_failure`), whatever the other checks found. A finding outside
    the changed modules, such as a new simp lemma breaking an unchanged declaration's simp normal
    form, therefore surfaces in that final lint and costs another round. The sources are the TauCetiTools pin
    the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into

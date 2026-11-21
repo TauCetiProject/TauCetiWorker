@@ -40,6 +40,13 @@ URL_VARIABLE = "TAUCETI_QUEUE_TOOLS_URL"  # a ``{repo}`` template; tests point i
 DEFAULT_URL = "https://github.com/{repo}.git"
 ENABLE_VARIABLE = "TAUCETI_QUEUE_WORKER_AUDITS"
 AUDIT_TIMEOUT_SECONDS = 3000  # sandbox-build.sh's liveness budget for the audit driver
+# The most changed modules the first environment lint covers before the whole-library lint takes
+# its place. In changed-only mode ``lint-env.sh`` writes every selected module into one
+# ``#[`A, `B, ...]`` array literal in its docstring-scan driver, and Lean's code generator stops
+# with "maximum recursion depth reached" a little under 3,000 elements (v4.37.0-rc1, real
+# TauCeti module names). Half that keeps a margin for longer names and toolchain changes.
+CHANGED_LINT_MODULE_LIMIT = 1500
+DRIVER_FAILURE = "LINT-ENV: FAIL \u2014 driver failure"  # lint-env.sh's fail() line for its own drivers
 MODULE_PATH = re.compile(r"^TauCeti(/[A-Za-z_][A-Za-z0-9_']*)+\.lean$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -336,6 +343,14 @@ def findings_of(kind: str, name: str, run: dict) -> list[dict]:
     return found
 
 
+def driver_failure(run: dict, findings: list[dict]) -> bool:
+    """Whether an environment-lint run ended in ``lint-env.sh``'s driver failure with no finding that
+    names a module (such as the docstring-scan driver failing to compile its module list)."""
+    if run["rc"] == 0 or any(f.get("module") for f in findings):
+        return False
+    return any(DRIVER_FAILURE in line for line in run["output"].splitlines())
+
+
 def check(
     worktree: Path,
     env: dict,
@@ -405,6 +420,10 @@ def check(
         modules = changed_modules(worktree, base)
     except (Unavailable, OSError, subprocess.SubprocessError):
         modules = None
+    if modules is not None and len(modules) > CHANGED_LINT_MODULE_LIMIT:
+        # Too many for the changed-only driver: the whole-library lint (CI's own scope) covers them.
+        record["changed_lint"] = {"skipped": "module_limit", "modules": len(modules)}
+        modules = None
     if modules is not None:
         scope_file = work / "lint-modules.txt"
         scope_file.write_text("".join(m + "\n" for m in modules))
@@ -455,10 +474,15 @@ def check(
     scope = "full"
     if modules is not None:
         scope = "changed"
-        if not any(found.values()):
+        # A changed-only run that failed in its own driver, naming no module, gives the repair
+        # nothing to fix; the whole-library lint replaces it whatever the other checks found.
+        driver_failed = driver_failure(runs["lint"], found["lint"])
+        if driver_failed or not any(found.values()):
             record["changed_lint"] = {k: v for k, v in runs["lint"].items() if k != "output"} | {
                 "modules": len(modules)
             }
+            if driver_failed:
+                record["changed_lint"]["skipped"] = "driver_failure"
             runs["lint"] = _sandboxed(
                 ["bash", scripts / "lint-env.sh"],
                 worktree,
