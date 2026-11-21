@@ -13,7 +13,7 @@ from tauceti_tools.forge import Incomplete, RepositoryRef
 
 from .constants import SURVEY_DETAIL_READS
 from .source_identity import SourceActor, maintains_author
-from .survey import PRInfo, Survey, bucket_status_labels, roadmap_open_count
+from .survey import PRInfo, Survey, bucket_status_labels, own_branch, roadmap_open_count
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -182,7 +182,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
     result.source_actor, result.me_login = actor, actor.login if actor else ""
     if count_all_roadmaps:
         result._automatic_open_count = roadmap_open_count(
-            [p for p in prs if not p.is_draft and result.authored(p)], "auto", skip
+            [p for p in prs if not p.is_draft and result.authored(p) and own_branch(p)], "auto", skip
         )
     if deep:
         prs = [
@@ -201,7 +201,7 @@ def inventory_survey(cfg, source, *, roadmap, skip, deep, stages, numbers, count
         )
     ]
     result.n_open_nondraft = len(nondraft)
-    result._mine_open_prs = [p for p in nondraft if result.authored(p)]
+    result._mine_open_prs = [p for p in nondraft if result.authored(p) and own_branch(p)]
     result.rescope_roadmap()
     result.status_labels, result.n_status_unlabeled = bucket_status_labels(
         nondraft, result.me_login, owns=result.authored

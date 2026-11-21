@@ -155,6 +155,7 @@ RUN_STDLIB=(
   observability_failures.py
   open_pr_pages.py
   overlaps.py
+  own_branches.py
   pace_curve.py
   pace_per_provider.py
   pr_targeting.py
