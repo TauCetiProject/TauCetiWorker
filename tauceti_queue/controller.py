@@ -2380,6 +2380,27 @@ class Controller:
                     for m in edited_no_repair
                 ]
                 return reject("no-repair-edited", violations)
+            if (
+                self.mixed is not None
+                and self.mixed.mode == "admit"
+                and self._candidate_coordinator(batch_id=batch["id"]) is not None
+                and not self.mixed.supports_candidate(task["onto"], tip_sha)
+            ):
+                # Source-candidate CI would pass this chain and promotion would then refuse it
+                # (`MixedCandidateCI.verify_promotion`), holding the head: refuse it here instead.
+                self._count("chain_validation_failures")
+                violations = [
+                    chain.Violation(
+                        "source-ci-scope",
+                        "the chain changes files outside the native path policy, which a batch with a "
+                        "Forgejo member cannot land: leave control files (`.github/`, the lakefile, "
+                        "scripts and other files outside the project's sources) as the members have them",
+                    )
+                ]
+                self.store.journal(
+                    now, "chain-invalid", batch["id"], task_id=task_id, violations=[v.to_dict() for v in violations]
+                )
+                return reject("invalid-chain", violations)
             knowledge = next(
                 (d for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"), {}
             )

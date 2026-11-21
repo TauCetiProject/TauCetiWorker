@@ -1143,6 +1143,37 @@ class MixedExecution(MixedFixture, unittest.TestCase):
         self.assertEqual(self.native_repo.main_sha(), tip)
         self.assertFalse(restarted.setting("forgejo_admission_enabled"))
 
+    def test_a_repair_outside_the_native_path_policy_is_rejected_at_submission(self):
+        from tauceti_queue.fakes import Resolution, ScriptedAgent
+
+        self.start_mixed()
+        self.native.admission_policy.prefix = "Math/"
+        self.native.admission_policy.allow_files = ("Github.lean", "Native.lean")
+        batch = self.controller._head()
+        task_id = self.controller._create_task(batch, "repair", batch["base"], [], self.clock())
+        self.github.admins.add("reviewer")
+        task = self.controller.claim_task("repair-worker", "reviewer", mixed_capable=True)
+        self.assertEqual(task.task_id, task_id)
+        github_pr = self.controller.repository + "#17"
+        for control in (".github/workflows/ci.yml", "lakefile.toml"):
+            agent = ScriptedAgent(
+                "repair-worker",
+                "reviewer",
+                self.repo,
+                self.root / f"repair-{control.replace('/', '-')}",
+                lambda task, control=control: {
+                    github_pr: Resolution({"Github.lean": "repaired\n", control: "edited\n"})
+                },
+            )
+            result = self.controller.submit_task(task_id, task.claim_token, agent.produce(task))
+            self.assertFalse(result.accepted, control)
+            self.assertEqual(result.reason, "invalid-chain")
+            self.assertEqual([v["code"] for v in result.violations], ["source-ci-scope"])
+        self.assertEqual(self.controller._head()["version"], batch["version"])
+        agent.script = lambda task: {github_pr: Resolution({"Github.lean": "repaired\n"})}
+        result = self.controller.submit_task(task_id, task.claim_token, agent.produce(task))
+        self.assertTrue(result.accepted, result)
+
     def test_historical_recovery_does_not_block_new_accepted_heads(self):
         frozen = self.start_mixed()
         self.execution.add(frozen, classification="passed")

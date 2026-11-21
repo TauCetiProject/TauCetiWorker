@@ -643,7 +643,8 @@ observation and cancellation after a receipt expires; it grants no verdict. A ma
 final result cannot erase ownership independently proved by a valid receipt. Completed
 runs need a freshly verified result for their current attempt. Legacy source statuses
 cannot make a source candidate pass. Promotion rechecks current membership, current
-passing evidence and fresh source approval before its source compare and set; an already
+passing evidence and the native path policy before its source compare and set, but not the
+original PRs, whose later pushes, closure or re-review belong to follow-up work; an already
 visible promotion is reconciled without another write.
 
 For an owned run that is in progress, the controller also reads GitHub's jobs listing for
