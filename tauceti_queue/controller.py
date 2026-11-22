@@ -4590,8 +4590,19 @@ class Controller:
                     "at": now,
                 },
             ][-8:]
-            # The input is one approved head, so the first refusal of it is the first entry here.
-            evidence.setdefault(MISSING_SOURCE_FIRST_REFUSED, now)
+            # The input is one approved head: its first refusal is the oldest recorded one (legacy
+            # rows keep their history), else this one.
+            evidence.setdefault(
+                MISSING_SOURCE_FIRST_REFUSED,
+                min(
+                    (
+                        e["at"]
+                        for e in evidence["merge_selection"]
+                        if e.get("kind") == "missing_source" and isinstance(e.get("at"), (int, float))
+                    ),
+                    default=now,
+                ),
+            )
             try:
                 evidence[MISSING_SOURCE_WATCH] = self._dependency_watch([(row, listed)])[0]
             except chain.ChainError:
