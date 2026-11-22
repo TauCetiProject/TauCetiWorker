@@ -51,7 +51,9 @@ DRIVER_FAILURE = "LINT-ENV: FAIL \u2014 driver failure"  # lint-env.sh's fail() 
 # Each imports the whole library and lints every second declaration. On chungus2 two shards took
 # the linters phase from 514 s to 234 s, and four to 177 s. Up to three repair workers share
 # tauchonki2's 96 cores with a staging guest, so two shards of 16 threads keep three concurrent
-# full lints within the host.
+# full lints within the host. Only inside the sandbox, though: lint-env.sh starts each shard in its
+# own process group, and without bwrap's --unshare-pid --die-with-parent nothing would collect the
+# shards when ``_sandboxed`` kills its own group on a timeout.
 LINT_SHARDS = "2"
 MODULE_PATH = re.compile(r"^TauCeti(/[A-Za-z_][A-Za-z0-9_']*)+\.lean$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -417,7 +419,7 @@ def check(
         **project,
         "LINT_DRIVER_EXE": drivers / "lint-env-driver",
         "LINT_ONLY_MODULES": "",
-        "LINT_SHARDS": LINT_SHARDS,
+        "LINT_SHARDS": "1" if repair_sandbox.disabled() else LINT_SHARDS,
         "TAUCETI_LINT_PROFILE": env.get("TAUCETI_LINT_PROFILE", "0"),
     }
     # The first lint covers the changed modules (staging's PR preflight scope). It misses findings

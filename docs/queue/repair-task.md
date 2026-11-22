@@ -936,7 +936,8 @@ roughly the time of the environment lint alone; the repair slice's live `memory.
 linters and report times; `TAUCETI_LINT_PROFILE=1` additionally profiles each linter separately.
 The whole-library lint runs as two driver shards (`LINT_SHARDS=2`, `repair_audit.LINT_SHARDS`), each
 linting every second declaration with the same verdicts; on chungus2 that took the linters phase
-from 514 s to 234 s for about 2 GB more PSS. These timing observations never authorize a pass.
+from 514 s to 234 s for about 2 GB more PSS. With `TAUCETI_QUEUE_SANDBOX=0` it stays one process,
+since nothing outside bwrap's PID namespace would collect the shards after a timeout. These timing observations never authorize a pass.
 
 The worker tests submission Git access before inference. A verified tip whose push/submission fails
 stays in the existing `delivery_pending` checkpoint and retained ref; polling renews its claim and
