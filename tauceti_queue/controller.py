@@ -7217,6 +7217,36 @@ class Controller:
             ),
         }
 
+    def _pre_rebase_unused(
+        self,
+        head: dict[str, Any],
+        canonical: str,
+        reason: str,
+        now: float,
+        conflict: chain.CommitRecord | None = None,
+    ) -> None:
+        """Journal why the head's usable pre-rebase was not used at its seal (`pre-rebase-unused`), so
+        the head-time replay of its own chain that follows is explained: `carry-conflict` (the
+        pre-rebase does not replay onto `main`), `extension-conflict` (members inserted after its task
+        do not replay onto it), `source-not-in-chain` or `members-mismatch`. Written once per head
+        version, `main` and reason: a later pass that declines again for the same reason adds nothing."""
+        detail: dict[str, Any] = {
+            "reason": reason,
+            "version": head["version"],
+            "onto": canonical,
+            "pre_rebase_onto": head["pre_rebase_onto"],
+            "pre_rebase_tip": head["pre_rebase_tip"],
+            "pre_rebase_source": head["pre_rebase_source"],
+            "tip": head["tip"],
+            "source_pr": conflict.source_pr if conflict else None,
+            "paths": list(conflict.conflict_paths) if conflict else [],
+        }
+        last = self.store.row("journal", {"batch_id": head["id"], "kind": "pre-rebase-unused"}, order="id DESC")
+        if last is not None and loads(last["detail"], {}) == detail:
+            return
+        self._count("pre_rebases_unused")
+        self.store.journal(now, "pre-rebase-unused", head["id"], **detail)
+
     def _seal_from_pre_rebase(self, head: dict[str, Any], canonical: str, now: float) -> bool:
         """Base a newly sealed head on `canonical` from its pre-rebase, without replaying it again.
 
@@ -7225,7 +7255,8 @@ class Controller:
         members inserted after the pre-rebase are replayed onto it first. The members take their
         commits from the pre-rebased chain, and those an agent edited in a `pre_rebase` task are
         recorded as edited with its explanation. False (nothing changed) when there is no such
-        pre-rebase, a carry or an extension conflicts, or the chain's members do not match.
+        pre-rebase, a carry or an extension conflicts, or the chain's members do not match. A usable
+        pre-rebase left unused is journaled (`pre-rebase-unused`, `_pre_rebase_unused`).
         """
         onto = head["pre_rebase_onto"]
         if head["pre_rebase_state"] not in PRE_REBASE_USABLE or not onto:
@@ -7233,6 +7264,7 @@ class Controller:
         tip = head["pre_rebase_tip"]
         source = head["pre_rebase_source"]
         if not tip or not source or not chain.is_ancestor(self.clone, source, head["tip"]):
+            self._pre_rebase_unused(head, canonical, "source-not-in-chain", now)
             return False
         if onto != canonical:
             # A batch landed after the pre-rebase was made (a lane or emergency head went ahead of
@@ -7249,6 +7281,7 @@ class Controller:
             finally:
                 chain.delete_chain_ref(self.clone, chain_id)
             if moved.status != chain.CLEAN:
+                self._pre_rebase_unused(head, canonical, "carry-conflict", now, moved.conflict)
                 return False
             tip = moved.tip
         landed_on_base: list[dict[str, str]] = []
@@ -7262,6 +7295,7 @@ class Controller:
             finally:
                 chain.delete_chain_ref(self.clone, chain_id)
             if extended.status != chain.CLEAN:
+                self._pre_rebase_unused(head, canonical, "extension-conflict", now, extended.conflict)
                 return False
             tip, landed_on_base = extended.tip, extended.landed_on_base
         try:
@@ -7271,6 +7305,7 @@ class Controller:
         by_pr = {commit.source_pr: commit for commit in commits}
         members = self._members(head["id"])
         if len(commits) != len(members) or set(by_pr) != {m["source_pr"] for m in members}:
+            self._pre_rebase_unused(head, canonical, "members-mismatch", now)
             return False
         edits = loads(head["pre_rebase_edits"], {})
         version = head["version"] + 1

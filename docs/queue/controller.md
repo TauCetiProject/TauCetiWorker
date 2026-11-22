@@ -308,7 +308,10 @@ rebuild of the head or a repair that empties a head member discards every pre-re
 lands and the canonical commit equals `pre_rebase_onto`, or the pre-rebase carries onto it by a clean
 replay (a preserved task that resolved onto an earlier tip of the landed head), the sealed head takes the pre-rebased chain
 directly (the `rebased` journal entry carries `pre_rebased`), recording the members edited in the
-task as edited; otherwise it is replayed as before. The stacked pair is never built by the
+task as edited; otherwise it is replayed as before, and a `pre-rebase-unused` journal entry says why
+the pre-rebase was left unused: `carry-conflict` (it does not replay onto `main`),
+`extension-conflict` (members inserted after its task do not replay onto it), `source-not-in-chain`
+or `members-mismatch`, with the conflicting member (`source_pr`) and `paths`. The stacked pair is never built by the
 controller and nothing about the pre-rebase is a verdict.
 
 Preparing the pre-rebased chain (item 16 of "Five improvements from the first production repair" in

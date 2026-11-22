@@ -1806,6 +1806,72 @@ class PreRebase(ControllerCase):
 
         self.assert_pre_rebase_kept_past_the_landed_tip(land)
 
+    def claimed_pre_rebase_adding_extra(self):
+        """The conflicting batch's pre-rebase, claimed, whose resolution of 102 also adds `Extra.lean`."""
+        self.conflicting_batch()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                f"{PROJECT}#102": Resolution(
+                    {"Shared.lean": resolved, "Extra.lean": "from the pre-rebase\n"}, explanation="Kept both edits."
+                )
+            },
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        return agent, task
+
+    def assert_pre_rebase_unused(self, batch, reason, source_pr):
+        """The head's own chain was replayed onto `main`, and the journal says why its pre-rebase was not used."""
+        head = self.controller._head()
+        self.assertEqual(head["id"], batch["id"])
+        self.assertEqual(
+            [t["kind"] for t in self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})],
+            ["rebase_conflict"],
+        )
+        [entry] = self.controller.store.journal_entries("pre-rebase-unused", batch["id"])
+        detail = entry["detail"]
+        self.assertEqual((detail["reason"], detail["source_pr"], detail["paths"]), (reason, source_pr, ["Extra.lean"]))
+        self.assertEqual(detail["onto"], self.repo.main_sha())
+        self.controller.tick()
+        self.assertEqual(len(self.controller.store.journal_entries("pre-rebase-unused")), 1, "journaled once")
+
+    def test_a_pre_rebase_whose_extension_conflicts_at_the_seal_is_journaled_as_unused(self):
+        """Batch 484: a member inserted while the pre-rebase was claimed replays onto the open batch's own
+        chain but not onto the adopted pre-rebase, so the seal replays the whole chain onto `main`."""
+        agent, task = self.claimed_pre_rebase_adding_extra()
+        batch = self.open_batch()
+        self.approve(103, {"Extra.lean": "from 103\n"})
+        self.controller.tick()
+        self.assertEqual([m["number"] for m in self.controller.members(batch["id"])], [102, 103])
+        self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        self.assert_pre_rebase_unused(batch, "extension-conflict", f"{PROJECT}#103")
+
+    def test_a_pre_rebase_whose_carry_conflicts_at_the_seal_is_journaled_as_unused(self):
+        """Batch 479: `main` moved past the tip the pre-rebase was made on, and it does not replay onto
+        `main`."""
+        agent, task = self.claimed_pre_rebase_adding_extra()
+        batch = self.open_batch()
+        self.github.complete_runs()
+        for context in VERDICT_CONTEXTS:
+            self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+        self.controller.tick()  # promotes the head and records the landing
+        self.repo.advance_main({"Extra.lean": "from main\n"})
+        self.controller.tick()
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        self.assert_pre_rebase_unused(batch, "carry-conflict", f"{PROJECT}#102")
+
     def test_a_pre_rebase_in_flight_is_kept_when_the_landing_is_observed_past_the_tip(self):
         def land(head):
             # The head lands outside the controller, with a commit on top of it.
