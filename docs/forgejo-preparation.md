@@ -293,13 +293,17 @@ The existing GitHub survey JSON shape stays unchanged.
 
 An automatic worker survey uses one shared listing (60 seconds, failed pages
 retried in place) for ranking: ownership, labels, draft state, pending publication
-and local review counters. It then reads review history for at most
-`TAUCETI_SURVEY_DETAIL_READS` (4) PRs that no cached observation describes at their
-current (updatedAt, head), in the cascade's order (automatic bumps, ambiguous owned
-mergeability, owned PRs, other reviews) with a random order within each group, and
-stops at the first PR read that is fix or review work. Every other PR is classified
-from its cached observation or left for a later survey; a survey never falls back to
-reading every PR. Explicit `--pr` targets are read in full. A selected-state refresh
+and local review counters. It then classifies every open PR from the host's
+review-state index: one observation per PR at its (updatedAt, head), shared by
+every worker on the host that reads the source with the same credential
+(`review-index/` under the shared read directory). Before classifying, the survey
+reads each PR the index does not describe at its current (updatedAt, head) and
+writes the observation to the index. One worker refreshes at a time under a host
+lock; the others wait, recheck and reuse its reads, so each PR change costs the
+host one read however many workers survey. A run of failed reads ends a refresh
+and the next survey continues it. Ambiguous owned mergeability is a Git fetch, so
+an automatic survey checks at most four such PRs, in random order, stopping at the
+first conflict. Explicit `--pr` targets are read in full. A selected-state refresh
 replaces that PR's row in the shared listing instead of expiring it.
 
 Forgejo renders each listed PR with git work (its head, base and diff stat), so a full
