@@ -243,6 +243,13 @@ class Refused(unittest.TestCase):
         theirs = base + "\ndef result : Bool := answer\n"
         self.refused(ours, base, theirs, "syntax or scoped")
 
+    def test_a_local_attribute_anywhere_in_the_list(self):
+        base = "def answer : Bool := true\n"
+        for attribute in ("attribute [simp, local instance] alt\n", "attribute [simp,\n  local instance] alt\n"):
+            ours = base + "\ndef c : Nat := 1\n\n" + attribute
+            theirs = base + "\ndef result : Bool := answer\n"
+            self.refused(ours, base, theirs, "scope")
+
     def test_in_inside_a_comment_does_not_scope(self):
         base = "def answer : Bool := true\n"
         ours = base + "\ndef c : Nat := 1\nopen Foo /- in -/\n"

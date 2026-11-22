@@ -497,6 +497,7 @@ GLOBAL_SYNTAX = re.compile(
     r"^(?:(?:@\[[^\]]*\]\s*)?(?:scoped|local)\b|(?:@\[[^\]]*\]\s*)?"
     r"(?:notation|infix|infixl|infixr|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules|declare_syntax_cat)\b)"
 )
+LOCAL = re.compile(r"\b(?:local|scoped)\b")
 SCOPED_IN = re.compile(r"^(?:open|set_option|variable|omit|include|unseal)\b.*\bin$")
 
 
@@ -577,6 +578,9 @@ def _check_side(side: list[str]) -> None:
             if blocks < 0:
                 raise Refused("an insertion closes a block it did not open")
         elif blocks == 0 and SCOPE.match(stripped) and not SCOPED_IN.match(stripped):
+            raise Refused(f"an insertion changes the scope after it: {stripped[:60]}")
+        elif blocks == 0 and LOCAL.search(stripped):
+            # `attribute [simp, local instance] x`, possibly over lines: in force until the file ends.
             raise Refused(f"an insertion changes the scope after it: {stripped[:60]}")
     if blocks:
         raise Refused("an insertion leaves a namespace or section open")
