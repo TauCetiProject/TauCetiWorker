@@ -71,8 +71,10 @@ from collections.abc import Callable
 from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
+from tauceti_queue import diagnostics as diagnostics_tool
 from tauceti_queue import (
     repair,
+    repair_additive,
     repair_audit,
     repair_context,
     repair_lookahead,
@@ -1096,6 +1098,9 @@ class RunnerConfig:
     # ``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 16, half for background work); 0 resolves every
     # conflict in turn.
     lookahead_helpers: int = dataclasses.field(default_factory=repair_lookahead.helpers_default)
+    # Resolve conflicts in which both sides only added lines without the agent (``repair_additive``;
+    # ``TAUCETI_QUEUE_ADDITIVE_PREPASS=0`` turns it off).
+    additive_prepass: bool = dataclasses.field(default_factory=repair_additive.enabled)
     poll_seconds: float = 60.0
     # A positive admin answer is cached on disk (``admin-check.json``) this long; a check that could not
     # be made is retried after ``admin_retry_seconds``, not on every poll.
@@ -2516,7 +2521,10 @@ def resolve_conflicts(
                         )
                         if made_on is not None and not cancel.is_set():
                             store_resolution(cfg.clone, task.batch_id, commit, prefix, tip)
-                        resolved.append({"source_pr": source_pr, "commit": commit, "resolved": tip, how: True})
+                        done = {"source_pr": source_pr, "commit": commit, "resolved": tip, how: True}
+                        if repair_additive.marked(chain_tool.read_commit(cfg.clone, tip).message):
+                            done["additive"] = {"paths": sorted(paths)}  # by the pre-pass, earlier or ahead
+                        resolved.append(done)
                         result = rest
                         continue
                 if how == "reused":
@@ -2560,6 +2568,7 @@ def resolve_conflicts(
             resolved.append(
                 {"source_pr": source_pr, "commit": commit, "resolved": outcome["tip"]}
                 | ({"numproj": True} if outcome.get("numproj") else {})
+                | ({"additive": outcome["additive"]} if outcome.get("additive") else {})
             )
             result = outcome["accepted"]
         git(worktree, "checkout", "--quiet", "--force", "--detach", result.tip)
@@ -2591,14 +2600,21 @@ def resolve_one(
     label: str,
     providers: list[str] | None = None,
 ) -> dict:
-    """Resolve the one conflicting ``commit`` onto ``prefix`` in ``worktree``: the numproj pre-pass, then
-    the agent for up to ``cfg.agent_attempts`` attempts. ``accept(tip, report)`` is not None for an
-    acceptable resolution (and adds its problems to ``report`` otherwise). ``providers`` is the
-    provider chain the worker chose (``repair_lookahead``).
+    """Resolve the one conflicting ``commit`` onto ``prefix`` in ``worktree``: the additive pre-pass
+    (``additive_prepass``), the numproj pre-pass, then the agent for up to ``cfg.agent_attempts``
+    attempts. ``accept(tip, report)`` is not None for an acceptable resolution (and adds its problems
+    to ``report`` otherwise). ``providers`` is the provider chain the worker chose
+    (``repair_lookahead``).
 
-    Returns ``{"status": "ok", "tip", "accepted", "agent"}`` (``numproj`` when the pre-pass resolved
-    it), or ``{"status", "reason"}``: an agent status that ends the task, or ``agent_failed``."""
+    Returns ``{"status": "ok", "tip", "accepted", "agent"}`` (``additive`` or ``numproj`` when a
+    pre-pass resolved it), or ``{"status", "reason"}``: an agent status that ends the task, or
+    ``agent_failed``."""
     source_pr = entry["source_pr"]
+    # Hunks in which both sides only added lines resolve without the agent (`repair_additive`); a
+    # conflict the pre-pass does not resolve acceptably goes to the agent exactly as before.
+    union = additive_prepass(cfg, task, worktree, state, prefix=prefix, commit=commit, entry=entry, accept=accept)
+    if union is not None:
+        return union
     # The clean prefix and the one conflicting commit: the commits after it are the worker's to replay.
     chain_before = [*read_chain(cfg.clone, task.onto, prefix), *read_chain(cfg.clone, f"{commit}^", commit)]
     findings = conflict_findings(task, entry, {c.pr for c in chain_before if c.pr is not None})
@@ -2713,6 +2729,126 @@ def resolve_one(
         feedback = "Local validation of the previous attempt's resolution:\n" + format_report(report)
         log(f"task {task.task_id}: the resolution of {source_pr} is not acceptable (attempt {attempt})")
     return {"status": "agent_failed", "reason": f"{source_pr}: the conflict stays unresolved\n{format_report(report)}"}
+
+
+ADDITIVE_REFUSED_PREFIX = "refs/tauceti-queue/additive-refused"
+
+
+def additive_refused_ref(batch_id: str, commit: str) -> str:
+    return f"{ADDITIVE_REFUSED_PREFIX}/{batch_id}/{commit}"
+
+
+def additive_prepass(
+    cfg: RunnerConfig, task: Task, worktree: Path, state, *, prefix: str, commit: str, entry: dict, accept
+) -> dict | None:
+    """``resolve_one``'s result when ``repair_additive`` resolves the conflict and ``accept`` takes it,
+    else None with the worktree left for the agent's path (which applies the conflict again). A
+    commit whose mechanical resolution an earlier verification build of the batch found errors in
+    (``refuse_additive``) is left to the agent."""
+    source_pr = entry["source_pr"]
+    if (
+        not cfg.additive_prepass
+        or git(
+            cfg.clone, "rev-parse", "--verify", "--quiet", additive_refused_ref(task.batch_id, commit), check=False
+        ).strip()
+    ):
+        return None
+    try:
+        union = repair_additive.resolve(worktree, prefix, commit, list(entry.get("paths") or []))
+    except Exception as error:  # noqa: BLE001 - the agent resolves it instead
+        union = f"{type(error).__name__}: {error}"
+    if isinstance(union, str):
+        log(f"task {task.task_id}: additive pre-pass left {source_pr}'s commit {commit[:12]}: {union}")
+        return None
+    paths = repair.apply_conflict(worktree, prefix, commit)
+    if set(paths) != set(union.files):
+        log(f"task {task.task_id}: additive pre-pass left {source_pr}: the replay conflicts in other paths")
+        return None
+    root = worktree.resolve()
+    for path, data in union.files.items():
+        target = worktree / path
+        # Each path is a regular file on every side (`repair_additive`), so `apply_conflict` checked
+        # out a regular file there; never write through a symlink out of the worktree.
+        if target.is_symlink() or not target.resolve().is_relative_to(root):
+            log(f"task {task.task_id}: additive pre-pass left {source_pr}: `{path}` is not a file of the worktree")
+            return None
+        target.write_bytes(data)
+    repair.listings_path(worktree).parent.mkdir(exist_ok=True)  # excluded from the commit
+    (worktree / repair.LISTINGS_DIR / repair.EXPLANATION_FILE).write_text(union.note + "\n")
+    tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads)
+    accepted = accept(tip, report)
+    record = {"paths": sorted(union.files), "hunks": union.hunks, "kinds": union.kinds}
+    state.write("conflict_validated", conflict=source_pr, attempt=0, tip=tip, report=report, additive=record)
+    if accepted is None:
+        log(
+            f"task {task.task_id}: the additive resolution of {source_pr} is not acceptable: "
+            + "; ".join(report.get("problems") or ["unexplained"])
+        )
+        return None
+    log(
+        f"task {task.task_id}: resolved {source_pr}'s commit {commit[:12]} by the additive pre-pass "
+        f"({union.hunks} hunks in {', '.join(sorted(union.files))})"
+    )
+    return {"status": "ok", "tip": tip, "accepted": accepted, "additive": record}
+
+
+def additive_summary(resolved: list[dict]) -> dict | None:
+    """The task record's account of its mechanical resolutions (``resolve_conflicts`` marks those made
+    here and those reused or merged from a lookahead, whose commit carries ``repair_additive.MARKER``)."""
+    members = [
+        {"source_pr": e["source_pr"], "commit": e["commit"], "paths": e["additive"]["paths"]}
+        for e in resolved
+        if e.get("additive")
+    ]
+    if not members:
+        return None
+    return {"count": len(members), "files": sorted({p for m in members for p in m["paths"]}), "members": members}
+
+
+def additive_findings(summary: dict | None, diagnostics: list[dict]) -> list[dict]:
+    """The mechanically resolved members whose files have a finding of the verification build, with
+    those findings' paths."""
+    if not summary:
+        return []
+    found = set()
+    for d in diagnostics:
+        where = d.get("path") or d.get("module") or ""
+        if where:
+            found.add(where if where.endswith(".lean") else diagnostics_tool.path_of(where))
+    hits = []
+    for member in summary["members"]:
+        paths = sorted(found.intersection(member["paths"]))
+        if paths:
+            hits.append({**member, "paths": paths})
+    return hits
+
+
+def additive_feedback(hits: list[dict]) -> str:
+    """The repair round's note on findings in mechanically resolved files."""
+    lines = [
+        "The worker resolved these members' conflicts mechanically, keeping the lines both sides added "
+        "(the target's, then the member's); check those insertions first: declaration order, a "
+        "duplicate of the target's declaration, or an import that is now redundant:"
+    ]
+    lines += [
+        f"- {h['source_pr']} (commit `{h['commit'][:12]}`): {', '.join(f'`{p}`' for p in h['paths'])}" for h in hits
+    ]
+    return "\n".join(lines)
+
+
+def refuse_additive(clone: Path, batch_id: str, commit: str) -> None:
+    """Leave ``commit``'s conflict in any later run of batch ``batch_id`` to the agent: a verification
+    build found errors in a file its mechanical resolution wrote. Its stored resolutions are dropped
+    too, so a rerun does not reuse the mechanical one. Never fails."""
+    try:
+        git(clone, "update-ref", additive_refused_ref(batch_id, commit), commit)
+        listing = git(
+            clone, "for-each-ref", "--format=%(refname)", f"{RESOLUTION_PREFIX}/{batch_id}/{commit}-*", check=False
+        )
+        for ref in listing.split():
+            git(clone, "update-ref", "-d", ref, check=False)
+    except Exception as error:  # noqa: BLE001 - only costs a mechanical retry that the build catches again
+        log(f"batch {batch_id}: could not record the refused additive resolution of {commit[:12]}: {error}")
 
 
 def resolution_ref(batch_id: str, commit: str, prefix_tree: str) -> str:
@@ -3288,6 +3424,15 @@ def _run_task(
                 )
                 outcome["agent"] = agent_records
                 outcome["conflicts"] = resolution["resolved"]
+                additive = additive_summary(resolution["resolved"])
+                if additive is not None:
+                    outcome["additive"] = additive
+                    log(
+                        f"task {task.task_id}: {additive['count']} conflicts resolved by the additive pre-pass, "
+                        f"in {', '.join(additive['files'])}"
+                    )
+                else:
+                    outcome.pop("additive", None)
                 if resolution["status"] == "cancelled":
                     return cancelled("the agent was cancelled")
                 if resolution["status"] != "ok":
@@ -3463,6 +3608,20 @@ def _run_task(
                         verification["diagnostics"]
                     )
                     state.write("verification_failed", attempt=attempt, tip=tip, detail=detail)
+                    hits = additive_findings(outcome.get("additive"), verification["diagnostics"])
+                    if hits:
+                        # A mechanical resolution may be the cause: say so to the repair round, and leave
+                        # those conflicts to the agent in any later run of the batch.
+                        outcome["additive"].setdefault("verification_findings", []).append(
+                            {"tip": tip, "members": hits}
+                        )
+                        log(
+                            f"task {task.task_id}: verification findings in mechanically resolved files: "
+                            + "; ".join(f"{h['source_pr']} ({', '.join(h['paths'])})" for h in hits)
+                        )
+                        for hit in hits:
+                            refuse_additive(cfg.clone, task.batch_id, hit["commit"])
+                        detail += "\n\n" + additive_feedback(hits)
                     if verify_rounds < cfg.verify_retries:
                         if rebasing:
                             # The agent resolved conflicts and never saw the whole chain: repair the chain

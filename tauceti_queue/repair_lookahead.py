@@ -11,7 +11,7 @@ helpers (``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 16, half that for backgrou
 batch's rebase onto ``main``, so the head's task comes first), each resolving a later member's commit on ``onto`` alone, in a worktree of its own and a child
 process (``python -m tauceti_queue.repair_lookahead run <job>``, as ``repair_parallel``'s group agents
 run, since the agent path keeps per-process state). A helper runs ``repair_task.resolve_one``, the
-serial path's own code for one conflict: the numproj pre-pass, then the agent with its attempts and
+serial path's own code for one conflict: the additive and numproj pre-passes, then the agent with its attempts and
 explanation follow-up. An acceptable resolution is recorded under the batch's stored resolutions
 (``repair_task.store_resolution``) keyed by ``onto``'s tree, so a rerun of the task, or a later task
 of the batch whose prefix has the same inputs, also finds it.

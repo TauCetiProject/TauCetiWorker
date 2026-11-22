@@ -82,6 +82,7 @@ from tauceti_queue import diagnostics as queue_diagnostics  # noqa: E402
 from tauceti_queue import (  # noqa: E402
     diff_guard,
     repair,
+    repair_additive,
     repair_audit,
     repair_context,
     repair_numproj,
@@ -7955,6 +7956,109 @@ class RebasedChainRepair(Fixture):
         self.assertEqual([v["ok"] for v in outcome["verification"]], [False])
         pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
         self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Three.lean"))
+
+
+class AdditiveRebase(Fixture):
+    """Main and member 3 each append a theorem to ``TauCeti/L.lean``: member 2's conflict goes to the
+    agent, and member 3's is resolved by the additive pre-pass, ours then theirs, without an agent."""
+
+    L_BASE = "theorem l : True := trivial\n"
+    MAIN_L = "\ntheorem l_main : True := trivial\n"
+    MEMBER_L = "\ntheorem l_three : True := trivial\n"
+    BASE_FILES = {"TauCeti/L.lean": L_BASE}
+
+    @property
+    def MEMBER_FILES(self):  # noqa: N802 - read by `Fixture.setUp` as the class attribute is
+        return {3: {"TauCeti/L.lean": self.L_BASE + self.MEMBER_L}}
+
+    def setUp(self):
+        super().setUp()
+        self.raw = self.content.rebase_task()
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.raw["onto"])
+        moved = commit(seed, "main adds a theorem", {"TauCeti/L.lean": self.L_BASE + self.MAIN_L})
+        sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        self.raw["onto"] = self.onto = moved
+        self.service.tasks = {1: self.raw}
+
+    def test_an_additive_conflict_is_resolved_without_the_agent(self):
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2", f"{PROJECT}#3"])
+        self.assertNotIn("additive", outcome["conflicts"][0])
+        self.assertEqual(
+            outcome["conflicts"][1]["additive"],
+            {"paths": ["TauCeti/L.lean"], "hunks": 1, "kinds": {"declarations": 1}},
+        )
+        self.assertEqual(len(self.agent_calls()), 1, "only member 2's conflict reaches the agent")
+        self.assertEqual(outcome["additive"]["count"], 1)
+        self.assertEqual(outcome["additive"]["files"], ["TauCeti/L.lean"])
+        self.assertNotIn("verification_findings", outcome["additive"])
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertEqual(
+            sh(self.content.bare, "show", f"{pushed}:TauCeti/L.lean"),
+            (self.L_BASE + self.MAIN_L + self.MEMBER_L).rstrip("\n"),  # `sh` strips the output
+        )
+        three = chain_tool.read_commit(self.content.bare, pushed)
+        self.assertTrue(repair_additive.marked(three.message), three.message)
+        self.assertIn(f"Source-PR: {PROJECT}#3", three.message)
+
+    def test_a_lookahead_helper_resolves_it_and_the_record_still_says_so(self):
+        cfg = self.config(lookahead_helpers=1)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual([c.get("lookahead", False) for c in outcome["conflicts"]], [False, True])
+        self.assertEqual(len(self.agent_calls()), 1, "the helper ran no agent")
+        self.assertEqual(outcome["conflicts"][1]["additive"], {"paths": ["TauCeti/L.lean"]})
+        self.assertEqual(outcome["additive"]["count"], 1)
+
+    def test_the_switch_leaves_it_to_the_agent(self):
+        cfg = self.config(additive_prepass=False)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.agent_calls()), 2)
+        self.assertNotIn("additive", outcome)
+
+
+class AdditiveRebaseFindings(AdditiveRebase):
+    """Member 3's appended theorem does not build: the verification build's finding is in the file the
+    pre-pass wrote, so the repair round is told so and later runs of the batch leave it to the agent."""
+
+    MEMBER_L = "\ntheorem l_three : True := BROKEN\n"
+
+    def test_an_additive_conflict_is_resolved_without_the_agent(self):
+        pass  # the parent's scenario: here the chain fails verification
+
+    def test_a_lookahead_helper_resolves_it_and_the_record_still_says_so(self):
+        pass  # likewise
+
+    def test_a_finding_in_a_mechanically_resolved_file_goes_to_the_repair_round(self):
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2, "member 2's conflict, then the repair round")
+        note = "resolved these members' conflicts mechanically"
+        self.assertIn(note, calls[1]["prompt"])
+        self.assertIn(f"{PROJECT}#3", calls[1]["prompt"].split(note)[1])
+        found = outcome["additive"]["verification_findings"]
+        self.assertEqual([[m["paths"] for m in f["members"]] for f in found], [[["TauCeti/L.lean"]]])
+        self.assertEqual([v["ok"] for v in outcome["verification"]], [False, True])
+        three = self.content.members[2]["commit"]
+        refused = sh(self.content.clone, "for-each-ref", "--format=%(refname)", repair_task.ADDITIVE_REFUSED_PREFIX)
+        self.assertEqual(refused.split(), [repair_task.additive_refused_ref(7, three)])
+        stored = sh(self.content.clone, "for-each-ref", "--format=%(refname)", repair_task.RESOLUTION_PREFIX)
+        self.assertNotIn(three, stored, "a rerun does not reuse the mechanical resolution")
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertNotIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/L.lean"))
+
+    def test_a_refused_commit_goes_to_the_agent(self):
+        three = self.content.members[2]["commit"]
+        sh(self.content.clone, "update-ref", repair_task.additive_refused_ref(7, three), three)
+        cfg = self.config(verify_retries=0)
+        repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(len(self.agent_calls()), 2, "both conflicts reach the agent")
 
 
 if __name__ == "__main__":
