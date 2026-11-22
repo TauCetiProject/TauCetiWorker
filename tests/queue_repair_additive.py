@@ -76,6 +76,13 @@ class Accepted(unittest.TestCase):
         self.assertEqual(kinds, ["imports"])
         self.assertEqual(text.count("import Mathlib.B\n"), 1, text)
 
+    def test_an_import_in_a_docstring_example_is_not_an_import(self):
+        base = "import Mathlib.A\n\n/-!\n```\nimport Extra.I\n```\n-/\n\ntheorem x : True := trivial\n"
+        ours = base.replace("import Mathlib.A\n", "import Mathlib.A\nimport Mathlib.B\n")
+        theirs = base.replace("import Mathlib.A\n", "import Mathlib.A\nimport Extra.I\n")
+        text, _ = union(ours, base, theirs)
+        self.assertTrue(text.startswith("import Mathlib.A\nimport Mathlib.B\nimport Extra.I\n"), text)
+
     def test_docstring_items_keep_the_target_s_first(self):
         ours = HEADER.replace("* `foo`: a thing\n", "* `foo`: a thing\n* `bar`: from main\n  continued\n")
         theirs = HEADER.replace("* `foo`: a thing\n", "* `foo`: a thing\n* `baz`: from the member\n")
@@ -249,6 +256,12 @@ class Refused(unittest.TestCase):
             ours = base + "\ndef c : Nat := 1\n\n" + attribute
             theirs = base + "\ndef result : Bool := answer\n"
             self.refused(ours, base, theirs, "scope")
+
+    def test_before_a_deriving_clause(self):
+        base = "structure A where\n  x : Nat\nderiving Inhabited\n"
+        ours = "structure A where\n  x : Nat\n\nstructure B where\n  y : Nat\nderiving Inhabited\n"
+        theirs = "structure A where\n  x : Nat\n\nstructure C where\n  z : Nat\nderiving Inhabited\n"
+        self.refused(ours, base, theirs, "inside a declaration, proof or term")
 
     def test_in_inside_a_comment_does_not_scope(self):
         base = "def answer : Bool := true\n"

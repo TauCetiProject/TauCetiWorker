@@ -231,7 +231,8 @@ def merge_text(ours: str, base: str, theirs: str) -> tuple[bytes, list[str]]:
         kind, k, x, y = _insertion(out, o, b, t, after)
         out.extend(b[:k])
         if kind == "imports":
-            existing = {line.strip() for line in [*out, *b[k:], *after] if IMPORT.match(line)}
+            # Masked: an `import` line in a docstring's example is not an import.
+            existing = {line.strip() for line in _mask([*out, *b[k:], *after])[0] if IMPORT.match(line)}
             x = [line for line in x if line.strip() not in existing]
             y = [line for line in y if line.strip() not in existing and line.strip() not in {s.strip() for s in x}]
             sort_imports = sort_imports or _sorted_import_block(ours)
@@ -510,7 +511,7 @@ def _check_commands(x: list[str], y: list[str], prior: list[str], rest: list[str
     if _dangling(masked_prior):
         raise Refused("the insertion point follows an attribute, modifier or `in`")
     following = next((line for line in _mask(rest, lex)[0] if line.strip()), None)
-    if following is not None and not _starts_command(following):
+    if following is not None and (not _starts_command(following) or CONTINUATION.match(following)):
         raise Refused("the insertion point is inside a declaration, proof or term")
     for side in (x, y):
         _check_side(side)
@@ -558,7 +559,7 @@ def _check_side(side: list[str]) -> None:
     code = [line for line in masked if line.strip()]
     if not code:
         raise Refused("an insertion of comments only")
-    if not _starts_command(code[0]) or END.match(code[0]):
+    if not _starts_command(code[0]) or END.match(code[0]) or CONTINUATION.match(code[0]):
         raise Refused("an insertion that does not start a command")
     text = "".join(masked)
     for opener, closer in ("()", "[]", "{}", "⟨⟩"):
