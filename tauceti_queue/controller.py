@@ -7241,11 +7241,13 @@ class Controller:
             "source_pr": conflict.source_pr if conflict else None,
             "paths": list(conflict.conflict_paths) if conflict else [],
         }
-        last = self.store.row("journal", {"batch_id": head["id"], "kind": "pre-rebase-unused"}, order="id DESC")
-        if last is not None and loads(last["detail"], {}) == detail:
-            return
-        self._count("pre_rebases_unused")
-        self.store.journal(now, "pre-rebase-unused", head["id"], **detail)
+        key = (head["version"], canonical, reason)
+        with self.store.transaction():
+            for entry in self.store.journal_entries("pre-rebase-unused", head["id"]):
+                if (entry["detail"].get("version"), entry["detail"].get("onto"), entry["detail"].get("reason")) == key:
+                    return
+            self._count("pre_rebases_unused")
+            self.store.journal(now, "pre-rebase-unused", head["id"], **detail)
 
     def _seal_from_pre_rebase(self, head: dict[str, Any], canonical: str, now: float) -> bool:
         """Base a newly sealed head on `canonical` from its pre-rebase, without replaying it again.
@@ -7300,7 +7302,8 @@ class Controller:
             tip, landed_on_base = extended.tip, extended.landed_on_base
         try:
             commits = chain.chain_commits(self.clone, canonical, tip)
-        except chain.ChainError:
+        except chain.ChainError as error:
+            self.store.journal(now, "pre-rebase-error", head["id"], onto=canonical, error=str(error))
             return False
         by_pr = {commit.source_pr: commit for commit in commits}
         members = self._members(head["id"])

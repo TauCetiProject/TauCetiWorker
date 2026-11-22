@@ -1837,8 +1837,10 @@ class PreRebase(ControllerCase):
         detail = entry["detail"]
         self.assertEqual((detail["reason"], detail["source_pr"], detail["paths"]), (reason, source_pr, ["Extra.lean"]))
         self.assertEqual(detail["onto"], self.repo.main_sha())
-        self.controller.tick()
+        # A later pass that declines again for the same head version, `main` and reason adds nothing.
+        self.assertFalse(self.controller._seal_from_pre_rebase(head, self.repo.main_sha(), self.clock()))
         self.assertEqual(len(self.controller.store.journal_entries("pre-rebase-unused")), 1, "journaled once")
+        self.assertEqual(self.controller.status()["counters"]["pre_rebases_unused"], 1)
 
     def test_a_pre_rebase_whose_extension_conflicts_at_the_seal_is_journaled_as_unused(self):
         """Batch 484: a member inserted while the pre-rebase was claimed replays onto the open batch's own
