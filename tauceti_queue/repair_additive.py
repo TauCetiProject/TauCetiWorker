@@ -529,7 +529,7 @@ def _starts_command(masked: str) -> bool:
 def _last_command(masked: list[str]) -> str:
     """The masked text of the last command in ``masked``: from its last column-0 line on."""
     code = [line for line in masked if line.strip()]
-    starts = [i for i, line in enumerate(code) if not line[:1].isspace()]
+    starts = [i for i, line in enumerate(code) if _starts_command(line)]  # not `]`, `|`, `where`...
     return " ".join(line.strip() for line in code[starts[-1] if starts else 0 :])
 
 
