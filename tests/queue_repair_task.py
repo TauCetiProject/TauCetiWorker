@@ -633,6 +633,7 @@ TOOLS_SCRIPTS = {
         'if [ -n "$LINT_ONLY_MODULES" ]; then cp "$LINT_ONLY_MODULES" "$STUB_DIR/lint-scope.txt"; '
         'else find TauCeti -name "*.lean" | sort | sed "s|/|.|g;s|.lean$||" > "$STUB_DIR/lint-scope.txt"; fi\n'
         'echo "${LINT_CHANGED_ONLY:-0}" $(cat "$STUB_DIR/lint-scope.txt") >> "$STUB_DIR/lint-runs.log"\n'
+        'echo "${LINT_SHARDS:-unset}" >> "$STUB_DIR/lint-shards.log"\n'
         'test -x "$LINT_DRIVER_EXE" || { echo "LINT-ENV: FAIL no driver"; exit 1; }\n'
         'if [ "${LINT_CHANGED_ONLY:-0}" = 1 ] && [ -f "$STUB_DIR/lint-driver-failure" ]; then '
         'cat "$STUB_DIR/lint-driver-failure"; exit 1; fi\n'
@@ -6094,6 +6095,29 @@ class WorkerAudits(Fixture):
         self.assertEqual((len(self.agent_calls()), len(self.lake_calls())), before)
         self.assertFalse((cfg.root / "worktrees/task-1").exists())
 
+    def test_an_unsandboxed_lint_runs_one_shard(self):
+        # Without bwrap nothing would collect lint-env.sh's shard process groups after a timeout.
+        cfg = self.config()
+        lint_envs = []
+        original = repair_audit._sandboxed
+
+        def run(argv, worktree, env, extra, *args, **kwargs):
+            if str(argv[-1]).endswith("/lint-env.sh"):
+                lint_envs.append(dict(extra))
+            return original(argv, worktree, env, extra, *args, **kwargs)
+
+        os.environ[repair_sandbox.DISABLE_VARIABLE] = "0"
+        with patch.object(repair_audit, "_sandboxed", run):
+            repair_audit.check(
+                self.content.clone,
+                repair.lake_env(cfg.root),
+                base=self.content.base,
+                tools_root=cfg.root / "tools",
+                logdir=cfg.root / "logs",
+            )
+        self.assertTrue(lint_envs)
+        self.assertEqual({e["LINT_SHARDS"] for e in lint_envs}, {"1"})
+
     def test_concurrent_checks_join_and_collect_both_failures(self):
         cfg = self.config()
         worktree = self.content.clone
@@ -6271,6 +6295,7 @@ class WorkerAudits(Fixture):
                 "0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two",
             ],
         )
+        self.assertEqual((self.stub_dir / "lint-shards.log").read_text().split(), ["2", "2", "2"])
 
     def test_a_changed_only_driver_failure_falls_back_to_the_whole_library_lint(self):
         # Batch 465's tip: the changed-only docstring-scan driver could not compile its module list.
