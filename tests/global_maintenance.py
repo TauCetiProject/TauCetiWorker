@@ -90,6 +90,8 @@ class GlobalMaintenance(unittest.TestCase):
         for item in (
             patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://state.test", "TAUCETI_ROADMAP_SKIP": ""}),
             patch.object(work, "roadmap_only", return_value=None),
+            # The roadmap repository defines no umbrella (tests/roadmap_umbrella.py covers them).
+            patch("tauceti_worker.umbrellas.read_umbrella", return_value=None),
             patch("tauceti_worker.survey.me", return_value="science"),
             patch.object(work, "mirror_creds"),
             patch.object(work, "_branch_claimed_elsewhere", return_value=False),

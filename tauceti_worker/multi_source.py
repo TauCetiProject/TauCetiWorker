@@ -14,7 +14,7 @@ from .survey import Counters, Survey, survey
 from .worker_sources import activate, native_source, source_config
 
 
-def collect(w, opts, *, use_fleet_focus=True):
+def collect(w, opts, *, use_fleet_focus=True, display=False):
     import os
 
     from .github_state import enabled as github_state_enabled
@@ -23,8 +23,9 @@ def collect(w, opts, *, use_fleet_focus=True):
     from .work_units import Worker, round_scope, want
 
     stages = [stage for stage in AUTO_STAGES if want(opts.only, stage)]
-    scope, global_pick, focused_round = round_scope(w, opts, use_fleet_focus)
+    scope, global_pick, focused_round = round_scope(w, opts, use_fleet_focus, display=display)
     scope = "auto" if scope is None else scope
+    umbrella = getattr(w, "umbrella", None)
     result = []
     if os.environ.get("TAUCETI_WORKER_FORGES") != "forgejo":
         try:
@@ -40,6 +41,7 @@ def collect(w, opts, *, use_fleet_focus=True):
                     numbers=opts.prs,
                     count_all_roadmaps=global_pick or focused_round,
                     cached_only=not opts.prs and scope in ("auto", "any") and github_state_enabled(),
+                    umbrella=umbrella,
                 )
         except (Die, ForgeError, OSError, RuntimeError) as error:
             github = Survey(worker_id=w.cfg.wid, github_failed=True)
@@ -66,6 +68,7 @@ def collect(w, opts, *, use_fleet_focus=True):
             selected_roadmap=scope,
             numbers=opts.prs,
             count_all_roadmaps=global_pick or focused_round,
+            umbrella=umbrella,
         )
         result.append(("forgejo", worker, native))
     except (Die, ForgeError, OSError, ValueError) as error:
@@ -309,9 +312,10 @@ def display_survey(cfg, gh):
 
     worker = Worker(cfg, gh, ReviewState(cfg, gh), Counters(cfg), None, None)
     options = RoundOpts(only=[], agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
-    observations = collect(worker, options)
+    observations = collect(worker, options, display=True)
     deduplicate(observations)
     result = Survey(worker_id=cfg.wid, roadmap_only=roadmap_only() or "auto")
+    result._umbrella = worker.umbrella
     result.github_failed = all(value.github_failed for _, _, value in observations)
     result.source_states = {}
     for name, _, value in observations:

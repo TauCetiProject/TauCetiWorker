@@ -160,6 +160,8 @@ def _only_label(sv=None) -> str:
     v = sv.roadmap_only if (sv is not None and sv.roadmap_only) else roadmap_only()
     if v is None or v == "auto":
         return "auto (random each round)"
+    if getattr(sv, "umbrella", None) is not None:
+        return f"{v} (umbrella)"
     return "all areas" if v in ("", "any") else v
 
 
