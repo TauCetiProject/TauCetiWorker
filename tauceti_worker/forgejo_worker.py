@@ -301,9 +301,33 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return ""
 
     def rebase_requested(self, pr, head):
-        return False
+        return bool(self._recovery_request(pr, head))
 
     def rebase_request_body(self, pr, head):
+        body = self._recovery_request(pr, head)
+        # Do not silently truncate a diagnosis; the prompt can fetch the original request.
+        return body if len(body) <= 32768 else ""
+
+    def _recovery_request(self, pr, head):
+        """The newest trusted merge-queue recovery request for exactly this head, or ""."""
+        import re
+
+        from .source_identity import recovery_author_ids
+
+        trusted = recovery_author_ids()
+        if not trusted or not re.fullmatch(r"[0-9a-f]{40}", head or ""):
+            return ""
+        marker = f"<!--tauceti-rebase:v1 {head}-->"
+        for row in reversed(self.issue_comments(pr) or []):
+            author = (row.get("user") or {}).get("id")
+            body = row.get("body") or ""
+            if (
+                type(author) is int
+                and author in trusted
+                and body.startswith("Merge-queue recovery for head `")
+                and marker in body.splitlines()
+            ):
+                return body
         return ""
 
     def bump_repair_requested(self, pr, head):

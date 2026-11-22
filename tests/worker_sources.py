@@ -483,6 +483,28 @@ ci="one/project"
         w.gh.live_pull = Mock(return_value=same)
         self.assertFalse(w.gh.authorize_candidate(candidate, require_writer=True))
 
+    def test_native_recovery_requests_bind_trusted_queue_authors_to_one_head(self):
+        w = self.native_worker()
+        head, other = "a" * 40, "b" * 40
+
+        def request(author, for_head, prefix="Merge-queue recovery for head `"):
+            return {
+                "user": {"id": author},
+                "body": f"{prefix}{for_head[:7]}`: conflicts.\n\n<!--tauceti-rebase:v1 {for_head}-->",
+            }
+
+        w.gh.issue_comments = Mock(
+            return_value=[request(9, head), request(5, other), request(5, head, prefix="Quoted ")]
+        )
+        self.assertFalse(w.gh.rebase_requested(1, head), "no trusted authors configured")
+        with patch.dict(os.environ, {"TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS": "5"}):
+            self.assertFalse(w.gh.rebase_requested(1, head), "untrusted author, another head, or no prefix")
+            self.assertTrue(w.gh.rebase_requested(1, other))
+            self.assertIn("conflicts", w.gh.rebase_request_body(1, other))
+            self.assertFalse(w.gh.rebase_requested(1, "not-a-sha"))
+        with patch.dict(os.environ, {"TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS": "9"}):
+            self.assertTrue(w.gh.rebase_requested(1, head))
+
     def test_unavailable_history_never_becomes_unreviewed_work(self):
         result = self.native_survey([self.row()], metadata=Meta({}, "fetch_failed"))
         self.assertFalse(result.reviewable.actionable)

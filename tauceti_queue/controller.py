@@ -182,6 +182,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # explanatory comment to its author (`_withdraw_member`). False defers the decision to landing,
     # where an empty final commit is rejected and its PR closed (`_enqueue_rejection_effects`).
     "withdraw_emptied_at_adoption": True,
+    # A `missing-source` refusal still standing at its head this long after the queue first refused it
+    # is handed to the PR's worker (`_hand_off_missing_sources`). Until then `_recheck_missing_sources`
+    # can re-admit it unchanged, and a recovery request would hold that head on Forgejo. 0: hand off at once.
+    "missing_source_handoff_seconds": 21600,
     # Infrastructure failures of one head version re-dispatch with short backoff
     # (`infrastructure_retry_backoff_seconds`) this many times; then the queue backs off automatically,
     # `automatic_retry_seconds` doubling up to `automatic_retry_max_seconds` between re-dispatches,
@@ -259,6 +263,12 @@ ESCALATIONS_KEPT = 50
 # The most CI findings a withdrawal or rejection comment quotes.
 COMMENT_FINDINGS = 8
 NEEDS_REBASE_LABEL = "needs-rebase"
+# Lifecycle label GitHub's PR-status reconciler sets when every per-PR prerequisite passes. A refused
+# head leaves it; the reconciler then reads the recovery request and reports `awaiting-author`.
+READY_TO_MERGE_LABEL = "ready-to-merge"
+# Head-bound recovery requests (TauCetiTools survey_facts.rebase_heads): this prefix, and the head in a
+# `<!--tauceti-rebase:v1 HEAD-->` line, which the source adapter appends for `recovery_head`.
+RECOVERY_PREFIX = "Merge-queue recovery for head `"
 # How `repaired_label` is created when the repository lacks it.
 REPAIRED_LABEL_COLOR = "d4c5f9"
 REPAIRED_LABEL_DESCRIPTION = "The merge queue modified this contribution while integrating it; see the landing comment"
@@ -3758,6 +3768,7 @@ class Controller:
             return list(self._reasons)
         self._follow_anticipated(now)
         self._recheck_missing_sources(now)
+        self._hand_off_missing_sources(now)
         hold = self._state("inference_hold")
         if hold:
             self._reasons.append(f"inference hold since {hold['since']:.0f}: {hold['last_error']}")
@@ -4754,6 +4765,20 @@ class Controller:
             return set()
         return {path for path, _ in planner.changes.get(sha, [])}
 
+    @staticmethod
+    def _missing_source_text(gaps: list[dict[str, Any]]) -> str:
+        """The gaps of a `missing-source` refusal, as one sentence per gap."""
+        parts = []
+        for gap in gaps:
+            provider = gap["module"].replace(".", "/") + ".lean"
+            if gap.get("changed", True):
+                parts.append(f"`{gap['path']}` imports `{gap['module']}`, but no source provides it (`{provider}`).")
+            else:
+                parts.append(
+                    f"`{gap['path']}` still imports `{gap['module']}`, whose source `{provider}` this PR removes."
+                )
+        return " ".join(parts)
+
     def _missing_source_request(self, row: dict[str, Any], gaps: list[dict[str, Any]]) -> None:
         if not self.setting("publication_enabled"):
             return
@@ -4861,6 +4886,45 @@ class Controller:
 
     def _native_admission_open(self) -> bool:
         return bool(self.mixed is not None and self.mixed.mode == "admit" and self.setting("forgejo_admission_enabled"))
+
+    def _hand_off_missing_sources(self, now: float) -> None:
+        """Hand each `missing-source` refusal that has stood `missing_source_handoff_seconds` at its head
+        to the PR's worker, as a recovery request.
+
+        The refusal itself stays: `_recheck_missing_sources` keeps watching it, and on GitHub it can
+        still re-admit the head unchanged when the missing source appears. On Forgejo the queue's own
+        recovery request holds that head, so the request waits out the grace period first: the
+        recheck gets the early window, when a provider is most likely to land, and the worker gets
+        the PR when nothing has. Keyed by head, so each refused head is handed off once."""
+        if not self.setting("publication_enabled"):
+            return
+        grace = float(self.setting("missing_source_handoff_seconds"))
+        for row in self._current_refusals():
+            gaps = loads(row["last_probe"], None)
+            if not isinstance(gaps, list) or not gaps:
+                continue
+            if not all(isinstance(g, dict) and g.get("path") and g.get("module") for g in gaps):
+                continue
+            refused = [
+                e.get("at")
+                for e in loads(row["evidence"], {}).get("merge_selection", [])
+                if e.get("kind") == "missing_source" and isinstance(e.get("at"), (int, float))
+            ]
+            if not refused or now - min(refused) < grace:
+                continue
+            key = f"missing-source-handoff:{row['number']}:{row['head_sha']}"
+            if self.store.row("outbox", {"key": key}) is not None:
+                continue
+            self._recovery_request(
+                key,
+                row["number"],
+                row["head_sha"],
+                self._missing_source_text(gaps)
+                + " The merge queue keeps watching for the missing source, but nothing has provided it "
+                "since it refused this head; fix it on the branch and push.",
+                f"<!-- {COMMENT_MARKER} missing-source-handoff:{row['head_sha']} -->",
+            )
+            self.store.journal(now, "missing-source-handoff", number=row["number"], head=row["head_sha"])
 
     def _recheck_missing_sources(self, now: float) -> None:
         """Re-admit `missing-source` refusals whose dependency fingerprint changed, at their original age.
@@ -4998,18 +5062,42 @@ class Controller:
         self._wake.set()
         return "readmitted"
 
+    def _recovery_request(self, key: str, number: Any, head: str, body: str, marker: str) -> None:
+        """Refuse `head` back to its author or worker: one head-bound recovery request comment, then
+        `needs-rebase` on and `ready-to-merge` off. Workers treat the pair as an integration-repair
+        handoff for exactly this head; a push makes it stale. The comment goes first, so the label
+        change that wakes GitHub's status reconciler finds it. Called with publication enabled."""
+        self._enqueue(
+            "comment",
+            key,
+            {
+                "number": number,
+                "body": f"{RECOVERY_PREFIX}{head[:7]}`: {body}",
+                "marker": marker,
+                "recovery_head": head,
+            },
+        )
+        self._enqueue(
+            "labels",
+            f"{key}:labels",
+            {"number": number, "add": [NEEDS_REBASE_LABEL], "remove": [READY_TO_MERGE_LABEL]},
+        )
+
     def _conflict_request(self, row: dict[str, Any], paths: list[str], now: float) -> None:
         if not self.setting("publication_enabled"):
             return
         body = (
-            f"This PR conflicts with `{self.canonical_branch}` ("
+            f"this PR conflicts with `{self.canonical_branch}` ("
             + ", ".join(f"`{path}`" for path in paths[:20])
-            + "). Rebase it and approve it again."
+            + f"). Rebase it onto `{self.canonical_branch}`, resolve the conflicts and push; the new head "
+            "returns to ordinary CI and review, and needs approving again."
         )
-        self._enqueue(
-            "comment",
+        self._recovery_request(
             f"conflict:{row['number']}:{row['head_sha']}",
-            {"number": row["number"], "body": body, "marker": f"<!-- {COMMENT_MARKER} conflict:{row['head_sha']} -->"},
+            row["number"],
+            row["head_sha"],
+            body,
+            f"<!-- {COMMENT_MARKER} conflict:{row['head_sha']} -->",
         )
 
     # --- the emergency lane ------------------------------------------------------------------------
@@ -9751,11 +9839,21 @@ class Controller:
             return
         number = member["number"]
         marker = f"<!-- {COMMENT_MARKER} withdrawn:{self._source_pr(number)}:{member['input_id']} -->"
-        self._enqueue(
-            "comment",
-            f"withdrawn-comment:{member['input_id']}",
-            {"number": number, "body": comment + "\n\n" + marker, "marker": marker},
-        )
+        if reason == EMPTY_COMMIT:
+            # The PR stays open at its accepted head: hand that head to its worker.
+            self._recovery_request(
+                f"withdrawn-comment:{member['input_id']}",
+                number,
+                member["accepted_head"],
+                comment + "\n\n" + marker,
+                marker,
+            )
+        else:
+            self._enqueue(
+                "comment",
+                f"withdrawn-comment:{member['input_id']}",
+                {"number": number, "body": comment + "\n\n" + marker, "marker": marker},
+            )
         label = self.setting("membership_label")
         if label:
             self._enqueue(
@@ -10468,7 +10566,13 @@ class Controller:
             return "retained"
         if kind == "comment":
             return "comment " + str(
-                self.source.post_comment(repo, payload["number"], payload["body"], payload["marker"])
+                self.source.post_comment(
+                    repo,
+                    payload["number"],
+                    payload["body"],
+                    payload["marker"],
+                    **({"recovery_head": payload["recovery_head"]} if payload.get("recovery_head") else {}),
+                )
             )
         if kind == "labels":
             if "admission_generation" in payload:

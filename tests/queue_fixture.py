@@ -1272,6 +1272,9 @@ class WithdrawnAtAdoption(QueueFixture):
         self.assertIn(f"Accepted revision: `{row['head_sha']}`", body)
         self.assertIn("> Dropped F102.lean: it cannot compile against #101.", body)
         self.assertIn("What to do next: rebase onto `main`", body)
+        self.assertTrue(body.startswith(f"Merge-queue recovery for head `{row['head_sha'][:7]}`: "))
+        self.assertIn(f"<!--tauceti-rebase:v1 {row['head_sha']}-->", body.splitlines())
+        self.assertIn("needs-rebase", self.github.labels[102])
         self.assertNotIn("bors-staging", self.github.labels[102])
         self.assertEqual(self.controller.store.journal_entries("member-withdrawn-empty")[0]["detail"]["number"], 102)
         # The batch lands without it: no second comment, no close, not counted as landed or rejected.
@@ -1304,8 +1307,8 @@ class WithdrawnAtAdoption(QueueFixture):
     def test_comment_delivery_survives_a_lost_response_and_restart_without_duplicates(self):
         post = self.github.post_comment
 
-        def post_then_fail(*args):
-            post(*args)
+        def post_then_fail(*args, **kwargs):
+            post(*args, **kwargs)
             raise RuntimeError("lost comment response")
 
         with patch.object(self.github, "post_comment", side_effect=post_then_fail):
@@ -2047,8 +2050,28 @@ class HeadOperations(QueueFixture):
         self.assertEqual(self.controller.inputs()[0]["state"], "cancelled")
         self.assertEqual(self.controller.inputs()[0]["reason"], "conflicts-with-main")
         self.tick()
-        self.assertIn("conflicts with `main`", self.github.comments_for(101)[0]["body"])
+        head = self.controller.inputs()[0]["head_sha"]
+        body = self.github.comments_for(101)[0]["body"]
+        self.assertIn("conflicts with `main`", body)
+        # A head-bound recovery request: workers rebase exactly this head, and the status labels stop
+        # calling it ready to merge.
+        self.assertTrue(body.startswith(f"Merge-queue recovery for head `{head[:7]}`: "))
+        self.assertIn(f"<!--tauceti-rebase:v1 {head}-->", body.splitlines())
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertNotIn("ready-to-merge", self.github.labels[101])
         self.assertIsNone(self.head())
+
+    def test_a_conflict_request_removes_ready_to_merge_and_quotes_no_markers(self):
+        self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
+        self.approve(
+            101, {"Shared.lean": "line one\nline two by 101\nline three\n"}, start=self.repo.rev_parse("main~1")
+        )
+        self.github.labels.setdefault(101, set()).add("ready-to-merge")
+        self.tick(2)
+        self.assertEqual(self.github.labels[101] & {"needs-rebase", "ready-to-merge"}, {"needs-rebase"})
+        [comment] = self.github.comments_for(101)
+        markers = [line for line in comment["body"].splitlines() if line.startswith("<!--tauceti-")]
+        self.assertEqual(markers, [f"<!--tauceti-rebase:v1 {self.controller.inputs()[0]['head_sha']}-->"])
 
 
 class MissingSource(QueueFixture):
@@ -2229,6 +2252,29 @@ class MissingSource(QueueFixture):
             self.drive()
         self.assertEqual(self.states(101), ["landed"])
         self.assertEqual(len(self.github.comments_for(101)), 2, "the refusal and the landing")
+
+    def test_a_long_standing_refusal_is_handed_to_its_worker_and_still_rechecked(self):
+        self.approve(101, {"TauCeti/Consumer.lean": "module\nimport TauCeti.Later\n"})
+        self.tick(2)
+        self.assertTrue(self.refused(101))
+        head = next(r for r in self.controller.inputs() if r["number"] == 101)["head_sha"]
+        [refusal] = self.github.comments_for(101)
+        self.assertNotIn("<!--tauceti-rebase:v1", refusal["body"], "the recheck gets the first window")
+        self.assertNotIn("needs-rebase", self.github.labels.get(101, set()))
+        self.clock.advance(self.controller.setting("missing_source_handoff_seconds"))
+        self.tick(2)
+        handoffs = [c for c in self.github.comments_for(101) if c["body"].startswith("Merge-queue recovery for head")]
+        self.assertEqual(len(handoffs), 1)
+        self.assertIn(f"<!--tauceti-rebase:v1 {head}-->", handoffs[0]["body"].splitlines())
+        self.assertIn("imports `TauCeti.Later`, but no source provides it", handoffs[0]["body"])
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertEqual(self.controller.store.count("journal", {"kind": "missing-source-handoff"}), 1)
+        self.tick(2)
+        self.assertEqual(self.controller.store.count("journal", {"kind": "missing-source-handoff"}), 1, "once per head")
+        # The refusal is still watched: the provider landing re-admits the unchanged head.
+        self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
+        self.tick()
+        self.assertEqual(self.states(101)[-1], "inserted")
 
     def test_removal_is_readmitted_once_main_drops_the_import(self):
         self.approve(101, {"TauCeti/Provider.lean": None})

@@ -37,6 +37,7 @@ from .ports import (
     PullRequest,
     Status,
     Task,
+    recovery_body,
 )
 
 
@@ -628,7 +629,9 @@ class FakeGitHub:
         else:
             run_git(self.repo.origin, "update-ref", ref, sha)
 
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
+    def post_comment(self, repo: str, number: int, body: str, marker: str, *, recovery_head: str | None = None) -> str:
+        if recovery_head is not None:
+            body = recovery_body(body, recovery_head)
         with self.lock:
             self._call("post_comment", number, marker)
             for comment in self.comments:

@@ -210,6 +210,23 @@ to waiting at its original age (journal `missing-source-readmitted`, counter
 gap remains. The refusal comment is keyed by head, so a repeated refusal posts nothing new.
 Closing, drafting, pushing to or withdrawing a refused PR drops its refusal from the recheck.
 
+Refusals that need a new head go back to the PR's worker as a head-bound recovery request: a
+comment beginning ``Merge-queue recovery for head `abc1234`: `` with a
+`<!--tauceti-rebase:v1 HEAD-->` line for the refused head, then `needs-rebase` on and
+`ready-to-merge` off. The source adapter appends that marker itself and escapes any quoted
+`<!--tauceti-` text, so only the request's own head is marked. A `conflicts-with-main` refusal and
+an `empty-commit` withdrawal at adoption post the request at once, in place of their old comments.
+A `missing-source` refusal keeps its ordinary comment and recheck, and gets the request only once it
+has stood `missing_source_handoff_seconds` (default six hours) at its head
+(`_hand_off_missing_sources`, journal `missing-source-handoff`, once per head). The delay matters
+on Forgejo, where the queue's own recovery request holds the head in admission: the recheck gets
+the early window, when a provider is most likely to land, and the worker gets the PR when nothing
+has. On GitHub the queue is not a recovery-hold author, so the recheck can still re-admit the head
+afterwards. GitHub workers recognize `tauceti-queue[bot]` requests through TauCetiTools'
+`rebase_authors`, and GitHub's status labels report such a head as `awaiting-author`; Forgejo
+workers trust the user IDs in `TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS` (the queue's publisher).
+A push makes every request stale.
+
 A blocking label (`hold`, `wip` and the others `approve` refuses) added to a PR whose input is
 waiting or reserved is recorded in the input's `blocked_labels` (journal `blocked-label`), from the
 `labeled` delivery or, when that was missed, from admission's or eligibility's next read of the PR.

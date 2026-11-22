@@ -56,6 +56,13 @@ review responses, rebases and closing superseded work. Authoring pressure
 account opened. PRs from the previous account's fork are not adopted. A
 malformed value stops the worker at startup.
 
+Set `TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS` to the merge queue's Forgejo publisher ID
+(comma-separated for several) to act on its refusals. A PR labelled `needs-rebase` whose
+newest comment from such an author begins ``Merge-queue recovery for head `...`: `` and carries a
+`<!--tauceti-rebase:v1 HEAD-->` line for the current head then gets an integration-repair rebase
+round under the ordinary rebase budget, with the request as its brief, even when Forgejo reports
+no conflict. Unset, no Forgejo recovery request is trusted.
+
 The canonical instance defaults to those values. Other instances require
 explicit bindings. Token files must be private. A missing canonical credential
 allows public Forgejo discovery. Authenticated native work becomes available
