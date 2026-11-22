@@ -593,6 +593,19 @@ class SharedIndexSurveys(unittest.TestCase):
         self.assertFalse(reader.current(5))
         reader._write_sidecar(reader._key_path(5), 5, {"status": "present", "meta": {}}, observed_at=started)
         self.assertFalse(writer.current(5), "the older observation must not land over the bust")
+        # A bust waits for a busy index directory rather than dropping its tombstone.
+        import fcntl
+        import os
+        import threading
+
+        directory = os.open(writer.sbcache, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        threading.Timer(0.2, lambda: fcntl.flock(directory, fcntl.LOCK_UN)).start()
+        started = time.time() - 1
+        writer.bust(6)
+        os.close(directory)
+        reader._write_sidecar(reader._key_path(6), 6, {"status": "present", "meta": {}}, observed_at=started)
+        self.assertFalse(writer.current(6))
         reader._write_sidecar(reader._key_path(5), 5, {"status": "present", "meta": {}})
         self.assertTrue(writer.current(5), "a read after the bust is indexed")
 

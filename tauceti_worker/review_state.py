@@ -258,7 +258,7 @@ class ReviewState:
             with contextlib.suppress(OSError):
                 marker.touch()
 
-    def _write_source_cache(self, path, value, *, prune=True, observed_at=None):
+    def _write_source_cache(self, path, value, *, prune=True, observed_at=None, wait=False):
         """Private atomic source cache writes, without following a target symlink."""
         self.sbcache.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory = os.open(self.sbcache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -268,7 +268,8 @@ class ReviewState:
             os.fchmod(directory, 0o700)
             # Serialize only local atomic replacements. No network read holds
             # this lock; using the directory avoids persistent lock files.
-            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # A tombstone waits for the lock: it must land, or an older read could republish.
+            fcntl.flock(directory, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 if os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mtime > observed_at:
                     return  # An independently fetched later observation won.
@@ -455,7 +456,7 @@ class ReviewState:
             now = time.time()
             for path in (self._key_path(pr), self._contest_path(pr)):
                 try:
-                    self._write_source_cache(path, {"status": "invalidated"}, prune=False, observed_at=now)
+                    self._write_source_cache(path, {"status": "invalidated"}, prune=False, observed_at=now, wait=True)
                 except (OSError, ValueError):
                     path.unlink(missing_ok=True)
         else:

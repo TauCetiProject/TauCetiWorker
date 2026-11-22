@@ -259,9 +259,6 @@ def index_order(result, counters, stages, pending):
         for p in _nondraft(result)
         if p.number in owned | reviewable
     ]
-    # Random within each group, so a few PRs that persistently fail to read cannot hold the front
-    # of every refresh; the sort is stable.
-    random.shuffle(entries)
     entries.sort(key=lambda entry: (not entry[0].automatic_bump, entry[0].number not in owned))
     return entries
 
@@ -291,6 +288,9 @@ def refresh_index(rs, entries):
     stale = [(p, stages) for p, stages in entries if _needs_read(rs, p, stages)]
     if not stale:
         return 0, 0
+    # Classification reads the whole index, so refresh order matters only when a refresh ends
+    # early. Random order keeps a few PRs that persistently fail to read from ending every refresh.
+    random.shuffle(stale)
     reads = failures = 0
     with rs.refresh_lock(REFRESH_LOCK_WAIT_S) as held:
         if not held:
