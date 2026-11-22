@@ -521,8 +521,9 @@ def round_scope(w, opts, use_fleet_focus=True, *, display=False):
 
 def umbrella_round(w, opts, scope, *, display=False) -> UmbrellaRound | None:
     """The umbrella `scope` names (docs/umbrellas.md), or None for an area or any other value. A round
-    that may author draws its member area now, before any model starts; with a target list the list
-    chooses, and a round without the roadmap phase only maintains the members' pull requests."""
+    that may author learns now, before any model starts, which members are roadmap areas, and draws
+    one of them unless a target list chooses among them; a round without the roadmap phase only
+    maintains the members' pull requests."""
     umbrella = umbrella_scope(w.gh, scope, display=display)
     if umbrella is None or display:
         return umbrella
@@ -530,16 +531,18 @@ def umbrella_round(w, opts, scope, *, display=False) -> UmbrellaRound | None:
         raise Die(
             f"--source needs one roadmap area, and {scope} is an umbrella of {len(umbrella.umbrella.members)} areas"
         )
-    if not want(opts.only, "roadmap") or roadmap_targets() is not None:
+    if not want(opts.only, "roadmap"):
+        return umbrella
+    umbrella = replace(umbrella, current=frozenset(m.area for m in umbrella_members_now(w, umbrella)))
+    if roadmap_targets() is not None:
         return umbrella
     return replace(umbrella, area=random_umbrella_area(w, umbrella))
 
 
-def random_umbrella_area(w, umbrella: UmbrellaRound) -> str:
-    """Draw an umbrella round's member area at random by weight, among the members that are roadmap
-    areas now and not in --roadmap-skip: the operator's own focus list, beside random_roadmap_area's
-    Fleet focus. Members whose roadmaps have not merged are skipped silently; NoProgress when none is
-    eligible."""
+def umbrella_members_now(w, umbrella: UmbrellaRound) -> list:
+    """The members an umbrella round may author in: those in its scope (outside --roadmap-skip) that
+    are roadmap areas now, read like random_roadmap_area reads them. Members whose roadmaps have not
+    merged are left out silently, so they are picked up when they land; NoProgress when none is left."""
     members = umbrella.umbrella.members
     areas = set(roadmap_areas(w.gh))
     eligible = [m for m in members if m.area in umbrella.scope and m.area in areas]
@@ -556,8 +559,21 @@ def random_umbrella_area(w, umbrella: UmbrellaRound) -> str:
             if part
         )
         raise NoProgress(f"roadmap: no member of umbrella {name} is eligible ({why}) — nothing to work on")
+    return eligible
+
+
+def random_umbrella_area(w, umbrella: UmbrellaRound) -> str:
+    """Draw an umbrella round's member area at random by weight among umbrella_members_now: the
+    operator's own focus list, beside random_roadmap_area's Fleet focus."""
+    members = umbrella.umbrella.members
+    eligible = (
+        [m for m in members if m.area in umbrella.current] if umbrella.current else umbrella_members_now(w, umbrella)
+    )
     area = random.choices([m.area for m in eligible], weights=[m.weight for m in eligible])[0]
-    log(f"ROADMAP area: {area} (umbrella {name}: picked from {len(eligible)} of {len(members)} members)")
+    log(
+        f"ROADMAP area: {area} (umbrella {umbrella.umbrella.name}: picked from {len(eligible)} of "
+        f"{len(members)} members)"
+    )
     return area
 
 
@@ -3375,7 +3391,11 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     # chooses among the umbrella's areas instead. Either way the area is then treated as pinned.
     umbrella = getattr(sv, "umbrella", None)
     if targets_path is not None:
-        live, item = assign_target(w, targets_path, only, skip, None if umbrella is None else umbrella.scope)
+        # An umbrella's list items count only in members that are roadmap areas now; the others wait.
+        within = None
+        if umbrella is not None:
+            within = umbrella.current or frozenset(m.area for m in umbrella_members_now(w, umbrella))
+        live, item = assign_target(w, targets_path, only, skip, within)
         only = item.area
         assignment = render_assignment(live, item)
         os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))

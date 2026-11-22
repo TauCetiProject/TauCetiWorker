@@ -481,6 +481,9 @@ class Survey:
         """Recompute authoring pressure after roadmap-only/skip changes, including live TUI dials."""
         automatic = getattr(self, "_automatic_open_count", None)
         umbrella = self.umbrella
+        if umbrella is not None:
+            # The skip dial may have taken members out of the umbrella or brought them back.
+            self._umbrella = umbrella = umbrella.rescoped(self.roadmap_skip)
         self.n_mine_open = (
             automatic
             if automatic is not None
@@ -568,6 +571,7 @@ def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str], within=Non
         return roadmap_focuses(p.labels, p.target_focuses, p.head_ref)
 
     if within is not None:
+        within = set(within) - set(skip)
         return sum((areas := focuses(p)) is None or bool(areas & within) for p in prs)
 
     if only not in ("", "any", "auto"):

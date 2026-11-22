@@ -22,7 +22,7 @@ from tauceti_worker.config import Die, NoProgress, _only_label
 from tauceti_worker.constants import ROADMAP, ROADMAP_DIR
 from tauceti_worker.github_state import SurveyRows
 from tauceti_worker.review_state import ReviewState
-from tauceti_worker.survey import Survey, survey
+from tauceti_worker.survey import PRInfo, Survey, roadmap_open_count, survey
 from tauceti_worker.umbrellas import Member, Umbrella, UmbrellaRound
 from tauceti_worker.work_units import RoundOpts, run_round
 
@@ -110,9 +110,10 @@ class Roadmap:
         return self
 
 
-def grh_round(area=None, skip=()):
+def grh_round(area=None, skip=(), current=None):
     umbrella = umbrellas.parse_umbrella("GRH", GRH.encode())
-    return UmbrellaRound(umbrella, frozenset(m.area for m in umbrella.members if m.area not in skip), area)
+    scope = frozenset(m.area for m in umbrella.members if m.area not in skip)
+    return UmbrellaRound(umbrella, scope, area, None if current is None else frozenset(current))
 
 
 class File(unittest.TestCase):
@@ -366,7 +367,19 @@ class Rounds(RoundHarness):
         self.assertEqual(self.draws, [])
         stage, _, reason, sv = self.calls[0]
         self.assertEqual((stage, reason, sv.umbrella.area), ("roadmap", "GRH", None))
-        self.assertEqual(sv.umbrella.scope, {ANT, RH, LATER})
+        self.assertEqual(sv.umbrella.scope, {ANT, RH, LATER}, "maintenance keeps every member")
+        self.assertEqual(sv.umbrella.current, {ANT, RH}, "the list may only author where a roadmap exists")
+
+    def test_a_target_list_with_no_member_that_is_an_area_ends_the_round_before_any_model(self):
+        with (
+            patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": "/dev/null/targets.md"}),
+            patch.dict(os.environ, {"TAUCETI_ROADMAP_SKIP": f"{ANT},{RH}"}),
+            self.assertRaisesRegex(
+                NoProgress, f"no member of umbrella GRH is eligible .*not roadmap areas now: {LATER}"
+            ),
+        ):
+            self.run_round([row(30, LATER)])
+        self.assertEqual(self.calls, [])
 
     def test_source_material_needs_one_area(self):
         self.opts.source = "/srv/source"
@@ -465,6 +478,7 @@ class Prompt(unittest.TestCase):
         cfg = SimpleNamespace(state=self.tmp, wid="worker3", checkout=self.tmp / "checkout", logdir=self.tmp / "logs")
         self.claims = SimpleNamespace(begin_target_work=Mock(return_value=0))
         self.w = SimpleNamespace(cfg=cfg, gh=None, claims=self.claims)
+        self.roadmap = Roadmap(self).install(self)  # LATER is a member but not a roadmap area yet
 
     def author(self, reason, scope=None):
         sv = Survey(worker_id="worker3", roadmap_only=scope.umbrella.name if scope else reason)
@@ -511,27 +525,53 @@ class Prompt(unittest.TestCase):
         sentence = re.search(r" It was drawn from the umbrella.*?acceptable\.", with_umbrella).group(0)
         self.assertEqual(with_umbrella.replace(sentence, "").replace(ANT, "Topology"), plain)
 
-    def test_a_target_list_is_restricted_to_the_umbrella_areas(self):
+    @contextlib.contextmanager
+    def target_list(self, *sections):
+        """A target list with one open item per (area, slug), in file order, offered in file order."""
         targets = self.tmp / "targets.md"
         targets.write_text(
-            "<!-- tauceti-targets:v1 -->\n"
-            f"## Other\n- [ ] `outside` — not in the umbrella\n"
-            f"## {RH}\n- [ ] `inside` — in the umbrella\n"
+            "<!-- tauceti-targets:v1 -->\n" + "".join(f"## {area}\n- [ ] `{slug}` — item\n" for area, slug in sections)
         )
-        reads = SimpleNamespace(open_prs=lambda: [], merged_prs=lambda *a, **k: [])
-        self.w.gh = reads
+        self.w.gh = SimpleNamespace(open_prs=lambda: [], merged_prs=lambda *a, **k: [])
         with (
             patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS": str(targets), "TAUCETI_ROADMAP_TARGETS_GITHUB": "0"}),
             patch.object(work, "live_targets", side_effect=lambda listed, *_: listed),
             patch.object(work, "_landed_link", return_value=None),
             patch.object(work, "_open_link", return_value=None),
+            patch("tauceti_worker.targets.random.shuffle"),  # keep file order, so a wrong offer is claimed first
         ):
+            yield
+
+    def test_a_target_list_is_restricted_to_the_umbrella_areas(self):
+        with self.target_list(("Other", "outside"), (RH, "inside")):
             prompt = self.author("GRH", grh_round())
             self.claims.begin_target_work.assert_called_once_with(RH, "inside")
             self.assertIn(f"Start with `{RH}`, the roadmap you were assigned. It is a member of the umbrella", prompt)
             self.assertNotIn("prefer the targets", prompt)
             with self.assertRaisesRegex(NoProgress, "offers nothing to author in GRH"):
                 self.author("GRH", grh_round(skip=(RH,)))
+
+    def test_a_target_list_offers_only_members_that_are_roadmap_areas_now(self):
+        # LATER comes first in the file: offered, it would be claimed first.
+        with self.target_list((LATER, "future"), (RH, "current")):
+            for scope in (grh_round(current=(ANT, RH)), grh_round()):  # as round_scope leaves it, or read here
+                self.claims.begin_target_work.reset_mock()
+                prompt = self.author("GRH", scope)
+                self.claims.begin_target_work.assert_called_once_with(RH, "current")
+                self.assertIn(f"Start with `{RH}`, the roadmap you were assigned.", prompt)
+        self.assertNotIn(LATER, prompt)
+
+    def test_a_future_member_as_the_only_eligible_target_stops_before_any_claim_or_model(self):
+        with (
+            self.target_list((LATER, "future"), ("Other", "outside")),
+            self.assertRaisesRegex(
+                NoProgress,
+                f"offers nothing to author in GRH .*only in areas outside GRH's current roadmap areas: {LATER}, Other",
+            ),
+        ):
+            self.author("GRH", grh_round(current=(ANT, RH)))
+        self.claims.begin_target_work.assert_not_called()
+        self.assertEqual(self.prompts, [], "no model started")
 
 
 class Visibility(unittest.TestCase):
@@ -582,6 +622,71 @@ class Visibility(unittest.TestCase):
         self.assertEqual((shown.roadmap_only, [p.number for p in shown.open_prs]), ("GRH", [10]))
         self.assertEqual(_only_label(shown), "GRH (umbrella)")
         self.assertEqual(dataclasses.asdict(shown).keys(), dataclasses.asdict(plain).keys())
+
+
+class LiveSkip(unittest.TestCase):
+    """The dashboard's skip dial changes roadmap_skip on a survey it already holds, then rescopes it
+    (tui._apply_skip); tests/dashboard.py drives the dial itself and its refresh."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.cfg = SimpleNamespace(wid="w", sbcache=root / "sb", store_dir=root, state=root)
+        self.gh = SimpleNamespace(repo="org/repo")
+        for item in (
+            patch.dict(
+                os.environ,
+                {
+                    "TAUCETI_ROADMAP_ONLY": "GRH",
+                    "TAUCETI_ROADMAP_SKIP": "",
+                    "TAUCETI_GITHUB_STATE_URL": "https://state.test",
+                    "TAUCETI_MAX_OPEN_PRS": "2",
+                },
+            ),
+            patch("tauceti_worker.survey.me", return_value="science"),
+        ):
+            item.start()
+            self.addCleanup(item.stop)
+        Roadmap(self, files={"GRH": GRH}).install(self)
+
+    def survey(self, rows):
+        counters = SimpleNamespace(read=lambda key: 0, write=lambda key, value: None)
+        rs = ReviewState(self.cfg, self.gh)
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, SurveyRows(rows, {}))):
+            return survey(self.cfg, self.gh, rs, counters, stages=STAGES, umbrella=umbrellas.display_umbrella(self.gh))
+
+    def test_adding_and_removing_a_skip_rescopes_the_umbrella(self):
+        sv = self.survey([row(10, ANT, blocking=False), row(20, RH, blocking=False)])
+        self.assertEqual((sv.n_mine_open, sv.roadmap_backpressure), (2, True))
+        sv.roadmap_skip = [RH]  # the dial adds RH
+        sv.rescope_roadmap()
+        self.assertEqual(sv.umbrella.scope, {ANT, LATER})
+        self.assertEqual((sv.n_mine_open, sv.roadmap_backpressure), (1, False), "RH's pull request no longer counts")
+        rows = dict(tui._expansion_rows(sv, "roadmap", {}, [ANT, RH]))
+        self.assertEqual((rows[f"    └ {ANT}"], rows[f"    └ {RH}"]), ("← umbrella", "(skipped)"))
+        self.assertEqual(tui._roadmap_note(sv), ("∞", f"only: GRH (umbrella of 2 areas)  (skip: {RH})"))
+        sv.roadmap_skip = []  # the dial removes it again
+        sv.rescope_roadmap()
+        self.assertEqual(sv.umbrella.scope, {ANT, RH, LATER})
+        self.assertEqual(dict(tui._expansion_rows(sv, "roadmap", {}, [RH]))[f"    └ {RH}"], "← umbrella")
+        self.assertEqual(sv.n_mine_open, 2, "this survey still holds RH's pull request")
+
+    def test_a_member_skipped_at_the_survey_needs_a_fresh_survey_to_count_again(self):
+        with patch.dict(os.environ, {"TAUCETI_ROADMAP_SKIP": RH}):
+            sv = self.survey([row(10, ANT, blocking=False), row(20, RH, blocking=False)])
+        self.assertEqual(sv.n_mine_open, 1)
+        sv.roadmap_skip = []
+        sv.rescope_roadmap()
+        # The scope widens at once; RH's pull request was never surveyed, which is why the dashboard
+        # refreshes after a widening skip change.
+        self.assertEqual((sv.umbrella.scope, sv.n_mine_open), ({ANT, RH, LATER}, 1))
+        self.assertEqual(self.survey([row(10, ANT, blocking=False), row(20, RH, blocking=False)]).n_mine_open, 2)
+
+    def test_the_umbrella_count_honours_the_skip_list_it_is_given(self):
+        prs = [PRInfo.from_json(row(n, area)["pr"]) for n, area in ((1, ANT), (2, RH), (3, "Other"))]
+        self.assertEqual(roadmap_open_count(prs, "GRH", [], within={ANT, RH}), 2)
+        self.assertEqual(roadmap_open_count(prs, "GRH", [RH], within={ANT, RH}), 1)
 
 
 class Docs(unittest.TestCase):

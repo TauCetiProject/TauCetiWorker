@@ -65,7 +65,8 @@ ROADMAP area: AnalyticNumberTheoryPartI (umbrella GRH: picked from 2 of 3 member
 ```
 
 If no member is eligible the round ends with that reason before any model
-starts. A round without the roadmap phase (`--only review,fix`) draws nothing.
+starts. A round without the roadmap phase (`--only review,fix`) draws nothing
+and does not check the members.
 
 Authoring in the drawn area is that of `--roadmap-only AREA`: claims, the
 intentions board and administrative holds apply to that area. The agent's
@@ -92,7 +93,7 @@ roadmap pull requests across those member areas together.
 | Setting | With an umbrella |
 | --- | --- |
 | `--roadmap-skip AREA[,AREA...]` | Removes those members from the umbrella: from the draw, from maintenance, and from a target list. A pinned area wins over the skip list; an umbrella does not, because skipping is how you leave one member to other workers. |
-| `--roadmap-targets FILE` | The [target list](target-lists.md) chooses the item, restricted to the umbrella's areas outside `--roadmap-skip`, as it is restricted to the area of `--roadmap-only AREA`. No area is drawn; the prompt names the umbrella but adds no section sentence, since the item is assigned. |
+| `--roadmap-targets FILE` | The [target list](target-lists.md) chooses the item, restricted to the members a draw could pick (roadmap areas now, outside `--roadmap-skip`), as it is restricted to the area of `--roadmap-only AREA`. Items under a member that has not merged wait for it; when the list offers nothing else the round ends before any claim or model, naming the areas its eligible items are in. No area is drawn; the prompt names the umbrella but adds no section sentence, since the item is assigned. Maintenance still covers every member. |
 | `--pr N[,N...]` | The named pull requests override the umbrella, as they override an area. |
 | Fleet roadmap focus | Not applied: an umbrella is an explicit `--roadmap-only`. |
 | `--extra-roadmap-prompt TEXT` | Still added, steering the choice of target within the drawn area. |
@@ -104,7 +105,10 @@ Logs carry the draw above. A managed worker's runtime status names the round's
 target as `new PR (area: AnalyticNumberTheoryPartI, umbrella GRH)`. `tauceti
 status` and the dashboard show `GRH (umbrella)` and count and list the work of
 its member areas; in the dashboard's expanded roadmap row the members are marked
-`← umbrella`. `tauceti workers` shows the configured name.
+`← umbrella`. The dashboard's skip dial (`x`) takes a member out of the count and
+the marks at once; bringing one back also starts a fresh survey, because the
+last one did not read that member's pull requests. `tauceti workers` shows the
+configured name.
 
 ## Examples
 

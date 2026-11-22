@@ -816,8 +816,13 @@ def _dashboard_app(cfg, loader=None):
             os.environ["TAUCETI_ROADMAP_SKIP"] = ",".join(areas)
             self._skip_set_by_user = True
             if self.sv is not None:  # keep the roadmap row in step with the status bar immediately
+                before = self.sv.umbrella.scope if self.sv.umbrella is not None else frozenset()
                 self.sv.roadmap_skip = roadmap_skip()
                 self.sv.rescope_roadmap()
+                # A member taken off the umbrella's skip list had its pull requests left out of the
+                # last survey, so only a fresh one can count and list them.
+                if self.sv.umbrella is not None and self.sv.umbrella.scope - before:
+                    self._refresh()
             self._save_prefs()
             self._render()
 

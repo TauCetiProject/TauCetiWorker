@@ -14,7 +14,7 @@ import binascii
 import re
 import subprocess
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .config import Die, log, roadmap_areas, roadmap_only, roadmap_skip
 from .constants import ROADMAP, ROADMAP_DIR
@@ -45,13 +45,27 @@ class Umbrella:
 
 @dataclass(frozen=True)
 class UmbrellaRound:
-    """An umbrella as one round uses it: `scope` is the member areas whose pull requests the round
-    maintains (every member outside --roadmap-skip), and `area` the member drawn for authoring, or None
-    when a target list chooses the area or the survey is only displayed."""
+    """An umbrella as one round uses it. `scope` is the member areas whose pull requests the round
+    maintains: every member outside --roadmap-skip, merged or not. `current` is the members of `scope`
+    that are roadmap areas now, the only ones a round may author in (None until a round that authors
+    checks them). `area` is the member drawn for authoring, or None when a target list chooses among
+    `current` or the survey is only displayed."""
 
     umbrella: Umbrella
     scope: frozenset[str]
     area: str | None = None
+    current: frozenset[str] | None = None
+
+    def rescoped(self, skip) -> UmbrellaRound:
+        """This umbrella under another --roadmap-skip (the dashboard's live dial). `current` can only
+        lose members: bringing one back needs a fresh area list."""
+        scope = _scope(self.umbrella, skip)
+        return replace(self, scope=scope, current=None if self.current is None else self.current & scope)
+
+
+def _scope(umbrella: Umbrella, skip) -> frozenset[str]:
+    skip = set(skip)
+    return frozenset(m.area for m in umbrella.members if m.area not in skip)
 
 
 def is_candidate(name: str | None) -> bool:
@@ -133,8 +147,7 @@ def umbrella_scope(gh, name: str | None, *, display: bool = False) -> UmbrellaRo
         return None
     if umbrella is None:
         return None
-    skip = set(roadmap_skip())
-    return UmbrellaRound(umbrella, frozenset(m.area for m in umbrella.members if m.area not in skip))
+    return UmbrellaRound(umbrella, _scope(umbrella, roadmap_skip()))
 
 
 def display_umbrella(gh) -> UmbrellaRound | None:
