@@ -19,6 +19,7 @@ from pathlib import Path
 
 from tauceti_tools.forge import ForgeError
 
+from . import peer_claims
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -178,6 +179,14 @@ def _branch_claimed_elsewhere(w, pr: int) -> bool:
     if getattr(getattr(w, "gh", None), "worker_capable", False) is True:
         return False
     return _claim_held_elsewhere(w, f"branch/{pr}", claims_repo())
+
+
+def _claim_scope(w) -> str:
+    """The repository a candidate's leases belong to, qualified by forge where the source has one."""
+    gh = getattr(w, "gh", None)
+    repository = getattr(gh, "repository", None)
+    key = getattr(repository, "key", None)
+    return key if isinstance(key, str) else str(getattr(gh, "repo", ""))
 
 
 def _review_claimed_elsewhere(w, candidate: Candidate) -> bool:
@@ -814,6 +823,11 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue
+        if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head):
+            log(f"Global PR work: {stage} #{c.pr} recently found claimed by a peer — skipping before fresh PR reads")
+            claim_collision = True
+            declined.append((stage, c.pr))
+            continue
         if stage == "review" and not opts.dry_run and _review_claimed_elsewhere(w, c):
             log(f"Global PR work: review #{c.pr} claimed by a peer — skipping before fresh PR reads")
             claim_collision = True
@@ -836,8 +850,13 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
             log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
         collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
+        w.review_claimed_by_peer = False
         rc = dispatch(stage, w, sv, c, opts)
-        claim_collision |= getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
+        collided = getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
+        if rc is None and not opts.dry_run and (collided or w.review_claimed_by_peer):
+            # Spare every other worker on the host the fresh reads that found this collision.
+            peer_claims.note(_claim_scope(w), stage, c.pr, c.head)
+        claim_collision |= collided
         if rc is not None:
             return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
         declined.append((stage, c.pr))
@@ -1947,6 +1966,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             return None
         if rc == EX_CLAIM_COLLISION:  # Review engine: another run already owns this head; no inference or verdict.
             log(f"  review #{pr}: claimed by a peer — selecting other work")
+            w.review_claimed_by_peer = True
             return None
         if rc in (85, 86):
             reason = "publisher/record repair" if rc == 86 else "publication retry"

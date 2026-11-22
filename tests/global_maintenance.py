@@ -119,6 +119,40 @@ class GlobalMaintenance(unittest.TestCase):
             result = run_round(self.w, self.opts)
         return result, query, areas
 
+    def test_a_peer_claim_found_once_is_skipped_by_every_worker_before_fresh_reads(self):
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        self.w.claims.collisions = 0
+
+        def collide(stage, candidate):
+            if candidate.pr == 10:
+                self.w.claims.collisions += 1  # dispatch read the PR, then lost the lease
+                return None
+            return 0
+
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            self.run_round([row(10, "Other"), row(20, "Other")], collide)
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20)])
+            # The next round on any worker skips #10 without dispatching (no fresh PR reads).
+            self.run_round([row(10, "Other"), row(20, "Other")], collide)
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+        # Without the configured shared directory nothing is recorded or skipped.
+        self.run_round([row(10, "Other"), row(20, "Other")], collide)
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20)])
+
+    def test_peer_claim_hints_expire_and_are_scoped(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            peer_claims.note("forgejo:one/project", "rebase", 7, HEAD, now=1000)
+            self.assertTrue(peer_claims.hinted("forgejo:one/project", "fix", 7, "b" * 40, now=1001))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001))
+            self.assertFalse(peer_claims.hinted("github:one/project", "rebase", 7, HEAD, now=1001))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "rebase", 7, HEAD, now=1000 + 601))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "rebase", 7, HEAD, now=0))
+
     def test_prepared_source_survey_keeps_global_peer_claim_checks(self):
         from tauceti_worker.survey import Candidate, Survey
 
