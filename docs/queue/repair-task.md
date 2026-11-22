@@ -144,6 +144,38 @@ to `agent_attempts`, with the report as feedback:
   not judged, and content moved between members in part is not detected mechanically, as for any
   repair.
 
+**Additive conflicts.** Before anything else, the worker tries a mechanical union of the conflict
+(`repair_additive`, in `repair_task.additive_prepass`, also in each lookahead helper). It merges each
+conflicting file again with `git merge-file --diff3` (base: the conflicting commit's parent, ours: the
+clean prefix, theirs: the commit). A hunk is additive when ours and theirs both keep the hunk's base
+lines and insert lines at one common point of them, usually into an empty base. The worker then
+writes ours' lines followed by theirs', but only where that is safe for Lean:
+
+- imports in the header: deduplicated against the whole header, and the import block sorted again
+  when ours' block was sorted;
+- list items inside a module docstring (`/-! ... -/`), with no comment delimiters and no item both
+  sides added;
+- whole top-level commands between commands: each side's lines start a command at column 0, the line
+  after the hunk starts a command (so the hunk is not inside a proof or term), and neither side ends in
+  an attribute, a doc comment or `... in`. Comments and `namespace`/`section`/`mutual` blocks balance
+  within each side, and neither side changes the scope after it (`open`, `variable`, `universe`,
+  `set_option`, notation and the like outside a block it closes).
+
+The worker refuses the union when a qualified declaration name is declared twice in the result, both
+sides add the same paragraph, or a side adds a paragraph the file already has. Every conflicting hunk
+of every conflicting file must pass; then the worker commits the files with an explanation that starts
+"Resolved mechanically by the worker (additive union):", and the resolution goes through every check
+below. Otherwise, or if a check fails, the agent gets the conflict as before. The outcome's
+`conflicts` entry has `additive: {paths, hunks, kinds}`, and the outcome's `additive` record has the
+count, the files and the members, including resolutions reused from a lookahead or an earlier run (the
+explanation identifies them). Union order can still be wrong for Lean, for example a declaration
+placed before something it uses, so the whole-library verification build remains the check. When the
+build reports findings in a file that a mechanical resolution wrote, the worker records them under
+`additive.verification_findings`, names those members and files in the repair round's prompt and
+deletes their stored resolutions. It also writes `refs/tauceti-queue/additive-refused/<batch>/<commit>`,
+so in any later run of the batch the agent resolves that conflict. `TAUCETI_QUEUE_ADDITIVE_PREPASS=0`
+turns the pre-pass off.
+
 **Renamed numeric projections.** When `main` rewrites numeric projections (`x.1` to `x.fst`, as the
 toolchain bump to v4.37.0-rc1 did across the library), a member written against the old `main`
 conflicts wherever its change touches a rewritten line. Before the agent runs, the worker tries a
