@@ -175,10 +175,25 @@ def _blob(repo: Path, rev: str, path: str) -> bytes | None:
     return done.stdout if done.returncode == 0 else None
 
 
+def _mode(repo: Path, rev: str, path: str) -> str | None:
+    done = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-z", rev, "--", path], capture_output=True, text=True, check=False
+    )
+    entry = done.stdout.split("\0")[0] if done.returncode == 0 else ""
+    meta, _, name = entry.partition("\t")
+    return meta.split(" ")[0] if meta and name == path else None
+
+
 def _resolve_file(repo: Path, prefix: str, commit: str, path: str) -> tuple[bytes, list[str]]:
     if not path.endswith(".lean"):
         raise Refused("not a Lean file")
-    blobs = [_blob(repo, rev, path) for rev in (prefix, f"{commit}^", commit)]
+    revs = (prefix, f"{commit}^", commit)
+    modes = [_mode(repo, rev, path) for rev in revs]
+    if any(mode is None for mode in modes):
+        raise Refused("added or deleted on one side")
+    if any(mode != "100644" for mode in modes):
+        raise Refused("not a regular file on every side")
+    blobs = [_blob(repo, rev, path) for rev in revs]
     if any(b is None for b in blobs):
         raise Refused("added or deleted on one side")
     if any(len(b) > MAX_BYTES for b in blobs):
@@ -214,6 +229,7 @@ def merge_text(ours: str, base: str, theirs: str) -> tuple[bytes, list[str]]:
         out.extend(b[:k])
         if kind == "imports":
             existing = {line.strip() for line in [*out, *b[k:], *after] if IMPORT.match(line)}
+            x = [line for line in x if line.strip() not in existing]
             y = [line for line in y if line.strip() not in existing and line.strip() not in {s.strip() for s in x}]
             sort_imports = sort_imports or _sorted_import_block(ours)
         elif kind == "declarations" and x and y and x[-1].strip() and y[0].strip():
@@ -420,8 +436,8 @@ def _sort_import_block(lines: list[str]) -> list[str]:
 
 
 def _check_commands(x: list[str], y: list[str], prior: list[str], rest: list[str]) -> None:
-    following = next((line for line in rest if line.strip()), None)
-    if following is not None and not (COMMAND.match(following) and not following[:1].isspace()):
+    following = next(_code_lines(rest), None)
+    if following is not None and not _starts_command(following):
         raise Refused("the insertion point is inside a declaration, proof or term")
     previous = _last_code_line(prior)
     if previous is not None and DANGLING.search(previous.strip()):
@@ -439,60 +455,98 @@ def _check_commands(x: list[str], y: list[str], prior: list[str], rest: list[str
 
 
 def _last_code_line(lines: list[str]) -> str | None:
-    depth, kind = 0, None
+    """The last code line (``_code_lines``) without its trailing line comment, or None."""
     last = None
+    for line in _code_lines(lines):
+        last = line
+    return None if last is None else _without_line_comment(last)
+
+
+def _without_line_comment(line: str) -> str:
+    """``line`` up to a ``--`` line comment outside a string literal."""
+    in_string, i = False, 0
+    while i < len(line):
+        if in_string and line[i] == "\\":
+            i += 2
+            continue
+        if line[i] == '"':
+            in_string = not in_string
+        elif not in_string and line.startswith("--", i):
+            return line[:i].rstrip() + "\n"
+        i += 1
+    return line
+
+
+def _code_lines(lines: list[str]):
+    """The lines outside comments that are not themselves comments, blank or a comment's first line."""
+    depth, kind = 0, None
     for line in lines:
         was = depth
         depth, kind = _scan(line, depth, kind)
-        if not was and not depth and line.strip() and not line.lstrip().startswith("--"):
-            last = line
-    return last
+        stripped = line.strip()
+        if was or not stripped or stripped.startswith(("--", "/-")):
+            continue
+        yield line
+
+
+def _starts_command(line: str) -> bool:
+    """A code line (``_code_lines``) at column 0 that starts a command."""
+    return not line[:1].isspace() and bool(COMMAND.match(line))
 
 
 def _ends_in_docstring(lines: list[str]) -> bool:
-    """The last non-blank line closes a ``/-- ... -/`` doc comment."""
+    """The last thing before the end, other than whitespace and line comments, is a ``/-- ... -/`` doc
+    comment, which would document whatever follows."""
     depth, kind, closed = 0, None, None
     for line in lines:
-        if not line.strip():
-            continue
-        opened = kind
-        depth, kind = _scan(line, depth, kind)
-        closed = (kind or opened) if depth == 0 and line.rstrip().endswith("-/") else None
+        i, n = 0, len(line)
+        while i < n:
+            two = line[i : i + 2]
+            if depth == 0 and two == "--":
+                break
+            if two == "/-":
+                if depth == 0:
+                    kind = "doc" if line[i + 2 : i + 3] == "-" else "other"
+                depth += 1
+                i += 2
+                continue
+            if two == "-/" and depth:
+                depth -= 1
+                i += 2
+                if depth == 0 and kind == "doc":
+                    closed = kind  # an ordinary comment after it leaves it documenting what follows
+                continue
+            if depth == 0 and not line[i].isspace():
+                closed = None
+            i += 1
     return closed == "doc"
 
 
 def _check_side(side: list[str]) -> None:
-    depth, kind = 0, None
     blocks = 0
-    first = True
-    last_code = None
-    for line in side:
-        was = depth
-        depth, kind = _scan(line, depth, kind)
-        if was or not line.strip() or line[:1].isspace():
-            if was == 0 and line.strip() and first:
-                raise Refused("an insertion starting inside a command")
-            continue
-        if first:
-            if not COMMAND.match(line) or END.match(line):
-                raise Refused("an insertion that does not start a command")
-            first = False
-        elif not COMMAND.match(line) and not CONTINUATION.match(line):
+    first = next(_code_lines(side), None)
+    if first is None:
+        raise Refused("an insertion of comments only")
+    if not _starts_command(first) or END.match(first):
+        raise Refused("an insertion that does not start a command")
+    if _comment_depth(side):
+        raise Refused("an insertion leaves a comment open")
+    for line in _code_lines(side):
+        if not line[:1].isspace() and not COMMAND.match(line) and not CONTINUATION.match(line):
             raise Refused(f"an unrecognised top-level line: {line.strip()[:60]}")
-        if not line.startswith(("--", "/-")):
-            last_code = line
-        if OPENER.match(line):
+        # Commands are whitespace-insensitive, so an indented one (in a namespace block, say) counts too.
+        code = _without_line_comment(line).strip()
+        if OPENER.match(code):
             blocks += 1
-        elif END.match(line):
+        elif END.match(code):
             blocks -= 1
             if blocks < 0:
                 raise Refused("an insertion closes a block it did not open")
-        elif blocks == 0 and SCOPE.match(line) and not re.search(r"\bin\s*$", line):
-            raise Refused(f"an insertion changes the scope after it: {line.strip()[:60]}")
-    if depth:
-        raise Refused("an insertion leaves a comment open")
+        elif blocks == 0 and SCOPE.match(code) and not re.search(r"\bin\b", code):
+            raise Refused(f"an insertion changes the scope after it: {code[:60]}")
     if blocks:
         raise Refused("an insertion leaves a namespace or section open")
+    last_code = _last_code_line(side)
     if last_code is not None and DANGLING.search(last_code.strip()):
         raise Refused("an insertion ends in an attribute, modifier or `in`")
     if _ends_in_docstring(side):
@@ -518,9 +572,9 @@ def _check_names(text: str) -> None:
     for line in text.splitlines(keepends=True):
         was = depth
         depth, kind = _scan(line, depth, kind)
-        if was or line[:1].isspace():
-            continue
         stripped = line.strip()
+        if was or stripped.startswith(("--", "/-")):
+            continue
         opened = re.match(r"^(?:noncomputable\s+)?(namespace|section|mutual)\b\s*(\S*)", stripped)
         if opened:
             stack.append(opened.group(2) if opened.group(1) == "namespace" else "")

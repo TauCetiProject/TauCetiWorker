@@ -2764,8 +2764,15 @@ def additive_prepass(
     if set(paths) != set(union.files):
         log(f"task {task.task_id}: additive pre-pass left {source_pr}: the replay conflicts in other paths")
         return None
+    root = worktree.resolve()
     for path, data in union.files.items():
-        (worktree / path).write_bytes(data)
+        target = worktree / path
+        # Each path is a regular file on every side (`repair_additive`), so `apply_conflict` checked
+        # out a regular file there; never write through a symlink out of the worktree.
+        if target.is_symlink() or not target.resolve().is_relative_to(root):
+            log(f"task {task.task_id}: additive pre-pass left {source_pr}: `{path}` is not a file of the worktree")
+            return None
+        target.write_bytes(data)
     repair.listings_path(worktree).parent.mkdir(exist_ok=True)  # excluded from the commit
     (worktree / repair.LISTINGS_DIR / repair.EXPLANATION_FILE).write_text(union.note + "\n")
     tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads)

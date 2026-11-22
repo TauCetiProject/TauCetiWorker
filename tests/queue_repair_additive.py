@@ -66,6 +66,16 @@ class Accepted(unittest.TestCase):
             text.startswith("import Mathlib.A\nimport Mathlib.B\nimport Mathlib.C\nimport Mathlib.D\n"), text
         )
 
+    def test_an_import_both_sides_add_is_kept_once(self):
+        base = "import Mathlib.A\nimport Mathlib.Z\n\ntheorem x : True := trivial\n"
+        ours = "import Mathlib.A\nimport Mathlib.Z\nimport Mathlib.B\n\ntheorem x : True := trivial\n"
+        theirs = (
+            "import Mathlib.A\nimport Mathlib.B\nimport Mathlib.Z\nimport Mathlib.C\n\ntheorem x : True := trivial\n"
+        )
+        text, kinds = union(ours, base, theirs)
+        self.assertEqual(kinds, ["imports"])
+        self.assertEqual(text.count("import Mathlib.B\n"), 1, text)
+
     def test_docstring_items_keep_the_target_s_first(self):
         ours = HEADER.replace("* `foo`: a thing\n", "* `foo`: a thing\n* `bar`: from main\n  continued\n")
         theirs = HEADER.replace("* `foo`: a thing\n", "* `foo`: a thing\n* `baz`: from the member\n")
@@ -178,6 +188,42 @@ class Refused(unittest.TestCase):
         theirs = "/-- A.\nThe member's sentence.\n-/\ntheorem a : True := trivial\n"
         self.refused(ours, base, theirs, "inside a comment or declaration docstring")
 
+    def test_inside_a_do_block_after_comments(self):
+        base = "def f : Nat := Id.run do\n  let mut x := 1\n-- step\n  return x\n"
+        ours = "def f : Nat := Id.run do\n  let mut x := 1\n-- a\n  x := x + 1\n-- step\n  return x\n"
+        theirs = "def f : Nat := Id.run do\n  let mut x := 1\n-- b\n  x := x * 2\n-- step\n  return x\n"
+        self.refused(ours, base, theirs, "inside a declaration, proof or term")
+
+    def test_a_one_line_doc_comment_left_for_what_follows(self):
+        base = "theorem a : True := trivial\n\ntheorem b : True := trivial\n"
+        ours = base.replace("\ntheorem b", "\ntheorem c : True := trivial\n\n/-- B. -/\ntheorem b")
+        theirs = base.replace("\ntheorem b", "\ntheorem d : True := trivial\n\n/-- B'. -/\ntheorem b")
+        self.refused(ours, base, theirs, "doc comment")
+
+    def test_the_same_name_inside_namespace_blocks(self):
+        base = "theorem a : True := trivial\n"
+        ours = base + "\nnamespace N\n  theorem same : True := trivial\nend N\n"
+        theirs = base + "\nnamespace N\n  theorem same : True := by trivial\nend N\n"
+        self.refused(ours, base, theirs, "declares `N.same` twice")
+
+    def test_an_indented_scope_command(self):
+        base = "theorem a : True := trivial\n"
+        ours = base + '\ntheorem b : True := trivial\n  local notation "flag" => false\n'
+        theirs = base + "\ndef d : Bool := true\n"
+        self.refused(ours, base, theirs, "changes the scope after it")
+
+    def test_a_doc_comment_behind_an_ordinary_comment(self):
+        base = "theorem a : True := trivial\n\ntheorem b : True := trivial\n"
+        ours = base.replace("\ntheorem b", "\ntheorem c : True := trivial\n\n/-- B. -/\n/- note -/\ntheorem b")
+        theirs = base.replace("\ntheorem b", "\ntheorem d : True := trivial\n\n/-- B. -/\n/- note -/\ntheorem b")
+        self.refused(ours, base, theirs, "doc comment")
+
+    def test_an_attribute_with_a_line_comment(self):
+        base = "theorem a : True := trivial\n\ntheorem b : True := trivial\n"
+        ours = base.replace("\ntheorem b", "\ntheorem c : True := trivial\n\n@[simp] -- for b\ntheorem b")
+        theirs = base.replace("\ntheorem b", "\ntheorem d : True := trivial\n\n@[simp] -- for b\ntheorem b")
+        self.refused(ours, base, theirs, "attribute")
+
     def test_conflict_markers_in_a_side(self):
         self.refused("<<<<<<< x\n", "", "y\n", "conflict-marker")
 
@@ -225,6 +271,13 @@ class Resolve(unittest.TestCase):
         self.assertIn("not a Lean file", ra.resolve(self.repo, self.ours, self.theirs, ["notes.txt"]))
         self.assertIn("added or deleted", ra.resolve(self.repo, self.ours, self.theirs, ["T/B.lean"]))
         self.assertEqual(ra.resolve(self.repo, self.ours, self.theirs, []), "no conflicting paths")
+
+    def test_a_file_that_is_not_regular_on_every_side(self):
+        git(self.repo, "checkout", "--quiet", "--detach", self.theirs)
+        (self.repo / "T/A.lean").chmod(0o755)
+        git(self.repo, "commit", "--quiet", "-am", "mode")
+        theirs = git(self.repo, "rev-parse", "HEAD").strip()
+        self.assertIn("not a regular file", ra.resolve(self.repo, self.ours, theirs, ["T/A.lean"]))
 
     def test_the_switch(self):
         self.assertTrue(ra.enabled({}))
