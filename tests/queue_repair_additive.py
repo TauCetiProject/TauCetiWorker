@@ -210,7 +210,7 @@ class Refused(unittest.TestCase):
         base = "theorem a : True := trivial\n"
         ours = base + '\ntheorem b : True := trivial\n  local notation "flag" => false\n'
         theirs = base + "\ndef d : Bool := true\n"
-        self.refused(ours, base, theirs, "changes the scope after it")
+        self.refused(ours, base, theirs, "syntax or scoped")
 
     def test_a_doc_comment_behind_an_ordinary_comment(self):
         base = "theorem a : True := trivial\n\ntheorem b : True := trivial\n"
@@ -223,6 +223,37 @@ class Refused(unittest.TestCase):
         ours = base.replace("\ntheorem b", "\ntheorem c : True := trivial\n\n@[simp] -- for b\ntheorem b")
         theirs = base.replace("\ntheorem b", "\ntheorem d : True := trivial\n\n@[simp] -- for b\ntheorem b")
         self.refused(ours, base, theirs, "attribute")
+
+    def test_a_dangling_attribute_behind_a_comment_or_over_lines(self):
+        base = "theorem a : True := trivial\n\ntheorem b : True := trivial\n"
+        for attribute in ("@[implemented_by r] /- for b -/\n", "@[simp,\n  nolint]\n"):
+            ours = base.replace("\ntheorem b", f"\ndef c : Nat := 1\n\n{attribute}theorem b")
+            theirs = base.replace("\ntheorem b", "\ndef d : Nat := 3\n\ntheorem b")
+            self.refused(ours, base, theirs, "attribute")
+
+    def test_code_after_a_block_comment(self):
+        base = "def answer : Bool := true\n"
+        ours = base + '\ndef c : Nat := 1\n/- note -/ local notation "answer" => false\n'
+        theirs = base + "\ndef result : Bool := answer\n"
+        self.refused(ours, base, theirs, "syntax or scoped")
+
+    def test_global_notation_inside_a_namespace(self):
+        base = "def answer : Bool := true\n"
+        ours = base + '\nnamespace N\nnotation "answer" => false\nend N\n'
+        theirs = base + "\ndef result : Bool := answer\n"
+        self.refused(ours, base, theirs, "syntax or scoped")
+
+    def test_in_inside_a_comment_does_not_scope(self):
+        base = "def answer : Bool := true\n"
+        ours = base + "\ndef c : Nat := 1\nopen Foo /- in -/\n"
+        theirs = base + "\ndef result : Bool := answer\n"
+        self.refused(ours, base, theirs, "changes the scope after it")
+
+    def test_inside_a_multiline_string(self):
+        base = 'def s : String := "head\ndef tail : Nat := 0\n"\n'
+        ours = 'def s : String := "head\ndef a : Nat := 1\ndef tail : Nat := 0\n"\n'
+        theirs = 'def s : String := "head\ndef b : Nat := 2\ndef tail : Nat := 0\n"\n'
+        self.refused(ours, base, theirs, "string")
 
     def test_conflict_markers_in_a_side(self):
         self.refused("<<<<<<< x\n", "", "y\n", "conflict-marker")

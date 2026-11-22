@@ -158,8 +158,12 @@ writes ours' lines followed by theirs', but only where that is safe for Lean:
 - whole top-level commands between commands: each side's lines start a command at column 0, the line
   after the hunk starts a command (so the hunk is not inside a proof or term), and neither side ends in
   an attribute, a doc comment or `... in`. Comments and `namespace`/`section`/`mutual` blocks balance
-  within each side, and neither side changes the scope after it (`open`, `variable`, `universe`,
-  `set_option`, notation and the like outside a block it closes).
+  within each side. Neither side may change the scope after it (`open`, `variable`, `universe`,
+  `set_option`, `include`, `omit` and local attributes, unless written `... in` or inside a block the
+  side closes), and neither side may add notation, syntax or `local`/`scoped` commands anywhere.
+  These checks read the code with comments and string literals blanked out, so text inside a comment
+  or string never counts as a command, and the worker refuses a hunk inside a comment that is not a
+  module docstring, or inside a string.
 
 The worker refuses the union when a qualified declaration name is declared twice in the result, both
 sides add the same paragraph, or a side adds a paragraph the file already has. Every conflicting hunk

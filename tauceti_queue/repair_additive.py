@@ -22,9 +22,11 @@ case). The insertion point then decides what is allowed:
   starts at column 0 with a command keyword, an attribute or a doc comment; anything indented continues
   it), the next line after the hunk starts a command too, so the hunk is not inside a proof or term,
   and no side ends in an attribute, a doc comment or ``... in`` that would attach to what follows.
-  Comments and ``namespace``/``section``/``mutual`` blocks must balance within each side, and no side
-  may change the scope that follows it (``open``, ``variable``, ``universe``, ``set_option``, notation,
-  ``include``/``omit`` outside a block it closes). A declaration name (with its namespace) declared
+  Comments, strings, brackets and ``namespace``/``section``/``mutual`` blocks must balance within
+  each side; no side may change the scope that follows it (``open``, ``variable``, ``universe``,
+  ``set_option``, ``include``/``omit``, local attributes, unless ``... in`` or inside a block it
+  closes) or add notation, syntax or ``local``/``scoped`` commands at all. These checks read a mask
+  of the code with comments and string literals blanked (``_mask``). A declaration name (with its namespace) declared
   twice in the union file, or a paragraph both sides add, rejects the conflict.
 
 The worker's whole-library verification build stays the safety net: a mechanical resolution can still
@@ -111,6 +113,7 @@ CONTINUATION = re.compile(r"^(?:\||where\b|termination_by\b|decreasing_by\b|deri
 # that the same side closes).
 SCOPE = re.compile(
     r"^(?:open|variable|universe|set_option|include|omit|export|suppress_compilation|unseal|seal|"
+    r"attribute\s*\[\s*(?:local|scoped)|"
     r"(?:local|scoped)\s+\S+|notation|infix|infixl|infixr|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules)\b"
 )
 OPENER = re.compile(r"^(?:noncomputable\s+)?(?:namespace|section|mutual)\b")
@@ -328,50 +331,109 @@ def _insertion(before: list[str], o: list[str], b: list[str], t: list[str], afte
     return "declarations", k, x, y
 
 
-def _scan(line: str, depth: int, kind: str | None) -> tuple[int, str | None]:
-    """Lean block-comment nesting after ``line``, and the outermost comment's kind (module / doc / plain)."""
-    i, n, in_string = 0, len(line), False
-    while i < n:
-        two = line[i : i + 2]
-        if depth == 0 and in_string:
-            if line[i] == "\\":
+@dataclasses.dataclass
+class Lex:
+    """Where a Lean lexer is between lines: block-comment nesting and the outermost comment's kind
+    (module / doc / plain), inside a string literal, and whether a doc comment was the last thing
+    closed with no code after it (so it documents whatever comes next)."""
+
+    depth: int = 0
+    kind: str | None = None
+    string: bool = False
+    doc_pending: bool = False
+
+    @property
+    def code(self) -> bool:
+        return not self.depth and not self.string
+
+
+def _mask(lines: list[str], lex: Lex | None = None) -> tuple[list[str], Lex]:
+    """``lines`` with every comment, and the contents of every string or character literal, replaced by
+    spaces (newlines kept), and the lexer state after them. Structural checks read only the mask, so
+    nothing in a comment or string counts as code."""
+    lex = dataclasses.replace(lex) if lex is not None else Lex()
+    masked = []
+    for line in lines:
+        out = []
+        i, n = 0, len(line)
+        while i < n:
+            c, two = line[i], line[i : i + 2]
+            if lex.depth:
+                if two == "/-":
+                    lex.depth += 1
+                    out.append("  ")
+                    i += 2
+                elif two == "-/":
+                    lex.depth -= 1
+                    out.append("  ")
+                    i += 2
+                    if not lex.depth:
+                        lex.doc_pending = lex.doc_pending or lex.kind == "doc"
+                        lex.kind = None
+                else:
+                    out.append(c if c == "\n" else " ")
+                    i += 1
+            elif lex.string:
+                if c == "\\":
+                    out.append("  " if i + 1 < n and line[i + 1] != "\n" else " ")
+                    i += 2
+                elif c == '"':
+                    lex.string = False
+                    out.append('"')
+                    i += 1
+                else:
+                    out.append(c if c == "\n" else " ")
+                    i += 1
+            elif two == "--":
+                out.append(" " * (len(line[i:].rstrip("\n"))) + ("\n" if line.endswith("\n") else ""))
+                break
+            elif two == "/-":
+                lex.depth, lex.kind = (
+                    1,
+                    "module" if line[i + 2 : i + 3] == "!" else "doc" if line[i + 2 : i + 3] == "-" else "plain",
+                )
+                out.append("  ")
                 i += 2
-                continue
-            if line[i] == '"':
-                in_string = False
-            i += 1
-            continue
-        if depth == 0 and two == "--":
-            break
-        if depth == 0 and line[i] == '"':
-            in_string = True
-            i += 1
-            continue
-        if two == "/-":
-            if depth == 0:
-                kind = "module" if line[i + 2 : i + 3] == "!" else "doc" if line[i + 2 : i + 3] == "-" else "plain"
-            depth += 1
-            i += 2
-            continue
-        if two == "-/" and depth:
-            depth -= 1
-            i += 2
-            if depth == 0:
-                kind = None
-            continue
-        i += 1
-    return depth, kind
+            elif c == '"':
+                lex.string, lex.doc_pending = True, False
+                out.append('"')
+                i += 1
+            elif (
+                c == "'"
+                and (i == 0 or not (line[i - 1].isalnum() or line[i - 1] in "_'!?."))
+                and _char_literal(line, i)
+            ):
+                end = _char_literal(line, i)
+                out.append("'" + " " * (end - i - 2) + "'")
+                lex.doc_pending = False
+                i = end
+            else:
+                if not c.isspace():
+                    lex.doc_pending = False
+                out.append(c)
+                i += 1
+        masked.append("".join(out))
+    return masked, lex
+
+
+def _char_literal(line: str, i: int) -> int:
+    """The end of a character literal starting at ``line[i]``, or 0."""
+    if line[i + 1 : i + 2] == "\\":
+        close = line.find("'", i + 3)
+        return close + 1 if 0 < close <= i + 12 else 0
+    return i + 3 if line[i + 2 : i + 3] == "'" and line[i + 1 : i + 2] not in ("", "\n") else 0
 
 
 def _comment_state(lines: list[str]) -> tuple[int, str | None]:
-    depth, kind = 0, None
-    for line in lines:
-        depth, kind = _scan(line, depth, kind)
-    return depth, kind
+    lex = _mask(lines)[1]
+    if lex.string:
+        raise Refused("inside a string literal")
+    return lex.depth, lex.kind
 
 
 def _comment_depth(lines: list[str]) -> int:
-    return _comment_state(lines)[0]
+    lex = _mask(lines)[1]
+    return lex.depth or int(lex.string)
 
 
 def _check_docstring_items(x: list[str], y: list[str]) -> None:
@@ -395,13 +457,8 @@ def _all_imports(side: list[str]) -> bool:
 
 def _in_header(prior: list[str]) -> bool:
     """Only the header (``module``, ``prelude``, imports and comments) comes before the insertion point."""
-    depth, kind = 0, None
-    for line in prior:
-        was = depth
-        depth, kind = _scan(line, depth, kind)
-        if was or depth or not line.strip() or line.lstrip().startswith("--") or line.lstrip().startswith("/-"):
-            continue
-        if not (IMPORT.match(line) or HEADER_LINE.match(line)):
+    for line in _mask(prior)[0]:
+        if line.strip() and not (IMPORT.match(line.rstrip()) or HEADER_LINE.match(line)):
             return False
     return True
 
@@ -435,18 +492,28 @@ def _sort_import_block(lines: list[str]) -> list[str]:
     return [*lines[:start], *(line + "\n" for line in imports), *lines[end:]]
 
 
+# Commands with a global effect on how later code parses or elaborates, refused anywhere in an insertion.
+GLOBAL_SYNTAX = re.compile(
+    r"^(?:(?:@\[[^\]]*\]\s*)?(?:scoped|local)\b|(?:@\[[^\]]*\]\s*)?"
+    r"(?:notation|infix|infixl|infixr|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules|declare_syntax_cat)\b)"
+)
+SCOPED_IN = re.compile(r"^(?:open|set_option|variable|omit|include|unseal)\b.*\bin$")
+
+
 def _check_commands(x: list[str], y: list[str], prior: list[str], rest: list[str]) -> None:
-    following = next(_code_lines(rest), None)
+    masked_prior, lex = _mask(prior)
+    if not lex.code:
+        raise Refused("inside a comment or string")
+    if lex.doc_pending:
+        raise Refused("the insertion point follows a doc comment")
+    if _dangling(masked_prior):
+        raise Refused("the insertion point follows an attribute, modifier or `in`")
+    following = next((line for line in _mask(rest, lex)[0] if line.strip()), None)
     if following is not None and not _starts_command(following):
         raise Refused("the insertion point is inside a declaration, proof or term")
-    previous = _last_code_line(prior)
-    if previous is not None and DANGLING.search(previous.strip()):
-        raise Refused("the insertion point follows an attribute, modifier or `in`")
-    if _ends_in_docstring(prior):
-        raise Refused("the insertion point follows a doc comment")
     for side in (x, y):
         _check_side(side)
-    paragraphs = {p for p in _paragraphs(x)}
+    paragraphs = set(_paragraphs(x))
     if any(p in paragraphs for p in _paragraphs(y)):
         raise Refused("both sides add the same paragraph")
     elsewhere = set(_paragraphs([*prior, *rest]))
@@ -454,103 +521,67 @@ def _check_commands(x: list[str], y: list[str], prior: list[str], rest: list[str
         raise Refused("a side adds a paragraph the file already has")
 
 
-def _last_code_line(lines: list[str]) -> str | None:
-    """The last code line (``_code_lines``) without its trailing line comment, or None."""
-    last = None
-    for line in _code_lines(lines):
-        last = line
-    return None if last is None else _without_line_comment(last)
+def _starts_command(masked: str) -> bool:
+    """A masked line at column 0 that starts a command."""
+    return not masked[:1].isspace() and bool(COMMAND.match(masked))
 
 
-def _without_line_comment(line: str) -> str:
-    """``line`` up to a ``--`` line comment outside a string literal."""
-    in_string, i = False, 0
-    while i < len(line):
-        if in_string and line[i] == "\\":
-            i += 2
-            continue
-        if line[i] == '"':
-            in_string = not in_string
-        elif not in_string and line.startswith("--", i):
-            return line[:i].rstrip() + "\n"
-        i += 1
-    return line
+def _last_command(masked: list[str]) -> str:
+    """The masked text of the last command in ``masked``: from its last column-0 line on."""
+    code = [line for line in masked if line.strip()]
+    starts = [i for i, line in enumerate(code) if not line[:1].isspace()]
+    return " ".join(line.strip() for line in code[starts[-1] if starts else 0 :])
 
 
-def _code_lines(lines: list[str]):
-    """The lines outside comments that are not themselves comments, blank or a comment's first line."""
-    depth, kind = 0, None
-    for line in lines:
-        was = depth
-        depth, kind = _scan(line, depth, kind)
-        stripped = line.strip()
-        if was or not stripped or stripped.startswith(("--", "/-")):
-            continue
-        yield line
-
-
-def _starts_command(line: str) -> bool:
-    """A code line (``_code_lines``) at column 0 that starts a command."""
-    return not line[:1].isspace() and bool(COMMAND.match(line))
-
-
-def _ends_in_docstring(lines: list[str]) -> bool:
-    """The last thing before the end, other than whitespace and line comments, is a ``/-- ... -/`` doc
-    comment, which would document whatever follows."""
-    depth, kind, closed = 0, None, None
-    for line in lines:
-        i, n = 0, len(line)
-        while i < n:
-            two = line[i : i + 2]
-            if depth == 0 and two == "--":
-                break
-            if two == "/-":
-                if depth == 0:
-                    kind = "doc" if line[i + 2 : i + 3] == "-" else "other"
-                depth += 1
-                i += 2
-                continue
-            if two == "-/" and depth:
-                depth -= 1
-                i += 2
-                if depth == 0 and kind == "doc":
-                    closed = kind  # an ordinary comment after it leaves it documenting what follows
-                continue
-            if depth == 0 and not line[i].isspace():
-                closed = None
-            i += 1
-    return closed == "doc"
+def _dangling(masked: list[str]) -> bool:
+    """The last command is only attributes and modifiers, or ends in ``in``: it applies to what follows."""
+    last = _last_command(masked)
+    if not last:
+        return False
+    if re.search(r"\bin$", last):
+        return True
+    previous = None
+    while previous != last:
+        previous = last
+        last = re.sub(r"^@\[[^\]]*\]\s*", "", last)
+        last = re.sub(r"^(?:private|protected|noncomputable|unsafe|partial|nonrec|public|meta)\b\s*", "", last)
+    return not last or last.startswith("@[")
 
 
 def _check_side(side: list[str]) -> None:
-    blocks = 0
-    first = next(_code_lines(side), None)
-    if first is None:
+    masked, lex = _mask(side)
+    if not lex.code:
+        raise Refused("an insertion leaves a comment or string open")
+    if lex.doc_pending:
+        raise Refused("an insertion ends in a doc comment")
+    code = [line for line in masked if line.strip()]
+    if not code:
         raise Refused("an insertion of comments only")
-    if not _starts_command(first) or END.match(first):
+    if not _starts_command(code[0]) or END.match(code[0]):
         raise Refused("an insertion that does not start a command")
-    if _comment_depth(side):
-        raise Refused("an insertion leaves a comment open")
-    for line in _code_lines(side):
+    text = "".join(masked)
+    for opener, closer in ("()", "[]", "{}", "⟨⟩"):
+        if text.count(opener) != text.count(closer):
+            raise Refused("an insertion with unbalanced brackets")
+    blocks = 0
+    for line in code:
         if not line[:1].isspace() and not COMMAND.match(line) and not CONTINUATION.match(line):
             raise Refused(f"an unrecognised top-level line: {line.strip()[:60]}")
-        # Commands are whitespace-insensitive, so an indented one (in a namespace block, say) counts too.
-        code = _without_line_comment(line).strip()
-        if OPENER.match(code):
+        stripped = line.strip()  # commands are whitespace-insensitive: an indented one counts too
+        if GLOBAL_SYNTAX.match(stripped):
+            raise Refused(f"an insertion adds syntax or scoped declarations: {stripped[:60]}")
+        if OPENER.match(stripped):
             blocks += 1
-        elif END.match(code):
+        elif END.match(stripped):
             blocks -= 1
             if blocks < 0:
                 raise Refused("an insertion closes a block it did not open")
-        elif blocks == 0 and SCOPE.match(code) and not re.search(r"\bin\b", code):
-            raise Refused(f"an insertion changes the scope after it: {code[:60]}")
+        elif blocks == 0 and SCOPE.match(stripped) and not SCOPED_IN.match(stripped):
+            raise Refused(f"an insertion changes the scope after it: {stripped[:60]}")
     if blocks:
         raise Refused("an insertion leaves a namespace or section open")
-    last_code = _last_code_line(side)
-    if last_code is not None and DANGLING.search(last_code.strip()):
+    if _dangling(masked):
         raise Refused("an insertion ends in an attribute, modifier or `in`")
-    if _ends_in_docstring(side):
-        raise Refused("an insertion ends in a doc comment")
 
 
 def _paragraphs(lines: list[str]) -> list[str]:
@@ -568,13 +599,8 @@ def _check_names(text: str) -> None:
     """No declaration name, qualified by its namespaces, is declared twice in ``text``."""
     seen: set[str] = set()
     stack: list[str] = []
-    depth, kind = 0, None
-    for line in text.splitlines(keepends=True):
-        was = depth
-        depth, kind = _scan(line, depth, kind)
+    for line in _mask(text.splitlines(keepends=True))[0]:
         stripped = line.strip()
-        if was or stripped.startswith(("--", "/-")):
-            continue
         opened = re.match(r"^(?:noncomputable\s+)?(namespace|section|mutual)\b\s*(\S*)", stripped)
         if opened:
             stack.append(opened.group(2) if opened.group(1) == "namespace" else "")
