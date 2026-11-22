@@ -1220,7 +1220,7 @@ def classify_survey(
                 budget=MAX_REVIEW_ERRORS,
                 ready_at=p.build_status_at,
                 preferred_reviewer=_scoreboard_reviewer(m),
-                rereview=bool(m.data.get("head_sha")),
+                rereview=str(m.data.get("head_sha") or p.head_oid) != p.head_oid,
             )
             if not p.automatic_bump and c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
@@ -1461,12 +1461,13 @@ def bump_prs(sv: Survey) -> set[int]:
 
 # Landing tiers: work is offered by how close it brings a PR to landing, not by a strict stage
 # cascade (which let several hundred visible fixes starve every review, and so every approval).
-# Automatic Mathlib bumps come first (tier 0, see cascade). Then conflict rebases (rare, and a
+# Automatic Mathlib bumps and bump-stage repairs come first (tier 0, see cascade). Then conflict rebases (rare, and a
 # conflicting PR cannot land; reviewing or fixing it first would be redone after the rebase moves
 # its head) and re-reviews of PRs already reviewed at an earlier head or author contests: the next
 # verdict can approve them. Then repairs of changes-requested or red PRs. Then first reviews, then
 # overlap work.
 LANDING_TIERS = {
+    "bump": 0,
     "rebase": 1,
     "lint-repair": 2,
     "progress": 2,
@@ -1523,8 +1524,15 @@ def cascade(sv: Survey, stages, listed=frozenset(), *, tier=None) -> list[tuple[
     if not listed:
         return pairs
     own = {p.number for p in sv.open_prs if sv.owns(p)} - bumps
-    for stage in ("rebase", "fix-ci", "fix", "review"):
-        slots = [i for i, (kind, c) in enumerate(pairs) if kind == stage and c.pr in own]
+    for stage, rank in {(kind, landing_tier(kind, c, bumps)) for kind, c in pairs}:
+        if stage not in ("rebase", "fix-ci", "fix", "review"):
+            continue
+        # Listed PRs move ahead only within their own stage and landing tier.
+        slots = [
+            i
+            for i, (kind, c) in enumerate(pairs)
+            if kind == stage and c.pr in own and landing_tier(kind, c, bumps) == rank
+        ]
         ranked = sorted((pairs[i] for i in slots), key=lambda pair: pair[1].pr not in listed)
         for i, pair in zip(slots, ranked, strict=True):
             pairs[i] = pair

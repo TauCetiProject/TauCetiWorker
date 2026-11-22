@@ -760,7 +760,11 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # and every other stage) keeps reporting the queue as it really is. Skipped outright when this
     # worker isn't reviewing anyway, so a `--only fix` round never logs a review it was not going to do.
     if want(opts.only, "review"):
-        throttle_review(sv, opts)
+        # multi_source offers one prepared survey once per landing tier; throttle its queue once,
+        # or each pass would judge the queue depth the previous pass already reduced.
+        if not getattr(sv, "_review_throttle_applied", False):
+            throttle_review(sv, opts)
+            sv._review_throttle_applied = True
         stamp = time.time()
         affinity_present = any(
             c.preferred_reviewer and c.ready_at is not None and max(0.0, stamp - c.ready_at) < REVIEW_AFFINITY_GRACE_S
@@ -806,7 +810,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     from .state_repair import retry_key
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
-    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages), tier=opts.landing_tier):
+    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages), tier=getattr(opts, "landing_tier", None)):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue
