@@ -353,6 +353,7 @@ class Candidate:
     bump_pending: bool = False  # an automatic bump taken before its build finished
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
+    rereview: bool = False  # a review of a PR already reviewed at an earlier head: closest to approval
     source_repository: RepositoryRef | None = None
     source_repository_id: int | None = None
     progress: dict | None = field(
@@ -1219,6 +1220,7 @@ def classify_survey(
                 budget=MAX_REVIEW_ERRORS,
                 ready_at=p.build_status_at,
                 preferred_reviewer=_scoreboard_reviewer(m),
+                rereview=str(m.data.get("head_sha") or p.head_oid) != p.head_oid,
             )
             if not p.automatic_bump and c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
@@ -1457,13 +1459,58 @@ def bump_prs(sv: Survey) -> set[int]:
     return {p.number for p in sv.open_prs if p.automatic_bump}
 
 
-def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate]]:
+# Landing tiers: work is offered by how close it brings a PR to landing, not by a strict stage
+# cascade (which let several hundred visible fixes starve every review, and so every approval).
+# Automatic Mathlib bumps and bump-stage repairs come first (tier 0, see cascade). Then conflict rebases (rare, and a
+# conflicting PR cannot land; reviewing or fixing it first would be redone after the rebase moves
+# its head) and re-reviews of PRs already reviewed at an earlier head or author contests: the next
+# verdict can approve them. Then repairs of changes-requested or red PRs. Then first reviews, then
+# overlap work.
+LANDING_TIERS = {
+    "bump": 0,
+    "rebase": 1,
+    "lint-repair": 2,
+    "progress": 2,
+    "fix-ci": 2,
+    "fix": 2,
+    "review": 3,
+    "overlap-fix": 5,
+    "overlap-scan": 6,
+}
+
+
+def landing_tier(stage: str, candidate: Candidate, bumps=frozenset()) -> int:
+    if candidate.pr in bumps:
+        return 0
+    if stage == "review" and (candidate.rereview or candidate.contest):
+        return 1
+    return LANDING_TIERS.get(stage, 7)
+
+
+def age_spread(candidates: list, rng=random) -> list:
+    """An oldest-first weighted random permutation (older PRs up to four times as likely to come
+    first), so concurrent workers spread over the queue while old work still drains first. Age is
+    the PR number's rank: numbers are assigned in creation order."""
+    if len(candidates) < 2:
+        return list(candidates)
+    ranked = sorted(candidates, key=lambda c: c.pr)
+    keyed = []
+    for index, candidate in enumerate(ranked):
+        weight = 1.0 + 3.0 * (len(ranked) - 1 - index) / (len(ranked) - 1)
+        draw = max(float(rng.random()), 1e-300)
+        keyed.append((-math.log(draw) / weight, candidate))
+    keyed.sort(key=lambda item: item[0])
+    return [candidate for _, candidate in keyed]
+
+
+def cascade(sv: Survey, stages, listed=frozenset(), *, tier=None) -> list[tuple[str, Candidate]]:
     """Actionable (stage, candidate) pairs in the order a round offers them.
 
     Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
     red build, review findings and pending reviews. Main moves faster than an ordinary queue
     position allows a bump round to start, so a bump that waits behind unrelated work goes stale
-    again before it can be admitted. Everything else follows in the usual stage order.
+    again before it can be admitted. Everything else follows in landing-tier order (LANDING_TIERS),
+    in stage order within a tier and the stage's own order within a stage. `tier` keeps one tier.
 
     Within each maintenance/review stage, prefer this account's listed PRs among its own
     non-bump positions. Other authors and automatic bumps keep their positions; no candidate
@@ -1471,12 +1518,21 @@ def cascade(sv: Survey, stages, listed=frozenset()) -> list[tuple[str, Candidate
     """
     bumps = bump_prs(sv)
     pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
-    pairs = [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+    pairs.sort(key=lambda pair: landing_tier(*pair, bumps))  # stable: stage order within a tier
+    if tier is not None:
+        pairs = [pair for pair in pairs if landing_tier(*pair, bumps) == tier]
     if not listed:
         return pairs
     own = {p.number for p in sv.open_prs if sv.owns(p)} - bumps
-    for stage in ("rebase", "fix-ci", "fix", "review"):
-        slots = [i for i, (kind, c) in enumerate(pairs) if kind == stage and c.pr in own]
+    for stage, rank in {(kind, landing_tier(kind, c, bumps)) for kind, c in pairs}:
+        if stage not in ("rebase", "fix-ci", "fix", "review"):
+            continue
+        # Listed PRs move ahead only within their own stage and landing tier.
+        slots = [
+            i
+            for i, (kind, c) in enumerate(pairs)
+            if kind == stage and c.pr in own and landing_tier(kind, c, bumps) == rank
+        ]
         ranked = sorted((pairs[i] for i in slots), key=lambda pair: pair[1].pr not in listed)
         for i, pair in zip(slots, ranked, strict=True):
             pairs[i] = pair

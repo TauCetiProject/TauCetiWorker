@@ -114,6 +114,7 @@ from .survey import (
     Counters,
     PRInfo,
     Survey,
+    age_spread,
     bump_prs,
     bust_progress_cache,
     cascade,
@@ -251,6 +252,9 @@ class RoundOpts:
     ignore_quota: bool = False
     quota_cmd: str | None = None  # current external admission policy, including source recovery
     loop_paced: bool = False  # soft pacing handoff; never permits telemetry-outage work
+    # Offer only this landing tier's work (survey.LANDING_TIERS); multi_source walks tiers across
+    # sources. None offers every tier in order.
+    landing_tier: int | None = None
 
     @property
     def agent_name(self) -> str:
@@ -747,14 +751,20 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         if stage in ("review", "overlap-scan", "overlap-fix"):
             continue
         candidates = sv.kind(stage).actionable
-        sv.kind(stage).actionable = spread_candidates(candidates)
+        sv.kind(stage).actionable = (
+            age_spread(candidates) if stage in ("rebase", "fix-ci", "fix") else spread_candidates(candidates)
+        )
 
     # The undocumented review throttles, off unless an expert asked for them. Applied here rather than
     # in survey() so they steer only what this round PICKS: the survey (and so `status`, the dashboard,
     # and every other stage) keeps reporting the queue as it really is. Skipped outright when this
     # worker isn't reviewing anyway, so a `--only fix` round never logs a review it was not going to do.
     if want(opts.only, "review"):
-        throttle_review(sv, opts)
+        # multi_source offers one prepared survey once per landing tier; throttle its queue once,
+        # or each pass would judge the queue depth the previous pass already reduced.
+        if not getattr(sv, "_review_throttle_applied", False):
+            throttle_review(sv, opts)
+            sv._review_throttle_applied = True
         stamp = time.time()
         affinity_present = any(
             c.preferred_reviewer and c.ready_at is not None and max(0.0, stamp - c.ready_at) < REVIEW_AFFINITY_GRACE_S
@@ -800,7 +810,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     from .state_repair import retry_key
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
-    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages)):
+    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages), tier=getattr(opts, "landing_tier", None)):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue
