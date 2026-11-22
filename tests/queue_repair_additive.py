@@ -240,7 +240,12 @@ class Refused(unittest.TestCase):
 
     def test_a_dangling_attribute_behind_a_comment_or_over_lines(self):
         base = "theorem a : True := trivial\n\ntheorem b : True := trivial\n"
-        for attribute in ("@[implemented_by r] /- for b -/\n", "@[simp,\n  nolint]\n", "@[\n  implemented_by r\n]\n"):
+        for attribute in (
+            "@[implemented_by r] /- for b -/\n",
+            "@[simp,\n  nolint]\n",
+            "@[\n  implemented_by r\n]\n",
+            "  @[simp]\n",
+        ):
             ours = base.replace("\ntheorem b", f"\ndef c : Nat := 1\n\n{attribute}theorem b")
             theirs = base.replace("\ntheorem b", "\ndef d : Nat := 3\n\ntheorem b")
             self.refused(ours, base, theirs, "attribute")

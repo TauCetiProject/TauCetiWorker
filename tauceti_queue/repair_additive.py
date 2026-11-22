@@ -538,18 +538,21 @@ def _last_command(masked: list[str]) -> str:
 
 
 def _dangling(masked: list[str]) -> bool:
-    """The last command is only attributes and modifiers, or ends in ``in``: it applies to what follows."""
-    last = _last_command(masked)
-    if not last:
-        return False
-    if re.search(r"\bin$", last):
+    """The last command, or the last line at any indentation, is only attributes and modifiers or ends
+    in ``in``: it applies to whatever follows."""
+    code = [line for line in masked if line.strip()]
+    return bool(code) and (_bare(_last_command(masked)) or _bare(code[-1].strip()))
+
+
+def _bare(text: str) -> bool:
+    if re.search(r"\bin$", text):
         return True
     previous = None
-    while previous != last:
-        previous = last
-        last = re.sub(r"^@\[[^\]]*\]\s*", "", last)
-        last = re.sub(r"^(?:private|protected|noncomputable|unsafe|partial|nonrec|public|meta)\b\s*", "", last)
-    return not last or last.startswith("@[")
+    while previous != text:
+        previous = text
+        text = re.sub(r"^@\[[^\]]*\]\s*", "", text)
+        text = re.sub(r"^(?:private|protected|noncomputable|unsafe|partial|nonrec|public|meta)\b\s*", "", text)
+    return not text or text.startswith("@[")
 
 
 def _check_side(side: list[str]) -> None:
