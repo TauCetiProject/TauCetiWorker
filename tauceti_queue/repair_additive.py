@@ -116,7 +116,9 @@ SCOPE = re.compile(
     r"attribute\s*\[\s*(?:local|scoped)|"
     r"(?:local|scoped)\s+\S+|notation|infix|infixl|infixr|prefix|postfix|macro|macro_rules|syntax|elab|elab_rules)\b"
 )
-OPENER = re.compile(r"^(?:noncomputable\s+)?(?:namespace|section|mutual)\b")
+# `noncomputable section`, `@[expose] public section` and the like open a block too.
+BLOCK_PREFIX = r"(?:@\[[^\]]*\]\s*)?(?:(?:noncomputable|public|private|meta)\s+)*"
+OPENER = re.compile(r"^" + BLOCK_PREFIX + r"(?:namespace|section|mutual)\b")
 END = re.compile(r"^end\b")
 DANGLING = re.compile(
     r"(?:^@\[.*\]$|\bin$|^(?:(?:private|protected|noncomputable|unsafe|partial|nonrec|public|meta)\s*)+$)"
@@ -606,7 +608,7 @@ def _check_names(text: str) -> None:
     stack: list[str] = []
     for line in _mask(text.splitlines(keepends=True))[0]:
         stripped = line.strip()
-        opened = re.match(r"^(?:noncomputable\s+)?(namespace|section|mutual)\b\s*(\S*)", stripped)
+        opened = re.match(r"^" + BLOCK_PREFIX + r"(namespace|section|mutual)\b\s*(\S*)", stripped)
         if opened:
             stack.append(opened.group(2) if opened.group(1) == "namespace" else "")
             continue

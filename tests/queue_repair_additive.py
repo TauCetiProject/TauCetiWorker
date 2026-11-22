@@ -177,6 +177,13 @@ class Refused(unittest.TestCase):
         theirs = HEADER.replace(anchor, anchor + "\ntheorem baz : True := trivial\n")
         self.refused(ours, HEADER, theirs, "changes the scope after it")
 
+    def test_an_unclosed_public_section(self):
+        base = "theorem a : True := trivial\n"
+        for opener in ("public section", "@[expose] public section"):
+            ours = base + f"\n{opener}\n\ndef c : Nat := 1\n"
+            theirs = base + "\ndef d : Nat := 2\n"
+            self.refused(ours, base, theirs, "namespace or section open")
+
     def test_an_unclosed_namespace(self):
         anchor = "end TauCeti\n"
         ours = HEADER.replace(anchor, anchor + "\nnamespace A\n\ntheorem a : True := trivial\n")
