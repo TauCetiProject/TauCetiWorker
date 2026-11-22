@@ -537,11 +537,19 @@ def _last_command(masked: list[str]) -> str:
     return " ".join(line.strip() for line in code[starts[-1] if starts else 0 :])
 
 
+TRAILING = re.compile(r"(?:@\[[^\]]*\]|\b(?:private|protected|noncomputable|unsafe|partial|nonrec|public|meta|in))$")
+
+
 def _dangling(masked: list[str]) -> bool:
     """The last command, or the last line at any indentation, is only attributes and modifiers or ends
     in ``in``: it applies to whatever follows."""
     code = [line for line in masked if line.strip()]
-    return bool(code) and (_bare(_last_command(masked)) or _bare(code[-1].strip()))
+    if not code:
+        return False
+    # Whatever the layout: the code ends in an attribute group, a modifier or `in`.
+    if TRAILING.search("".join(masked).rstrip()):
+        return True
+    return _bare(_last_command(masked)) or _bare(code[-1].strip())
 
 
 def _bare(text: str) -> bool:

@@ -245,6 +245,7 @@ class Refused(unittest.TestCase):
             "@[simp,\n  nolint]\n",
             "@[\n  implemented_by r\n]\n",
             "  @[simp]\n",
+            "  @[\n    implemented_by r\n  ]\n",
         ):
             ours = base.replace("\ntheorem b", f"\ndef c : Nat := 1\n\n{attribute}theorem b")
             theirs = base.replace("\ntheorem b", "\ndef d : Nat := 3\n\ntheorem b")
