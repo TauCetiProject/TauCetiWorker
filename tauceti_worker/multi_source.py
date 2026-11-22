@@ -233,27 +233,30 @@ def run_round(w, opts, *, use_fleet_focus=True):
         log("Forgejo agent rounds currently require host mode")
     random.shuffle(executable)
     from .config import ClaimCollision, GitHubUnavailable, SourceUnavailable
-    from .survey import bump_prs
+    from .survey import bump_prs, landing_tier
 
     stages = [stage for stage in AUTO_STAGES if want(opts.only, stage)]
+    # One choice per (landing tier, source), walked tier by tier across sources: a re-review on
+    # either forge is offered before any fix, a fix before any first review (survey.LANDING_TIERS).
     choices = []
     for name, worker, result in executable:
         bumps = bump_prs(result)
-        for index, stage in enumerate(stages):
-            candidates = result.kind(stage).actionable
-            if candidates:
-                priority = 0 if any(candidate.pr in bumps for candidate in candidates) else 1
-                choices.append((priority, index, name, worker, result, stage))
+        tiers = {}
+        for stage in stages:
+            for candidate in result.kind(stage).actionable:
+                tiers.setdefault(landing_tier(stage, candidate, bumps), []).append(stage)
+        for tier, tier_stages in tiers.items():
+            choices.append((tier, name, worker, result, list(dict.fromkeys(tier_stages))))
     complete = all(
         not value.github_failed and not value.dependency_wait and getattr(value, "target_inventory_available", True)
         for _, _, value in observations
     )
     execution_failed = set()
     collisions = False
-    for _, _, name, worker, result, stage in sorted(choices, key=lambda item: item[:2]):
+    for tier, name, worker, result, tier_stages in sorted(choices, key=lambda item: item[0]):
         if name in execution_failed:
             continue
-        selected = dataclasses.replace(opts, only=[stage])
+        selected = dataclasses.replace(opts, only=tier_stages, landing_tier=tier)
         try:
             if name == "github":
                 return ordinary_round(worker, selected, prepared_survey=result)

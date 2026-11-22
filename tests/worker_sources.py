@@ -815,6 +815,32 @@ ci="one/project"
         self.assertEqual(execute.call_count, 2)
         self.assertEqual(execute.call_args.args[1].only, ["review"])
 
+    def test_rereviews_on_either_source_come_before_any_fix(self):
+        import contextlib
+
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        observations = self.observations([], [])
+        observations[0][2].needs_fix.actionable.append(Candidate(1, "a" * 40))
+        observations[1][2].reviewable.actionable.append(Candidate(2, "b" * 40))
+        observations[1][2].reviewable.actionable.append(Candidate(3, "c" * 40, rereview=True))
+        for _, worker, _ in observations:
+            worker.cfg = self.cfg
+        options = RoundOpts(only=["fix", "review"], agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
+        from tauceti_worker.config import ClaimCollision
+
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+            patch(
+                "tauceti_worker.work_units.run_round", side_effect=[ClaimCollision("x"), ClaimCollision("x"), 0]
+            ) as execute,
+        ):
+            self.assertEqual(run_round(None, options), 0)
+        tiers = [(call.args[1].only, call.args[1].landing_tier) for call in execute.call_args_list]
+        self.assertEqual(tiers, [(["review"], 1), (["fix"], 2), (["review"], 3)])
+
     def test_shared_github_intentions_use_the_github_identity(self):
         from tauceti_worker.intentions import own_identities
 
