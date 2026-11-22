@@ -247,6 +247,8 @@ MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # an input waiting for a 
 # The evidence key of a `missing-source` refusal's dependency fingerprint: what `main` and the batches
 # introducing sources held for the refused gaps. The refused head is re-admitted when it changes.
 MISSING_SOURCE_WATCH = "missing_source_watch"
+# When the queue first refused this input's head as `missing-source` (`_hand_off_missing_sources`).
+MISSING_SOURCE_FIRST_REFUSED = "missing_source_first_refused"
 # The cancellation reason of a `missing-source` refusal whose dependencies changed: admission reads
 # the PR again and, if it would still admit the head, restores the input (`restore_missing_source`).
 MISSING_SOURCE_RECHECK = "missing-source-recheck"
@@ -4588,6 +4590,8 @@ class Controller:
                     "at": now,
                 },
             ][-8:]
+            # The input is one approved head, so the first refusal of it is the first entry here.
+            evidence.setdefault(MISSING_SOURCE_FIRST_REFUSED, now)
             try:
                 evidence[MISSING_SOURCE_WATCH] = self._dependency_watch([(row, listed)])[0]
             except chain.ChainError:
@@ -4905,26 +4909,32 @@ class Controller:
                 continue
             if not all(isinstance(g, dict) and g.get("path") and g.get("module") for g in gaps):
                 continue
-            refused = [
-                e.get("at")
-                for e in loads(row["evidence"], {}).get("merge_selection", [])
-                if e.get("kind") == "missing_source" and isinstance(e.get("at"), (int, float))
-            ]
-            if not refused or now - min(refused) < grace:
+            evidence = loads(row["evidence"], {})
+            first = evidence.get(MISSING_SOURCE_FIRST_REFUSED)
+            if not isinstance(first, (int, float)):
+                # Refusals recorded before the first-refusal time: the oldest history that remains.
+                refused = [
+                    e.get("at")
+                    for e in evidence.get("merge_selection", [])
+                    if e.get("kind") == "missing_source" and isinstance(e.get("at"), (int, float))
+                ]
+                first = min(refused) if refused else None
+            if first is None or now - first < grace:
                 continue
-            key = f"missing-source-handoff:{row['number']}:{row['head_sha']}"
+            key = f"recovery-missing-source:{row['number']}:{row['head_sha']}"
             if self.store.row("outbox", {"key": key}) is not None:
                 continue
-            self._recovery_request(
-                key,
-                row["number"],
-                row["head_sha"],
-                self._missing_source_text(gaps)
-                + " The merge queue keeps watching for the missing source, but nothing has provided it "
-                "since it refused this head; fix it on the branch and push.",
-                f"<!-- {COMMENT_MARKER} missing-source-handoff:{row['head_sha']} -->",
-            )
-            self.store.journal(now, "missing-source-handoff", number=row["number"], head=row["head_sha"])
+            with self.store.transaction():
+                self._recovery_request(
+                    key,
+                    row["number"],
+                    row["head_sha"],
+                    self._missing_source_text(gaps)
+                    + " The merge queue keeps watching for the missing source, but nothing has provided it "
+                    "since it refused this head; fix it on the branch and push.",
+                    f"<!-- {COMMENT_MARKER} missing-source-handoff:{row['head_sha']} -->",
+                )
+                self.store.journal(now, "missing-source-handoff", number=row["number"], head=row["head_sha"])
 
     def _recheck_missing_sources(self, now: float) -> None:
         """Re-admit `missing-source` refusals whose dependency fingerprint changed, at their original age.
@@ -5063,12 +5073,14 @@ class Controller:
         return "readmitted"
 
     def _recovery_request(self, key: str, number: Any, head: str, body: str, marker: str) -> None:
-        """Refuse `head` back to its author or worker: one head-bound recovery request comment, then
-        `needs-rebase` on and `ready-to-merge` off. Workers treat the pair as an integration-repair
-        handoff for exactly this head; a push makes it stale. The comment goes first, so the label
-        change that wakes GitHub's status reconciler finds it. Called with publication enabled."""
+        """Refuse `head` back to its author or worker: one outbox entry (kind `recovery`) that posts a
+        head-bound recovery request comment, then puts `needs-rebase` on and takes `ready-to-merge`
+        off. Workers treat the pair as an integration-repair handoff for exactly this head. One entry
+        keeps the two effects together across failures and restarts, and in order: the label change
+        that wakes GitHub's status reconciler always finds the comment. Delivered only while the PR
+        is open at `head` (`_perform`). Called with publication enabled."""
         self._enqueue(
-            "comment",
+            "recovery",
             key,
             {
                 "number": number,
@@ -5076,11 +5088,6 @@ class Controller:
                 "marker": marker,
                 "recovery_head": head,
             },
-        )
-        self._enqueue(
-            "labels",
-            f"{key}:labels",
-            {"number": number, "add": [NEEDS_REBASE_LABEL], "remove": [READY_TO_MERGE_LABEL]},
         )
 
     def _conflict_request(self, row: dict[str, Any], paths: list[str], now: float) -> None:
@@ -5093,7 +5100,7 @@ class Controller:
             "returns to ordinary CI and review, and needs approving again."
         )
         self._recovery_request(
-            f"conflict:{row['number']}:{row['head_sha']}",
+            f"recovery-conflict:{row['number']}:{row['head_sha']}",
             row["number"],
             row["head_sha"],
             body,
@@ -9842,7 +9849,7 @@ class Controller:
         if reason == EMPTY_COMMIT:
             # The PR stays open at its accepted head: hand that head to its worker.
             self._recovery_request(
-                f"withdrawn-comment:{member['input_id']}",
+                f"recovery-withdrawn:{member['input_id']}",
                 number,
                 member["accepted_head"],
                 comment + "\n\n" + marker,
@@ -10566,14 +10573,18 @@ class Controller:
             return "retained"
         if kind == "comment":
             return "comment " + str(
-                self.source.post_comment(
-                    repo,
-                    payload["number"],
-                    payload["body"],
-                    payload["marker"],
-                    **({"recovery_head": payload["recovery_head"]} if payload.get("recovery_head") else {}),
-                )
+                self.source.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )
+        if kind == "recovery":
+            head = payload["recovery_head"]
+            pull = self.source.fetch_pr(repo, payload["number"])
+            if pull.state != "open" or pull.head_sha != head:
+                return "stale-head"  # a push or close already answered the refusal of this head
+            comment = self.source.post_comment(
+                repo, payload["number"], payload["body"], payload["marker"], recovery_head=head
+            )
+            self.source.set_labels(repo, payload["number"], [NEEDS_REBASE_LABEL], [READY_TO_MERGE_LABEL])
+            return f"recovery {comment}"
         if kind == "labels":
             if "admission_generation" in payload:
                 work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})

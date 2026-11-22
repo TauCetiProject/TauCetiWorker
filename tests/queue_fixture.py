@@ -1320,7 +1320,7 @@ class WithdrawnAtAdoption(QueueFixture):
         restarted.recover()
         self.clock.advance(restarted.setting("outbox_retry_max_seconds"))
         restarted.tick()
-        self.assertEqual(restarted.store.count("outbox", {"key": "withdrawn-comment:2", "state": "done"}), 1)
+        self.assertEqual(restarted.store.count("outbox", {"key": "recovery-withdrawn:2", "state": "done"}), 1)
         self.assertEqual(len(self.github.comments_for(102)), 1)
 
     def test_a_withdrawn_member_merged_outside_the_queue_lands_with_its_batch(self):
@@ -2061,6 +2061,33 @@ class HeadOperations(QueueFixture):
         self.assertNotIn("ready-to-merge", self.github.labels[101])
         self.assertIsNone(self.head())
 
+    def conflicting_approval(self):
+        self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
+        self.approve(
+            101, {"Shared.lean": "line one\nline two by 101\nline three\n"}, start=self.repo.rev_parse("main~1")
+        )
+
+    def test_a_failed_recovery_comment_leaves_the_labels_for_its_retry(self):
+        self.conflicting_approval()
+        with patch.object(self.github, "post_comment", side_effect=RuntimeError("comment refused")):
+            self.tick(2)
+        self.assertNotIn("needs-rebase", self.github.labels.get(101, set()), "labels never precede the comment")
+        self.clock.advance(self.controller.setting("outbox_retry_max_seconds"))
+        self.tick()
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertEqual(len(self.github.comments_for(101)), 1)
+
+    def test_a_recovery_request_for_a_head_already_replaced_is_dropped(self):
+        self.conflicting_approval()
+        self.tick(2)
+        entry = self.controller.store.row("outbox", {"kind": "recovery"})
+        payload = json.loads(entry["payload"])
+        self.github.labels[101] = {"ready-to-merge"}
+        self.github.prs[101]["head_sha"] = "f" * 40  # delivery delayed past a push
+        self.assertEqual(self.controller._perform("recovery", payload, self.clock()), "stale-head")
+        self.assertEqual(self.github.labels[101], {"ready-to-merge"}, "the new head's labels are not touched")
+        self.assertEqual(len(self.github.comments_for(101)), 1)
+
     def test_a_conflict_request_removes_ready_to_merge_and_quotes_no_markers(self):
         self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
         self.approve(
@@ -2261,6 +2288,12 @@ class MissingSource(QueueFixture):
         [refusal] = self.github.comments_for(101)
         self.assertNotIn("<!--tauceti-rebase:v1", refusal["body"], "the recheck gets the first window")
         self.assertNotIn("needs-rebase", self.github.labels.get(101, set()))
+        row = next(r for r in self.controller.inputs() if r["number"] == 101)
+        evidence = json.loads(row["evidence"])
+        # The grace period runs from the first refusal, which survives truncated selection history.
+        self.assertEqual(evidence["missing_source_first_refused"], evidence["merge_selection"][0]["at"])
+        evidence["merge_selection"] = [dict(evidence["merge_selection"][0], at=self.clock() + 10**6)]
+        self.controller.store.update("inputs", {"id": row["id"]}, evidence=json.dumps(evidence))
         self.clock.advance(self.controller.setting("missing_source_handoff_seconds"))
         self.tick(2)
         handoffs = [c for c in self.github.comments_for(101) if c["body"].startswith("Merge-queue recovery for head")]

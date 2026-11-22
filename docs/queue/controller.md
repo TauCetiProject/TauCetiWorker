@@ -213,12 +213,13 @@ Closing, drafting, pushing to or withdrawing a refused PR drops its refusal from
 Refusals that need a new head go back to the PR's worker as a head-bound recovery request: a
 comment beginning ``Merge-queue recovery for head `abc1234`: `` with a
 `<!--tauceti-rebase:v1 HEAD-->` line for the refused head, then `needs-rebase` on and
-`ready-to-merge` off. The source adapter appends that marker itself and escapes any quoted
+`ready-to-merge` off. Both effects are one outbox entry (kind `recovery`), retried together and
+dropped (`stale-head`) once the PR is closed or no longer at the refused head. The source adapter appends that marker itself and escapes any quoted
 `<!--tauceti-` text, so only the request's own head is marked. A `conflicts-with-main` refusal and
 an `empty-commit` withdrawal at adoption post the request at once, in place of their old comments.
 A `missing-source` refusal keeps its ordinary comment and recheck, and gets the request only once it
-has stood `missing_source_handoff_seconds` (default six hours) at its head
-(`_hand_off_missing_sources`, journal `missing-source-handoff`, once per head). The delay matters
+has stood `missing_source_handoff_seconds` (default six hours) since its first refusal
+(`evidence.missing_source_first_refused`; `_hand_off_missing_sources`, journal `missing-source-handoff`, once per head). The delay matters
 on Forgejo, where the queue's own recovery request holds the head in admission: the recheck gets
 the early window, when a provider is most likely to land, and the worker gets the PR when nothing
 has. On GitHub the queue is not a recovery-hold author, so the recheck can still re-admit the head
