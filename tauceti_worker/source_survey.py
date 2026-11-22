@@ -259,6 +259,9 @@ def index_order(result, counters, stages, pending):
         for p in _nondraft(result)
         if p.number in owned | reviewable
     ]
+    # Random within each group, so a few PRs that persistently fail to read cannot hold the front
+    # of every refresh; the sort is stable.
+    random.shuffle(entries)
     entries.sort(key=lambda entry: (not entry[0].automatic_bump, entry[0].number not in owned))
     return entries
 
@@ -293,17 +296,17 @@ def refresh_index(rs, entries):
         if not held:
             return 0, len(stale)
         for index, (p, stages) in enumerate(stale):
+            failed = False
             if not rs.current(p.number):
                 reads += 1
-                if rs.gh_meta(p.number).provenance in ("stale", "fetch_failed"):
-                    failures += 1
-                    if failures >= REFRESH_FAILURE_LIMIT:
-                        return reads, len(stale) - index - 1
-                    continue
-                failures = 0
-            if _wants_thread(rs, p, stages) and not rs.current(p.number, contest=True):
+                failed = rs.gh_meta(p.number).provenance in ("stale", "fetch_failed")
+            if not failed and _wants_thread(rs, p, stages) and not rs.current(p.number, contest=True):
                 reads += 1
                 rs.newest_contest_reply(p.number)
+                failed = not rs.current(p.number, contest=True)  # a failed thread read stores nothing
+            failures = failures + 1 if failed else 0
+            if failures >= REFRESH_FAILURE_LIMIT:
+                return reads, len(stale) - index - 1
     return reads, 0
 
 

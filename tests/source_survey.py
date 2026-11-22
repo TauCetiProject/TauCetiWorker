@@ -562,6 +562,40 @@ class SharedIndexSurveys(unittest.TestCase):
         self.assertEqual(len(self.detail), 3)
         self.assertEqual(result.detail_deferred, self.OPEN - 3)
 
+    def test_failing_thread_reads_end_the_refresh(self):
+        from tauceti_tools.forge import Incomplete
+
+        self.reviewed = {n: "a" * 40 for n in self.heads}  # clean heads: every thread is read
+
+        def failing(repository, number):
+            self.detail.append(("reviews", number))
+            raise Incomplete("transient", status=502)
+
+        self.api.reviews.side_effect = failing
+        result = self.survey(seed=0)
+        self.assertEqual(len([1 for endpoint, _ in self.detail if endpoint == "reviews"]), 3)
+        self.assertEqual(result.detail_deferred, self.OPEN - 3)
+
+    def test_a_read_that_started_before_a_peers_bust_cannot_republish(self):
+        import time
+
+        from tauceti_worker.review_state import ReviewState
+
+        self.reviewed = {n: "a" * 40 for n in self.heads}
+        self.survey(seed=0)
+        reader, writer = ReviewState(self.cfg, self.source), ReviewState(self.peer("peer"), self.source)
+        prs = [p for p in self.survey(seed=0).open_prs]
+        reader.observe(prs)
+        writer.observe(prs)
+        self.assertTrue(reader.current(5))
+        started = time.time() - 1
+        writer.bust(5)
+        self.assertFalse(reader.current(5))
+        reader._write_sidecar(reader._key_path(5), 5, {"status": "present", "meta": {}}, observed_at=started)
+        self.assertFalse(writer.current(5), "the older observation must not land over the bust")
+        reader._write_sidecar(reader._key_path(5), 5, {"status": "present", "meta": {}})
+        self.assertTrue(writer.current(5), "a read after the bust is indexed")
+
     def test_ambiguous_owned_mergeability_checks_are_bounded(self):
         from tauceti_worker.constants import MERGEABILITY_CHECKS
         from tauceti_worker.forgejo_worker import ForgejoWorkerSource

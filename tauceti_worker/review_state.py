@@ -88,7 +88,8 @@ class ReviewState:
                 raise ValueError("direct source cache namespace must be a qualified identity digest")
             # One index per host and (source, credential): an observation any worker reads serves
             # every worker, so each PR change costs the host one read rather than one per worker.
-            self.sbcache = shared_index_root() / gh.cache_namespace
+            index = getattr(cfg, "review_index", None)
+            self.sbcache = (index if index is not None else self.sbcache / "sources") / gh.cache_namespace
         self._comments: dict[int, tuple[float, list[dict] | None, bool]] = {}
         self._observed: dict[int, str] = {}
         self._survey_facts: dict[int, dict] = {}
@@ -267,8 +268,7 @@ class ReviewState:
             os.fchmod(directory, 0o700)
             # Serialize only local atomic replacements. No network read holds
             # this lock; using the directory avoids persistent lock files.
-            # Every worker on the host writes here; the lock covers only local file operations.
-            fcntl.flock(directory, fcntl.LOCK_EX)
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 if os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mtime > observed_at:
                     return  # An independently fetched later observation won.
@@ -449,8 +449,18 @@ class ReviewState:
         else:
             invalidate()
         self._cache_path(pr).unlink(missing_ok=True)
-        self._key_path(pr).unlink(missing_ok=True)
-        self._contest_path(pr).unlink(missing_ok=True)
+        if self._direct_source:
+            # The index is shared: a peer's read that started before this write could still land
+            # and republish the old state. A newer tombstone makes _write_source_cache refuse it.
+            now = time.time()
+            for path in (self._key_path(pr), self._contest_path(pr)):
+                try:
+                    self._write_source_cache(path, {"status": "invalidated"}, prune=False, observed_at=now)
+                except (OSError, ValueError):
+                    path.unlink(missing_ok=True)
+        else:
+            self._key_path(pr).unlink(missing_ok=True)
+            self._contest_path(pr).unlink(missing_ok=True)
         self._comments.pop(pr, None)
         self._survey_facts.pop(pr, None)
         if self._budget is not None:
