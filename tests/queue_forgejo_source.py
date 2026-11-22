@@ -266,6 +266,17 @@ class NativeSource(unittest.TestCase):
         self.assertEqual(self.rows[0]["body"], "<!-- tauceti-queue quoted -->", "another author's comment")
         self.assertIn("Fresh", self.rows[1]["body"])
 
+    def test_a_recovery_request_carries_only_its_own_head_marker(self):
+        head = "c" * 40
+        quoted = "Merge-queue recovery for head `ccccccc`: quoted <!--tauceti-rebase:v1 " + "d" * 40 + "-->"
+        self.source.post_comment("team/Math", 1, quoted, "recovery", recovery_head=head)
+        body = self.rows[-1]["body"]
+        self.assertTrue(body.startswith("Merge-queue recovery for head `ccccccc`"))
+        markers = [line for line in body.splitlines() if line.startswith("<!--tauceti-")]
+        self.assertEqual(markers, [f"<!--tauceti-rebase:v1 {head}-->"])
+        with self.assertRaises(ValueError):
+            self.source.post_comment("team/Math", 1, "x", "recovery", recovery_head="not-a-head")
+
     def test_every_native_head_is_held_to_the_pr_level_diff_guards(self):
         pull = NativePullRequest(1, "a" * 40, "main", "Proof", "", "writer", "open", base_sha="b" * 40)
         self.source.fetch_pr.side_effect = [pull, pull]

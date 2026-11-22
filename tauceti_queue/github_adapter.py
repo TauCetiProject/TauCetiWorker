@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 
 from . import chain, declaration_names, diagnostics, diff_guard, github_app, ports
-from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
+from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status, recovery_body
 
 API = github_app.API
 API_VERSION = "2022-11-28"
@@ -1872,8 +1872,11 @@ class GitHubAdapter:
 
     # -- comments and labels
 
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
+    def post_comment(self, repo: str, number: int, body: str, marker: str, *, recovery_head: str | None = None) -> str:
         """Post `body` once per `marker`: a comment already carrying the marker is edited instead."""
+        if recovery_head is not None:
+            # tauceti-queue[bot] is a trusted recovery author: only the request's own head is marked.
+            body = recovery_body(body, recovery_head)
         hidden = comment_marker(marker)
         existing = self.find_comment(repo, number, hidden)
         full = f"{body.rstrip()}\n\n{hidden}\n"
