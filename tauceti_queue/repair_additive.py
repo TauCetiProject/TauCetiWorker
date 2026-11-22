@@ -537,7 +537,23 @@ def _last_command(masked: list[str]) -> str:
     return " ".join(line.strip() for line in code[starts[-1] if starts else 0 :])
 
 
-TRAILING = re.compile(r"(?:@\[[^\]]*\]|\b(?:private|protected|noncomputable|unsafe|partial|nonrec|public|meta|in))$")
+TRAILING = re.compile(r"\b(?:private|protected|noncomputable|unsafe|partial|nonrec|public|meta|in)$")
+
+
+def _ends_in_attribute(joined: str) -> bool:
+    """``joined`` (masked code) ends with a whole ``@[...]`` group, nested brackets included."""
+    start = joined.find("@[")
+    while start >= 0:
+        depth, i = 0, start + 1
+        while i < len(joined):
+            depth += {"[": 1, "]": -1}.get(joined[i], 0)
+            if depth == 0:
+                break
+            i += 1
+        if depth == 0 and not joined[i + 1 :].strip():
+            return True
+        start = joined.find("@[", start + 2)
+    return False
 
 
 def _dangling(masked: list[str]) -> bool:
@@ -547,7 +563,8 @@ def _dangling(masked: list[str]) -> bool:
     if not code:
         return False
     # Whatever the layout: the code ends in an attribute group, a modifier or `in`.
-    if TRAILING.search("".join(masked).rstrip()):
+    joined = "".join(masked).rstrip()
+    if TRAILING.search(joined) or _ends_in_attribute(joined):
         return True
     return _bare(_last_command(masked)) or _bare(code[-1].strip())
 

@@ -246,6 +246,7 @@ class Refused(unittest.TestCase):
             "@[\n  implemented_by r\n]\n",
             "  @[simp]\n",
             "  @[\n    implemented_by r\n  ]\n",
+            "  @[aesop safe apply (rule_sets := [default])]\n",
         ):
             ours = base.replace("\ntheorem b", f"\ndef c : Nat := 1\n\n{attribute}theorem b")
             theirs = base.replace("\ntheorem b", "\ndef d : Nat := 3\n\ntheorem b")
