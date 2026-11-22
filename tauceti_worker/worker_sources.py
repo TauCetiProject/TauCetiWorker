@@ -172,6 +172,8 @@ def native_source(cfg):
 
 
 def source_config(cfg, source):
+    from .review_state import shared_index_root
+
     suffix = hashlib.sha256(
         json.dumps({"repository": source.repository.key, "id": source.identity.native_id}, sort_keys=True).encode()
     ).hexdigest()[:24]
@@ -183,6 +185,7 @@ def source_config(cfg, source):
         store_dir=cfg.store_dir / "sources" / suffix,
         sbcache=state / "cache/scoreboard",
         logdir=cfg.logdir / "sources" / suffix,
+        review_index=shared_index_root(),
     )
 
 

@@ -270,6 +270,9 @@ class Config:
     sbcache: Path  # scoreboard meta cache dir
     logdir: Path  # HERE/logs/<wid>
     quota_cache: Path  # raw provider usage responses
+    # A direct source's host-shared review-state index root (worker_sources.source_config sets it);
+    # None keeps the review state under this worker's own sbcache.
+    review_index: Path | None = None
 
     @property
     def store(self) -> Path:
