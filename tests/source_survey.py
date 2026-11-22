@@ -670,8 +670,9 @@ class SharedIndexSurveys(unittest.TestCase):
         rs = ReviewState(self.cfg, self.source)
         for number in read:
             rs._contest_path(number).unlink()
-        self.survey(seed=0)
+        result = self.survey(seed=0)
         self.assertFalse(self.read_prs() & read, "answered from the shared cache")
+        self.assertEqual(result.detail_deferred, 0, "a reused thread read is not a failure")
         # Rewriting the sidecar now would restart the clock on an observation the shared cache aged.
         self.assertFalse(any(rs._contest_path(number).exists() for number in read))
 

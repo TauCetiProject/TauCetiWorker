@@ -94,6 +94,9 @@ class ReviewState:
         self._observed: dict[int, str] = {}
         self._survey_facts: dict[int, dict] = {}
         self._budget: CacheOnly | None = None
+        # PRs whose newest thread read failed; refresh_index counts these, not the absence of an
+        # indexed thread (a read the shared read cache answered is not re-indexed, by design).
+        self.thread_failures: set[int] = set()
 
     @contextlib.contextmanager
     def cache_only(self):
@@ -531,7 +534,9 @@ class ReviewState:
         except _Deferred:
             return None  # unread this survey; dispatch re-reads contests for the PR it selects
         if rcs is None:
+            self.thread_failures.add(pr)
             return None  # a fetch FAILURE answers nothing and must not be cached as "no contest"
+        self.thread_failures.discard(pr)
         best = self._newest_contest(rcs)
         if not (self._direct_source and reused):  # as for scoreboards: do not reset a reused observation's age
             self._write_sidecar(

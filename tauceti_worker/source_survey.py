@@ -303,7 +303,7 @@ def refresh_index(rs, entries):
             if not failed and _wants_thread(rs, p, stages) and not rs.current(p.number, contest=True):
                 reads += 1
                 rs.newest_contest_reply(p.number)
-                failed = not rs.current(p.number, contest=True)  # a failed thread read stores nothing
+                failed = p.number in rs.thread_failures
             failures = failures + 1 if failed else 0
             if failures >= REFRESH_FAILURE_LIMIT:
                 return reads, len(stale) - index - 1
