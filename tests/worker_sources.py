@@ -981,10 +981,15 @@ ci="one/project"
             ("github", ["overlap-scan"], 6),
         ]
         self.assertEqual(walk({"TAUCETI_REVIEW_FIRST": "1"}), reviewing)
-        # With a forge preference too, the preferred forge leads inside each band.
+        # With a forge preference too, the preferred forge leads inside each step.
         self.assertEqual(
             walk({"TAUCETI_REVIEW_FIRST": "1", "TAUCETI_PREFER_FORGE": "forgejo"}),
             [*reviewing[:2], reviewing[3], reviewing[2], *reviewing[4:]],
+        )
+        # A preference never puts a first review ahead of the other forge's re-review.
+        self.assertEqual(
+            walk({"TAUCETI_REVIEW_FIRST": "1", "TAUCETI_PREFER_FORGE": "github"}),
+            reviewing,
         )
 
     def test_review_first_survives_the_loop_handoff(self):

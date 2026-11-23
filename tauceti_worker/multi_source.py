@@ -272,7 +272,8 @@ def run_round(w, opts, *, use_fleet_focus=True):
     def order(item):
         tier, name, reviewing = item[0], item[1], item[5]
         band = 0 if tier == 0 else 2 if tier >= LANDING_TIERS["overlap-fix"] else 1
-        return band, not reviewing, band == 1 and bool(preferred) and name != preferred, tier
+        # Review-first choices go re-reviews then first reviews; the preference orders forges inside each.
+        return band, not reviewing, tier if reviewing else 0, band == 1 and bool(preferred) and name != preferred, tier
 
     for tier, name, worker, result, tier_stages, _ in sorted(choices, key=order):
         if name in execution_failed:
