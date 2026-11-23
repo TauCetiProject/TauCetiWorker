@@ -493,10 +493,13 @@ class ClientCompatibility(unittest.TestCase):
             native = root / "store/bin/.claude-wrapped"
             native.parent.mkdir(parents=True)
             native.write_bytes(b"\x7fELF fixture")
+            bash = root / "bash/bin/bash"
+            bash.parent.mkdir(parents=True)
+            bash.write_bytes(b"\x7fELF bash")
             # The form of Nix's makeWrapper output, as installed for claude-code.
             nix = root / "store/bin/claude"
             nix.write_text(
-                "#! /nix/store/x-bash/bin/bash -e\n"
+                f"#! {bash} -e\n"
                 "export DISABLE_AUTOUPDATER='1'\n"
                 "export FORCE_AUTOUPDATE_PLUGINS=${FORCE_AUTOUPDATE_PLUGINS-'1'}\n"
                 "PATH=${PATH:+':'$PATH':'}\n"
@@ -515,7 +518,8 @@ class ClientCompatibility(unittest.TestCase):
                 patch.object(clients.subprocess, "run", return_value=run) as version,
             ):
                 value = clients.fingerprint("claude")
-            self.assertEqual(list(value["files"]), [str(shim), str(nix), str(native)])
+            sh = str(Path("/bin/sh").resolve())
+            self.assertEqual(list(value["files"]), [str(shim), sh, str(nix), str(bash), str(native)])
             self.assertEqual(version.call_args.args[0], [str(shim), "--version"])
             with (
                 patch.object(clients, "client_path", return_value=shim),
@@ -531,6 +535,14 @@ class ClientCompatibility(unittest.TestCase):
                 f'source /tmp/env\nexec {native} "$@"',
                 f'X=1; exec {native} "$@"',
                 f'exec {native} "$@" > /tmp/out',
+                f'X=\\" /tmp/hidden #"\nexec {native} "$@"',  # an escaped quote hides a command
+                f"X='\n#'\n/tmp/hidden\nexec {native} \"$@\"",  # a quote spanning lines
+                f'export LD_PRELOAD=/tmp/plugin.so\nexec {native} "$@"',
+                f'LD_PRELOAD=plugin.so exec {native} "$@"',
+                f'export BASH_ENV=/nix/store/x-env\nexec {native} "$@"',
+                f"PATH='/tmp/bin':$PATH\nexec {native} \"$@\"",  # a mutable path
+                f"PATH='/nix/store/../../tmp/bin'$PATH\nexec {native} \"$@\"",
+                'exec "/opt/$CHANNEL/client" "$@"',  # the executed path is not the hashed one
             ):
                 shim.write_text(f"#!/bin/sh\n{body}\n")
                 self.assertIsNone(clients.shim_target(shim), body)
@@ -539,6 +551,9 @@ class ClientCompatibility(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "native client"),
                 ):
                     clients.fingerprint("claude")
+            for shebang in ("#!/bin/bash /tmp/hidden", "#!/usr/bin/env python3", "#!sh"):
+                shim.write_text(f'{shebang}\nexec {native} "$@"\n')
+                self.assertIsNone(clients.shim_target(shim), shebang)
             shim.write_text(f'#!/bin/sh\nexec {root}/missing "$@"\n')
             with (
                 patch.object(clients, "client_path", return_value=shim),
@@ -563,7 +578,8 @@ class ClientCompatibility(unittest.TestCase):
                 patch.object(clients.subprocess, "run", return_value=SimpleNamespace(stdout="codex-cli 0.167.0\n")),
             ):
                 files = clients.fingerprint("codex")["files"]
-            self.assertEqual(list(files), [str(shim), str(launcher), str(binary)])
+            sh = str(Path("/bin/sh").resolve())
+            self.assertEqual(list(files), [str(shim), sh, str(launcher), str(binary)])
 
     def test_missing_stale_and_changed_clients_are_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:

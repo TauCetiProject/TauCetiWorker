@@ -36,37 +36,61 @@ def client_path(provider: str) -> Path:
     return Path(path).resolve()
 
 
-# An environment shim: only assignments and exports, then one exec of an absolute path with
-# the caller's arguments. Nix's makeWrapper output and a one-line launcher shim have this form.
-SHIM_EXEC = re.compile(r'(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*exec\s+(?:-a\s+"\$0"\s+)?"?(/[^"\s]+)"?\s+"\$@"')
-SHIM_ASSIGNMENT = re.compile(r"export\s+[A-Za-z_][A-Za-z0-9_]*|(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=\S*")
+# An environment shim: a POSIX shell script that only assigns or exports variables and then
+# execs an absolute path with the caller's arguments. Nix's makeWrapper output and a one-line
+# launcher shim have this form. Every file it can run must be hashed or immutable: its
+# interpreter and target are hashed, and any other path it names must be in the Nix store.
+SHIM_INTERPRETER = re.compile(r"#!\s*(/[^\s]+/(?:sh|bash|dash))(?:\s+-e)?\s*")
+SHIM_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+SHIM_PREFIX = rf"{SHIM_NAME}=\S*"
+SHIM_EXEC = re.compile(rf'((?:{SHIM_PREFIX}\s+)*)exec\s+(?:-a\s+"\$0"\s+)?("?)(/[^"\s$]+)\2\s+"\$@"')
+SHIM_ASSIGNMENT = re.compile(rf"export\s+{SHIM_NAME}|(?:export\s+)?{SHIM_PREFIX}")
 SHIM_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+SHIM_STORE_PATH = re.compile(r"/nix/store/[^:'\"\s}]*")
+# Variables that make the loader or shell run code no path in the shim need name.
+SHIM_REFUSED = re.compile(r"(?:export\s+)?(?:LD_PRELOAD|LD_AUDIT|BASH_ENV|ENV|DYLD_\w*)(?:=|$)")
 SHIM_LIMIT = 64 * 1024
 SHIM_DEPTH = 4
 
 
-def shim_target(path: Path) -> Path | None:
-    """The absolute target of an environment shim, or None for anything else.
+def shim_word(text: str) -> bool:
+    """Whether an assignment, with its quoted text removed, is one word naming only store paths."""
+    if SHIM_REFUSED.match(text):
+        return False
+    bare = SHIM_QUOTED.sub("", text)
+    if "'" in bare or '"' in bare or not SHIM_ASSIGNMENT.fullmatch(bare):
+        return False
+    # A slash left once store paths are removed is a mutable path, unless it is the operator in
+    # makeWrapper's `${PATH/':'...'':'/':'}`, followed by a quote.
+    if any(".." in store for store in SHIM_STORE_PATH.findall(text)):
+        return False
+    rest = SHIM_STORE_PATH.sub("", text)
+    return all(rest[i + 1 : i + 2] == "'" for i, c in enumerate(rest) if c == "/")
 
-    The shim itself is hashed with its target, so this follows only scripts whose every
-    effect is visible in their own bytes: no command substitution, pipelines or lists."""
+
+def shim_target(path: Path) -> tuple[Path, Path] | None:
+    """The interpreter and absolute target of an environment shim, or None for anything else."""
     with path.open("rb") as stream:
         data = stream.read(SHIM_LIMIT + 1)
-    if len(data) > SHIM_LIMIT or not data.startswith(b"#!"):
+    if len(data) > SHIM_LIMIT:
         return None
     try:
-        lines = data.decode("utf-8").splitlines()[1:]
+        lines = data.decode("utf-8").splitlines()
     except UnicodeDecodeError:
         return None
-    body = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
-    if not body or any(c in "".join(body) for c in ("`", "$(", ";", "&", "|", "<", ">")):
+    interpreter = SHIM_INTERPRETER.fullmatch(lines[0]) if lines else None
+    if interpreter is None:
+        return None
+    body = [line.strip() for line in lines[1:] if line.strip() and not line.strip().startswith("#")]
+    if not body or any(c in "".join(body) for c in ("\\", "`", "$(", ";", "&", "|", "<", ">")):
         return None
     match = SHIM_EXEC.fullmatch(body[-1])
-    # Quoted text cannot run anything here, so an assignment is one word once it is removed:
-    # `NAME=value command` is a command, not an assignment.
-    if match is None or not all(SHIM_ASSIGNMENT.fullmatch(SHIM_QUOTED.sub("", line)) for line in body[:-1]):
+    if match is None:
         return None
-    return Path(match[1])
+    assignments = body[:-1] + match[1].split()
+    if not all(shim_word(line) for line in assignments):
+        return None
+    return Path(interpreter[1]), Path(match[3])
 
 
 def fingerprint(provider: str) -> dict:
@@ -79,12 +103,13 @@ def fingerprint(provider: str) -> dict:
     # claim verified identity.
     files = {str(path): file_digest(path)}
     for _ in range(SHIM_DEPTH):
-        target = shim_target(path)
-        if target is None:
+        shim = shim_target(path)
+        if shim is None:
             break
-        path = target.resolve()
-        if not path.is_file():
-            raise ValueError("audit client shim targets a missing file")
+        interpreter, path = (p.resolve() for p in shim)
+        if not interpreter.is_file() or not path.is_file():
+            raise ValueError("audit client shim names a missing file")
+        files[str(interpreter)] = file_digest(interpreter)
         files[str(path)] = file_digest(path)
     managed = path.parent.parent / "dist/current/bin/codex"
     if provider == "codex" and managed.is_file():
