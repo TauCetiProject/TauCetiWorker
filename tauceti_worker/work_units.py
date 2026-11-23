@@ -53,6 +53,7 @@ from .config import (
     Die,
     GitHubUnavailable,
     NoProgress,
+    ReviewSourceUnavailable,
     SharedStateUnavailable,
     environment,
     extra_roadmap_prompt,
@@ -821,6 +822,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
+    unavailable_sources = 0
     from .state_repair import retry_key
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
@@ -832,6 +834,10 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         review_first=os.environ.get("TAUCETI_REVIEW_FIRST") == "1",
     ):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
+            w.selection_changed = True
+            continue
+        if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head, unavailable=True):
+            log(f"Global PR work: {stage} #{c.pr} source recently unavailable on this host — selecting other work")
             w.selection_changed = True
             continue
         if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head):
@@ -862,7 +868,19 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
         collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
         w.review_claimed_by_peer = False
-        rc = dispatch(stage, w, sv, c, opts)
+        try:
+            rc = dispatch(stage, w, sv, c, opts)
+        except ReviewSourceUnavailable as error:
+            # One PR's source failing to fetch says nothing about the rest: spare peers the same
+            # attempt and move on. Repeated failures in one round look like an outage; back off.
+            peer_claims.note(_claim_scope(w), stage, c.pr, c.head, unavailable=True)
+            unavailable_sources += 1
+            if unavailable_sources >= MAX_UNAVAILABLE_SOURCES:
+                raise
+            log(f"{error}; selecting other work")
+            w.selection_changed = True
+            declined.append((stage, c.pr))
+            continue
         collided = getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
         if rc is None and not opts.dry_run and (collided or w.review_claimed_by_peer):
             # Spare every other worker on the host the fresh reads that found this collision.
@@ -943,6 +961,8 @@ FILE_CHANGE_STAGES = {"rebase", "fix", "fix-ci", "bump", "lint-repair", "roadmap
 # Stages whose pushes the worker labels `self-tested` itself; automatic bumps use bump_attestation.
 SELF_TESTED_STAGES = {"rebase", "fix", "fix-ci", "lint-repair", "roadmap"}
 _MAX_CHANGED_FILES = 25
+# Source-preparation failures one round absorbs before backing off as a probable outage.
+MAX_UNAVAILABLE_SOURCES = 3
 
 
 def _checkout_head(cfg: Config) -> str | None:
@@ -1990,7 +2010,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
 
             w.counters.write(retry_key(pr, head), int(time.time() + MAX_RETRY_AFTER) + 1)
             w.rs.bust(pr)
-            raise NoProgress(f"review #{pr}: source preparation unavailable before inference — not charged to the PR")
+            raise ReviewSourceUnavailable(
+                f"review #{pr}: source preparation unavailable before inference — not charged to the PR"
+            )
         if rc == 0:
             # Both changed and unchanged success prove the review is published.
             w.counters.write(errkey, 0)
