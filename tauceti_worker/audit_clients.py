@@ -42,9 +42,10 @@ def client_path(provider: str) -> Path:
 # interpreter and target are hashed, and any other path it names is in the Nix store. This is
 # an allowlist of whole lines, never a shell parser.
 _NAME = r"(?!(?:LD_PRELOAD|LD_AUDIT|BASH_ENV|ENV|DYLD_\w*)\b)[A-Za-z_][A-Za-z0-9_]*"
-# A literal is one plain word, and never a search path: none can name a file.
+# A literal is one plain word, set only in a client's own namespace: no literal can name a
+# file for an interpreter or loader to read.
 _LITERAL = r"[A-Za-z0-9_]*"
-_SETTING = rf"(?!\w*PATH\b){_NAME}"
+_SETTING = r"(?:CLAUDE|CODEX|DISABLE|FORCE|USE)_(?!\w*PATH\b)[A-Za-z0-9_]*"
 # Absolute paths of plain components: never `.` or `..`, so a store path stays in the store.
 _COMPONENT = r"/(?!\.\.?(?![A-Za-z0-9._+-]))[A-Za-z0-9._+-]+"
 _PATH = rf"(?:{_COMPONENT})+"
@@ -74,14 +75,15 @@ def shim_target(path: Path) -> tuple[Path, Path] | None:
         data = stream.read(SHIM_LIMIT + 1)
     if len(data) > SHIM_LIMIT:
         return None
-    try:
-        lines = data.decode("ascii").splitlines()
-    except UnicodeDecodeError:
+    # Lines end only at LF, and nothing the shell would read differently from this check
+    # (CR, form feed, other control characters) is accepted.
+    if any(not (32 <= byte < 127 or byte == 10) for byte in data):
         return None
+    lines = data.decode("ascii").split("\n")
     interpreter = SHIM_INTERPRETER.fullmatch(lines[0]) if lines else None
     if interpreter is None or Path(interpreter[1]).name not in ("sh", "bash", "dash"):
         return None
-    body = [line.strip() for line in lines[1:] if line.strip() and not line.strip().startswith("#")]
+    body = [line.strip(" ") for line in lines[1:] if line.strip(" ") and not line.strip(" ").startswith("#")]
     match = SHIM_EXEC.fullmatch(body[-1]) if body else None
     if match is None or not all(any(p.fullmatch(line) for p in SHIM_LINES) for line in body[:-1]):
         return None

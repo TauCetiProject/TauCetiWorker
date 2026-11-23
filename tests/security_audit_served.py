@@ -511,7 +511,7 @@ class ClientCompatibility(unittest.TestCase):
             # A one-line launcher shim in front of it.
             shim = root / "bin/claude"
             shim.parent.mkdir()
-            shim.write_text(f'#!/bin/sh\n# launcher\nIN_NIX=1 exec {nix} "$@"\n')
+            shim.write_text(f'#!/bin/sh\n# launcher\nCLAUDE_IN_NIX=1 exec {nix} "$@"\n')
             run = SimpleNamespace(stdout="2.1.323 (Claude Code)\n")
             with (
                 patch.object(clients, "client_path", return_value=shim),
@@ -550,6 +550,10 @@ class ClientCompatibility(unittest.TestCase):
                 f"PATH='/''tmp/''bin'$PATH\nexec {native} \"$@\"",  # a quote splits a mutable path
                 'exec "/bin/\'echo\'" "$@"',  # quotes inside the target
                 f'exec {native}/.. "$@"',
+                f'\rexec {native} "$@"',  # the shell reads a command named "\\rexec"
+                f'exec {native} "$@"\x0c',
+                f"export PERL5LIB='payload'\nexec {native} \"$@\"",  # outside the clients' namespaces
+                f"export CLAUDE_CONFIG_PATH='payload'\nexec {native} \"$@\"",
             ):
                 shim.write_text(f"#!/bin/sh\n{body}\n")
                 self.assertIsNone(clients.shim_target(shim), body)
