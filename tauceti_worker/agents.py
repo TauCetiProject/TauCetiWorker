@@ -973,11 +973,42 @@ def prompt_on_stdin(prompt: str, profile: AuthoringProfile | str) -> bool:
     return provider in _STDIN_PROMPT_PROVIDERS and len(prompt.encode("utf-8", errors="replace")) > PROMPT_ARGV_LIMIT
 
 
+def validate_host_agent_credentials(profile: AuthoringProfile | str, env: dict) -> None:
+    """Recheck the selected native Claude file at launch; argv inspection remains side-effect free."""
+    if (
+        _authoring_profile(profile).provider != "claude"
+        or claude_usage_credentials() is None
+        or env.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+        or env.get("TAUCETI_CLAUDE_BILLING") == "api"
+        or env.get("TAUCETI_API_CONTEXT")
+    ):
+        return
+    from .quota import (
+        claude_file_credential_problem,
+        claude_file_keychain_problem,
+        claude_file_store_problem,
+        claude_saved_api_key_problem,
+    )
+
+    if problem := claude_file_store_problem(env):
+        raise NoProgress(problem)
+    if problem := claude_saved_api_key_problem(env.get("CLAUDE_CONFIG_DIR")):
+        raise NoProgress(problem)
+    if sys.platform != "darwin":
+        return
+    directory = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else Path.home() / ".claude"
+    if problem := claude_file_credential_problem(directory / ".credentials.json", renewable=False):
+        raise NoProgress(problem)
+    if problem := claude_file_keychain_problem(env.get("CLAUDE_CONFIG_DIR"), env=env):
+        raise NoProgress(problem)
+
+
 def host_agent_launch(prompt: str, profile: AuthoringProfile | str) -> tuple[list[str], dict, str | None]:
     """``host_agent_argv`` plus the text to write on the agent's stdin: the prompt itself when it is
     too long for one argv string (``PROMPT_ARGV_LIMIT``), else None and the prompt stays in argv."""
     on_stdin = prompt_on_stdin(prompt, profile)
     argv, env = host_agent_argv(prompt, profile, prompt_on_stdin=on_stdin)
+    validate_host_agent_credentials(profile, env)
     return argv, env, prompt if on_stdin else None
 
 
@@ -2545,6 +2576,9 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
     host review process. If the Keychain is unavailable, copy an existing configured credential file into
     the private directory as the same fallback the old in-place handoff provided.
 
+    With a usage login (claude_usage_credentials) the configured file is the agents' credential and is
+    staged without a Keychain password read or unlock.
+
     The caller owns and must remove the returned directory."""
     if sys.platform != "darwin":
         return None  # Linux/Windows: the configured file is the store; Bubble reads it directly
@@ -2555,7 +2589,21 @@ def _stage_claude_creds_for_bubble(cfg: Config) -> Path | None:
         shutil.rmtree(stale, ignore_errors=True)
 
     source = claude_dir(cfg.home) / ".credentials.json"
-    blob = _claude_keychain_creds_interactive()
+    if claude_usage_credentials() is not None:
+        from .quota import claude_file_credential_problem
+
+        if problem := claude_file_credential_problem(source, renewable=False):
+            raise Die(problem)
+        # The configured file is the agents' credential here; the Keychain item for the default config
+        # directory is at most the operator's own sign-in.
+        blob = _read_json_file(source)
+        oauth = blob.get("claudeAiOauth") if isinstance(blob, dict) else None
+        if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+            raise Die(f"no Claude agent credentials to seed the bubble from {source}")
+        # This private copy cannot persist a renewal to the canonical source.
+        blob = {"claudeAiOauth": {key: value for key, value in oauth.items() if key != "refreshToken"}}
+    else:
+        blob = _claude_keychain_creds_interactive()
     if not (blob or {}).get("claudeAiOauth"):
         blob = _read_json_file(source)
         if (blob or {}).get("claudeAiOauth"):

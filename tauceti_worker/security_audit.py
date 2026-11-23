@@ -1122,6 +1122,13 @@ def client_env(home: Path, provider: str, claude_credential: str | None) -> dict
         # the isolated client process; the reviewer has no tool to read it.
         env["ANTHROPIC_API_KEY"] = api_key
     elif source.is_file():
+        if provider == "claude":
+            from .quota import claude_file_credential_problem, claude_usage_credentials
+
+            if claude_usage_credentials() is not None and (
+                problem := claude_file_credential_problem(source, renewable=False)
+            ):
+                raise Die(f"security-audit: {problem}")
         _mirror_creds_file(
             source,
             dest,
@@ -1131,8 +1138,10 @@ def client_env(home: Path, provider: str, claude_credential: str | None) -> dict
             rt_placeholder=CODEX_RT_PLACEHOLDER if provider == "codex" else None,
         )
     elif provider == "claude":
-        from .quota import _claude_keychain_creds
+        from .quota import _claude_keychain_creds, claude_usage_credentials
 
+        if claude_usage_credentials() is not None:
+            raise Die(f"security-audit: no configured Claude agent file at {source}; refusing Keychain fallback")
         creds = _claude_keychain_creds()
         if not creds:
             raise Die("security-audit: no isolated Claude subscription credential available")

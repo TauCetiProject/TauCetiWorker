@@ -1794,7 +1794,7 @@ def cmd_host_doctor(args) -> int:
             note += f", id {acct.account_id}"
         rows.append(("codex account", acct.describes_an_account and not acct.conflict, note))
     claude_creds = claude_dir(cfg.home) / ".credentials.json"
-    if _safe_exists(claude_creds) or sys.platform != "darwin":
+    if _safe_exists(claude_creds) or sys.platform != "darwin" or claude_usage_credentials() is not None:
         rows.append(("claude creds", _safe_exists(claude_creds), str(claude_creds)))
     else:
         # macOS keeps Claude creds in the login Keychain, not a file; the pacer reads them there.
