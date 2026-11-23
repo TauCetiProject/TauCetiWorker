@@ -2042,7 +2042,7 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(len(self.agent_calls()), 2, "task 3's conflict goes to the agent")
         self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [False])
 
-    def pre_rebased_run(self, onto: str | None = None) -> tuple[str, dict]:
+    def pre_rebased_run(self, onto: str | None = None, *, carried: bool = False) -> tuple[str, dict]:
         """Task 1 resolves member 2 onto ``onto`` (the head's pre-rebase), and the head-time task 2 then
         replays the batch's own chain onto ``main`` (``onto``, or the new target given) naming task 1's
         chain as its unused pre-rebase. Each run starts with no stored resolution, as on another worker."""
@@ -2051,7 +2051,15 @@ class RebaseArtifacts(Fixture):
         first = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(first["status"], "adopted", first)
         self.assertEqual(sh(clone, "for-each-ref", repair_task.RESOLUTION_PREFIX), "")
-        pre_rebased = {"kind": "pre_rebased_chain", "base": self.onto, "tip": first["tip"], "source": self.raw["tip"]}
+        tip = first["tip"]
+        if carried:
+            # What the controller's carry replays leave: the same chain, every commit redated.
+            with patch.dict(os.environ, {"GIT_COMMITTER_DATE": "1800000000 +0000"}):
+                tip = chain_tool.replay(clone, self.onto, tip, self.onto, chain_id="carry").tip
+            sh(clone, "update-ref", "refs/test/carried", tip)
+            self.assertNotEqual(tip, first["tip"])
+            self.assertEqual(chain_tool.tree_of(clone, tip), chain_tool.tree_of(clone, first["tip"]))
+        pre_rebased = {"kind": "pre_rebased_chain", "base": self.onto, "tip": tip, "source": self.raw["tip"]}
         task = {**self.raw, "task_id": 2, "diagnostics": [*self.raw["diagnostics"], pre_rebased]}
         if onto is not None:
             task["onto"] = onto
@@ -2064,7 +2072,7 @@ class RebaseArtifacts(Fixture):
         prefixes again and reuses its resolutions: no agent runs for them, and the chain is the same."""
         pre_rebased, outcome = self.pre_rebased_run()
         self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assertEqual(outcome["pre_rebased"], {"seeded": 1, "exact": True})
+        self.assertEqual(outcome["pre_rebased"], {"seeded": 1, "exact": 1})
         self.assertEqual(len(self.agent_calls()), 1, "only the pre-rebase's own agent run")
         self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True])
         clone = self.content.clone
@@ -2072,6 +2080,15 @@ class RebaseArtifacts(Fixture):
             [c.tree for c in chain_tool.chain_commits(clone, self.onto, outcome["tip"])],
             [c.tree for c in chain_tool.chain_commits(clone, self.onto, pre_rebased)],
         )
+
+    def test_a_carried_pre_rebase_is_reused_too(self):
+        """The controller carried the pre-rebase by replay, which redates its commits; its resolutions are
+        reused all the same."""
+        _, outcome = self.pre_rebased_run(carried=True)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["pre_rebased"], {"seeded": 1, "exact": 1})
+        self.assertEqual(len(self.agent_calls()), 1, "only the pre-rebase's own agent run")
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True])
 
     def test_the_head_time_rebase_resolves_only_what_its_pre_rebase_left(self):
         """Batch 479: `main` moved past the pre-rebase's target, in member 3's file, so the pre-rebase does
@@ -2083,7 +2100,7 @@ class RebaseArtifacts(Fixture):
         sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
         _, outcome = self.pre_rebased_run(onto=moved)
         self.assertEqual(outcome["status"], "adopted", outcome)
-        self.assertEqual(outcome["pre_rebased"], {"seeded": 1, "exact": False})
+        self.assertEqual(outcome["pre_rebased"], {"seeded": 1, "exact": 0})
         self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True, False])
         calls = self.agent_calls()
         self.assertEqual(len(calls), 2, "one more agent run: member 3's conflict")
@@ -2213,8 +2230,9 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(len(self.agent_calls()), 1)
         self.assertEqual(self.service.releases, [])
         prompt = self.agent_calls()[0]["prompt"]
-        self.assertIn("The worker owns final verification", prompt)
-        self.assertIn("The worker checks the downstream closure of your edits", prompt)
+        self.assertNotIn("The worker owns final verification", prompt)
+        self.assertIn("Do not run a whole-library `lake build`, the audits or the environment lint", prompt)
+        self.assertIn("A failure in the head's own commits below the prefix is the head's to fix", prompt)
         self.assertTrue(self.state()["report"]["ok"], "the resulting chain still goes through ordinary validation")
 
     def test_a_pre_rebase_cache_miss_still_runs_the_agent_cold(self):

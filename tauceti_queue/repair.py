@@ -1670,11 +1670,52 @@ AUDIT_SENTENCE = (
 )
 
 
+def _pre_rebase_verification(context: PromptContext, check_command: str | None) -> list[str]:
+    """A pre-rebase's "Verifying locally" (decision 153, S1): scoped checks of the resolution only. The
+    chain is not built, checked or repaired as a whole until the batch is the head, on `main`, and the
+    head's tip below it may fail its own checks."""
+    lines = []
+    if check_command:
+        lines += [
+            f"`{check_command}` checks the commit's form: trailers kept, the original message a prefix of the new "
+            "one, a clean working tree. It prints the first problem, or `ok`. Run it before you finish.",
+            "",
+        ]
+    if context.listings_path is not None:
+        lines += [
+            f"Check the files you resolved with `{LISTINGS_DIR}/{BUILD_FILE} <Module.Name>`: it builds only those "
+            "modules. That is all the checking this task needs.",
+            "",
+        ]
+    if context.artifacts_cold:
+        lines += [
+            "The build is cold: the worker found no warm artifacts"
+            + (f" ({context.artifacts_reason})" if context.artifacts_reason else "")
+            + ", so a scoped build may take long. Build only the modules you touched.",
+            "",
+        ]
+    lines += [
+        "Do not run a whole-library `lake build`, the audits or the environment lint, and do not fix anything "
+        "outside the conflict: the worker submits this resolution without a whole-library build, and the batch is "
+        "built, checked and repaired once it is the head, on `main`. A failure in the head's own commits below "
+        "the prefix is the head's to fix, not this batch's.",
+        "",
+        CACHE_SENTENCE,
+        f"Run scoped checks in the foreground: shell commands have a {_hours_text(context.shell_limit)} limit. "
+        "Do not use `--fail-fast`.",
+        "",
+        HARD_RULES,
+    ]
+    return lines
+
+
 def _verification_section(
     context: PromptContext, findings: dict, base_short: str, check_command: str | None
 ) -> list[str]:
     conflict = context.conflict if context.kind in REBASE_KINDS else None
     lines = ["", "## Verifying locally", ""]
+    if context.kind == "pre_rebase":
+        return lines + _pre_rebase_verification(context, check_command)
     if not context.worker_verifies and not resolving(context):
         lines += [
             "Fold fixups and finalize all commit-message explanations before the final whole-library build. "

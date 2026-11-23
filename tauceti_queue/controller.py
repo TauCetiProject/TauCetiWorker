@@ -924,6 +924,14 @@ class Controller:
             wanted = [(self.batch_ref(batch["id"], batch["version"]), batch["tip"])]
             for member in self._members(batch["id"]):
                 wanted.append((self.input_ref(member["number"], member["accepted_head"]), member["accepted_head"]))
+            for task in self.store.rows(
+                "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_REBASE_CONFLICT}
+            ):
+                # The unused pre-rebase a head-time rebase names (`_pre_rebased_chain`), which its worker fetches.
+                for diagnostic in loads(task["diagnostics"], []):
+                    if isinstance(diagnostic, dict) and diagnostic.get("kind") == "pre_rebased_chain":
+                        tip = diagnostic["tip"]
+                        wanted.append((self.pre_rebased_ref(batch["id"], tip), tip))
             for ref, sha in wanted:
                 key = f"retain:{ref}:{sha}"
                 if self.store.row("outbox", {"key": key}) is not None or self._local_ref(ref) != sha:

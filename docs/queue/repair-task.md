@@ -102,12 +102,15 @@ A head-time `rebase_conflict` task whose diagnostics carry `{kind: "pre_rebased_
 source}` replays the head's own chain onto `main` after the seal could not use its pre-rebase
 `base..tip` (docs/queue/controller.md). Before the replay, `repair_task.seed_pre_rebased` stores each
 member that chain resolved (its message extends the member's own) as the member's resolution on the
-prefix it was made on, skipping a mechanical resolution the batch's verification refused. The replay
-reuses one at once on the same prefix, as when the pre-rebase was onto the commit `main` now is
-(`exact`; no lookahead helper starts for those members), and otherwise tries it as an earlier
-resolution of the same conflict (`applicable_resolution`) before waiting for a helper. Only what is
-left goes to an agent; verification and repair follow as for any rebase. The outcome records
-`pre_rebased: {seeded, exact}`.
+prefix it was made on, committed again as the worker commits a resolution (the controller's carry
+replays redate commits), and skips a mechanical resolution the batch's verification refused. The
+replay reuses one at once on the same prefix, as when the pre-rebase was onto the commit `main` now
+is and every member before it replays to the pre-rebased commit (`exact`; no lookahead helper starts
+for those members), and otherwise tries it as an earlier resolution of the same conflict
+(`applicable_resolution`) before waiting for a helper. Only what is left goes to an agent;
+verification and repair follow as for any rebase. The outcome records `pre_rebased: {seeded, exact}`
+(counts). A `pre_rebase` task's prompt asks for scoped checks of the resolved files only, with no
+whole-library build, audits or lint.
 
 `diagnostics` is the controller's list of findings, each `{kind, module, message}` as the CI
 adapter extracted them (`repair.findings_from_diagnostics`): `compiler`/`compiler_error` entries

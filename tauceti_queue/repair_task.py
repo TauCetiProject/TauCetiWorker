@@ -2447,14 +2447,14 @@ def resolve_conflicts(
     ``cfg.agent_attempts`` attempts.
 
     ``seeded`` is ``seed_pre_rebased``'s record: a member resolved by the head's unused pre-rebase tries
-    that resolution (``applicable_resolution``) before waiting for a helper, and when the pre-rebase was
-    onto ``onto`` itself, where the replay meets the same prefixes, no helper is started for it."""
+    that resolution (``applicable_resolution``) before waiting for a helper, and no helper is started for
+    one the replay meets on the very prefix it was made on (``exact``)."""
     chain_ids: list[str] = []
     resolved: list[dict] = []
     agent: dict = {"status": "ok"}
     lookahead = None
     reusable = frozenset((seeded or {}).get("seeded") or ())
-    skip = reusable if (seeded or {}).get("exact") else frozenset()
+    skip = frozenset((seeded or {}).get("exact") or ())
 
     def replay(base: str, onto: str) -> chain_tool.ChainResult:
         chain_id = f"worker-{task.task_id}-{secrets.token_hex(4)}"
@@ -2947,8 +2947,11 @@ def seed_pre_rebased(clone: Path, task: Task) -> dict | None:
     where it reaches the same prefix (the pre-rebase was onto the `main` the head landed as), and
     elsewhere where it is the same conflict (``applicable_resolution``), so only the remaining
     conflicts go to an agent. A mechanical resolution the batch's verification refused is not
-    seeded. Returns ``{"seeded": [own commit SHAs], "exact": bool}`` (``exact`` when the pre-rebase's
-    target is the task's ``onto``), or None without such a diagnostic. Never fails the task."""
+    seeded. Each is stored in the form the worker commits a resolution, since the controller's carry
+    replays redate the commits they move. Returns ``{"seeded": [own commit SHAs], "exact": [...]}``:
+    ``exact`` are those the replay meets on the very prefix they were made on (the pre-rebase was onto
+    the task's ``onto``, and every member before them replays to the pre-rebased commit), or None
+    without such a diagnostic. Never fails the task."""
     record = pre_rebased_chain(task)
     if record is None:
         return None
@@ -2957,14 +2960,24 @@ def seed_pre_rebased(clone: Path, task: Task) -> dict | None:
         theirs = chain_tool.chain_commits(clone, record["base"], record["tip"])
     except (chain_tool.ChainError, RuntimeError) as error:
         log(f"task {task.task_id}: the pre-rebased chain {str(record['tip'])[:12]} is unreadable: {error}")
-        return {"seeded": [], "exact": False, "error": str(error)}
+        return {"seeded": [], "exact": [], "error": str(error)}
     seeded: list[str] = []
+    exact: list[str] = []
+    same_prefixes = record["base"] == task.onto  # until a member's own replay leaves the pre-rebased chain
     for commit in theirs:
         original = own.get(commit.source_pr) if commit.source_pr else None
-        if original is None or len(commit.parents) != 1 or commit.message == original.message:
-            continue  # not a member of this chain, or replayed without a resolution
-        if not commit.message.startswith(original.message.rstrip() + "\n"):
+        if original is None or len(commit.parents) != 1:
+            same_prefixes = False
             continue
+        prefix = commit.parents[0]
+        replayed = chain_tool.merge_trees(clone, prefix, original.sha, merge_base=f"{original.sha}^")
+        if replayed.clean:
+            # The replay reproduces this commit only when the member applies to the same tree.
+            same_prefixes = same_prefixes and replayed.tree == commit.tree
+            continue
+        if commit.message == original.message or not commit.message.startswith(original.message.rstrip() + "\n"):
+            same_prefixes = False
+            continue  # not a resolution the worker made
         if (
             repair_additive.marked(commit.message)
             and git(
@@ -2976,13 +2989,26 @@ def seed_pre_rebased(clone: Path, task: Task) -> dict | None:
                 check=False,
             ).strip()
         ):
+            same_prefixes = False
             continue
-        store_resolution(clone, task.batch_id, original.sha, commit.parents[0], commit.sha)
+        # Stored as the worker commits a resolution (`repair.recommit_resolution` reuses only that form):
+        # the controller's carry and extension replays redate the commits they move.
+        resolution = chain_tool.commit_tree(
+            clone,
+            commit.tree,
+            prefix,
+            commit.message,
+            (original.author_name, original.author_email),
+            author_date=original.author_date,
+            committer_date=original.author_date,
+        )
+        store_resolution(clone, task.batch_id, original.sha, prefix, resolution)
         seeded.append(original.sha)
-    exact = record["base"] == task.onto
+        if same_prefixes:
+            exact.append(original.sha)
     log(
         f"task {task.task_id}: seeded {len(seeded)} resolutions from the pre-rebased chain "
-        f"{str(record['tip'])[:12]} onto {str(record['base'])[:12]}" + (" (the same target)" if exact else "")
+        f"{str(record['tip'])[:12]} onto {str(record['base'])[:12]}, {len(exact)} on the replay's own prefixes"
     )
     return {"seeded": seeded, "exact": exact}
 
@@ -3312,7 +3338,7 @@ def _run_task(
         # The head's unused pre-rebase: its resolutions are reused, and only the rest is resolved.
         seeded = seed_pre_rebased(cfg.clone, task) if rebasing else None
         if seeded is not None:
-            outcome["pre_rebased"] = {k: (len(v) if k == "seeded" else v) for k, v in seeded.items()}
+            outcome["pre_rebased"] = {k: (len(v) if isinstance(v, list) else v) for k, v in seeded.items()}
 
         def compute_ownership(chain: list) -> repair_context.RepairContext:
             return repair_context.compute(

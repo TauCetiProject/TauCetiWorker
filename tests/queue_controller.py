@@ -1855,6 +1855,11 @@ class PreRebase(ControllerCase):
         claimed = self.controller.claim_task("head-worker", "admin-worker")
         self.assertEqual((claimed.task_id, claimed.kind), (task["id"], "rebase_conflict"))
         self.assertIn(ref, claimed.retained_refs)
+        # A ref retained while publication was off reaches GitHub with the live batches' refs.
+        key = f"retain:{ref}:{pre_rebased['tip']}"
+        self.controller.store.execute("DELETE FROM outbox WHERE key=?", (key,))
+        self.controller._republish_retained_refs(self.clock())
+        self.assertIsNotNone(self.controller.store.row("outbox", {"key": key}))
         # A later pass that declines again for the same head version, `main` and reason adds nothing.
         self.assertFalse(self.controller._seal_from_pre_rebase(head, self.repo.main_sha(), self.clock()))
         self.assertEqual(len(self.controller.store.journal_entries("pre-rebase-unused")), 1, "journaled once")

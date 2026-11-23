@@ -345,8 +345,9 @@ When that replay of the head's own chain conflicts, the head-time `rebase_confli
 the unused pre-rebase (`_pre_rebased_chain`): while it is usable and its source is in the head's
 chain, the task's diagnostics carry `{kind: "pre_rebased_chain", base, tip, source}` (the
 pre-rebase's target, its chain and the batch tip it covered), the controller retains the chain as
-`refs/tauceti-queue/batches/<id>/pre-rebased/<tip>` and lists that ref in the claim's retained refs,
-and the `rebase-conflict` journal entry names the tip (`pre_rebased`). The worker
+`refs/tauceti-queue/batches/<id>/pre-rebased/<tip>` (republished with the live batches' refs) and
+lists that ref in the claim's retained refs, and the `rebase-conflict` journal entry names the tip
+(`pre_rebased`). The worker
 (`repair_task.seed_pre_rebased`) records each member that chain resolved as that member's resolution
 on the prefix it was made on, so its replay reuses it at once where it meets the same prefix (the
 pre-rebase was onto the tip that landed, as for 484 and 490: no helper is started for those
