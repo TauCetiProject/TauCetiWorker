@@ -1230,6 +1230,143 @@ class StalledRepair(QueueFixture):
         self.assertFalse(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
 
 
+class RepairReleaseStall(QueueFixture):
+    """A head repair whose claims keep ending as releases with the same error is stalled too: one
+    progress alert within a few claims, the task stays offered, and the stall ends when the error
+    changes or the task is settled (docs/queue/escalation.md, "Stalled repair"). Batch 506's repair
+    task 1521 was released 332 times in 7 hours with `KeyError: 'members'` and nobody was told."""
+
+    ERROR = "KeyError: 'members'"
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+        self.github.ci_policy = lambda head, _base, _members: (
+            ("fail", [DRIVER_FAILURE]) if self.repo.file_at(head, "Bad.lean") is not None else ("pass", [])
+        )
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+
+    def release(self, reason="artifacts_unavailable", error=ERROR, revision="a" * 40):
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision=revision)
+        self.assertIsNotNone(task, "the task stays offered")
+        self.controller.release_task(task.task_id, task.claim_token, reason, error)
+        self.clock.advance(120)  # task 1521's claims were given back every two minutes or so
+        return task
+
+    def escalated(self, action):
+        return [e for e in self.controller.store.journal_entries("escalated") if e["detail"]["action"] == action]
+
+    def test_identical_releases_alert_once_and_keep_the_task_offered(self):
+        task = None
+        for _ in range(3):
+            task = self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.tick()
+        entry = self.controller.store.row("outbox", {"kind": "progress-alert"})
+        self.assertEqual((entry["state"], entry["result"]), ("done", "journal-only"))
+        content = json.loads(entry["payload"])["content"]
+        self.assertIn("repair-stalled", content)
+        self.assertIn("KeyError: 'members'", content)
+        self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
+        alerts = [a for a in self.controller.status()["alerts"] if a.startswith("repair stalled")]
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn(f"task {task.task_id} given back 4 times", alerts[0])
+        self.assertIn("AEDT", alerts[0])
+        for _ in range(5):
+            self.release()  # no backoff: the same revision is offered the task at once
+        self.assertEqual(len(self.escalated("repair-stalled")), 1, "one alert per stall")
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual((stall["source"], stall["releases"]), ("releases", 9))
+        self.assertEqual(self.controller.store.journal_entries("repair-stall-claimed"), [])
+
+    def test_volatile_detail_and_stops_do_not_break_the_run(self):
+        self.release(error="SourcesUnavailable: ref /tmp/abc123/x (after 13 attempt(s))")
+        self.release(reason="worker-stopped", error="stopped")
+        self.release(error="SourcesUnavailable: ref /tmp/def456/y (after 12 attempt(s))")
+        self.release(reason="inference_unavailable", error="429")
+        self.release(error="SourcesUnavailable: ref /tmp/0987/z (after 13 attempt(s))")
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release(error="SourcesUnavailable: ref /tmp/fff/w (after 2 attempt(s))")
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+
+    def test_another_error_breaks_the_run_and_ends_a_stall(self):
+        for _ in range(3):
+            self.release()
+        self.release(error="ValueError: something else")
+        self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [], "the run restarted")
+        for _ in range(3):
+            self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.release(reason="agent_failed", error="the agent exited 1")
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_a_submission_breaks_the_run(self):
+        for _ in range(3):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="a" * 40)
+        notes = {"repair_checkpoint": [DRIVER_FAILURE], "worker_revision": "a" * 40}
+        self.controller.submit_task(task.task_id, task.claim_token, task.tip, json.dumps(notes), checkpoint=True)
+        self.clock.advance(120)
+        for _ in range(3):
+            self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+
+    def test_a_rejected_submission_ends_the_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="b" * 40)
+        self.controller.submit_task(task.task_id, task.claim_token, task.tip, "{}")
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_settling_the_task_ends_the_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        agent = self.agent(
+            script=lambda _task: {f"{PROJECT}#101": Resolution({"Bad.lean": "ok\n"}, explanation="Fixed.")}
+        )
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task)).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_turning_release_detection_off(self):
+        self.controller.set_setting("repair_stall_releases", 0, "test")
+        for _ in range(6):
+            self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.controller.set_setting("repair_stall_releases", 4, "test")
+        for _ in range(4):
+            self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.controller.set_setting("repair_stall_releases", 0, "test")
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+
+    def test_the_head_alert_names_the_release_stall(self):
+        self.tick()
+        for _ in range(3 * 3600 // 120 + 2):
+            self.release()
+            self.tick()
+        entries = self.escalated("head-no-progress")
+        self.assertEqual(len(entries), 1)
+        self.assertIn("given back", entries[0]["detail"]["detail"])
+
+
 class WithdrawnAtAdoption(QueueFixture):
     """An adopted repair that empties an ordinary member sends it back to its author at once."""
 

@@ -212,6 +212,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "repair_stall_checkpoints": 3,
     "repair_stall_retry_seconds": 1800,
     "repair_stall_retry_max_seconds": 14400,
+    # A repair task whose claims this many times in a row end as releases with the same reason and the
+    # same normalized error (and no submission in between) is stalled too: a worker failing the same way
+    # before it can submit. The queue alerts once and keeps offering the task. 0: off.
+    "repair_stall_releases": 4,
     # A head whose version, tip, base, CI attempt and open task have all stayed the same this long has
     # made no progress: one alert, and one message when it moves again. 0: off.
     "head_progress_alert_seconds": 10800,
@@ -268,6 +272,9 @@ PROBLEM_ANTICIPATED = "problem-anticipated"
 EMPTY_COMMIT = "empty-commit"
 # The head-progress alert's wording, which the public observation recognises (`monitoring.py`).
 HEAD_NO_PROGRESS_TEXT = repair_stall.HEAD_ALERT_TEXT
+# Releases that say nothing about the task: the worker was stopped, or inference was unavailable (the
+# inference hold covers that). They neither count toward nor break a run of identical releases.
+STALL_IGNORED_RELEASES = ("worker-stopped", "inference_unavailable", "prepared_clean")
 # How many escalations the controller keeps for the status page.
 ESCALATIONS_KEPT = 50
 # The most CI findings a withdrawal or rejection comment quotes.
@@ -2069,7 +2076,7 @@ class Controller:
                     **({"worker_revision": worker_revision} if worker_revision else {}),
                 )
                 stall = self._repair_stalls().get(str(task["id"]))
-                if stall is not None:
+                if stall is not None and stall.get("source") != "releases":  # a release stall never holds
                     self.store.journal(
                         now,
                         "repair-stall-claimed",
@@ -2262,6 +2269,8 @@ class Controller:
                 self.store.journal(now, "released", claim["batch_id"], task_id=task_id, reason=reason, error=error)
                 if stale_policy and task["state"] == TASK_OPEN:
                     self._replace_stale_source_task(task, now)
+                elif task is not None and task["kind"] != TASK_PREPARE and task["state"] == TASK_OPEN:
+                    self._observe_repair_release(task, claim["batch_id"], reason, error, now)
                 elif task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
                     self._settle_prepare_release(task, reason, now)
                     if reason == PREPARE_CLEAN_REASON:
@@ -9410,6 +9419,100 @@ class Controller:
             retry_at=current["retry_at"],
         )
 
+    def _observe_repair_release(self, task: dict[str, Any], batch_id: int, reason: str, error: str, now: float) -> None:
+        """After a claim of an open task is given back without a result: when its last
+        `repair_stall_releases` releases since its last submission share one reason and normalized
+        error (`repair_stall.release_signature`), the task is stalled. The first time, journal it and
+        raise one progress alert quoting the error; the task stays offered (no backoff), because the
+        worker already paces such releases and a fix on any worker should be picked up at once. A
+        release with another error ends a release stall; a submission ends it through
+        `_observe_repair_stall` or `_settle_repair_stalls`."""
+        if reason in STALL_IGNORED_RELEASES:
+            return
+        limit = int(self.setting("repair_stall_releases"))
+        stalls = self._repair_stalls()
+        key = str(task["id"])
+        current = stalls.get(key)
+        if current is not None and current.get("source") != "releases":
+            return  # a checkpoint stall: checkpoints decide it
+        latest = repair_stall.release_signature(task["tip"], reason, error)
+        if current is not None and (current.get("signature") != latest or not limit):
+            batch = self.store.row("batches", {"id": batch_id})
+            self._end_repair_stall(task, batch, current, now, "a release with another error")
+            stalls.pop(key, None)
+            self._set_state("repair_stalls", stalls)
+            current = None
+        if not limit:
+            return
+        if current is not None:
+            current["releases"] = int(current.get("releases", 0)) + 1
+            current["last_at"] = now
+            stalls[key] = current
+            self._set_state("repair_stalls", stalls)
+            return
+        submitted = self.store.row("submissions", {"task_id": task["id"]}, order="id DESC")
+        since = submitted["created_at"] if submitted is not None else task["created_at"]
+        run = 0
+        for entry in self.store.rows("journal", {"kind": "released", "batch_id": batch_id}, order="id DESC", limit=500):
+            if entry["at"] < since:
+                break
+            detail = loads(entry["detail"], {})
+            if not isinstance(detail, dict) or detail.get("task_id") != task["id"]:
+                continue
+            if detail.get("reason") in STALL_IGNORED_RELEASES:
+                continue
+            signature = repair_stall.release_signature(
+                task["tip"], str(detail.get("reason") or ""), str(detail.get("error") or "")
+            )
+            if signature != latest:
+                break
+            run += 1
+        if run < limit:
+            return
+        batch = self.store.row("batches", {"id": batch_id}) or {"id": batch_id, "version": task["batch_version"]}
+        message = " ".join(str(error or "no error given").split())[:240]
+        current = {
+            "task_id": task["id"],
+            "batch_id": batch_id,
+            "version": task["batch_version"],
+            "kind": task["kind"],
+            "source": "releases",
+            "since": now,
+            "last_at": now,
+            "signature": latest,
+            "tip": task["tip"],
+            "checkpoints": 0,
+            "releases": run,
+            "reason": reason,
+            "retries": 0,
+            "retry_at": now,
+            "revisions": [],
+            "tools": [],
+            "findings": [f"{reason}: {message}"],
+            "conclusion": "",
+        }
+        stalls[key] = current
+        self._set_state("repair_stalls", stalls)
+        self._count("repair_stalls")
+        self._record_escalation(
+            "repair-stalled",
+            batch,
+            now,
+            cause=(
+                f"{task['kind']} task {task['id']} was given back {run} times in a row as {reason} "
+                f"with the same error, without a submission"
+            ),
+            detail=(
+                "the task stays offered; the worker fails before it can submit, so a worker fix or an operator "
+                "is needed; one more message when the error changes or the task is settled"
+            ),
+            lines=current["findings"],
+            key=f"repair-stalled:{task['id']}:{latest}:{now}",
+            counted=False,
+            channel="progress-alert",
+            extra={"task_id": task["id"], "tip": task["tip"], "signature": latest, "release_reason": reason},
+        )
+
     def _end_repair_stall(
         self, task: dict[str, Any] | None, batch: dict[str, Any] | None, stall: dict[str, Any], now: float, why: str
     ) -> None:
@@ -9436,16 +9539,25 @@ class Controller:
         stalls = self._repair_stalls()
         if not stalls:
             return
-        disabled = not int(self.setting("repair_stall_checkpoints"))
         with self.store.transaction():
             ended = False
             for key, stall in list(stalls.items()):
+                setting = "repair_stall_releases" if stall.get("source") == "releases" else "repair_stall_checkpoints"
+                disabled = not int(self.setting(setting))
                 task = self.store.row("tasks", {"id": int(key)})
-                if task is not None and task["state"] == TASK_OPEN and not disabled:
+                submitted = (
+                    stall.get("source") == "releases"
+                    and task is not None
+                    and (latest := self.store.row("submissions", {"task_id": task["id"]}, order="id DESC")) is not None
+                    and latest["created_at"] >= stall["since"]
+                )
+                if task is not None and task["state"] == TASK_OPEN and not disabled and not submitted:
                     continue
                 batch = self.store.row("batches", {"id": stall["batch_id"]})
                 if disabled and task is not None and task["state"] == TASK_OPEN:
                     why = "stalled-repair detection was turned off"
+                elif submitted and task["state"] == TASK_OPEN:
+                    why = "a worker submitted a result"
                 else:
                     why = "the task was " + ((task["resolution"] or task["state"]) if task is not None else "removed")
                 self._end_repair_stall(task, batch, stall, now, why)
@@ -9460,7 +9572,7 @@ class Controller:
         if not int(self.setting("repair_stall_checkpoints")):
             return False
         stall = self._repair_stalls().get(str(task["id"]))
-        if stall is None or now >= stall.get("retry_at", 0):
+        if stall is None or stall.get("source") == "releases" or now >= stall.get("retry_at", 0):
             return False
         return not (worker_revision and worker_revision not in stall.get("revisions", []))
 
@@ -9513,7 +9625,10 @@ class Controller:
                         f"(since {repair_stall.clock(state['since'])}), at stage {stage}"
                     ),
                     detail=(
-                        f"repair task {stall['task_id']} is stalled: {stall['checkpoints']} identical checkpoints at "
+                        f"repair task {stall['task_id']} is stalled: given back {stall['releases']} times in a row as "
+                        f"{stall['reason']} with the same error ({stall['findings'][0]})"
+                        if stall and stall.get("source") == "releases"
+                        else f"repair task {stall['task_id']} is stalled: {stall['checkpoints']} identical checkpoints at "
                         f"{stall['tip'][:12]}; next claim at {repair_stall.clock(stall['retry_at'])}"
                         if stall
                         else "nothing was changed; one more message when the head moves again"
@@ -9558,6 +9673,13 @@ class Controller:
         """The status alerts of stalled repairs and of a head without progress, with times in AEDT."""
         alerts = []
         for stall in self._repair_stalls().values():
+            if stall.get("source") == "releases":
+                alerts.append(
+                    f"{repair_stall.ALERT_TEXT}: batch {stall['batch_id']} {stall['kind']} task {stall['task_id']} "
+                    f"given back {stall['releases']} times in a row as {stall['reason']} with the same error since "
+                    f"{repair_stall.clock(stall['since'])}; {stall['findings'][0]}"
+                )
+                continue
             line = (
                 f"{repair_stall.ALERT_TEXT}: batch {stall['batch_id']} {stall['kind']} task {stall['task_id']} "
                 f"retained tip {stall['tip'][:12]} with the same findings {stall['checkpoints']} times since "

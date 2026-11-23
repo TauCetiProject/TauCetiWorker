@@ -14,6 +14,11 @@ applies it at each checkpoint, backs the task off and raises the alert:
   are the same failure on the same chain. The worker and TauCetiTools revisions are not part of it:
   a code change that leaves the failure as it was has not made progress either. They decide instead
   whether a backed-off task may be offered again at once (`Controller._claimable_tasks`).
+- `release_signature` is the failure signature of a claim the worker gave back without a result
+  (`Controller._observe_repair_release`): the task's tip, the release reason and the worker's error,
+  normalized the same way. Repair task 1521 of batch 506 was released 332 times in 7 hours with
+  `KeyError: 'members'` from the worker's prompt composition and never checkpointed, so the
+  checkpoint rule never saw it.
 - `conclusion` is what the agent itself concluded in its last message, cut to the passage that says
   why it could not make progress (for example that a human has to intervene).
 - `retry_delay` is the backoff: `first` seconds, doubling at each further identical checkpoint up to
@@ -76,6 +81,14 @@ def signature(tip: str, findings: Iterable[Mapping[str, Any]]) -> str:
     keys = sorted({finding_key(f) for f in findings if isinstance(f, Mapping)})
     payload = json.dumps([tip, keys], separators=(",", ":"))
     return hashlib.sha256(payload.encode()).hexdigest()[:24]
+
+
+def release_signature(tip: str, reason: str, error: str) -> str:
+    """The failure signature of a claim given back without a result: the task's tip, the release reason
+    and the worker's error with volatile detail removed. Two releases with equal signatures are the
+    same failure of the same task, for example a worker crashing at the same line on every claim."""
+    payload = json.dumps(["release", tip, reason, normalize(error)], separators=(",", ":"))
+    return "release:" + hashlib.sha256(payload.encode()).hexdigest()[:24]
 
 
 def notes_of(worker_notes: str | None) -> dict[str, Any]:

@@ -92,6 +92,24 @@ new code that fails the same way has not made progress either.
   identical checkpoint waits twice as long, up to `repair_stall_retry_max_seconds` (4 hours), with a
   `repair-stall-backoff` journal entry each time. It never stops offering it.
 
+**Releases with the same error.** A worker that fails before it can submit gives the claim back
+(`released`, with a reason and its error) and never checkpoints, so the rule above does not see it.
+Batch 506's repair task 1521 was given back 332 times in 7 hours as `artifacts_unavailable` with
+`KeyError: 'members'` from the worker's prompt composition, and nobody was told until the head
+alert three hours in, which was journal-only. So when a task's last `repair_stall_releases` (default
+4) releases since its last submission have the same reason and the same error (normalized like a
+finding's message: `repair_stall.release_signature`), the task is stalled as well: the controller
+journals `escalated` (`repair-stalled`), raises one progress alert quoting the error, and shows the
+stall among the status `alerts` (`repair stalled: batch B repair task T given back N times in a row
+as REASON with the same error since <AEDT time>; ...`), in `loop_termination.repair_stalls` (with
+`source` `releases` and the running count `releases`) and as a `repair_stalled` condition. Releases
+as `worker-stopped` or `inference_unavailable` neither count nor break the run. The task is not
+backed off: the worker already paces its releases, and a fixed worker must get it at once. The stall
+ends, with one `repair-stall-ended` message, at a release with another reason or error, at a
+checkpoint, or when the task leaves the open state. With releases about two minutes apart the alert
+comes within about ten minutes of the first failure; with the worker's longest pacing (ten minutes
+between claims) within about half an hour.
+
 **Resuming.** The stall ends, with one `repair-stall-ended` progress message, when the inputs
 change: a checkpoint with another signature (another tip or other findings), or the task leaving
 the open state (adopted, or replaced by a new batch version, a new base or new members). A worker
@@ -168,6 +186,7 @@ that report (`tauceti_queue/stuck_heads.py`):
 | `automatic_retry_max_seconds` | `14400` | the most that delay doubles to |
 | `escalation_alert_seconds` | `86400` | how long an escalation stays among the status alerts |
 | `repair_stall_checkpoints` | `3` | identical checkpoints in a row that make a repair task stalled; 0: off |
+| `repair_stall_releases` | `4` | identical releases in a row, without a submission, that make a task stalled; 0: off |
 | `repair_stall_retry_seconds` | `1800` | first wait before a stalled task is offered again |
 | `repair_stall_retry_max_seconds` | `14400` | the most that wait doubles to |
 | `head_progress_alert_seconds` | `10800` | how long the head may stay unchanged before its progress alert; 0: off |

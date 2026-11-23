@@ -980,6 +980,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `automatic_retry_max_seconds` | `14400` | integer, at least 0 |
 | `escalation_alert_seconds` | `86400` | integer, at least 0 |
 | `repair_stall_checkpoints` | `3` | integer, at least 0; 0 disables stalled-repair detection ([escalation.md](escalation.md), "Stalled repair") |
+| `repair_stall_releases` | `4` | integer, at least 0; 0 disables stalled-repair detection from identical releases ([escalation.md](escalation.md), "Stalled repair") |
 | `repair_stall_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |
 | `repair_stall_retry_max_seconds` | `14400` | integer, at least 0 |
 | `head_progress_alert_seconds` | `10800` | integer, at least 0; 0 disables the head-progress alert |
