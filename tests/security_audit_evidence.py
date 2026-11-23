@@ -32,12 +32,15 @@ class Classification(unittest.TestCase):
         self.batch["input_digest"] = hashlib.sha256(sa.serialize(self.batch).encode()).hexdigest()
         (self.attempt / "input.json").write_text(sa.serialize(self.batch))
 
-    def respond(self, *blocks, stop="end_turn", protocol=sa.PROTOCOL, attempt=None):
+    def respond(self, *blocks, stop="end_turn", protocol=sa.PROTOCOL, attempt=None, stage=ev.ESCALATION):
+        """A retained response; by default the escalation reviewer's, which binds."""
         attempt = attempt or self.attempt
         attempt.mkdir(parents=True, exist_ok=True)
         (attempt / "execution.json").write_text(sa.serialize({"protocol_version": protocol}))
         content = [b if "type" in b else {"type": "text", "text": sa.serialize(b)} for b in blocks]
-        (attempt / "response.json").write_text(sa.serialize({"content": content, "stop_reason": stop}))
+        if stage == ev.ESCALATION:
+            (attempt / "escalation-request.json").write_text("{}")
+        (attempt / f"{stage}response.json").write_text(sa.serialize({"content": content, "stop_reason": stop}))
 
     def kind(self, failure=None):
         return ev.classify(self.state, self.attempt, self.batch, failure)
@@ -89,7 +92,8 @@ class Classification(unittest.TestCase):
 
     def test_an_unreadable_response_file_is_unreadable(self):
         (self.attempt / "execution.json").write_text(sa.serialize({"protocol_version": sa.PROTOCOL}))
-        (self.attempt / "response.json").write_text('{"content": [')
+        (self.attempt / "escalation-request.json").write_text("{}")
+        (self.attempt / "escalation-response.json").write_text('{"content": [')
         self.assertEqual(self.kind().kind, ev.UNREADABLE)
 
     def test_a_current_protocol_ledger_concern_binds_every_range_with_its_commits(self):
@@ -138,6 +142,33 @@ class Classification(unittest.TestCase):
         self.assertFalse(ev.holds(self.state, self.attempt))
         self.respond(FINDING)
         self.assertTrue(ev.holds(self.state, self.attempt))
+
+    def test_a_triage_pass_passes(self):
+        self.respond(PASS, stage=ev.TRIAGE)
+        self.assertEqual(self.kind().kind, ev.PASS)
+
+    def test_a_triage_concern_or_unreadable_answer_escalates_and_never_binds(self):
+        for answer in (FINDING, {"type": "text", "text": "all fine"}):
+            with self.subTest(answer=answer):
+                self.respond(answer, stage=ev.TRIAGE)
+                self.assertEqual(self.kind().kind, ev.ESCALATE)
+                self.assertFalse(ev.holds(self.state, self.attempt))
+                with self.assertRaises(ev.NeedsEscalation):
+                    sa.judged(self.attempt, self.batch)
+
+    def test_once_escalated_only_the_escalation_reviewer_decides(self):
+        self.respond(FINDING, stage=ev.TRIAGE)
+        self.respond(PASS)
+        self.assertEqual(self.kind().kind, ev.PASS)
+        self.assertEqual(ev.triage_judgment(self.attempt)["judgments"], [FINDING])
+        self.respond(FINDING)
+        self.assertEqual(self.kind().kind, ev.FINDING)
+
+    def test_an_escalation_that_never_answered_still_needs_escalation(self):
+        self.respond(FINDING, stage=ev.TRIAGE)
+        (self.attempt / "escalation-request.json").write_text("{}")
+        with self.assertRaises(ev.NeedsEscalation):
+            sa.judged(self.attempt, self.batch, "security-audit: claude-sonnet-5-5 request failed")
 
     def test_judged_raises_typed_outcomes(self):
         self.respond({"type": "text", "text": "all fine"})
