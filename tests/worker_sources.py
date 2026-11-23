@@ -1230,6 +1230,23 @@ ci="one/project"
         shown.rescope_roadmap()
         self.assertTrue(shown.roadmap_backpressure)
 
+    def test_a_github_only_dashboard_shows_the_account_total(self):
+        from tauceti_worker.tui import dashboard_survey
+
+        github = Survey(worker_id="test")
+        github._automatic_open_count, github.max_open_prs = 589, 1024
+        github.rescope_roadmap()
+        with (
+            patch.dict(os.environ, {"TAUCETI_WORKER_FORGES": "github"}),
+            patch("tauceti_worker.tui.survey", return_value=github),
+            patch("tauceti_worker.tui.ReviewState"),
+            patch("tauceti_worker.umbrellas.display_umbrella", return_value=None),
+            patch("tauceti_worker.account_pressure.project_forges", return_value=("github", "forgejo")),
+            patch("tauceti_worker.account_pressure.forgejo_open", return_value=916),
+        ):
+            shown = dashboard_survey(self.cfg, SimpleNamespace(repo="one/project"))
+        self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (1505, True))
+
     def test_an_anonymous_forgejo_listing_is_not_an_account_count(self):
         from tauceti_worker.account_pressure import forgejo_open
 
