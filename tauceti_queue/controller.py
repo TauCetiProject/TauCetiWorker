@@ -9422,52 +9422,46 @@ class Controller:
     def _observe_repair_release(self, task: dict[str, Any], batch_id: int, reason: str, error: str, now: float) -> None:
         """After a claim of an open task is given back without a result: when its last
         `repair_stall_releases` releases since its last submission share one reason and normalized
-        error (`repair_stall.release_signature`), the task is stalled. The first time, journal it and
-        raise one progress alert quoting the error; the task stays offered (no backoff), because the
-        worker already paces such releases and a fix on any worker should be picked up at once. A
-        release with another error ends a release stall; a submission ends it through
-        `_observe_repair_stall` or `_settle_repair_stalls`."""
+        error (`repair_stall.release_signature`), the task is stalled. The run is kept per task in
+        `state:repair_release_runs`. The first time, journal it and raise one progress alert quoting
+        the error; the task stays offered (no backoff), because the worker already paces such releases
+        and a fix on any worker should be picked up at once. A release with another error or after a
+        submission ends a release stall; `_observe_repair_stall` and `_settle_repair_stalls` end it too."""
         if reason in STALL_IGNORED_RELEASES:
             return
         limit = int(self.setting("repair_stall_releases"))
-        stalls = self._repair_stalls()
         key = str(task["id"])
+        latest = repair_stall.release_signature(task["tip"], reason, error)
+        submitted = self.store.row("submissions", {"task_id": task["id"]}, order="id DESC")
+        boundary = submitted["id"] if submitted is not None else None
+        runs = dict(self._state("repair_release_runs", {}) or {})
+        run = runs.get(key)
+        if run is None or run.get("signature") != latest or run.get("after") != boundary:
+            run = {"signature": latest, "after": boundary, "count": 0}
+        run["count"] = int(run["count"]) + 1
+        runs[key] = run
+        self._set_state("repair_release_runs", runs)
+        stalls = self._repair_stalls()
         current = stalls.get(key)
         if current is not None and current.get("source") != "releases":
             return  # a checkpoint stall: checkpoints decide it
-        latest = repair_stall.release_signature(task["tip"], reason, error)
-        if current is not None and (current.get("signature") != latest or not limit):
-            batch = self.store.row("batches", {"id": batch_id})
-            self._end_repair_stall(task, batch, current, now, "a release with another error")
+        if current is not None and (
+            current.get("signature") != latest or current.get("after") != boundary or not limit
+        ):
+            why = "a worker submitted a result" if current.get("after") != boundary else "a release with another error"
+            self._end_repair_stall(task, self.store.row("batches", {"id": batch_id}), current, now, why)
             stalls.pop(key, None)
             self._set_state("repair_stalls", stalls)
             current = None
         if not limit:
             return
         if current is not None:
-            current["releases"] = int(current.get("releases", 0)) + 1
+            current["releases"] = run["count"]
             current["last_at"] = now
             stalls[key] = current
             self._set_state("repair_stalls", stalls)
             return
-        submitted = self.store.row("submissions", {"task_id": task["id"]}, order="id DESC")
-        since = submitted["created_at"] if submitted is not None else task["created_at"]
-        run = 0
-        for entry in self.store.rows("journal", {"kind": "released", "batch_id": batch_id}, order="id DESC", limit=500):
-            if entry["at"] < since:
-                break
-            detail = loads(entry["detail"], {})
-            if not isinstance(detail, dict) or detail.get("task_id") != task["id"]:
-                continue
-            if detail.get("reason") in STALL_IGNORED_RELEASES:
-                continue
-            signature = repair_stall.release_signature(
-                task["tip"], str(detail.get("reason") or ""), str(detail.get("error") or "")
-            )
-            if signature != latest:
-                break
-            run += 1
-        if run < limit:
+        if run["count"] < limit:
             return
         batch = self.store.row("batches", {"id": batch_id}) or {"id": batch_id, "version": task["batch_version"]}
         message = " ".join(str(error or "no error given").split())[:240]
@@ -9480,9 +9474,10 @@ class Controller:
             "since": now,
             "last_at": now,
             "signature": latest,
+            "after": boundary,
             "tip": task["tip"],
             "checkpoints": 0,
-            "releases": run,
+            "releases": run["count"],
             "reason": reason,
             "retries": 0,
             "retry_at": now,
@@ -9499,7 +9494,7 @@ class Controller:
             batch,
             now,
             cause=(
-                f"{task['kind']} task {task['id']} was given back {run} times in a row as {reason} "
+                f"{task['kind']} task {task['id']} was given back {run['count']} times in a row as {reason} "
                 f"with the same error, without a submission"
             ),
             detail=(
@@ -9535,7 +9530,12 @@ class Controller:
 
     def _settle_repair_stalls(self, now: float) -> None:
         """End the stalls of tasks that are no longer open: adopted, superseded by a new batch version
-        (new members, a new base) or replaced by another task."""
+        (new members, a new base) or replaced by another task. Forget the release runs of such tasks."""
+        runs = dict(self._state("repair_release_runs", {}) or {})
+        if runs:
+            open_ids = {str(t["id"]) for t in self.store.rows("tasks", {"state": TASK_OPEN})}
+            if set(runs) - open_ids:
+                self._set_state("repair_release_runs", {k: v for k, v in runs.items() if k in open_ids})
         stalls = self._repair_stalls()
         if not stalls:
             return
@@ -9549,7 +9549,7 @@ class Controller:
                     stall.get("source") == "releases"
                     and task is not None
                     and (latest := self.store.row("submissions", {"task_id": task["id"]}, order="id DESC")) is not None
-                    and latest["created_at"] >= stall["since"]
+                    and latest["id"] != stall.get("after")
                 )
                 if task is not None and task["state"] == TASK_OPEN and not disabled and not submitted:
                     continue

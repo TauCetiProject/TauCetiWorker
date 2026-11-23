@@ -98,7 +98,7 @@ Batch 506's repair task 1521 was given back 332 times in 7 hours as `artifacts_u
 `KeyError: 'members'` from the worker's prompt composition, and nobody was told until the head
 alert three hours in, which was journal-only. So when a task's last `repair_stall_releases` (default
 4) releases since its last submission have the same reason and the same error (normalized like a
-finding's message: `repair_stall.release_signature`), the task is stalled as well: the controller
+finding's message: `repair_stall.release_signature`; the run is kept per task in `state:repair_release_runs`), the task is stalled as well: the controller
 journals `escalated` (`repair-stalled`), raises one progress alert quoting the error, and shows the
 stall among the status `alerts` (`repair stalled: batch B repair task T given back N times in a row
 as REASON with the same error since <AEDT time>; ...`), in `loop_termination.repair_stalls` (with

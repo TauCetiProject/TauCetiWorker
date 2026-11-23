@@ -1326,10 +1326,36 @@ class RepairReleaseStall(QueueFixture):
         for _ in range(4):
             self.release()
         task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="b" * 40)
-        self.controller.submit_task(task.task_id, task.claim_token, task.tip, "{}")
+        result = self.controller.submit_task(task.task_id, task.claim_token, "0" * 40, "{}")
+        self.assertFalse(result.accepted)
+        self.controller.release_task(task.task_id, task.claim_token, "worker-stopped", "stopped")
         self.tick()
         self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
         self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_identical_releases_after_a_submission_are_a_new_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="b" * 40)
+        self.assertFalse(self.controller.submit_task(task.task_id, task.claim_token, "0" * 40, "{}").accepted)
+        self.controller.release_task(task.task_id, task.claim_token, "artifacts_unavailable", self.ERROR)
+        self.clock.advance(120)
+        for _ in range(2):
+            self.release()  # no loop pass in between
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 2)
+        self.tick()
+        self.assertEqual(len(self.controller.status()["loop_termination"]["repair_stalls"]), 1)
+
+    def test_many_ignored_releases_do_not_hide_the_run(self):
+        for _ in range(3):
+            self.release()
+        for _ in range(30):
+            self.release(reason="worker-stopped", error="stopped")
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
 
     def test_settling_the_task_ends_the_stall(self):
         for _ in range(4):
