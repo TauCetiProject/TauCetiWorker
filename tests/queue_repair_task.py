@@ -1916,7 +1916,9 @@ class RebaseArtifacts(Fixture):
         task = repair_task.Task.from_json(
             {**self.raw, "claim_token": "x", "expires_at": time.time() + 60, "extra": {"claim_id": 1}}
         )
-        lookahead = types.SimpleNamespace(cfg=types.SimpleNamespace(clone=clone), task=task, stopped=lambda: False)
+        lookahead = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(clone=clone), task=task, stopped=lambda: False, skip=frozenset()
+        )
         three = self.content.members[2]["commit"]
 
         def candidates() -> list[str]:
@@ -2040,6 +2042,59 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(len(self.agent_calls()), 2, "task 3's conflict goes to the agent")
         self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [False])
 
+    def pre_rebased_run(self, onto: str | None = None) -> tuple[str, dict]:
+        """Task 1 resolves member 2 onto ``onto`` (the head's pre-rebase), and the head-time task 2 then
+        replays the batch's own chain onto ``main`` (``onto``, or the new target given) naming task 1's
+        chain as its unused pre-rebase. Each run starts with no stored resolution, as on another worker."""
+        cfg = self.config()
+        clone = self.content.clone
+        first = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(first["status"], "adopted", first)
+        self.assertEqual(sh(clone, "for-each-ref", repair_task.RESOLUTION_PREFIX), "")
+        pre_rebased = {"kind": "pre_rebased_chain", "base": self.onto, "tip": first["tip"], "source": self.raw["tip"]}
+        task = {**self.raw, "task_id": 2, "diagnostics": [*self.raw["diagnostics"], pre_rebased]}
+        if onto is not None:
+            task["onto"] = onto
+        self.service.tasks = {2: task}
+        return first["tip"], repair_task.claim_and_run(cfg, self.client(cfg))
+
+    def test_the_head_time_rebase_reuses_its_pre_rebase_on_the_same_target(self):
+        """Batches 484 and 490: the pre-rebase was onto the tip that landed, but the members inserted since
+        conflict on it, so the head's own chain is replayed onto `main`. The replay meets the pre-rebase's
+        prefixes again and reuses its resolutions: no agent runs for them, and the chain is the same."""
+        pre_rebased, outcome = self.pre_rebased_run()
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["pre_rebased"], {"seeded": 1, "exact": True})
+        self.assertEqual(len(self.agent_calls()), 1, "only the pre-rebase's own agent run")
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True])
+        clone = self.content.clone
+        self.assertEqual(
+            [c.tree for c in chain_tool.chain_commits(clone, self.onto, outcome["tip"])],
+            [c.tree for c in chain_tool.chain_commits(clone, self.onto, pre_rebased)],
+        )
+
+    def test_the_head_time_rebase_resolves_only_what_its_pre_rebase_left(self):
+        """Batch 479: `main` moved past the pre-rebase's target, in member 3's file, so the pre-rebase does
+        not carry. Member 2's conflict has the same inputs and takes the pre-rebase's resolution; only
+        member 3's new conflict goes to an agent."""
+        seed = self.content.bare.parent / "seed"
+        sh(seed, "checkout", "--quiet", "--detach", self.onto)
+        moved = commit(seed, "main moved again", {"TauCeti/Three.lean": "-- three, on main\n"})
+        sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
+        _, outcome = self.pre_rebased_run(onto=moved)
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["pre_rebased"], {"seeded": 1, "exact": False})
+        self.assertEqual([c.get("reused", False) for c in outcome["conflicts"]], [True, False])
+        calls = self.agent_calls()
+        self.assertEqual(len(calls), 2, "one more agent run: member 3's conflict")
+        self.assertIn(f"PR #3's commit `{self.content.members[2]['commit'][:12]}`", calls[1]["prompt"])
+
+    def test_a_task_without_a_pre_rebased_chain_seeds_nothing(self):
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertNotIn("pre_rebased", outcome)
+
     def test_a_stored_resolution_that_does_not_match_is_not_used(self):
         """An entry naming another commit's resolution under this commit's key is not reused: the agent
         resolves the conflict and the entry is dropped."""
@@ -2152,7 +2207,9 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(outcome["artifacts"]["cache_revision"], self.onto)
         self.assertTrue(outcome["artifacts"]["available"])
         self.assertFalse(outcome["artifacts"]["incremental_build"])
-        self.assertEqual([call for call in self.lake_calls() if call.startswith("build")], ["build --iofail"])
+        self.assertEqual(
+            [call for call in self.lake_calls() if call.startswith("build")], [], "no verification build (S1)"
+        )
         self.assertEqual(len(self.agent_calls()), 1)
         self.assertEqual(self.service.releases, [])
         prompt = self.agent_calls()[0]["prompt"]
@@ -5998,22 +6055,17 @@ class WorkerAudits(Fixture):
         self.assertEqual(outcome["reason"], "agent_failed", outcome)
         self.assertEqual(self.service.results, [])
 
-    def test_pre_rebase_retains_full_check_receipt(self):
-        onto = self.pre_rebase_task()["onto"]
+    def test_a_pre_rebase_is_submitted_unverified(self):
+        """Decision 153 (S1): a pre-rebase resolves its conflicts and is submitted with no verification
+        build or checks, so no receipt; the batch is verified once it is the head, on `main`."""
+        self.pre_rebase_task()
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertNotIn("verification", outcome)
+        self.assertEqual(outcome["verification_skipped"], "pre_rebase: conflicts only")
         notes = json.loads(self.service.results[0]["worker_notes"])
-        receipt = notes["pre_rebase_verification"]
-        self.assertEqual(
-            receipt,
-            {
-                "tip": outcome["tip"],
-                "base": onto,
-                "tools": f"TauCetiProject/TauCetiTools@{TOOLS_REF}",
-                "scope": "full",
-            },
-        )
+        self.assertNotIn("pre_rebase_verification", notes)
 
     def test_lint_checkpoint_survives_lost_receipt_and_continues_on_a_new_claim(self):
         self.service.tasks[1].setdefault("extra", {})["can_checkpoint_repair"] = True
@@ -6408,21 +6460,34 @@ class PreRebaseChecks(Fixture):
         os.environ[repair_audit.URL_VARIABLE] = str(TOOLS_REPOSITORY)
         self.addCleanup(os.environ.pop, repair_audit.URL_VARIABLE, None)
 
-    def test_waiting_pre_rebase_runs_full_checks(self):
+    def test_a_pre_rebase_runs_no_checks(self):
         self.pre_rebase_task()
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
-        checks = outcome["verification"][-1]["checks"]
-        self.assertEqual(checks["status"], "passed")
-        self.assertEqual(checks["lint"]["scope"], "full")
+        self.assertNotIn("verification", outcome)
         notes = json.loads(self.service.results[0]["worker_notes"])
-        self.assertEqual(notes["pre_rebase_verification"]["scope"], "full")
+        self.assertNotIn("pre_rebase_verification", notes)
 
-    def test_a_resolution_that_fails_verification_is_repaired_then_submitted(self):
-        """The rebased chain fails verification: the agent gets a repair round on it, and when that leaves
-        the chain as it was, the chain is submitted and the whole chain's CI judges."""
+    def test_a_resolution_that_would_fail_verification_is_submitted_without_a_repair_round(self):
+        """Decision 153 (S1): the resolved chain still fails to build, which a rebase onto `main` would
+        find and repair. A pre-rebase submits it as resolved, with no build and no repair round: the
+        head's tip below it may itself fail, and the batch is repaired once it is the head."""
         self.pre_rebase_task()
+        os.environ["STUB_AGENT_MODE"] = "explain-only"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.agent_calls()), 1, "the conflict only")
+        self.assertIn("Resolve the textual conflict only", self.agent_calls()[0]["prompt"])
+        self.assertNotIn("verification", outcome)
+        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
+        self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Two.lean"))
+
+    def test_the_same_resolution_in_a_rebase_onto_main_is_repaired(self):
+        """The head-time path is unchanged: a `rebase_conflict` task verifies and repairs."""
+        self.pre_rebase_task()
+        self.service.tasks[1]["kind"] = "rebase_conflict"
         os.environ["STUB_AGENT_MODE"] = "explain-only"
         cfg = self.config()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
@@ -6430,8 +6495,6 @@ class PreRebaseChecks(Fixture):
         self.assertEqual(len(self.agent_calls()), 2)
         self.assertNotIn("## Resolving the commit", self.agent_calls()[1]["prompt"])
         self.assertFalse(outcome["verification"][-1]["ok"])
-        pushed = sh(self.content.bare, "rev-parse", self.submission_ref())
-        self.assertIn("BROKEN", sh(self.content.bare, "show", f"{pushed}:TauCeti/Two.lean"))
 
 
 class TargetedRepairChecks(Fixture):

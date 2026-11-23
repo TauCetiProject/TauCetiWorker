@@ -90,9 +90,24 @@ tip, like `base`, for a preparation of the pre-rebased chain), `members` (`sourc
 verbatim as the prompt's first paragraph), `created_at`, `extra`. The runner renews every
 `extra.renew_after` seconds when the service sets it, else every third of the claim's lifetime. A
 `pre_rebase` task is run like a `rebase_conflict` (warm artifacts from `onto` first, run cold rather
-than released); its prompt says that the target is the next head's expected base, not `main`, and
-lists the `cross_batch` diagnostic's predicted ripples from the head under "Predicted ripples from the
-head".
+than released); its prompt says that the target is the next head's expected base, not `main`, that
+only the textual conflict is the agent's to resolve, and lists the `cross_batch` diagnostic's
+predicted ripples from the head under "Predicted ripples from the head". It resolves the conflicts
+and submits (decision 153, S1): no verification build, no checks and no repair round (the outcome
+says `verification_skipped`), and no repair checkpoint is continued. The head's tip below it may
+fail its own checks, and those findings are not the later batch's to fix; the batch is verified and
+repaired once it is the head, on `main`.
+
+A head-time `rebase_conflict` task whose diagnostics carry `{kind: "pre_rebased_chain", base, tip,
+source}` replays the head's own chain onto `main` after the seal could not use its pre-rebase
+`base..tip` (docs/queue/controller.md). Before the replay, `repair_task.seed_pre_rebased` stores each
+member that chain resolved (its message extends the member's own) as the member's resolution on the
+prefix it was made on, skipping a mechanical resolution the batch's verification refused. The replay
+reuses one at once on the same prefix, as when the pre-rebase was onto the commit `main` now is
+(`exact`; no lookahead helper starts for those members), and otherwise tries it as an earlier
+resolution of the same conflict (`applicable_resolution`) before waiting for a helper. Only what is
+left goes to an agent; verification and repair follow as for any rebase. The outcome records
+`pre_rebased: {seeded, exact}`.
 
 `diagnostics` is the controller's list of findings, each `{kind, module, message}` as the CI
 adapter extracted them (`repair.findings_from_diagnostics`): `compiler`/`compiler_error` entries
@@ -173,7 +188,8 @@ below. Otherwise, or if a check fails, the agent gets the conflict as before. Th
 `conflicts` entry has `additive: {paths, hunks, kinds}`, and the outcome's `additive` record has the
 count, the files and the members, including resolutions reused from a lookahead or an earlier run (the
 explanation identifies them). Union order can still be wrong for Lean, for example a declaration
-placed before something it uses, so the whole-library verification build remains the check. When the
+placed before something it uses, so the whole-library verification build remains the check (for a
+`pre_rebase`, the head-time build, since the pre-rebase runs none). When the
 build reports findings in a file that a mechanical resolution wrote, the worker records them under
 `additive.verification_findings`, names those members and files in the repair round's prompt and
 deletes their stored resolutions. It also writes `refs/tauceti-queue/additive-refused/<batch>/<commit>`,

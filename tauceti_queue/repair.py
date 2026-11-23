@@ -189,6 +189,8 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
         if kind == "prepare_errors":
             findings["prepare_errors"] = raw
             continue
+        if kind == "pre_rebased_chain":
+            continue  # the worker's input (`repair_task.seed_pre_rebased`), not a finding
         module = str(raw.get("module") or raw.get("path") or "")
         message = str(raw.get("message") or "")
         if kind == "conflict":
@@ -1842,7 +1844,9 @@ def _rebase_sections(
         "commits your resolution and replays the rest of the batch itself; a later conflict is a separate request."
         + (
             f" The target is not `main`: `{base_short}` is what `main` becomes when the head lands, so this is the next "
-            "head's expected base, and the head's CI round may still change it."
+            "head's expected base, and the head's CI round may still change it. Resolve the textual conflict only: "
+            "the head's own commits below it are not yours to fix, and this batch is built and repaired once it is "
+            "the head, on `main`."
             if pre
             else ""
         )

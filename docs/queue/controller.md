@@ -247,7 +247,10 @@ no `prepare` task open or settled (adopted, clean or failed) at that version get
 task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty. The batch lands on
 `main`, so one based elsewhere is first replayed onto the canonical commit: a clean replay re-bases
 it (a new version) and it is prepared there; a conflicting one is recorded per version and canonical
-commit and the batch gets no own-base preparation until it is pre-rebased. An unclaimed own-base
+commit and the batch gets no own-base preparation until it is pre-rebased. Two batches are not
+rebased onto `main` this way while `pre_rebase_enabled` is on (decision 153, "Rebase ordering"
+below): the next batch, unless the head has failed CI, and the batch behind it in the handoff
+window. An unclaimed own-base
 preparation on a base other than the canonical commit is neither offered nor kept (`base-behind`). A sealed successor
 bypasses both size and quiet gates; its preparation is preferred over other own-base preparations. This happens whether
 or not the head has a task of its own, since the long head repairs are when the batch would
@@ -310,7 +313,13 @@ head's tip) with the conflict evidence of a `rebase_conflict` task and a `cross_
 `repair_context.cross_batch`: the names a head member removes or renames that a member of this batch
 uses (`removed_used`) and the names both batches add (`added_by_both`), text-derived and approximate,
 which the worker's prompt lists as predicted ripples. The worker handles it like a rebase conflict,
-told that the target is the next head's expected base rather than `main`. `claim_task` offers it
+told that the target is the next head's expected base rather than `main`, but resolves the textual
+conflicts only (decision 153, S1): it runs no verification build and so no repair rounds, and saves
+no repair checkpoint (`_can_checkpoint_repair` excludes `pre_rebase`). The head's tip it sits on may
+itself fail its checks, and a later batch must never act on the head's own failures (task 1416
+fixed 465's lint findings through 475's members). The batch is built, checked and repaired once it
+is the head, on `main`: by its own CI round and the head's repair tasks, or by the head-time
+`rebase_conflict` task's verification. `claim_task` offers it
 after the unheld head tasks and before `prepare`, one claim per batch; insertion goes on during the claim, and the submission
 is validated against the members the task covers and adopted as the batch's pre-rebase (`adopted`)
 with base, tip, version and members unchanged. A task whose `onto` is no longer the head's tip, or
@@ -332,8 +341,43 @@ the pre-rebase was left unused: `carry-conflict` (it does not replay onto `main`
 or `members-mismatch`, with the conflicting member (`source_pr`) and `paths`. The stacked pair is never built by the
 controller and nothing about the pre-rebase is a verdict.
 
+When that replay of the head's own chain conflicts, the head-time `rebase_conflict` task starts from
+the unused pre-rebase (`_pre_rebased_chain`): while it is usable and its source is in the head's
+chain, the task's diagnostics carry `{kind: "pre_rebased_chain", base, tip, source}` (the
+pre-rebase's target, its chain and the batch tip it covered), the controller retains the chain as
+`refs/tauceti-queue/batches/<id>/pre-rebased/<tip>` and lists that ref in the claim's retained refs,
+and the `rebase-conflict` journal entry names the tip (`pre_rebased`). The worker
+(`repair_task.seed_pre_rebased`) records each member that chain resolved as that member's resolution
+on the prefix it was made on, so its replay reuses it at once where it meets the same prefix (the
+pre-rebase was onto the tip that landed, as for 484 and 490: no helper is started for those
+members) and wherever else it is the same conflict (`applicable_resolution`, tried before waiting
+for a helper, as for 479). Only the remaining conflicts go to an agent, then the chain is verified
+and repaired on `main` as for any head-time rebase. A mechanical resolution the batch's verification
+refused is not reused, and the additive pre-pass applies to the remaining conflicts as usual.
+
+Rebase ordering (decision 153): each handoff should rebase the next batch once, onto the head's
+tip, rather than onto `main` first and again as the head. While `pre_rebase_enabled` is on:
+
+- R1 (`_successor_rebase_held`): the next batch (the oldest open batch), when behind `main`, gets no
+  rebase onto `main` and so no own-base preparation unless the head has failed CI on the source:
+  with no head, before the head is dispatched, during the head's own rebase and while its CI runs.
+  After a source failure the head's repair may take hours, and a rebase onto `main` is useful then.
+  Once the head is dispatched the next batch gets no own-base preparation either, as before.
+- R2 (`_handoff_window`): in the handoff window (no head, or a head with no dispatched CI attempt at
+  any version) the batch behind the next batch, when behind `main`, gets no rebase onto `main`
+  either; the pass's reasons say `open batch N: no rebase onto main until the head is dispatched
+  (handoff window)`. It is about to become the next batch. This alone would have prevented the
+  rebases onto `main` that blocked 465, 477 and 484 (tasks 1401, 1446 and 1464).
+- R3 (`_take_over_rebase`): when the pre-rebase may start (`_pre_rebase_blocked` is None) and the
+  next batch has an open `rebase_conflict` task onto `main`, that task is superseded (resolution
+  `pre-rebase-first`, journal `rebase-taken-over` with `claimed` and `claim_age_seconds`, counter
+  `rebases_taken_over`) if it is unclaimed or its oldest live claim is younger than
+  `pre_rebase_takeover_seconds` (1200), whose claim is then released; the pre-rebase starts in the
+  same pass. An older claim runs to the end, as before: the batch is then on `main`, and its
+  pre-rebase carries only the head's own conflicts.
+
 Preparing the pre-rebased chain (item 16 of "Five improvements from the first production repair" in
-the plan): a clean replay produces a tip nobody has built, so `_prepare_pre_rebased` creates a
+the plan), off by default since decision 153 (`prepare_pre_rebased` false; S1 above): a clean replay produces a tip nobody has built, so `_prepare_pre_rebased` creates a
 second kind of `prepare` task for the oldest open batch's usable pre-rebase (`clean`, or `adopted`
 from a `pre_rebase` task) once it is up to date (on the head's tip, covering the batch's tip),
 `_pre_rebase_blocked` allows the head, `prepare_pre_rebased` and `prepare_open_batches` are on, the

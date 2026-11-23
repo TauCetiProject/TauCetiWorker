@@ -175,14 +175,15 @@ class SealedSuccessor(ControllerCase):
         self.assertIsNone(self.controller._head())
         self.assertEqual([self.row(b)["sealed"] for b in (first, later, third)], [1, 1, 0])
         members = sorted(m["source_pr"] for m in self.controller.members(later["id"]))
-        self.assertEqual(
-            self.row(later)["base"], self.repo.main_sha(), "re-based onto main, not prepared on its old base"
-        )
+        # R2 (decision 153): in the handoff window the batch behind the next head is neither rebased onto
+        # `main` nor prepared there; it is pre-rebased onto that head's tip once it is dispatched.
+        self.assertEqual(self.row(later)["base"], later["base"], "not rebased onto main in the handoff window")
+        self.assertNotEqual(later["base"], self.repo.main_sha())
+        self.assertIsNone(self.controller._open_own_base_prepare(self.row(later)))
         self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
         self.controller.renew_task(task.task_id, task.claim_token)
         active = self.controller._active_claims(first["id"], task_id=task.task_id)
         self.assertEqual(len(active), 1)
-        self.assertIsNotNone(self.controller._open_own_base_prepare(self.row(later)))
         self.approve(501, {"P501.lean": "501\n"})
         self.controller.tick()
         self.assertEqual(sorted(m["source_pr"] for m in self.controller.members(later["id"])), members)
@@ -315,6 +316,7 @@ class SealedSuccessor(ControllerCase):
         controller, github, repo, clock = make_controller(self.root / "pre-rebase")
         self.addCleanup(controller.store.close)
         github.admins.add("admin-worker")
+        controller.set_setting("prepare_pre_rebased", True, "test")  # off by default (decision 153, S1)
         controller.set_setting("sealed_successor_min_members", 3, "test")
         controller.set_setting("repair_concurrency", 2, "test")
         for number in (101, 201, 202, 203):
