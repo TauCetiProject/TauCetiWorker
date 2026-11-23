@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""`git` for commands run in Bubble with run_in_bubble(inner_cmd=...), such as the review engine.
+
+Bubble routes GitHub through its auth proxy with `url.<proxy>.insteadOf` and the proxy's
+`http.<proxy>.extraHeader` in the container user's ~/.gitconfig, and its network allowlist drops
+direct GitHub traffic. TauCetiTools runs source git with GIT_CONFIG_GLOBAL=/dev/null and, for
+scoped credentials, only https allowed, so without this git dials github.com and times out.
+When the global config is blanked, re-apply those two kinds of setting for http(s) proxies and
+allow the proxy's scheme; otherwise this is plain git.
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+from urllib.parse import urlsplit
+
+here = os.path.dirname(os.path.abspath(__file__))
+rest = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if p and os.path.abspath(p) != here)
+real = shutil.which("git", path=rest)
+if real is None:
+    sys.exit("review-git: no git on PATH")
+args = [real]
+if os.environ.get("GIT_CONFIG_GLOBAL") == os.devnull:
+    config = os.path.join(os.environ.get("HOME", ""), ".gitconfig")
+    if os.path.isfile(config):
+        # The caller's GIT_CONFIG_* entries must not leak into reading Bubble's own file.
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_CONFIG")}
+        listed = subprocess.run(
+            [
+                real,
+                "config",
+                "--file",
+                config,
+                "--null",
+                "--get-regexp",
+                r"^(url\..*\.insteadof|http\..*\.extraheader)$",
+            ],
+            capture_output=True,
+            text=True,
+            env=clean,
+        ).stdout
+        schemes = set()
+        for entry in filter(None, listed.split("\0")):
+            key, _, value = entry.partition("\n")
+            section, _, name = key.rpartition(".")
+            scheme = urlsplit(section.split(".", 1)[1]).scheme
+            if scheme not in ("http", "https") or "=" in key:
+                continue
+            args += ["-c", f"{key}={value}"]
+            if name == "insteadof":
+                schemes.add(scheme)
+        for scheme in sorted(schemes):
+            args += ["-c", f"protocol.{scheme}.allow=always"]
+os.execv(real, args + sys.argv[1:])
