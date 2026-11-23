@@ -474,8 +474,7 @@ FLAGGED_ATTRIBUTES = frozenset(
     {"extern", "implemented_by", "export", "init", "builtin_init", "csimp", "never_extract", "macro_inline"}
 )
 ATTRIBUTE_USE = re.compile(r"(?:@|\battribute\s*)\[([^\]]*)\]")
-# A line that could define or register a name: if one in the bundle mentions an attribute, the
-# bundle may define it, and it is not reported as of baseline origin.
+# Text that could define or register a name: a bundle containing any gets no provenance.
 DEFINING = re.compile(
     r"\b(?:register\w*|\w*Attribute\w*|syntax|initialize|builtin_initialize|macro|macro_rules|elab|elab_rules)\b"
     r"|:\s*attr\b"
@@ -486,7 +485,8 @@ def baseline_attributes(batch: dict) -> list[str]:
     """The attributes this bundle uses that the pinned baseline defines and the bundle does not.
 
     Worker-computed provenance, so the reviewer never has to vouch for an attribute's origin. A
-    flagged attribute, or one any line of the bundle could define, is never listed."""
+    flagged attribute is never listed, and nothing is listed for a bundle with any line that could
+    define or register a name: a registration can span lines or compute its name."""
     from .audit_trusted_names import NAMES
 
     texts = [t for c in batch["commits"] for f in c["files"] for t in (f["before"], f["after"], f["diff"]) if t]
@@ -497,12 +497,9 @@ def baseline_attributes(batch: dict) -> list[str]:
                 words = [w for w in item.split() if w not in ("local", "scoped")]
                 if words:
                     used.add(words[0].lstrip("-"))
-    defining = [line for text in texts for line in text.splitlines() if DEFINING.search(line)]
-    return sorted(
-        name
-        for name in used & set(NAMES) - FLAGGED_ATTRIBUTES
-        if not any(re.search(rf"(?<![\w.]){re.escape(name)}(?![\w.])", line) for line in defining)
-    )
+    if any(DEFINING.search(text) for text in texts):
+        return []
+    return sorted(used & set(NAMES) - FLAGGED_ATTRIBUTES)
 
 
 def trusted_names_text() -> str:
@@ -524,22 +521,19 @@ def judgment_request(batch: dict) -> dict:
     )
     return {
         "model": REVIEWER_MODEL,
-        "max_tokens": 32000,
+        "max_tokens": 16000,
         "system": [{"type": "text", "text": POLICY + trusted_names_text(), "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": "user", "content": provenance + "Bundle:\n" + serialize(batch)}],
         "output_config": {"effort": REVIEWER_EFFORT, "format": {"type": "json_schema", "schema": JUDGMENT_SCHEMA}},
-        # A request a safety classifier declines is answered by Anthropic's recommended fallback model.
-        "betas": ["server-side-fallback-2026-07-01"],
-        "fallbacks": "default",
     }
 
 
 def call_reviewer(request: dict, key: str) -> dict:
+    """One non-streaming request: the whole response arrives, or none of it does."""
     import anthropic
 
     client = anthropic.Anthropic(api_key=key, max_retries=4, timeout=REVIEWER_TIMEOUT)
-    with client.beta.messages.stream(**request) as stream:
-        return stream.get_final_message().to_dict()
+    return client.messages.create(**request).to_dict()
 
 
 def inspect(batch: dict, work: Path) -> dict:
@@ -575,16 +569,16 @@ def inspect(batch: dict, work: Path) -> dict:
     failure = None
     try:
         response = call_reviewer(request, key)
-    except anthropic.BadRequestError as exc:
-        too_large = "too long" in str(exc).lower() or "too large" in str(exc).lower()
-        save(work / "reviewer-error.json", {"too_large": too_large, "error": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - no response arrived, so there is no judgment to keep.
+        status = getattr(exc, "status_code", None)
+        too_large = status == 413 or (
+            isinstance(exc, anthropic.BadRequestError) and re.search(r"too (?:long|large)", str(exc).lower())
+        )
+        save(work / "reviewer-error.json", {"too_large": bool(too_large), "status": status, "error": str(exc)})
         if too_large and len(batch["commits"]) == 1:
             raise Unreadable(
                 "security-audit: one commit exceeds the reviewer's context; human review required"
             ) from exc
-        failure = f"security-audit: reviewer request rejected: {exc}"
-    except (anthropic.APIError, OSError) as exc:
-        save(work / "reviewer-error.json", {"too_large": False, "error": str(exc)})
         failure = f"security-audit: reviewer request failed: {exc}"
     else:
         save(work / "response.json", response)

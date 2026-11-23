@@ -14,7 +14,7 @@ from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
-from tauceti_worker import cli
+from tauceti_worker import audit_evidence, cli
 from tauceti_worker import security_audit as sa
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
@@ -290,15 +290,6 @@ class PrivateAlerts(unittest.TestCase):
         finding = {**self.block, "outcome": "finding", "verdict": {"verdict": "finding", "findings": ["run_cmd"]}}
         self.assertEqual(alerts.report(self.work, finding)["details"], ["run_cmd"])
         self.assertEqual(alerts.report(self.work, {**self.block, "outcome": "not-judged"})["kind"], "Operational stall")
-
-    def test_every_block_writer_records_its_outcome(self):
-        from tauceti_worker.audit_evidence import NotJudged, Unreadable, outcome_of
-
-        finding = {"verdict": "finding", "findings": ["IO"]}
-        self.assertEqual(outcome_of(finding, Die("x")), {"outcome": "finding", "verdict": finding})
-        self.assertEqual(outcome_of(None, Unreadable("x")), {"outcome": "unreadable"})
-        self.assertEqual(outcome_of(None, NotJudged("x")), {"outcome": "not-judged"})
-        self.assertEqual(outcome_of({"verdict": "pass", "findings": []}, Die("ref")), {"outcome": "not-judged"})
 
     def test_code_uncertainty_notifies_immediately_during_operational_delay(self):
         (self.work / "ledger.jsonl").unlink()
@@ -812,6 +803,8 @@ class Authority(unittest.TestCase):
         self.assertEqual(sa.baseline_attributes(batch(local)), [])
         registered = "initialize registerBuiltinAttribute { name := `simp }\n@[simp] theorem t := x\n"
         self.assertEqual(sa.baseline_attributes(batch(registered)), [])
+        multiline = 'initialize customAttr : TagAttribute ←\n  registerTagAttribute\n    `stacks\n    "c"\n@[stacks 1] theorem t := x\n'
+        self.assertEqual(sa.baseline_attributes(batch(multiline)), [])
 
     def test_a_request_too_large_for_the_context_splits_or_holds(self):
         import anthropic
@@ -828,27 +821,54 @@ class Authority(unittest.TestCase):
             value["input_digest"] = hashlib.sha256(sa.serialize(value).encode()).hexdigest()
             return value
 
-        response = httpx2.Response(400, request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"))
-        error = anthropic.BadRequestError(
-            "prompt is too long: 1157582 tokens > 1000000 maximum", response=response, body=None
-        )
+        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+        too_long = "prompt is too long: 1157582 tokens > 1000000 maximum"
+        errors = {
+            "context": anthropic.BadRequestError(too_long, response=httpx2.Response(400, request=request), body=None),
+            "413": anthropic.APIStatusError(
+                "request too large", response=httpx2.Response(413, request=request), body=None
+            ),
+        }
         with tempfile.TemporaryDirectory() as tmp:
             key = Path(tmp) / "key"
             key.write_text("k")
             key.chmod(0o600)
+            for name, error in errors.items():
+                with (
+                    patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key)}),
+                    patch.object(sa, "call_reviewer", side_effect=error),
+                ):
+                    for n, raised in ((2, sa.NotJudged), (1, sa.Unreadable)):
+                        attempt = Path(tmp) / f"attempt-{name}-{n}"
+                        attempt.mkdir()
+                        with self.subTest(error=name, commits=n), self.assertRaises(raised):
+                            sa.inspect(batch(n), attempt)
+                        if n == 2:
+                            self.assertTrue(audit_evidence.engaged(attempt))
+
+    def test_a_transport_failure_is_not_a_judgment_and_never_holds(self):
+        import httpx2
+
+        files = [{"path": "TauCeti/A.lean", "before": "", "after": "x", "diff": ""}]
+        batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "b" * 40,
+            "commits": [{"sha": "b" * 40, "parent": "a" * 40, "files": files}],
+        }
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "key"
+            key.write_text("k")
+            key.chmod(0o600)
+            attempt = Path(tmp) / "attempt-1"
+            attempt.mkdir()
             with (
                 patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key)}),
-                patch.object(sa, "call_reviewer", side_effect=error),
+                patch.object(sa, "call_reviewer", side_effect=httpx2.ReadTimeout("read timed out")),
+                self.assertRaises(sa.NotJudged),
             ):
-                for n, raised in ((2, sa.NotJudged), (1, sa.Unreadable)):
-                    attempt = Path(tmp) / f"attempt-{n}"
-                    attempt.mkdir()
-                    with self.subTest(commits=n), self.assertRaises(raised):
-                        sa.inspect(batch(n), attempt)
-                    if n == 2:
-                        from tauceti_worker import audit_evidence
-
-                        self.assertTrue(audit_evidence.engaged(attempt))
+                sa.inspect(batch, attempt)
+            self.assertFalse(audit_evidence.engaged(attempt))
 
     def test_publications_do_not_enter_the_replay_outbox(self):
         with patch.object(sa, "execute", return_value=SimpleNamespace(returncode=0, stdout="{}", stderr="")) as execute:

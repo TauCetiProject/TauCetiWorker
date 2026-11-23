@@ -225,9 +225,9 @@ inline, no tools and a JSON schema for the answer. The request is retained as
 reviewer received: the API reads the whole request or rejects it, and nothing between the
 Worker and the model can truncate or drop input. There is no reviewer client to
 fingerprint and no delivery check. A request too large for the model's context is not a
-judgment: a range of several commits is split, and a single commit holds for a human. A
-request a safety classifier declines is answered by Anthropic's recommended fallback model
-(`fallbacks: "default"`); the response records which model answered.
+judgment: a range of several commits is split, and a single commit holds for a human. The
+request does not stream: the whole response arrives or none does, so an interrupted request
+leaves no partial answer to interpret, and is simply not a judgment.
 
 The reviewer returns exactly `pass` or `finding`. Genuine doubt whether code in the
 bundle is safe is a `finding`: a concern for human review, not necessarily a demonstrated
@@ -237,8 +237,9 @@ trusted baseline. The policy lists the attribute and syntax names the baseline d
 (`audit_trusted_names.py`), and the Worker states with each bundle which of the attributes
 it uses the baseline defines and the bundle does not (`baseline_attributes`): so the
 reviewer never has to vouch for, say, Mathlib's `@[stacks]` documentation attribute.
-Attributes the policy flags (`extern`, `implemented_by`, `init` and the like), and any name
-that a line of the bundle could define or register, are never listed.
+Attributes the policy flags (`extern`, `implemented_by`, `init` and the like) are never
+listed, and a bundle containing anything that could define or register a name (`syntax`,
+`initialize`, `register…`, `elab`, `macro`, `: attr`) gets no list at all.
 
 Why the audit is shaped this way, and what it does not defend against, is in
 `docs/security-audit-threat-model.md`.

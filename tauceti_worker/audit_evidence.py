@@ -41,8 +41,8 @@ def unique_pairs(pairs: list) -> dict:
 
 
 DECODER = json.JSONDecoder(object_pairs_hook=unique_pairs)
-# Response blocks that never hold an answer: reasoning, and the marker of a server-side fallback.
-ANSWERLESS = frozenset({"thinking", "redacted_thinking", "fallback"})
+# Response blocks that never hold an answer: reasoning.
+ANSWERLESS = frozenset({"thinking", "redacted_thinking"})
 
 
 class NotJudged(Die):
