@@ -1228,7 +1228,7 @@ ci="one/project"
             ) as read,
         ):
             self.assertEqual(github_open(gh, ["B"]), 589)
-        self.assertEqual(read.call_args.kwargs["numbers"], (0,))
+        self.assertEqual(read.call_args.kwargs["numbers"], (2**31 - 1,))  # positive: the service accepts it
         with (
             patch("tauceti_worker.github.me", return_value="science"),
             patch("tauceti_worker.github_state.enabled", return_value=True),

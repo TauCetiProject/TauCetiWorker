@@ -31,7 +31,18 @@ def project_forges(cfg) -> tuple[str, ...]:
     path = os.environ.get("TAUCETI_FORGEJO_TOKEN_FILE")
     if path is None and canonical and getattr(cfg, "home", None) is not None:
         path = str(cfg.home / ".config/tauceti-forgejo/worker-token")
-    return ("github", "forgejo") if path and os.path.lexists(path) else ("github",)
+    if not path:
+        return ("github",)
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        return ("github",)
+    except OSError:
+        pass  # Unreadable is not absent: count Forgejo, whose read then fails closed.
+    return ("github", "forgejo")
+
+
+NO_PR = 2**31 - 1  # the service accepts only positive PR numbers
 
 
 def github_open(gh, skip) -> int | None:
@@ -46,8 +57,9 @@ def github_open(gh, skip) -> int | None:
         with read_context(retry=False):
             login = me()
             if github_state_enabled():
-                # No PR numbers match 0: the service answers with its inventory-wide counts alone.
-                available, rows = read_survey(gh.repo, "any", skip, numbers=(0,), stages=())
+                # No PR has this number, so the service answers with its inventory-wide counts
+                # alone; one shared response serves every worker on the host.
+                available, rows = read_survey(gh.repo, "any", skip, numbers=(NO_PR,), stages=())
                 if available and not rows.cached and rows.author_counts is not None:
                     return rows.author_counts.get(login, 0)
             prs = [PRInfo.from_json(row) for row in gh.open_prs()]

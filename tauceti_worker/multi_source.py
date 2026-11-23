@@ -365,8 +365,9 @@ def display_survey(cfg, gh):
     failed = {name for name, _, value in observations if value.github_failed}
     healthy = {name: value for name, source, value in observations if source is not None and name not in failed}
     account = count_account(worker, healthy, unknown=failed) if healthy else {}
-    result.n_mine_open = sum(count for count in account.values() if count is not None)
-    result.roadmap_backpressure = result.n_mine_open >= result.max_open_prs or None in account.values()
+    # The combined survey holds every surveyed forge's own PRs; the dashboard's dials rescope those
+    # and keep the other forges' counts, so an unknown one stays blocked.
+    result.count_account({name: count for name, count in account.items() if name not in healthy})
     result.next_auto_stage = next((stage for stage in AUTO_STAGES if result.kind(stage).actionable), None)
     if result.next_auto_stage is None and not result.roadmap_backpressure and not result.errors:
         result.next_auto_stage = "roadmap"
