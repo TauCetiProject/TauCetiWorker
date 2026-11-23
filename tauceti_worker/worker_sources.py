@@ -125,6 +125,10 @@ def configure(args):
         os.environ.pop("TAUCETI_PREFER_FORGE", None)
     else:
         os.environ["TAUCETI_PREFER_FORGE"] = preference
+    if getattr(args, "review_first", False):
+        os.environ["TAUCETI_REVIEW_FIRST"] = "1"
+    else:
+        os.environ.pop("TAUCETI_REVIEW_FIRST", None)
 
 
 def selection_arguments():
@@ -139,6 +143,8 @@ def selection_arguments():
         arguments += ["--new-pr-forge", destination]
     if preference := os.environ.get("TAUCETI_PREFER_FORGE"):
         arguments += ["--prefer-forge", preference]
+    if os.environ.get("TAUCETI_REVIEW_FIRST") == "1":
+        arguments += ["--review-first"]
     return arguments
 
 

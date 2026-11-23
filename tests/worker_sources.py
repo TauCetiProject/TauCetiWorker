@@ -908,6 +908,103 @@ ci="one/project"
         # any Forgejo re-review, and Forgejo work remains the fallback.
         self.assertEqual(walk("github"), [(False, 0), (True, 2), (False, 1), (False, 3), (True, 6)])
 
+    def test_review_first_offers_reviews_on_either_forge_before_other_work(self):
+        import contextlib
+
+        from tauceti_worker.config import ClaimCollision
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        def walk(environment):
+            observations = self.observations([], [])
+            github, forgejo = observations[0][2], observations[1][2]
+            github.rebaseable.actionable.append(Candidate(1, "a" * 40))
+            github.needs_fix.actionable.append(Candidate(2, "b" * 40))
+            github.reviewable.actionable.append(Candidate(6, "f" * 40))
+            github.overlap_scan.actionable.append(Candidate(7, "1" * 40))
+            forgejo.reviewable.actionable.append(Candidate(3, "c" * 40, rereview=True))
+            forgejo.reviewable.actionable.append(Candidate(4, "d" * 40))
+            forgejo.rebaseable.actionable.append(Candidate(5, "e" * 40))
+            for _, worker, _ in observations:
+                worker.cfg = self.cfg
+            options = RoundOpts(
+                only=["rebase", "fix", "review", "overlap-scan"],
+                agent="auto",
+                work_model="auto",
+                sandbox_host=True,
+                dry_run=True,
+            )
+            with (
+                patch.dict(os.environ, environment),
+                patch("tauceti_worker.multi_source.collect", return_value=observations),
+                patch("tauceti_worker.multi_source.random.shuffle"),
+                patch("tauceti_worker.survey.bump_prs", side_effect=lambda sv: {5} if sv is forgejo else set()),
+                patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+                patch("tauceti_worker.work_units.run_round", side_effect=ClaimCollision("x")) as execute,
+            ):
+                for name in ("TAUCETI_PREFER_FORGE", "TAUCETI_REVIEW_FIRST"):
+                    if name not in environment:
+                        os.environ.pop(name, None)
+                with self.assertRaises(ClaimCollision):
+                    run_round(None, options)
+            return [
+                (
+                    "github" if call.args[0] is observations[0][1] else "forgejo",
+                    call.args[1].only,
+                    call.args[1].landing_tier,
+                )
+                for call in execute.call_args_list
+            ]
+
+        # The landing order: bump, rebases with re-reviews, fixes, first reviews, overlap.
+        self.assertEqual(
+            walk({}),
+            [
+                ("forgejo", ["rebase"], 0),
+                ("github", ["rebase"], 1),
+                ("forgejo", ["review"], 1),
+                ("github", ["fix"], 2),
+                ("github", ["review"], 3),
+                ("forgejo", ["review"], 3),
+                ("github", ["overlap-scan"], 6),
+            ],
+        )
+        # Review-first: the bump still leads, then the re-review and first reviews on either forge,
+        # then the rest of the landing order without the reviews already offered.
+        reviewing = [
+            ("forgejo", ["rebase"], 0),
+            ("forgejo", ["review"], 1),
+            ("github", ["review"], 3),
+            ("forgejo", ["review"], 3),
+            ("github", ["rebase"], 1),
+            ("github", ["fix"], 2),
+            ("github", ["overlap-scan"], 6),
+        ]
+        self.assertEqual(walk({"TAUCETI_REVIEW_FIRST": "1"}), reviewing)
+        # With a forge preference too, the preferred forge leads inside each step.
+        self.assertEqual(
+            walk({"TAUCETI_REVIEW_FIRST": "1", "TAUCETI_PREFER_FORGE": "forgejo"}),
+            [*reviewing[:2], reviewing[3], reviewing[2], *reviewing[4:]],
+        )
+        # A preference never puts a first review ahead of the other forge's re-review.
+        self.assertEqual(
+            walk({"TAUCETI_REVIEW_FIRST": "1", "TAUCETI_PREFER_FORGE": "github"}),
+            reviewing,
+        )
+
+    def test_review_first_survives_the_loop_handoff(self):
+        from tauceti_worker.cli import build_parser
+        from tauceti_worker.worker_sources import selection_arguments
+
+        with patch.dict(os.environ, {"TAUCETI_REVIEW_FIRST": "1"}, clear=True):
+            configure(build_parser().parse_args(["work", "--forgejo", "--review-first"]))
+            self.assertEqual(os.environ["TAUCETI_REVIEW_FIRST"], "1")
+            configure(build_parser().parse_args(["_round", *selection_arguments()]))
+            self.assertEqual(os.environ["TAUCETI_REVIEW_FIRST"], "1")
+            configure(build_parser().parse_args(["work", "--forgejo"]))
+            self.assertNotIn("TAUCETI_REVIEW_FIRST", os.environ)
+            self.assertNotIn("--review-first", selection_arguments())
+
     def test_a_forge_preference_survives_the_loop_handoff_and_must_be_selected(self):
         from tauceti_worker.cli import build_parser
         from tauceti_worker.worker_sources import selection_arguments

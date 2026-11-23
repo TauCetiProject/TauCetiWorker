@@ -91,6 +91,31 @@ class Ordering(unittest.TestCase):
         self.assertEqual(order(cascade(sv, AUTO_STAGES, tier=1))[-1], ("review", 60))
         self.assertNotIn("review", [stage for stage, _ in cascade(sv, AUTO_STAGES, tier=2)])
 
+    def test_review_first_offers_rereviews_then_first_reviews_after_bumps(self):
+        sv = survey()
+        sv.kind("review").actionable.append(Candidate(60, HEAD, rereview=True))
+        sv.kind("review").actionable.append(Candidate(9, HEAD))
+        pairs = order(cascade(sv, AUTO_STAGES, review_first=True))
+        self.assertEqual(
+            pairs[:8],
+            [
+                ("rebase", 9),
+                ("review", 9),
+                ("review", 60),
+                ("review", 50),
+                ("review", 1),
+                ("review", 2),
+                ("review", 5),
+                ("review", 6),
+            ],
+        )
+        # The rest keeps the landing order: rebases, then fixes.
+        self.assertEqual(pairs[8:], [pair for pair in order(cascade(sv, AUTO_STAGES)) if pair[0] != "review"][1:])
+        # A one-tier round still keeps only its tier, re-reviews first.
+        self.assertEqual(
+            order(cascade(sv, AUTO_STAGES, tier=1, review_first=True)), [("review", 60), ("rebase", 1), ("rebase", 2)]
+        )
+
     def test_age_spread_favours_old_prs_without_fixing_their_order(self):
         import random
 
