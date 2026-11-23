@@ -57,13 +57,17 @@ SHIM_LINES = [
         rf"export {_NAME}",
         rf"export {_SETTING}='{_LITERAL}'",
         rf"export (?P<n>{_SETTING})=\$\{{(?P=n):?-'{_LITERAL}'\}}",
-        rf"(?P<n>{_NAME})=\$\{{(?P=n):\+':'\$(?P=n)':'\}}",
-        rf"(?P<n>{_NAME})=\$\{{(?P=n)/':''{_STORE}'':'/':'\}}",
-        rf"(?P<n>{_NAME})='{_STORE}'\$(?P=n)",
-        rf"(?P<n>{_NAME})=\$(?P=n)'{_STORE}'",
-        rf"(?P<n>{_NAME})=\$\{{(?P=n)[#%]':'\}}",
     )
 ]
+# makeWrapper's --prefix or --suffix of one store path to a search path, as one whole block:
+# whatever was inherited, the result adds only that store path and no empty entry.
+SHIM_SEARCH_PATH = re.compile(
+    rf"(?P<n>{_NAME})=\$\{{(?P=n):\+':'\$(?P=n)':'\}}\n"
+    rf"(?P=n)=\$\{{(?P=n)/':''(?P<s>{_STORE})'':'/':'\}}\n"
+    rf"(?P=n)=(?:'(?P=s)'\$(?P=n)|\$(?P=n)'(?P=s)')\n"
+    rf"(?P=n)=\$\{{(?P=n)#':'\}}\n"
+    rf"(?P=n)=\$\{{(?P=n)%':'\}}"
+)
 SHIM_EXEC = re.compile(rf'((?:{_SETTING}={_LITERAL} )*)exec (?:-a "\$0" )?("?)({_PATH})\2\s+"\$@"')
 SHIM_LIMIT = 64 * 1024
 SHIM_DEPTH = 4
@@ -85,8 +89,16 @@ def shim_target(path: Path) -> tuple[Path, Path] | None:
         return None
     body = [line.strip(" ") for line in lines[1:] if line.strip(" ") and not line.strip(" ").startswith("#")]
     match = SHIM_EXEC.fullmatch(body[-1]) if body else None
-    if match is None or not all(any(p.fullmatch(line) for p in SHIM_LINES) for line in body[:-1]):
+    if match is None:
         return None
+    i = 0
+    while i < len(body) - 1:
+        if any(p.fullmatch(body[i]) for p in SHIM_LINES):
+            i += 1
+        elif i + 5 < len(body) and SHIM_SEARCH_PATH.fullmatch("\n".join(body[i : i + 5])):
+            i += 5
+        else:
+            return None
     return Path(interpreter[1]), Path(match[3])
 
 

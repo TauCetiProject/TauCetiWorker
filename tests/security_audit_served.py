@@ -505,6 +505,8 @@ class ClientCompatibility(unittest.TestCase):
                 "PATH=${PATH:+':'$PATH':'}\n"
                 "PATH=${PATH/':''/nix/store/x-socat/bin'':'/':'}\n"
                 "PATH='/nix/store/x-socat/bin'$PATH\n"
+                "PATH=${PATH#':'}\n"
+                "PATH=${PATH%':'}\n"
                 "export PATH\n"
                 f'exec -a "$0" "{native}"  "$@" \n'
             )
@@ -548,6 +550,10 @@ class ClientCompatibility(unittest.TestCase):
                 f"export LD_LIBRARY_PATH='.'\nexec {native} \"$@\"",  # a relative search path
                 f"export NODE_OPTIONS='--require=payload'\nexec {native} \"$@\"",
                 f"PATH='/''tmp/''bin'$PATH\nexec {native} \"$@\"",  # a quote splits a mutable path
+                # Out of makeWrapper's order, an unset search path gains empty (current directory) entries.
+                f"LD_LIBRARY_PATH='/nix/store/x/lib'$LD_LIBRARY_PATH\n"
+                f"LD_LIBRARY_PATH=${{LD_LIBRARY_PATH:+':'$LD_LIBRARY_PATH':'}}\n"
+                f'export LD_LIBRARY_PATH\nexec {native} "$@"',
                 'exec "/bin/\'echo\'" "$@"',  # quotes inside the target
                 f'exec {native}/.. "$@"',
                 f'\rexec {native} "$@"',  # the shell reads a command named "\\rexec"
