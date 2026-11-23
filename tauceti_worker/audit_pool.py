@@ -47,6 +47,7 @@ class Slot:
     failure: dict | None = None
     attempts: list[str] = field(default_factory=list)
     protocol: int | None = None  # The judgment protocol of the latest attempt.
+    escalate: bool = False  # The triage reviewer raised a concern: only the escalation reviewer judges it.
 
     @property
     def digest(self) -> str:
@@ -70,7 +71,7 @@ class Slot:
             "failure": self.failure,
             "attempts": self.attempts,
             "protocol_version": self.protocol,
-            "model": sa.REVIEWER_MODEL if self.protocol == sa.PROTOCOL else None,
+            "escalate": self.escalate,
         }
 
 
@@ -142,6 +143,7 @@ class Pool:
                     failure=record["failure"] if status != "planned" else None,
                     attempts=list(record["attempts"]) if status != "planned" else [],
                     protocol=protocol if status != "planned" else None,
+                    escalate=record.get("escalate") is True,
                 )
                 if slot.status == "pass":
                     sa.validate_verdict(slot.verdict, batch)
@@ -328,9 +330,9 @@ class Pool:
             commits = len(slot.batch["commits"])
             log(
                 f"security-audit pool: inspect {slot.batch['from_sha'][:12]}..{slot.target[:12]} ({commits} commits)"
-                f" with {sa.REVIEWER_MODEL} in {attempt.name}"
+                f" with {sa.ESCALATION_MODEL if slot.escalate else sa.TRIAGE_MODEL} in {attempt.name}"
             )
-            future = executor.submit(self.inspect, slot.batch, attempt)
+            future = executor.submit(self.inspect, slot.batch, attempt, slot.escalate)
             self.running[future] = (slot, attempt)
             busy += 1
 
@@ -343,7 +345,7 @@ class Pool:
             return False
 
     @staticmethod
-    def inspect(batch, attempt) -> dict:
+    def inspect(batch, attempt, escalate=False) -> dict:
         """One fresh inspection; a batch that changes no audited file passes as is."""
         if not any(c["files"] for c in batch["commits"]):
             return {
@@ -352,7 +354,7 @@ class Pool:
                 "verdict": "pass",
                 "findings": [],
             }
-        return sa.inspect(batch, attempt)
+        return sa.inspect(batch, attempt, escalate=escalate)
 
     def finished(self, future, cursor: str) -> None:
         slot, attempt = self.running.pop(future)
@@ -383,14 +385,18 @@ class Pool:
             "outcome": "unreadable" if hold else "not-judged",
             "batch": slot.digest,
             "commits": [c["sha"] for c in slot.batch["commits"]],
-            **self.reviewer(slot),
+            **self.reviewer(slot, attempt),
         }
+        if isinstance(exc, evidence.NeedsEscalation) or evidence.escalated(attempt):
+            failure["triage"] = evidence.triage_judgment(attempt)  # Kept, never binding.
         sa.record(self.work / "ledger.jsonl", failure)
         if hold:
             slot.status = "blocked"
             self.block(slot, failure, head=slot.batch["from_sha"] == cursor)
             log(f"security-audit pool: {span} held for review: {exc}")
             return
+        if isinstance(exc, evidence.NeedsEscalation):
+            slot.escalate = True  # Never back to the triage reviewer: the retry, or both halves, escalate.
         engaged = launched and evidence.engaged(attempt)
         if engaged and len(slot.batch["commits"]) > 1:
             self.split(slot, failure)
@@ -415,8 +421,13 @@ class Pool:
             return  # The cursor moved past it while it ran.
         shas = [c["sha"] for c in slot.batch["commits"]]
         half = len(shas) // 2
-        left = Slot(sa.build_batch(self.repo, slot.batch["from_sha"], slot.batch["main_sha"], shas[:half]))
-        right = Slot(sa.build_batch(self.repo, shas[half - 1], slot.batch["main_sha"], shas[half:]))
+        left = Slot(
+            sa.build_batch(self.repo, slot.batch["from_sha"], slot.batch["main_sha"], shas[:half]),
+            escalate=slot.escalate,
+        )
+        right = Slot(
+            sa.build_batch(self.repo, shas[half - 1], slot.batch["main_sha"], shas[half:]), escalate=slot.escalate
+        )
         index = next(i for i, s in enumerate(self.slots) if s is slot)
         self.slots[index : index + 1] = [left, right]
         sa.record(
@@ -439,6 +450,8 @@ class Pool:
     def concluded(self, slot: Slot, attempt: Path, verdict: dict, cursor: str) -> None:
         """A binding verdict: a pass may advance; any recorded concern blocks the range for review."""
         span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
+        if evidence.escalated(attempt):
+            slot.escalate = True  # Whatever remains of this range after a cursor move stays with Sonnet.
         sa.record(
             self.work / "ledger.jsonl",
             sa.review_record(self.actor or "", slot.batch, attempt, verdict),
@@ -462,15 +475,23 @@ class Pool:
             "attempt": str(attempt),
             "outcome": "finding",
             "verdict": verdict,
-            **self.reviewer(slot),
+            **self.reviewer(slot, attempt),
         }
+        if evidence.escalated(attempt):
+            failure["triage"] = evidence.triage_judgment(attempt)
         sa.record(self.work / "ledger.jsonl", failure)
         self.block(slot, failure, head=slot.batch["from_sha"] == cursor)
         log(f"security-audit pool: {span} {verdict['verdict']}; human review required")
 
     @staticmethod
-    def reviewer(slot: Slot) -> dict:
-        return {"model": sa.REVIEWER_MODEL, "protocol_version": slot.protocol}
+    def reviewer(slot: Slot, attempt: Path) -> dict:
+        """The reviewer that decided this attempt: Sonnet once it was asked, else Haiku."""
+        escalated = evidence.escalated(attempt)
+        return {
+            "model": sa.ESCALATION_MODEL if escalated else sa.TRIAGE_MODEL,
+            "protocol_version": slot.protocol,
+            "escalated": escalated,
+        }
 
     def block(self, slot: Slot, failure: dict, *, head: bool) -> None:
         slot.failure = failure
@@ -583,7 +604,7 @@ class Pool:
         """Run until `stop(pool)` returns true; a binding block holds advancement, never the pool."""
         with self.owned(Die):
             log(
-                f"security-audit pool: up to {self.parallel} isolated reviewers; reviewer {sa.REVIEWER_MODEL} (protocol {sa.PROTOCOL})"
+                f"security-audit pool: up to {self.parallel} isolated reviewers; {sa.TRIAGE_MODEL}, escalating concerns to {sa.ESCALATION_MODEL} (protocol {sa.PROTOCOL})"
             )
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel) as executor:
                 while True:

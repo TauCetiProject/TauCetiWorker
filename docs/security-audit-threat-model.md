@@ -20,8 +20,8 @@ mechanism is shaped the way it is.
    never truncates silently. A rejected request is split, or held if one commit is too
    large.
 3. **A weak reviewer.** Missing a planted construct, or raising non-concerns, both make
-   the audit worse. The reviewer model is chosen by measurement (below), and the Worker
-   supplies attribute provenance itself so the model never has to vouch for it.
+   the audit worse. The reviewers are chosen by measurement (below), and the Worker
+   supplies attribute provenance itself so a model never has to vouch for it.
 
 ## What it does not defend against
 
@@ -58,13 +58,33 @@ is different: the protocol change is a reviewed change to this repository, which
 equally change the audit code. So ranges blocked under an earlier protocol are inspected
 afresh, once, under the new one, and its findings bind.
 
-## Reviewer choice (November 2026 measurement)
+## Reviewers: Haiku triage, Sonnet escalation
 
-On 22 requests (9 recent ranges, including the four held only for `@[stacks]`), with
-Worker-supplied provenance: Haiku 5.5 returned 4 bogus findings (notes of "no concern"
-labelled `finding`); Sonnet 5.5 and Opus 5.5 returned none. On 10 planted constructs
-(`run_cmd`, `initialize`, a macro expanding to `#eval`, a prompt-injected `#eval`,
-`implemented_by`, `include_str`, a local tactic elaborator, `macro_rules` hijacking
-`ring_nf`, `extern`, a local `stacks` attribute running a process) all three models
-flagged every one. Opus 5.5 is the reviewer: as accurate as Sonnet here and about twice
-as fast (median 7 s against 17 s per 400k-token request), at twice the price.
+Haiku 5.5 reviews every range. A Haiku pass passes. A Haiku finding (or an answer that cannot
+be read) does not bind: the identical request goes once to Sonnet 5.5, and Sonnet's judgment
+binds, a finding holding the range for human review as before. Opus is not used by the
+automation; it is kept for interventions by operators.
+
+Why this is sound, from the November 2026 measurement (22 requests over 9 recent ranges,
+including the four held only for `@[stacks]`, plus 10 planted constructs: `run_cmd`,
+`initialize`, a macro expanding to `#eval`, a prompt-injected `#eval`, `implemented_by`,
+`include_str`, a local tactic elaborator, `macro_rules` hijacking `ring_nf`, `extern`, a
+locally defined `stacks` attribute running a process):
+
+- Haiku flagged 10 of 10 plants, as did Sonnet and Opus. So the escalation only filters false
+  alarms; it is not where dangerous code is caught.
+- Haiku raised 4 bogus findings in 22 requests (notes of "no concern" labelled `finding`);
+  Sonnet and Opus raised none. Sending only Haiku's findings to Sonnet removes those without
+  paying Sonnet's price for every range.
+- A Haiku pass is final, so it must be right: this design rests on Haiku's 10/10 plant
+  catch rate. That a subtler construct could get past Haiku, where Sonnet would have caught
+  it, is the accepted risk of this cost trade-off.
+
+The escalation is not a re-roll. Each range gets at most one judgment from each reviewer, in a
+fixed order, toward the stronger one: a Haiku concern is never sent back to Haiku (a retry or a
+split after a failed Sonnet request goes to Sonnet only), and a Sonnet finding binds. Both
+judgments are kept in the attempt and the ledger.
+
+Cost: Lean source here runs about 135k input tokens per commit, and requests are 200k to 600k
+tokens, so Haiku bills $0.50 per million (its rate above 100k) and Sonnet $2. With about 18% of
+requests escalated, that is roughly $0.08 per commit, against about $0.55 on Opus.

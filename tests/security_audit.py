@@ -783,12 +783,90 @@ class Authority(unittest.TestCase):
             execution = json.loads((attempt / "execution.json").read_text())
             self.assertEqual(execution["protocol_version"], sa.PROTOCOL)
             self.assertEqual(
-                execution["request_digest"], hashlib.sha256((attempt / "request.json").read_bytes()).hexdigest()
+                execution["stages"],
+                [
+                    {
+                        "stage": "triage",
+                        "model": sa.TRIAGE_MODEL,
+                        "request_digest": hashlib.sha256((attempt / "request.json").read_bytes()).hexdigest(),
+                    }
+                ],
             )
+        self.assertEqual(seen["request"]["model"], "claude-haiku-5-5")
         user = seen["request"]["messages"][0]["content"]
         self.assertIn(sa.serialize(batch), user)
         self.assertIn("(determined by the trusted Worker): simp, stacks.", user)
         self.assertNotIn("tools", seen["request"])
+
+    def escalation_case(self, answers, *, escalate=False):
+        """Run inspect with these answers in order; return (verdict or exception, models asked, attempt)."""
+        files = [{"path": "TauCeti/A.lean", "before": "", "after": "x", "diff": ""}]
+        batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "b" * 40,
+            "commits": [{"sha": "b" * 40, "parent": "a" * 40, "files": files}],
+        }
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        models, answers = [], list(answers)
+
+        def reviewer(request, key):
+            models.append(request["model"])
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return {"content": [{"type": "text", "text": json.dumps(answer)}], "stop_reason": "end_turn"}
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        key = Path(tmp.name) / "key"
+        key.write_text("k")
+        key.chmod(0o600)
+        attempt = Path(tmp.name) / "state" / "attempt-1"
+        attempt.mkdir(parents=True)
+        with (
+            patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key)}),
+            patch.object(sa, "call_reviewer", side_effect=reviewer),
+        ):
+            try:
+                result = sa.inspect(batch, attempt, escalate=escalate)
+            except Exception as exc:  # noqa: BLE001
+                result = exc
+        return result, models, attempt
+
+    def test_a_triage_pass_is_not_escalated(self):
+        result, models, _ = self.escalation_case([{"verdict": "pass", "findings": []}])
+        self.assertEqual((result["verdict"], models), ("pass", [sa.TRIAGE_MODEL]))
+
+    def test_a_triage_finding_escalates_once_and_the_escalation_decides(self):
+        finding = {"verdict": "finding", "findings": ["commit 1: origin of `stacks`"]}
+        result, models, attempt = self.escalation_case([finding, {"verdict": "pass", "findings": []}])
+        self.assertEqual((result["verdict"], models), ("pass", [sa.TRIAGE_MODEL, sa.ESCALATION_MODEL]))
+        stages = json.loads((attempt / "execution.json").read_text())["stages"]
+        self.assertEqual([s["model"] for s in stages], [sa.TRIAGE_MODEL, sa.ESCALATION_MODEL])
+        self.assertTrue((attempt / "response.json").exists())  # The triage judgment is kept.
+        record = sa.review_record(
+            "admin",
+            json.loads(json.dumps({"input_digest": "d", "from_sha": "a", "commits": [{"sha": "b"}]})),
+            attempt,
+            result,
+        )
+        self.assertEqual((record["model"], record["triage"]["judgments"]), (sa.ESCALATION_MODEL, [finding]))
+        result, models, _ = self.escalation_case([finding, {"verdict": "finding", "findings": ["IO"]}])
+        self.assertEqual((result["findings"], models), (["IO"], [sa.TRIAGE_MODEL, sa.ESCALATION_MODEL]))
+
+    def test_a_failed_escalation_needs_escalation_and_a_retry_never_asks_triage(self):
+        import httpx2
+
+        finding = {"verdict": "finding", "findings": ["x"]}
+        result, models, _ = self.escalation_case([finding, httpx2.ReadTimeout("t")])
+        self.assertIsInstance(result, audit_evidence.NeedsEscalation)
+        result, models, _ = self.escalation_case([{"verdict": "pass", "findings": []}], escalate=True)
+        self.assertEqual((result["verdict"], models), ("pass", [sa.ESCALATION_MODEL]))
+
+    def test_the_automation_never_asks_opus(self):
+        self.assertNotIn("opus", sa.TRIAGE_MODEL + sa.ESCALATION_MODEL)
+        source = Path(sa.__file__).read_text() + Path(sa.__file__).with_name("audit_pool.py").read_text()
+        self.assertNotIn("claude-opus", source)
 
     def test_baseline_attributes_never_vouch_for_flagged_or_locally_defined_attributes(self):
         def batch(text):

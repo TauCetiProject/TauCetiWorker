@@ -19,7 +19,18 @@ import time
 from pathlib import Path
 
 from .audit_alerts import save
-from .audit_evidence import FINDING, PASS, UNREADABLE, NotJudged, Unreadable, classify
+from .audit_evidence import (
+    ESCALATE,
+    ESCALATION,
+    FINDING,
+    PASS,
+    TRIAGE,
+    UNREADABLE,
+    NeedsEscalation,
+    NotJudged,
+    Unreadable,
+    classify,
+)
 from .config import Die, NoProgress, log
 from .constants import TAUCETI
 from .github_transport import execute
@@ -29,12 +40,13 @@ BOOTSTRAP = "8eecb48e9b51da99ca119f190a64ca43c100795b"
 MAX_COMMITS = 20
 
 
-# Judgment protocol 6: one Messages API request per inspection, made by this process, carrying the
-# whole bundle inline. Protocol 5 ran a reviewer CLI with a paged reader. A concern recorded under
-# an earlier protocol does not bind a protocol-6 range: it is inspected afresh, once, by protocol 6
-# (docs/security-audit-threat-model.md).
-PROTOCOL = 6
-REVIEWER_MODEL = "claude-opus-5-5"
+# Judgment protocol 7: each inspection is Messages API requests made by this process, carrying the
+# whole bundle inline. Haiku triages; only a Haiku concern goes, once, to Sonnet, whose judgment
+# binds. Opus is never used by the automation. A concern recorded under an earlier protocol does
+# not bind a protocol-7 range: it is inspected afresh, once (docs/security-audit-threat-model.md).
+PROTOCOL = 7
+TRIAGE_MODEL = "claude-haiku-5-5"
+ESCALATION_MODEL = "claude-sonnet-5-5"
 REVIEWER_EFFORT = "high"
 REVIEWER_TIMEOUT = 1800
 MAX_BYTES = 1024 * 1024  # Batch target: about 600k tokens of Lean source, inside the reviewer's 1M context.
@@ -512,7 +524,7 @@ def trusted_names_digest() -> str:
     return hashlib.sha256(trusted_names_text().encode()).hexdigest()
 
 
-def judgment_request(batch: dict) -> dict:
+def judgment_request(batch: dict, model: str) -> dict:
     """The complete Messages API request for one inspection: policy, provenance, the whole bundle."""
     attributes = baseline_attributes(batch)
     provenance = (
@@ -520,7 +532,7 @@ def judgment_request(batch: dict) -> dict:
         "(determined by the trusted Worker): " + (", ".join(attributes) if attributes else "none") + ".\n"
     )
     return {
-        "model": REVIEWER_MODEL,
+        "model": model,
         "max_tokens": 16000,
         "system": [{"type": "text", "text": POLICY + trusted_names_text(), "cache_control": {"type": "ephemeral"}}],
         "messages": [{"role": "user", "content": provenance + "Bundle:\n" + serialize(batch)}],
@@ -536,27 +548,27 @@ def call_reviewer(request: dict, key: str) -> dict:
     return client.messages.create(**request).to_dict()
 
 
-def inspect(batch: dict, work: Path) -> dict:
-    """One protocol-6 inspection of one exact batch, judged by the shared classification.
+def review(batch: dict, work: Path, stage: str, key: str) -> str | None:
+    """Send one stage's request and retain it and its response; return why it did not end normally.
 
-    This process sends the whole bundle in one API request, so the reviewer receives exactly the
-    bytes recorded in `request.json`: the API either reads the entire request or rejects it. A
-    request too large for the reviewer's context is not judged (a range of several commits is
-    split); a single commit that is too large holds for a human."""
+    Its files are `<stage>request.json`, `<stage>response.json` and `<stage>reviewer-error.json`,
+    and execution.json lists every stage launched, in order."""
     import anthropic
 
-    key = anthropic_api_key()
-    if not key:
-        raise NoProgress(f"security-audit: no reviewer API key; set {API_KEY_FILE_ENV}")
-    request = judgment_request(batch)
+    model = TRIAGE_MODEL if stage == TRIAGE else ESCALATION_MODEL
+    request = judgment_request(batch, model)
     body = serialize(request)
-    (work / "request.json").write_text(body)
-    (work / "execution.json").write_text(
+    (work / f"{stage}request.json").write_text(body)
+    path = work / "execution.json"
+    stages = json.loads(path.read_text())["stages"] if path.exists() else []
+    stages.append(
+        {"stage": stage or "triage", "model": model, "request_digest": hashlib.sha256(body.encode()).hexdigest()}
+    )
+    path.write_text(
         serialize(
             {
                 "protocol_version": PROTOCOL,
-                "model": REVIEWER_MODEL,
-                "request_digest": hashlib.sha256(body.encode()).hexdigest(),
+                "stages": stages,
                 "batch_identity": {
                     "input_digest": batch["input_digest"],
                     "commits": [c["sha"] for c in batch["commits"]],
@@ -566,7 +578,6 @@ def inspect(batch: dict, work: Path) -> dict:
             }
         )
     )
-    failure = None
     try:
         response = call_reviewer(request, key)
     except Exception as exc:  # noqa: BLE001 - no response arrived, so there is no judgment to keep.
@@ -574,24 +585,45 @@ def inspect(batch: dict, work: Path) -> dict:
         too_large = status == 413 or (
             isinstance(exc, anthropic.BadRequestError) and re.search(r"too (?:long|large)", str(exc).lower())
         )
-        save(work / "reviewer-error.json", {"too_large": bool(too_large), "status": status, "error": str(exc)})
+        save(work / f"{stage}reviewer-error.json", {"too_large": bool(too_large), "status": status, "error": str(exc)})
         if too_large and len(batch["commits"]) == 1:
             raise Unreadable(
                 "security-audit: one commit exceeds the reviewer's context; human review required"
             ) from exc
-        failure = f"security-audit: reviewer request failed: {exc}"
-    else:
-        save(work / "response.json", response)
-        if response.get("stop_reason") != "end_turn":
-            failure = f"security-audit: reviewer stopped with {response.get('stop_reason')}"
-    return judged(work, batch, failure)
+        return f"security-audit: {model} request failed: {exc}"
+    save(work / f"{stage}response.json", response)
+    if response.get("stop_reason") != "end_turn":
+        return f"security-audit: {model} stopped with {response.get('stop_reason')}"
+    return None
+
+
+def inspect(batch: dict, work: Path, *, escalate: bool = False) -> dict:
+    """One protocol-7 inspection of one exact batch, judged by the shared classification.
+
+    The triage reviewer (Haiku) judges first. A pass passes. A concern, or an answer that cannot be
+    read, does not bind by itself: the same request goes once to the escalation reviewer (Sonnet),
+    whose judgment binds. `escalate` starts with Sonnet: a range whose triage already raised a
+    concern is never sent to Haiku again. This process sends the whole bundle in each request, so a
+    reviewer receives exactly the bytes retained in the attempt: the API reads all of it or rejects
+    it. A request too large for the context is not judged (a range of several commits is split);
+    a single commit that is too large holds for a human."""
+    key = anthropic_api_key()
+    if not key:
+        raise NoProgress(f"security-audit: no reviewer API key; set {API_KEY_FILE_ENV}")
+    if not escalate:
+        failure = review(batch, work, TRIAGE, key)
+        if classify(work.parent, work, batch, failure).kind != ESCALATE:
+            return judged(work, batch, failure)
+        log(f"security-audit: {TRIAGE_MODEL} raised a concern; escalating to {ESCALATION_MODEL}")
+    return judged(work, batch, review(batch, work, ESCALATION, key))
 
 
 def judged(work: Path, batch: dict, failure=None) -> dict:
     """Return a binding verdict (pass, or every recorded concern); raise otherwise.
 
-    The one shared classification decides, whatever the last launch did: a concern recorded
-    anywhere binds, unreadable evidence holds, and anything else is not a judgment.
+    The one shared classification decides, whatever the last launch did: a binding concern
+    binds, unreadable evidence holds, a triage concern not yet escalated raises NeedsEscalation,
+    and anything else is not a judgment.
     """
     outcome = classify(work.parent, work, batch, failure)
     if outcome.kind in (PASS, FINDING):
@@ -599,6 +631,8 @@ def judged(work: Path, batch: dict, failure=None) -> dict:
     cause = failure if isinstance(failure, BaseException) else None
     if outcome.kind == UNREADABLE:
         raise Unreadable(outcome.reason) from cause
+    if outcome.kind == ESCALATE or (work / f"{ESCALATION}request.json").exists():
+        raise NeedsEscalation(outcome.reason) from cause
     raise NotJudged(outcome.reason) from cause
 
 
@@ -646,11 +680,16 @@ def dispatch_advanced(work: Path, landed: str) -> None:
 
 
 def review_record(actor: str, batch: dict, attempt: Path, verdict: dict) -> dict:
-    """The ledger entry for one reviewer verdict on one exact batch. Never includes a key."""
+    """The ledger entry for one binding verdict on one exact batch, with the triage judgment it
+    escalated from, if any. Never includes a key."""
+    from .audit_evidence import triage_judgment
+
+    escalated = (attempt / f"{ESCALATION}request.json").exists()
     return {
         "actor": actor,
         "provider": "anthropic-api",
-        "model": REVIEWER_MODEL,
+        "model": ESCALATION_MODEL if escalated else TRIAGE_MODEL,
+        "triage": triage_judgment(attempt) if escalated else None,
         "batch": batch["input_digest"],
         "policy_digest": hashlib.sha256(POLICY.encode()).hexdigest(),
         "protocol_version": PROTOCOL,

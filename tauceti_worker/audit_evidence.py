@@ -2,12 +2,15 @@
 
 Every finished, failed or interrupted attempt is exactly one outcome, in this precedence:
 
-- FINDING: a judgment recorded anywhere names a concern. "Anywhere" is the reviewer's API
-  response, the attempts this one continued, and the ledger's current-protocol verdicts for
-  the same input or any of its commits. It binds whatever else the attempt did.
+- FINDING: a binding judgment names a concern. Binding judgments are the deciding reviewer's
+  API response (the escalation reviewer's once it was asked, else the triage reviewer's
+  pass), the attempts this one continued, and the ledger's current-protocol verdicts for the
+  same input or any of its commits. It binds whatever else the attempt did.
 - UNREADABLE: no concern was found, but some evidence cannot be read, so the absence of a
   concern is not established. It holds the range for a human, exactly like a finding.
-- PASS: the request completed normally and its answer is a valid pass of the exact batch.
+- ESCALATE: the triage reviewer raised a concern, or gave an answer that cannot be read, and
+  the escalation reviewer has not judged yet. It never binds by itself.
+- PASS: the deciding request completed normally and its answer is a valid pass of the exact batch.
 - NOT_JUDGED: everything else (malformed output, a refusal, an API failure or a request too
   large to judge). It never binds.
 
@@ -26,6 +29,8 @@ from pathlib import Path
 from .config import Die
 
 FINDING, UNREADABLE, PASS, NOT_JUDGED = "finding", "unreadable", "pass", "not-judged"
+ESCALATE = "escalate"
+TRIAGE, ESCALATION = "", "escalation-"  # The file-name prefix of each stage (security_audit).
 
 # Text that mentions a judgment key must contain a readable judgment.
 KEYS = ("verdict", "findings")  # Either key makes a decoded object a judgment.
@@ -49,6 +54,12 @@ class NotJudged(Die):
     """The attempt recorded no concern and no valid complete judgment. It never binds."""
 
 
+class NeedsEscalation(NotJudged):
+    """The triage reviewer raised a concern that the escalation reviewer has not yet judged.
+
+    The range is retried with the escalation reviewer only, never with the triage reviewer."""
+
+
 class Unreadable(Die):
     """The attempt's evidence cannot establish the absence of a concern. It holds for a human."""
 
@@ -65,6 +76,7 @@ class Evidence:
     judgments: list = field(default_factory=list)  # Every judgment-shaped value, in recorded order.
     tools: list[str] = field(default_factory=list)  # Every response block that is neither answer nor reasoning.
     unreadable: list[str] = field(default_factory=list)  # Why some evidence could not be read.
+    escalate: list[str] = field(default_factory=list)  # Triage concerns awaiting the escalation reviewer.
 
     def concerns(self) -> list[tuple[str, list[str]]]:
         return [(j.get("verdict"), c) for j in self.judgments if (c := concern(j))]
@@ -136,8 +148,41 @@ def judgments_in(value, evidence: Evidence, where: str, *, answer: bool = False)
         evidence.unreadable.append(f"{where}: reviewer answer is not a judgment")
 
 
+def read_response(path: Path, evidence: Evidence) -> None:
+    """The judgments in one retained API response."""
+    if not path.exists():
+        return
+    try:
+        response = json.loads(path.read_text(encoding="utf-8"))
+        content = response["content"]
+        if not isinstance(content, list) or any(not isinstance(b, dict) for b in content):
+            raise ValueError("response content is not a list of blocks")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        evidence.unreadable.append(f"{path}: {exc}")
+        return
+    for number, block in enumerate(content):
+        where = f"{path}:content[{number}]"
+        if block.get("type") == "text":
+            judgments_in(block.get("text", ""), evidence, where, answer=True)
+        elif block.get("type") not in ANSWERLESS:
+            evidence.tools.append(str(block.get("type")))
+
+
+def escalated(attempt: Path) -> bool:
+    return (attempt / f"{ESCALATION}request.json").exists()
+
+
+def answer_path(attempt: Path) -> Path:
+    """The response that decides the attempt: the escalation reviewer's once it was asked."""
+    return attempt / f"{ESCALATION if escalated(attempt) else TRIAGE}response.json"
+
+
 def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] | None = None) -> Evidence:
-    """Everything the attempt and the attempts it continued recorded."""
+    """Everything binding that the attempt and the attempts it continued recorded.
+
+    Once the escalation reviewer was asked, its response alone decides; the triage response is
+    kept as a record. Before that, a triage concern or unreadable triage answer is not binding:
+    it is a reason to escalate (`Evidence.escalate`)."""
     evidence = Evidence() if evidence is None else evidence
     attempt = attempt.resolve()
     seen = set() if seen is None else seen
@@ -145,22 +190,17 @@ def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] 
         evidence.unreadable.append(f"{attempt}: cyclic continuation lineage")
         return evidence
     seen.add(attempt)
-    path = attempt / "response.json"
-    if path.exists():
-        try:
-            response = json.loads(path.read_text(encoding="utf-8"))
-            content = response["content"]
-            if not isinstance(content, list) or any(not isinstance(b, dict) for b in content):
-                raise ValueError("response content is not a list of blocks")
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            evidence.unreadable.append(f"{path}: {exc}")
+    if escalated(attempt):
+        read_response(answer_path(attempt), evidence)
+    else:
+        triage = Evidence()
+        read_response(answer_path(attempt), triage)
+        reasons = [text for _, texts in triage.concerns() for text in texts] + triage.unreadable
+        if reasons:
+            evidence.escalate.extend(reasons)
         else:
-            for number, block in enumerate(content):
-                where = f"{path}:content[{number}]"
-                if block.get("type") == "text":
-                    judgments_in(block.get("text", ""), evidence, where, answer=True)
-                elif block.get("type") not in ANSWERLESS:
-                    evidence.tools.append(str(block.get("type")))
+            evidence.judgments.extend(triage.judgments)
+            evidence.tools.extend(triage.tools)
     previous = attempt / "previous-block.json"
     if previous.exists():
         try:
@@ -172,6 +212,13 @@ def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] 
         else:
             collect(parent, evidence, seen=seen)
     return evidence
+
+
+def triage_judgment(attempt: Path) -> dict:
+    """The triage reviewer's judgment, for the record of an escalated attempt."""
+    triage = Evidence()
+    read_response(attempt / f"{TRIAGE}response.json", triage)
+    return {"judgments": triage.judgments, "unreadable": triage.unreadable}
 
 
 def recorded(state: Path, batch: dict, evidence: Evidence | None = None) -> Evidence:
@@ -247,7 +294,7 @@ def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
         raise Die(
             f"security-audit: reviewer answered with unexpected content: {', '.join(sorted(set(evidence.tools)))}"
         )
-    response = json.loads((attempt / "response.json").read_text())
+    response = json.loads(answer_path(attempt).read_text())
     if response.get("stop_reason") != "end_turn":
         raise Die(f"security-audit: reviewer stopped with {response.get('stop_reason')}")
     texts = [b["text"] for b in response["content"] if b.get("type") == "text"]
@@ -267,6 +314,10 @@ def classify(state: Path, attempt: Path, batch: dict, failure: BaseException | s
         return Outcome(FINDING, verdict=verdict)
     if evidence.unreadable:
         return Outcome(UNREADABLE, reason="security-audit: unreadable evidence: " + "; ".join(evidence.unreadable[:3]))
+    if evidence.escalate:
+        return Outcome(
+            ESCALATE, reason="security-audit: triage concern awaiting escalation: " + "; ".join(evidence.escalate[:3])
+        )
     if failure is not None:
         return Outcome(NOT_JUDGED, reason=failure_reason(failure))
     if not (attempt / "execution.json").exists():
@@ -301,9 +352,12 @@ def engaged(attempt: Path) -> bool:
 
     An attempt that is not a judgment is divided only then; a provider or setup failure, where
     no reviewer engaged, is retried on the same range."""
-    if (attempt / "response.json").exists():
-        return True
-    try:
-        return json.loads((attempt / "reviewer-error.json").read_text()).get("too_large") is True
-    except (OSError, ValueError, AttributeError):
-        return False
+    for stage in (TRIAGE, ESCALATION):
+        if (attempt / f"{stage}response.json").exists():
+            return True
+        try:
+            if json.loads((attempt / f"{stage}reviewer-error.json").read_text()).get("too_large") is True:
+                return True
+        except (OSError, ValueError, AttributeError):
+            pass
+    return False

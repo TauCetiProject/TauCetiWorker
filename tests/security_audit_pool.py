@@ -39,6 +39,7 @@ class PoolFixture(unittest.TestCase):
         self.lock = threading.Lock()
         self.calls = []
         self.calls_from = []
+        self.escalated = []
 
         def advance(repo, batch):
             with self.lock:
@@ -108,11 +109,12 @@ class PoolFixture(unittest.TestCase):
     def serve(self, inspect, parallel=3, stop=None):
         self.launches = getattr(self, "launches", [])
 
-        def fake(batch, attempt):
+        def fake(batch, attempt, escalate=False):
             with self.lock:
                 self.calls.append(self.index(batch))
                 self.calls_from.append(batch["from_sha"])
                 self.launches.append(self.index(batch))
+                self.escalated.append((batch["from_sha"], len(batch["commits"]), escalate))
             return inspect(batch, attempt)
 
         stop = stop or self.settled
@@ -317,7 +319,8 @@ class Ordering(PoolFixture):
             if self.index(batch) == 0:
                 text = sa.serialize({"verdict": "finding", "findings": ["x"]})
                 response = {"content": [{"type": "text", "text": text}], "stop_reason": "max_tokens"}
-                (attempt / "response.json").write_text(sa.serialize(response))
+                (attempt / "escalation-request.json").write_text("{}")
+                (attempt / "escalation-response.json").write_text(sa.serialize(response))
                 return sa.judged(attempt, batch, "security-audit: reviewer stopped with max_tokens")
             return self.verdict(batch)
 
@@ -442,6 +445,79 @@ class BindingJudgments(PoolFixture):
         self.assertEqual(self.calls, [])
 
 
+class Escalation(PoolFixture):
+    """A triage concern escalates once to the stronger reviewer; it never returns to triage."""
+
+    def test_a_failed_escalation_splits_and_both_halves_go_only_to_the_escalation_reviewer(self):
+        def inspect(batch, attempt):
+            if batch["from_sha"] == self.shas[0] and len(batch["commits"]) == 2:
+                (attempt / "execution.json").write_text(sa.serialize({"protocol_version": sa.PROTOCOL}))
+                text = sa.serialize({"verdict": "finding", "findings": ["origin of `stacks`"]})
+                (attempt / "response.json").write_text(
+                    sa.serialize({"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"})
+                )
+                (attempt / "escalation-request.json").write_text("{}")
+                return sa.judged(attempt, batch, "security-audit: claude-sonnet-5-5 request failed")
+            return self.verdict(batch)
+
+        self.serve(inspect)
+        self.assertEqual(len(self.advanced), 4)
+        first = [(n, e) for frm, n, e in self.escalated if frm in self.shas[:2]]
+        self.assertEqual(first, [(2, False), (1, True), (1, True)])
+        rows = [r for r in self.ledger() if r.get("outcome") == "not-judged"]
+        self.assertEqual(rows[0]["triage"]["judgments"][0]["findings"], ["origin of `stacks`"])
+        self.assertFalse((self.state / "blocked.json").exists())
+
+    def test_split_halves_keep_escalation_across_a_restart_before_they_launch(self):
+        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
+        p = pool.Pool(self.state, parallel=3)
+        slot = pool.Slot(batch, status="running", protocol=sa.PROTOCOL, escalate=True)
+        p.slots = [slot]
+        p.split(slot, {"attempt": "a", "reason": "r", "from_sha": self.shas[0], "to_sha": self.shas[2]})
+        restored = pool.Pool(self.state, parallel=3).restored()
+        self.assertEqual([s.escalate for s in restored], [True, True])
+
+    def test_an_escalated_unreadable_hold_records_both_judgments(self):
+        def inspect(batch, attempt):
+            if self.index(batch) == 0:
+                (attempt / "execution.json").write_text(sa.serialize({"protocol_version": sa.PROTOCOL}))
+                text = sa.serialize({"verdict": "finding", "findings": ["haiku concern"]})
+                (attempt / "response.json").write_text(
+                    sa.serialize({"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"})
+                )
+                (attempt / "escalation-request.json").write_text("{}")
+                (attempt / "escalation-response.json").write_text("{damaged")
+                return sa.judged(attempt, batch)
+            return self.verdict(batch)
+
+        self.serve(inspect, stop=self.settled)
+        row = next(r for r in self.ledger() if r.get("outcome") == "unreadable")
+        self.assertEqual((row["model"], row["escalated"]), (sa.ESCALATION_MODEL, True))
+        self.assertEqual(row["triage"]["judgments"][0]["findings"], ["haiku concern"])
+
+    def test_a_range_escalated_to_a_pass_stays_escalated_for_its_remaining_commits(self):
+        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
+        p = pool.Pool(self.state, parallel=3)
+        slot = pool.Slot(batch, status="running", protocol=sa.PROTOCOL)
+        p.slots = [slot]
+        attempt = self.state / "attempt-1"
+        attempt.mkdir()
+        (attempt / "escalation-request.json").write_text("{}")
+        p.concluded(slot, attempt, self.verdict(batch), self.shas[0])
+        self.cursor = self.shas[1]  # A human attested the first commit only.
+        rest = p.aligned(pool.Pool(self.state, parallel=3).restored(), self.shas[1], self.shas[-1])
+        self.assertEqual((rest[0].status, rest[0].escalate), ("planned", True))
+
+    def test_the_escalation_flag_survives_a_restart(self):
+        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
+        p = pool.Pool(self.state, parallel=3)
+        p.slots = [pool.Slot(batch, escalate=True, protocol=sa.PROTOCOL)]
+        p.persist()
+        self.serve(lambda b, a: self.verdict(b))
+        self.assertIn((self.shas[0], 2, True), self.escalated)
+        self.assertEqual(len(self.advanced), 3)
+
+
 class Supersession(PoolFixture):
     """Concerns from an earlier judgment protocol are inspected afresh, once, by the current one."""
 
@@ -519,7 +595,10 @@ class DurableRanges(PoolFixture):
         if evidence:
             (attempt / "execution.json").write_text(sa.serialize({"protocol_version": sa.PROTOCOL}))
             content = [{"type": "text", "text": sa.serialize(value)} for value in evidence]
-            (attempt / "response.json").write_text(sa.serialize({"content": content, "stop_reason": "end_turn"}))
+            (attempt / "escalation-request.json").write_text("{}")
+            (attempt / "escalation-response.json").write_text(
+                sa.serialize({"content": content, "stop_reason": "end_turn"})
+            )
         p.slots = [pool.Slot(batch, status="running", attempts=[str(attempt)], protocol=sa.PROTOCOL)]
         p.persist()
         return batch
@@ -675,7 +754,7 @@ class WorkerRounds(PoolFixture):
     """A Worker round runs one bounded quantum of the same scheduler, with its round's reviewer."""
 
     def round(self, inspect, **kwargs):
-        def fake(batch, attempt):
+        def fake(batch, attempt, escalate=False):
             self.calls.append(self.index(batch))
             self.launches.append(self.index(batch))
             return inspect(batch, attempt)
@@ -744,7 +823,7 @@ class WorkerRounds(PoolFixture):
     def test_rounds_record_the_current_protocol_and_reviewer(self):
         self.assertEqual(self.round(lambda b, a: self.verdict(b)), 0)
         row = next(r for r in self.ledger() if "verdict" in r)
-        self.assertEqual((row["protocol_version"], row["model"]), (sa.PROTOCOL, sa.REVIEWER_MODEL))
+        self.assertEqual((row["protocol_version"], row["model"]), (sa.PROTOCOL, sa.TRIAGE_MODEL))
         self.assertEqual(row["policy_digest"], sa.hashlib.sha256(sa.POLICY.encode()).hexdigest())
 
 
