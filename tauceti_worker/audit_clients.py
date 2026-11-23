@@ -42,10 +42,14 @@ def client_path(provider: str) -> Path:
 # interpreter and target are hashed, and any other path it names is in the Nix store. This is
 # an allowlist of whole lines, never a shell parser.
 _NAME = r"(?!(?:LD_PRELOAD|LD_AUDIT|BASH_ENV|ENV|DYLD_\w*)\b)[A-Za-z_][A-Za-z0-9_]*"
-# A literal is one plain word, set only in a client's own namespace: no literal can name a
-# file for an interpreter or loader to read.
+# A literal is a number, a switch or the certificate store's `system`.
 _LITERAL = r"(?:[0-9]+|true|false|system)"
-_SETTING = r"(?:CLAUDE|CODEX|DISABLE|FORCE|USE)_(?!\w*(?:PATH|DIR|HOME|SHELL)\b)[A-Za-z0-9_]*"
+# Only settings known to take a switch or enum, never a file: those the claude-code Nix wrapper
+# and the codex-patches launcher shim set.
+_SETTING = (
+    r"(?:DISABLE_AUTOUPDATER|FORCE_AUTOUPDATE_PLUGINS|DISABLE_INSTALLATION_CHECKS|USE_BUILTIN_RIPGREP"
+    r"|CLAUDE_CODE_CERT_STORE|CODEX_PATCHES_IN_NIX)"
+)
 # Absolute paths of plain components: never `.` or `..`, so a store path stays in the store.
 _COMPONENT = r"/(?!\.\.?(?![A-Za-z0-9._+-]))[A-Za-z0-9._+-]+"
 _PATH = rf"(?:{_COMPONENT})+"

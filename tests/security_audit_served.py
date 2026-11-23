@@ -513,7 +513,7 @@ class ClientCompatibility(unittest.TestCase):
             # A one-line launcher shim in front of it.
             shim = root / "bin/claude"
             shim.parent.mkdir()
-            shim.write_text(f'#!/bin/sh\n# launcher\nCLAUDE_IN_NIX=1 exec {nix} "$@"\n')
+            shim.write_text(f'#!/bin/sh\n# launcher\nCODEX_PATCHES_IN_NIX=1 exec {nix} "$@"\n')
             run = SimpleNamespace(stdout="2.1.323 (Claude Code)\n")
             with (
                 patch.object(clients, "client_path", return_value=shim),
@@ -562,6 +562,7 @@ class ClientCompatibility(unittest.TestCase):
                 f"export CLAUDE_CONFIG_PATH='payload'\nexec {native} \"$@\"",
                 f"export CLAUDE_CONFIG_DIR='payload'\nexec {native} \"$@\"",
                 f"export DISABLE_X='payload'\nexec {native} \"$@\"",
+                f"export CLAUDE_ENV_FILE='system'\nexec {native} \"$@\"",  # a file, not a switch
             ):
                 shim.write_text(f"#!/bin/sh\n{body}\n")
                 self.assertIsNone(clients.shim_target(shim), body)
