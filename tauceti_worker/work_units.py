@@ -691,6 +691,11 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         # credential when the answer was an HTTP 504 from the GraphQL gateway, retried out of a round.
         why = one_line("; ".join(sv.errors)) or "the open PR query failed (GitHub API?)"
         raise NoProgress(f"{why} — aborting round, not falling through to authoring")
+    if prepared_survey is None and want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
+        # The authoring limit is the account's across every project forge, not this forge's share.
+        from .account_pressure import count_account, report
+
+        report(count_account(w, {"github": sv}), sv)
 
     log(f"open PRs: {sv.status_label_line()}")
     # `--pr` scopes what this round SAYS as well as what it does. Every note below is about one named

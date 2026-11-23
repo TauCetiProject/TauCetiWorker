@@ -160,33 +160,6 @@ def deduplicate(observations):
             kind.actionable = [candidate for candidate in kind.actionable if candidate.pr not in duplicates]
 
 
-def report_authoring(healthy):
-    """Publish the authoring backpressure this round enforces, for supervisors such as Fleet.
-
-    The count is this round's own survey of every healthy source: what roadmap authoring is
-    actually checked against, whichever forge it runs on."""
-    import time
-
-    from .runtime_status import report_runtime
-
-    first = healthy[0][2]
-    count = sum(result.n_mine_open for _, _, result in healthy)
-    # A Fleet-focused round counts every roadmap while it works in one area: report the scope the
-    # count covers, not the area selected for work.
-    counted_all = getattr(first, "_automatic_open_count", None) is not None
-    report_runtime(
-        authoring=dict(
-            observed_at=time.time(),
-            sources={name: result.n_mine_open for name, _, result in healthy},
-            count=count,
-            limit=first.max_open_prs,
-            blocked=count >= first.max_open_prs,
-            scope="any" if counted_all else first.roadmap_only or "any",
-            skip=",".join(sorted(set(filter(None, first.roadmap_skip)))),
-        )
-    )
-
-
 def run_round(w, opts, *, use_fleet_focus=True):
     import os
 
@@ -227,7 +200,13 @@ def run_round(w, opts, *, use_fleet_focus=True):
         if waits:
             raise waits[0]
         raise NoProgress("all selected source surveys are unavailable")
-    report_authoring(healthy)
+    from .account_pressure import count_account, report
+
+    # Every healthy survey judges authoring against the account's open PRs on all project forges;
+    # a forge this worker does not survey is read, and a failed survey's forge counts as unknown.
+    unknown_forges = {name for name, _, value in observations if value.github_failed or value.dependency_wait}
+    account = count_account(w, {name: result for name, _, result in healthy}, unknown=unknown_forges)
+    report(account, healthy[0][2])
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")
@@ -301,12 +280,20 @@ def run_round(w, opts, *, use_fleet_focus=True):
         for pr in result.open_prs
         if pr.work_targets
     ]
-    authored = sum(result.n_mine_open for _, _, result in healthy)
+    authored = sum(count for count in account.values() if count is not None)
+    # An account count unknown on any project forge never reads as room to author.
+    counts_known = None not in account.values()
+    if not counts_known and want(opts.only, "roadmap") and not opts.prs:
+        log(
+            "Roadmap authoring waits: "
+            + ", ".join(f"{name} open-PR count unavailable" for name, n in sorted(account.items()) if n is None)
+        )
     for name, worker, result in executable:
         if (
             name == destination
             and name not in execution_failed
             and complete
+            and counts_known
             and authored < result.max_open_prs
             and want(opts.only, "roadmap")
             and not opts.prs
@@ -349,7 +336,6 @@ def display_survey(cfg, gh):
         result.open_prs.extend(value.open_prs)
         result._mine_open_prs.extend(value._mine_open_prs)
         result.n_open_nondraft += value.n_open_nondraft
-        result.n_mine_open += value.n_mine_open
         for stage in (
             "rebase",
             "review",
@@ -374,7 +360,17 @@ def display_survey(cfg, gh):
         for label in STATUS_LABELS
     ]
     result.n_status_unlabeled = sum(value.n_status_unlabeled for _, _, value in observations)
-    result.roadmap_backpressure = result.n_mine_open >= result.max_open_prs
+    from .account_pressure import count_account
+
+    failed = {name for name, _, value in observations if value.github_failed}
+    healthy = {name: value for name, source, value in observations if source is not None and name not in failed}
+    account = count_account(worker, healthy, unknown=failed) if healthy else {}
+    # The combined survey holds every surveyed forge's own PRs; the dashboard's dials rescope those
+    # and keep the other forges' counts, so an unknown one stays blocked. A Fleet-focused survey
+    # counts every roadmap, which its focused rows do not hold: keep those totals as they are.
+    if any(getattr(value, "_automatic_open_count", None) is not None for value in healthy.values()):
+        result._automatic_open_count = sum(account[name] for name in healthy)
+    result.count_account({name: count for name, count in account.items() if name not in healthy})
     result.next_auto_stage = next((stage for stage in AUTO_STAGES if result.kind(stage).actionable), None)
     if result.next_auto_stage is None and not result.roadmap_backpressure and not result.errors:
         result.next_auto_stage = "roadmap"

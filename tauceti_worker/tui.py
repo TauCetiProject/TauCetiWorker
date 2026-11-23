@@ -941,9 +941,16 @@ def dashboard_survey(cfg, gh):
         from .multi_source import display_survey
 
         return display_survey(cfg, gh)
+    from types import SimpleNamespace
+
+    from .account_pressure import count_account
     from .umbrellas import display_umbrella
 
-    return survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True, umbrella=display_umbrella(gh))
+    sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True, umbrella=display_umbrella(gh))
+    if not sv.github_failed and not sv.dependency_wait:
+        # Show the gate the worker enforces: the account's open PRs on every project forge.
+        count_account(SimpleNamespace(cfg=cfg, gh=gh), {"github": sv})
+    return sv
 
 
 def cmd_tui(args) -> int:

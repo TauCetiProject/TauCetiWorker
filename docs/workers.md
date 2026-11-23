@@ -37,11 +37,15 @@ an already-started agent session runs to completion. Workers report
 the environment variable behave as before.
 
 Each round also records, in the worker's runtime status, the authoring
-backpressure it enforces: `authoring` holds the open non-draft PRs it counts as
-its own on every healthy source (`sources`, `count`), the `limit`, whether roadmap
-authoring is `blocked`, the roadmap `scope` the count covers and its `skip`
-list, and `observed_at`. The count comes from that round's own survey, so it is
-current on any forge. A starting loop clears the previous report.
+backpressure it enforces: `authoring` holds the account's open non-draft PRs on
+every forge it counts (`sources`, per forge, and their sum `count`), the forges
+it counted (`forges`) and whether every one of those counts was known
+(`complete`), the `limit`, whether roadmap authoring is `blocked`, the roadmap
+`scope` the count covers and its `skip` list, and `observed_at`. A forge the
+round surveys counts from that survey; a project forge it does not survey is
+read cheaply (see [roadmap backpressure](reference.md#roadmap-backpressure)), so
+workers with different forge selections report the same account total. A
+starting loop clears the previous report.
 
 `TAUCETI_FLEET_MACHINE_ID` and `TAUCETI_FLEET_EVENTS` opt into a private JSONL
 provenance journal. Successful PR creation and GitHub mutations record machine,

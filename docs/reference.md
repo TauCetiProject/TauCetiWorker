@@ -46,6 +46,16 @@ PRs, and PRs for roadmaps outside the selected scope do not consume its authorin
 limit. An open roadmap PR whose area is temporarily unknown counts conservatively
 in every scope until its area label resolves.
 
+The limit is the account's across every forge the project uses, whichever forges
+the worker itself surveys. A Forgejo-only worker adds the account's open
+non-draft roadmap PRs on GitHub (the shared GitHub state's author counts, or the
+open-PR listing), and a GitHub-only worker with a Forgejo credential adds the
+account's Forgejo PRs (the host's shared Forgejo listing). That other-forge count
+covers every non-skipped area, so a focused round is at least as strict as its
+own scope. When the other forge's count is unavailable, authoring waits: an
+unknown count never reads as zero. A worker without a Forgejo credential has no
+Forgejo account to count and counts GitHub alone.
+
 ## The claim namespace
 
 Mathlib overlap phases require the canonical shared namespace and never use its

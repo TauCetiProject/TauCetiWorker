@@ -440,6 +440,10 @@ class Survey:
         # The umbrella round (docs/umbrellas.md) when roadmap_only names an umbrella; not a field, so
         # `status --json` keeps its shape. Read it through `umbrella`.
         self._umbrella = None
+        # The account's open roadmap PRs on the project's other forges (account_pressure), added to
+        # this survey's own count; None for a forge whose count is unknown, which blocks authoring.
+        self._account_others: dict[str, int | None] = {}
+        self._own_open = 0
 
     @property
     def umbrella(self):
@@ -485,7 +489,7 @@ class Survey:
         if umbrella is not None:
             # The skip dial may have taken members out of the umbrella or brought them back.
             self._umbrella = umbrella = umbrella.rescoped(self.roadmap_skip)
-        self.n_mine_open = (
+        self._own_open = (
             automatic
             if automatic is not None
             else roadmap_open_count(
@@ -495,8 +499,22 @@ class Survey:
                 within=None if umbrella is None else umbrella.scope,
             )
         )
-        self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs
+        others = self._account_others.values()
+        self.n_mine_open = self._own_open + sum(count for count in others if count is not None)
+        # An unknown count on another forge fails closed: the account may already be at its limit.
+        self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs or None in others
         self.next_auto_stage = _next_auto_stage(self)
+
+    @property
+    def own_open(self) -> int:
+        """This survey's own forge's share of n_mine_open."""
+        return self._own_open
+
+    def count_account(self, others: dict[str, int | None]) -> None:
+        """Judge authoring against the account's open PRs on every forge: `others` maps each other
+        project forge to its count there, or None when that count is unavailable."""
+        self._account_others = dict(others)
+        self.rescope_roadmap()
 
     def status_label_line(self) -> str:
         """One-line breakdown of open non-draft PRs by status label: 'N label (M mine), N label (M),

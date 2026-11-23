@@ -1088,7 +1088,7 @@ ci="one/project"
         from tauceti_worker.work_units import NoEligibleWork, RoundOpts
 
         observations = self.observations([], [])
-        observations[0][2].n_mine_open, observations[1][2].n_mine_open = 3, 4
+        observations[0][2]._automatic_open_count, observations[1][2]._automatic_open_count = 3, 4
         for _, _, result in observations:
             result.max_open_prs = 7
             result.roadmap_skip = ["B", "A", ""]
@@ -1107,8 +1107,10 @@ ci="one/project"
             {k: authoring[k] for k in ("count", "limit", "blocked", "scope", "skip")},
             dict(count=7, limit=7, blocked=True, scope="any", skip="A,B"),
         )
+        self.assertEqual(authoring["forges"], ["forgejo", "github"])
+        self.assertIs(authoring["complete"], True)
         for _, _, result in observations:  # a Fleet-focused round counts every roadmap
-            result.roadmap_only, result._automatic_open_count = "Algebra", result.n_mine_open
+            result.roadmap_only = "Algebra"
         with (
             patch("tauceti_worker.multi_source.collect", return_value=observations),
             patch("tauceti_worker.runtime_status.report_runtime") as report,
@@ -1127,6 +1129,169 @@ ci="one/project"
         ):
             run_round(None, options)
         self.assertEqual(report.call_args.kwargs["authoring"]["scope"], "Algebra")
+
+    def forgejo_only(self, count, limit=1024):
+        native = Survey(worker_id="test")
+        native._automatic_open_count, native.max_open_prs = count, limit
+        native.rescope_roadmap()
+        worker = SimpleNamespace(cfg=self.cfg, gh=SimpleNamespace(repo="one/project"))
+        return worker, [("forgejo", SimpleNamespace(gh=self.source, cfg=self.cfg), native)]
+
+    def test_a_forgejo_only_worker_counts_the_accounts_github_prs(self):
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import NoEligibleWork, RoundOpts
+
+        worker, observations = self.forgejo_only(916)
+        options = RoundOpts(only=["roadmap"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True)
+        with (
+            patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": "forgejo"}),
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.account_pressure.github_open", return_value=589) as github,
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", side_effect=AssertionError("authored")) as ordinary,
+            self.assertRaises(Exception) as raised,
+        ):
+            run_round(worker, options)
+        self.assertNotIsInstance(raised.exception, AssertionError)
+        ordinary.assert_not_called()
+        github.assert_called_once()
+        authoring = report.call_args.kwargs["authoring"]
+        self.assertEqual(authoring["sources"], {"forgejo": 916, "github": 589})
+        self.assertEqual((authoring["count"], authoring["blocked"], authoring["complete"]), (1505, True, True))
+        native = observations[0][2]
+        self.assertEqual((native.own_open, native.n_mine_open, native.roadmap_backpressure), (916, 1505, True))
+
+        worker, observations = self.forgejo_only(10)  # far below the limit, but GitHub is unknown
+        with (
+            patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": "forgejo"}),
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.account_pressure.github_open", return_value=None),
+            patch("tauceti_worker.runtime_status.report_runtime") as report,
+            patch("tauceti_worker.work_units.run_round", side_effect=AssertionError("authored")) as ordinary,
+            patch("tauceti_worker.multi_source.log") as logged,
+            self.assertRaises(NoEligibleWork),
+        ):
+            run_round(worker, options)
+        ordinary.assert_not_called()
+        self.assertIn("github open-PR count unavailable", " ".join(str(c.args) for c in logged.call_args_list))
+        authoring = report.call_args.kwargs["authoring"]
+        self.assertEqual((authoring["count"], authoring["blocked"], authoring["complete"]), (10, True, False))
+        self.assertTrue(observations[0][2].roadmap_backpressure)
+
+    def test_a_github_only_survey_counts_the_accounts_forgejo_prs(self):
+        from tauceti_worker.account_pressure import count_account
+
+        for forgejo, total, blocked in ((916, 1506, True), (None, 590, True), (100, 690, False)):
+            github = Survey(worker_id="test")
+            github._automatic_open_count, github.max_open_prs = 590, 1024
+            github.rescope_roadmap()
+            with patch("tauceti_worker.account_pressure.forgejo_open", return_value=forgejo):
+                counts = count_account(SimpleNamespace(cfg=self.cfg, gh=None), {"github": github})
+                self.assertEqual(counts, {"github": 590})  # no Forgejo credential: no Forgejo account
+                token = self.root / ".config/tauceti-forgejo/worker-token"
+                token.parent.mkdir(parents=True, exist_ok=True)
+                token.touch()
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("TAUCETI_FORGEJO_TOKEN_FILE", None)
+                    counts = count_account(SimpleNamespace(cfg=self.cfg, gh=None), {"github": github})
+                token.unlink()
+            self.assertEqual(counts, {"github": 590, "forgejo": forgejo})
+            self.assertEqual((github.n_mine_open, github.roadmap_backpressure), (total, blocked))
+            github.rescope_roadmap()  # a dashboard dial keeps the other forge's count
+            self.assertEqual((github.n_mine_open, github.roadmap_backpressure), (total, blocked))
+
+    def test_the_dashboard_shows_the_account_total_of_a_focused_round(self):
+        from tauceti_worker.multi_source import display_survey
+
+        github, native = Survey(worker_id="test"), Survey(worker_id="test")
+        for result, count in ((github, 589), (native, 916)):
+            result._automatic_open_count, result.max_open_prs = count, 1024
+            result.rescope_roadmap()
+        observations = [
+            ("github", SimpleNamespace(gh=SimpleNamespace(repo="one/project")), github),
+            ("forgejo", SimpleNamespace(gh=self.source), native),
+        ]
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.multi_source.ReviewState"),
+        ):
+            shown = display_survey(self.cfg, SimpleNamespace(repo="one/project"))
+        self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (1505, True))
+        shown.roadmap_skip = ["Algebra"]
+        shown.rescope_roadmap()  # a dashboard dial
+        self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (1505, True))
+        native.github_failed = True
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.multi_source.ReviewState"),
+        ):
+            shown = display_survey(self.cfg, SimpleNamespace(repo="one/project"))
+        self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (589, True))  # Forgejo unknown
+        shown.rescope_roadmap()
+        self.assertTrue(shown.roadmap_backpressure)
+
+    def test_a_github_only_dashboard_shows_the_account_total(self):
+        from tauceti_worker.tui import dashboard_survey
+
+        github = Survey(worker_id="test")
+        github._automatic_open_count, github.max_open_prs = 589, 1024
+        github.rescope_roadmap()
+        with (
+            patch.dict(os.environ, {"TAUCETI_WORKER_FORGES": "github"}),
+            patch("tauceti_worker.tui.survey", return_value=github),
+            patch("tauceti_worker.tui.ReviewState"),
+            patch("tauceti_worker.umbrellas.display_umbrella", return_value=None),
+            patch("tauceti_worker.account_pressure.project_forges", return_value=("github", "forgejo")),
+            patch("tauceti_worker.account_pressure.forgejo_open", return_value=916),
+        ):
+            shown = dashboard_survey(self.cfg, SimpleNamespace(repo="one/project"))
+        self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (1505, True))
+
+    def test_the_selected_area_is_counted_on_the_other_forge_despite_a_skip(self):
+        from tauceti_worker.account_pressure import count_account
+
+        native = Survey(worker_id="test", roadmap_only="Algebra", roadmap_skip=["Algebra", "PDE"])
+        native.rescope_roadmap()
+        with patch("tauceti_worker.account_pressure.github_open", return_value=1) as github:
+            count_account(SimpleNamespace(cfg=None, gh=None), {"forgejo": native})
+        self.assertEqual(github.call_args.args[1], ["PDE"])
+
+    def test_an_anonymous_forgejo_listing_is_not_an_account_count(self):
+        from tauceti_worker.account_pressure import forgejo_open
+
+        listing = Survey(worker_id="test")
+        listing.source_actor = None
+        with (
+            patch("tauceti_worker.worker_sources.native_source", return_value=self.source),
+            patch("tauceti_worker.worker_sources.source_config", return_value=self.cfg),
+            patch("tauceti_worker.source_survey.inventory_survey", return_value=listing),
+        ):
+            self.assertIsNone(forgejo_open(self.cfg, []))
+            listing.source_actor, listing._automatic_open_count = self.actor, 12
+            listing.rescope_roadmap()
+            self.assertEqual(forgejo_open(self.cfg, []), 12)
+
+    def test_the_github_count_reads_the_shared_author_counts_alone(self):
+        from tauceti_worker.account_pressure import github_open
+        from tauceti_worker.github_state import SurveyRows
+
+        gh = SimpleNamespace(repo="one/project", open_prs=Mock(side_effect=AssertionError("full listing")))
+        with (
+            patch("tauceti_worker.github.me", return_value="science"),
+            patch("tauceti_worker.github_state.enabled", return_value=True),
+            patch(
+                "tauceti_worker.github_state.read_survey", return_value=(True, SurveyRows([], {"science": 589}))
+            ) as read,
+        ):
+            self.assertEqual(github_open(gh, ["B"]), 589)
+        self.assertEqual(read.call_args.kwargs["numbers"], (2**31 - 1,))  # positive: the service accepts it
+        with (
+            patch("tauceti_worker.github.me", return_value="science"),
+            patch("tauceti_worker.github_state.enabled", return_value=True),
+            patch("tauceti_worker.github_state.read_survey", return_value=(False, None)),
+        ):
+            gh.open_prs = Mock(side_effect=OSError("down"))
+            self.assertIsNone(github_open(gh, []))  # unknown, never zero
 
     def test_native_execution_failure_does_not_invalidate_github_authoring_inventory(self):
         import contextlib
@@ -1161,7 +1326,7 @@ ci="one/project"
         scoped, global_work = self.observations([], []), self.observations([], [])
         for _, _, result in scoped:
             result._round_scope = (False, True)
-            result.n_mine_open = result.max_open_prs
+            result._automatic_open_count = result.max_open_prs
         global_work[0][2].reviewable.actionable = [Candidate(1, "a" * 40)]
         options = RoundOpts(
             only=["review", "roadmap"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True
