@@ -450,6 +450,8 @@ class Pool:
     def concluded(self, slot: Slot, attempt: Path, verdict: dict, cursor: str) -> None:
         """A binding verdict: a pass may advance; any recorded concern blocks the range for review."""
         span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
+        if evidence.escalated(attempt):
+            slot.escalate = True  # Whatever remains of this range after a cursor move stays with Sonnet.
         sa.record(
             self.work / "ledger.jsonl",
             sa.review_record(self.actor or "", slot.batch, attempt, verdict),

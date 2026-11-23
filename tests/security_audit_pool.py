@@ -495,6 +495,19 @@ class Escalation(PoolFixture):
         self.assertEqual((row["model"], row["escalated"]), (sa.ESCALATION_MODEL, True))
         self.assertEqual(row["triage"]["judgments"][0]["findings"], ["haiku concern"])
 
+    def test_a_range_escalated_to_a_pass_stays_escalated_for_its_remaining_commits(self):
+        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
+        p = pool.Pool(self.state, parallel=3)
+        slot = pool.Slot(batch, status="running", protocol=sa.PROTOCOL)
+        p.slots = [slot]
+        attempt = self.state / "attempt-1"
+        attempt.mkdir()
+        (attempt / "escalation-request.json").write_text("{}")
+        p.concluded(slot, attempt, self.verdict(batch), self.shas[0])
+        self.cursor = self.shas[1]  # A human attested the first commit only.
+        rest = p.aligned(pool.Pool(self.state, parallel=3).restored(), self.shas[1], self.shas[-1])
+        self.assertEqual((rest[0].status, rest[0].escalate), ("planned", True))
+
     def test_the_escalation_flag_survives_a_restart(self):
         batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
         p = pool.Pool(self.state, parallel=3)
