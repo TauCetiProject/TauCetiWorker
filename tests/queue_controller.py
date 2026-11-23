@@ -1837,6 +1837,29 @@ class PreRebase(ControllerCase):
         detail = entry["detail"]
         self.assertEqual((detail["reason"], detail["source_pr"], detail["paths"]), (reason, source_pr, ["Extra.lean"]))
         self.assertEqual(detail["onto"], self.repo.main_sha())
+        # The head-time task starts from the pre-rebased chain: the worker reuses its resolutions and
+        # resolves only what is left (`repair_task.seed_pre_rebased`).
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        [pre_rebased] = [d for d in loads(task["diagnostics"]) if d.get("kind") == "pre_rebased_chain"]
+        self.assertEqual(
+            pre_rebased,
+            {
+                "kind": "pre_rebased_chain",
+                "base": detail["pre_rebase_onto"],
+                "tip": detail["pre_rebase_tip"],
+                "source": detail["pre_rebase_source"],
+            },
+        )
+        ref = self.controller.pre_rebased_ref(batch["id"], pre_rebased["tip"])
+        self.assertEqual(chain.resolve_commit(self.controller.clone, ref), pre_rebased["tip"])
+        claimed = self.controller.claim_task("head-worker", "admin-worker")
+        self.assertEqual((claimed.task_id, claimed.kind), (task["id"], "rebase_conflict"))
+        self.assertIn(ref, claimed.retained_refs)
+        # A ref retained while publication was off reaches GitHub with the live batches' refs.
+        key = f"retain:{ref}:{pre_rebased['tip']}"
+        self.controller.store.execute("DELETE FROM outbox WHERE key=?", (key,))
+        self.controller._republish_retained_refs(self.clock())
+        self.assertIsNotNone(self.controller.store.row("outbox", {"key": key}))
         # A later pass that declines again for the same head version, `main` and reason adds nothing.
         self.assertFalse(self.controller._seal_from_pre_rebase(head, self.repo.main_sha(), self.clock()))
         self.assertEqual(len(self.controller.store.journal_entries("pre-rebase-unused")), 1, "journaled once")
@@ -2021,7 +2044,9 @@ class PreRebase(ControllerCase):
         self.assertEqual(self.open_batch()["pre_rebase_prepared"], tip)
         self.assertEqual(self.open_tasks(self.open_batch()), [])
 
-    def test_compiling_repair_is_retained_for_the_next_claim_without_adoption(self):
+    def test_a_pre_rebase_saves_no_repair_checkpoint(self):
+        """Decision 153 (S1): a `pre_rebase` task resolves conflicts only, so it has no repair to checkpoint;
+        the next claim gets the task as it was, and the resolved chain is adopted as usual."""
         self.conflicting_batch()
         agent = ScriptedAgent(
             "w",
@@ -2033,25 +2058,12 @@ class PreRebase(ControllerCase):
             },
         )
         task = agent.claim(self.controller)
+        self.assertNotIn("can_checkpoint_repair", task.extra)
         tip = agent.produce(task)
-        findings = [{"kind": "lint", "module": "Shared", "message": "unused argument"}]
-        notes = json.dumps({"repair_checkpoint": findings})
-        before = self.open_batch()
+        notes = json.dumps({"repair_checkpoint": [{"kind": "lint", "module": "Shared", "message": "unused"}]})
         result = self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True)
-        self.assertFalse(result.accepted, result)
-        self.assertEqual(result.reason, "repair-checkpoint")
-        self.assertEqual(self.open_batch(), before)
-        self.assertEqual(
-            self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True).reason,
-            "repair-checkpoint",
-        )
-        self.assertEqual(self.controller.store.count("submissions", {"task_id": task.task_id}), 1)
-        next_task = self.controller.claim_task("next", "admin-worker")
-        self.assertEqual(next_task.extra["repair_checkpoint"], {"tip": tip, "diagnostics": findings})
-        self.assertEqual(next_task.warm_revs[0], tip)
-        self.assertIn(result.retained_ref, next_task.retained_refs)
-        self.assertEqual(next_task.tip, task.tip, "the original membership and validation baseline survive")
-        adoption = self.controller.submit_task(task.task_id, next_task.claim_token, tip)
+        self.assertEqual((result.accepted, result.reason), (False, "invalid-repair-checkpoint"))
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, tip)
         self.assertTrue(adoption.accepted, adoption)
         self.assertEqual(self.open_batch()["pre_rebase_tip"], tip)
 
@@ -2157,6 +2169,158 @@ class PreRebase(ControllerCase):
         self.approve(102, {"B.lean": "b\n"})
         self.controller.tick()
         self.assertEqual(self.pre_rebased(), [])
+
+
+class RebaseOrdering(ControllerCase):
+    """Decision 153: the next batch is rebased once per handoff, onto the head's tip, not onto `main` first.
+
+    R1: no rebase onto `main` for the next batch unless the head has failed CI. R2: none for the batch
+    behind it in the handoff window (no head, or a head never dispatched). R3: the pre-rebase takes over
+    an unclaimed rebase onto `main`, or one claimed less than `pre_rebase_takeover_seconds` ago."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 3, "kim")
+        # Every open batch is due for preparation, so one behind `main` is rebased there first unless a rule holds it.
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+
+    def open_batches(self):
+        return self.controller.store.rows("batches", {"state": "open"}, order="id")
+
+    def tasks(self, batch, kind, state=None):
+        where = {"batch_id": batch["id"], "kind": kind}
+        if state is not None:
+            where["state"] = state
+        return self.controller.store.rows("tasks", where, order="id")
+
+    def land_head(self):
+        self.github.complete_runs()
+        for context in VERDICT_CONTEXTS:
+            self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+        self.controller.tick()  # promotes the head
+        return self.controller.tick()  # observes the landing
+
+    def test_r1_holds_the_next_batch_off_main_until_the_head_fails_ci(self):
+        held = self.controller._successor_rebase_held
+        self.assertTrue(held(None), "no head: the handoff window")
+        head = self.failing_head()
+        self.assertFalse(held(head), "after a source failure the head's repair may take hours")
+        self.controller.set_setting("pre_rebase_enabled", False, "kim")
+        self.assertFalse(held(None), "without pre-rebase a rebase onto main is the only one")
+
+    def test_r1_no_rebase_onto_main_before_the_head_is_dispatched(self):
+        """`main` moves while the head waits for dispatch: the head rebases, the next batch does not. Once
+        the head is dispatched the next batch is rebased once, onto the head's tip."""
+        self.controller.set_setting("publication_enabled", False, "kim")  # holds the head's dispatch
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.controller.tick()
+        [batch] = self.open_batches()
+        self.repo.advance_main({"Shared.lean": "line one\nline two on main\nline three\n"})
+        self.controller.tick()
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual(head["base"], self.repo.main_sha(), "the head itself is rebased")
+        self.assertEqual(self.tasks(batch, "rebase_conflict"), [], "the next batch is not rebased onto main")
+        self.assertEqual(self.controller.store.journal_entries("open-rebase-conflict"), [])
+        self.controller.set_setting("publication_enabled", True, "kim")
+        self.controller.tick()
+        [task] = self.tasks(batch, "pre_rebase", "open")
+        self.assertEqual(task["onto"], self.controller._head()["tip"])
+        self.assertEqual(self.tasks(batch, "rebase_conflict"), [])
+
+    def test_r2_no_rebase_onto_main_behind_the_next_batch_in_the_handoff_window(self):
+        """Batches 465, 477 and 484: the head lands while the next batch is held by its claimed pre-rebase,
+        and the batch behind it, now behind `main` and conflicting there, got a rebase onto `main` that
+        then blocked its own pre-rebase for the whole of the next head's CI run. Now it waits, and is
+        pre-rebased onto the new head's tip once that is dispatched."""
+        self.controller.set_setting("open_batch_limit", 3, "kim")
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        for number in (102, 103):  # each conflicts with the batches before it
+            self.approve(number, {"Shared.lean": f"line one\nline two by {number}\nline three\n"})
+            self.controller.tick()
+        successor, behind = self.open_batches()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution({"Shared.lean": resolved}, explanation="Kept both edits.")},
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual((task.kind, task.batch_id), ("pre_rebase", successor["id"]))
+        reasons = self.land_head()
+        self.assertIsNone(self.controller._head(), "the seal waits for the claimed pre-rebase")
+        self.assertNotEqual(self.controller.store.row("batches", {"id": behind["id"]})["base"], self.repo.main_sha())
+        self.assertEqual(self.tasks(behind, "rebase_conflict"), [], "no rebase onto main in the handoff window")
+        self.assertIn(
+            f"open batch {behind['id']}: no rebase onto main until the head is dispatched (handoff window)", reasons
+        )
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task)).accepted)
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual(head["id"], successor["id"])
+        self.controller.tick()
+        [pre_rebase] = self.tasks(behind, "pre_rebase", "open")
+        self.assertEqual(pre_rebase["onto"], head["tip"], "one rebase per handoff, onto the head's tip")
+        self.assertEqual(self.tasks(behind, "rebase_conflict"), [])
+
+    def rebase_onto_main(self, *, claim_age=None):
+        """A dispatched head held back by `publication_enabled`, and an open batch with an open
+        `rebase_conflict` task onto `main` (made before R1 and R2), claimed `claim_age` seconds before
+        the head is dispatched when given."""
+        self.controller.set_setting("publication_enabled", False, "kim")
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.controller.tick()
+        [batch] = self.open_batches()
+        task_id = self.controller._create_task(batch, "rebase_conflict", self.repo.main_sha(), [], self.clock())
+        claimed = None
+        if claim_age is not None:
+            claimed = self.controller.claim_task("w", "admin-worker")
+            self.assertEqual(claimed.task_id, task_id)
+            for _ in range(int(claim_age // 600)):
+                self.clock.advance(600)
+                self.controller.renew_task(claimed.task_id, claimed.claim_token)
+            self.clock.advance(claim_age % 600)
+        self.controller.set_setting("publication_enabled", True, "kim")
+        reasons = self.controller.tick()
+        return batch, self.controller.store.row("tasks", {"id": task_id}), claimed, reasons
+
+    def assert_taken_over(self, batch, task, claimed):
+        self.assertEqual((task["state"], task["resolution"]), ("superseded", "pre-rebase-first"))
+        [entry] = self.controller.store.journal_entries("rebase-taken-over", batch["id"])
+        self.assertEqual((entry["detail"]["task_id"], entry["detail"]["claimed"]), (task["id"], claimed))
+        self.assertEqual(
+            [e["detail"]["onto"] for e in self.controller.store.journal_entries("pre-rebased", batch["id"])],
+            [self.controller._head()["tip"]],
+        )
+
+    def test_r3_an_unclaimed_rebase_onto_main_is_taken_over(self):
+        batch, task, _, _ = self.rebase_onto_main()
+        self.assert_taken_over(batch, task, False)
+
+    def test_r3_a_rebase_onto_main_claimed_recently_is_taken_over_and_its_claim_released(self):
+        """1401 (17 s old) and 1446 (40 s old) would have been taken over."""
+        batch, task, claimed, _ = self.rebase_onto_main(claim_age=300)
+        self.assert_taken_over(batch, task, True)
+        claim = self.controller.store.row("claims", {"token": claimed.claim_token})
+        self.assertEqual(claim["release_reason"], "superseded")
+        with self.assertRaises(TaskError):
+            self.controller.renew_task(claimed.task_id, claimed.claim_token)
+
+    def test_r3_a_rebase_onto_main_claimed_longer_runs_to_the_end(self):
+        batch, task, claimed, reasons = self.rebase_onto_main(claim_age=1260)
+        self.assertEqual(task["state"], "open")
+        self.assertIn(f"open batch {batch['id']} waits for its rebase onto main", reasons)
+        self.assertEqual(self.controller.store.journal_entries("rebase-taken-over"), [])
+        self.assertEqual(self.controller.store.journal_entries("pre-rebased", batch["id"]), [])
+        self.controller.renew_task(claimed.task_id, claimed.claim_token)  # still its owner's
 
 
 class Tasks(ControllerCase):
@@ -2868,6 +3032,8 @@ class PreRebasedPreparation(ControllerCase):
         self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
         self.controller.set_setting("prepare_min_members", 2, "t")
         self.controller.set_setting("prepare_quiet_seconds", 0, "t")
+        # Off by default since decision 153 (S1); these tests cover the opt-in path.
+        self.controller.set_setting("prepare_pre_rebased", True, "t")
 
     def open_batch(self):
         """A head waiting on CI and an open batch of 201 and 202, prepared on its own base and pre-rebased
@@ -2926,7 +3092,6 @@ class PreRebasedPreparation(ControllerCase):
         self.assertEqual(len(claimed.warm_revs), len(set(claimed.warm_revs)))
 
     def test_adopting_the_pre_rebase_creates_a_prepare_task_for_the_pre_rebased_chain(self):
-        self.assertTrue(DEFAULT_SETTINGS["prepare_pre_rebased"])
         batch = self.open_batch()
         head = self.head()
         [task] = self.pre_rebased_tasks()

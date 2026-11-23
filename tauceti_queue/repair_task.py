@@ -2424,6 +2424,7 @@ def resolve_conflicts(
     *,
     artifacts: dict | None,
     agent_records: list[dict],
+    seeded: dict | None = None,
 ) -> dict:
     """Replay a rebase task's chain onto ``onto`` and resolve its conflicts one commit at a time.
 
@@ -2443,11 +2444,17 @@ def resolve_conflicts(
     Returns ``{"status": "ok", "tip", "agent", "resolved"}`` with the worktree checked out at the whole
     chain, ``{"status": "cancelled"}``, or a release status with its ``reason``: an agent status in
     ``RELEASED_AGENT_STATUSES``, or ``agent_failed`` when a conflict stays unresolved after
-    ``cfg.agent_attempts`` attempts."""
+    ``cfg.agent_attempts`` attempts.
+
+    ``seeded`` is ``seed_pre_rebased``'s record: a member resolved by the head's unused pre-rebase tries
+    that resolution (``applicable_resolution``) before waiting for a helper, and no helper is started for
+    one the replay meets on the very prefix it was made on (``exact``)."""
     chain_ids: list[str] = []
     resolved: list[dict] = []
     agent: dict = {"status": "ok"}
     lookahead = None
+    reusable = frozenset((seeded or {}).get("seeded") or ())
+    skip = frozenset((seeded or {}).get("exact") or ())
 
     def replay(base: str, onto: str) -> chain_tool.ChainResult:
         chain_id = f"worker-{task.task_id}-{secrets.token_hex(4)}"
@@ -2483,7 +2490,7 @@ def resolve_conflicts(
                 and not repair_lookahead.changes_dependencies(cfg.clone, task)
             ):
                 lookahead = repair_lookahead.Lookahead(
-                    cfg, task, worktree, logdir, cancel, env_lake, artifacts, after=commit
+                    cfg, task, worktree, logdir, cancel, env_lake, artifacts, after=commit, skip=skip
                 )
             accept = accepter(source_pr, prefix, commit)
             paths = list(conflict.conflict_paths)
@@ -2493,6 +2500,9 @@ def resolve_conflicts(
                 # An earlier run of a task of this batch (on any worker sharing the clone) accepted a
                 # resolution of this commit on this prefix; it goes through the same checks as a fresh one.
                 reuse = ("reused", stored, None)
+            elif commit in reusable and (earlier := applicable_resolution(cfg.clone, task.batch_id, commit, prefix)):
+                # The pre-rebase's resolution of the same conflict: no need to wait for a helper.
+                reuse = ("reused", earlier, git(cfg.clone, "rev-parse", f"{earlier}^").strip())
             else:
                 if lookahead is not None:
                     lookahead.wait(commit)
@@ -2910,6 +2920,99 @@ def store_resolution(clone: Path, batch_id: str, commit: str, prefix: str, resol
         log(f"batch {batch_id}: could not record the resolution of {commit[:12]}: {error}")
 
 
+def pre_rebased_chain(task: Task) -> dict | None:
+    """The ``pre_rebased_chain`` diagnostic of a head-time ``rebase_conflict`` task: the head's pre-rebase
+    ``base..tip`` (its earlier target, its resolved chain), which the seal could not use. None otherwise."""
+    if task.kind != "rebase_conflict" or not isinstance(task.diagnostics, list):
+        return None
+    for entry in task.diagnostics:
+        if (
+            isinstance(entry, dict)
+            and entry.get("kind") == "pre_rebased_chain"
+            and entry.get("base")
+            and entry.get("tip")
+        ):
+            return entry
+    return None
+
+
+def seed_pre_rebased(clone: Path, task: Task) -> dict | None:
+    """Store the resolutions in the head's unused pre-rebase as resolutions of this task's batch.
+
+    When the seal cannot use the head's pre-rebase (it does not replay onto `main`, or the members
+    inserted since do not replay onto it), the controller replays the head's own chain onto `main` and
+    names the pre-rebased chain in the task (``pre_rebased_chain``). Each member that chain resolved (a
+    commit whose message adds an explanation to the member's own) is recorded as that member's
+    resolution on the prefix it was made on (``store_resolution``). The replay then reuses it at once
+    where it reaches the same prefix (the pre-rebase was onto the `main` the head landed as), and
+    elsewhere where it is the same conflict (``applicable_resolution``), so only the remaining
+    conflicts go to an agent. A mechanical resolution the batch's verification refused is not
+    seeded. Each is stored in the form the worker commits a resolution, since the controller's carry
+    replays redate the commits they move. Returns ``{"seeded": [own commit SHAs], "exact": [...]}``:
+    ``exact`` are those the replay meets on the very prefix they were made on (the pre-rebase was onto
+    the task's ``onto``, and every member before them replays to the pre-rebased commit), or None
+    without such a diagnostic. Never fails the task."""
+    record = pre_rebased_chain(task)
+    if record is None:
+        return None
+    try:
+        own = {c.source_pr: c for c in chain_tool.chain_commits(clone, task.base, task.tip) if c.source_pr}
+        theirs = chain_tool.chain_commits(clone, record["base"], record["tip"])
+    except (chain_tool.ChainError, RuntimeError) as error:
+        log(f"task {task.task_id}: the pre-rebased chain {str(record['tip'])[:12]} is unreadable: {error}")
+        return {"seeded": [], "exact": [], "error": str(error)}
+    seeded: list[str] = []
+    exact: list[str] = []
+    same_prefixes = record["base"] == task.onto  # until a member's own replay leaves the pre-rebased chain
+    for commit in theirs:
+        original = own.get(commit.source_pr) if commit.source_pr else None
+        if original is None or len(commit.parents) != 1:
+            same_prefixes = False
+            continue
+        prefix = commit.parents[0]
+        replayed = chain_tool.merge_trees(clone, prefix, original.sha, merge_base=f"{original.sha}^")
+        if replayed.clean:
+            # The replay reproduces this commit only when the member applies to the same tree.
+            same_prefixes = same_prefixes and replayed.tree == commit.tree
+            continue
+        if commit.message == original.message or not commit.message.startswith(original.message.rstrip() + "\n"):
+            same_prefixes = False
+            continue  # not a resolution the worker made
+        if (
+            repair_additive.marked(commit.message)
+            and git(
+                clone,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                additive_refused_ref(task.batch_id, original.sha),
+                check=False,
+            ).strip()
+        ):
+            same_prefixes = False
+            continue
+        # Stored as the worker commits a resolution (`repair.recommit_resolution` reuses only that form):
+        # the controller's carry and extension replays redate the commits they move.
+        resolution = chain_tool.commit_tree(
+            clone,
+            commit.tree,
+            prefix,
+            commit.message,
+            (original.author_name, original.author_email),
+            author_date=original.author_date,
+            committer_date=original.author_date,
+        )
+        store_resolution(clone, task.batch_id, original.sha, prefix, resolution)
+        seeded.append(original.sha)
+        if same_prefixes:
+            exact.append(original.sha)
+    log(
+        f"task {task.task_id}: seeded {len(seeded)} resolutions from the pre-rebased chain "
+        f"{str(record['tip'])[:12]} onto {str(record['base'])[:12]}, {len(exact)} on the replay's own prefixes"
+    )
+    return {"seeded": seeded, "exact": exact}
+
+
 def forget_resolutions(clone: Path, batch_id: str, only: str | None = None) -> None:
     """Delete batch ``batch_id``'s stored resolutions (``only``: the entries naming that commit). Never
     fails."""
@@ -3030,7 +3133,11 @@ def _run_task(
     outcome: dict = dict(state.record.get("outcome") or {}) if pending_delivery else {}
     outcome.update(task_id=task.task_id, status="running", worker=cfg.worker)
     state.progress_outcome = outcome
-    continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits else None
+    # Decision 153 (S1): a `pre_rebase` task resolves textual conflicts only, with no verification build
+    # and no repair rounds (not even from a checkpoint an older worker left); the head-time task
+    # verifies and repairs the batch on `main`.
+    conflicts_only = task.kind == "pre_rebase"
+    continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits and not conflicts_only else None
     start_tip = continuation["tip"] if continuation else task.tip
     # A rebase task's agent step is the worker's own replay, the agent resolving one conflict at a time
     # (`resolve_conflicts`); a retained repair checkpoint is already on the target and is repaired as is.
@@ -3228,6 +3335,10 @@ def _run_task(
                 )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
         prompt_chain = read_chain(cfg.clone, task.validation_base, start_tip) if continuation else chain_before
+        # The head's unused pre-rebase: its resolutions are reused, and only the rest is resolved.
+        seeded = seed_pre_rebased(cfg.clone, task) if rebasing else None
+        if seeded is not None:
+            outcome["pre_rebased"] = {k: (len(v) if isinstance(v, list) else v) for k, v in seeded.items()}
 
         def compute_ownership(chain: list) -> repair_context.RepairContext:
             return repair_context.compute(
@@ -3421,6 +3532,7 @@ def _run_task(
                     env_lake,
                     artifacts=outcome.get("artifacts") or state.record.get("artifacts"),
                     agent_records=agent_records,
+                    seeded=seeded,
                 )
                 outcome["agent"] = agent_records
                 outcome["conflicts"] = resolution["resolved"]
@@ -3570,7 +3682,12 @@ def _run_task(
                 or tip == rebased_tip
             )
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
-            if cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
+            if conflicts_only:
+                # Decision 153 (S1): a pre-rebase resolves the textual conflicts and stops. The head's tip
+                # it sits on may itself fail, and its findings are not this batch's to repair; the batch
+                # is verified and repaired once it is the head, on `main`.
+                outcome["verification_skipped"] = "pre_rebase: conflicts only"
+            elif cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
                 outcome.pop("repair_checkpoint", None)
                 # Compile the final chain, capture its native output map and run every check.
                 state.write("verifying", attempt=attempt, tip=tip)
@@ -3699,19 +3816,6 @@ def _run_task(
             )
             if verification_note is not None:
                 notes["admission_verification"] = verification_note
-            if task.kind == "pre_rebase":
-                for result in reversed(outcome.get("verification", [])):
-                    checks = result.get("checks") or {}
-                    if result.get("tip") == tip and result.get("ok") is True and checks.get("status") == "passed":
-                        scope = (checks.get("lint") or {}).get("scope")
-                        if scope == "full":
-                            notes["pre_rebase_verification"] = {
-                                "tip": tip,
-                                "base": task.validation_base,
-                                "tools": checks.get("tools"),
-                                "scope": scope,
-                            }
-                        break
             if task.kind == "prepare":
                 notes["remaining_errors"] = prepare_remaining_errors(outcome.get("parallel"), findings, worktree)
             checkpoint = outcome.get("repair_checkpoint") or {}

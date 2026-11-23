@@ -36,6 +36,7 @@ from tauceti_queue.controller import (  # noqa: E402
     CANDIDATE_BUILD_STEP,
     CANDIDATE_HANDOFF_STEP,
     CANDIDATE_PUBLICATION_JOB,
+    DEFAULT_SETTINGS,
     LOG_GRACE_SECONDS,
     MERGED_TITLE_PREFIX,
     MISSING_SOURCE_WATCH,
@@ -2194,6 +2195,7 @@ class MissingSource(QueueFixture):
 
     def test_old_open_batch_does_not_supply_a_module_deleted_on_main(self):
         self.controller.set_setting("repair_concurrency", 2, "t")
+        self.controller.set_setting("prepare_pre_rebased", True, "t")  # a claimed preparation holds the batch
         self.controller.set_setting("prepare_min_members", 1, "t")
         self.controller.set_setting("prepare_quiet_seconds", 0, "t")
         self.approve(101, {"TauCeti/Provider.lean": None, "TauCeti/Importer.lean": None})
@@ -2580,9 +2582,12 @@ class Preparation(QueueFixture):
 
         return policy
 
-    def scenario(self, prepare):
-        """A head in CI and an open batch with one broken member behind it; returns the batch and the agent."""
+    def scenario(self, prepare, pre_rebased=None):
+        """A head in CI and an open batch with one broken member behind it; returns the batch and the agent.
+        The pre-rebased chain is prepared with `prepare` unless `pre_rebased` says otherwise."""
         self.controller.set_setting("prepare_open_batches", prepare, "t")
+        # Off by default (decision 153, S1).
+        self.controller.set_setting("prepare_pre_rebased", prepare if pre_rebased is None else pre_rebased, "t")
         self.controller.set_setting("prepare_min_members", 3, "t")
         self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
         self.github.ci_policy = self.broken_content_policy()
@@ -2654,6 +2659,20 @@ class Preparation(QueueFixture):
         self.drive_until_landed(batch, [agent])
         self.assertEqual(self.source_failures(batch), 1)
         self.assertEqual([t.kind for t in agent.tasks], ["repair"])
+
+    def test_by_default_the_next_batch_is_verified_and_repaired_only_as_the_head(self):
+        """Decision 153 (S1): the next batch is pre-rebased onto the head's tip but neither built nor repaired
+        there. It seals from that pre-rebase, its own CI round on `main` finds the broken member, and the
+        head's repair fixes it."""
+        self.assertFalse(DEFAULT_SETTINGS["prepare_pre_rebased"])
+        batch, agent = self.scenario(prepare=True, pre_rebased=False)
+        self.tick()
+        self.assertIsNone(agent.claim(self.controller), "nothing is verified on the head's tip")
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["pre_rebase_state"], "clean")
+        self.drive_until_landed(batch, [agent])
+        self.assertEqual(self.source_failures(batch), 1, "found by its own CI round, as the head")
+        self.assertEqual([t.kind for t in agent.tasks], ["repair"])
+        self.assertEqual(self.repo.file_at(self.repo.main_sha(), "TauCeti/Pr202.lean"), "202\n")
 
     def test_insertion_during_preparation_goes_to_the_next_batch_and_the_head_task_comes_first(self):
         batch, agent = self.scenario(prepare=True)

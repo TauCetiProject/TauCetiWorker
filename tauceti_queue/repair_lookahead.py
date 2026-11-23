@@ -94,8 +94,21 @@ class Lookahead:
     """The helpers of one rebase task; see the module docstring. ``after`` is the first conflicting
     commit, which the serial replay resolves itself."""
 
-    def __init__(self, cfg, task, worktree: Path, logdir: Path, cancel: threading.Event, env_lake, artifacts, *, after):
+    def __init__(
+        self,
+        cfg,
+        task,
+        worktree: Path,
+        logdir: Path,
+        cancel: threading.Event,
+        env_lake,
+        artifacts,
+        *,
+        after,
+        skip: frozenset[str] = frozenset(),
+    ):
         self.cfg, self.task, self.worktree, self.logdir = cfg, task, worktree, logdir
+        self.skip = skip  # commits the serial path reuses a resolution for (`repair_task.seed_pre_rebased`)
         self.env_lake, self.artifacts = env_lake, artifacts
         self.task_cancel = cancel
         self.stop = threading.Event()
@@ -134,7 +147,7 @@ class Lookahead:
             parent = commit.parents[0]
             if commit.source_pr and chain_tool.landed_commit(landed, commit.source_pr):
                 continue
-            if commit.tree == chain_tool.tree_of(clone, parent):
+            if commit.tree == chain_tool.tree_of(clone, parent) or commit.sha in self.skip:
                 continue
             merged = chain_tool.merge_trees(clone, task.onto, commit.sha, merge_base=parent)
             if merged.clean or not changed.intersection(merged.conflict_paths):

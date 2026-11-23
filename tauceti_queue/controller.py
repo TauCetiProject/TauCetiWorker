@@ -168,11 +168,19 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "prepare_quiet_seconds": 600,
     # Replay the oldest open batch onto the head's tip once the head's chain is submitted and waits
     # for its CI verdict, so the next head seals from the result without a replay (`_pre_rebase`).
+    # A `pre_rebase` task resolves textual conflicts only: the worker runs no verification build and
+    # no repair rounds on it (decision 153, S1), so a later batch never acts on the head's own
+    # failures. Verification and repair happen once the batch is the head, on `main`. While this is
+    # on, the next batch is never rebased onto `main` unless the head has failed CI (`_successor_rebase_held`).
     "pre_rebase_enabled": True,
+    # A claimed `rebase_conflict` task onto `main` of the next batch younger than this is superseded
+    # when its pre-rebase onto the head's tip can start (`_take_over_rebase`); an unclaimed one always
+    # is. An older claim runs to the end. 0: only an unclaimed one is taken over.
+    "pre_rebase_takeover_seconds": 1200,
     # Build, repair and publish an open batch's usable pre-rebase on the head's tip (a `prepare` task
-    # of the pre-rebased chain, `_prepare_pre_rebased`), so the head it seals as reaches CI with
-    # published outputs for its exact tip. Applies to the batches own-base preparation applies to.
-    "prepare_pre_rebased": True,
+    # of the pre-rebased chain, `_prepare_pre_rebased`). Off since decision 153 (S1): verifying and
+    # repairing a later batch on the head's tip makes it act on the head's own failures (task 1416).
+    "prepare_pre_rebased": False,
     # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
     # `problem-anticipated` (`_anticipate`).
@@ -916,6 +924,14 @@ class Controller:
             wanted = [(self.batch_ref(batch["id"], batch["version"]), batch["tip"])]
             for member in self._members(batch["id"]):
                 wanted.append((self.input_ref(member["number"], member["accepted_head"]), member["accepted_head"]))
+            for task in self.store.rows(
+                "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_REBASE_CONFLICT}
+            ):
+                # The unused pre-rebase a head-time rebase names (`_pre_rebased_chain`), which its worker fetches.
+                for diagnostic in loads(task["diagnostics"], []):
+                    if isinstance(diagnostic, dict) and diagnostic.get("kind") == "pre_rebased_chain":
+                        tip = diagnostic["tip"]
+                        wanted.append((self.pre_rebased_ref(batch["id"], tip), tip))
             for ref, sha in wanted:
                 key = f"retain:{ref}:{sha}"
                 if self.store.row("outbox", {"key": key}) is not None or self._local_ref(ref) != sha:
@@ -3038,6 +3054,10 @@ class Controller:
             ahead = self._head()
             if ahead is not None and ahead["tip"] == task["onto"]:
                 refs.insert(1, self.batch_ref(ahead["id"], ahead["version"]))  # where `onto` is fetched from
+        if task["kind"] == TASK_REBASE_CONFLICT:
+            for diagnostic in loads(task["diagnostics"], []):
+                if isinstance(diagnostic, dict) and diagnostic.get("kind") == "pre_rebased_chain":
+                    refs.append(self.pre_rebased_ref(batch["id"], diagnostic["tip"]))  # its resolutions
         if self.candidate_ci is not None and getattr(self.source, "task_git_transport", None) == NATIVE_GIT_REFS:
             refs = [native_retained_ref(ref) for ref in refs]
             members = [
@@ -3067,7 +3087,8 @@ class Controller:
         )
 
     def _can_checkpoint_repair(self, task: dict[str, Any]) -> bool:
-        return self.candidate_ci is None and task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT, TASK_PRE_REBASE)
+        # Not a `pre_rebase`: it resolves conflicts only (decision 153, S1) and has nothing to checkpoint.
+        return self.candidate_ci is None and task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT)
 
     def _create_task(
         self,
@@ -6420,6 +6441,12 @@ class Controller:
             return True
         conflict = result.conflict
         diagnostics = self._conflict_diagnostics(result, canonical)
+        pre_rebased = self._pre_rebased_chain(head)
+        if pre_rebased is not None:
+            # Its pre-rebase did not carry onto `main` or take the members inserted since: the worker
+            # reuses its resolutions and resolves only what is left (`seed_pre_rebased`).
+            self._retain(self.pre_rebased_ref(head["id"], pre_rebased["tip"]), pre_rebased["tip"])
+            diagnostics.append(pre_rebased)
         with self.store.transaction():
             self._release_claim(claim, "conflict", now)
             self.store.journal(
@@ -6429,10 +6456,28 @@ class Controller:
                 onto=canonical,
                 source_pr=conflict.source_pr if conflict else None,
                 landed_on_base=result.landed_on_base,
+                pre_rebased=pre_rebased["tip"] if pre_rebased else None,
             )
         self._create_task(head, "rebase_conflict", canonical, diagnostics, now)
         self._reasons.append(f"head {head['id']} needs an agent to resolve the rebase conflict")
         return False
+
+    def _pre_rebased_chain(self, head: dict[str, Any]) -> dict[str, Any] | None:
+        """The `pre_rebased_chain` diagnostic of the head's head-time `rebase_conflict` task: its usable
+        pre-rebase, which `_seal_from_pre_rebase` could not use because it does not replay onto `main`
+        or the members inserted since do not replay onto it. Its chain `base..tip` holds the agent's
+        resolutions of the same members on the earlier target, which the worker reuses wherever they
+        still apply, resolving only the remaining conflicts. None when there is no such pre-rebase."""
+        tip, source = head["pre_rebase_tip"], head["pre_rebase_source"]
+        if (
+            head["pre_rebase_state"] not in PRE_REBASE_USABLE
+            or not tip
+            or not head["pre_rebase_onto"]
+            or not source
+            or not chain.is_ancestor(self.clone, source, head["tip"])
+        ):
+            return None
+        return {"kind": "pre_rebased_chain", "base": head["pre_rebase_onto"], "tip": tip, "source": source}
 
     @staticmethod
     def _conflict_diagnostics(result: chain.ChainResult, onto: str) -> list[dict[str, Any]]:
@@ -6502,16 +6547,29 @@ class Controller:
         if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
         staging = self._staging_batches()
+        head = self._head()
         for index, batch in enumerate(staging):
             successor = self._open_batch()
-            if (
-                self.setting("prepare_pre_rebased")
-                and successor
-                and successor["id"] == batch["id"]
-                and self._pre_rebase_blocked(self._head()) is None
-            ):
-                # Prepare this successor on its intended parent. Starting another
-                # own-base pass would serialize two full builds and rewrite repairs.
+            behind = bool(self._canonical) and batch["base"] != self._canonical
+            if successor and successor["id"] == batch["id"]:
+                if self.setting("pre_rebase_enabled") and self._pre_rebase_blocked(head) is None:
+                    # Pre-rebased onto the head's tip instead. Starting another own-base pass would
+                    # serialize two full builds and rewrite the chain under the pre-rebase.
+                    continue
+                if behind and self._successor_rebase_held(head):
+                    # R1 (decision 153): a rebase onto `main` started now would block the pre-rebase
+                    # onto the head's tip until it finished, and go stale when the head lands.
+                    self._note_reason(
+                        f"open batch {batch['id']}: no rebase onto main; it is pre-rebased onto the head's tip"
+                    )
+                    continue
+            if index == 1 and behind and self.setting("pre_rebase_enabled") and self._handoff_window(head):
+                # R2 (decision 153): in the handoff window this batch is about to become the next batch,
+                # whose rebase onto `main` R1 holds; started now, it would block its pre-rebase (465, 477
+                # and 484 in November).
+                self._note_reason(
+                    f"open batch {batch['id']}: no rebase onto main until the head is dispatched (handoff window)"
+                )
                 continue
             if self._retained_tasks(batch):
                 continue  # its retained work as the evicted head owns the chain
@@ -6553,6 +6611,29 @@ class Controller:
                     )
             self._create_task(batch, TASK_PREPARE, batch["base"], [], now)
             self._note_reason(f"open batch {batch['id']} waits for a worker to prepare it")
+
+    def _successor_rebase_held(self, head: dict[str, Any] | None) -> bool:
+        """R1 (decision 153): whether the next batch, when behind `main`, gets no rebase onto `main` (and so
+        no own-base preparation), because it is to be pre-rebased onto the head's tip. That holds while
+        pre-rebase is on and the head has not failed CI on the source: before the head is dispatched,
+        during its own rebase, while its CI runs, and in the handoff window with no head. After a
+        source failure the head's repair may take hours, and a rebase onto `main` is useful meanwhile."""
+        if not self.setting("pre_rebase_enabled"):
+            return False
+        if head is None:
+            return True
+        attempt = self._current_attempt(head)
+        return attempt is None or attempt["outcome"] != OUTCOME_SOURCE_FAILURE
+
+    def _handoff_window(self, head: dict[str, Any] | None) -> bool:
+        """R2 (decision 153): the stretch from one head landing until the next head is first dispatched:
+        no head, or a head with no dispatched CI attempt at any version."""
+        if head is None:
+            return True
+        return not self.store.query(
+            "SELECT 1 FROM ci_attempts WHERE batch_id=? AND dispatch_state NOT IN ('prepared', 'rejected') LIMIT 1",
+            (head["id"],),
+        )
 
     def _stale_prepare(self, task: dict[str, Any]) -> bool:
         """An own-base `prepare` task on a base other than the canonical commit."""
@@ -6942,11 +7023,13 @@ class Controller:
         if self._retained_tasks(batch):
             self._note_reason(f"open batch {batch['id']} waits for its retained work as the evicted head")
             return
-        if self._open_rebase_task(batch) is not None:
+        head = self._head()
+        blocked = self._pre_rebase_blocked(head)
+        rebase = self._open_rebase_task(batch)
+        if rebase is not None and (blocked is not None or not self._take_over_rebase(batch, rebase, now)):
             self._note_reason(f"open batch {batch['id']} waits for its rebase onto main")
             return
-        head = self._head()
-        if self._pre_rebase_blocked(head) is not None:
+        if blocked is not None:
             return
         assert head is not None
         onto = head["tip"]
@@ -7037,6 +7120,36 @@ class Controller:
             diagnostics.append(prepared)
         self._create_task(batch, TASK_PRE_REBASE, onto, diagnostics, now)
         self._reasons.append(f"open batch {batch['id']} needs an agent to resolve its pre-rebase onto the head")
+
+    def _take_over_rebase(self, batch: dict[str, Any], task: dict[str, Any], now: float) -> bool:
+        """R3 (decision 153): supersede the next batch's open `rebase_conflict` task onto `main` so its
+        pre-rebase onto the head's tip can start; True when it was superseded. An unclaimed task always
+        is (resolution `pre-rebase-first`); a claimed one only while its oldest live claim is younger
+        than `pre_rebase_takeover_seconds`, and the claim is released. Its conflict phase has barely
+        started, and its resolutions rarely carry to the new target (465's 1410 reused none of 1401's
+        212). An older claim runs to the end: the batch is then on `main`, and its pre-rebase carries
+        only the head's own conflicts."""
+        claims = self._active_claims(batch["id"], task_id=task["id"])
+        age = now - min(claim["created_at"] for claim in claims) if claims else None
+        if age is not None and age >= int(self.setting("pre_rebase_takeover_seconds")):
+            return False
+        with self.store.transaction():
+            self.store.update(
+                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="pre-rebase-first"
+            )
+            for claim in claims:
+                self._release_claim(claim, "superseded", now)
+            self._count("rebases_taken_over")
+            self.store.journal(
+                now,
+                "rebase-taken-over",
+                batch["id"],
+                task_id=task["id"],
+                onto=task["onto"],
+                claimed=bool(claims),
+                claim_age_seconds=round(age) if age is not None else None,
+            )
+        return True
 
     def _carry_pre_rebase(
         self, batch: dict[str, Any], onto: str, replay: Callable[[str, str, str], chain.ChainResult]
