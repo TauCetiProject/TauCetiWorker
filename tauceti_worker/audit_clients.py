@@ -36,36 +36,36 @@ def client_path(provider: str) -> Path:
     return Path(path).resolve()
 
 
-# An environment shim: a POSIX shell script that only assigns or exports variables and then
-# execs an absolute path with the caller's arguments. Nix's makeWrapper output and a one-line
-# launcher shim have this form. Every file it can run must be hashed or immutable: its
-# interpreter and target are hashed, and any other path it names must be in the Nix store.
-SHIM_INTERPRETER = re.compile(r"#!\s*(/[^\s]+/(?:sh|bash|dash))(?:\s+-e)?\s*")
-SHIM_NAME = r"[A-Za-z_][A-Za-z0-9_]*"
-SHIM_PREFIX = rf"{SHIM_NAME}=\S*"
-SHIM_EXEC = re.compile(rf'((?:{SHIM_PREFIX}\s+)*)exec\s+(?:-a\s+"\$0"\s+)?("?)(/[^"\s$]+)\2\s+"\$@"')
-SHIM_ASSIGNMENT = re.compile(rf"export\s+{SHIM_NAME}|(?:export\s+)?{SHIM_PREFIX}")
-SHIM_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
-SHIM_STORE_PATH = re.compile(r"/nix/store/[^:'\"\s}]*")
-# Variables that make the loader or shell run code no path in the shim need name.
-SHIM_REFUSED = re.compile(r"(?:export\s+)?(?:LD_PRELOAD|LD_AUDIT|BASH_ENV|ENV|DYLD_\w*)(?:=|$)")
+# An environment shim: a shell script that only sets variables, in exactly the forms Nix's
+# makeWrapper emits, then execs an absolute path with the caller's arguments; or a one-line
+# launcher shim of that exec. Every file it can run must be hashed or immutable: its
+# interpreter and target are hashed, and any other path it names is in the Nix store. This is
+# an allowlist of whole lines, never a shell parser.
+_NAME = r"(?!(?:LD_PRELOAD|LD_AUDIT|BASH_ENV|ENV|DYLD_\w*)\b)[A-Za-z_][A-Za-z0-9_]*"
+# A literal is one plain word, and never a search path: none can name a file.
+_LITERAL = r"[A-Za-z0-9_]*"
+_SETTING = rf"(?!\w*PATH\b){_NAME}"
+# Absolute paths of plain components: never `.` or `..`, so a store path stays in the store.
+_COMPONENT = r"/(?!\.\.?(?![A-Za-z0-9._+-]))[A-Za-z0-9._+-]+"
+_PATH = rf"(?:{_COMPONENT})+"
+_STORE = rf"/nix/store(?:{_COMPONENT})+"
+SHIM_INTERPRETER = re.compile(rf"#!\s*({_PATH})(?:\s+-e)?\s*")
+SHIM_LINES = [
+    re.compile(p)
+    for p in (
+        rf"export {_NAME}",
+        rf"export {_SETTING}='{_LITERAL}'",
+        rf"export (?P<n>{_SETTING})=\$\{{(?P=n):?-'{_LITERAL}'\}}",
+        rf"(?P<n>{_NAME})=\$\{{(?P=n):\+':'\$(?P=n)':'\}}",
+        rf"(?P<n>{_NAME})=\$\{{(?P=n)/':''{_STORE}'':'/':'\}}",
+        rf"(?P<n>{_NAME})='{_STORE}'\$(?P=n)",
+        rf"(?P<n>{_NAME})=\$(?P=n)'{_STORE}'",
+        rf"(?P<n>{_NAME})=\$\{{(?P=n)[#%]':'\}}",
+    )
+]
+SHIM_EXEC = re.compile(rf'((?:{_SETTING}={_LITERAL} )*)exec (?:-a "\$0" )?("?)({_PATH})\2\s+"\$@"')
 SHIM_LIMIT = 64 * 1024
 SHIM_DEPTH = 4
-
-
-def shim_word(text: str) -> bool:
-    """Whether an assignment, with its quoted text removed, is one word naming only store paths."""
-    if SHIM_REFUSED.match(text):
-        return False
-    bare = SHIM_QUOTED.sub("", text)
-    if "'" in bare or '"' in bare or not SHIM_ASSIGNMENT.fullmatch(bare):
-        return False
-    # A slash left once store paths are removed is a mutable path, unless it is the operator in
-    # makeWrapper's `${PATH/':'...'':'/':'}`, followed by a quote.
-    if any(".." in store for store in SHIM_STORE_PATH.findall(text)):
-        return False
-    rest = SHIM_STORE_PATH.sub("", text)
-    return all(rest[i + 1 : i + 2] == "'" for i, c in enumerate(rest) if c == "/")
 
 
 def shim_target(path: Path) -> tuple[Path, Path] | None:
@@ -75,20 +75,15 @@ def shim_target(path: Path) -> tuple[Path, Path] | None:
     if len(data) > SHIM_LIMIT:
         return None
     try:
-        lines = data.decode("utf-8").splitlines()
+        lines = data.decode("ascii").splitlines()
     except UnicodeDecodeError:
         return None
     interpreter = SHIM_INTERPRETER.fullmatch(lines[0]) if lines else None
-    if interpreter is None:
+    if interpreter is None or Path(interpreter[1]).name not in ("sh", "bash", "dash"):
         return None
     body = [line.strip() for line in lines[1:] if line.strip() and not line.strip().startswith("#")]
-    if not body or any(c in "".join(body) for c in ("\\", "`", "$(", ";", "&", "|", "<", ">")):
-        return None
-    match = SHIM_EXEC.fullmatch(body[-1])
-    if match is None:
-        return None
-    assignments = body[:-1] + match[1].split()
-    if not all(shim_word(line) for line in assignments):
+    match = SHIM_EXEC.fullmatch(body[-1]) if body else None
+    if match is None or not all(any(p.fullmatch(line) for p in SHIM_LINES) for line in body[:-1]):
         return None
     return Path(interpreter[1]), Path(match[3])
 

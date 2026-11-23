@@ -543,6 +543,13 @@ class ClientCompatibility(unittest.TestCase):
                 f"PATH='/tmp/bin':$PATH\nexec {native} \"$@\"",  # a mutable path
                 f"PATH='/nix/store/../../tmp/bin'$PATH\nexec {native} \"$@\"",
                 'exec "/opt/$CHANNEL/client" "$@"',  # the executed path is not the hashed one
+                f"export BA''SH_ENV=payload\nexec {native} \"$@\"",  # a quote splits a refused name
+                f"export L''D_PRELOAD=plugin.so\nexec {native} \"$@\"",
+                f"export LD_LIBRARY_PATH='.'\nexec {native} \"$@\"",  # a relative search path
+                f"export NODE_OPTIONS='--require=payload'\nexec {native} \"$@\"",
+                f"PATH='/''tmp/''bin'$PATH\nexec {native} \"$@\"",  # a quote splits a mutable path
+                'exec "/bin/\'echo\'" "$@"',  # quotes inside the target
+                f'exec {native}/.. "$@"',
             ):
                 shim.write_text(f"#!/bin/sh\n{body}\n")
                 self.assertIsNone(clients.shim_target(shim), body)
