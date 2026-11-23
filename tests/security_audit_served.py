@@ -487,6 +487,84 @@ class ClientCompatibility(unittest.TestCase):
             ):
                 clients.fingerprint("claude")
 
+    def test_environment_shims_are_followed_and_hashed_with_their_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            native = root / "store/bin/.claude-wrapped"
+            native.parent.mkdir(parents=True)
+            native.write_bytes(b"\x7fELF fixture")
+            # The form of Nix's makeWrapper output, as installed for claude-code.
+            nix = root / "store/bin/claude"
+            nix.write_text(
+                "#! /nix/store/x-bash/bin/bash -e\n"
+                "export DISABLE_AUTOUPDATER='1'\n"
+                "export FORCE_AUTOUPDATE_PLUGINS=${FORCE_AUTOUPDATE_PLUGINS-'1'}\n"
+                "PATH=${PATH:+':'$PATH':'}\n"
+                "PATH=${PATH/':''/nix/store/x-socat/bin'':'/':'}\n"
+                "PATH='/nix/store/x-socat/bin'$PATH\n"
+                "export PATH\n"
+                f'exec -a "$0" "{native}"  "$@" \n'
+            )
+            # A one-line launcher shim in front of it.
+            shim = root / "bin/claude"
+            shim.parent.mkdir()
+            shim.write_text(f'#!/bin/sh\n# launcher\nIN_NIX=1 exec {nix} "$@"\n')
+            run = SimpleNamespace(stdout="2.1.323 (Claude Code)\n")
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                patch.object(clients.subprocess, "run", return_value=run) as version,
+            ):
+                value = clients.fingerprint("claude")
+            self.assertEqual(list(value["files"]), [str(shim), str(nix), str(native)])
+            self.assertEqual(version.call_args.args[0], [str(shim), "--version"])
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                patch.object(clients.subprocess, "run", return_value=run),
+            ):
+                nix.write_text(nix.read_text().replace("'1'", "'0'", 1))
+                self.assertNotEqual(clients.fingerprint("claude")["files"], value["files"])
+            for body in (
+                'exec hidden-client "$@"',  # not an absolute target
+                f"exec {native}",  # does not pass the caller's arguments
+                f'X=1 curl https://example.invalid\nexec {native} "$@"',  # a command, not an assignment
+                f'X=$(curl https://example.invalid)\nexec {native} "$@"',
+                f'source /tmp/env\nexec {native} "$@"',
+                f'X=1; exec {native} "$@"',
+                f'exec {native} "$@" > /tmp/out',
+            ):
+                shim.write_text(f"#!/bin/sh\n{body}\n")
+                self.assertIsNone(clients.shim_target(shim), body)
+                with (
+                    patch.object(clients, "client_path", return_value=shim),
+                    self.assertRaisesRegex(ValueError, "native client"),
+                ):
+                    clients.fingerprint("claude")
+            shim.write_text(f'#!/bin/sh\nexec {root}/missing "$@"\n')
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                self.assertRaisesRegex(ValueError, "missing file"),
+            ):
+                clients.fingerprint("claude")
+
+    def test_a_shim_in_front_of_the_managed_codex_launcher_keeps_its_binary_hashed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "codex-patches/bin/codex"
+            binary = root / "codex-patches/dist/current/bin/codex"
+            binary.parent.mkdir(parents=True)
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/usr/bin/env python3\nimport os\n")
+            binary.write_bytes(b"\x7fELF fixture")
+            shim = root / "local/bin/codex"
+            shim.parent.mkdir(parents=True)
+            shim.write_text(f'#!/bin/sh\nCODEX_PATCHES_IN_NIX=1 exec {launcher} "$@"\n')
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                patch.object(clients.subprocess, "run", return_value=SimpleNamespace(stdout="codex-cli 0.167.0\n")),
+            ):
+                files = clients.fingerprint("codex")["files"]
+            self.assertEqual(list(files), [str(shim), str(launcher), str(binary)])
+
     def test_missing_stale_and_changed_clients_are_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)

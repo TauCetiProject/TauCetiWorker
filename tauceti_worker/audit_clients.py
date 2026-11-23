@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -35,14 +36,56 @@ def client_path(provider: str) -> Path:
     return Path(path).resolve()
 
 
+# An environment shim: only assignments and exports, then one exec of an absolute path with
+# the caller's arguments. Nix's makeWrapper output and a one-line launcher shim have this form.
+SHIM_EXEC = re.compile(r'(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*exec\s+(?:-a\s+"\$0"\s+)?"?(/[^"\s]+)"?\s+"\$@"')
+SHIM_ASSIGNMENT = re.compile(r"export\s+[A-Za-z_][A-Za-z0-9_]*|(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=\S*")
+SHIM_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
+SHIM_LIMIT = 64 * 1024
+SHIM_DEPTH = 4
+
+
+def shim_target(path: Path) -> Path | None:
+    """The absolute target of an environment shim, or None for anything else.
+
+    The shim itself is hashed with its target, so this follows only scripts whose every
+    effect is visible in their own bytes: no command substitution, pipelines or lists."""
+    with path.open("rb") as stream:
+        data = stream.read(SHIM_LIMIT + 1)
+    if len(data) > SHIM_LIMIT or not data.startswith(b"#!"):
+        return None
+    try:
+        lines = data.decode("utf-8").splitlines()[1:]
+    except UnicodeDecodeError:
+        return None
+    body = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+    if not body or any(c in "".join(body) for c in ("`", "$(", ";", "&", "|", "<", ">")):
+        return None
+    match = SHIM_EXEC.fullmatch(body[-1])
+    # Quoted text cannot run anything here, so an assignment is one word once it is removed:
+    # `NAME=value command` is a command, not an assignment.
+    if match is None or not all(SHIM_ASSIGNMENT.fullmatch(SHIM_QUOTED.sub("", line)) for line in body[:-1]):
+        return None
+    return Path(match[1])
+
+
 def fingerprint(provider: str) -> dict:
     from . import security_audit as sa
 
-    path = client_path(provider)
+    path = client = client_path(provider)
     # Hash native clients directly, or the managed Codex launcher AND its native
-    # binary. Other wrappers may hide code changes behind an unchanged version;
-    # keep those on the token protocol rather than claim verified identity.
+    # binary, after every environment shim leading to them. Other wrappers may hide
+    # code changes behind an unchanged version; keep those unverified rather than
+    # claim verified identity.
     files = {str(path): file_digest(path)}
+    for _ in range(SHIM_DEPTH):
+        target = shim_target(path)
+        if target is None:
+            break
+        path = target.resolve()
+        if not path.is_file():
+            raise ValueError("audit client shim targets a missing file")
+        files[str(path)] = file_digest(path)
     managed = path.parent.parent / "dist/current/bin/codex"
     if provider == "codex" and managed.is_file():
         binary = managed.resolve()
@@ -51,9 +94,11 @@ def fingerprint(provider: str) -> dict:
         with path.open("rb") as stream:
             magic = stream.read(4)
         if magic not in (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe"):
-            raise ValueError("protocol 4 requires a native client or the managed Codex launcher")
+            raise ValueError("delivery verification requires a native client or the managed Codex launcher")
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "SSL_CERT_FILE")}
-    version = subprocess.run([str(path), "--version"], env=env, capture_output=True, text=True, timeout=20, check=True)
+    version = subprocess.run(
+        [str(client), "--version"], env=env, capture_output=True, text=True, timeout=20, check=True
+    )
     return {
         "files": files,
         "version": version.stdout.strip(),
