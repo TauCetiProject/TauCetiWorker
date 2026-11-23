@@ -46,9 +46,7 @@ class Slot:
     verdict: dict | None = None
     failure: dict | None = None
     attempts: list[str] = field(default_factory=list)
-    provider: str | None = None  # The reviewer of the latest attempt.
-    credential: str | None = None
-    avoid: str | None = None  # A retry prefers another reviewer than this one, when one is available.
+    protocol: int | None = None  # The judgment protocol of the latest attempt.
 
     @property
     def digest(self) -> str:
@@ -71,10 +69,8 @@ class Slot:
             "verdict": self.verdict,
             "failure": self.failure,
             "attempts": self.attempts,
-            "provider": self.provider,
-            "model": sa.reviewer_model(self.provider) if self.provider else None,
-            "credential": self.credential,
-            "avoid": self.avoid,
+            "protocol_version": self.protocol,
+            "model": sa.REVIEWER_MODEL if self.protocol == sa.PROTOCOL else None,
         }
 
 
@@ -83,7 +79,7 @@ KEPT_ATTEMPTS = 2  # Attempts of a range kept while it is retried.
 
 
 class Pool:
-    def __init__(self, state: Path, *, parallel: int, chooser, min_commits: int = 1):
+    def __init__(self, state: Path, *, parallel: int, min_commits: int = 1):
         if parallel < 1:
             raise Die("security-audit: pool parallelism must be positive")
         self.work = state
@@ -93,7 +89,6 @@ class Pool:
         # Plan ahead of the running reviewers, so a binding block awaiting human
         # review does not idle the pool: inspection continues, advancement waits.
         self.window = LOOKAHEAD * parallel
-        self.chooser = chooser  # Picks (provider, credential) for new batches and retries, or None to wait.
         self.min_commits = min_commits
         self.slots: list[Slot] = []
         self.running: dict[concurrent.futures.Future, tuple[Slot, Path]] = {}
@@ -122,7 +117,9 @@ class Pool:
 
         A pass whose rebuilt input differs is inspected again; a block stays binding. A range
         left running by a stopped pool keeps that status and is settled from its attempt's own
-        evidence (`settle_interrupted`) before anything else is admitted."""
+        evidence (`settle_interrupted`) before anything else is admitted. A block, or a range left
+        running, from an earlier judgment protocol is inspected afresh under the current one: its
+        concern no longer binds (`audit_evidence.recorded`). Earlier protocols' passes stand."""
         path = self.store / RANGES
         if not path.exists():
             return []
@@ -131,7 +128,10 @@ class Pool:
             for record in json.loads(path.read_text())["ranges"]:
                 batch = sa.build_batch(self.repo, record["from_sha"], record["main_sha"], record["commits"])
                 status = record["status"]
+                protocol = record.get("protocol_version")
                 if status == "pass" and batch["input_digest"] != record["input_digest"]:
+                    status = "planned"
+                if status in ("blocked", "running") and protocol != sa.PROTOCOL:
                     status = "planned"
                 slot = Slot(
                     batch,
@@ -139,11 +139,9 @@ class Pool:
                     failures=record["failures"],
                     retry_at=record["retry_at"],
                     verdict=record["verdict"] if status != "planned" else None,
-                    failure=record["failure"],
-                    attempts=list(record["attempts"]),
-                    provider=record["provider"],
-                    credential=record["credential"],
-                    avoid=record.get("avoid"),
+                    failure=record["failure"] if status != "planned" else None,
+                    attempts=list(record["attempts"]) if status != "planned" else [],
+                    protocol=protocol if status != "planned" else None,
                 )
                 if slot.status == "pass":
                     sa.validate_verdict(slot.verdict, batch)
@@ -240,90 +238,6 @@ class Pool:
         return False
 
     # Window ----------------------------------------------------------------
-    def imported(self, main: str) -> None:
-        """Carry records written before binding lived in the ranges and the ledger into the ledger.
-
-        A legacy block's attempt, or the attempt of a sequential round that stopped mid-inspection
-        (`running.json`), may hold a concern or unreadable evidence that no ledger verdict records.
-        Its evidence is classified once and any hold is recorded against its commits, so it binds
-        every range containing them; the block is then marked with its outcome."""
-        running = self.work / "running.json"  # A sequential round stopped mid-inspection.
-        if running.exists():
-            try:
-                attempt = json.loads(running.read_text())["attempt"]
-                stopped = json.loads((Path(attempt) / "input.json").read_text())
-                block = {"from_sha": stopped["from_sha"], "to_sha": stopped["commits"][-1]["sha"], "attempt": attempt}
-            except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
-                # Its range is unknown, so nothing can bind it: hold the pool for review (the watchdog DMs).
-                raise NoProgress(
-                    f"security-audit pool: {running} cannot be settled; preserve it for review: {exc}"
-                ) from exc
-            self.import_block(block, main)
-            running.unlink()
-        # The pool's batch files from before ranges.json: a blocked batch's attempts may hold a
-        # concern that no ledger verdict records.
-        for path in sorted(self.store.glob("*.json")):
-            if path.name == RANGES or path.name.endswith(".input.json"):
-                continue
-            try:
-                old = json.loads(path.read_text())
-            except (OSError, ValueError) as exc:
-                raise NoProgress(f"security-audit pool: {path} cannot be read; preserve it for review: {exc}") from exc
-            if not isinstance(old, dict) or old.get("status") != "blocked" or old.get("imported"):
-                continue
-            span = {"from_sha": old.get("from_sha"), "to_sha": old.get("to_sha")}
-            if isinstance(old.get("verdict"), dict):
-                self.import_block({**span, "verdict": old["verdict"]}, main, verdict=old["verdict"])
-            attempts = old.get("attempts") or []
-            for attempt in attempts:
-                self.import_block({**span, "attempt": attempt}, main)
-            if not attempts and not isinstance(old.get("verdict"), dict):
-                # A block with no evidence to classify: hold its commits rather than forget it.
-                self.import_block(
-                    {**span, "reason": "security-audit: legacy pool block without evidence"}, main, hold=True
-                )
-            save(path, {**old, "imported": True})
-        path = self.work / "blocked.json"
-        try:
-            block = json.loads(path.read_text()) if path.exists() else {}
-        except ValueError:
-            block = {"reason": "security-audit: unreadable blocked.json"}
-        if "outcome" in block or not block:
-            return
-        save(path, {**block, **self.import_block(block, main)})
-
-    def import_block(self, block: dict, main: str, *, verdict: dict | None = None, hold: bool = False) -> dict:
-        """Record in the ledger what one legacy record's attempt holds; return its outcome."""
-        outcome = {"outcome": "not-judged"}
-        if verdict is not None:
-            if not (verdict.get("findings") or verdict.get("verdict") == "finding"):
-                return outcome  # Names no concern: the range is inspected afresh.
-            outcome = {"outcome": "finding", "verdict": verdict}
-        elif hold:
-            outcome = {"outcome": "unreadable", "reason": block["reason"]}
-        elif block.get("manual_inspection_required"):
-            outcome = {}  # A planning block is planned again, and blocks again if it still cannot be.
-        elif block.get("attempt") and Path(block["attempt"]).exists():  # A missing attempt recorded nothing.
-            attempt = Path(block["attempt"])
-            try:
-                batch = json.loads((attempt / "input.json").read_text())
-                outcome = evidence.outcome_of(sa.judged(attempt, batch, "security-audit: legacy block"), None)
-            except evidence.NotJudged:
-                pass
-            except Exception as exc:  # noqa: BLE001 - evidence that cannot be classified holds.
-                outcome = {"outcome": "unreadable", "reason": f"security-audit: legacy block evidence: {exc}"}
-        if outcome:
-            frm, to = block.get("from_sha"), block.get("to_sha")
-            commits = []
-            if frm and to:
-                try:
-                    history = sa.validate_history(self.repo, frm, main)
-                except Die:
-                    history = []  # Not on main's history: it cannot bind a range the pool plans.
-                commits = history[: history.index(to) + 1] if to in history else []
-            sa.record(self.work / "ledger.jsonl", {"legacy_block": block, "commits": commits, **outcome})
-        return outcome or {"outcome": "not-judged"}
-
     def sync(self, cursor: str, main: str) -> None:
         """Align the window with the remote cursor, restoring the durable list after a restart."""
         before = [slot.record() for slot in self.slots]
@@ -385,6 +299,7 @@ class Pool:
             "reason": refused,
             "outcome": "finding" if verdict else "unreadable",
             "verdict": verdict,
+            "protocol_version": sa.PROTOCOL,
         }
         sa.record(self.work / "ledger.jsonl", failure)
         self.block(slot, failure, head=slot.batch["from_sha"] == self.slots[0].batch["from_sha"])
@@ -401,10 +316,9 @@ class Pool:
                 continue
             if self.refused(slot):
                 continue
-            choice = self.chooser.choose(avoid=slot.avoid)
-            if choice is None:
-                return  # No reviewer under pace and no API key: wait.
-            slot.provider, slot.credential = choice
+            if not self.api_key():
+                return  # No reviewer credential: wait.
+            slot.protocol = sa.PROTOCOL
             attempt = self.work / f"attempt-{time.time_ns()}"
             attempt.mkdir()
             (attempt / "input.json").write_text(sa.serialize(slot.batch))
@@ -414,15 +328,23 @@ class Pool:
             commits = len(slot.batch["commits"])
             log(
                 f"security-audit pool: inspect {slot.batch['from_sha'][:12]}..{slot.target[:12]} ({commits} commits)"
-                f" with {slot.provider}/{sa.reviewer_model(slot.provider)} ({slot.credential}) in {attempt.name}"
+                f" with {sa.REVIEWER_MODEL} in {attempt.name}"
             )
-            future = executor.submit(self.inspect, slot.batch, attempt, slot.provider, slot.credential)
+            future = executor.submit(self.inspect, slot.batch, attempt)
             self.running[future] = (slot, attempt)
             busy += 1
 
     @staticmethod
-    def inspect(batch, attempt, provider, credential) -> dict:
-        """One fresh protocol-5 inspection; a batch that changes no audited file passes as is."""
+    def api_key() -> bool:
+        try:
+            return bool(sa.anthropic_api_key())
+        except Die as exc:
+            log(f"security-audit pool: reviewer API key unavailable: {exc}")
+            return False
+
+    @staticmethod
+    def inspect(batch, attempt) -> dict:
+        """One fresh inspection; a batch that changes no audited file passes as is."""
         if not any(c["files"] for c in batch["commits"]):
             return {
                 "input_digest": batch["input_digest"],
@@ -430,7 +352,7 @@ class Pool:
                 "verdict": "pass",
                 "findings": [],
             }
-        return sa.inspect(batch, provider, attempt, claude_credential=credential if provider == "claude" else None)
+        return sa.inspect(batch, attempt)
 
     def finished(self, future, cursor: str) -> None:
         slot, attempt = self.running.pop(future)
@@ -448,7 +370,7 @@ class Pool:
         Anything else is retried autonomously, never bound: a range of several commits that the
         reviewer worked on (it answered or was served input) is replaced by its two complete
         halves, inspected afresh; a single commit, or an attempt where no reviewer engaged (a
-        provider or setup failure), is inspected afresh, preferably by the other reviewer. Retries
+        provider or setup failure), is inspected afresh. Retries
         back off up to an hour and never stop; the cursor watchdog reports a long stall."""
         span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
         launched = (attempt / "execution.json").exists()
@@ -463,8 +385,6 @@ class Pool:
             "commits": [c["sha"] for c in slot.batch["commits"]],
             **self.reviewer(slot),
         }
-        if isinstance(exc.__cause__, subprocess.TimeoutExpired):
-            failure["failure_kind"] = "provider-timeout"
         sa.record(self.work / "ledger.jsonl", failure)
         if hold:
             slot.status = "blocked"
@@ -477,7 +397,6 @@ class Pool:
             return
         slot.failures += 1
         slot.status = "planned"
-        slot.avoid = slot.provider
         # Retries never stop, so their storage must not grow: keep the last two attempts. An older
         # attempt was classified as no judgment and its outcome is in the ledger; one whose
         # evidence holds is never removed (it would have bound the range instead).
@@ -487,7 +406,7 @@ class Pool:
         slot.attempts = slot.attempts[-KEPT_ATTEMPTS:]
         slot.retry_at = time.time() + min(RETRY_CAP, RETRY_SECONDS * 2 ** (slot.failures - 1))
         self.persist()
-        log(f"security-audit pool: {span} not judged on {slot.provider} ({exc}); fresh retry {slot.failures}")
+        log(f"security-audit pool: {span} not judged ({exc}); fresh retry {slot.failures}")
 
     def split(self, slot: Slot, failure: dict) -> None:
         """Replace a range by its two halves, in one durable update: complete fresh inspections of
@@ -522,7 +441,7 @@ class Pool:
         span = f"{slot.batch['from_sha'][:12]}..{slot.target[:12]}"
         sa.record(
             self.work / "ledger.jsonl",
-            sa.review_record(self.actor or "", slot.provider, slot.batch, attempt, verdict, slot.credential),
+            sa.review_record(self.actor or "", slot.batch, attempt, verdict),
         )
         slot.verdict = verdict
         if verdict["verdict"] == "pass" and verdict["input_digest"] != slot.digest:
@@ -551,7 +470,7 @@ class Pool:
 
     @staticmethod
     def reviewer(slot: Slot) -> dict:
-        return {"provider": slot.provider, "model": sa.reviewer_model(slot.provider), "credential": slot.credential}
+        return {"model": sa.REVIEWER_MODEL, "protocol_version": slot.protocol}
 
     def block(self, slot: Slot, failure: dict, *, head: bool) -> None:
         slot.failure = failure
@@ -602,7 +521,6 @@ class Pool:
         except BaseException as exc:
             self.observation = exc
             raise
-        self.imported(main)
         self.sync(cursor, main)
         # Binding ranges are the durable list and the ledger's recorded concerns, never blocked.json,
         # which only mirrors the block at the cursor for operators and alerts. Delivery is idempotent
@@ -664,7 +582,9 @@ class Pool:
     def serve(self, *, stop=None) -> None:
         """Run until `stop(pool)` returns true; a binding block holds advancement, never the pool."""
         with self.owned(Die):
-            log(f"security-audit pool: up to {self.parallel} isolated reviewers; {self.chooser.describe()}")
+            log(
+                f"security-audit pool: up to {self.parallel} isolated reviewers; reviewer {sa.REVIEWER_MODEL} (protocol {sa.PROTOCOL})"
+            )
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.parallel) as executor:
                 while True:
                     try:
@@ -688,80 +608,3 @@ class Pool:
                         cursor = sa.remote_sha(sa.CURSOR)
                         for future in done:
                             self.finished(future, cursor)
-
-
-class Chooser:
-    """Pick each new batch's reviewer: Codex Luna under pace, then subscription Haiku under pace,
-    then Haiku billed to the configured API key regardless of pace. None means wait.
-
-    Pacing uses the ordinary `resolve_work_model` verdict. `--ignore-quota` overrides soft
-    pacing for subscription reviewers, never hard limits. `pin` restricts the run to one provider."""
-
-    TTL = 300
-
-    def __init__(self, cfg, *, pin: str | None = None, ignore_quota: bool = False):
-        if pin not in (None, "codex", "claude"):
-            raise Die("security-audit: pool reviewer must be codex or claude")
-        self.cfg = cfg
-        self.pin = pin
-        self.ignore_quota = ignore_quota
-        self.checked: dict[str, tuple[float, bool]] = {}
-
-    def describe(self) -> str:
-        order = {
-            None: "codex, then subscription haiku, then API-key haiku",
-            "codex": "codex only",
-            "claude": "subscription haiku, then API-key haiku",
-        }[self.pin]
-        return f"reviewer order: {order}" + (" (--ignore-quota)" if self.ignore_quota else "")
-
-    def under_pace(self, provider: str) -> bool:
-        at, ok = self.checked.get(provider, (0.0, False))
-        if time.time() - at < self.TTL:
-            return ok
-        from .loop import resolve_work_model
-
-        try:
-            resolve_work_model(self.cfg, provider, dry=False, ignore_quota=self.ignore_quota, fresh=True)
-            ok = True
-        except (NoProgress, SystemExit) as exc:
-            log(f"security-audit pool: {provider} subscription unavailable for new launches: {exc}")
-            ok = False
-        self.checked[provider] = (time.time(), ok)
-        return ok
-
-    @staticmethod
-    def api_key() -> bool:
-        try:
-            return bool(getattr(sa, "anthropic_api_key", lambda: None)())
-        except Die as exc:
-            log(f"security-audit pool: API-key Haiku unavailable: {exc}")
-            return False
-
-    def choose(self, avoid: str | None = None):
-        """The first available reviewer, preferring one other than `avoid`; None means wait."""
-        options = []
-        if self.pin != "claude" and self.under_pace("codex"):
-            options.append(("codex", "subscription"))
-        if self.pin != "codex":
-            if self.under_pace("claude"):
-                options.append(("claude", "subscription"))
-            elif self.api_key():
-                options.append(("claude", "api-key"))
-        preferred = [option for option in options if option[0] != avoid]
-        return (preferred or options or [None])[0]
-
-
-class Single:
-    """The reviewer of a Worker round: already paced by the round itself."""
-
-    def __init__(self, provider: str):
-        if provider not in ("codex", "claude"):
-            raise Die("security-audit: the audit reviewer must be codex or claude")
-        self.provider = provider
-
-    def describe(self) -> str:
-        return f"reviewer: {self.provider}"
-
-    def choose(self, avoid: str | None = None):
-        return (self.provider, sa.credential_kind(self.provider))

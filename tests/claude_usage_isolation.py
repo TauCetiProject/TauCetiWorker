@@ -2,18 +2,16 @@
 
 import json
 import os
-import runpy
 import sys
 import tempfile
 import time
 import unittest
-import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from tauceti_worker import agents, audit_pool, quota, security_audit, usage, work_units
+from tauceti_worker import agents, quota, usage, work_units
 from tauceti_worker.config import Config, NoProgress
 
 USAGE_VAR = "TAUCETI_CLAUDE_USAGE_CREDENTIALS"
@@ -237,62 +235,6 @@ class Isolation(unittest.TestCase):
             self.assertIsNone(quota.claude_usage_configuration_problem(self.cfg))
             with patch.dict(os.environ, {"TAUCETI_CLAUDE_AGENT_CREDENTIAL": "file"}):
                 self.assertIn("#682", reader._claude_launch_credential_unusable())
-        keychain.assert_not_called()
-
-    def pool_cli(self, inspect):
-        cfg = self.config()
-        with (
-            patch.object(Config, "resolve", return_value=cfg),
-            patch.object(audit_pool.Pool, "serve", side_effect=inspect) as serve,
-            patch("tauceti_worker.paths.ensure_ssl_cert_file"),
-            patch.object(sys, "argv", ["security_audit", "pool", "--state", str(cfg.state / security_audit.CURSOR)]),
-            warnings.catch_warnings(),
-        ):
-            warnings.filterwarnings(
-                "ignore", message="'tauceti_worker.security_audit' found in sys.modules", category=RuntimeWarning
-            )
-            runpy.run_module("tauceti_worker.security_audit", run_name="__main__")
-        serve.assert_called_once()
-
-    def test_standalone_pool_checks_the_access_only_route_before_admission(self):
-        for platform, exists in (("linux", True), ("linux", False), ("darwin", False)):
-            with self.subTest(platform=platform, file_exists=exists):
-                os.environ.pop("TAUCETI_CLAUDE_AGENT_CREDENTIAL", None)
-                os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "parent-setup-token"
-                credential(self.usage, "usage-token")
-                credential(self.agent, expires=-60, refresh="agent-refresh")
-                if not exists:
-                    self.agent.unlink()
-
-                def inspect(expected="#682" if platform == "darwin" else "expired" if exists else "no "):
-                    self.assertEqual(os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"], "access-only")
-                    problem = quota.Quota(self.config())._claude_launch_credential_unusable()
-                    self.assertIsNotNone(problem)
-                    self.assertIn(expected, problem)
-
-                with patch.object(sys, "platform", platform), patch.object(quota, "_claude_keychain_creds") as keychain:
-                    self.pool_cli(inspect)
-                keychain.assert_not_called()
-
-    def test_standalone_pool_copies_the_live_agent_file_not_the_parent_token(self):
-        credential(self.agent, "agent-token", refresh="agent-refresh")
-        credential(self.usage, "usage-token", refresh="usage-refresh")
-        os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = "parent-setup-token"
-        before = self.usage.read_bytes()
-
-        def inspect():
-            self.assertIsNone(quota.Quota(self.config())._claude_launch_credential_unusable())
-            home = self.root / "pool-reviewer"
-            env = security_audit.client_env(home, "claude", "subscription")
-            blob = json.loads((home / ".claude/.credentials.json").read_text())["claudeAiOauth"]
-            self.assertEqual(blob["accessToken"], "agent-token")
-            self.assertNotIn("refreshToken", blob)
-            self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", env)
-            self.assertNotIn(USAGE_VAR, env)
-            self.assertEqual(self.usage.read_bytes(), before)
-
-        with patch.object(sys, "platform", "linux"), patch.object(quota, "_claude_keychain_creds") as keychain:
-            self.pool_cli(inspect)
         keychain.assert_not_called()
 
     def test_unsupported_review_file_flag_does_not_charge_the_pr(self):

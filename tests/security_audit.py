@@ -14,91 +14,11 @@ from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
-from tauceti_worker import audit_clients as clients
-from tauceti_worker import cli
+from tauceti_worker import audit_evidence, cli
 from tauceti_worker import security_audit as sa
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
 from tauceti_worker.work_units import want
-
-
-def append_native(home, answer, thread="11111111-2222-4333-8444-555555555555"):
-    sessions = home / ".codex/sessions"
-    sessions.mkdir(parents=True, exist_ok=True)
-    files = list(sessions.rglob("*.jsonl"))
-    if not files:
-        path = sessions / "rollout.jsonl"
-        path.write_text(sa.serialize({"type": "session_meta", "payload": {"id": thread}}) + "\n")
-    else:
-        path = files[0]
-    with path.open("a") as native:
-        native.write(
-            sa.serialize(
-                {
-                    "type": "response_item",
-                    "payload": {
-                        "role": "assistant",
-                        "type": "message",
-                        "phase": "final_answer",
-                        "content": [{"type": "output_text", "text": sa.serialize(answer)}],
-                    },
-                }
-            )
-            + "\n"
-        )
-
-
-CAPACITY_RETRY = {
-    "type": "error",
-    "message": "Retrying model request in 300 seconds... (Selected model is at capacity. Please try a different model.)",
-}
-
-
-class RetryEvents(unittest.TestCase):
-    def final(self, events):
-        return sa.codex_final("\n".join(map(sa.serialize, events)), True)
-
-    def test_server_retry_notices_followed_by_a_completed_answer_are_progress(self):
-        answer = {"verdict": "pass", "findings": [], "read_token": "token"}
-        for message in (
-            CAPACITY_RETRY["message"],
-            "Retrying model request in 600 seconds... (An error occurred while processing your request. Request ID abc)",
-        ):
-            with self.subTest(message=message):
-                self.assertEqual(
-                    self.final(
-                        [
-                            {"type": "turn.started"},
-                            {"type": "error", "message": message},
-                            CAPACITY_RETRY,
-                            {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(answer)}},
-                            {"type": "turn.completed"},
-                        ]
-                    ),
-                    answer,
-                )
-
-    def test_terminal_unknown_unfinished_and_out_of_order_errors_never_pass(self):
-        answer = {"type": "item.completed", "item": {"type": "agent_message", "text": '{"verdict":"pass"}'}}
-        completed = {"type": "turn.completed"}
-        for events in (
-            [CAPACITY_RETRY, answer],
-            [answer, completed, CAPACITY_RETRY],
-            [answer, CAPACITY_RETRY, completed],
-            [CAPACITY_RETRY, completed, answer],
-            [answer, completed, {"type": "turn.started"}, completed],
-            [{"type": "error", "message": "unknown error"}, answer, completed],
-            [{"type": "turn.failed", "error": {"message": CAPACITY_RETRY["message"]}}, answer, completed],
-            [{**CAPACITY_RETRY, "unknown": True}, answer, completed],
-            [
-                {"type": "error", "message": "Retrying model request in 300 seconds... (unknown failure)"},
-                answer,
-                completed,
-            ],
-            [CAPACITY_RETRY, {"type": "item.completed", "item": {"type": "command_execution"}}, answer, completed],
-        ):
-            with self.subTest(events=events), self.assertRaises(Die):
-                self.final(events)
 
 
 class History(unittest.TestCase):
@@ -181,7 +101,7 @@ class History(unittest.TestCase):
         batch = sa.plan_batch(self.repo, self.base, head)
         self.assertEqual([c["sha"] for c in batch["commits"]], [small])
 
-    def test_single_large_commit_gets_one_complete_compacting_session(self):
+    def test_single_large_commit_is_inspected_alone_and_complete(self):
         content = "-- Ordinary mathematical source\n" * 45000
         head = self.commit("large", "TauCeti/A.lean", content)
         batch = sa.plan_batch(self.repo, self.base, head)
@@ -370,15 +290,6 @@ class PrivateAlerts(unittest.TestCase):
         finding = {**self.block, "outcome": "finding", "verdict": {"verdict": "finding", "findings": ["run_cmd"]}}
         self.assertEqual(alerts.report(self.work, finding)["details"], ["run_cmd"])
         self.assertEqual(alerts.report(self.work, {**self.block, "outcome": "not-judged"})["kind"], "Operational stall")
-
-    def test_every_block_writer_records_its_outcome(self):
-        from tauceti_worker.audit_evidence import NotJudged, Unreadable, outcome_of
-
-        finding = {"verdict": "finding", "findings": ["IO"]}
-        self.assertEqual(outcome_of(finding, Die("x")), {"outcome": "finding", "verdict": finding})
-        self.assertEqual(outcome_of(None, Unreadable("x")), {"outcome": "unreadable"})
-        self.assertEqual(outcome_of(None, NotJudged("x")), {"outcome": "not-judged"})
-        self.assertEqual(outcome_of({"verdict": "pass", "findings": []}, Die("ref")), {"outcome": "not-judged"})
 
     def test_code_uncertainty_notifies_immediately_during_operational_delay(self):
         (self.work / "ledger.jsonl").unlink()
@@ -829,63 +740,135 @@ class Authority(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(Die):
                 sa.validate_verdict({**good, **changes}, batch)
 
-    def test_launcher_isolated_from_github_and_config(self):
-        batch = {"input_digest": "digest", "commits": [{"sha": "a" * 40}]}
-        verdict = {"input_digest": "digest", "commits": ["a" * 40], "verdict": "pass", "findings": []}
+    def test_reviewer_is_one_api_request_carrying_the_whole_bundle_and_no_secrets(self):
+        files = [
+            {
+                "path": "TauCeti/A.lean",
+                "before": "",
+                "after": "@[stacks 0BE9, simp] theorem t : True := trivial\n",
+                "diff": "",
+            }
+        ]
+        batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "b" * 40,
+            "commits": [{"sha": "b" * 40, "parent": "a" * 40, "files": files}],
+        }
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        seen = {}
+
+        def reviewer(request, key):
+            seen.update(request=request, key=key)
+            answer = {"verdict": "pass", "findings": []}
+            return {"content": [{"type": "text", "text": json.dumps(answer)}], "stop_reason": "end_turn"}
+
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
-            auth = work / "auth.json"
-            auth.write_text('{"tokens":{"access_token":"only-the-provider","refresh_token":"real-refresh-secret"}}')
-
-            def model(argv, **kwargs):
-                self.assertNotIn("GH_TOKEN", kwargs["env"])
-                self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
-                self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
-                self.assertNotIn("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG", kwargs["env"])
-                self.assertNotEqual(kwargs["cwd"], work)
-                credentials = json.loads((kwargs["cwd"] / ".codex/auth.json").read_text())
-                self.assertEqual(credentials["tokens"]["refresh_token"], sa.CODEX_RT_PLACEHOLDER)
-                self.assertNotIn("real-refresh-secret", json.dumps(credentials))
-                self.assertIn("--output-schema", argv)
-                catalog = json.loads((kwargs["cwd"] / "model-catalog.json").read_text())["models"][0]
-                self.assertIsNone(catalog["apply_patch_tool_type"])
-                self.assertEqual(catalog["shell_type"], "disabled")
-                self.assertEqual(catalog["experimental_supported_tools"], [])
-                self.assertTrue(any(a.startswith("model_catalog_json=") for a in argv))
-                append_native(kwargs["cwd"], {k: verdict[k] for k in ("verdict", "findings")})
-                events = [
-                    {
-                        "type": "item.completed",
-                        "item": {
-                            "type": "agent_message",
-                            "text": json.dumps({k: verdict[k] for k in ("verdict", "findings")}),
-                        },
-                    },
-                    {"type": "turn.completed"},
-                ]
-                return SimpleNamespace(returncode=0, stdout="\n".join(map(json.dumps, events)), stderr="")
-
+            key = work / "key"
+            key.write_text("sk-test-secret\n")
+            key.chmod(0o600)
+            attempt = work / "attempt-1"
+            attempt.mkdir()
             with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "GH_TOKEN": "admin-secret",
-                        "GITHUB_TOKEN": "secret",
-                        "TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG": "/private/bot.json",
-                    },
-                ),
-                patch.object(sa, "codex_dir", return_value=work),
-                patch.object(sa, "run_process", side_effect=model),
-                patch.object(clients, "selected_protocol", return_value=sa.PROTOCOL),
+                patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key), "GH_TOKEN": "admin-secret"}),
+                patch.object(sa, "call_reviewer", side_effect=reviewer),
             ):
-                attempt = work / "attempt-1"
-                attempt.mkdir()
-                self.assertEqual(sa.inspect(batch, "codex", attempt), verdict)
-        self.assertIn("--ignore-user-config", sa.reviewer_argv("codex"))
-        self.assertIn("shell_tool", sa.reviewer_argv("codex"))
-        args = sa.reviewer_argv("claude")
-        self.assertEqual(args[args.index("--tools") + 1], "")
-        self.assertIn("--safe-mode", args)
+                verdict = sa.inspect(batch, attempt)
+            self.assertEqual(verdict["verdict"], "pass")
+            self.assertEqual(seen["key"], "sk-test-secret")
+            retained = "".join(p.read_text() for p in attempt.iterdir())
+            self.assertNotIn("sk-test-secret", retained)
+            self.assertNotIn("admin-secret", retained)
+            self.assertEqual(json.loads((attempt / "request.json").read_text()), seen["request"])
+            execution = json.loads((attempt / "execution.json").read_text())
+            self.assertEqual(execution["protocol_version"], sa.PROTOCOL)
+            self.assertEqual(
+                execution["request_digest"], hashlib.sha256((attempt / "request.json").read_bytes()).hexdigest()
+            )
+        user = seen["request"]["messages"][0]["content"]
+        self.assertIn(sa.serialize(batch), user)
+        self.assertIn("(determined by the trusted Worker): simp, stacks.", user)
+        self.assertNotIn("tools", seen["request"])
+
+    def test_baseline_attributes_never_vouch_for_flagged_or_locally_defined_attributes(self):
+        def batch(text):
+            return {"commits": [{"files": [{"before": None, "after": text, "diff": ""}]}]}
+
+        self.assertEqual(
+            sa.baseline_attributes(batch("@[simp, stacks 0BE9] theorem t := x\nattribute [local ext] f")),
+            ["ext", "simp", "stacks"],
+        )
+        self.assertEqual(sa.baseline_attributes(batch('@[extern "f", implemented_by g, csimp] def f := 1')), [])
+        local = 'syntax (name := stacksLocal) "stacks" ident : attr\n@[stacks 1] theorem t := x\n'
+        self.assertEqual(sa.baseline_attributes(batch(local)), [])
+        registered = "initialize registerBuiltinAttribute { name := `simp }\n@[simp] theorem t := x\n"
+        self.assertEqual(sa.baseline_attributes(batch(registered)), [])
+        multiline = 'initialize customAttr : TagAttribute ←\n  registerTagAttribute\n    `stacks\n    "c"\n@[stacks 1] theorem t := x\n'
+        self.assertEqual(sa.baseline_attributes(batch(multiline)), [])
+
+    def test_a_request_too_large_for_the_context_splits_or_holds(self):
+        import anthropic
+        import httpx2
+
+        files = [{"path": "TauCeti/A.lean", "before": "", "after": "x", "diff": ""}]
+
+        def batch(n):
+            value = {
+                "from_sha": "a" * 40,
+                "main_sha": "b" * 40,
+                "commits": [{"sha": str(i) * 40, "parent": "a" * 40, "files": files} for i in range(n)],
+            }
+            value["input_digest"] = hashlib.sha256(sa.serialize(value).encode()).hexdigest()
+            return value
+
+        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+        too_long = "prompt is too long: 1157582 tokens > 1000000 maximum"
+        errors = {
+            "context": anthropic.BadRequestError(too_long, response=httpx2.Response(400, request=request), body=None),
+            "413": anthropic.APIStatusError(
+                "request too large", response=httpx2.Response(413, request=request), body=None
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "key"
+            key.write_text("k")
+            key.chmod(0o600)
+            for name, error in errors.items():
+                with (
+                    patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key)}),
+                    patch.object(sa, "call_reviewer", side_effect=error),
+                ):
+                    for n, raised in ((2, sa.NotJudged), (1, sa.Unreadable)):
+                        attempt = Path(tmp) / f"attempt-{name}-{n}"
+                        attempt.mkdir()
+                        with self.subTest(error=name, commits=n), self.assertRaises(raised):
+                            sa.inspect(batch(n), attempt)
+                        if n == 2:
+                            self.assertTrue(audit_evidence.engaged(attempt))
+
+    def test_a_transport_failure_is_not_a_judgment_and_never_holds(self):
+        import httpx2
+
+        files = [{"path": "TauCeti/A.lean", "before": "", "after": "x", "diff": ""}]
+        batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "b" * 40,
+            "commits": [{"sha": "b" * 40, "parent": "a" * 40, "files": files}],
+        }
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "key"
+            key.write_text("k")
+            key.chmod(0o600)
+            attempt = Path(tmp) / "attempt-1"
+            attempt.mkdir()
+            with (
+                patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key)}),
+                patch.object(sa, "call_reviewer", side_effect=httpx2.ReadTimeout("read timed out")),
+                self.assertRaises(sa.NotJudged),
+            ):
+                sa.inspect(batch, attempt)
+            self.assertFalse(audit_evidence.engaged(attempt))
 
     def test_publications_do_not_enter_the_replay_outbox(self):
         with patch.object(sa, "execute", return_value=SimpleNamespace(returncode=0, stdout="{}", stderr="")) as execute:
@@ -924,9 +907,6 @@ class Run(unittest.TestCase):
         self.old, self.target = "a" * 40, "b" * 40
         self.batch = {"from_sha": self.old, "input_digest": "digest", "commits": [{"sha": self.target, "files": [{}]}]}
         self.opts = SimpleNamespace(dry_run=False, work_model="codex")
-        protocol = patch.object(clients, "selected_protocol", return_value=3)
-        protocol.start()
-        self.addCleanup(protocol.stop)
         for name, kwargs in (
             ("require_admin", {}),
             ("remote_sha", {"return_value": self.old}),
@@ -956,72 +936,6 @@ class Run(unittest.TestCase):
         with patch.object(sa, "advance") as advance, self.assertRaises(Die):
             sa.attest(self.state, self.target, "   ")
         advance.assert_not_called()
-
-    def retained_incomplete(self, *, finding=False):
-
-        work = self.state / sa.CURSOR
-        original = work / "attempt-1"
-        original.mkdir(parents=True)
-        batch = {
-            "from_sha": self.old,
-            "main_sha": self.target,
-            "commits": [{"sha": self.target, "parent": self.old, "files": [{}]}],
-        }
-        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
-        (original / "input.json").write_text(sa.serialize(batch))
-        (work / "blocked.json").write_text(
-            sa.serialize(
-                {
-                    "from_sha": self.old,
-                    "to_sha": self.target,
-                    "attempt": str(original),
-                    "reason": "security-audit: Unable to inspect pages 19–20: the available reader token could not be validated, so the final two pages and their source changes remain unreviewed.",
-                }
-            )
-        )
-        verdict = {
-            "input_digest": batch["input_digest"],
-            "commits": [self.target],
-            "verdict": "finding" if finding else "incomplete",
-            "findings": [
-                "IO"
-                if finding
-                else "Unable to inspect pages 19–20: the available reader token could not be validated, so the final two pages and their source changes remain unreviewed."
-            ],
-        }
-        sa.record(
-            work / "ledger.jsonl",
-            {
-                "batch": batch["input_digest"],
-                "provider": "codex",
-                "model": "gpt-6-luna",
-                "verdict": verdict,
-                "execution_record": str(original / "execution.json"),
-                "reader_digest": sa.LEGACY_READER_DIGEST,
-            },
-        )
-        return work, original, batch
-
-    def service_evidence(self, work, original):
-
-        batch = json.loads((original / "input.json").read_text())
-        prompt = sa.inspection_prompt(batch, False, policy=sa.PROMPT)
-        (original / "prompt.txt").write_text(prompt)
-        (original / "execution.json").write_text(
-            sa.serialize(
-                {
-                    **sa.inspection_profile(),
-                    "argv": sa.codex_launch(original / "home", False),
-                    "environment": {"HOME": str(original / "home")},
-                    "paged": False,
-                    "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
-                }
-            )
-        )
-        blocked = work / "blocked.json"
-        value = json.loads(blocked.read_text())
-        value["reason"] = f"security-audit: codex failed; see {original}/model-stderr.txt"
-        blocked.write_text(sa.serialize(value))
 
 
 if __name__ == "__main__":
