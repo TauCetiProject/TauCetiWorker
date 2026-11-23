@@ -560,6 +560,8 @@ class ClientCompatibility(unittest.TestCase):
                 f'exec {native} "$@"\x0c',
                 f"export PERL5LIB='payload'\nexec {native} \"$@\"",  # outside the clients' namespaces
                 f"export CLAUDE_CONFIG_PATH='payload'\nexec {native} \"$@\"",
+                f"export CLAUDE_CONFIG_DIR='payload'\nexec {native} \"$@\"",
+                f"export DISABLE_X='payload'\nexec {native} \"$@\"",
             ):
                 shim.write_text(f"#!/bin/sh\n{body}\n")
                 self.assertIsNone(clients.shim_target(shim), body)
@@ -568,6 +570,12 @@ class ClientCompatibility(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "native client"),
                 ):
                     clients.fingerprint("claude")
+            # A store path that links out of the store is refused.
+            real = Path.resolve
+            escape = {"/nix/store/x-socat/bin": Path(tmp)}
+            with patch.object(Path, "resolve", lambda p, *a, **k: escape.get(str(p)) or real(p, *a, **k)):
+                self.assertIsNone(clients.shim_target(nix))
+            self.assertIsNotNone(clients.shim_target(nix))
             for shebang in ("#!/bin/bash /tmp/hidden", "#!/usr/bin/env python3", "#!sh"):
                 shim.write_text(f'{shebang}\nexec {native} "$@"\n')
                 self.assertIsNone(clients.shim_target(shim), shebang)

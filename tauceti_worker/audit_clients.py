@@ -44,8 +44,8 @@ def client_path(provider: str) -> Path:
 _NAME = r"(?!(?:LD_PRELOAD|LD_AUDIT|BASH_ENV|ENV|DYLD_\w*)\b)[A-Za-z_][A-Za-z0-9_]*"
 # A literal is one plain word, set only in a client's own namespace: no literal can name a
 # file for an interpreter or loader to read.
-_LITERAL = r"[A-Za-z0-9_]*"
-_SETTING = r"(?:CLAUDE|CODEX|DISABLE|FORCE|USE)_(?!\w*PATH\b)[A-Za-z0-9_]*"
+_LITERAL = r"(?:[0-9]+|true|false|system)"
+_SETTING = r"(?:CLAUDE|CODEX|DISABLE|FORCE|USE)_(?!\w*(?:PATH|DIR|HOME|SHELL)\b)[A-Za-z0-9_]*"
 # Absolute paths of plain components: never `.` or `..`, so a store path stays in the store.
 _COMPONENT = r"/(?!\.\.?(?![A-Za-z0-9._+-]))[A-Za-z0-9._+-]+"
 _PATH = rf"(?:{_COMPONENT})+"
@@ -95,7 +95,10 @@ def shim_target(path: Path) -> tuple[Path, Path] | None:
     while i < len(body) - 1:
         if any(p.fullmatch(body[i]) for p in SHIM_LINES):
             i += 1
-        elif i + 5 < len(body) and SHIM_SEARCH_PATH.fullmatch("\n".join(body[i : i + 5])):
+        elif i + 5 < len(body) and (block := SHIM_SEARCH_PATH.fullmatch("\n".join(body[i : i + 5]))):
+            # A store path that is a link out of the store would name mutable files.
+            if not Path(block["s"]).resolve().is_relative_to("/nix/store"):
+                return None
             i += 5
         else:
             return None
