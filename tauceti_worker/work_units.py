@@ -819,7 +819,13 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     from .state_repair import retry_key
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
-    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages), tier=getattr(opts, "landing_tier", None)):
+    for stage, c in cascade(
+        sv,
+        stages,
+        target_list_prs(w, sv, stages),
+        tier=getattr(opts, "landing_tier", None),
+        review_first=os.environ.get("TAUCETI_REVIEW_FIRST") == "1",
+    ):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue

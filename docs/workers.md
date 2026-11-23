@@ -115,6 +115,13 @@ last on either forge, and the worker falls back to the other forge when its
 preferred forge has nothing claimable. Giving part of a pool a preference keeps
 one forge's backlog from starving behind the other's higher-tier work.
 
+Set `review_first = true` (or `--review-first` for `tauceti work`) to have a worker
+offer re-reviews, then first reviews, on either forge before any other PR work. Automatic
+bumps still come first and overlap work last, a forge preference still orders the forges
+inside each step, and the worker falls back to the normal landing order (rebases and the
+rest) when no review is claimable. A few review-first workers keep approvals flowing into
+the queue while the rest of the pool works through long conflict rebases.
+
 ## Locally verified publications
 
 With `self_tested = true` and `TAUCETI_VERIFY_HELPER=1`, the worker applies

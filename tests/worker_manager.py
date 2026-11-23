@@ -120,6 +120,15 @@ assert wm.WorkerSpec.from_dict(preferring.as_dict(), 0) == preferring
 argv = preferring.work_argv()
 assert argv[argv.index("--prefer-forge") + 1] == "github"
 assert build_parser().parse_args(argv[argv.index("work") :]).prefer_forge == "github"
+reviewing = wm.WorkerSpec.from_dict(dict(id="reviewing", forgejo=True, review_first=True), 0)
+assert reviewing.as_dict()["review_first"] is True
+assert "review_first" not in wm.WorkerSpec.from_dict(dict(id="plain", forgejo=True), 0).as_dict()
+assert wm.WorkerSpec.from_dict(reviewing.as_dict(), 0) == reviewing
+assert build_parser().parse_args(reviewing.work_argv()[reviewing.work_argv().index("work") :]).review_first is True
+assert not wm._defer_read_policy_reload(
+    reviewing,
+    dict(applied_spec=wm.WorkerSpec.from_dict(dict(id="reviewing", forgejo=True), 0).as_dict(), state="running"),
+)
 for changes in (dict(prefer_forge="forgejo"), dict(forgejo=True, prefer_forge="other")):
     try:
         wm.WorkerSpec.from_dict(dict(id="invalid-preference", **changes), 0)

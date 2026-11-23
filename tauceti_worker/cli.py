@@ -240,6 +240,12 @@ def add_source_flags(parser):
         default=argparse.SUPPRESS,
         help="within each landing tier, offer this forge's PR work first (default: no preference)",
     )
+    parser.add_argument(
+        "--review-first",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="offer re-reviews and first reviews before any other PR work (default: landing order)",
+    )
 
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
@@ -1092,6 +1098,7 @@ def main(argv: list[str] | None = None) -> int:
                     "self_tested": 1,
                     "source_selection": 1,
                     "prefer_forge": 1,
+                    "review_first": 1,
                     "graceful_restart": 1,
                 }
             )

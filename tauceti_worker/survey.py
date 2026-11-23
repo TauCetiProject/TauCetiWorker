@@ -1503,7 +1503,13 @@ def age_spread(candidates: list, rng=random) -> list:
     return [candidate for _, candidate in keyed]
 
 
-def cascade(sv: Survey, stages, listed=frozenset(), *, tier=None) -> list[tuple[str, Candidate]]:
+def review_first_rank(stage: str, rank: int) -> bool:
+    """False for the reviews a review-first worker offers ahead of the landing order: re-reviews
+    and first reviews, though not an automatic bump's review (bumps lead anyway) or overlap work."""
+    return not (stage == "review" and 0 < rank < LANDING_TIERS["overlap-fix"])
+
+
+def cascade(sv: Survey, stages, listed=frozenset(), *, tier=None, review_first=False) -> list[tuple[str, Candidate]]:
     """Actionable (stage, candidate) pairs in the order a round offers them.
 
     Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
@@ -1511,6 +1517,7 @@ def cascade(sv: Survey, stages, listed=frozenset(), *, tier=None) -> list[tuple[
     position allows a bump round to start, so a bump that waits behind unrelated work goes stale
     again before it can be admitted. Everything else follows in landing-tier order (LANDING_TIERS),
     in stage order within a tier and the stage's own order within a stage. `tier` keeps one tier.
+    `review_first` moves re-reviews, then first reviews, ahead of every other tier but the bumps.
 
     Within each maintenance/review stage, prefer this account's listed PRs among its own
     non-bump positions. Other authors and automatic bumps keep their positions; no candidate
@@ -1518,7 +1525,12 @@ def cascade(sv: Survey, stages, listed=frozenset(), *, tier=None) -> list[tuple[
     """
     bumps = bump_prs(sv)
     pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
-    pairs.sort(key=lambda pair: landing_tier(*pair, bumps))  # stable: stage order within a tier
+
+    def rank(pair):
+        tier_rank = landing_tier(*pair, bumps)
+        return review_first and tier_rank > 0 and review_first_rank(pair[0], tier_rank), tier_rank
+
+    pairs.sort(key=rank)  # stable: stage order within a tier
     if tier is not None:
         pairs = [pair for pair in pairs if landing_tier(*pair, bumps) == tier]
     if not listed:

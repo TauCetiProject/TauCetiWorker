@@ -233,9 +233,13 @@ def run_round(w, opts, *, use_fleet_focus=True):
         log("Forgejo agent rounds currently require host mode")
     random.shuffle(executable)
     from .config import ClaimCollision, GitHubUnavailable, SourceUnavailable
-    from .survey import LANDING_TIERS, bump_prs, landing_tier
+    from .survey import LANDING_TIERS, bump_prs, landing_tier, review_first_rank
 
     stages = [stage for stage in AUTO_STAGES if want(opts.only, stage)]
+    # A review-first worker (--review-first) offers re-reviews, then first reviews, on either forge
+    # before any other PR work, and falls back to the landing order below when no review is
+    # claimable. Automatic bumps still come first and overlap work last.
+    review_first = os.environ.get("TAUCETI_REVIEW_FIRST") == "1"
     # One choice per (landing tier, source), walked tier by tier across sources: a re-review on
     # either forge is offered before any fix, a fix before any first review (survey.LANDING_TIERS).
     choices = []
@@ -246,7 +250,13 @@ def run_round(w, opts, *, use_fleet_focus=True):
             for candidate in result.kind(stage).actionable:
                 tiers.setdefault(landing_tier(stage, candidate, bumps), []).append(stage)
         for tier, tier_stages in tiers.items():
-            choices.append((tier, name, worker, result, list(dict.fromkeys(tier_stages))))
+            tier_stages = list(dict.fromkeys(tier_stages))
+            if review_first and tier > 0 and "review" in tier_stages and not review_first_rank("review", tier):
+                choices.append((tier, name, worker, result, ["review"], True))
+                tier_stages = [stage for stage in tier_stages if stage != "review"]
+                if not tier_stages:
+                    continue
+            choices.append((tier, name, worker, result, tier_stages, False))
     complete = all(
         not value.github_failed and not value.dependency_wait and getattr(value, "target_inventory_available", True)
         for _, _, value in observations
@@ -260,11 +270,11 @@ def run_round(w, opts, *, use_fleet_focus=True):
     preferred = os.environ.get("TAUCETI_PREFER_FORGE")
 
     def order(item):
-        tier, name = item[0], item[1]
+        tier, name, reviewing = item[0], item[1], item[5]
         band = 0 if tier == 0 else 2 if tier >= LANDING_TIERS["overlap-fix"] else 1
-        return band, band == 1 and bool(preferred) and name != preferred, tier
+        return band, not reviewing, band == 1 and bool(preferred) and name != preferred, tier
 
-    for tier, name, worker, result, tier_stages in sorted(choices, key=order):
+    for tier, name, worker, result, tier_stages, _ in sorted(choices, key=order):
         if name in execution_failed:
             continue
         selected = dataclasses.replace(opts, only=tier_stages, landing_tier=tier)
