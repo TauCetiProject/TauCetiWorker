@@ -863,6 +863,66 @@ ci="one/project"
         tiers = [(call.args[1].only, call.args[1].landing_tier) for call in execute.call_args_list]
         self.assertEqual(tiers, [(["review"], 1), (["fix"], 2), (["review"], 3)])
 
+    def test_a_forge_preference_walks_that_forges_landing_tiers_first(self):
+        import contextlib
+
+        from tauceti_worker.config import ClaimCollision
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        def walk(preference):
+            observations = self.observations([], [])
+            github, forgejo = observations[0][2], observations[1][2]
+            github.needs_fix.actionable.append(Candidate(1, "a" * 40))
+            github.overlap_scan.actionable.append(Candidate(2, "b" * 40))
+            forgejo.reviewable.actionable.append(Candidate(3, "c" * 40, rereview=True))
+            forgejo.reviewable.actionable.append(Candidate(4, "d" * 40))
+            forgejo.rebaseable.actionable.append(Candidate(5, "e" * 40))
+            for _, worker, _ in observations:
+                worker.cfg = self.cfg
+            options = RoundOpts(
+                only=["rebase", "fix", "review", "overlap-scan"],
+                agent="auto",
+                work_model="auto",
+                sandbox_host=True,
+                dry_run=True,
+            )
+            environment = {"TAUCETI_PREFER_FORGE": preference} if preference else {}
+            with (
+                patch.dict(os.environ, environment),
+                patch("tauceti_worker.multi_source.collect", return_value=observations),
+                patch("tauceti_worker.multi_source.random.shuffle"),
+                patch("tauceti_worker.survey.bump_prs", side_effect=lambda sv: {5} if sv is forgejo else set()),
+                patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+                patch("tauceti_worker.work_units.run_round", side_effect=ClaimCollision("x")) as execute,
+            ):
+                if not preference:
+                    os.environ.pop("TAUCETI_PREFER_FORGE", None)
+                with self.assertRaises(ClaimCollision):
+                    run_round(None, options)
+            return [(call.args[0] is observations[0][1], call.args[1].landing_tier) for call in execute.call_args_list]
+
+        # Without a preference the Forgejo re-review outranks the GitHub fix.
+        self.assertEqual(walk(None), [(False, 0), (False, 1), (True, 2), (False, 3), (True, 6)])
+        # GitHub-first: the bump still leads and overlap still trails, but GitHub's fix comes before
+        # any Forgejo re-review, and Forgejo work remains the fallback.
+        self.assertEqual(walk("github"), [(False, 0), (True, 2), (False, 1), (False, 3), (True, 6)])
+
+    def test_a_forge_preference_survives_the_loop_handoff_and_must_be_selected(self):
+        from tauceti_worker.cli import build_parser
+        from tauceti_worker.worker_sources import selection_arguments
+
+        with patch.dict(os.environ, {"TAUCETI_PREFER_FORGE": "forgejo"}, clear=True):
+            configure(build_parser().parse_args(["work", "--forgejo", "--prefer-forge", "github"]))
+            self.assertEqual(os.environ["TAUCETI_PREFER_FORGE"], "github")
+            configure(build_parser().parse_args(["_round", *selection_arguments()]))
+            self.assertEqual(os.environ["TAUCETI_PREFER_FORGE"], "github")
+            configure(build_parser().parse_args(["work", "--forgejo"]))
+            self.assertNotIn("TAUCETI_PREFER_FORGE", os.environ)
+            self.assertNotIn("--prefer-forge", selection_arguments())
+            with self.assertRaises(Die):
+                configure(build_parser().parse_args(["work", "--prefer-forge", "forgejo"]))
+
     def test_shared_github_intentions_use_the_github_identity(self):
         from tauceti_worker.intentions import own_identities
 
