@@ -25,8 +25,10 @@ mechanism is shaped the way it is.
 A commit is indivisible, and a large refactor can exceed the 1M-token context with its
 before images, after images and diffs together (two 23- and 42-file commits in November
 2026 came to 1.08M and 1.16M tokens). Such a commit is sent without its before images.
-That loses nothing the audit needs: the before state is the commit's parent, which a
-pass of this commit can only advance from once it was audited; the complete after images
+That loses nothing the audit needs: the before state is the commit's parent, and a pass
+of this commit advances the cursor only from there, after the parent passed inspection or
+was attested by a human (a range may be inspected ahead of that, but never advanced past
+it); the complete after images
 are exactly what is built, and the diffs show every line added or changed. Removed code
 cannot run. The Worker still computes attribute provenance from the complete input, and
 `input.json` and its digest stay complete. The request is about half the size (about

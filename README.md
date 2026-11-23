@@ -217,8 +217,8 @@ Human-reviewed scripts, workflows, configuration and dependency pins are exclude
 Each inspection covers complete per-commit diffs and before/after file contents,
 up to 20 commits with a 1 MiB batch target (about 600k tokens of Lean source). A single
 larger commit is inspected alone, and is sent without its before contents: its complete
-after contents and diffs still show every line it adds, and its parent is audited before the
-cursor can pass it. Provenance is still computed from the complete input, and the retained
+after contents and diffs still show every line it adds or removes, and the cursor passes it
+only from its parent, after that passed inspection or was attested. Provenance is still computed from the complete input, and the retained
 `input.json` and digest stay complete. Each source blob remains limited to 4 MiB.
 
 Judgment protocol 8: every inspection is Anthropic Messages API requests that this process

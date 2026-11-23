@@ -109,6 +109,31 @@ class History(unittest.TestCase):
         self.assertEqual([c["sha"] for c in batch["commits"]], [head])
         self.assertEqual(batch["commits"][0]["files"][0]["after"], content)
 
+    def test_oversized_commit_keeps_deleted_and_renamed_source_visible_in_its_diffs(self):
+        content = "theorem a : True := trivial\n" * (sa.MAX_BYTES // 40)
+        self.commit("large baseline", "TauCeti/A.lean", content)
+        self.commit("executable", "TauCeti/B.lean", '#eval IO.println "removed"\n')
+        baseline = self.commit("to rename", "TauCeti/C.lean", "run_cmd pure ()\n")
+        (self.root / "TauCeti/A.lean").write_text(content + "theorem b : True := trivial\n")
+        self.command("rm", "-q", "TauCeti/B.lean")
+        self.command("mv", "TauCeti/C.lean", "TauCeti/D.lean")
+        self.command("add", "-A")
+        self.command("commit", "-qm", "large edit, deletion and rename")
+        head = self.command("rev-parse", "HEAD")
+        batch = sa.plan_batch(self.repo, baseline, head)
+        self.assertEqual([c["sha"] for c in batch["commits"]], [head])
+        bundle, note = sa.reviewed_bundle(batch)
+        self.assertEqual(note, sa.AFTER_ONLY)
+        files = {f["path"]: f for f in bundle["commits"][0]["files"]}
+        self.assertEqual(set(files), {"TauCeti/A.lean", "TauCeti/B.lean", "TauCeti/C.lean", "TauCeti/D.lean"})
+        self.assertTrue(all("before" not in f for f in files.values()))
+        self.assertEqual(files["TauCeti/A.lean"]["after"], content + "theorem b : True := trivial\n")
+        self.assertIsNone(files["TauCeti/B.lean"]["after"])
+        self.assertIn('-#eval IO.println "removed"', files["TauCeti/B.lean"]["diff"])
+        self.assertIn("-run_cmd pure ()", files["TauCeti/C.lean"]["diff"])
+        self.assertEqual(files["TauCeti/D.lean"]["after"], "run_cmd pure ()\n")
+        self.assertIn("+run_cmd pure ()", files["TauCeti/D.lean"]["diff"])
+
     def test_normal_multifile_edit_fits_with_complete_images(self):
         content = "-- A reasonably sized mathematical file with explanation\n" * 800
         self.commit("large baseline", "TauCeti/A.lean", content)
