@@ -233,7 +233,7 @@ def run_round(w, opts, *, use_fleet_focus=True):
         log("Forgejo agent rounds currently require host mode")
     random.shuffle(executable)
     from .config import ClaimCollision, GitHubUnavailable, SourceUnavailable
-    from .survey import bump_prs, landing_tier
+    from .survey import LANDING_TIERS, bump_prs, landing_tier
 
     stages = [stage for stage in AUTO_STAGES if want(opts.only, stage)]
     # One choice per (landing tier, source), walked tier by tier across sources: a re-review on
@@ -253,7 +253,18 @@ def run_round(w, opts, *, use_fleet_focus=True):
     )
     execution_failed = set()
     collisions = False
-    for tier, name, worker, result, tier_stages in sorted(choices, key=lambda item: item[0]):
+    # A forge preference (--prefer-forge) walks the preferred forge's landing tiers (rebases and
+    # re-reviews, fixes, first reviews) before the other forge's, so a preferring worker reaches its
+    # forge's fixes even while the other forge has re-reviews left. Automatic bumps still come first
+    # on either forge (main outruns them), and overlap work still comes last on either forge.
+    preferred = os.environ.get("TAUCETI_PREFER_FORGE")
+
+    def order(item):
+        tier, name = item[0], item[1]
+        band = 0 if tier == 0 else 2 if tier >= LANDING_TIERS["overlap-fix"] else 1
+        return band, band == 1 and bool(preferred) and name != preferred, tier
+
+    for tier, name, worker, result, tier_stages in sorted(choices, key=order):
         if name in execution_failed:
             continue
         selected = dataclasses.replace(opts, only=tier_stages, landing_tier=tier)

@@ -76,6 +76,17 @@ def resolve_selection(github, forgejo, new_pr_forge=None):
     return requested, destination
 
 
+def resolve_preference(requested, prefer_forge=None):
+    """Validate a forge preference: which selected forge a both-forge worker offers first."""
+    if prefer_forge is None:
+        return None
+    if prefer_forge not in ("github", "forgejo"):
+        raise Die("preferred forge must be github or forgejo")
+    if requested not in ("both", prefer_forge):
+        raise Die("the preferred forge must be among the selected forges")
+    return prefer_forge
+
+
 def configure(args):
     github = getattr(args, "github", None)
     forgejo = getattr(args, "forgejo", None)
@@ -107,8 +118,13 @@ def configure(args):
         adopted_author_ids()
     except ValueError as error:
         raise Die(str(error)) from None
+    preference = resolve_preference(requested, getattr(args, "prefer_forge", None))
     os.environ["TAUCETI_WORKER_FORGES"] = requested
     os.environ["TAUCETI_NEW_PR_FORGE"] = destination
+    if preference is None:
+        os.environ.pop("TAUCETI_PREFER_FORGE", None)
+    else:
+        os.environ["TAUCETI_PREFER_FORGE"] = preference
 
 
 def selection_arguments():
@@ -121,6 +137,8 @@ def selection_arguments():
     destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
     if selected == "both" or selected == destination:
         arguments += ["--new-pr-forge", destination]
+    if preference := os.environ.get("TAUCETI_PREFER_FORGE"):
+        arguments += ["--prefer-forge", preference]
     return arguments
 
 

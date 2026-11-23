@@ -234,6 +234,12 @@ def add_source_flags(parser):
         default=argparse.SUPPRESS,
         help="destination for new PRs (default: github)",
     )
+    parser.add_argument(
+        "--prefer-forge",
+        choices=("github", "forgejo"),
+        default=argparse.SUPPRESS,
+        help="within each landing tier, offer this forge's PR work first (default: no preference)",
+    )
 
 
 def add_work_flags(p: argparse.ArgumentParser) -> None:
@@ -1085,6 +1091,7 @@ def main(argv: list[str] | None = None) -> int:
                     "targets_inspect": 1,
                     "self_tested": 1,
                     "source_selection": 1,
+                    "prefer_forge": 1,
                     "graceful_restart": 1,
                 }
             )

@@ -114,6 +114,23 @@ for changes in (
         pass
     else:
         raise AssertionError(f"accepted invalid source selection: {changes}")
+preferring = wm.WorkerSpec.from_dict(dict(id="preferring", forgejo=True, prefer_forge="github"), 0)
+assert preferring.as_dict()["prefer_forge"] == "github"
+assert wm.WorkerSpec.from_dict(preferring.as_dict(), 0) == preferring
+argv = preferring.work_argv()
+assert argv[argv.index("--prefer-forge") + 1] == "github"
+assert build_parser().parse_args(argv[argv.index("work") :]).prefer_forge == "github"
+for changes in (dict(prefer_forge="forgejo"), dict(forgejo=True, prefer_forge="other")):
+    try:
+        wm.WorkerSpec.from_dict(dict(id="invalid-preference", **changes), 0)
+    except wm.WorkersError:
+        pass
+    else:
+        raise AssertionError(f"accepted invalid forge preference: {changes}")
+both = wm.WorkerSpec.from_dict(dict(id="preferring", forgejo=True), 0)
+assert wm._defer_read_policy_reload(preferring, dict(applied_spec=both.as_dict(), state="running")), (
+    "a forge preference change must wait for the round boundary"
+)
 old_source = wm.WorkerSpec("source-worker")
 new_source = dataclasses.replace(old_source, github=False, forgejo=True, new_pr_forge="forgejo")
 live_source = dict(applied_spec=old_source.as_dict(), state="running")

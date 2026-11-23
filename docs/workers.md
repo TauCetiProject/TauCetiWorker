@@ -107,6 +107,14 @@ These fields are available in `workers.toml`. Credentials use the existing
 private Forgejo token-file configuration. Source changes wait for the worker's
 current round to finish; other workers retain their running processes and settings.
 
+A both-source worker offers existing PR work by closeness to landing across both
+forges. Set `prefer_forge = "github"` (or `"forgejo"`, or `--prefer-forge` for
+`tauceti work`) to offer that forge's rebases, re-reviews, fixes and first reviews
+before any of the other forge's. Automatic bumps still come first and overlap work
+last on either forge, and the worker falls back to the other forge when its
+preferred forge has nothing claimable. Giving part of a pool a preference keeps
+one forge's backlog from starving behind the other's higher-tier work.
+
 ## Locally verified publications
 
 With `self_tested = true` and `TAUCETI_VERIFY_HELPER=1`, the worker applies
