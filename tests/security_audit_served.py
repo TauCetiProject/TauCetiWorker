@@ -487,6 +487,135 @@ class ClientCompatibility(unittest.TestCase):
             ):
                 clients.fingerprint("claude")
 
+    def test_environment_shims_are_followed_and_hashed_with_their_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            native = root / "store/bin/.claude-wrapped"
+            native.parent.mkdir(parents=True)
+            native.write_bytes(b"\x7fELF fixture")
+            bash = root / "bash/bin/bash"
+            bash.parent.mkdir(parents=True)
+            bash.write_bytes(b"\x7fELF bash")
+            # The form of Nix's makeWrapper output, as installed for claude-code.
+            nix = root / "store/bin/claude"
+            nix.write_text(
+                f"#! {bash} -e\n"
+                "export DISABLE_AUTOUPDATER='1'\n"
+                "export FORCE_AUTOUPDATE_PLUGINS=${FORCE_AUTOUPDATE_PLUGINS-'1'}\n"
+                "PATH=${PATH:+':'$PATH':'}\n"
+                "PATH=${PATH/':''/nix/store/x-socat/bin'':'/':'}\n"
+                "PATH='/nix/store/x-socat/bin'$PATH\n"
+                "PATH=${PATH#':'}\n"
+                "PATH=${PATH%':'}\n"
+                "export PATH\n"
+                f'exec -a "$0" "{native}"  "$@" \n'
+            )
+            # A one-line launcher shim in front of it.
+            shim = root / "bin/claude"
+            shim.parent.mkdir()
+            shim.write_text(f'#!/bin/sh\n# launcher\nCODEX_PATCHES_IN_NIX=1 exec {nix} "$@"\n')
+            run = SimpleNamespace(stdout="2.1.323 (Claude Code)\n")
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                patch.object(clients.subprocess, "run", return_value=run) as version,
+            ):
+                value = clients.fingerprint("claude")
+            sh = str(Path("/bin/sh").resolve())
+            self.assertEqual(list(value["files"]), [str(shim), sh, str(nix), str(bash), str(native)])
+            self.assertEqual(version.call_args.args[0], [str(shim), "--version"])
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                patch.object(clients.subprocess, "run", return_value=run),
+            ):
+                nix.write_text(nix.read_text().replace("'1'", "'0'", 1))
+                self.assertNotEqual(clients.fingerprint("claude")["files"], value["files"])
+            for body in (
+                'exec hidden-client "$@"',  # not an absolute target
+                f"exec {native}",  # does not pass the caller's arguments
+                f'X=1 curl https://example.invalid\nexec {native} "$@"',  # a command, not an assignment
+                f'X=$(curl https://example.invalid)\nexec {native} "$@"',
+                f'source /tmp/env\nexec {native} "$@"',
+                f'X=1; exec {native} "$@"',
+                f'exec {native} "$@" > /tmp/out',
+                f'X=\\" /tmp/hidden #"\nexec {native} "$@"',  # an escaped quote hides a command
+                f"X='\n#'\n/tmp/hidden\nexec {native} \"$@\"",  # a quote spanning lines
+                f'export LD_PRELOAD=/tmp/plugin.so\nexec {native} "$@"',
+                f'LD_PRELOAD=plugin.so exec {native} "$@"',
+                f'export BASH_ENV=/nix/store/x-env\nexec {native} "$@"',
+                f"PATH='/tmp/bin':$PATH\nexec {native} \"$@\"",  # a mutable path
+                f"PATH='/nix/store/../../tmp/bin'$PATH\nexec {native} \"$@\"",
+                'exec "/opt/$CHANNEL/client" "$@"',  # the executed path is not the hashed one
+                f"export BA''SH_ENV=payload\nexec {native} \"$@\"",  # a quote splits a refused name
+                f"export L''D_PRELOAD=plugin.so\nexec {native} \"$@\"",
+                f"export LD_LIBRARY_PATH='.'\nexec {native} \"$@\"",  # a relative search path
+                f"export NODE_OPTIONS='--require=payload'\nexec {native} \"$@\"",
+                f"PATH='/''tmp/''bin'$PATH\nexec {native} \"$@\"",  # a quote splits a mutable path
+                # Out of makeWrapper's order, an unset search path gains empty (current directory) entries.
+                f"LD_LIBRARY_PATH='/nix/store/x/lib'$LD_LIBRARY_PATH\n"
+                f"LD_LIBRARY_PATH=${{LD_LIBRARY_PATH:+':'$LD_LIBRARY_PATH':'}}\n"
+                f'export LD_LIBRARY_PATH\nexec {native} "$@"',
+                'exec "/bin/\'echo\'" "$@"',  # quotes inside the target
+                f'exec {native}/.. "$@"',
+                f'\rexec {native} "$@"',  # the shell reads a command named "\\rexec"
+                f'exec {native} "$@"\x0c',
+                f"export PERL5LIB='payload'\nexec {native} \"$@\"",  # outside the clients' namespaces
+                f"export CLAUDE_CONFIG_PATH='payload'\nexec {native} \"$@\"",
+                f"export CLAUDE_CONFIG_DIR='payload'\nexec {native} \"$@\"",
+                f"export DISABLE_X='payload'\nexec {native} \"$@\"",
+                f"export CLAUDE_ENV_FILE='system'\nexec {native} \"$@\"",  # a file, not a switch
+            ):
+                shim.write_text(f"#!/bin/sh\n{body}\n")
+                self.assertIsNone(clients.shim_target(shim), body)
+                with (
+                    patch.object(clients, "client_path", return_value=shim),
+                    self.assertRaisesRegex(ValueError, "native client"),
+                ):
+                    clients.fingerprint("claude")
+            # A store path that links out of the store is refused.
+            real = Path.resolve
+            escape = {"/nix/store/x-socat/bin": Path(tmp)}
+            with patch.object(Path, "resolve", lambda p, *a, **k: escape.get(str(p)) or real(p, *a, **k)):
+                self.assertIsNone(clients.shim_target(nix))
+            self.assertIsNotNone(clients.shim_target(nix))
+            for shebang in ("#!/bin/bash /tmp/hidden", "#!/usr/bin/env python3", "#!sh"):
+                shim.write_text(f'{shebang}\nexec {native} "$@"\n')
+                self.assertIsNone(clients.shim_target(shim), shebang)
+            script = root / "script/bin/sh"
+            script.parent.mkdir(parents=True)
+            script.write_text(f'#!/bin/sh\nexec {native} "$@"\n')
+            shim.write_text(f'#!{script}\nexec {native} "$@"\n')  # a script cannot interpret a shim
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                self.assertRaisesRegex(ValueError, "native client"),
+            ):
+                clients.fingerprint("claude")
+            shim.write_text(f'#!/bin/sh\nexec {root}/missing "$@"\n')
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                self.assertRaisesRegex(ValueError, "missing file"),
+            ):
+                clients.fingerprint("claude")
+
+    def test_a_shim_in_front_of_the_managed_codex_launcher_keeps_its_binary_hashed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "codex-patches/bin/codex"
+            binary = root / "codex-patches/dist/current/bin/codex"
+            binary.parent.mkdir(parents=True)
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("#!/usr/bin/env python3\nimport os\n")
+            binary.write_bytes(b"\x7fELF fixture")
+            shim = root / "local/bin/codex"
+            shim.parent.mkdir(parents=True)
+            shim.write_text(f'#!/bin/sh\nCODEX_PATCHES_IN_NIX=1 exec {launcher} "$@"\n')
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                patch.object(clients.subprocess, "run", return_value=SimpleNamespace(stdout="codex-cli 0.167.0\n")),
+            ):
+                files = clients.fingerprint("codex")["files"]
+            sh = str(Path("/bin/sh").resolve())
+            self.assertEqual(list(files), [str(shim), sh, str(launcher), str(binary)])
+
     def test_missing_stale_and_changed_clients_are_unverified(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
