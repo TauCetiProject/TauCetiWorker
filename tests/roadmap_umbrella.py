@@ -283,6 +283,8 @@ class RoundHarness(unittest.TestCase):
             ) as query,
             patch.object(work, "dispatch", side_effect=perform),
             patch.object(work.random, "choices", side_effect=choices),
+            # Fix-like stages are otherwise an age-weighted random permutation; pin oldest first.
+            patch.object(work, "age_spread", side_effect=lambda cs: sorted(cs, key=lambda c: c.pr)),
         ):
             run_round(self.w, self.opts)
         return query

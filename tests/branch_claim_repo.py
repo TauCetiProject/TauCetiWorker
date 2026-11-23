@@ -264,7 +264,10 @@ def safe_push_scopes_claim_repo():
         claim.chmod(0o755)
         git = tmp / "git"
         git.write_text(
-            '#!/bin/sh\ncase "$*" in *rev-parse*|*mktag*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;; esac\nexit 0\n'
+            # mktag drains its input like the real one: git-safe-push runs under pipefail, so a fake
+            # that exits before printf has written would fail the push with SIGPIPE at random.
+            '#!/bin/sh\ncase "$*" in *mktag*) cat >/dev/null; echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;\n'
+            "*rev-parse*) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;; esac\nexit 0\n"
         )
         git.chmod(0o755)
         env = {

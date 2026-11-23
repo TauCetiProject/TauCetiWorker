@@ -125,6 +125,8 @@ def main():
             patch.object(tc.work_units, "mirror_creds"),
             patch.object(tc.work_units, "survey", return_value=survey),
             patch.object(tc.work_units, "spread_candidates", side_effect=lambda cs: cs),
+            # Fix candidates are otherwise an age-weighted random permutation.
+            patch.object(tc.work_units, "age_spread", side_effect=lambda cs: cs),
             patch.object(tc.work_units, "_still_actionable", return_value=True),
             patch.object(tc.work_units, "_host_agent_binary", return_value="python3"),
             patch.object(tc.work_units, "_progress_snapshot", return_value={}),
