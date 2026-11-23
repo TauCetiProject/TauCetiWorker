@@ -2507,6 +2507,62 @@ class ScopeOnlyRepair(Fixture):
         self.assertFalse(repair_task.scope_only_repair(task))
 
 
+class DriverFailureRepair(Fixture):
+    BROKEN = ()
+
+    def driver_failure(self):
+        self.service.tasks[1]["diagnostics"] = [
+            {
+                "kind": "lint",
+                "module": "",
+                "message": "LINT-ENV: FAIL \u2014 driver failure: the docstring-scan driver did not elaborate cleanly",
+            },
+            {"kind": "infrastructure", "module": "", "reason": "finalizer_failed", "message": "finalizer failed"},
+        ]
+        os.environ["STUB_AGENT_MODE"] = "noop"
+
+    def verification(self, status):
+        return {"ok": True, "diagnostics": [], "build": {"rc": 0}, "checks": {"status": status}}
+
+    def test_unchanged_chain_passing_every_check_is_submitted_for_fresh_ci(self):
+        self.driver_failure()
+        cfg = self.config(agent_attempts=1)
+        with patch.object(repair_audit, "verify", return_value=self.verification("passed")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["tip"], self.content.tip)
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(json.loads(self.service.results[0]["worker_notes"])["edited"], [])
+
+    def test_unchanged_chain_without_a_complete_local_pass_is_not_submitted(self):
+        self.driver_failure()
+        cfg = self.config(agent_attempts=1)
+        with patch.object(repair_audit, "verify", return_value=self.verification("unavailable")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["reason"], "agent_failed", outcome)
+        self.assertEqual(self.service.results, [])
+
+    def test_a_finding_that_names_a_module_keeps_the_changed_result_rule(self):
+        self.driver_failure()
+        record = self.service.task_record(1, self.service.preclaim(1, "token", "worker"))
+        task = repair_task.Task.from_json(record)
+        self.assertTrue(repair_task.driver_failure_only(task))
+        for finding in [
+            {"kind": "lint", "module": "TauCeti.A", "message": "driver failure"},
+            {"kind": "lint", "path": "TauCeti/A.lean", "message": "driver failure"},
+            {"kind": "lint", "message": "simpNF: a finding"},
+            {"kind": "compiler", "message": "driver failure"},
+            None,
+            {"kind": "admission_predictions", "was_proactive": True},
+        ]:
+            original = list(task.diagnostics)
+            task.diagnostics.append(finding)
+            self.assertFalse(repair_task.driver_failure_only(task), finding)
+            task.diagnostics[:] = original
+        task.diagnostics[:] = [{"kind": "infrastructure", "message": "driver failure"}]
+        self.assertFalse(repair_task.driver_failure_only(task))
+
+
 class PredictedRepair(Fixture):
     BROKEN = ()
 

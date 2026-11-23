@@ -1406,6 +1406,48 @@ def scope_only_repair(task: Task) -> bool:
     return bool(findings) and all(d.get("kind") == "status" and d.get("context") == "scope" for d in findings)
 
 
+def driver_failure_only(task: Task) -> bool:
+    """Every source finding is a check whose driver failed without naming a module or file.
+
+    CI reports a lint or audit driver that crashed or did not elaborate (``LINT-ENV: FAIL`` naming
+    ``driver failure``, an audit driver's segfault) as a finding with no module and no path. No Lean
+    edit is evidence against it, so an unchanged chain may be submitted, but only once the worker's
+    own whole-library build and every check pass on it (``verified_unchanged``): the controller then
+    stages the same chain again as the head's next version. Batch 506's repair task 1536 was released
+    ``agent_failed`` on every claim while its chain passed everything locally, with no other way to
+    stage it again.
+    """
+    if task.kind != "repair" or not isinstance(task.diagnostics, list):
+        return False
+    findings = []
+    for entry in task.diagnostics:
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("kind") == "admission_predictions":
+            if entry.get("was_proactive"):
+                return False
+        elif entry.get("kind") != "infrastructure":
+            findings.append(entry)
+    return bool(findings) and all(
+        d.get("kind") in ("lint", "audit")
+        and not d.get("module")
+        and not d.get("path")
+        and "driver failure" in str(d.get("message") or "")
+        for d in findings
+    )
+
+
+def verified_unchanged(tip: str, outcome: dict) -> bool:
+    """The worker's own verification of ``tip`` ran every check and they passed."""
+    if any(
+        v.get("tip") == tip and v.get("ok") is True and (v.get("checks") or {}).get("status") == "passed"
+        for v in outcome.get("verification", [])
+    ):
+        return True
+    parallel = outcome.get("parallel") or {}
+    return parallel.get("verified_tip") == tip and (parallel.get("checks") or {}).get("status") == "passed"
+
+
 def admission_verification(task: Task, tip: str, outcome: dict, stream_findings: list) -> dict | None:
     """Telemetry from scripted checks, never permission to skip the candidate's CI."""
     if not task_findings(task).get("admission_predictions"):
@@ -3648,7 +3690,7 @@ def _run_task(
             acceptable = (
                 report["ok"]
                 and not report["dirty"]
-                and (not report["unchanged"] or proactive or scope_only_repair(task))
+                and (not report["unchanged"] or proactive or scope_only_repair(task) or driver_failure_only(task))
             )
             if not acceptable:
                 detail = format_report(report)
@@ -3779,6 +3821,18 @@ def _run_task(
                             # The code that produced it, kept if a later process delivers it.
                             "worker_revision": STARTUP_REVISION,
                         }
+            if report["unchanged"] and driver_failure_only(task) and not verified_unchanged(tip, outcome):
+                # Only a complete local pass makes an unchanged chain worth staging again.
+                return release_task(
+                    cfg,
+                    client,
+                    task,
+                    state,
+                    "agent_failed",
+                    "CI's check driver failed, but the worker could not verify the unchanged chain itself",
+                    outcome,
+                    lease,
+                )
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
             if cfg.publish.when == "before" and (outcome.get("publish") or {}).get("revision") != tip:
