@@ -366,7 +366,10 @@ def display_survey(cfg, gh):
     healthy = {name: value for name, source, value in observations if source is not None and name not in failed}
     account = count_account(worker, healthy, unknown=failed) if healthy else {}
     # The combined survey holds every surveyed forge's own PRs; the dashboard's dials rescope those
-    # and keep the other forges' counts, so an unknown one stays blocked.
+    # and keep the other forges' counts, so an unknown one stays blocked. A Fleet-focused survey
+    # counts every roadmap, which its focused rows do not hold: keep those totals as they are.
+    if any(getattr(value, "_automatic_open_count", None) is not None for value in healthy.values()):
+        result._automatic_open_count = sum(account[name] for name in healthy)
     result.count_account({name: count for name, count in account.items() if name not in healthy})
     result.next_auto_stage = next((stage for stage in AUTO_STAGES if result.kind(stage).actionable), None)
     if result.next_auto_stage is None and not result.roadmap_backpressure and not result.errors:

@@ -1200,6 +1200,36 @@ ci="one/project"
             github.rescope_roadmap()  # a dashboard dial keeps the other forge's count
             self.assertEqual((github.n_mine_open, github.roadmap_backpressure), (total, blocked))
 
+    def test_the_dashboard_shows_the_account_total_of_a_focused_round(self):
+        from tauceti_worker.multi_source import display_survey
+
+        github, native = Survey(worker_id="test"), Survey(worker_id="test")
+        for result, count in ((github, 589), (native, 916)):
+            result._automatic_open_count, result.max_open_prs = count, 1024
+            result.rescope_roadmap()
+        observations = [
+            ("github", SimpleNamespace(gh=SimpleNamespace(repo="one/project")), github),
+            ("forgejo", SimpleNamespace(gh=self.source), native),
+        ]
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.multi_source.ReviewState"),
+        ):
+            shown = display_survey(self.cfg, SimpleNamespace(repo="one/project"))
+        self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (1505, True))
+        shown.roadmap_skip = ["Algebra"]
+        shown.rescope_roadmap()  # a dashboard dial
+        self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (1505, True))
+        native.github_failed = True
+        with (
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.multi_source.ReviewState"),
+        ):
+            shown = display_survey(self.cfg, SimpleNamespace(repo="one/project"))
+        self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (589, True))  # Forgejo unknown
+        shown.rescope_roadmap()
+        self.assertTrue(shown.roadmap_backpressure)
+
     def test_an_anonymous_forgejo_listing_is_not_an_account_count(self):
         from tauceti_worker.account_pressure import forgejo_open
 
