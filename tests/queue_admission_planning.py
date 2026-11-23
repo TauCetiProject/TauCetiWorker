@@ -474,6 +474,11 @@ class Planning(unittest.TestCase):
         context = self.controller._state(f"admission_context:{self.controller._head()['id']}")
         self.assertFalse(context["complete"])
 
+    def test_prompt_tolerates_records_without_members(self):
+        context = {"records": [{"kind": "import_component"}, {"kind": "cross_batch", "batch_id": 7}, {}], "complete": True}
+        lines = admission_planning.prompt_lines(context)
+        self.assertEqual(sum(line.startswith("- Admission note") for line in lines), 3)
+
     def test_prompt_never_claims_a_prediction_is_a_failed_ci_verdict(self):
         self.assertFalse(any("admission.json" in line for line in admission_planning.prompt_lines(knowledge())))
 
