@@ -171,6 +171,31 @@ class GlobalMaintenance(unittest.TestCase):
             self.run_round(rows, unavailable)
         self.assertEqual([n for _, n, *_ in self.calls], [10, 20, 30])
 
+    def test_the_unavailable_source_cutoff_spans_prepared_tier_rounds(self):
+        import dataclasses
+
+        from tauceti_worker.config import ReviewSourceUnavailable
+        from tauceti_worker.survey import Candidate, Survey
+
+        def tier(numbers):
+            prepared = Survey(worker_id="test", roadmap_only="auto")
+            prepared._round_scope = (True, False)
+            prepared.needs_fix.actionable = [Candidate(n, HEAD) for n in numbers]
+            return prepared
+
+        def unavailable(stage, _w, _sv, candidate, _opts):
+            raise ReviewSourceUnavailable(f"review #{candidate.pr}: source preparation unavailable")
+
+        self.opts.only = ["fix"]
+        with patch.object(work, "dispatch", side_effect=unavailable):
+            first = dataclasses.replace(self.opts)
+            with self.assertRaises(ClaimCollision):
+                run_round(self.w, first, prepared_survey=tier([10, 20]))
+            second = dataclasses.replace(self.opts)
+            with self.assertRaises(ReviewSourceUnavailable):
+                run_round(self.w, second, prepared_survey=tier([30, 40]))
+        self.assertEqual([n for _, n in self.opts.unavailable_sources], [10, 20, 30])
+
     def test_unavailable_source_hints_are_short_and_separate_from_claims(self):
         from tauceti_worker import peer_claims
 

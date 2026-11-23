@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 from tauceti_tools.forge import ForgeError
@@ -265,6 +266,9 @@ class RoundOpts:
     # Offer only this landing tier's work (survey.LANDING_TIERS); multi_source walks tiers across
     # sources. None offers every tier in order.
     landing_tier: int | None = None
+    # Review sources found unavailable this round, shared by the per-tier copies multi_source makes
+    # (dataclasses.replace keeps this list), so the outage cutoff spans the whole round.
+    unavailable_sources: list = dataclass_field(default_factory=list)
 
     @property
     def agent_name(self) -> str:
@@ -822,7 +826,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
-    unavailable_sources = 0
+    if prepared_survey is None:
+        opts.unavailable_sources.clear()  # multi_source clears it once for all of its tiers
     from .state_repair import retry_key
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
@@ -874,8 +879,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             # One PR's source failing to fetch says nothing about the rest: spare peers the same
             # attempt and move on. Repeated failures in one round look like an outage; back off.
             peer_claims.note(_claim_scope(w), stage, c.pr, c.head, unavailable=True)
-            unavailable_sources += 1
-            if unavailable_sources >= MAX_UNAVAILABLE_SOURCES:
+            opts.unavailable_sources.append((stage, c.pr))
+            if len(opts.unavailable_sources) >= MAX_UNAVAILABLE_SOURCES:
                 raise
             log(f"{error}; selecting other work")
             w.selection_changed = True
