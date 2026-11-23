@@ -696,6 +696,23 @@ def content_write(args):
     return len(args) > 1 and args[0] in ("pr", "issue") and args[1] in ("create", "comment", "review")
 
 
+def publication_backoff(env=None) -> float:
+    """Seconds this host's pacer still refuses content writes for the account after a rejection.
+
+    A review admitted now would finish its model work and then sleep in the pacer holding its
+    worker slot, so selection offers other work first while this is positive. Read-only, unlocked.
+    """
+    identity = quota_scope(scope(env))
+    if not identity:
+        return 0.0
+    try:
+        state = json.loads((root() / "quota" / identity / "secondary.json").read_text())
+        until = max(float(state.get("until") or 0), float(state.get("mutation_until") or 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0.0
+    return max(0.0, until - time.time())
+
+
 def mutation_slot(env):
     """Reserve one account-wide send; never hold the file lock during a request or sleep."""
     identity = quota_scope(scope(env))

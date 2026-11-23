@@ -992,6 +992,111 @@ ci="one/project"
             reviewing,
         )
 
+    def test_github_reviews_trail_other_work_during_publication_backoff(self):
+        import contextlib
+
+        from tauceti_worker.config import ClaimCollision
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        def walk(backoff, environment=None):
+            observations = self.observations([], [])
+            github, forgejo = observations[0][2], observations[1][2]
+            github.rebaseable.actionable.append(Candidate(1, "a" * 40))
+            github.reviewable.actionable.append(Candidate(2, "b" * 40, rereview=True))
+            github.needs_fix.actionable.append(Candidate(3, "c" * 40))
+            github.reviewable.actionable.append(Candidate(4, "d" * 40))
+            github.reviewable.actionable.append(Candidate(5, "e" * 40))
+            github.overlap_scan.actionable.append(Candidate(6, "f" * 40))
+            forgejo.reviewable.actionable.append(Candidate(7, "1" * 40))
+            for _, worker, _ in observations:
+                worker.cfg = self.cfg
+            options = RoundOpts(
+                only=["rebase", "fix", "review", "overlap-scan"],
+                agent="auto",
+                work_model="auto",
+                sandbox_host=True,
+                dry_run=True,
+            )
+            with (
+                patch.dict(os.environ, environment or {}),
+                patch("tauceti_worker.multi_source.collect", return_value=observations),
+                patch("tauceti_worker.multi_source.random.shuffle"),
+                patch("tauceti_worker.survey.bump_prs", side_effect=lambda sv: {5} if sv is github else set()),
+                patch("tauceti_worker.github_transport.publication_backoff", return_value=backoff),
+                patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+                patch("tauceti_worker.work_units.run_round", side_effect=ClaimCollision("x")) as execute,
+            ):
+                for name in ("TAUCETI_PREFER_FORGE", "TAUCETI_REVIEW_FIRST"):
+                    if name not in (environment or {}):
+                        os.environ.pop(name, None)
+                with self.assertRaises(ClaimCollision):
+                    run_round(None, options)
+            return [
+                (
+                    "github" if call.args[0] is observations[0][1] else "forgejo",
+                    call.args[1].only,
+                    call.args[1].landing_tier,
+                )
+                for call in execute.call_args_list
+            ]
+
+        normal = [
+            ("github", ["review"], 0),
+            ("github", ["rebase", "review"], 1),
+            ("github", ["fix"], 2),
+            ("github", ["review"], 3),
+            ("forgejo", ["review"], 3),
+            ("github", ["overlap-scan"], 6),
+        ]
+        self.assertEqual(walk(0.0), normal)
+        # The bump's review keeps its lead; every other GitHub review waits behind all other work,
+        # including Forgejo's first review and overlap, and is still offered last.
+        backing_off = [
+            ("github", ["review"], 0),
+            ("github", ["rebase"], 1),
+            ("github", ["fix"], 2),
+            ("forgejo", ["review"], 3),
+            ("github", ["overlap-scan"], 6),
+            ("github", ["review"], 1),
+            ("github", ["review"], 3),
+        ]
+        self.assertEqual(walk(600.0), backing_off)
+        # Review-first workers also take Forgejo's review before an unpublishable GitHub one.
+        self.assertEqual(
+            walk(600.0, {"TAUCETI_REVIEW_FIRST": "1"}),
+            [
+                ("github", ["review"], 0),
+                ("forgejo", ["review"], 3),
+                ("github", ["rebase"], 1),
+                ("github", ["fix"], 2),
+                ("github", ["overlap-scan"], 6),
+                ("github", ["review"], 1),
+                ("github", ["review"], 3),
+            ],
+        )
+
+    def test_publication_backoff_reads_the_accounts_rejection_window(self):
+        import json
+        import tempfile
+        import time
+
+        from tauceti_worker import github_transport as transport
+
+        with tempfile.TemporaryDirectory() as directory:
+            env = {"GH_TOKEN": "token-for-test", "GH_HOST": "github.com"}
+            with patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": directory}):
+                self.assertEqual(transport.publication_backoff(env), 0.0)
+                path = Path(directory) / "quota" / transport.scope(env) / "secondary.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"next_send": time.time() + 50, "probe_until": time.time() + 30}))
+                self.assertEqual(transport.publication_backoff(env), 0.0)
+                path.write_text(json.dumps({"mutation_until": time.time() + 300, "until": time.time() - 5}))
+                self.assertGreater(transport.publication_backoff(env), 290)
+                path.write_text("[]")
+                self.assertEqual(transport.publication_backoff(env), 0.0)
+                self.assertEqual(transport.publication_backoff({}), 0.0)
+
     def test_review_first_survives_the_loop_handoff(self):
         from tauceti_worker.cli import build_parser
         from tauceti_worker.worker_sources import selection_arguments
