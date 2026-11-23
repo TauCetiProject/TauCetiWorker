@@ -57,9 +57,12 @@ with tempfile.TemporaryDirectory() as temporary:
     base = Path(temporary)
     started, cleaned = base / "started", base / "cleaned"
     process = subprocess.Popen([sys.executable, __file__, "driver", str(started), str(cleaned)])
-    if not wait_for(started):
+    # The driver imports the whole worker package before it spawns the round; under a fully
+    # parallel CI start that alone has taken over 10 seconds.
+    if not wait_for(started, timeout=90):
+        exited = process.poll()
         process.kill()
-        raise AssertionError("round child did not start")
+        raise AssertionError(f"round child did not start (driver exit status {exited})")
     process.terminate()
     return_code = process.wait(15)
     if return_code != 143:
