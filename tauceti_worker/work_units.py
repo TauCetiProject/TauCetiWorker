@@ -826,10 +826,13 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
-    if prepared_survey is None and use_fleet_focus:
+    unavailable_sources = getattr(opts, "unavailable_sources", None)
+    if unavailable_sources is None:
+        unavailable_sources = []  # option objects without the field count for this call only
+    elif prepared_survey is None and use_fleet_focus:
         # The outer round. multi_source clears it once for all of its tiers, and the unfocused
         # fallback keeps the focused attempt's count.
-        opts.unavailable_sources.clear()
+        unavailable_sources.clear()
     from .state_repair import retry_key
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
@@ -881,8 +884,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             # One PR's source failing to fetch says nothing about the rest: spare peers the same
             # attempt and move on. Repeated failures in one round look like an outage; back off.
             peer_claims.note(_claim_scope(w), stage, c.pr, c.head, unavailable=True)
-            opts.unavailable_sources.append((stage, c.pr))
-            if len(opts.unavailable_sources) >= MAX_UNAVAILABLE_SOURCES:
+            unavailable_sources.append((stage, c.pr))
+            if len(unavailable_sources) >= MAX_UNAVAILABLE_SOURCES:
                 raise
             log(f"{error}; selecting other work")
             w.selection_changed = True
