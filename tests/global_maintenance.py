@@ -196,6 +196,25 @@ class GlobalMaintenance(unittest.TestCase):
                 run_round(self.w, second, prepared_survey=tier([30, 40]))
         self.assertEqual([n for _, n in self.opts.unavailable_sources], [10, 20, 30])
 
+    def test_the_unfocused_fallback_keeps_the_rounds_unavailable_source_count(self):
+        from tauceti_worker.config import ReviewSourceUnavailable
+
+        def unavailable(stage, _w, _sv, candidate, _opts):
+            raise ReviewSourceUnavailable(f"review #{candidate.pr}: source preparation unavailable")
+
+        self.opts.unavailable_sources[:] = [("review", 1), ("review", 2)]
+        with (
+            patch(
+                "tauceti_worker.github_state.read_survey",
+                return_value=(True, SurveyRows([row(10, "Other"), row(20, "Other")], {"science": 3})),
+            ),
+            patch.object(work, "dispatch", side_effect=unavailable),
+            patch.object(work, "roadmap_areas", return_value=["NewArea"]),
+        ):
+            with self.assertRaises(ReviewSourceUnavailable):
+                run_round(self.w, self.opts, use_fleet_focus=False)
+        self.assertEqual([n for _, n in self.opts.unavailable_sources], [1, 2, 10])
+
     def test_unavailable_source_hints_are_short_and_separate_from_claims(self):
         from tauceti_worker import peer_claims
 

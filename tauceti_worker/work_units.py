@@ -826,8 +826,10 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
-    if prepared_survey is None:
-        opts.unavailable_sources.clear()  # multi_source clears it once for all of its tiers
+    if prepared_survey is None and use_fleet_focus:
+        # The outer round. multi_source clears it once for all of its tiers, and the unfocused
+        # fallback keeps the focused attempt's count.
+        opts.unavailable_sources.clear()
     from .state_repair import retry_key
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
