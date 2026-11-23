@@ -1247,6 +1247,15 @@ ci="one/project"
             shown = dashboard_survey(self.cfg, SimpleNamespace(repo="one/project"))
         self.assertEqual((shown.n_mine_open, shown.roadmap_backpressure), (1505, True))
 
+    def test_the_selected_area_is_counted_on_the_other_forge_despite_a_skip(self):
+        from tauceti_worker.account_pressure import count_account
+
+        native = Survey(worker_id="test", roadmap_only="Algebra", roadmap_skip=["Algebra", "PDE"])
+        native.rescope_roadmap()
+        with patch("tauceti_worker.account_pressure.github_open", return_value=1) as github:
+            count_account(SimpleNamespace(cfg=None, gh=None), {"forgejo": native})
+        self.assertEqual(github.call_args.args[1], ["PDE"])
+
     def test_an_anonymous_forgejo_listing_is_not_an_account_count(self):
         from tauceti_worker.account_pressure import forgejo_open
 

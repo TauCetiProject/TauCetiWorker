@@ -105,7 +105,9 @@ def count_account(worker, surveyed, *, unknown=()) -> dict[str, int | None]:
     failed this round) is unknown, and any other project forge is read."""
     if not surveyed:
         return {}
-    skip = next(iter(surveyed.values())).roadmap_skip
+    first = next(iter(surveyed.values()))
+    # An explicitly selected area wins over an overlapping skip, as in the round's own count.
+    skip = [area for area in first.roadmap_skip if area != first.roadmap_only]
     for result in surveyed.values():
         result.count_account({})  # its own forge's count, from its own survey
     counts: dict[str, int | None] = {name: result.own_open for name, result in surveyed.items()}
