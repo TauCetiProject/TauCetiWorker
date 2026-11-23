@@ -1138,7 +1138,6 @@ def _defer_read_policy_reload(spec: WorkerSpec, live: dict) -> bool:
         "github",
         "forgejo",
         "new_pr_forge",
-        "prefer_forge",
     ):
         old.pop(field, None)
         desired.pop(field, None)

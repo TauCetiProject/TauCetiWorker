@@ -127,10 +127,10 @@ for changes in (dict(prefer_forge="forgejo"), dict(forgejo=True, prefer_forge="o
         pass
     else:
         raise AssertionError(f"accepted invalid forge preference: {changes}")
+# A preference change takes the graceful-drain path (which waits for the round) rather than the
+# read-policy deferral, which waits for a long enough pause and can wait forever on a busy worker.
 both = wm.WorkerSpec.from_dict(dict(id="preferring", forgejo=True), 0)
-assert wm._defer_read_policy_reload(preferring, dict(applied_spec=both.as_dict(), state="running")), (
-    "a forge preference change must wait for the round boundary"
-)
+assert not wm._defer_read_policy_reload(preferring, dict(applied_spec=both.as_dict(), state="running"))
 old_source = wm.WorkerSpec("source-worker")
 new_source = dataclasses.replace(old_source, github=False, forgejo=True, new_pr_forge="forgejo")
 live_source = dict(applied_spec=old_source.as_dict(), state="running")
