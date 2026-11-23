@@ -259,9 +259,7 @@ RUN_STDLIB=(
   safe_exists.py
   scoreboard_trust.py
   security_audit.py
-  security_audit_served.py
   security_audit_pool.py
-  security_audit_claude.py
   security_audit_watchdog.py
   security_audit_evidence.py
   shared_build_caches.py

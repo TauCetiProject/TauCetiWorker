@@ -2,20 +2,17 @@
 
 Every finished, failed or interrupted attempt is exactly one outcome, in this precedence:
 
-- FINDING: a judgment recorded anywhere names a concern. "Anywhere" is the reviewer's
-  retained session, every captured client output (including archived earlier launches),
-  the attempts this one continued, and the ledger's verdicts for the same input. It binds
-  whatever the final answer says, and even if the attempt later failed.
+- FINDING: a judgment recorded anywhere names a concern. "Anywhere" is the reviewer's API
+  response, the attempts this one continued, and the ledger's current-protocol verdicts for
+  the same input or any of its commits. It binds whatever else the attempt did.
 - UNREADABLE: no concern was found, but some evidence cannot be read, so the absence of a
   concern is not established. It holds the range for a human, exactly like a finding.
-- PASS: the last launch completed normally, its final answer is a valid pass of the exact
-  batch with complete coverage, and the whole history used only the inspection's tools.
-- NOT_JUDGED: everything else (unfinished, malformed output, a provider failure or timeout,
-  an unexpected tool). It never binds.
+- PASS: the request completed normally and its answer is a valid pass of the exact batch.
+- NOT_JUDGED: everything else (malformed output, a refusal, an API failure or a request too
+  large to judge). It never binds.
 
 A concern is a judgment's nonempty findings, or a `finding` label even without findings.
-An `incomplete` label alone, with no findings, names no concern. Concerns are collected
-before any validation, so an invalid attempt can never discard one.
+Concerns are collected before any validation, so an invalid attempt can never discard one.
 """
 
 from __future__ import annotations
@@ -30,24 +27,6 @@ from .config import Die
 
 FINDING, UNREADABLE, PASS, NOT_JUDGED = "finding", "unreadable", "pass", "not-judged"
 
-# A client killed mid-write leaves a partial row. JSON escapes every quote inside a string, so
-# these `"type": "..."`/`"role": "..."` pairs are the row's own structure, never reviewer text.
-STRUCTURE = re.compile(r'"(?:type|role)":\s*"([^"\\]+)"')
-# Rows of these kinds never hold a judgment: tool calls' outputs, reasoning, progress and input.
-HARMLESS = frozenset(
-    {
-        "function_call_output",
-        "custom_tool_call_output",
-        "mcp_tool_call",
-        "tool_result",
-        "reasoning",
-        "item.started",
-        "item.updated",
-        "event_msg",
-        "user",
-    }
-)
-ANSWERS = frozenset({"assistant", "agent_message", "result"})
 # Text that mentions a judgment key must contain a readable judgment.
 KEYS = ("verdict", "findings")  # Either key makes a decoded object a judgment.
 VALUE_START = re.compile(r'[{\["]')
@@ -62,10 +41,8 @@ def unique_pairs(pairs: list) -> dict:
 
 
 DECODER = json.JSONDecoder(object_pairs_hook=unique_pairs)
-READ_PAGE = "read_page"
-# Codex offers its MCP resource helpers whenever an MCP server is configured. The only server is
-# the read-only audit reader, which serves no resources: a call reads nothing and is inert.
-INERT_TOOLS = frozenset({"list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"})
+# Response blocks that never hold an answer: reasoning, and the marker of a server-side fallback.
+ANSWERLESS = frozenset({"thinking", "redacted_thinking", "fallback"})
 
 
 class NotJudged(Die):
@@ -86,9 +63,8 @@ class Outcome:
 @dataclass
 class Evidence:
     judgments: list = field(default_factory=list)  # Every judgment-shaped value, in recorded order.
-    tools: list[str] = field(default_factory=list)  # Every tool request, normalized.
+    tools: list[str] = field(default_factory=list)  # Every response block that is neither answer nor reasoning.
     unreadable: list[str] = field(default_factory=list)  # Why some evidence could not be read.
-    damaged: list[str] = field(default_factory=list)  # Unreadable rows that cannot have held a judgment.
 
     def concerns(self) -> list[tuple[str, list[str]]]:
         return [(j.get("verdict"), c) for j in self.judgments if (c := concern(j))]
@@ -160,99 +136,8 @@ def judgments_in(value, evidence: Evidence, where: str, *, answer: bool = False)
         evidence.unreadable.append(f"{where}: reviewer answer is not a judgment")
 
 
-def tool_name(name) -> str:
-    return READ_PAGE if name in ("read_page", "mcp__audit__read_page", "audit.read_page") else str(name)
-
-
-def rows(path: Path, evidence: Evidence):
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        evidence.unreadable.append(f"{path}: {exc}")
-        return
-    for number, line in enumerate(text.splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            row = None
-        if not isinstance(row, dict):
-            # A partial row that visibly cannot hold a judgment only prevents a pass. Any other
-            # row could have held one, so it is unreadable evidence.
-            kinds = set(STRUCTURE.findall(line))
-            harmless = kinds & HARMLESS and not kinds & ANSWERS
-            (evidence.damaged if harmless else evidence.unreadable).append(f"{path}:{number}: unreadable row")
-            continue
-        yield f"{path}:{number}", row
-
-
-def read_row(row: dict, evidence: Evidence, where: str, messages: dict) -> None:
-    """One row of a Codex native rollout, a Codex exec stream, or a Claude session or stream."""
-    kind = row.get("type")
-    if kind == "response_item":  # Codex native rollout: what a resume loads.
-        item = row.get("payload")
-        if not isinstance(item, dict):
-            evidence.unreadable.append(f"{where}: unreadable native item")
-        elif item.get("type") == "message" and item.get("role") == "assistant":
-            parts = item.get("content")
-            if not isinstance(parts, list) or any(not isinstance(p, dict) for p in parts):
-                evidence.unreadable.append(f"{where}: unreadable native message")
-                return
-            text = "".join(str(p.get("text", "")) for p in parts if p.get("type") == "output_text")
-            # Any phase but commentary is the answer itself, and must be a readable judgment.
-            judgments_in(text, evidence, where, answer=item.get("phase") != "commentary")
-        elif str(item.get("type", "")).endswith("_call"):
-            evidence.tools.append(tool_name(item.get("name") or item.get("type")))
-    elif kind == "event_msg":  # Codex native copies of the same messages; read them too.
-        item = row.get("payload")
-        if not isinstance(item, dict):
-            evidence.unreadable.append(f"{where}: unreadable native event")
-        elif item.get("type") == "agent_message":
-            judgments_in(item.get("message"), evidence, where)
-        elif item.get("type") == "task_complete" and item.get("last_agent_message") is not None:
-            judgments_in(item["last_agent_message"], evidence, where)
-    elif kind in ("item.started", "item.updated", "item.completed"):  # Codex exec stream.
-        item = row.get("item")
-        if not isinstance(item, dict):
-            evidence.unreadable.append(f"{where}: unreadable client item")
-        elif item.get("type") == "agent_message":
-            # A message's updates hold partial text: read only its latest version, at the end of
-            # the stream (`messages`), so an interrupted message is still read.
-            key = item.get("id") or where
-            if kind == "item.completed" or key not in messages or not messages[key][2]:
-                messages[key] = (where, item.get("text"), kind == "item.completed")
-        elif item.get("type") == "mcp_tool_call":
-            server, tool = item.get("server"), item.get("tool")
-            evidence.tools.append(tool_name(tool) if server == "audit" else f"{server}.{tool}")
-        elif item.get("type") not in ("reasoning", "context_compaction"):
-            evidence.tools.append(str(item.get("type")))
-    elif kind == "assistant":  # Claude session or stream-json.
-        message = row.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, str):
-            content = [{"type": "text", "text": content}]
-        if not isinstance(content, list) or any(not isinstance(item, dict) for item in content):
-            evidence.unreadable.append(f"{where}: unreadable assistant message")
-            return
-        for item in content:
-            if item.get("type") == "tool_use" and item.get("name") == "StructuredOutput":
-                judgments_in(item.get("input"), evidence, where, answer=True)
-            elif item.get("type") == "tool_use":
-                evidence.tools.append(tool_name(item.get("name")))
-            elif item.get("type") == "text":
-                judgments_in(item.get("text", ""), evidence, where)
-    elif kind == "result":  # Claude's final result: its structured answer and its text.
-        if row.get("structured_output") is not None:
-            judgments_in(row["structured_output"], evidence, where, answer=True)
-        if row.get("result") is not None:
-            judgments_in(row["result"], evidence, where)
-
-
 def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] | None = None) -> Evidence:
     """Everything the attempt and the attempts it continued recorded."""
-    from . import security_audit as sa
-
     evidence = Evidence() if evidence is None else evidence
     attempt = attempt.resolve()
     seen = set() if seen is None else seen
@@ -260,19 +145,22 @@ def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] 
         evidence.unreadable.append(f"{attempt}: cyclic continuation lineage")
         return evidence
     seen.add(attempt)
-    sources = [
-        *sa.native_rollouts(attempt),
-        *sa.claude_sessions(attempt),
-        attempt / "model-transcript.jsonl",
-        *sorted(attempt.glob("*/model-transcript.jsonl")),  # Archived earlier launches.
-    ]
-    for path in sources:
-        if path.is_file():
-            messages = {}
-            for where, row in rows(path, evidence):
-                read_row(row, evidence, where, messages)
-            for where, text, _ in messages.values():
-                judgments_in(text, evidence, where)
+    path = attempt / "response.json"
+    if path.exists():
+        try:
+            response = json.loads(path.read_text(encoding="utf-8"))
+            content = response["content"]
+            if not isinstance(content, list) or any(not isinstance(b, dict) for b in content):
+                raise ValueError("response content is not a list of blocks")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            evidence.unreadable.append(f"{path}: {exc}")
+        else:
+            for number, block in enumerate(content):
+                where = f"{path}:content[{number}]"
+                if block.get("type") == "text":
+                    judgments_in(block.get("text", ""), evidence, where, answer=True)
+                elif block.get("type") not in ANSWERLESS:
+                    evidence.tools.append(str(block.get("type")))
     previous = attempt / "previous-block.json"
     if previous.exists():
         try:
@@ -287,10 +175,14 @@ def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] 
 
 
 def recorded(state: Path, batch: dict, evidence: Evidence | None = None) -> Evidence:
-    """The ledger's verdicts about this input or any of its commits.
+    """The ledger's current-protocol verdicts about this input or any of its commits.
 
     A concern recorded for a range binds every range containing any of its commits, until the
-    cursor passes them: binding never depends on how ranges are later planned or split."""
+    cursor passes them: binding never depends on how ranges are later planned or split. A
+    verdict or hold recorded under an earlier judgment protocol does not bind: its commits are
+    inspected afresh, once, under the current protocol, whose own concerns then bind."""
+    from .security_audit import PROTOCOL
+
     evidence = Evidence() if evidence is None else evidence
     digest, commits = batch["input_digest"], {c["sha"] for c in batch["commits"]}
     ledger = state / "ledger.jsonl"
@@ -309,6 +201,8 @@ def recorded(state: Path, batch: dict, evidence: Evidence | None = None) -> Evid
             # one of its commits can have held a verdict about it.
             if digest in line or any(sha in line for sha in commits):
                 evidence.unreadable.append(f"{ledger}:{number}: unreadable row")
+        elif row.get("protocol_version") != PROTOCOL:
+            continue
         elif isinstance(row.get("verdict"), dict) and (
             row.get("batch") == digest or commits & (judged_commits(row["verdict"]) | judged_commits(row))
         ):
@@ -341,35 +235,27 @@ def finding(batch: dict, evidence: Evidence) -> dict | None:
 
 
 def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
-    """The last launch's valid complete pass; raises with the reason when there is none."""
+    """The request's valid complete pass; raises with the reason when there is none."""
     from . import security_audit as sa
 
-    if evidence.unreadable or evidence.damaged:
-        raise Die("security-audit: retained history has unreadable rows")
+    if evidence.unreadable:
+        raise Die("security-audit: retained evidence is unreadable")
     execution = json.loads((attempt / "execution.json").read_text())
     if execution.get("protocol_version") != sa.PROTOCOL:
-        raise Die("security-audit: only a judgment-protocol-5 attempt can pass")
-    provider = "claude" if execution["argv"][0] == "claude" else "codex"
-    paged = execution["paged"]
-    allowed = {READ_PAGE} if paged else set()
-    if unexpected := sorted(set(evidence.tools) - allowed - INERT_TOOLS):
-        raise Die(f"security-audit: reviewer attempted an unauthorized tool call: {', '.join(unexpected)}")
-    transcript = (attempt / "model-transcript.jsonl").read_text()
-    if provider == "claude":
-        events = [json.loads(line) for line in transcript.splitlines() if line.strip()]
-        if not paged and any(e.get("type") == "system" and e.get("subtype") == "compact_boundary" for e in events):
-            raise Die("security-audit: inline source was compacted without a reader")
-        value = sa.claude_result(transcript).get("structured_output")
-    else:
-        if len(sa.native_rollouts(attempt)) != 1:
-            raise Die("security-audit: retained native history is missing or ambiguous")
-        value = sa.codex_final(transcript, paged)
-    if isinstance(value, dict) and value.get("verdict") == "unfinished":
-        raise Die("security-audit: inspection unfinished")
-    verdict = sa.bind_verdict(value, batch)
+        raise Die(f"security-audit: only a judgment-protocol-{sa.PROTOCOL} attempt can pass")
+    if evidence.tools:
+        raise Die(
+            f"security-audit: reviewer answered with unexpected content: {', '.join(sorted(set(evidence.tools)))}"
+        )
+    response = json.loads((attempt / "response.json").read_text())
+    if response.get("stop_reason") != "end_turn":
+        raise Die(f"security-audit: reviewer stopped with {response.get('stop_reason')}")
+    texts = [b["text"] for b in response["content"] if b.get("type") == "text"]
+    if len(texts) != 1:
+        raise Die("security-audit: reviewer answer is not exactly one judgment")
+    verdict = sa.bind_verdict(json.loads(texts[0]), batch)
     if verdict["verdict"] != "pass":
         raise Die(f"security-audit: {verdict['verdict']} without a recorded concern")
-    sa.validate_reads(verdict, batch, (attempt / "read-receipt.json").resolve(), paged)
     return verdict
 
 
@@ -410,21 +296,14 @@ def holds(state: Path, attempt: Path) -> bool:
     return bool(evidence.concerns() or evidence.unreadable)
 
 
-def outcome_of(verdict, exc: BaseException | None) -> dict:
-    """What a block records about how its attempt ended, so alerts never re-read the evidence."""
-    if isinstance(verdict, dict) and verdict.get("verdict") != "pass":
-        return {"outcome": FINDING, "verdict": verdict}
-    return {"outcome": UNREADABLE if isinstance(exc, Unreadable) else NOT_JUDGED}
-
-
 def engaged(attempt: Path) -> bool:
-    """Whether the reviewer engaged with the input: it answered, or the reader served it a page.
+    """Whether the reviewer engaged with the input: it answered, or the request was too large.
 
     An attempt that is not a judgment is divided only then; a provider or setup failure, where
     no reviewer engaged, is retried on the same range."""
-    if collect(attempt).judgments:
+    if (attempt / "response.json").exists():
         return True
     try:
-        return bool(json.loads((attempt / "read-receipt.json").read_text()).get("served"))
+        return json.loads((attempt / "reviewer-error.json").read_text()).get("too_large") is True
     except (OSError, ValueError, AttributeError):
         return False

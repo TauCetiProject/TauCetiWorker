@@ -14,6 +14,7 @@ dependencies = [
     "textual>=8,<9",
     "psutil>=7; sys_platform == 'darwin'",
     "cryptography>=42",
+    "anthropic>=2.12,<3",
 ]
 
 [project.scripts]

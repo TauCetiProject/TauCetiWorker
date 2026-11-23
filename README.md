@@ -208,87 +208,48 @@ Audit-only runs inspect any nonempty backlog. While a range waits (its retry bac
 binding range at the cursor), the round yields at once. Findings and unreadable evidence
 stop audit advancement and preserve their blocks and evidence. The combined worker continues with its other phases; this
 never clears a block or bypasses release gating. `--pr` cannot be combined with
-the audit phase. Its isolated Luna/Haiku reviewer is unchanged, and the worker's
+the audit phase. Its reviewer is the API reviewer below, and the worker's
 other phases use their default authoring profile.
 
 It advances TauCeti's protected `security-audit` branch through main's first-parent
 history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable meta code.
 Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
-Each session inspects complete per-commit diffs and before/after file contents,
-up to 20 commits with a 2 MiB workload target. A single larger commit is inspected
-alone without an aggregate byte cap, through the same compacting session. Each
-source blob remains limited to 4 MiB, and each model launch to 30 minutes.
-The batching target is separate from the model's live context window. Small
-inputs are supplied inline; larger inputs use one read-only `audit.read_page` tool.
-It accepts only a numbered chunk, with no paths, commands or copied
-identifiers. The reader serves the next unserved chunk or an earlier reread and
-rejects skipping ahead. The complete encoded tool response is capped at 64 KiB,
-with headroom under the configured 120k output allowance. It validates size and
-flushes the response before atomically recording served coverage. Failed writes
-receive no credit; a crash before the receipt is committed can require a reread.
-The Worker saves coverage before each client call and reconciles it with the
-client's successful tool-call reports afterwards, including on timeout or failure.
-For Codex, each successful read must also have its matching complete source
-sections in the saved native conversation that a continuation resumes. The Worker
-keeps the contiguous confirmed prefix and rereads only the unconfirmed remainder in the
-same conversation. This works independently of parallel tool-call ordering.
-If the Worker dies without saving a transcript, the launch's new reads are replayed.
-Earlier findings and uncertainty are preserved;
-partial progress never substitutes for a final safety judgment.
+Each inspection covers complete per-commit diffs and before/after file contents,
+up to 20 commits with a 1 MiB batch target (about 600k tokens of Lean source). A single
+larger commit is inspected alone. Each source blob remains limited to 4 MiB.
 
-New inspections use judgment protocol 5 (the same served reader as protocol 4). The
-reviewer returns exactly `pass`, `finding` or `unfinished`; there is no `incomplete`.
-Genuine uncertainty about whether a construct is safe, or where it comes from, is a
-`finding`: a concern for human review, not necessarily a demonstrated vulnerability.
-Unread pages, lost context or running out of time are never findings: the reviewer
-returns `unfinished` with no findings. A fresh attempt continues its own session while
-it has no judgment, within one budget: three charged launches, where a launch that
-served new pages is not charged; a timeout ends it. Native goal tools are not offered.
-Codex registers its MCP resource helpers (`list_mcp_resources`,
-`list_mcp_resource_templates`, `read_mcp_resource`) whenever any MCP server is
-configured, and nothing turns them off: the model catalog describes them as unavailable,
-and calls to them are inert (the only server, the audit reader, serves no resources, so
-they read nothing and count as no coverage). New inspections never fall back to
-protocol 3 or 4: until a client is verified for protocol 5 they wait, and the cursor
-watchdog reports a long stall. The delivery check also confirms that Codex receives the
-helpers' unavailable descriptions. Evidence retained from protocols 1 to 4 is only
-classified; it is never continued.
+Judgment protocol 6: every inspection is one Anthropic Messages API request that this
+process makes itself, to `claude-opus-5-5` (`REVIEWER_MODEL`), with the whole bundle
+inline, no tools and a JSON schema for the answer. The request is retained as
+`request.json` and its digest in `execution.json`, so the evidence is exactly the bytes the
+reviewer received: the API reads the whole request or rejects it, and nothing between the
+Worker and the model can truncate or drop input. There is no reviewer client to
+fingerprint and no delivery check. A request too large for the model's context is not a
+judgment: a range of several commits is split, and a single commit holds for a human. A
+request a safety classifier declines is answered by Anthropic's recommended fallback model
+(`fallbacks: "default"`); the response records which model answered.
 
-New inspections run only after the installed client passes an intact
-response check for this Worker release. The Worker runs this check automatically
-when verification is missing or stale, serializes concurrent checks, and caches
-failures for five minutes before retrying. A changed client bypasses that failure
-cooldown. The selected protocol and verification failures are logged, with failure
-details retained in `client-coverage-failures.json`. The same check is available
-manually for diagnosis:
+The reviewer returns exactly `pass` or `finding`. Genuine doubt whether code in the
+bundle is safe is a `finding`: a concern for human review, not necessarily a demonstrated
+vulnerability. Where a construct comes from is never a finding by itself. The pinned
+toolchain and dependencies, and Tau Ceti modules the bundle does not change, are the
+trusted baseline. The policy lists the attribute and syntax names the baseline defines
+(`audit_trusted_names.py`), and the Worker states with each bundle which of the attributes
+it uses the baseline defines and the bundle does not (`baseline_attributes`): so the
+reviewer never has to vouch for, say, Mathlib's `@[stacks]` documentation attribute.
+Attributes the policy flags (`extern`, `implemented_by`, `init` and the like), and any name
+that a line of the bundle could define or register, are never listed.
 
-```bash
-python3 -m tauceti_worker.audit_client_check --provider codex --state /path/to/worker/state/security-audit
-python3 -m tauceti_worker.audit_client_check --provider claude --state /path/to/worker/state/security-audit
-```
+Why the audit is shaped this way, and what it does not defend against, is in
+`docs/security-audit-threat-model.md`.
 
-This runs the real client and reader against a loopback test endpoint, with
-synthetic source and no subscription credentials or real model requests. It
-compares the complete chunks in actual reviewer requests and, for Codex, in the
-saved native conversation, including Unicode and escaped text. It writes a private
-`client-coverage.json` compatibility record.
-The record is tied to client paths, file hashes, version and the reader, launcher,
-catalog and verification code. A client or Worker upgrade requires verification
-again, which the Worker performs automatically. A failed verification makes new inspections
-wait until a later check succeeds. Verification supports native executables and the
-managed Codex launcher; other wrappers cannot be identified reliably, so inspections
-with them wait.
-
-Luna/Haiku receives no GitHub credential or general command/edit tools; trusted
-Worker code alone verifies ancestry and moves the ref. Host-owned identity and
-served coverage do not establish source safety.
-No Lean builds or candidate scripts run. A finding, unreadable evidence or an
-unsupported source blob stops advancement; an attempt with no judgment is retried. Read the retained `security-audit/blocked.json`
-in that worker's state directory. Resolve findings by explicit human attestation,
-not by rerunning the model until it passes. Do not change worker IDs to bypass a block.
-The input, actual launcher/environment/prompt, transcript, native Codex
-compaction/usage records, read receipt (for larger inputs), and durable ledger are
-retained in the same directory.
+The reviewer receives no GitHub credential and no tools; trusted Worker code alone
+verifies ancestry and moves the ref. No Lean builds or candidate scripts run. A finding,
+unreadable evidence or an unsupported source blob stops advancement; an attempt with no
+judgment is retried. Read the retained `security-audit/blocked.json` in that worker's
+state directory. Resolve findings by explicit human attestation, not by rerunning the
+model until it passes. Do not change worker IDs to bypass a block. The input, request,
+response, execution record and durable ledger are retained in the same directory.
 
 For private Zulip alerts, set `TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG` in the trusted
 worker's environment to an absolute path to a mode-0600 JSON file:
@@ -328,34 +289,32 @@ python3 -m tauceti_worker.security_audit watchdog --state /path/to/worker/state/
 
 Without this setting, reporting remains local to the worker's evidence and logs.
 
-The reader rejects skipping unserved chunks and reports `next_unserved_page` and
-`remaining_pages`. Served coverage drives continuation and splitting, never approval.
-
 Every attempt, however it ends, gets one shared classification of its evidence
-(`audit_evidence.classify`). It reads the retained session, every captured client
-output (including archived earlier launches), the attempts it continued and the
-ledger's verdicts for the same input. A concern recorded anywhere is a **finding**
-and binds, even when the final answer is `unfinished` or `pass`, or the client timed
-out or failed: a concern is a judgment's nonempty findings, or a `finding` label. An
-`incomplete` label with no findings names no concern. Otherwise, evidence that
-cannot be read (a row cut off where an answer could have been, or text mentioning a
-judgment that cannot be parsed, or an answer that is not a judgment) holds the range
-for a human like a finding, with an immediate **Unreadable evidence** DM. Judgments
-are found by decoding JSON, including JSON carried in strings, never by matching text.
-Each block records its classified outcome, and alerts read it from there. Otherwise
-the attempt is a **pass** only when its last launch ended normally with a valid
-complete pass and only the inspection's tools were used. Everything else
-(unfinished, malformed output, a provider failure, an unexpected tool) is **not a
-judgment** and never binds.
+(`audit_evidence.classify`). It reads the API response, the attempts it continued and
+the ledger's current-protocol verdicts for the same input or any of its commits. A
+concern recorded anywhere is a **finding** and binds, even when the request did not end
+normally: a concern is a judgment's nonempty findings, or a `finding` label. Otherwise,
+evidence that cannot be read (an unreadable response, text mentioning a judgment that
+cannot be parsed, or an answer that is not a judgment) holds the range for a human like a
+finding, with an immediate **Unreadable evidence** DM. Judgments are found by decoding
+JSON, including JSON carried in strings, never by matching text. Each block records its
+classified outcome, and alerts read it from there. Otherwise the attempt is a **pass**
+only when the request ended normally (`end_turn`) with exactly one valid pass of the exact
+batch and no content but reasoning. Everything else (malformed output, a refusal, an API
+failure, a request too large) is **not a judgment** and never binds.
+
+A verdict or hold recorded under an earlier judgment protocol does not bind a protocol-6
+range: when the protocol changes, its blocked ranges are inspected afresh, once, under the
+new protocol, whose own concerns then bind. Changing the protocol is a reviewed change to
+this repository, the same authority that could change the audit code itself; it is not a
+re-roll of the same judgment. Passes from earlier protocols stand.
 
 This phase can run alone or alongside bump/progress maintenance. It cannot use `--pr` or authoring-model overrides,
-and is never enabled by `--skip` alone. `--agent codex` uses `gpt-6-luna`;
-`--agent claude` uses Haiku, with ordinary subscription pacing and no expensive fallback.
-To bill Haiku reviews to the Claude API instead, set
-`TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE` to an absolute path to a mode-0600 file
-containing only the key. Only the isolated client process receives it, and retained
-evidence records a placeholder instead of the key.
-It uses its own isolated launcher regardless of the ordinary host/Bubble setting.
+and is never enabled by `--skip` alone. Whatever `--agent` the worker uses for its other
+phases, audit inspections use the API reviewer, billed to the key in
+`TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE`: an absolute path to a mode-0600 file
+containing only the key. Without it, audit work waits. The key is sent only to the API
+and never recorded in retained evidence.
 The active GitHub credential must have repository-admin permission, checked before
 spending and again before updating the cursor. New toolchain tags must be at or
 behind the cursor; see [the policy](https://github.com/TauCetiProject/TauCeti/blob/main/docs/security-audit.md).
@@ -370,12 +329,12 @@ python3 -m tauceti_worker.security_audit pool --state /path/to/worker/state/secu
 
 On the queue host, `services/queue/install-security-audit.sh` runs the pool as
 `tauceti-queue-security-audit.service` from its own origin/main release, like the other queue
-units (`docs/queue/operations.md`, "Install and update"): `--parallel 16 --ignore-quota` on
+units (`docs/queue/operations.md`, "Install and update"): `--parallel 16` on
 `~/TauCetiQueue-data/security-audit-pool/state/pool/security-audit` (worker `pool` under the data root
 `~/TauCetiQueue-data/security-audit-pool`), with alerts configured by
 `~/.config/tauceti-queue/security-audit-zulip.json`, cursor updates use the security-audit GitHub
-App in `~/.config/tauceti-security-audit`, and Haiku reviews fall back to the API key in
-`~/.config/tauceti-queue/security-audit-anthropic-api-key` when neither subscription is available.
+App in `~/.config/tauceti-security-audit`, and reviews are billed to the API key in
+`~/.config/tauceti-queue/security-audit-anthropic-api-key`.
 
 The pool plans a window of consecutive batches ahead of the cursor, each exactly as
 `work` would plan it from that batch's start, and inspects them concurrently in
@@ -385,24 +344,25 @@ finishes first waits for its predecessors. Each attempt's outcome is the shared
 classification above. A finding or unreadable evidence is binding: the batch is never
 inspected again, nothing beyond it advances, and the usual block and alert are
 recorded. An attempt that is not a judgment never binds; it is retried autonomously by
-bisection. If the reviewer engaged with the range (it answered or was served input) and
+bisection. If the reviewer engaged with the range (it answered, or the request was too large) and
 the range has several commits, the range is replaced, in one durable update, by its two
 halves: consecutive slices of its exact commit list, the second starting at the first's
 last commit, each a complete fresh inspection with full per-commit input. Pages or
 partial approvals from different attempts are never combined. A single commit, or a
-range whose reviewer never engaged (a provider or setup failure), is inspected afresh,
-preferring the other reviewer when one is available, with a persisted backoff of up to
+range whose reviewer never engaged (an API or setup failure), is inspected afresh,
+with a persisted backoff of up to
 an hour that never gives up; the cursor watchdog reports a long stall. A recorded concern
 about any commit binds every range containing it, however the commits are later split
 or planned. A block left at the cursor by an ordinary round whose evidence binds nothing
 is archived and inspected afresh; source findings never are.
 The pool's whole scheduling state is one ordered list of active ranges,
 `pool/ranges.json`, replaced atomically on every change: each range's exact commits,
-status, verdict or block, attempts, reviewer, retry count and next retry time. Every
+status, verdict or block, attempts, judgment protocol, retry count and next retry time. Every
 batch input is built by one function (`build_batch`) from a range's exact consecutive
 first-parent commits, with complete per-commit images and diffs. After a restart the
 list is restored while it is still the next main prefix; a pass is reused only when its
-rebuilt input is byte-identical, and a block stays binding. When a human attestation moves
+rebuilt input is byte-identical, and a block stays binding unless an earlier protocol
+recorded it. When a human attestation moves
 the cursor, ranges after it are kept, and a range it entered keeps only its remaining
 commits: still binding if blocked or in flight, otherwise inspected afresh. A range that was running
 when the pool stopped is first classified from its attempt's own evidence: a recorded
@@ -411,17 +371,9 @@ holds the pool rather than replanning over a block. While the pool
 holds `pool.lock`, ordinary audit rounds for that state defer to it. A GitHub rate
 limit defers admin checks and cursor updates until reset without failing reviews.
 
-Each new batch gets the first available reviewer: Codex `gpt-6-luna` while the Codex
-subscription is under pace, then Haiku on the Claude subscription while that is under
-pace, then Haiku billed to the API key in `TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE`
-regardless of pace. With none available, new batches wait. Pacing is the ordinary
-`work` verdict, and `--ignore-quota` overrides soft pacing only. Within one attempt,
-Codex continues its native rollout and Haiku its Claude session (`claude -p --resume`),
-which the Worker retains under the attempt's `claude-projects/`. Every retry is a fresh
-attempt, and only an attempt classified as no judgment is retried, so a retry never
-discards a concern. `--agent codex` or
-`--agent claude` pins one provider. The ledger and `pool/` result files record each
-review's provider, model and credential kind, never the key.
+Every retry is a fresh attempt, and only an attempt classified as no judgment is retried, so a
+retry never discards a concern. The ledger and `pool/` result files record each review's model
+and judgment protocol, never the key.
 
 An admin initializes the protections and original audited snapshot once with:
 
