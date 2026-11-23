@@ -505,10 +505,72 @@ ci="one/project"
         with patch.dict(os.environ, {"TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS": "9"}):
             self.assertTrue(w.gh.rebase_requested(1, head))
 
-    def test_unavailable_history_never_becomes_unreviewed_work(self):
+    def test_unavailable_history_is_offered_for_a_direct_read(self):
+        # Not unreviewed work: dispatch reads the index for this PR before launching anything,
+        # and declines it if that read fails too (tests/dispatch_revalidation.py).
         result = self.native_survey([self.row()], metadata=Meta({}, "fetch_failed"))
-        self.assertFalse(result.reviewable.actionable)
+        self.assertEqual([c.pr for c in result.reviewable.actionable], [1])
+        self.assertIn("read before launch", result.reviewable.actionable[0].reason)
+        self.assertFalse(result.reviewable.actionable[0].partial_history)
         self.assertEqual(result.discovery_gap_prs, [1])
+
+    def test_an_unrefreshed_review_index_is_offered_not_skipped(self):
+        # The index could not be refreshed this survey: review and fix are unknown, so both are
+        # offered, and dispatch reads this PR's scoreboard directly before launching either.
+        row = self.row()
+        result = self.native_survey([row], metadata=Meta({}, "deferred"))
+        self.assertEqual([c.pr for c in result.reviewable.actionable], [1])
+        self.assertEqual(
+            [(c.pr, c.reason) for c in result.needs_fix.actionable],
+            [(1, "review index unread this survey; findings read before launch")],
+        )
+
+    def test_a_failed_read_keeps_authoring_off_that_forge_only(self):
+        import contextlib
+
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import NoEligibleWork, RoundOpts
+
+        options = RoundOpts(
+            only=["review", "roadmap"], agent="auto", work_model="codex", sandbox_host=True, dry_run=True
+        )
+        for failed, authored in (("github", False), ("forgejo", True)):
+            observations = self.observations([], [])
+            for name, worker, result in observations:
+                worker.cfg = self.cfg
+                result._read_failed = name == failed
+            with (
+                patch.dict(os.environ, {"TAUCETI_NEW_PR_FORGE": "github"}),
+                patch("tauceti_worker.multi_source.collect", return_value=observations),
+                patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+                patch("tauceti_worker.work_units.run_round", return_value=0) as execute,
+            ):
+                if authored:
+                    self.assertEqual(run_round(None, options), 0)
+                    self.assertEqual(execute.call_args.args[1].only, ["roadmap"])
+                else:
+                    with self.assertRaises(NoEligibleWork):
+                        run_round(None, options)
+
+    def test_maintenance_passes_know_authoring_follows(self):
+        import contextlib
+
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        observations = self.observations([], [])
+        observations[1][2].reviewable.actionable = [Candidate(2, "b" * 40)]
+        for _, worker, _ in observations:
+            worker.cfg = self.cfg
+        for only, expected in ((["review", "roadmap"], True), (["review"], False)):
+            options = RoundOpts(only=only, agent="auto", work_model="codex", sandbox_host=True, dry_run=True)
+            with (
+                patch("tauceti_worker.multi_source.collect", return_value=observations),
+                patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+                patch("tauceti_worker.work_units.run_round", return_value=0),
+            ):
+                self.assertEqual(run_round(None, options), 0)
+            self.assertIs(observations[1][2]._may_author, expected)
 
     def test_unavailable_native_inventory_stays_a_failure(self):
         result = self.native_survey(None)

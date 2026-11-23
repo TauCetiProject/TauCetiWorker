@@ -68,6 +68,15 @@ slots, not runtime or output quotas. Focused slots retain the shared account-wid
 open-PR limit. If that limit prevents authoring and the selected area has no
 available maintenance, the slot falls back to the ordinary global cascade.
 
+A worker never passes over maintenance in its scope for new authoring. A PR the
+survey could not classify (a needs-rebase request behind incomplete cached
+history, a review index that could not be read or refreshed) is offered as a
+candidate, and dispatch reads that one PR directly before anything launches. A
+review whose index still cannot be read is declined rather than reviewed blind,
+and the worker does not author on that forge this round. Its other candidates,
+and other forges, still get worked. Reviews held for their previous reviewer's
+first-refusal window go to a worker that would otherwise author.
+
 Fleet installers can query `_fleet-protocol` to verify this integration before
 starting workers. The response is local, contains no credentials, and launches
 no agents. `"graceful_restart": 1` there (and in the manager's `ping` reply)

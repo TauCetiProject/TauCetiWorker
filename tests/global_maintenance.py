@@ -592,6 +592,68 @@ class GlobalMaintenance(unittest.TestCase):
         self.run_round([pr])
         self.assertEqual(self.calls[0][:2], ("fix", 10))
 
+    def test_rebase_request_behind_partial_history_is_offered(self):
+        handoff = row(10, "Other", complete=False)
+        handoff["pr"]["labels"].append({"name": "needs-rebase"})
+        self.opts.only = ["rebase", "roadmap"]
+        self.run_round([handoff])
+        # Taken as rebase work (dispatch reads the request itself), never passed over for authoring.
+        self.assertEqual(
+            self.calls[0][:3], ("rebase", 10, "needs-rebase with incomplete cached history; request read before launch")
+        )
+
+    def test_unreadable_review_index_is_offered(self):
+        survey = importlib.import_module("tauceti_worker.survey")
+        self.opts.only = ["review", "roadmap"]
+        with patch.object(survey.ReviewState, "gh_meta", return_value=survey.Meta({}, "fetch_failed")):
+            self.run_round([row(20, "Other", author="peer", blocking=False)])
+        self.assertEqual(self.calls[0][:2], ("review", 20))
+
+    def test_failed_review_read_declines_and_keeps_this_forge_from_authoring(self):
+        from tauceti_worker.review_state import Meta
+        from tauceti_worker.survey import Candidate, Survey
+
+        sv = Survey(worker_id="test")
+        self.w.rs = Mock()
+        self.w.rs.gh_meta.return_value = Meta({}, "fetch_failed")
+        live = dict(headRefOid=HEAD, state="OPEN", isDraft=False, labels=[])
+        self.w.gh = SimpleNamespace(repo="org/repo", pr_view=lambda *a, **k: live)
+        # Never a blind review: declined, and the forge is marked as not answering reads.
+        self.assertFalse(work._still_actionable_direct("review", self.w, sv, Candidate(11, HEAD)))
+        self.assertTrue(sv._read_failed)
+        prepared = Survey(worker_id="test", roadmap_only="auto")
+        prepared._round_scope = (True, False)
+        prepared._read_failed = True
+        self.opts.only = ["roadmap"]
+        with patch.object(work, "dispatch") as dispatch, self.assertRaisesRegex(NoProgress, "could not be read"):
+            run_round(self.w, self.opts, prepared_survey=prepared)
+        dispatch.assert_not_called()
+
+    def test_review_claimed_by_peer_counts_as_a_collision(self):
+        def peer(stage, candidate):
+            self.w.review_claimed_by_peer = True
+            return None
+
+        self.opts.only = ["review"]
+        with self.assertRaises(ClaimCollision):
+            self.run_round([row(10, "Other", author="peer", blocking=False)], peer)
+
+    def test_previous_reviewer_preference_comes_before_authoring(self):
+        from tauceti_worker.survey import Candidate
+
+        deferred = Candidate(10, HEAD, "review preferred elsewhere")
+        with patch.object(work, "prioritize_review_candidates", return_value=([], [deferred])):
+            self.run_round([row(10, "Other", author="peer", blocking=False)])
+        self.assertEqual(self.calls[0][:2], ("review", 10))
+        # A worker that cannot author leaves the preferred reviewer its window.
+        self.opts.only = ["review"]
+        with (
+            patch.object(work, "prioritize_review_candidates", return_value=([], [deferred])),
+            self.assertRaises(NoProgress),
+        ):
+            self.run_round([row(10, "Other", author="peer", blocking=False)])
+        self.assertEqual(self.calls, [])
+
     def test_partial_history_never_prevents_authoring_when_work_is_claimed(self):
         self.run_round([row(10, "Other", complete=False)], lambda stage, c: 0 if stage == "roadmap" else None)
         self.assertEqual([s for s, *_ in self.calls], ["review", "roadmap"])

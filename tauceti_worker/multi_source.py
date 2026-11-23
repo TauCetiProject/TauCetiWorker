@@ -231,6 +231,10 @@ def run_round(w, opts, *, use_fleet_focus=True):
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")
+    # Each maintenance pass below runs with only its tier's stages; tell it when this round goes on
+    # to author, so it treats work it would otherwise hold back (affinity) as doable now.
+    for _, _, result in executable:
+        result._may_author = want(opts.only, "roadmap") and not opts.prs
     random.shuffle(executable)
     from .config import ClaimCollision, GitHubUnavailable, SourceUnavailable
     from .survey import LANDING_TIERS, bump_prs, landing_tier, review_first_rank
@@ -306,6 +310,8 @@ def run_round(w, opts, *, use_fleet_focus=True):
         if (
             name == destination
             and name not in execution_failed
+            # A forge that could not answer a selected PR's read this round is not a working one.
+            and not getattr(result, "_read_failed", False)
             and complete
             and authored < result.max_open_prs
             and want(opts.only, "roadmap")

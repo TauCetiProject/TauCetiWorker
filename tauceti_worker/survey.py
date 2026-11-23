@@ -440,6 +440,9 @@ class Survey:
         # The umbrella round (docs/umbrellas.md) when roadmap_only names an umbrella; not a field, so
         # `status --json` keeps its shape. Read it through `umbrella`.
         self._umbrella = None
+        # Set when a dispatch re-read of a selected PR failed (work_units._still_actionable_direct):
+        # that forge is not answering, so no new PR is authored on it this round. Not a field.
+        self._read_failed = False
 
     @property
     def umbrella(self):
@@ -1101,21 +1104,27 @@ def classify_survey(
         labels = {label.lower() for label in p.labels}
         if labels & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}:
             continue
-        if (
+        # A handoff request behind incomplete cached history is unknown, not absent: offer it, and
+        # dispatch reads this PR's request directly before anything launches (_still_actionable).
+        unverified = (
             cached_only
             and p.mergeable != "CONFLICTING"
             and "needs-rebase" in labels
             and not facts.get(p.number, {}).get("issue_complete")
-        ):
+        )
+        if unverified:
             gaps.add(p.number)
-            continue
-        handoff = foreign or (
-            p.mergeable != "CONFLICTING"
-            and "needs-rebase" in labels
-            and (
-                p.head_oid in rs._survey_facts[p.number]["rebase_heads"]
-                if getattr(rs, "_survey_facts", {}).get(p.number, {}).get("issue_complete")
-                else gh.rebase_requested(p.number, p.head_oid)
+        handoff = (
+            foreign
+            or unverified
+            or (
+                p.mergeable != "CONFLICTING"
+                and "needs-rebase" in labels
+                and (
+                    p.head_oid in rs._survey_facts[p.number]["rebase_heads"]
+                    if getattr(rs, "_survey_facts", {}).get(p.number, {}).get("issue_complete")
+                    else gh.rebase_requested(p.number, p.head_oid)
+                )
             )
         )
         # Healthy tended PRs must be observed too: they replenish the budget
@@ -1144,7 +1153,11 @@ def classify_survey(
         if p.mergeable != "CONFLICTING":
             if not handoff:
                 continue
-            reason = "authenticated request for integration repair"
+            reason = (
+                "needs-rebase with incomplete cached history; request read before launch"
+                if unverified
+                else "authenticated request for integration repair"
+            )
         c = Candidate(p.number, p.head_oid, reason)
         if foreign:
             c.foreign_repair_base = integration
@@ -1205,10 +1218,21 @@ def classify_survey(
                 (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
             continue
         m = rs.gh_meta(p.number)
-        if m.provenance == "deferred":
-            continue  # the index could not be refreshed for it this survey; a later survey reads it
-        if m.provenance in {"stale", "fetch_failed"}:
-            gaps.add(p.number)
+        if m.provenance in {"deferred", "stale", "fetch_failed"}:
+            # This survey could not read the PR's review index, so whether it needs a review is
+            # unknown, not "no". Offer it: dispatch reads the index for this one PR directly and
+            # skips a cleanly reviewed head, or lets the review engine investigate if it still can't.
+            if m.provenance != "deferred":
+                gaps.add(p.number)
+            c = Candidate(
+                p.number,
+                p.head_oid,
+                "ready for review; review index unread this survey, read before launch",
+                attempts=counters.read(f"review-err-{p.number}"),
+                budget=MAX_REVIEW_ERRORS,
+                ready_at=p.build_status_at,
+            )
+            (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
             continue
         if rs.ledger_clean_head(p.number) != p.head_oid:
             # normal review path: the head moved or the last round errored.
@@ -1301,7 +1325,21 @@ def classify_survey(
                 continue
             meta = rs.gh_meta(p.number)
             if meta.provenance == "deferred":
-                sv.fix_waiting.append((p.number, "review index not refreshed this survey"))
+                # Unknown findings, not none: dispatch reads this PR's scoreboard directly and
+                # declines it there unless a blocking review stands at this head.
+                per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
+                if per_head < MAX_FIX_ATTEMPTS:
+                    sv.needs_fix.actionable.append(
+                        Candidate(
+                            p.number,
+                            p.head_oid,
+                            "review index unread this survey; findings read before launch",
+                            attempts=per_head,
+                            budget=MAX_FIX_ATTEMPTS,
+                        )
+                    )
+                else:
+                    sv.fix_waiting.append((p.number, "review index not refreshed this survey"))
                 continue
             blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")

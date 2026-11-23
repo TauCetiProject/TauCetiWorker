@@ -497,6 +497,15 @@ def target_list_prs(w, sv, stages) -> set[int]:
     return {number for number, values in markers.items() if keys.intersection(values)}
 
 
+def may_author(sv, opts) -> bool:
+    """Whether this round's alternative to the maintenance it is offered is new roadmap authoring:
+    a round that wants the roadmap stage, or a multi-source maintenance pass whose round goes on to
+    author (multi_source marks its surveys), with no --pr targets."""
+    if getattr(opts, "prs", ()):
+        return False
+    return want(opts.only, "roadmap") or getattr(sv, "_may_author", False)
+
+
 class NoEligibleWork(NoProgress):
     """Selection exhausted its candidates without launching a paid unit."""
 
@@ -794,6 +803,12 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             log("  review: authoring paused; previous-reviewer preference will not leave workers idle")
             ordered.extend(deferred)
             deferred = []
+        elif deferred and may_author(sv, opts):
+            # This worker's alternative to these reviews is authoring a new PR, and doable
+            # maintenance always comes first: offer them after every review without a preference.
+            log(f"  review: {len(deferred)} PR(s) preferred by their previous reviewers come before authoring")
+            ordered.extend(deferred)
+            deferred = []
         sv.reviewable.actionable = ordered
         if deferred:
             waits = [REVIEW_AFFINITY_GRACE_S - max(0.0, stamp - c.ready_at) for c in deferred if c.ready_at is not None]
@@ -862,7 +877,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         if rc is None and not opts.dry_run and (collided or w.review_claimed_by_peer):
             # Spare every other worker on the host the fresh reads that found this collision.
             peer_claims.note(_claim_scope(w), stage, c.pr, c.head)
-        claim_collision |= collided
+        claim_collision |= collided or w.review_claimed_by_peer
         if rc is not None:
             return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
         declined.append((stage, c.pr))
@@ -884,6 +899,14 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
                 f"roadmap: {sv.n_mine_open} open PRs in selected scope "
                 f"(>= {sv.max_open_prs}) — backpressure, not authoring"
             )
+        if getattr(sv, "_read_failed", False):
+            # A selected PR could not be read on this forge: it is not working well enough to
+            # prove there is nothing left here, so this worker does not author on it this round.
+            if focused_round:
+                log("Fleet roadmap focus: a PR read failed; selecting global maintenance")
+                return run_round(w, opts, use_fleet_focus=False)
+            error = ClaimCollision if claim_collision or w.selection_changed else NoProgress
+            raise error("roadmap: a selected PR could not be read on this forge this round — not authoring here")
         if global_pick:
             log("No available maintenance or reviews; proceeding to roadmap authoring")
             if scope in (None, "auto") and not opts.dry_run and roadmap_targets() is None:
@@ -1308,6 +1331,8 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate, *,
 
         with read_context(fresh=True, direct=True):
             live = w.gh.pr_view(c.pr, ["headRefOid", "isDraft", "state", "labels", "mergeable", "baseRefName"])
+            if not live:
+                sv._read_failed = True
             if live and (live.get("headRefOid") != c.head or live.get("state") != "OPEN" or live.get("isDraft")):
                 from .state_repair import repair_selected
 
@@ -1373,6 +1398,8 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate, *,
 
         repair_selected(w, c, live.get("headRefOid") or "")
     matches = _selected_pr_matches(stage, c, live, explicit=explicit)
+    if matches is None and stage == "review":
+        sv._read_failed = True  # the PR header could not be read (a fix investigates it instead)
     if matches is not True:
         return matches if stage == "fix" else False
     if stage == "review" and getattr(c, "partial_history", False):
@@ -1388,6 +1415,10 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate, *,
         return True
     if meta.provenance in ("stale", "fetch_failed"):
         log(f"  {stage} #{c.pr}: current review read unavailable")
+        if stage == "review":
+            # Never review blind, but this forge is not answering reads: no new PR is authored on it
+            # this round (work_units.run_round, multi_source.run_round).
+            sv._read_failed = True
         return None if stage == "fix" else False
     if stage == "fix":
         p = next((x for x in sv.open_prs if x.number == c.pr), None)
