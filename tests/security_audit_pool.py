@@ -468,6 +468,33 @@ class Escalation(PoolFixture):
         self.assertEqual(rows[0]["triage"]["judgments"][0]["findings"], ["origin of `stacks`"])
         self.assertFalse((self.state / "blocked.json").exists())
 
+    def test_split_halves_keep_escalation_across_a_restart_before_they_launch(self):
+        batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
+        p = pool.Pool(self.state, parallel=3)
+        slot = pool.Slot(batch, status="running", protocol=sa.PROTOCOL, escalate=True)
+        p.slots = [slot]
+        p.split(slot, {"attempt": "a", "reason": "r", "from_sha": self.shas[0], "to_sha": self.shas[2]})
+        restored = pool.Pool(self.state, parallel=3).restored()
+        self.assertEqual([s.escalate for s in restored], [True, True])
+
+    def test_an_escalated_unreadable_hold_records_both_judgments(self):
+        def inspect(batch, attempt):
+            if self.index(batch) == 0:
+                (attempt / "execution.json").write_text(sa.serialize({"protocol_version": sa.PROTOCOL}))
+                text = sa.serialize({"verdict": "finding", "findings": ["haiku concern"]})
+                (attempt / "response.json").write_text(
+                    sa.serialize({"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"})
+                )
+                (attempt / "escalation-request.json").write_text("{}")
+                (attempt / "escalation-response.json").write_text("{damaged")
+                return sa.judged(attempt, batch)
+            return self.verdict(batch)
+
+        self.serve(inspect, stop=self.settled)
+        row = next(r for r in self.ledger() if r.get("outcome") == "unreadable")
+        self.assertEqual((row["model"], row["escalated"]), (sa.ESCALATION_MODEL, True))
+        self.assertEqual(row["triage"]["judgments"][0]["findings"], ["haiku concern"])
+
     def test_the_escalation_flag_survives_a_restart(self):
         batch = sa.plan_batch(self.repo, self.shas[0], self.shas[-1])
         p = pool.Pool(self.state, parallel=3)

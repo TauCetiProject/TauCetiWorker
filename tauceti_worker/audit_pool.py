@@ -143,7 +143,7 @@ class Pool:
                     failure=record["failure"] if status != "planned" else None,
                     attempts=list(record["attempts"]) if status != "planned" else [],
                     protocol=protocol if status != "planned" else None,
-                    escalate=record.get("escalate") is True and protocol == sa.PROTOCOL,
+                    escalate=record.get("escalate") is True,
                 )
                 if slot.status == "pass":
                     sa.validate_verdict(slot.verdict, batch)
@@ -385,9 +385,9 @@ class Pool:
             "outcome": "unreadable" if hold else "not-judged",
             "batch": slot.digest,
             "commits": [c["sha"] for c in slot.batch["commits"]],
-            **self.reviewer(slot),
+            **self.reviewer(slot, attempt),
         }
-        if isinstance(exc, evidence.NeedsEscalation):
+        if isinstance(exc, evidence.NeedsEscalation) or evidence.escalated(attempt):
             failure["triage"] = evidence.triage_judgment(attempt)  # Kept, never binding.
         sa.record(self.work / "ledger.jsonl", failure)
         if hold:
@@ -473,18 +473,22 @@ class Pool:
             "attempt": str(attempt),
             "outcome": "finding",
             "verdict": verdict,
-            **self.reviewer(slot),
+            **self.reviewer(slot, attempt),
         }
+        if evidence.escalated(attempt):
+            failure["triage"] = evidence.triage_judgment(attempt)
         sa.record(self.work / "ledger.jsonl", failure)
         self.block(slot, failure, head=slot.batch["from_sha"] == cursor)
         log(f"security-audit pool: {span} {verdict['verdict']}; human review required")
 
     @staticmethod
-    def reviewer(slot: Slot) -> dict:
+    def reviewer(slot: Slot, attempt: Path) -> dict:
+        """The reviewer that decided this attempt: Sonnet once it was asked, else Haiku."""
+        escalated = evidence.escalated(attempt)
         return {
-            "model": sa.ESCALATION_MODEL if slot.escalate else sa.TRIAGE_MODEL,
+            "model": sa.ESCALATION_MODEL if escalated else sa.TRIAGE_MODEL,
             "protocol_version": slot.protocol,
-            "escalate": slot.escalate,
+            "escalated": escalated,
         }
 
     def block(self, slot: Slot, failure: dict, *, head: bool) -> None:
