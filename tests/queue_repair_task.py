@@ -3731,7 +3731,7 @@ class PublishOutputs(Fixture):
         )
         prompt = self.agent_calls()[0]["prompt"]
         self.assertIn(repair.CACHE_SENTENCE, prompt)
-        self.assertIn("worker owns final verification", prompt)
+        self.assertIn("Do not run a whole-library `lake build`", prompt, "a pre-rebase resolves conflicts only")
 
     def test_warm_revs_alone_make_the_artifacts_available(self):
         raw = self.content.rebase_task()
