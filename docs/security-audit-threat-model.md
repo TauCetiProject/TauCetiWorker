@@ -19,6 +19,19 @@ mechanism is shaped the way it is.
    `execution.json`). The API reads all of it or rejects it ("prompt is too long"); it
    never truncates silently. A rejected request is split, or held if one commit is too
    large.
+
+## Single commits beyond the batch target
+
+A commit is indivisible, and a large refactor can exceed the 1M-token context with its
+before images, after images and diffs together (two 23- and 42-file commits in November
+2026 came to 1.08M and 1.16M tokens). Such a commit is sent without its before images.
+That loses nothing the audit needs: the before state is the commit's parent, which a
+pass of this commit can only advance from once it was audited; the complete after images
+are exactly what is built, and the diffs show every line added or changed. Removed code
+cannot run. The Worker still computes attribute provenance from the complete input, and
+`input.json` and its digest stay complete. The request is about half the size (about
+600k tokens for both commits above). A commit still too large is held for a human as
+before. Introducing this was judgment protocol 8.
 3. **A weak reviewer.** Missing a planted construct, or raising non-concerns, both make
    the audit worse. The reviewers are chosen by measurement (below), and the Worker
    supplies attribute provenance itself so a model never has to vouch for it.

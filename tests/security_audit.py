@@ -924,6 +924,42 @@ class Authority(unittest.TestCase):
                         if n == 2:
                             self.assertTrue(audit_evidence.engaged(attempt))
 
+    def test_a_single_commit_beyond_the_target_is_reviewed_from_its_after_images_and_diffs(self):
+        def batch(before, after, n=1):
+            files = [{"path": "TauCeti/A.lean", "before": before, "after": after, "diff": "+new line\n"}]
+            value = {
+                "from_sha": "a" * 40,
+                "main_sha": "b" * 40,
+                "commits": [{"sha": str(i) * 40, "parent": "a" * 40, "files": files} for i in range(n)],
+            }
+            value["input_digest"] = hashlib.sha256(sa.serialize(value).encode()).hexdigest()
+            return value
+
+        small = batch("theorem a : True := trivial\n", "theorem a : True := trivial\n-- x\n")
+        self.assertEqual(sa.reviewed_bundle(small), (small, ""))
+        content = "theorem a : True := trivial\n" * (sa.MAX_BYTES // 40)
+        added = "@[simp] theorem b : True := trivial\n"
+        large = batch(content, content + added)
+        self.assertGreater(len(sa.serialize(large).encode()), sa.MAX_BYTES)
+        # Several commits beyond the target are split, never trimmed.
+        several = batch(content, content + added, n=2)
+        self.assertEqual(sa.reviewed_bundle(several), (several, ""))
+        bundle, note = sa.reviewed_bundle(large)
+        self.assertEqual(note, sa.AFTER_ONLY)
+        self.assertLessEqual(len(sa.serialize(bundle).encode()), sa.MAX_BYTES)
+        (reviewed,) = bundle["commits"][0]["files"]
+        self.assertEqual(reviewed, {"path": "TauCeti/A.lean", "after": content + added, "diff": "+new line\n"})
+        self.assertEqual(bundle["input_digest"], large["input_digest"])
+        self.assertIn("before", large["commits"][0]["files"][0])  # The retained input stays complete.
+        user = sa.judgment_request(large, sa.TRIAGE_MODEL)["messages"][0]["content"]
+        self.assertIn(sa.AFTER_ONLY + "Bundle:\n" + sa.serialize(bundle), user)
+        self.assertIn("(determined by the trusted Worker): simp.", user)
+        # Provenance reads the before images too: a registration there still withholds it.
+        registering = batch('syntax (name := s) "s" : attr\n' + content, content + added)
+        user = sa.judgment_request(registering, sa.TRIAGE_MODEL)["messages"][0]["content"]
+        self.assertIn("(determined by the trusted Worker): none.", user)
+        self.assertNotIn("syntax (name := s)", user)
+
     def test_a_transport_failure_is_not_a_judgment_and_never_holds(self):
         import httpx2
 

@@ -216,9 +216,12 @@ history, inspecting only `TauCeti/` and `TauCeti.lean` for IO and executable met
 Human-reviewed scripts, workflows, configuration and dependency pins are excluded.
 Each inspection covers complete per-commit diffs and before/after file contents,
 up to 20 commits with a 1 MiB batch target (about 600k tokens of Lean source). A single
-larger commit is inspected alone. Each source blob remains limited to 4 MiB.
+larger commit is inspected alone, and is sent without its before contents: its complete
+after contents and diffs still show every line it adds, and its parent is audited before the
+cursor can pass it. Provenance is still computed from the complete input, and the retained
+`input.json` and digest stay complete. Each source blob remains limited to 4 MiB.
 
-Judgment protocol 7: every inspection is Anthropic Messages API requests that this process
+Judgment protocol 8: every inspection is Anthropic Messages API requests that this process
 makes itself, with the whole bundle inline, no tools and a JSON schema for the answer.
 `claude-haiku-5-5` (`TRIAGE_MODEL`) judges first, and its pass passes. A Haiku finding, or an
 answer that cannot be read, does not bind by itself: the same request goes once to
@@ -232,7 +235,8 @@ Each request is retained with its digest in `execution.json`, so the evidence is
 bytes the reviewer received: the API reads the whole request or rejects it, and nothing between the
 Worker and the model can truncate or drop input. There is no reviewer client to
 fingerprint and no delivery check. A request too large for the model's context is not a
-judgment: a range of several commits is split, and a single commit holds for a human. The
+judgment: a range of several commits is split, and a single commit (already without its
+before contents) holds for a human. The
 request does not stream: the whole response arrives or none does, so an interrupted request
 leaves no partial answer to interpret, and is simply not a judgment.
 
@@ -311,7 +315,7 @@ only when the request ended normally (`end_turn`) with exactly one valid pass of
 batch and no content but reasoning. Everything else (malformed output, a refusal, an API
 failure, a request too large) is **not a judgment** and never binds.
 
-A verdict or hold recorded under an earlier judgment protocol does not bind a protocol-7
+A verdict or hold recorded under an earlier judgment protocol does not bind a protocol-8
 range: when the protocol changes, its blocked ranges are inspected afresh, once, under the
 new protocol, whose own concerns then bind. Changing the protocol is a reviewed change to
 this repository, the same authority that could change the audit code itself; it is not a
