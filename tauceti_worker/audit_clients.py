@@ -90,6 +90,12 @@ def shim_target(path: Path) -> tuple[Path, Path] | None:
     return Path(interpreter[1]), Path(match[3])
 
 
+def native(path: Path) -> bool:
+    with path.open("rb") as stream:
+        magic = stream.read(4)
+    return magic in (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe")
+
+
 def fingerprint(provider: str) -> dict:
     from . import security_audit as sa
 
@@ -106,17 +112,17 @@ def fingerprint(provider: str) -> dict:
         interpreter, path = (p.resolve() for p in shim)
         if not interpreter.is_file() or not path.is_file():
             raise ValueError("audit client shim names a missing file")
+        if not native(interpreter):
+            # A script interpreter could itself read files this fingerprint never hashes.
+            raise ValueError("delivery verification requires a native client or the managed Codex launcher")
         files[str(interpreter)] = file_digest(interpreter)
         files[str(path)] = file_digest(path)
     managed = path.parent.parent / "dist/current/bin/codex"
     if provider == "codex" and managed.is_file():
         binary = managed.resolve()
         files[str(binary)] = file_digest(binary)
-    else:
-        with path.open("rb") as stream:
-            magic = stream.read(4)
-        if magic not in (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xca\xfe\xba\xbe"):
-            raise ValueError("delivery verification requires a native client or the managed Codex launcher")
+    elif not native(path):
+        raise ValueError("delivery verification requires a native client or the managed Codex launcher")
     env = {k: v for k, v in os.environ.items() if k in ("PATH", "SYSTEMROOT", "SSL_CERT_FILE")}
     version = subprocess.run(
         [str(client), "--version"], env=env, capture_output=True, text=True, timeout=20, check=True

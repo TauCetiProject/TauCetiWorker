@@ -565,6 +565,15 @@ class ClientCompatibility(unittest.TestCase):
             for shebang in ("#!/bin/bash /tmp/hidden", "#!/usr/bin/env python3", "#!sh"):
                 shim.write_text(f'{shebang}\nexec {native} "$@"\n')
                 self.assertIsNone(clients.shim_target(shim), shebang)
+            script = root / "script/bin/sh"
+            script.parent.mkdir(parents=True)
+            script.write_text(f'#!/bin/sh\nexec {native} "$@"\n')
+            shim.write_text(f'#!{script}\nexec {native} "$@"\n')  # a script cannot interpret a shim
+            with (
+                patch.object(clients, "client_path", return_value=shim),
+                self.assertRaisesRegex(ValueError, "native client"),
+            ):
+                clients.fingerprint("claude")
             shim.write_text(f'#!/bin/sh\nexec {root}/missing "$@"\n')
             with (
                 patch.object(clients, "client_path", return_value=shim),
