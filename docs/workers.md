@@ -126,6 +126,12 @@ inside each step, and the worker falls back to the normal landing order (rebases
 rest) when no review is claimable. A few review-first workers keep approvals flowing into
 the queue while the rest of the pool works through long conflict rebases.
 
+While GitHub is rejecting the account's comments and the host's publication pacer is
+backing off, a both-source worker offers GitHub reviews after all its other work,
+including review-first workers. A review started then would finish its model work and
+then wait, holding its slot, until GitHub accepted its comments again. Automatic bump
+reviews keep their lead, and the review is still offered when nothing else is claimable.
+
 ## Locally verified publications
 
 With `self_tested = true` and `TAUCETI_VERIFY_HELPER=1`, the worker applies

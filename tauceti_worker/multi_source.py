@@ -219,6 +219,17 @@ def run_round(w, opts, *, use_fleet_focus=True):
     # before any other PR work, and falls back to the landing order below when no review is
     # claimable. Automatic bumps still come first and overlap work last.
     review_first = os.environ.get("TAUCETI_REVIEW_FIRST") == "1"
+    # While GitHub rejects this account's content writes, a new GitHub review would do its model
+    # work and then sleep in the publication pacer, holding this slot for up to an hour. Offer it
+    # after every other choice instead, so the slot repairs PRs or reviews on Forgejo meanwhile.
+    # Automatic bumps keep their lead; with nothing else claimable the review still runs.
+    backoff = 0.0
+    if any(name == "github" for name, _, _ in executable) and want(opts.only, "review"):
+        from .github_transport import publication_backoff
+
+        backoff = publication_backoff()
+        if backoff:
+            log(f"github: publication backoff for {int(backoff)}s; offering GitHub reviews after other work")
     # One choice per (landing tier, source), walked tier by tier across sources: a re-review on
     # either forge is offered before any fix, a fix before any first review (survey.LANDING_TIERS).
     choices = []
@@ -230,12 +241,17 @@ def run_round(w, opts, *, use_fleet_focus=True):
                 tiers.setdefault(landing_tier(stage, candidate, bumps), []).append(stage)
         for tier, tier_stages in tiers.items():
             tier_stages = list(dict.fromkeys(tier_stages))
-            if review_first and tier > 0 and "review" in tier_stages and not review_first_rank("review", tier):
-                choices.append((tier, name, worker, result, ["review"], True))
+            if backoff and name == "github" and tier > 0 and "review" in tier_stages:
+                choices.append((tier, name, worker, result, ["review"], False, True))
                 tier_stages = [stage for stage in tier_stages if stage != "review"]
                 if not tier_stages:
                     continue
-            choices.append((tier, name, worker, result, tier_stages, False))
+            if review_first and tier > 0 and "review" in tier_stages and not review_first_rank("review", tier):
+                choices.append((tier, name, worker, result, ["review"], True, False))
+                tier_stages = [stage for stage in tier_stages if stage != "review"]
+                if not tier_stages:
+                    continue
+            choices.append((tier, name, worker, result, tier_stages, False, False))
     complete = all(
         not value.github_failed and not value.dependency_wait and getattr(value, "target_inventory_available", True)
         for _, _, value in observations
@@ -249,12 +265,19 @@ def run_round(w, opts, *, use_fleet_focus=True):
     preferred = os.environ.get("TAUCETI_PREFER_FORGE")
 
     def order(item):
-        tier, name, reviewing = item[0], item[1], item[5]
+        tier, name, reviewing, unpublishable = item[0], item[1], item[5], item[6]
         band = 0 if tier == 0 else 2 if tier >= LANDING_TIERS["overlap-fix"] else 1
         # Review-first choices go re-reviews then first reviews; the preference orders forges inside each.
-        return band, not reviewing, tier if reviewing else 0, band == 1 and bool(preferred) and name != preferred, tier
+        return (
+            unpublishable,
+            band,
+            not reviewing,
+            tier if reviewing else 0,
+            band == 1 and bool(preferred) and name != preferred,
+            tier,
+        )
 
-    for tier, name, worker, result, tier_stages, _ in sorted(choices, key=order):
+    for tier, name, worker, result, tier_stages, *_ in sorted(choices, key=order):
         if name in execution_failed:
             continue
         selected = dataclasses.replace(opts, only=tier_stages, landing_tier=tier)
