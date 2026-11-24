@@ -374,6 +374,51 @@ DRIVER_SCRIPT = (
 DRIVER_EXES = ("lint-env-driver", "audit-driver")
 
 
+def toolchain_executable(worktree: Path, env: dict, name: str) -> str | None:
+    """The absolute path of ``name`` in the toolchain the worktree's ``lean-toolchain`` names, under elan's
+    read-only toolchains, or None."""
+    try:
+        pin = (worktree / "lean-toolchain").read_text().strip()
+    except OSError:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+:[A-Za-z0-9_.+-]+", pin):
+        return None
+    directory = pin.replace("/", "--").replace(":", "---")
+    path = repair_sandbox._elan_home(env) / "toolchains" / directory / "bin" / name
+    return str(path) if path.is_file() and not path.is_symlink() else None
+
+
+def pristine_driver_root(worktree: Path, tools_root: Path, ref: str, env: dict) -> Path | None:
+    """A project root for the driver builds that candidate code has never written, or None: only the
+    toolchain pin (copied) and the worker's shared seed packages, under ``tools_root/drivers/root-<key>``.
+    The packages are the target the worker itself recorded when it linked the worktree's ``.lake/packages``
+    (``repair_sandbox.linked_packages``; the link itself is build state and never followed), and only one
+    inside a configured read-only tree, never another worktree's ``.lake``. Staging builds its drivers
+    before any candidate code runs; this is the worker's equivalent."""
+    recorded = repair_sandbox.linked_packages(worktree)
+    if len(recorded) != 1:
+        return None
+    shared = recorded[0]
+    if shared != shared.resolve() or not any(shared.is_relative_to(t) for t in repair_sandbox._read_only_trees(env)):
+        return None
+    if not (shared / "batteries" / "Batteries" / "Tactic" / "Lint.lean").is_file():
+        return None
+    try:
+        toolchain = (worktree / "lean-toolchain").read_text()
+    except OSError:
+        return None
+    root = tools_root / DRIVERS_DIR / f"root-{_driver_key(worktree, ref)[:24]}"
+    lake_dir = root / ".lake"
+    lake_dir.mkdir(parents=True, exist_ok=True)
+    (root / "lean-toolchain").write_text(toolchain)
+    link = lake_dir / "packages"
+    if link.is_symlink() and link.resolve() != shared:
+        link.unlink()
+    if not link.is_symlink():
+        link.symlink_to(shared)
+    return root
+
+
 def build_drivers(
     worktree: Path,
     scripts: Path,
@@ -412,7 +457,15 @@ def build_drivers(
         stamp.write_text(key)
         return drivers, {k: v for k, v in run.items() if k != "output"}
     dest = tools_root / DRIVERS_DIR / key
-    if all(os.access(dest / e, os.X_OK) for e in DRIVER_EXES):
+
+    def regular(directory: Path) -> bool:
+        """Every driver is a regular executable file, not a link (which could lead into the worktree)."""
+        return all(
+            (directory / e).is_file() and not (directory / e).is_symlink() and os.access(directory / e, os.X_OK)
+            for e in DRIVER_EXES
+        )
+
+    if regular(dest):
         return dest, None
     dest.parent.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix=f".{key[:12]}-", dir=dest.parent))
@@ -427,12 +480,12 @@ def build_drivers(
             ro_binds=(scripts,),
             rw_binds=(scratch,),
         )
-        if run["rc"] != 0 or not all(os.access(scratch / e, os.X_OK) for e in DRIVER_EXES):
+        if run["rc"] != 0 or not regular(scratch):
             raise Unavailable(f"building the audit and lint drivers exited {run['rc']}: {_tail(run['output'])}")
         try:
             os.rename(scratch, dest)
         except OSError:
-            if not all(os.access(dest / e, os.X_OK) for e in DRIVER_EXES):  # another check's rename did not win
+            if not regular(dest):  # another check's rename did not win either
                 raise
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
@@ -527,6 +580,11 @@ def _check(
     started = time.monotonic()
     record: dict = {"status": "passed", "diagnostics": []}
     work = worktree / WORK_DIR
+    # The phase markers (and, without shared packages, the drivers) stay under `.lake`, which candidate code
+    # can write. A link it left in place of the directory is removed rather than followed.
+    if work.is_symlink():
+        work.unlink()
+    work.mkdir(parents=True, exist_ok=True)
     setup_started = time.monotonic()
     record["sandbox"] = not repair_sandbox.disabled(env)
     try:
@@ -554,9 +612,16 @@ def _check(
                 shutil.rmtree(source, ignore_errors=True)
         record["materialize_seconds"] = round(time.monotonic() - materialize_started, 3)
         drivers_started = time.monotonic()
-        drivers, built = build_drivers(
-            worktree, scripts, env, ref, logdir / "audit-drivers.log", timeout, tools_root=tools_root
-        )
+        pristine = pristine_driver_root(worktree, tools_root, ref, env)
+        if pristine is None:
+            # The worktree has no shared read-only packages: build as before, and say the verifier is not isolated.
+            drivers, built = build_drivers(worktree, scripts, env, ref, logdir / "audit-drivers.log", timeout)
+            record["drivers_isolated"] = False
+        else:
+            drivers, built = build_drivers(
+                pristine, scripts, env, ref, logdir / "audit-drivers.log", timeout, tools_root=tools_root
+            )
+            record["drivers_isolated"] = True
         record["drivers_seconds"] = round(time.monotonic() - drivers_started, 3)
         if built:
             record["drivers"] = built
@@ -568,11 +633,6 @@ def _check(
     publication = repair_publish.start_early(worktree, env)
     if publication is not None:
         record["publication"] = publication
-    # The phase markers stay under `.lake`, where the audit driver can write them; they are telemetry. A
-    # link the candidate's code left there is removed rather than followed.
-    if work.is_symlink():
-        work.unlink()
-    work.mkdir(parents=True, exist_ok=True)
     phases_path = work / "audit-phases.tsv"
     phase_record = logdir / ("audit-phases-" + str(time.time_ns()) + ".tsv")
     with contextlib.suppress(OSError):
@@ -583,7 +643,17 @@ def _check(
         # markers in task logs even if the parent/helper is killed mid-audit.
         os.link(phase_record, phases_path)
     record["audit_phases_file"] = str(phase_record)
-    audit_argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s"]
+    # `lake env` puts the worktree's build directories first on PATH, which the candidate can write: name the
+    # trusted executables by absolute path, as staging's sandbox-build.sh does with `timeout`.
+    timeout_exe = shutil.which("timeout") or "timeout"
+    lean_exe = toolchain_executable(worktree, env, "lean")
+    # Inside the sandbox only the read-only system roots are where the host has them.
+    system = os.path.isabs(timeout_exe) and any(
+        Path(timeout_exe).is_relative_to(root) for root in repair_sandbox.SYSTEM_ROOTS
+    )
+    if not system or lean_exe is None:
+        record["verifier_isolated_reason"] = "the trusted timeout or lean executable could not be resolved"
+    audit_argv = [*lake, "env", timeout_exe, "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s"]
     project = {"TAUCETI_PROJECT_ROOT": worktree, "TAUCETI_TRUSTED_SCRIPTS": scripts, "LINT_CHANGED_ONLY": "0"}
     full_lint_env = {
         **project,
@@ -630,7 +700,7 @@ def _check(
         (
             "module_system",
             "audit",
-            [*lake, "env", "lean", "--run", scripts / "ModuleSystem.lean"],
+            [*lake, "env", lean_exe or "lean", "--run", scripts / "ModuleSystem.lean"],
             None,
             "module-system.log",
             True,
@@ -654,12 +724,11 @@ def _check(
             for _, _, argv, extra, log, read_only in jobs
         ]
         runs = {job[0]: future.result() for job, future in zip(jobs, futures, strict=True)}
-    record["audit_phases"] = audit_phases(phases_path, runs["audit"])
+    # Read the markers through the host-only hard link in the log directory, never through the path under
+    # `.lake`: candidate code could have replaced that with a link to any host file meanwhile.
+    record["audit_phases"] = audit_phases(phase_record, runs["audit"])
     with contextlib.suppress(OSError):
-        if not os.path.samefile(phases_path, phase_record):
-            shutil.copyfile(phases_path, phase_record)
-    with contextlib.suppress(OSError):
-        shutil.copyfile(phases_path, logdir / "audit-phases.tsv")
+        shutil.copyfile(phase_record, logdir / "audit-phases.tsv")
     found = {name: findings_of(kind, log.removesuffix(".log"), runs[name]) for name, kind, _, _, log, _ in jobs}
     scope = "full"
     if modules is not None:
@@ -691,7 +760,9 @@ def _check(
     record["lint"]["scope"] = scope
     # The scripts, scope files and drivers lived outside the worktree and were mounted read-only into
     # every check (decision 200); without the sandbox nothing kept the candidate's code away from them.
-    record["verifier_isolated"] = record["sandbox"]
+    record["verifier_isolated"] = (
+        record["sandbox"] and record.get("drivers_isolated") is True and "verifier_isolated_reason" not in record
+    )
     record["status"] = "failed" if record["diagnostics"] else "passed"
     record["seconds"] = round(time.monotonic() - started, 1)
     with contextlib.suppress(OSError):

@@ -337,8 +337,7 @@ repairs the next batch only on a head tip with such a pass (decision 174). With 
 tip, tree, policy_commit, tools_commit, lint_scope, sandbox, verifier_isolated, toolchain,
 outputs_published, worker_revision}`, what the checks took their pin and policy from, whether the
 whole-library lint ran, whether the build sandbox was on, and whether the checks' own scripts and
-drivers were out of candidate code's reach (`verifier_isolated`, `checks.verifier_isolated`: true
-when the build sandbox is on). A `prepare` task released `prepared_clean` after a clean
+drivers were out of candidate code's reach (`verifier_isolated`, `checks.verifier_isolated`). A `prepare` task released `prepared_clean` after a clean
 streamed build with passing checks sends the same object as the release's `notes`. The worker only
 reports; the controller decides whether it counts. A `repair` task whose
 `parallel_check` diagnostic is proactive (`parallel_check_task`, the head's parallel check while
@@ -630,12 +629,19 @@ has a time budget holds because the service re-exposes the task.
    `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and that
    policy directory into a fresh host-only directory for the check (`<root>/tauceti-tools/verifier/check-*`,
    removed afterwards), which also holds the lint scope file. Both drivers are compiled by the
-   pinned `build-lint-driver.sh` and `build-audit-driver.sh` inside the sandbox, in a scratch directory
-   that is the build's only writable bind besides `.lake`, then moved to `<root>/tauceti-tools/drivers/<key>`
-   (reused while pin, toolchain and manifest are unchanged, and never written again). The checks run in
-   the sandbox with both directories mounted read-only, so code the candidate runs can change neither
-   the verifier nor its inputs (`checks.verifier_isolated`, decision 200); only the audit driver's phase
-   markers stay under `.lake/tauceti-repair-audit`, where a link left in its place is removed, not followed. Their output is read by
+   pinned `build-lint-driver.sh` and `build-audit-driver.sh` inside the sandbox, from a root candidate
+   code never wrote (`<root>/tauceti-tools/drivers/root-<key>`: a copy of the toolchain pin and the
+   worker's recorded seed packages, only when they lie in a configured read-only tree), in a scratch
+   directory that is the build's only extra writable bind, then moved to `<root>/tauceti-tools/drivers/<key>`
+   as regular files (reused while pin, toolchain and manifest are unchanged, and never written again).
+   The checks run in the sandbox with both directories mounted read-only, and name `timeout` and the
+   toolchain's `lean` by absolute path, since `lake env` puts the worktree's build directories first on
+   `PATH`. All of that is `checks.verifier_isolated` (decision 200); without read-only seed packages the
+   drivers are built in the worktree as before and it is false (`checks.drivers_isolated`). Only the audit
+   driver's phase markers stay under `.lake/tauceti-repair-audit`; the host reads them through their
+   hard link in the log directory, never through that path, and a link left in the directory's place
+   is removed, not followed. The lint scripts' own scratch files under `.lake/tmp` are as writable as in
+   staging, which runs the same scripts. Their output is read by
    `diagnostics.parse_log`, so each finding is the diagnostic the controller would create from CI
    (`{"kind": "audit", "module", "path", "message": "duplicate-declarations: ..."}` once per TauCeti module,
    `lint` with its location; the dot-notation and style lints' compiler-shaped lines are `lint` too), and it
