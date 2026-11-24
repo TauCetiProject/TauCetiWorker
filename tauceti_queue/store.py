@@ -21,7 +21,9 @@ Tables:
   the expected parent recorded for promotion and, for a non-head batch, the version a `prepare` task
   last built (and repaired) on its own base and its pre-rebase onto the head's tip
   (`pre_rebase_state`, `_tip`, `_onto`, `_source`, `_edits`, `_at`, and `_prepared`, the pre-rebased
-  tip a `prepare` task last built and repaired on the head's tip).
+  tip a `prepare` task last built and repaired on the head's tip); and the worker's attestation
+  (decision 200) of its passing verification of the batch's tip (`attestation`) and of its
+  pre-rebased tip (`pre_rebase_attestation`), JSON, kept only for the tip it names.
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
   the task that edited it, the explanation collected from its message, the `no_repair` opt-out and
   whether it was `withdrawn` (a member the queue sent back, an emptied `no_repair` member or one an
@@ -207,7 +209,9 @@ CREATE TABLE IF NOT EXISTS batches (
     pre_rebase_prepared TEXT,
     lane TEXT NOT NULL DEFAULT '',
     verified_tip TEXT,
-    pre_rebase_verified TEXT
+    pre_rebase_verified TEXT,
+    attestation TEXT,
+    pre_rebase_attestation TEXT
 );
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,

@@ -332,7 +332,13 @@ a JSON string with the worker, the attempt number, the members whose provenance 
 seconds, the estimated inference cost (from the host agent's telemetry and `cost_model`), and
 `local_verification` (`{tip, checks_passed}`: whether the worker's latest verification of exactly
 the submitted tip ran every check and passed, `verified_unchanged`). The controller verifies and
-repairs the next batch only on a head tip with such a pass (decision 174). A `repair` task whose
+repairs the next batch only on a head tip with such a pass (decision 174). With such a pass it also carries
+`attestation` (decision 200, `repair_task.attestation`): `{schema: "tauceti-queue.attestation/v1",
+tip, tree, policy_commit, tools_commit, lint_scope, sandbox, toolchain, outputs_published,
+worker_revision}`, what the checks took their pin and policy from, whether the whole-library lint
+ran and whether the build sandbox was on. A `prepare` task released `prepared_clean` after a clean
+streamed build with passing checks sends the same object as the release's `notes`. The worker only
+reports; the controller decides whether it counts. A `repair` task whose
 `parallel_check` diagnostic is proactive (`parallel_check_task`, the head's parallel check while
 staging runs the same tip) skips the agent when the streamed build is clean, or when there is no
 streamed build, and goes straight to verification; it may submit the chain unchanged, and a failed
@@ -604,9 +610,15 @@ has a time budget holds because the service re-exposes the task.
    naming a module (`driver_failure`), whatever the other checks found. A finding outside
    the changed modules, such as a new simp lemma breaking an unchanged declaration's simp normal
    form, therefore surfaces in that final lint and costs another round. The sources are the TauCetiTools pin
-   the worktree's `tauceti.toml` names (`[tools.tools] repo`, `ref`): fetched once into
-   `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and the worktree's
-   `scripts/` as policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
+   that `tauceti.toml` names (`[tools.tools] repo`, `ref`), and its `scripts/` the policy directory,
+   both taken as staging takes them from `main` (decision 200): from the offer's `policy_commit` (the
+   controller's canonical commit at the claim, `extra.policy_commit`, recorded in `audit.json`), read
+   from the object store (fetched from `origin` when missing) into `<root>/tauceti-tools/policy/<commit>`,
+   once per commit and outside every sandbox bind. When the offer names none, or it cannot be read
+   (`checks.policy_error`), the worktree's own files are used, as before, and nothing is attested. The
+   pin is fetched once into
+   `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and that
+   policy directory into `.lake/tauceti-repair-audit/scripts`, with both drivers compiled by the
    pinned `build-lint-driver.sh` and `build-audit-driver.sh` inside the sandbox (reused while pin, toolchain
    and manifest are unchanged); the checks run in the sandbox too. Their output is read by
    `diagnostics.parse_log`, so each finding is the diagnostic the controller would create from CI

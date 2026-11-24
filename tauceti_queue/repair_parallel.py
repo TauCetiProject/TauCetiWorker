@@ -794,6 +794,7 @@ def repair_groups(
             base=base,
             tools_root=cfg.root / repair_audit.TOOLS_DIR,
             lake=tuple(cfg.lake),
+            policy_commit=task.extra.get("policy_commit"),
         )
         group.worktree = str(path)
         return path

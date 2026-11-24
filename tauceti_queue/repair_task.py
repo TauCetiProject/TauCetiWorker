@@ -608,13 +608,14 @@ class TaskClient:
             payload["accepted"] = bool(payload["adopted"])
         return payload
 
-    def release(self, task: Task, reason: str, error: str = "") -> dict:
-        """``release_task(task_id, claim_token, reason, error)``."""
+    def release(self, task: Task, reason: str, error: str = "", notes: dict | None = None) -> dict:
+        """``release_task(task_id, claim_token, reason, error, notes)``; ``notes`` (the attestation of a
+        ``prepared_clean`` preparation) is sent only when given, so an older service just ignores it."""
         self._require_task(task)
-        status, payload = self._post(
-            f"/tasks/{task.task_id}/release",
-            {"worker": self.worker, "claim_token": task.claim_token, "reason": reason, "error": error or ""},
-        )
+        body = {"worker": self.worker, "claim_token": task.claim_token, "reason": reason, "error": error or ""}
+        if notes:
+            body["notes"] = notes
+        status, payload = self._post(f"/tasks/{task.task_id}/release", body)
         if status in (404, 405, 501) and not (isinstance(payload, dict) and payload.get("task_id")):
             raise EndpointMissing(f"release: HTTP {status}")
         if status in (401, 403, 409, 410):
@@ -1457,6 +1458,47 @@ def verified_unchanged(tip: str, outcome: dict) -> bool:
         return latest.get("ok") is True and (latest.get("checks") or {}).get("status") == "passed"
     parallel = outcome.get("parallel") or {}
     return parallel.get("verified_tip") == tip and (parallel.get("checks") or {}).get("status") == "passed"
+
+
+ATTESTATION_SCHEMA = "tauceti-queue.attestation/v1"
+
+
+def latest_checks(tip: str, outcome: dict) -> dict | None:
+    """The check record of the worker's latest verification of ``tip`` (`verified_unchanged`'s choice)
+    when its build passed, else None."""
+    runs = [v for v in outcome.get("verification", []) if v.get("tip") == tip]
+    if runs:
+        latest = runs[-1]
+        return latest.get("checks") if latest.get("ok") is True else None
+    parallel = outcome.get("parallel") or {}
+    return parallel.get("checks") if parallel.get("verified_tip") == tip else None
+
+
+def attestation(clone: Path, tip: str, checks: dict | None, publish: dict | None = None) -> dict | None:
+    """What the worker states about its passing verification of exactly ``tip`` (decision 200): the tip
+    and its tree, the policy commit whose TauCetiTools pin and policy files the checks used, the tools
+    commit, the lint scope, whether the build sandbox was on, the tip's toolchain and whether its
+    outputs were published for that revision. None unless every check passed. The controller decides
+    whether it counts (`Controller._attestation_problem`); this only reports."""
+    if not isinstance(checks, dict) or checks.get("status") != "passed":
+        return None
+    try:
+        tree = git(clone, "rev-parse", f"{tip}^{{tree}}").strip()
+        toolchain = git(clone, "show", f"{tip}:lean-toolchain", check=False).strip()
+    except (OSError, RuntimeError):
+        return None
+    return {
+        "schema": ATTESTATION_SCHEMA,
+        "tip": tip,
+        "tree": tree,
+        "policy_commit": checks.get("policy_commit"),
+        "tools_commit": checks.get("tools_commit"),
+        "lint_scope": (checks.get("lint") or {}).get("scope"),
+        "sandbox": checks.get("sandbox") is True,
+        "toolchain": toolchain,
+        "outputs_published": bool(publish and publish.get("revision") == tip and publish.get("published")),
+        "worker_revision": STARTUP_REVISION,
+    }
 
 
 # One unchanged re-staging per batch and chain: a driver failure that CI reproduces every time
@@ -2404,6 +2446,7 @@ def release_task(
     detail,
     outcome: dict | None = None,
     lease: ClaimLease | None = None,
+    notes: dict | None = None,
 ) -> dict:
     """Give the task back with a reason; without a ``release`` endpoint the claim is left to expire."""
     assert reason in RELEASE_REASONS
@@ -2414,7 +2457,9 @@ def release_task(
     outcome.update(status="released", reason=reason, detail=detail)
     try:
         outcome["response"] = with_retries(
-            lambda: client.release(task, reason, error_text),
+            lambda: (
+                client.release(task, reason, error_text, notes) if notes else client.release(task, reason, error_text)
+            ),
             attempts=cfg.service_attempts,
             delays=cfg.service_delays,
             what="release",
@@ -3464,6 +3509,7 @@ def _run_task(
                 tools_root=tools_root,
                 lake=tuple(cfg.lake),
                 logdir=logdir,
+                policy_commit=task.extra.get("policy_commit"),
             )
         if streaming and (outcome.get("artifacts") or {}).get("available"):
             stream = repair_stream.start_build(
@@ -3512,6 +3558,7 @@ def _run_task(
                     )
                 where = "the head's tip" if pre_rebased(task) is not None else "its base"
                 log(f"task {task.task_id}: the open batch builds on {where}; nothing to prepare")
+                attested = attestation(cfg.clone, task.tip, stream.audit_record, outcome.get("publish"))
                 released = release_task(
                     cfg,
                     client,
@@ -3521,6 +3568,7 @@ def _run_task(
                     f"the batch built on {where} without errors",
                     outcome,
                     lease,
+                    notes={"attestation": attested} if attested is not None else None,
                 )
                 publish_after(task.tip)
                 return released
@@ -3948,6 +3996,9 @@ def _run_task(
             # Whether this exact tip passed the worker's own verification: the controller verifies and
             # repairs the next batch only on a head tip with such a pass (decision 174).
             notes["local_verification"] = {"tip": tip, "checks_passed": verified_unchanged(tip, outcome)}
+            attested = attestation(cfg.clone, tip, latest_checks(tip, outcome), outcome.get("publish"))
+            if attested is not None and verified_unchanged(tip, outcome):
+                notes["attestation"] = attested
             verification_note = admission_verification(
                 task, tip, outcome, stream.findings if stream is not None else []
             )

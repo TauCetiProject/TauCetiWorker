@@ -1077,11 +1077,14 @@ class FakeService:
         claim["expires_at"] = time.time() + self.ttl
         return claim["expires_at"]
 
-    def release_task(self, task_id: int, token: str, reason: str, error: str) -> dict:
+    def release_task(self, task_id: int, token: str, reason: str, error: str, notes: dict | None = None) -> dict:
         claim = self._claim_for(task_id, token)
         claim["released_at"] = time.time()
         claim["release_reason"] = reason
-        self.releases.append({"task_id": task_id, "reason": reason, "error": error, "worker": claim["worker"]})
+        release = {"task_id": task_id, "reason": reason, "error": error, "worker": claim["worker"]}
+        if notes is not None:
+            release["notes"] = notes
+        self.releases.append(release)
         return {"task_id": task_id, "released": True}
 
     def submit_task(self, task_id: int, token: str, tip_sha: str, worker_notes: str, *, checkpoint=False) -> dict:
@@ -1207,7 +1210,9 @@ class FakeService:
                 if verb == "release":
                     if self.release_mode == "error":
                         raise RuntimeError("database unavailable")
-                    return 200, self.release_task(task_id, token, str(body.get("reason")), str(body.get("error", "")))
+                    return 200, self.release_task(
+                        task_id, token, str(body.get("reason")), str(body.get("error", "")), body.get("notes")
+                    )
                 return 200, self.submit_task(
                     task_id,
                     token,
@@ -6195,6 +6200,59 @@ class WorkerAudits(Fixture):
         self.assertTrue((self.stub_dir / "module-system-runs.log").exists())
         self.assertTrue((self.stub_dir / "style-runs.log").exists())
 
+    def test_the_checks_take_their_pin_and_policy_from_the_policy_commit_and_attest_it(self):
+        """Decision 200: the controller names `main` as the policy commit; the checks read its tauceti.toml
+        and scripts/ from the object store, and the submission attests the passing verification."""
+        policy = self.content.base
+        self.service.tasks[1]["extra"]["policy_commit"] = policy
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        checks = outcome["verification"][-1]["checks"]
+        self.assertEqual((checks["status"], checks["policy_commit"], checks["sandbox"]), ("passed", policy, True))
+        tree = cfg.root / repair_audit.TOOLS_DIR / repair_audit.POLICY_DIR / policy
+        self.assertTrue((tree / "tauceti.toml").is_file() and (tree / "scripts" / "lint-baseline.txt").is_file())
+        notes = json.loads(self.service.results[0]["worker_notes"])
+        attested = notes["attestation"]
+        self.assertEqual(
+            (
+                attested["schema"],
+                attested["tip"],
+                attested["policy_commit"],
+                attested["lint_scope"],
+                attested["sandbox"],
+            ),
+            (repair_task.ATTESTATION_SCHEMA, outcome["tip"], policy, "full", True),
+        )
+        self.assertEqual(attested["tools_commit"], f"TauCetiProject/TauCetiTools@{TOOLS_REF}")
+        self.assertEqual(
+            attested["tree"], repair.git(self.content.clone, "rev-parse", f"{outcome['tip']}^{{tree}}").strip()
+        )
+
+    def test_an_unreadable_policy_commit_falls_back_to_the_worktrees_files_and_says_so(self):
+        self.service.tasks[1]["extra"]["policy_commit"] = "f" * 40
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        checks = outcome["verification"][-1]["checks"]
+        self.assertEqual(checks["status"], "passed")
+        self.assertNotIn("policy_commit", checks)
+        self.assertIn("not in the clone", checks["policy_error"])
+        attested = json.loads(self.service.results[0]["worker_notes"])["attestation"]
+        self.assertIsNone(attested["policy_commit"], "the controller will not count it")
+
+    def test_a_failed_verification_is_not_attested(self):
+        self.findings("audit-findings-always", DUPLICATE_LINE)
+        checks = repair_audit.check(
+            self.content.clone,
+            repair.lake_env(self.config().root),
+            base=self.content.base,
+            tools_root=self.root / "tools",
+            logdir=self.root / "logs",
+        )
+        self.assertEqual(checks["status"], "failed")
+        self.assertIsNone(repair_task.attestation(self.content.clone, self.content.tip, checks))
+
     def test_every_checks_findings_return_together(self):
         self.findings(
             "audit-findings", "duplicate-declarations: TauCeti.Two.x is declared in both TauCeti.Two and TauCeti.Three"
@@ -7002,6 +7060,19 @@ class StreamAudits(WorkerAudits):
         )
         self.assertEqual(launch[-1]["message"], "build finished, exit 0, 0 errors total, 2 audit or lint findings")
         self.assertTrue(outcome["verification"][-1]["ok"])
+
+    def test_a_clean_preparation_attests_its_streamed_checks_in_its_release(self):
+        self.service.tasks[1]["kind"] = "prepare"
+        self.service.tasks[1]["extra"]["policy_commit"] = self.content.base
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual((outcome["status"], outcome["reason"]), ("released", "prepared_clean"), outcome)
+        [release] = self.service.releases
+        attested = release["notes"]["attestation"]
+        self.assertEqual(
+            (attested["tip"], attested["policy_commit"], attested["lint_scope"]),
+            (self.content.tip, self.content.base, "full"),
+        )
 
     # The scenarios of the parent class assume a failing streaming build.
     test_prepare_runs_final_audits_and_reports_observed_duplicates = None

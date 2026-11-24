@@ -367,6 +367,10 @@ OUTCOME_PASS = "pass"
 OUTCOME_SOURCE_FAILURE = "source-failure"
 OUTCOME_INFRASTRUCTURE = "infrastructure"
 OUTCOME_SUPERSEDED = "superseded"
+# Decision 200: a worker's attestation of its passing verification (`tauceti_queue.repair_task.attestation`),
+# and what it must have taken from `main` to stand in for staging's checks (`_attestation_problem`).
+ATTESTATION_SCHEMA = "tauceti-queue.attestation/v1"
+ATTESTED_POLICY_PATHS = ("tauceti.toml", "scripts")
 # Run statuses GitHub reports for a run that has not finished: such a run is never re-dispatched over.
 LIVE_RUN_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
 # The detail of an in-progress run declared lost after a direct read confirmed it stale. Such a run is
@@ -2288,13 +2292,16 @@ class Controller:
                     del self._renewal_waiters[claim_token]
                     self._renewing.pop(claim_token, None)
 
-    def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
+    def release_task(
+        self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None, notes=None
+    ) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
 
         A `prepare` task released as `prepared_clean` (its batch built without an error, so there was
         nothing to repair) records the batch version as prepared; one released after the agent or the
         push failed is resolved as `failed` and not offered again at that version. Any other release
-        leaves the task open for the next claim, as for the head's tasks.
+        leaves the task open for the next claim, as for the head's tasks. `notes` may carry the worker's
+        `attestation` of a clean preparation (decision 200).
         """
         with self._lock.priority():
             now = self.clock()
@@ -2325,7 +2332,7 @@ class Controller:
                 elif task is not None and task["kind"] != TASK_PREPARE and task["state"] == TASK_OPEN:
                     self._observe_repair_release(task, claim["batch_id"], reason, error, now)
                 elif task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
-                    self._settle_prepare_release(task, reason, now)
+                    self._settle_prepare_release(task, reason, now, notes)
                     if reason == PREPARE_CLEAN_REASON:
                         settled = self.store.row("tasks", {"id": task_id}) or {}
                         knowledge = next(
@@ -2350,10 +2357,10 @@ class Controller:
                 self.report_inference(claim["worker"], False, error)
             self._wake.set()
 
-    def _settle_prepare_release(self, task: dict[str, Any], reason: str, now: float) -> None:
+    def _settle_prepare_release(self, task: dict[str, Any], reason: str, now: float, notes: Any = None) -> None:
         batch = self.store.row("batches", {"id": task["batch_id"]})
         if self._pre_rebased_prepare(task):
-            self._settle_pre_rebased_release(task, batch, reason, now)
+            self._settle_pre_rebased_release(task, batch, reason, now, notes)
             return
         current = batch is not None and batch["state"] == BATCH_OPEN and batch["version"] == task["batch_version"]
         if reason == PREPARE_CLEAN_REASON:
@@ -2766,6 +2773,7 @@ class Controller:
                 base=task["onto"],
                 tip=tip_sha,
                 verified_tip=tip_sha if self._locally_verified(worker_notes, tip_sha) else None,
+                attestation=self._notes_attestation(worker_notes, tip_sha),
                 **prepared,
             )
             self._record_tip(batch["id"], version, tip_sha, now)
@@ -3079,6 +3087,10 @@ class Controller:
             "canonical_branch": self.canonical_branch,
             "claim_id": claim_id,
         }
+        if self._canonical:
+            # Decision 200: the worker's checks take their TauCetiTools pin and policy files from this
+            # commit, as staging takes them from `main`, not from the candidate.
+            extra["policy_commit"] = self._canonical
         if loads(task.get("task_binding"), {}).get("schema") == "tauceti-queue.mixed-task/v1":
             if self.mixed is None:
                 raise TaskError("source-disabled", "mixed task requires its enrolled sources")
@@ -4298,7 +4310,9 @@ class Controller:
                 submissions=task["submissions"] + 1,
             )
             if verified:
-                self.store.update("batches", {"id": batch["id"]}, verified_tip=tip)
+                self.store.update(
+                    "batches", {"id": batch["id"]}, verified_tip=tip, attestation=self._notes_attestation(notes, tip)
+                )
             if check:
                 self._count("parallel_checks_clean" if verified else "parallel_checks_unverified")
                 self.store.journal(
@@ -7051,6 +7065,59 @@ class Controller:
         note = notes.get("local_verification") if isinstance(notes, dict) else None
         return isinstance(note, dict) and note.get("tip") == tip and note.get("checks_passed") is True
 
+    @staticmethod
+    def _notes_attestation(worker_notes: Any, tip: str) -> str | None:
+        """The submission's (or a clean release's) `attestation` of exactly `tip` as stored JSON, else None.
+        Whether it counts is `_attestation_problem`'s, at the time it is used."""
+        notes = worker_notes
+        if isinstance(notes, str):
+            try:
+                notes = loads(notes, {})
+            except ValueError:
+                return None
+        note = notes.get("attestation") if isinstance(notes, dict) else None
+        if not isinstance(note, dict) or note.get("tip") != tip or note.get("schema") != ATTESTATION_SCHEMA:
+            return None
+        return dumps(note)
+
+    def _attestation_problem(self, stored: str | None, tip: str) -> str | None:
+        """Why the stored attestation does not let the worker's verification of `tip` stand in for staging's
+        checks (decision 200); None when it does. It must be of exactly `tip` and its tree, have run every
+        check with the whole-library lint inside the build sandbox, and have taken its TauCetiTools pin and
+        policy files from a commit whose `tauceti.toml` and `scripts/` are `main`'s now."""
+        note = loads(stored, None) if stored else None
+        if not isinstance(note, dict) or note.get("schema") != ATTESTATION_SCHEMA:
+            return "no attestation"
+        if note.get("tip") != tip:
+            return "the attestation is of another tip"
+        tree = chain._git(self.clone, "rev-parse", f"{tip}^{{tree}}")
+        if tree.returncode != 0 or note.get("tree") != tree.stdout.strip():
+            return "the attestation names another tree"
+        if note.get("sandbox") is not True:
+            return "the verification ran outside the build sandbox"
+        if note.get("lint_scope") != "full":
+            return "the verification did not run the whole-library lint"
+        policy = note.get("policy_commit")
+        if not isinstance(policy, str) or not policy or self._canonical is None:
+            return "the verification used the candidate's own tools and policy"
+        for path in ATTESTED_POLICY_PATHS:
+            ours = chain._git(self.clone, "rev-parse", f"{self._canonical}:{path}")
+            theirs = chain._git(self.clone, "rev-parse", f"{policy}:{path}")
+            if ours.returncode != 0 or theirs.returncode != 0 or ours.stdout != theirs.stdout:
+                return f"the verification's {path} is not {self.canonical_branch}'s"
+        from .repair_audit import Unavailable, parse_tools_pin
+
+        shown = chain._git(self.clone, "show", f"{self._canonical}:tauceti.toml")
+        try:
+            repo, ref = parse_tools_pin(shown.stdout if shown.returncode == 0 else "")
+        except Unavailable:
+            return f"{self.canonical_branch} names no TauCetiTools pin"
+        commit = str(note.get("tools_commit") or "")
+        # A `main` pin is resolved when the checks run, as staging's reusable workflow resolves it.
+        if not commit.startswith(repo + "@") or (ref != "main" and commit != f"{repo}@{ref}"):
+            return "the verification used another TauCetiTools"
+        return None
+
     def _head_tip_verified(self, head: dict[str, Any] | None) -> bool:
         """The head's current tip has passed its own local verification, so a later batch may be
         verified and repaired on it (decision 174): a worker verified exactly that tip clean
@@ -7126,7 +7193,11 @@ class Controller:
                     self._set_pre_rebase(batch, "", now)
                 else:
                     self.store.update(
-                        "batches", {"id": batch["id"]}, pre_rebase_prepared=None, pre_rebase_verified=None
+                        "batches",
+                        {"id": batch["id"]},
+                        pre_rebase_prepared=None,
+                        pre_rebase_verified=None,
+                        pre_rebase_attestation=None,
                     )
                 self._count("pre_rebase_verification_discarded")
                 self.store.journal(
@@ -7166,6 +7237,7 @@ class Controller:
         edits: dict[str, Any] | None = None,
         prepared: bool = False,
         verified: bool = False,
+        attestation: str | None = None,
     ) -> None:
         """Record (or with an empty `state`, clear) a batch's pre-rebase, keeping its chain under
         `pre_rebase_ref` in the clone and dropping the previous one. `pre_rebase_prepared` names the
@@ -7177,6 +7249,8 @@ class Controller:
         prepared_tip = tip if prepared or (tip and kept == tip) else None
         kept_verified = current.get("pre_rebase_verified")
         verified_tip = tip if verified or (tip and kept_verified == tip) else None
+        # The attestation follows the verified mark: kept while the tip it names is the pre-rebase's.
+        attested = attestation if verified else (current.get("pre_rebase_attestation") if verified_tip else None)
         previous = (
             self.pre_rebase_ref(batch["id"], current["pre_rebase_onto"])
             if current.get("pre_rebase_tip") and current.get("pre_rebase_onto")
@@ -7198,6 +7272,7 @@ class Controller:
             pre_rebase_at=now if state else None,
             pre_rebase_prepared=prepared_tip if state else None,
             pre_rebase_verified=verified_tip if state else None,
+            pre_rebase_attestation=attested if state and verified_tip else None,
         )
 
     def _supersede_pre_rebase_tasks(self, batch_id: int, resolution: str, now: float) -> int:
@@ -7597,7 +7672,7 @@ class Controller:
         self._note_reason(f"open batch {batch['id']} waits for a worker to prepare its pre-rebased chain")
 
     def _settle_pre_rebased_release(
-        self, task: dict[str, Any], batch: dict[str, Any] | None, reason: str, now: float
+        self, task: dict[str, Any], batch: dict[str, Any] | None, reason: str, now: float, notes: Any = None
     ) -> None:
         """A released preparation of a pre-rebased chain: `prepared_clean` records the chain as
         prepared (when it is still the batch's pre-rebase), a failure settles the task for that chain."""
@@ -7611,7 +7686,11 @@ class Controller:
                 # Built with no error and no audit or lint finding: the worker's verification passed on
                 # exactly this tip, which `_seal_from_pre_rebase` carries to the head it seals.
                 self.store.update(
-                    "batches", {"id": batch["id"]}, pre_rebase_prepared=task["tip"], pre_rebase_verified=task["tip"]
+                    "batches",
+                    {"id": batch["id"]},
+                    pre_rebase_prepared=task["tip"],
+                    pre_rebase_verified=task["tip"],
+                    pre_rebase_attestation=self._notes_attestation(notes, task["tip"]),
                 )
             self._count("pre_rebased_prepares_clean")
             self.store.journal(
@@ -7663,6 +7742,7 @@ class Controller:
                 edits=edits,
                 prepared=True,
                 verified=self._locally_verified(worker_notes, tip_sha),
+                attestation=self._notes_attestation(worker_notes, tip_sha),
             )
             self.store.update(
                 "tasks",
@@ -7869,6 +7949,7 @@ class Controller:
                 tip=tip,
                 expected_parent=None,
                 verified_tip=tip if verified else None,
+                attestation=head["pre_rebase_attestation"] if verified else None,
             )
             self._record_tip(head["id"], version, tip, now)
             self._set_pre_rebase(head, "", now)
@@ -11730,6 +11811,13 @@ class Controller:
             "prepare_claimed": preparing is not None
             and bool(self._active_claims(batch["id"], task_id=preparing["id"])),
             "prepare_blocked": None if preparing is not None or prepared else self._pre_rebased_prepare_blocked(batch),
+            # Decision 200: why the worker's verification of the prepared tip would not stand in for
+            # staging's checks; None when it would. Only for a verified tip.
+            "attestation_problem": self._attestation_problem(
+                batch["pre_rebase_attestation"], batch["pre_rebase_verified"]
+            )
+            if batch["pre_rebase_verified"] and batch["pre_rebase_verified"] == batch["pre_rebase_tip"]
+            else None,
         }
 
     def _batch_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:
@@ -11795,6 +11883,11 @@ class Controller:
         info["based_on_canonical"] = head["base"] == self._canonical
         # Decision 174: the next batch is verified and repaired on the head's tip only while this holds.
         info["tip_verified"] = self._head_tip_verified(head)
+        # Decision 200: why the worker's verification of the head's tip would not stand in for staging's
+        # checks; None when it would (only for a verified tip).
+        info["attestation_problem"] = (
+            self._attestation_problem(head["attestation"], head["tip"]) if info["tip_verified"] else None
+        )
         task = self._open_task(head)
         info["task"] = None if task is None else self._task_status(task)
         attempt = self._current_attempt(head)

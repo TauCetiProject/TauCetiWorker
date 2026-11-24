@@ -1,4 +1,4 @@
-"""Worker-owned whole-library verification using the candidate's pinned CI tools.
+"""Worker-owned whole-library verification using main's pinned CI tools and policy files.
 
 Every repair, preparation and rebase verification runs the check set staging runs: the final
 build, then the compiled audit driver (import, duplicates, axioms), the module-system check, the
@@ -33,6 +33,8 @@ from pathlib import Path
 from tauceti_queue import diagnostics, repair_sandbox, repair_tools
 
 WORK_DIR = Path(".lake") / "tauceti-repair-audit"
+# Under the TauCetiTools checkouts' root: one tree of trusted pin and policy files per policy commit.
+POLICY_DIR = "policy"
 SETTINGS_FILE = "audit.json"  # in .tauceti-repair: what the agent's build script needs to run the checks
 ERRORS_FILE = "errors.jsonl"  # repair_stream's error list, in .tauceti-repair
 TOOLS_DIR = "tauceti-tools"  # under the worker's root: one TauCetiTools checkout per commit
@@ -82,14 +84,19 @@ def write_settings(
     tools_root: Path,
     lake: tuple[str, ...] = ("lake",),
     logdir: Path | None = None,
+    policy_commit: str | None = None,
 ) -> Path:
     """``.tauceti-repair/audit.json``: the base the lint scope is taken against, where the TauCetiTools
-    checkouts live and the Lake command, for ``.tauceti-repair/build``."""
+    checkouts live and the Lake command, for ``.tauceti-repair/build``; and the ``policy_commit``
+    (the queue's canonical commit when the task was claimed) whose ``tauceti.toml`` and ``scripts/``
+    the checks take their TauCetiTools pin and policy files from, as staging takes them from ``main``."""
     path = worktree / repair_tools.TOOLS_DIR / SETTINGS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     settings = {"base": base, "tools_root": str(tools_root), "lake": list(lake)}
     if logdir is not None:
         settings["logdir"] = str(logdir)
+    if policy_commit and SHA.match(policy_commit):
+        settings["policy_commit"] = policy_commit
     path.write_text(json.dumps(settings))
     return path
 
@@ -179,6 +186,55 @@ def tools_checkout(tools_root: Path, repo: str, ref: str) -> Path:
                 raise
     except subprocess.TimeoutExpired as error:
         raise Unavailable(f"fetching {repo}@{ref[:12]}: {error}") from error
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return dest
+
+
+def policy_tree(worktree: Path, commit: str, tools_root: Path) -> Path:
+    """``tools_root/policy/<commit>``, holding ``tauceti.toml`` and ``scripts/`` exactly as ``commit`` has
+    them, read from the worktree's object store (fetched from ``origin`` when missing), never from the
+    worktree's files: the trusted TauCetiTools pin and policy files a verification uses (decision 200).
+    It is made once per commit, beside the TauCetiTools checkouts and outside every sandbox bind."""
+
+    def run(argv: list) -> subprocess.CompletedProcess:
+        try:
+            return _run(["git", "-C", worktree, *argv], timeout=300)
+        except subprocess.TimeoutExpired as error:
+            raise Unavailable(f"reading the policy commit {commit[:12]}: {error}") from error
+
+    if not SHA.match(commit):
+        raise Unavailable(f"policy commit {commit!r} is not a commit SHA")
+    dest = tools_root / POLICY_DIR / commit
+    if (dest / "tauceti.toml").is_file() and (dest / "scripts").is_dir():
+        return dest
+    if run(["cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
+        run(["fetch", "--quiet", "origin", commit])
+        if run(["cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
+            raise Unavailable(f"the policy commit {commit[:12]} is not in the clone")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix=f".{commit[:12]}-", dir=dest.parent))
+    try:
+        shown = run(["show", f"{commit}:tauceti.toml"])
+        if shown.returncode != 0:
+            raise Unavailable(f"the policy commit {commit[:12]} has no tauceti.toml")
+        (scratch / "tauceti.toml").write_text(shown.stdout)
+        archive = scratch / "scripts.tar"
+        listed = run(["archive", "--format=tar", "-o", str(archive), commit, "scripts"])
+        if listed.returncode != 0:
+            raise Unavailable(f"the policy commit {commit[:12]} has no scripts/: {_tail(listed.stderr)}")
+        try:
+            unpacked = _run(["tar", "-xf", archive, "-C", scratch], timeout=300)
+        except subprocess.TimeoutExpired as error:
+            raise Unavailable(f"unpacking the policy commit's scripts/: {error}") from error
+        archive.unlink(missing_ok=True)
+        if unpacked.returncode != 0 or not (scratch / "scripts").is_dir():
+            raise Unavailable(f"unpacking the policy commit's scripts/: {_tail(unpacked.stderr)}")
+        try:
+            os.rename(scratch, dest)
+        except OSError:
+            if not (dest / "tauceti.toml").is_file():  # another check's rename did not win either
+                raise
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     return dest
@@ -380,15 +436,26 @@ def check(
     record: dict = {"status": "passed", "diagnostics": []}
     work = worktree / WORK_DIR
     setup_started = time.monotonic()
+    record["sandbox"] = not repair_sandbox.disabled(env)
     try:
-        repo, ref = tools_pin(worktree)
+        # The pin and policy files come from the task's policy commit (`main`), as staging takes them,
+        # when the controller named one; otherwise, and when it cannot be read, from the worktree.
+        source = worktree
+        policy_commit = (read_settings(worktree) or {}).get("policy_commit")
+        if policy_commit:
+            try:
+                source = policy_tree(worktree, policy_commit, tools_root)
+                record["policy_commit"] = policy_commit
+            except Unavailable as error:
+                record["policy_error"] = str(error)
+        repo, ref = tools_pin(source)
         record["tools"] = f"{repo}@{ref}"
         checkout = tools_checkout(tools_root, repo, ref)
         ref = checkout.name  # the exact commit, which keys the compiled drivers
         record["tools_commit"] = f"{repo}@{ref}"
         record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
         materialize_started = time.monotonic()
-        scripts = materialize(checkout, worktree, work / "scripts")
+        scripts = materialize(checkout, source, work / "scripts")
         record["materialize_seconds"] = round(time.monotonic() - materialize_started, 3)
         drivers_started = time.monotonic()
         drivers, built = build_drivers(worktree, scripts, env, ref, logdir / "audit-drivers.log", timeout)
