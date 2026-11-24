@@ -324,7 +324,9 @@ ALLOWED_TASKS = [
     "overlap-fix",
 ]
 
-EXPLICIT_TASKS = ("security-audit",)
+# Never part of the full cascade: a round does one of these only when `only` names it. `reconcile`
+# writes back what an operator's target list's pull requests settled (docs/target-lists.md).
+EXPLICIT_TASKS = ("security-audit", "reconcile")
 WORK_TASKS = [*ALLOWED_TASKS, *EXPLICIT_TASKS]
 
 # Priority for an unrestricted round. Resolve conflicts and adapt a broken Mathlib bump first, then
@@ -355,6 +357,7 @@ SANDBOX_DEFAULT = {t: True for t in WORK_TASKS}
 # bounded by the merge gate, which only ever admits two markdown files in one directory.
 SANDBOX_DEFAULT["progress"] = False
 SANDBOX_DEFAULT["overlap-scan"] = False  # host investigation; publication stays outside the model
+SANDBOX_DEFAULT["reconcile"] = False  # no model and no checkout; the worker edits the operator's list
 
 
 AGENTS = ["auto", "codex", "claude", "kiro", "deepseek", "minimax"]
