@@ -156,7 +156,9 @@ class GitLOC(unittest.TestCase):
             hook.chmod(0o700)
 
             def short_run(argv, **kwargs):
-                return original_run(argv, **{**kwargs, "timeout": 0.5})
+                # Long enough for the fetch to receive its objects on a loaded runner and block in
+                # the 60 s hook; a sub-second limit can expire before the objects arrive.
+                return original_run(argv, **{**kwargs, "timeout": 15})
 
             with patch.object(g.processes, "run", side_effect=short_run):
                 return self.transport(directory, *args, input=input)

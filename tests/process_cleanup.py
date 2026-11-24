@@ -60,10 +60,11 @@ class Cleanup(unittest.TestCase):
     def command(self, *, hang=False, inherit_output=False, detached=False, double_fork=False):
         # The background child remains in its parent's group and ignores TERM so
         # successful cleanup has to reach KILL. Some cases deliberately inherit pipes.
+        # It sleeps far longer than any wait below, so only cleanup, never its own exit, ends it.
         code = (
             "import os,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
             + ("exec('if os.fork(): os._exit(0)'); " if double_fork else "")
-            + "open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(60)"
+            + "open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(3600)"
         )
         parent = (
             "import subprocess,sys,time; from pathlib import Path; "
@@ -80,7 +81,7 @@ class Cleanup(unittest.TestCase):
     def assert_cleaned(self):
         self.assertTrue(self.pidfile.exists())
         pid = int(self.pidfile.read_text())
-        deadline = time.monotonic() + 5  # Two-second TERM grace plus scheduling/reaping time.
+        deadline = time.monotonic() + 30  # Two-second TERM grace plus scheduling/reaping time.
         while running(pid) and time.monotonic() < deadline:
             time.sleep(0.01)
         self.assertFalse(running(pid))
@@ -102,7 +103,9 @@ class Cleanup(unittest.TestCase):
 
     def test_tool_timeout_retains_output_and_cleans_owned_children(self):
         with self.assertRaises(subprocess.TimeoutExpired) as error:
-            processes.run(self.command(hang=True), env=self.env, capture_output=True, timeout=1)
+            # The timeout must outlast starting the tool and its child on a loaded runner (the tool
+            # hangs for 60 s); a sub-second one can fire before the child exists.
+            processes.run(self.command(hang=True), env=self.env, capture_output=True, timeout=15)
         self.assertIn(b"ready", error.exception.output)
         self.assert_cleaned()
 
@@ -127,7 +130,7 @@ class Cleanup(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "linux", "kernel child subreaping is Linux-specific")
     def test_timeout_reaps_detached_child(self):
         with self.assertRaises(subprocess.TimeoutExpired):
-            processes.run(self.command(hang=True, detached=True), env=self.env, capture_output=True, timeout=1)
+            processes.run(self.command(hang=True, detached=True), env=self.env, capture_output=True, timeout=15)
         self.assert_cleaned()
 
     @unittest.skipUnless(sys.platform == "linux", "kernel child subreaping is Linux-specific")
@@ -192,7 +195,7 @@ class Cleanup(unittest.TestCase):
         code = (
             "import signal,sys,time; from pathlib import Path; "
             f"signal.signal(signal.SIGTERM,lambda *_: (time.sleep(.15),Path({str(flushed)!r}).write_text('done'),sys.exit(0))); "
-            f"Path({str(self.pidfile)!r}).write_text(str(__import__('os').getpid())); time.sleep(60)"
+            f"Path({str(self.pidfile)!r}).write_text(str(__import__('os').getpid())); time.sleep(3600)"
         )
         with processes.owned_process([sys.executable, "-c", code], env=self.env) as process:
             deadline = time.monotonic() + 5
