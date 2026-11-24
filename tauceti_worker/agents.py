@@ -559,10 +559,10 @@ def scope_policy(labels=(), head_ref: str = "", *, bump: bool = False) -> str:
 
 
 def self_tested_guidance(policy: str) -> str:
-    from .self_tested_label import enabled
+    from .self_tested_label import enabled, forgejo
     from .worker_sources import current
 
-    if policy != "ordinary" or enabled():
+    if policy != "ordinary" or enabled() or forgejo(current()):
         return ""
     comment_requests = getattr(current(), "supports_label_requests", True)
     # Most authors lack triage permission on TauCeti; send them straight to the comment request

@@ -11,8 +11,10 @@ worker labels each head the round published through git-safe-push itself, but on
   `ordinary`) whose recorded sources are exactly the pushed commit's tree.
 
 The label is a persistent author declaration. Reviews and admission check eligibility inline;
-all staging builds and audits still run. The worker's optional automatic labeling uses the same
-receipt and source checks on either forge, without a picker or status-publication protocol.
+all staging builds and audits still run. On Forgejo the label buys nothing: review selection there
+schedules a review without waiting for CI or the label, and native admission always runs the
+candidate's full CI. So on Forgejo neither the worker nor its agent edits the label, which a
+contributor fleet's account could not do anyway (it has no write on the pull-requests unit).
 """
 
 from __future__ import annotations
@@ -311,8 +313,18 @@ def scoped_publications(checkout: Path, scope: str) -> dict[str, str]:
     return out
 
 
+def forgejo(source) -> bool:
+    """Whether `source` is a Forgejo source, where no label edit is made (module docstring)."""
+    forge = getattr(getattr(source, "repository", None), "forge", None)
+    return getattr(forge, "kind", None) == "forgejo"
+
+
 def label_round_pushes(w, c, stage: str, since: float) -> list[tuple[int | None, str]]:
-    """Apply `label_push` to every head the round published; one (PR, outcome) per push."""
+    """Apply `label_push` to every head the round published; one (PR, outcome) per push.
+
+    Nothing on Forgejo, quietly: no reader there consults the label (module docstring)."""
+    if forgejo(w.gh):
+        return []
     owner = str((c.progress or {}).get("published_owner") or "")
     results = []
     for pr, branch, commit in round_pushes(c):
