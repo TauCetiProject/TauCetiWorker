@@ -63,5 +63,28 @@ round cannot have the checkout, the repair goes ahead, and the prompt tells the 
 write the `### Roadmap report` section without a marker and say so; a later round adds
 the marker. An authoring round without the checkout does not start, as before.
 
+## Reports the board already knows
+
+The job board keeps a register of the reports it has harvested, `reports/register.json`
+on the main branch of
+[TauCetiRoadmapJobs](https://github.com/TauCetiProject/TauCetiRoadmapJobs). Each
+authoring round reads it once, as a plain HTTPS read of the raw file with no token: a
+10-second timeout, at most 1 MiB, from
+`https://raw.githubusercontent.com/TauCetiProject/TauCetiRoadmapJobs/main/reports/register.json`
+unless `TAUCETI_ROADMAP_REPORT_REGISTER` names another location. Setting it to the empty
+string turns the read off. A missing register (HTTP 404, the normal case until the board
+writes one) is silent. A register that cannot be read, is too large, or is not version 1
+JSON is logged in one line, and the round goes on as if there were none.
+
+The prompt lists the register's entries for the round's roadmap and the roadmaps nested
+in it, or for every roadmap when the round's roadmap is `any`, at most 20 entries and
+6000 characters, with a count of the rest. Each line is built from validated fields only:
+the roadmap and file, the kind, the state, the anchor JSON-quoted on one line, and the
+`replaces` and `refutes` names that look like declaration names. The prompt frames them as
+untrusted data. `open` and `confirmed` entries are not to be reported again, and a target
+that depends on one builds on the corrected statement it names. `rejected` entries were
+found not to be errors and are reported again only with more than a claim. `fixed`
+entries, and entries in states or with fields the worker does not recognise, are left out.
+
 A round that opens no pull request leaves no report: reports travel only in pull request
 descriptions, where the work behind them is checked and reviewed.

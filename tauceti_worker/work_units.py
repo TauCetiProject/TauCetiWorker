@@ -62,6 +62,7 @@ from .config import (
     respect_claims,
     roadmap_areas,
     roadmap_only,
+    roadmap_report_register,
     roadmap_skip,
     roadmap_targets,
     warn_red,
@@ -3524,6 +3525,12 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     os.environ["TAUCETI_REQUIRE_TARGET_MARKER"] = "1"
     roadmap_dir_name = os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap")
     roadmap_sha = roadmap_head(refs / "roadmap")
+    # Reports the job board already knows, read fail-open (docs/roadmap-reports.md).
+    from .roadmap_reports import fetch_register, known_block, known_reports
+
+    reported = known_block(
+        known_reports(fetch_register(roadmap_report_register(), log)), None if only in ("any", "") else only
+    )
     # Author from the contributor's OWN fork: push the new branch there and open the PR from it, so the
     # worker never needs write access to canonical (and canonical stays free of WIP branches). The agent
     # builds against canonical main (the bubble/checkout still targets TAUCETI) — only the push redirects.
@@ -3607,6 +3614,7 @@ other contributors' claims, or the hard rules of the repo.
                 WORKERID=w.cfg.wid,
                 ROADMAP_DIR="/opt/roadmap/" + roadmap_dir_name,
                 ROADMAP_SHA=roadmap_sha or "(unknown: run `git rev-parse HEAD` in the roadmap checkout)",
+                REPORTED=reported,
                 REVIEW_DIR="/opt/review",
                 RUBRICS=(
                     f"/opt/rubrics/{RUBRIC_BUNDLE}"
@@ -3637,6 +3645,7 @@ other contributors' claims, or the hard rules of the repo.
         WORKERID=w.cfg.wid,
         ROADMAP_DIR=str(refs / "roadmap" / roadmap_dir_name),
         ROADMAP_SHA=roadmap_sha or "(unknown: run `git rev-parse HEAD` in the roadmap checkout)",
+        REPORTED=reported,
         REVIEW_DIR=str(refs / "review"),
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,

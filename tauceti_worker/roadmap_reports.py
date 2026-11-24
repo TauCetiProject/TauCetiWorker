@@ -6,7 +6,8 @@ visible `### Roadmap report` section and one marker line per error,
 
     <!--tauceti-roadmap-report:v1 {"roadmap":"...","file":"README.md","roadmap_sha":"...", ...}-->
 
-which the job board harvests from the library repository (docs/roadmap-reports.md).
+which the job board harvests from the library repository (docs/roadmap-reports.md). The board keeps a
+register of the reports it knows; `fetch_register` and `known_block` put it in the authoring prompt.
 
 Stdlib only and free of package imports: `scripts/roadmap-report-check`, which agents and
 gh-safe-pr-create run inside the sandbox, loads this file on its own.
@@ -17,6 +18,8 @@ from __future__ import annotations
 import json
 import re
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +50,16 @@ def declaration_name(value) -> bool:
     """Whether `value` is a declaration name as `refutes` and `replaces` hold them (at most 200 characters)."""
     return isinstance(value, str) and len(value) <= MAX_NAME and _NAME.fullmatch(value) is not None
 
+# The board's register of known reports (docs/roadmap-reports.md). Blank turns the read off.
+REGISTER_URL = "https://raw.githubusercontent.com/TauCetiProject/TauCetiRoadmapJobs/main/reports/register.json"
+REGISTER_LIMIT = 1 << 20  # bytes read at most; a larger register is ignored
+REGISTER_STATES = ("open", "confirmed", "rejected", "fixed")
+# What the authoring prompt shows of the register, at most.
+MAX_KNOWN = 20
+MAX_KNOWN_CHARS = 6000
+# A name the prompt shows unquoted: a Lean declaration name, nothing that could carry markup.
+_DECLARATION = re.compile(r"[^\W\d][\w.'!?₀-₉]{0,199}")
+
 
 def normalise(text: str) -> str:
     """Runs of whitespace compared as one space."""
@@ -63,6 +76,110 @@ class Report:
     effect: str
     refutes: tuple = ()
     replaces: tuple = ()
+
+
+@dataclass(frozen=True)
+class Known:
+    """One entry of the board's register, from validated fields only."""
+
+    roadmap: str
+    file: str
+    anchor: str
+    kind: str
+    state: str
+    refutes: tuple = ()
+    replaces: tuple = ()
+
+    def line(self) -> str:
+        """One prompt line. The anchor is JSON-quoted on one line, so it cannot leave its quotes."""
+        names = "".join(
+            f"; {label}: " + ", ".join(f"`{name}`" for name in names)
+            for label, names in (("corrected by", self.replaces), ("refuted by", self.refutes))
+            if names
+        )
+        quote = json.dumps(normalise(self.anchor), ensure_ascii=False)
+        return f"- `{self.roadmap}/{self.file}` ({self.kind}, {self.state}): {quote}{names}"
+
+
+def fetch_register(url: str, log, *, timeout: float = 10) -> dict | None:
+    """The board's register at `url`, or None: a blank url, a 404 (the board has none yet) and any
+    other failure, logged once, all leave the round as it would be without the register."""
+    if not url:
+        return None
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "TauCetiWorker/1.0"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = response.read(REGISTER_LIMIT + 1)
+    except urllib.error.HTTPError as error:
+        error.close()
+        if error.code != 404:
+            log(f"roadmap report register: HTTP {error.code}; proceeding without it")
+        return None
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        log(f"roadmap report register: unreadable ({type(error).__name__}); proceeding without it")
+        return None
+    if len(data) > REGISTER_LIMIT:
+        log(f"roadmap report register: larger than {REGISTER_LIMIT} bytes; proceeding without it")
+        return None
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        value = None
+    if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("roadmaps"), dict):
+        log("roadmap report register: not a version 1 register; proceeding without it")
+        return None
+    return value
+
+
+def known_reports(register: dict | None) -> list[Known]:
+    """The register's well-formed entries, sorted; entries with unknown states or bad fields are skipped."""
+    found = []
+    for roadmap, entries in ((register or {}).get("roadmaps") or {}).items():
+        if not isinstance(roadmap, str) or not all(_SEGMENT.fullmatch(part) for part in roadmap.split("/")):
+            continue
+        for entry in entries if isinstance(entries, list) else ():
+            if not isinstance(entry, dict):
+                continue
+            anchor = entry.get("anchor")
+            if (
+                entry.get("file") not in FILES
+                or entry.get("kind") not in KINDS
+                or entry.get("state") not in REGISTER_STATES
+                or not isinstance(anchor, str)
+                or not normalise(anchor)
+                or len(anchor) > MAX_ANCHOR
+            ):
+                continue
+            names = {
+                key: tuple(
+                    name
+                    for name in (entry.get(key) if isinstance(entry.get(key), list) else ())[:MAX_NAMES]
+                    if isinstance(name, str) and _DECLARATION.fullmatch(name)
+                )
+                for key in ("refutes", "replaces")
+            }
+            found.append(Known(roadmap, entry["file"], anchor, entry["kind"], entry["state"], **names))
+    return sorted(found, key=lambda k: (k.roadmap, k.file, normalise(k.anchor).casefold()))
+
+
+def known_block(known: list[Known], roadmap: str | None) -> str:
+    """The `__REPORTED__` text for a round: the register's live entries for `roadmap` and the roadmaps
+    nested in it (every roadmap when None), bounded; "none" when there are none."""
+    chosen = [
+        k
+        for k in known
+        if k.state != "fixed" and (roadmap is None or k.roadmap == roadmap or k.roadmap.startswith(roadmap + "/"))
+    ]
+    lines, size = [], 0
+    for k in chosen[:MAX_KNOWN]:
+        line = k.line()
+        if size + len(line) > MAX_KNOWN_CHARS:
+            break
+        lines.append(line)
+        size += len(line) + 1
+    if len(lines) < len(chosen):
+        lines.append(f"- ({len(chosen) - len(lines)} more not shown)")
+    return "\n".join(lines) or "none"
 
 
 def problems(value) -> list[str]:

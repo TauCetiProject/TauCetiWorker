@@ -154,6 +154,15 @@ def respect_claims() -> bool:
     return os.environ.get("TAUCETI_RESPECT_CLAIMS", "true").strip().lower() not in ("0", "false", "no", "off")
 
 
+def roadmap_report_register() -> str:
+    """Where authoring rounds read the job board's register of known roadmap reports
+    (docs/roadmap-reports.md): TAUCETI_ROADMAP_REPORT_REGISTER, else the board's raw file. Blank
+    turns the read off."""
+    from .roadmap_reports import REGISTER_URL
+
+    return os.environ.get("TAUCETI_ROADMAP_REPORT_REGISTER", REGISTER_URL).strip()
+
+
 def _only_label(sv=None) -> str:
     """Friendly render of the roadmap-only area for the status bar. Prefers the survey's sanitized
     value ("auto"/"any"/area); falls back to the raw env tri-state before the first survey lands."""
