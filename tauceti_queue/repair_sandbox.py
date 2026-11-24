@@ -24,6 +24,8 @@ that none of them can be read.
 The repair agent's own ``lake``, ``lean`` and ``elan`` commands reach the same sandbox through the
 shims of ``repair_agent_tools``, which pass the caller's directory as ``cwd``.
 
+The worker's cache fetches go through :func:`sandboxed_fetch`, the same sandbox online.
+
 ``TAUCETI_QUEUE_SANDBOX=0`` turns the sandbox off for hosts without ``bwrap``; every build then logs
 a warning that it ran unsandboxed. ``python -m tauceti_queue.repair_sandbox [--worktree DIR] -- lake
 build ...`` runs one command under the sandbox (the helper scripts' entry point); ``--check`` runs
@@ -56,6 +58,23 @@ PRESSURE_WRAPPER = "/opt/tauceti/tauceti-lean"
 SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/nix", "/run/current-system")
 # Lake's artifact-cache settings, passed through from the build's environment as CI passes them.
 PASSED_ENV = ("LAKE_ARTIFACT_CACHE", "LAKE_RESTORE_ARTIFACTS", "LAKE_CACHE_DIR", "LAKE_CONFIG", "ELAN_HOME")
+# Passed through to a networked sandbox (``network=True``): TLS trust and proxies for the fetch.
+NETWORK_ENV = (
+    "SSL_CERT_FILE",
+    "NIX_SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+)
+# Mathlib's cache tool (``lake exe cache get``) reads and writes this directory; ``repair.lake_env``
+# points it at the workers' own one, never the host's ``~/.cache/mathlib``, which unsandboxed Lean
+# elsewhere on the host imports from.
+MATHLIB_CACHE_VARIABLE = "MATHLIB_CACHE_DIR"
 # Retain the caller's cgroup namespace: the pressure wrapper needs every capped ancestor,
 # with /proc/self/cgroup paths matching the read-only host cgroup mount.
 NAMESPACE_FLAGS = (
@@ -391,8 +410,11 @@ def sandbox_argv(
     bwrap: str | None = None,
     extra_env: dict | None = None,
     cwd: Path | None = None,
+    network: bool = False,
 ) -> list[str]:
-    """``argv`` wrapped in the offline sandbox, run from ``worktree`` (or ``cwd``, a directory inside
+    """``argv`` wrapped in the offline sandbox (with ``network``, the same sandbox online, for the
+    worker's cache fetches: no ``--unshare-net``, no ``LAKE_NO_CACHE``, ``NETWORK_ENV`` passed and
+    Mathlib's cache directory ``MATHLIB_CACHE_DIR`` writable), run from ``worktree`` (or ``cwd``, a directory inside
     it), with ``extra_env`` set inside it (the audit and lint scripts' inputs, ``repair_audit``). Raises
     :class:`SandboxUnavailable` when ``bwrap`` is not on PATH, when ``cwd`` lies outside ``worktree``
     or when a bound tree lies inside a credential directory."""
@@ -429,6 +451,10 @@ def sandbox_argv(
         cache = Path(env["LAKE_CACHE_DIR"])
         cache.mkdir(parents=True, exist_ok=True)
         args += ["--bind", str(cache), str(cache)]
+    if network and env.get(MATHLIB_CACHE_VARIABLE):
+        mathlib = Path(env[MATHLIB_CACHE_VARIABLE])
+        mathlib.mkdir(parents=True, exist_ok=True)
+        args += ["--bind", str(mathlib), str(mathlib)]
     args += ["--ro-bind", str(worktree), str(worktree), "--bind", str(lake_dir), str(lake_dir)]
     packages = lake_dir / "packages"
     if packages.is_symlink():  # the shared extracted Mathlib (--seed-packages), read-only for every build
@@ -436,16 +462,19 @@ def sandbox_argv(
     args += _credential_masks(_binds(args), env)
     args += ["--remount-ro", "/"]
     args += ["--setenv", "PATH", _inside_path(env, elan), "--setenv", "HOME", home]
-    # The sandbox is always offline: Lake restores only from the local pool, never a remote cache.
-    args += ["--setenv", "LAKE_NO_CACHE", "true", "--setenv", "TMPDIR", str(lake_dir / "tmp")]
-    for key in PASSED_ENV:
+    # Offline, Lake restores only from the local pool, never a remote cache.
+    if not network:
+        args += ["--setenv", "LAKE_NO_CACHE", "true"]
+    args += ["--setenv", "TMPDIR", str(lake_dir / "tmp")]
+    for key in PASSED_ENV + ((*NETWORK_ENV, MATHLIB_CACHE_VARIABLE) if network else ()):
         if env.get(key):
             args += ["--setenv", key, env[key]]
     for key, value in (extra_env or {}).items():
         args += ["--setenv", key, str(value)]
     for key, value in _pressure_env(worktree, PRESSURE_WRAPPER).items():
         args += ["--setenv", key, value]
-    args += ["--chdir", str(directory), *NAMESPACE_FLAGS, "--", *argv]
+    flags = [f for f in NAMESPACE_FLAGS if not (network and f == "--unshare-net")]
+    args += ["--chdir", str(directory), *flags, "--", *argv]
     return args
 
 
@@ -461,7 +490,13 @@ def prioritized(argv: list[str]) -> list[str]:
 
 
 def sandboxed_lake(
-    argv: list[str], worktree: Path, env: dict | None = None, *, extra_env: dict | None = None, cwd: Path | None = None
+    argv: list[str],
+    worktree: Path,
+    env: dict | None = None,
+    *,
+    extra_env: dict | None = None,
+    cwd: Path | None = None,
+    network: bool = False,
 ) -> list[str]:
     """The command to run for ``argv`` (a ``lake build ...``) from ``worktree``: wrapped in the
     sandbox, or an environment wrapper with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0``
@@ -483,7 +518,15 @@ def sandboxed_lake(
                 *argv,
             ]
         )
-    return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env, cwd=cwd))
+    return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env, cwd=cwd, network=network))
+
+
+def sandboxed_fetch(argv: list[str], worktree: Path, env: dict | None = None) -> list[str]:
+    """A cache fetch (``lake cache get``, ``lake exe cache get``) from ``worktree``: the build sandbox
+    online. A fetch loads the workspace's and its packages' Lake configurations and may run Mathlib's
+    cache executable, all from ``.lake``, which the batch's code could write during an earlier build of
+    the same tree; outside the sandbox that would run with the worker's credentials in reach."""
+    return sandboxed_lake(argv, worktree, env, network=True)
 
 
 # Inside the sandbox: exit 1 naming the first argument that is a non-empty file or directory.

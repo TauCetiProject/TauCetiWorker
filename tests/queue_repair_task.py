@@ -1415,12 +1415,23 @@ class HappyPath(Fixture):
         self.assertEqual(lake[0], "exe cache get")
         self.assertIn(f"--rev={self.content.base}", lake[1])
         self.assertTrue(lake[2].startswith("build --iofail"))
-        # Only the build ran in the sandbox, from a cleared environment; the cache fetches need the network.
+        # Every Lake command ran in the sandbox, from a cleared environment: the cache fetches online, the
+        # streaming build and the worker's verification build of the agent's chain offline.
         sandboxed = self.bwrap_calls()
-        # The streaming build, then the worker's verification build of the agent's chain.
-        self.assertEqual(
-            [c["argv"][c["argv"].index("--") + 1 :] for c in sandboxed], [["lake", "build", "--iofail"]] * 2
-        )
+        commands = [c["argv"][c["argv"].index("--") + 1 :] for c in sandboxed]
+        self.assertEqual(commands[0], ["lake", "exe", "cache", "get"])
+        self.assertEqual(commands[1][:3], ["lake", "cache", "get"])
+        self.assertEqual(commands[2:], [["lake", "build", "--iofail"]] * 2)
+        for call, command in zip(sandboxed, commands, strict=True):
+            argv = call["argv"]
+            fetch = command[1] in ("exe", "cache")
+            self.assertEqual("--unshare-net" in argv, not fetch, command)
+            setenv = dict(pairs(argv, "--setenv"))
+            self.assertEqual("LAKE_NO_CACHE" in setenv, not fetch, command)
+            if fetch:
+                mathlib = setenv["MATHLIB_CACHE_DIR"]
+                self.assertIn((mathlib, mathlib), pairs(argv, "--bind"), "Mathlib's cache is the workers' own")
+                self.assertNotIn(str(HOME / ".cache" / "mathlib"), mathlib)
         self.assertEqual(len(outcome["verification"]), 1)
         self.assertTrue(outcome["verification"][0]["ok"])
         self.assertEqual(outcome["verification"][0]["checks"]["status"], "unavailable", "this fixture has no pin")

@@ -437,5 +437,33 @@ class Credentials(Fixture):
         self.assertIn(str(key), detail)
 
 
+class Fetches(Fixture):
+    def test_a_fetch_runs_in_the_sandbox_online(self):
+        mathlib = self.tmp / "mathlib-cache"
+        env = {**self.env, "MATHLIB_CACHE_DIR": str(mathlib), "SSL_CERT_FILE": "/etc/ssl/certs/ca.crt"}
+        with patch.dict(os.environ, {"PATH": env["PATH"]}):
+            argv = repair_sandbox.sandboxed_fetch(["lake", "exe", "cache", "get"], self.worktree, env)
+            offline = repair_sandbox.sandboxed_lake(["lake", "build"], self.worktree, env)
+        self.assertEqual(argv[argv.index("--") :], ["--", "lake", "exe", "cache", "get"])
+        self.assertNotIn("--unshare-net", argv)
+        self.assertIn("--unshare-user", argv)
+        setenv = dict((argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == "--setenv")
+        self.assertNotIn("LAKE_NO_CACHE", setenv)
+        self.assertEqual(setenv["MATHLIB_CACHE_DIR"], str(mathlib))
+        self.assertEqual(setenv["SSL_CERT_FILE"], "/etc/ssl/certs/ca.crt")
+        self.assertIn(["--bind", str(mathlib), str(mathlib)], [argv[i : i + 3] for i in range(len(argv))])
+        self.assertTrue(mathlib.is_dir())
+        self.assertIn(
+            ["--ro-bind", str(self.worktree), str(self.worktree)], [argv[i : i + 3] for i in range(len(argv))]
+        )
+        # The offline build neither reaches the network nor sees Mathlib's cache.
+        self.assertIn("--unshare-net", offline)
+        self.assertNotIn(str(mathlib), offline)
+
+    def test_the_workers_mathlib_cache_is_their_own(self):
+        env = repair.lake_env(self.root, {"HOME": str(self.home)}, cache_root=self.tmp / "shared")
+        self.assertEqual(env["MATHLIB_CACHE_DIR"], str(self.tmp / "shared" / "mathlib-cache"))
+
+
 if __name__ == "__main__":
     unittest.main()
