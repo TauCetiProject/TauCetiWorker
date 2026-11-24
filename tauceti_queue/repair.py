@@ -35,6 +35,7 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -818,6 +819,14 @@ def link_shared_packages(worktree: Path, seed_packages: Path) -> None:
         else:
             shutil.rmtree(target)
     target.symlink_to(seed_packages)
+    # The sandbox binds a packages link's target only when the worker recorded it, outside the
+    # checkout and every bind (repair_sandbox.linked_packages), and only a target that may be shared
+    # at all: a parent worktree's `.lake/packages` is build state the parent's build could have
+    # replaced by a link elsewhere before this call.
+    record = repair_sandbox.packages_record(worktree)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    shared = Path(seed_packages)
+    record.write_text(f"{shared}\n" if repair_sandbox.shareable_packages(shared) else "")
 
 
 def lake_env(root: Path, base_env: dict | None = None, *, cache_root: Path | None = None) -> dict:
@@ -1663,7 +1672,10 @@ CACHE_SENTENCE = (
     "this batch and the revisions near it, then the public cache); do not run `lake exe cache get`, "
     "`lake cache get` or any other cache fetch yourself. When the task replays a batch onto a queue head, the "
     "public cache has nothing for the target commit, which is not on `main` yet: that miss is expected and is not "
-    "a reason to stop. Proceed to build incrementally."
+    "a reason to stop. Proceed to build incrementally. `lake`, `lean` and `elan` run offline in the build "
+    "sandbox, from your current directory in this worktree: only the worktree and the toolchains are visible "
+    "and only `.lake` is writable, so keep scratch files under `.lake/`. Run them by name, never by a "
+    "toolchain path."
 )
 
 # The one sentence the prompt says about the worker's checks (``repair_audit``): a fact, not a request.
@@ -2404,8 +2416,9 @@ def prepare_codex_home(root: Path) -> Path:
     return iso
 
 
-def prepare_claude_shell_env(config: Path) -> Path:
-    """Keep unattended Bash stdin at EOF, including commands with heredocs.
+def prepare_claude_shell_env(config: Path, guard: Path | None = None) -> Path:
+    """Keep unattended Bash stdin at EOF, including commands with heredocs, and source ``guard``
+    (``repair_agent_tools``' shell guard): Claude Code's Bash sources this file, not ``BASH_ENV``.
 
     Claude's native guard misses compound commands: anthropics/claude-code#84424.
     The CLI re-reads this file after cwd changes, so keep it in persistent config,
@@ -2416,6 +2429,8 @@ def prepare_claude_shell_env(config: Path) -> Path:
     try:
         with os.fdopen(fd, "w") as stream:
             stream.write("exec </dev/null\n")
+            if guard is not None:
+                stream.write(f". {shlex.quote(str(guard))}\n")
         os.replace(name, path)
     finally:
         Path(name).unlink(missing_ok=True)
@@ -2435,6 +2450,12 @@ def isolation_env(
     for key in LAKE_ENV_KEYS:
         if env_lake and key in env_lake:
             changes[key] = env_lake[key]
+    # The agent's lake, lean and elan run in the build sandbox (repair_agent_tools), which also hides
+    # the worker's credential paths named here; the agent's own environment loses their variables.
+    from tauceti_queue import repair_agent_tools, repair_sandbox
+
+    changes[repair_sandbox.HIDDEN_VARIABLE] = os.pathsep.join(str(p) for p in repair_sandbox.credential_paths())
+    changes.update(repair_agent_tools.agent_environment(root))
     changes["OPENAI_API_KEY"] = None
     if provider == "api":
         changes["CLAUDE_CONFIG_DIR"] = str(prepare_claude_config(root, credentials=False))
@@ -2450,7 +2471,9 @@ def isolation_env(
     if provider != "codex":
         # The host launcher supplies this through --settings, above project/user
         # settings and inherited CLAUDE_ENV_FILE; this private queue config owns it.
-        changes["TAUCETI_REPAIR_CLAUDE_ENV_FILE"] = str(prepare_claude_shell_env(Path(changes["CLAUDE_CONFIG_DIR"])))
+        changes["TAUCETI_REPAIR_CLAUDE_ENV_FILE"] = str(
+            prepare_claude_shell_env(Path(changes["CLAUDE_CONFIG_DIR"]), Path(changes["BASH_ENV"]))
+        )
     changes["GH_TOKEN"] = None
     changes["GITHUB_TOKEN"] = None
     changes["TAUCETI_QUEUE_TOKEN"] = None

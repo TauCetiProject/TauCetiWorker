@@ -533,7 +533,16 @@ env.update(extra)
 env["PATH"] = f"{here}:{env.get('PATH', '')}"
 if cwd:
     os.chdir(cwd)
-os.execvpe(args[split + 1], args[split + 1 :], env)
+command = args[split + 1 :]
+if command[:2] == ["sh", "-c"] and command[2].startswith("for p; do"):
+    # The preflight's credential probe: emulate the mounts, keeping only paths a bind would show.
+    pairs = [(a, args[i + 1], args[i + 2]) for i, a in enumerate(args[:split]) if a in ("--ro-bind", "--bind")]
+    masks = [args[i + 1] for i, a in enumerate(args[:split]) if a == "--tmpfs"]
+    masks += [target for flag, source, target in pairs if source == "/dev/null"]
+    under = lambda path, roots: any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+    shown = [target for _, source, target in pairs if source != "/dev/null"]
+    command = command[:4] + [p for p in command[4:] if under(p, shown) and not under(p, masks)]
+os.execvpe(command[0], command, env)
 '''.replace("PYTHON", sys.executable)
 
 LEAN = r"""#!/bin/sh
@@ -4854,6 +4863,7 @@ class SandboxedBuilds(Fixture):
 
     def test_the_wrapper_composes_ci_sandbox(self):
         worktree, seed, env = self.worktree()
+        env[repair_sandbox.READ_ONLY_VARIABLE] = str(seed)  # the worker's --seed-packages
         argv = repair_sandbox.sandboxed_lake(["lake", "build", "--iofail"], worktree, env)
         self.assertEqual(argv[1:3], ["-i", str(BIN / "bwrap")], "bwrap starts from an empty environment")
         self.assertEqual(argv[argv.index("--") :], ["--", "lake", "build", "--iofail"])
@@ -4955,7 +4965,8 @@ class SandboxedBuilds(Fixture):
         by_name = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
         self.assertTrue(by_name["build sandbox"]["ok"], by_name["build sandbox"])
         self.assertIn(str(BIN / "bwrap"), by_name["build sandbox"]["detail"])
-        self.assertEqual(self.bwrap_calls()[-1]["argv"][-2:], ["--", "true"])
+        probe = self.bwrap_calls()[-1]["argv"]
+        self.assertEqual(probe[probe.index("--") + 1 :][:4], ["sh", "-c", repair_sandbox._CREDENTIAL_PROBE, "sh"])
         (BIN / "sandbox-env.json").write_text("{}")  # the stub now fails, as a broken bwrap would
         by_name = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
         self.assertFalse(by_name["build sandbox"]["ok"])

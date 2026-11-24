@@ -991,7 +991,10 @@ def host_agent_argv(
     the caller writes it to the process's stdin; see ``host_agent_launch``."""
     from .build_resources import defaults
 
-    env = defaults({**os.environ, "PATH": f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"})
+    path = f"{HERE / 'scripts'}:{os.environ.get('PATH', '')}"
+    if tools := os.environ.get("TAUCETI_AGENT_TOOLS"):
+        path = f"{tools}:{path}"  # the queue repair agent's sandboxed toolchain shims come first
+    env = defaults({**os.environ, "PATH": path})
     env = _without_usage_credentials(env)
     env["TAUCETI_VERIFY_PYTHON"] = sys.executable
     env.update(_foreground_shell_env(float(env.get("TAUCETI_ROUND_DEADLINE") or time.time() + 7200)))

@@ -4858,6 +4858,9 @@ def main(argv: list[str] | None = None) -> int:
     # The api provider's key, from the environment file; taken out of this process's environment so
     # only the api provider's agent ever sees it (and nothing logs it).
     api_key = (os.environ.pop("ANTHROPIC_API_KEY", "") or "").strip() or None
+    if args.seed_packages:
+        # The one tree every sandbox of this worker and its agents may bind through `.lake/packages`.
+        os.environ[repair_sandbox.READ_ONLY_VARIABLE] = str(args.seed_packages)
 
     clone = args.clone
     if clone is None:

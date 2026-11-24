@@ -14,10 +14,20 @@ the worker's private artifact pool (``LAKE_CACHE_DIR``) is a writable bind, sinc
 built artifact there; ``LAKE_CONFIG`` and a shared ``.lake/packages`` (``--seed-packages``) are
 read-only binds; the content clone's Git directory is read-only so Lake's Git queries resolve.
 
+Credentials stay outside: the sandbox binds nothing of ``$HOME`` beyond the toolchain, and every
+credential path :func:`credential_paths` knows (the queue App's directory, the worker token file,
+the repair-cache write key, the provider and ``gh`` config directories, ``~/.ssh`` and the like) that
+lies inside a bound tree is covered by an empty ``tmpfs`` (a directory) or ``/dev/null`` (a file). A
+bound tree inside a credential directory is refused. :func:`check` confirms from inside the sandbox
+that none of them can be read.
+
+The repair agent's own ``lake``, ``lean`` and ``elan`` commands reach the same sandbox through the
+shims of ``repair_agent_tools``, which pass the caller's directory as ``cwd``.
+
 ``TAUCETI_QUEUE_SANDBOX=0`` turns the sandbox off for hosts without ``bwrap``; every build then logs
 a warning that it ran unsandboxed. ``python -m tauceti_queue.repair_sandbox [--worktree DIR] -- lake
 build ...`` runs one command under the sandbox (the helper scripts' entry point); ``--check`` runs
-``true`` inside it.
+the credential probe inside it.
 """
 
 from __future__ import annotations
@@ -60,6 +70,43 @@ NAMESPACE_FLAGS = (
 )
 
 
+# Credential locations, by variable (the worker's environment) and under $HOME. The worker passes
+# the resolved list to its agents in HIDDEN_VARIABLE, since their environment drops the variables.
+CREDENTIAL_VARIABLES = (
+    "TAUCETI_QUEUE_GITHUB_APP",
+    "TAUCETI_QUEUE_TOKEN_FILE",
+    "TAUCETI_REPAIR_CACHE_KEY_FILE",
+    "TAUCETI_QUEUE_CONFIG",
+    "TAUCETI_CLAUDE_USAGE_CREDENTIALS",
+    "TAUCETI_ANTHROPIC_KEY_FILE",
+    "TAUCETI_FORGEJO_TOKEN_FILE",
+    "TAUCETI_GITHUB_STATE_TOKEN_FILE",
+    "TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE",
+    "CREDENTIALS_DIRECTORY",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "GH_CONFIG_DIR",
+)
+HOME_CREDENTIALS = (
+    ".config/tauceti-queue",
+    ".config/gh",
+    ".claude",
+    ".claude.json",
+    ".codex",
+    ".ssh",
+    ".gnupg",
+    ".netrc",
+    ".git-credentials",
+    ".aws",
+    ".config/rclone",
+)
+HIDDEN_VARIABLE = "TAUCETI_SANDBOX_HIDDEN"
+# Trees a sandbox may bind only read-only (the shared ``--seed-packages`` Mathlib), as a path list;
+# ``TAUCETI_QUEUE_SEED_PACKAGES`` counts too. A worktree inside one is refused, since its ``.lake``
+# would be writable.
+READ_ONLY_VARIABLE = "TAUCETI_SANDBOX_READONLY"
+
+
 class SandboxUnavailable(RuntimeError):
     """``bwrap`` is required (the sandbox is not disabled) but is not on PATH."""
 
@@ -98,6 +145,156 @@ def _git_dir(worktree: Path) -> Path | None:
     if path is None or not path.is_dir() or path.is_relative_to(worktree):
         return None  # a worktree's own .git directory is already under the read-only worktree bind
     return path
+
+
+def credential_paths(env: dict | None = None) -> list[Path]:
+    """Every credential location this environment names or implies, absolute and deduplicated,
+    whether or not it exists: the variables of ``CREDENTIAL_VARIABLES`` (a configuration file's
+    directory for ``TAUCETI_QUEUE_CONFIG``), the entries of ``HIDDEN_VARIABLE`` and
+    ``HOME_CREDENTIALS`` under ``$HOME``."""
+    env = os.environ if env is None else env
+    home = Path(env.get("HOME") or os.path.expanduser("~"))
+    found: list[Path] = []
+    for key in CREDENTIAL_VARIABLES:
+        value = (env.get(key) or "").strip()
+        # A path, absolute or relative to this process's directory. A relative value names nothing
+        # unless it exists, so a misplaced secret value is never copied anywhere.
+        if value.startswith(("/", "~")) or (value and "\n" not in value and os.path.lexists(value)):
+            found.append(Path(value).parent if key == "TAUCETI_QUEUE_CONFIG" else Path(value))
+    found += [Path(p) for p in (env.get(HIDDEN_VARIABLE) or "").split(os.pathsep) if p.strip()]
+    found += [home / name for name in HOME_CREDENTIALS]
+    result: list[Path] = []
+    for path in found:
+        path = Path(os.path.abspath(os.path.expanduser(str(path))))
+        for candidate in (path, path.resolve()):
+            if candidate.is_absolute() and candidate not in result:
+                result.append(candidate)
+    return result
+
+
+def _binds(args: list[str]) -> list[tuple[str, str]]:
+    """The ``(source, destination)`` of every bind in sandbox arguments, ``/dev/null`` masks excluded."""
+    return [
+        (args[i + 1], args[i + 2])
+        for i, a in enumerate(args)
+        if a in ("--ro-bind", "--bind") and args[i + 1] != "/dev/null"
+    ]
+
+
+def linked_credentials(paths: list[Path]) -> list[Path]:
+    """The targets of the symlinks directly inside each credential directory (a key file kept
+    elsewhere and linked in), treated as credential paths themselves."""
+    found: list[Path] = []
+    for directory in paths:
+        try:
+            entries = list(os.scandir(directory)) if directory.is_dir() else []
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink():
+                target = Path(entry.path).resolve()
+                if target not in paths and target not in found:
+                    found.append(target)
+    return found
+
+
+def exposures(binds: list[tuple[str, str]], env: dict) -> list[tuple[Path, Path]]:
+    """Where each credential path would appear inside the sandbox: ``(inside, host)`` for every bind
+    whose resolved source contains the credential's resolved path, the inside path being that bind's
+    destination joined with the remainder (a symlinked source shows its target's files under its own
+    name). Raises :class:`SandboxUnavailable` when a bound source lies inside a credential directory
+    (or is one), which no mask could repair."""
+    found: list[tuple[Path, Path]] = []
+    named = credential_paths(env)
+    for credential in [*named, *linked_credentials(named)]:
+        host = credential.resolve()
+        for source, destination in binds:
+            resolved = Path(source).resolve()
+            if resolved == host or resolved.is_relative_to(host):
+                raise SandboxUnavailable(f"the sandbox would bind {source}, inside the credential path {credential}")
+            if host.is_relative_to(resolved):
+                pair = (Path(destination) / host.relative_to(resolved), host)
+                if pair not in found:
+                    found.append(pair)
+    return found
+
+
+def _credential_masks(binds: list[tuple[str, str]], env: dict) -> list[str]:
+    """Mount arguments covering each existing credential path wherever a bind exposes it: an empty
+    tmpfs on a directory, ``/dev/null`` on a file."""
+    masks: list[str] = []
+    for inside, host in exposures(binds, env):
+        if host.is_dir():
+            masks += ["--tmpfs", str(inside)]
+        elif host.is_file():
+            masks += ["--ro-bind", "/dev/null", str(inside)]
+    return masks
+
+
+# ``repair.link_shared_packages`` records the target it linked a worktree's ``.lake/packages`` to in
+# this directory of the worker's root (the worktrees directory's parent), outside the checkout (which
+# a candidate commit could fill) and outside every bind (so no sandbox can write it).
+PACKAGES_RECORDS = "packages-links"
+
+
+def packages_record(worktree: Path) -> Path:
+    worktree = Path(os.path.abspath(worktree))
+    return worktree.parent.parent / PACKAGES_RECORDS / worktree.parent.name / worktree.name
+
+
+def _read_only_trees(env: dict) -> list[Path]:
+    trees = [*(env.get(READ_ONLY_VARIABLE) or "").split(os.pathsep), env.get("TAUCETI_QUEUE_SEED_PACKAGES") or ""]
+    return [Path(t).resolve() for t in trees if t.strip()]
+
+
+def shareable_packages(target: Path, env: dict | None = None) -> bool:
+    """Whether ``target`` may be bound read-only as a worktree's ``.lake/packages``: a real directory
+    with no symlink on its path, never under ``/proc``, ``/dev``, ``/sys`` or ``/run``, and either
+    inside a configured read-only tree or another worktree's own ``.lake/packages``."""
+    env = os.environ if env is None else env
+    target = Path(os.path.abspath(target))
+    if target != target.resolve() or not target.is_dir():
+        return False
+    if any(target.is_relative_to(root) for root in ("/proc", "/dev", "/sys", "/run")):
+        return False
+    if any(target.is_relative_to(tree) for tree in _read_only_trees(env)):
+        return True
+    return target.name == "packages" and target.parent.name == ".lake"
+
+
+def linked_packages(worktree: Path) -> list[Path]:
+    """The ``.lake/packages`` targets the worker itself linked in ``worktree`` (:func:`packages_record`),
+    as recorded: canonical when written and never resolved again, since a target inside another
+    worktree's ``.lake`` is build state that could since have been replaced by a link elsewhere."""
+    try:
+        text = packages_record(worktree).read_text()
+    except OSError:
+        return []
+    return [Path(line) for line in text.splitlines() if line.startswith("/")]
+
+
+def _packages_binds(packages: Path, worktree: Path, read_only: list[Path], env: dict) -> list[str]:
+    """The bind that makes a worktree's ``.lake/packages`` link resolve inside the sandbox, if any.
+
+    The link is build state the batch's code can rewrite, so it is never followed on the host to pick
+    a bind source. A link the worker recorded (:func:`linked_packages`) to another worktree's
+    ``.lake/packages`` must still name that path literally; that worktree's ``.lake`` is bound, a
+    directory no sandbox can rename or replace (its worktree is read-only inside every sandbox), so a
+    later swap of its ``packages`` entry for a link resolves inside the sandbox, never on the host. A
+    link into a configured read-only tree is bound at its resolved path, which no sandbox can change.
+    Any other link dangles."""
+    try:
+        literal = Path(os.readlink(packages))
+    except OSError:
+        return []
+    if literal.is_absolute() and literal in linked_packages(worktree) and literal.name == "packages":
+        lake = literal.parent
+        if lake.name == ".lake" and not lake.is_symlink() and lake.is_dir() and lake == lake.resolve():
+            return ["--ro-bind", str(lake), str(lake)]
+    shared = packages.resolve()
+    if any(shared.is_relative_to(tree) for tree in read_only) and shareable_packages(shared, env):
+        return ["--ro-bind", str(shared), str(shared)]
+    return []
 
 
 def _system_binds() -> list[str]:
@@ -193,15 +390,24 @@ def sandbox_argv(
     *,
     bwrap: str | None = None,
     extra_env: dict | None = None,
+    cwd: Path | None = None,
 ) -> list[str]:
-    """``argv`` wrapped in the offline sandbox, run from ``worktree``, with ``extra_env`` set inside it
-    (the audit and lint scripts' inputs, ``repair_audit``). Raises :class:`SandboxUnavailable` when
-    ``bwrap`` is not on PATH."""
+    """``argv`` wrapped in the offline sandbox, run from ``worktree`` (or ``cwd``, a directory inside
+    it), with ``extra_env`` set inside it (the audit and lint scripts' inputs, ``repair_audit``). Raises
+    :class:`SandboxUnavailable` when ``bwrap`` is not on PATH, when ``cwd`` lies outside ``worktree``
+    or when a bound tree lies inside a credential directory."""
     env = dict(os.environ if env is None else env)
     bwrap = bwrap or shutil.which("bwrap")
     if not bwrap:
         raise SandboxUnavailable(f"bwrap is not on PATH; install bubblewrap or set {DISABLE_VARIABLE}=0")
     worktree = Path(worktree).resolve()
+    directory = worktree if cwd is None else Path(os.path.abspath(cwd))
+    if not (directory.is_relative_to(worktree) or directory.resolve().is_relative_to(worktree)):
+        raise SandboxUnavailable(f"{directory} is outside the sandboxed worktree {worktree}")
+    read_only = _read_only_trees(env)
+    for tree in read_only:
+        if worktree.is_relative_to(tree):
+            raise SandboxUnavailable(f"{worktree} is inside {tree}, which builds may only read")
     lake_dir = worktree / ".lake"
     lake_dir.mkdir(exist_ok=True)
     (lake_dir / "tmp").mkdir(exist_ok=True)
@@ -226,9 +432,8 @@ def sandbox_argv(
     args += ["--ro-bind", str(worktree), str(worktree), "--bind", str(lake_dir), str(lake_dir)]
     packages = lake_dir / "packages"
     if packages.is_symlink():  # the shared extracted Mathlib (--seed-packages), read-only for every build
-        shared = packages.resolve()
-        if shared.is_dir():
-            args += ["--ro-bind", str(shared), str(shared)]
+        args += _packages_binds(packages, worktree, read_only, env)
+    args += _credential_masks(_binds(args), env)
     args += ["--remount-ro", "/"]
     args += ["--setenv", "PATH", _inside_path(env, elan), "--setenv", "HOME", home]
     # The sandbox is always offline: Lake restores only from the local pool, never a remote cache.
@@ -240,7 +445,7 @@ def sandbox_argv(
         args += ["--setenv", key, str(value)]
     for key, value in _pressure_env(worktree, PRESSURE_WRAPPER).items():
         args += ["--setenv", key, value]
-    args += ["--chdir", str(worktree), *NAMESPACE_FLAGS, "--", *argv]
+    args += ["--chdir", str(directory), *NAMESPACE_FLAGS, "--", *argv]
     return args
 
 
@@ -256,7 +461,7 @@ def prioritized(argv: list[str]) -> list[str]:
 
 
 def sandboxed_lake(
-    argv: list[str], worktree: Path, env: dict | None = None, *, extra_env: dict | None = None
+    argv: list[str], worktree: Path, env: dict | None = None, *, extra_env: dict | None = None, cwd: Path | None = None
 ) -> list[str]:
     """The command to run for ``argv`` (a ``lake build ...``) from ``worktree``: wrapped in the
     sandbox, or an environment wrapper with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0``
@@ -278,18 +483,35 @@ def sandboxed_lake(
                 *argv,
             ]
         )
-    return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env))
+    return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env, cwd=cwd))
+
+
+# Inside the sandbox: exit 1 naming the first argument that is a non-empty file or directory.
+_CREDENTIAL_PROBE = (
+    'for p; do if { [ -f "$p" ] && [ -s "$p" ]; } || { [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null)" ]; }; then '
+    'echo "readable: $p"; exit 1; fi; done'
+)
 
 
 def check(scratch: Path | None = None, env: dict | None = None) -> tuple[bool, str]:
-    """Run ``true`` inside the sandbox; ``(ok, detail)`` for the worker preflight."""
-    if disabled():
+    """Run the credential probe inside the sandbox; ``(ok, detail)`` for the worker preflight. It
+    fails when any credential path of :func:`credential_paths` that holds something on the host can
+    be read inside, as well as when the sandbox does not start."""
+    if disabled(env):
         return True, f"DISABLED by {DISABLE_VARIABLE}=0: repair builds run unsandboxed"
     if scratch is not None:
         scratch.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ if env is None else env)
+    named = credential_paths(env)
+    present = [p for p in [*named, *linked_credentials(named)] if p.is_file() or (p.is_dir() and any(p.iterdir()))]
     with tempfile.TemporaryDirectory(prefix="sandbox-check-", dir=scratch) as directory:
         try:
             argv = sandbox_argv(["true"], Path(directory), env)
+            # Each credential's own path and every path a bind exposes it under.
+            held = {p.resolve() for p in present}
+            probed = [str(p) for p in present]
+            probed += [str(inside) for inside, host in exposures(_binds(argv), env) if host in held]
+            argv = sandbox_argv(["sh", "-c", _CREDENTIAL_PROBE, "sh", *dict.fromkeys(probed)], Path(directory), env)
         except SandboxUnavailable as error:
             return False, str(error)
         try:
@@ -299,7 +521,9 @@ def check(scratch: Path | None = None, env: dict | None = None) -> tuple[bool, s
         if proc.returncode != 0:
             detail = (proc.stderr or proc.stdout).strip().splitlines()
             return False, f"{argv[2]} exited {proc.returncode}: {detail[-1] if detail else 'no output'}"
-        return True, f"{argv[2]} runs `true` offline with the toolchain read-only"
+        return True, (
+            f"{argv[2]} runs offline with the toolchain read-only and none of {len(present)} credential paths readable"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -307,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m tauceti_queue.repair_sandbox", description=__doc__.split("\n\n")[0]
     )
     parser.add_argument("--worktree", type=Path, default=Path.cwd(), help="the repair worktree (default: cwd)")
-    parser.add_argument("--check", action="store_true", help="run `true` inside the sandbox and report")
+    parser.add_argument("--check", action="store_true", help="probe the credential paths inside the sandbox and report")
     parser.add_argument("command", nargs=argparse.REMAINDER, help="-- lake build ...")
     args = parser.parse_args(argv)
     if args.check:

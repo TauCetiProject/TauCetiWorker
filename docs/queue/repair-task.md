@@ -434,6 +434,40 @@ has a time budget holds because the service re-exposes the task.
    clone's Git directory (read-only, so Lake's Git queries resolve). The arguments, `--iofail`
    included, and the exit status pass through unchanged. Only the build is sandboxed: the cache
    fetches before it need the network, and the agent's own shell is not confined.
+   No credential is visible inside: the sandbox binds nothing of the home directory but the
+   toolchains, and every credential path the worker knows (`repair_sandbox.credential_paths`: the
+   queue App's directory, the worker token file, the repair-cache write key, the provider and `gh`
+   config directories, `~/.ssh` and the like) that lies inside a bound tree is covered by an empty
+   tmpfs or `/dev/null`, at every path a bind exposes it under (a symlinked bind source shows its
+   target's files under its own name); the targets of symlinks directly inside a credential
+   directory are masked too. A worktree's `.lake/packages` link is build state the batch can rewrite,
+   so it is never followed on the host to pick a bind source. A link the worker made itself
+   (`repair.link_shared_packages` records it in `packages-links/` under the worker root, outside the
+   checkout and every bind, and only for another worktree's real `.lake/packages`) must still name
+   that path literally, and then that worktree's `.lake` is bound read-only: no sandbox can replace
+   it, and a later swap of its `packages` entry resolves inside the sandbox. A link into the worker's
+   `--seed-packages` tree (`TAUCETI_SANDBOX_READONLY`, which the worker exports at start) is bound at
+   its resolved path; any other link dangles, and a worktree inside that tree is refused. The preflight's "build sandbox" check fails when any of them that holds
+   something can be read from inside.
+
+   **The agent's toolchain commands.** The batch's Lean can run code whenever it is elaborated, so the
+   agent's own `lake`, `lean` and `elan` run in the same sandbox (`tauceti_queue/repair_agent_tools.py`).
+   The worker writes `agent-tools/` under its root: a shim for each toolchain command (`elan`, `lake`,
+   `lean`, `leanc`, `leanchecker`, `leanmake`, `leanpkg` and every `lean*` or `lake*` executable of an
+   installed toolchain), first on the agent's `PATH`, which runs the command in the sandbox from the
+   caller's directory, the worktree being the nearest directory above holding a Lake configuration or
+   `lean-toolchain`. That covers `lake build`, `lake env`, `lake exe`, `lean --run`, `elan run` and any
+   program that finds the commands on `PATH`. Outside a Lake project the shims refuse. Beside them,
+   `shell-guard.sh` is sourced by every bash the agent starts (`BASH_ENV` for Codex and scripts,
+   Claude Code's `CLAUDE_ENV_FILE`): before each command it puts the shims back first on `PATH` and
+   refuses a command line naming a toolchain executable by path (under the elan home, or the elan
+   proxy's resolved file) or giving a toolchain command a `PATH` of its own (a `PATH=` prefix not led
+   by the shims, `env -i`, `env -u PATH`, `command -p`). A bash whose stdin is a socket reads the system bashrc instead of `BASH_ENV`
+   (bash takes it to be run by `sshd`); Claude Code's Bash is covered through `CLAUDE_ENV_FILE`, and
+   that file points the shell's stdin at `/dev/null` for everything it starts. What the agent's
+   unconfined shell leaves uncovered: a non-bash program that
+   executes a toolchain binary by absolute path, a path assembled at run time, and deliberate evasion;
+   closing those needs the agent itself confined, with builds requested from outside.
    The agent's scoped builds through `.tauceti-repair/build` import the same function from the
    worker's checkout, and `python -m tauceti_queue.repair_sandbox [--worktree DIR] -- lake build ...`
    is the same wrapper on the command line. Because the pool and the worktree's `.lake` are separate mounts inside the
