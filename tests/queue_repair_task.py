@@ -5102,6 +5102,29 @@ exit 1
         [call] = self.agent_calls()
         self.assertIn("verification of the chain failed", call["prompt"])
 
+    def test_a_parallel_check_whose_verification_passes_is_submitted_unchanged(self):
+        raw = self.parallel_check_task()
+        self.script("✔ [1/3] Built TauCeti.One (0.1s)\n✔ [2/3] Built TauCeti.Two (0.1s)\nexit 0\n")
+        passed = {"ok": True, "checks": {"status": "passed"}, "build": {"rc": 0}, "diagnostics": []}
+        cfg = self.config()
+        with patch.object(repair_audit, "verify", return_value=passed):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.agent_calls(), [], "nothing failed: no agent")
+        [result] = self.service.results
+        self.assertEqual(result["tip_sha"], raw["tip"], "submitted unchanged")
+        local = json.loads(result["worker_notes"])["local_verification"]
+        self.assertEqual(local, {"tip": raw["tip"], "checks_passed": True})
+
+    def test_a_parallel_check_without_the_workers_own_verification_is_given_back(self):
+        self.parallel_check_task()
+        self.script("✔ [1/3] Built TauCeti.One (0.1s)\nexit 0\n")
+        cfg = self.config(worker_audits=False)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual((outcome["status"], outcome["reason"]), ("released", "artifacts_unavailable"), outcome)
+        self.assertEqual(self.agent_calls(), [])
+        self.assertEqual(self.service.results, [])
+
     def test_a_parallel_check_repairs_what_fails(self):
         self.parallel_check_task()
         self.script()

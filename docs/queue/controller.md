@@ -460,7 +460,10 @@ verifies the chain unchanged without an agent; a clean unchanged submission with
 the worker repairs as for any repair task, and the repaired tip becomes the head's next version,
 whose dispatch cancels the running staging run (`_cancel_superseded_runs`) and stages the repaired
 tip. A released check is superseded (`parallel-check-released`) rather than offered again: staging
-remains the authority.
+remains the authority. A worker without its own warm verification (no audits, cold artifacts) gives
+the check back. When `main` advances while a check is claimed, the check is superseded
+(`head-rebasing`) so the head is rebased at once, and the rebased tip gets its own check; a
+speculative task never re-dispatches a head that is behind `main`.
 
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,

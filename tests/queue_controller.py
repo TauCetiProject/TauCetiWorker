@@ -3679,6 +3679,23 @@ class ParallelHeadCheck(PreRebasedCase):
         self.controller.tick()
         self.assertEqual(self.checks(), [])
 
+    def test_a_claimed_check_gives_way_when_the_head_must_be_rebased(self):
+        _, head, check = self.dispatched()
+        self.controller.claim_task("worker-1", "admin-worker")
+        runs = len(self.github.runs)
+        self.repo.advance_main({"Z.lean": "z\n"})
+        self.controller.tick()
+        row = self.controller.store.row("tasks", {"id": check["id"]})
+        self.assertEqual((row["state"], row["resolution"]), ("superseded", "head-rebasing"))
+        for _ in range(3):
+            self.controller.tick()
+        rebased = self.head()
+        self.assertNotEqual(rebased["tip"], head["tip"])
+        stale = [r for r in self.github.runs[runs:] if r.head_sha == head["tip"]]
+        self.assertEqual(stale, [], "the old tip is never dispatched again on its old base")
+        [again] = self.checks()
+        self.assertEqual(again["tip"], rebased["tip"], "the rebased tip gets its own check")
+
     def test_a_known_good_head_or_the_setting_off_gets_no_check(self):
         self.open_batch()  # the setting is off by default
         self.controller.tick()

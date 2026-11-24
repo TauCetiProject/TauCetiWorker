@@ -4133,6 +4133,18 @@ class Controller:
     def _parallel_check(task: dict[str, Any]) -> dict[str, Any] | None:
         return next((d for d in loads(task["diagnostics"], []) if d.get("kind") == PARALLEL_CHECK), None)
 
+    def _supersede_parallel_check(
+        self, head: dict[str, Any], task: dict[str, Any], resolution: str, now: float
+    ) -> None:
+        with self.store.transaction():
+            self.store.update(
+                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
+            )
+            for claim in self._active_claims(head["id"], task_id=task["id"]):
+                self._release_claim(claim, "superseded", now)
+            self.store.journal(now, "parallel-check-finished", head["id"], task_id=task["id"], superseded=resolution)
+        self._wake.set()
+
     def _proactive_check(self, task: dict[str, Any]) -> bool:
         """The head's parallel check before staging has failed the tip (it is then a repair task)."""
         return bool((self._parallel_check(task) or {}).get("proactive"))
@@ -4318,8 +4330,10 @@ class Controller:
             self.store.update(
                 "tasks", {"id": task["id"]}, diagnostics=dumps([*loads(attempt["diagnostics"], []), *knowledge])
             )
-        elif attempt["outcome"] in (OUTCOME_INFRASTRUCTURE, OUTCOME_SUPERSEDED):
-            self._ci(head, now)  # speculative work must not disable the controller's retry policy
+        elif attempt["outcome"] in (OUTCOME_INFRASTRUCTURE, OUTCOME_SUPERSEDED) and head["base"] == self._canonical:
+            # Speculative work must not disable the controller's retry policy; a head behind `main` is
+            # rebased first, never dispatched again on its old base.
+            self._ci(head, now)
 
     # --- insertion ---------------------------------------------------------------------------------
 
@@ -6458,6 +6472,12 @@ class Controller:
         assert canonical is not None
         task_claims = [c for c in self._active_claims(head["id"]) if c["task_id"] is not None]
         if task_claims:
+            active = self._open_task(head)
+            if head["base"] != canonical and active is not None and self._proactive_check(active):
+                # The head is about to be rebased, so its tip changes: a parallel check of the old tip
+                # would only hold the rebase up. Take it back; the rebased tip gets its own check.
+                self._supersede_parallel_check(head, active, "head-rebasing", now)
+                return
             if head["base"] != canonical:
                 self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase waits for worker")
             # A speculative repair runs alongside its own candidate CI, whose observation

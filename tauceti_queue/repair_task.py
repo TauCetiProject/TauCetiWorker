@@ -3529,8 +3529,22 @@ def _run_task(
         resubmit = False
         agent_records: list[dict] = list(outcome.get("agent", []))
         agent = {"status": "ok"}
-        # A parallel check with no streamed build (no artifacts) goes straight to verification too;
-        # a failed verification then runs the agent on its findings like any repair round.
+        if parallel_check_task(task) and not pending_delivery:
+            # The check exists to verify the tip; without the worker's own verification (no audits, or
+            # cold artifacts, which skip it) it would do nothing useful. Give it back: staging decides.
+            if not cfg.worker_audits or (outcome.get("artifacts") or {}).get("cold"):
+                return release_task(
+                    cfg,
+                    client,
+                    task,
+                    state,
+                    "artifacts_unavailable",
+                    "a parallel check needs the worker's own warm verification",
+                    outcome,
+                    lease,
+                )
+        # A parallel check with no streamed build goes straight to verification too; a failed
+        # verification then runs the agent on its findings like any repair round.
         skip_agent = bool(pending_delivery) or clean_check or (parallel_check_task(task) and stream is None)
         # Numeric projections are rewritten mechanically before an agent sees them: the first findings
         # (the stream's too) and those of each failed verification (`rewrite_projections`).
