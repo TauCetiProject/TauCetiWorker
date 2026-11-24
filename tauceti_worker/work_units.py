@@ -194,19 +194,28 @@ def _claim_scope(w) -> str:
 
 
 def _fix_loop_escalated(w, c: Candidate) -> bool:
-    """Whether this host already fixed MAX_FIX_ROUNDS_WITHOUT_APPROVAL other heads of the PR. If so,
-    label the PR for a person (the label pauses fix and review fleet-wide) instead of fixing again."""
-    fixed = peer_claims.fixed_heads(_claim_scope(w), c.pr) - {c.head}
+    """Count the heads of this PR that review sent back for a fix on this host, and stop at the cap.
+
+    Called once the PR's live review state confirms a fix at `c.head`. Each distinct head here is one
+    review that asked for changes after a push, so MAX_FIX_ROUNDS_WITHOUT_APPROVAL other heads mean
+    that many fix and review cycles without an approval. The PR is then labelled for a person (the
+    label pauses fix and review fleet-wide) and this host's count starts again, so removing the label
+    resumes fixing with a fresh budget."""
+    scope = _claim_scope(w)
+    fixed = peer_claims.fixed_heads(scope, c.pr) - {c.head}
     if len(fixed) < MAX_FIX_ROUNDS_WITHOUT_APPROVAL:
+        peer_claims.note_fixed_head(scope, c.pr, c.head)
         return False
     try:
         labelled = w.gh.add_label(c.pr, NEEDS_HUMAN_LABEL) is not False
     except Exception as error:  # the cap holds on this host whether or not the label lands
         log(f"  fix #{c.pr}: could not add the {NEEDS_HUMAN_LABEL!r} label ({type(error).__name__})")
         labelled = False
+    if labelled:
+        peer_claims.clear_fixed_heads(scope, c.pr)
     log(
-        f"Global PR work: fix #{c.pr} skipped: {len(fixed)} earlier heads fixed on this host without an "
-        f"approval; {'labelled' if labelled else 'not labelled'} {NEEDS_HUMAN_LABEL!r} for a person"
+        f"  fix #{c.pr}: review sent back {len(fixed)} earlier heads on this host without an approval; "
+        f"{'labelled' if labelled else 'could not label'} it {NEEDS_HUMAN_LABEL!r} for a person instead of fixing"
     )
     return True
 
@@ -892,9 +901,6 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             claim_collision = True
             declined.append((stage, c.pr))
             continue
-        if stage == "fix" and not opts.dry_run and c.pr and c.pr not in bump_prs(sv) and _fix_loop_escalated(w, c):
-            declined.append((stage, c.pr))
-            continue
         if global_pick and c.pr:
             p = next((p for p in sv.open_prs if p.number == c.pr), None)
             areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
@@ -919,8 +925,6 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             # Spare every other worker on the host the fresh reads that found this collision.
             peer_claims.note(_claim_scope(w), stage, c.pr, c.head)
         claim_collision |= collided
-        if rc is not None and stage == "fix" and not opts.dry_run and c.pr:
-            peer_claims.note_fixed_head(_claim_scope(w), c.pr, c.head)
         if rc is not None:
             return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
         declined.append((stage, c.pr))
@@ -1754,6 +1758,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # configured account), so it stays ahead of a network read that only matters if we get this far.
     actionable = _still_actionable(stage, w, sv, c, explicit=explicit)
     if actionable is False:
+        return None
+    if stage == "fix" and actionable is True and c.pr not in bump_prs(sv) and _fix_loop_escalated(w, c):
         return None
     from .claude_api import admission_failure
     from .fleet_capacity import admission_reason

@@ -249,39 +249,46 @@ class GlobalMaintenance(unittest.TestCase):
             )
         self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), set(), "no shared directory")
 
-    def test_fix_rounds_stop_and_label_after_the_cap_of_fixed_heads(self):
+    def test_fix_rounds_stop_and_label_after_the_cap_of_sent_back_heads(self):
         from tauceti_worker import peer_claims
         from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL, NEEDS_HUMAN_LABEL
-        from tauceti_worker.survey import Candidate, Survey
+        from tauceti_worker.survey import Candidate
 
         shared = tempfile.TemporaryDirectory()
         self.addCleanup(shared.cleanup)
         labels = []
         self.w.gh.add_label = lambda pr, name: labels.append((pr, name)) or True
-        self.opts.only = ["fix"]
-
-        def attempt():
-            prepared = Survey(worker_id="test", roadmap_only="auto")
-            prepared._round_scope = (True, False)
-            prepared.needs_fix.actionable = [Candidate(10, HEAD)]
-            with patch.object(work, "dispatch", return_value=0) as dispatch:
-                try:
-                    run_round(self.w, self.opts, prepared_survey=prepared)
-                except work.NoEligibleWork:
-                    pass
-            return dispatch.called
-
         with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
             scope = work._claim_scope(self.w)
-            for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL - 1):
-                peer_claims.note_fixed_head(scope, 10, f"{n:040x}")
-            self.assertTrue(attempt(), "under the cap the fix runs")
-            self.assertIn(HEAD, peer_claims.fixed_heads(scope, 10), "a performed fix records its head")
-            self.assertTrue(attempt(), "the same head again does not count twice")
+            heads = [f"{n:040x}" for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL + 1)]
+            for head in heads[:-1]:
+                self.assertFalse(work._fix_loop_escalated(self.w, Candidate(10, head)))
+                self.assertFalse(work._fix_loop_escalated(self.w, Candidate(10, head)), "a retry at one head")
+            self.assertEqual(len(peer_claims.fixed_heads(scope, 10)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+            self.assertFalse(work._fix_loop_escalated(self.w, Candidate(11, heads[-1])), "per PR")
             self.assertEqual(labels, [])
-            peer_claims.note_fixed_head(scope, 10, "f" * 40)
-            self.assertFalse(attempt(), "at the cap the fix is not offered")
+            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(10, heads[-1])))
             self.assertEqual(labels, [(10, NEEDS_HUMAN_LABEL)])
+            self.assertEqual(peer_claims.fixed_heads(scope, 10), set(), "a person removing the label resumes fixes")
+
+            # A label that cannot be added keeps the cap on this host and the count, so the next try labels.
+            for head in heads[:-1]:
+                work._fix_loop_escalated(self.w, Candidate(12, head))
+            self.w.gh.add_label = Mock(side_effect=OSError("down"))
+            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(12, heads[-1])))
+            self.assertEqual(len(peer_claims.fixed_heads(scope, 12)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+            self.w.gh.add_label = Mock(return_value=False)
+            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(12, heads[-1])))
+            self.assertEqual(len(peer_claims.fixed_heads(scope, 12)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+
+    def test_the_fix_cap_is_counted_only_after_the_live_recheck_confirms_the_fix(self):
+        import inspect
+
+        source = inspect.getsource(work.dispatch)
+        recheck = source.index("actionable = _still_actionable(stage, w, sv, c, explicit=explicit)")
+        cap = source.index("_fix_loop_escalated(w, c)")
+        self.assertLess(recheck, cap)
+        self.assertIn('stage == "fix" and actionable is True and c.pr not in bump_prs(sv)', source)
 
     def test_peer_claim_hints_expire_and_are_scoped(self):
         from tauceti_worker import peer_claims

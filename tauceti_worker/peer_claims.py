@@ -10,7 +10,7 @@ The store lives under the explicitly configured shared read directory
 ($TAUCETI_GITHUB_SHARED_DIR, which the fleet's worker manager sets); without it no hint is
 recorded or read.
 
-The store also keeps, per PR, the heads that fix rounds on this host have repaired, so the host can
+The store also keeps, per PR, the heads that review sent back for a fix on this host, so the host can
 see a PR that fix and review keep handing back and forth (constants.MAX_FIX_ROUNDS_WITHOUT_APPROVAL).
 One empty file per head makes concurrent records race-free.
 """
@@ -95,7 +95,8 @@ def _prune(root: Path, now: float) -> None:
             pass
 
 
-FIXED_HEAD_TTL_S = 14 * 86400
+# Long enough to outlive any PR the fleet still works on; only bounds stale records.
+FIXED_HEAD_TTL_S = 60 * 86400
 
 
 def _fixed_dir(scope: str, pr: int) -> Path | None:
@@ -106,7 +107,7 @@ def _fixed_dir(scope: str, pr: int) -> Path | None:
 
 
 def note_fixed_head(scope: str, pr: int, head: str) -> None:
-    """Record that a fix round on this host repaired `head` of PR `pr`."""
+    """Record that review sent `head` of PR `pr` back for a fix on this host."""
     directory = _fixed_dir(scope, pr)
     if directory is None or not head or "/" in head:
         return
@@ -118,7 +119,7 @@ def note_fixed_head(scope: str, pr: int, head: str) -> None:
 
 
 def fixed_heads(scope: str, pr: int, *, now: float | None = None) -> set[str]:
-    """The heads of PR `pr` that fix rounds on this host repaired in the last FIXED_HEAD_TTL_S."""
+    """The heads of PR `pr` sent back for a fix on this host in the last FIXED_HEAD_TTL_S."""
     directory = _fixed_dir(scope, pr)
     if directory is None:
         return set()
@@ -134,3 +135,14 @@ def fixed_heads(scope: str, pr: int, *, now: float | None = None) -> set[str]:
     except OSError:
         pass
     return heads
+
+
+def clear_fixed_heads(scope: str, pr: int) -> None:
+    directory = _fixed_dir(scope, pr)
+    if directory is None:
+        return
+    try:
+        for path in directory.iterdir():
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass

@@ -33,7 +33,7 @@ MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't
 # The review-ROUND budget lives in CI now (TauCeti housekeeping closes a PR reviewed to its cap while
 # still blocking). The worker no longer caps its own review rounds — it keeps reviewing on every new
 # head until the PR merges or CI closes it — so every PR reaches a terminal state.
-# Per PR and host: after fix rounds on this many distinct heads, a PR that is still not approved is
+# Per PR and host: once review has sent this many other heads of a PR back for a fix, the PR is
 # labelled NEEDS_HUMAN_LABEL instead of being fixed again. Every pause set honours the label, so the
 # whole fleet stops fixing and reviewing it until a person removes it. An approved PR leaves the fix
 # stage for the queue, so the count only grows while review keeps asking for changes.
