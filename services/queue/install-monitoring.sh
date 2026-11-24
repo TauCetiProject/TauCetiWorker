@@ -6,9 +6,10 @@
 # default ~/TauCetiQueue, whose own working tree is left alone), hands off to that release's copy
 # of this script, builds the release's uv environment, writes
 # ~/.config/tauceti-queue/monitoring-environment from the example when absent, installs the
-# monitoring units (the live publisher, the live repair-phase observer, and the hourly history report
-# with its timer) pointing at the release, reloads, restarts the two long-running units and checks
-# that they stay active and run from the release. The controller and the repair workers are not
+# monitoring units (the live publisher, the live repair-phase observer, the hourly history report
+# with its timer, and the Forgejo contributor-fleets team sync with its timer) pointing at the
+# release, reloads, restarts the two long-running units and checks that they stay active and run
+# from the release. The controller and the repair workers are not
 # touched, and keep running from their own release directories; none of these units can change
 # queue state. Unused release directories are then removed (services/queue/release.sh).
 #
@@ -40,7 +41,8 @@ WAIT=20
 UNIT_DIR="$HOME/.config/systemd/user"
 CONFIG_DIR="$HOME/.config/tauceti-queue"
 LONG_RUNNING=(tauceti-queue-monitoring.service tauceti-queue-task-activity.service)
-UNITS=("${LONG_RUNNING[@]}" tauceti-queue-monitoring-history.service tauceti-queue-monitoring-history.timer)
+UNITS=("${LONG_RUNNING[@]}" tauceti-queue-monitoring-history.service tauceti-queue-monitoring-history.timer
+       tauceti-queue-forgejo-team-sync.service tauceti-queue-forgejo-team-sync.timer)
 
 ARGS=("$@")
 while [ $# -gt 0 ]; do
@@ -50,7 +52,7 @@ while [ $# -gt 0 ]; do
     --checkout) CHECKOUT="$2"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     --wait) WAIT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
     *) echo "install-monitoring.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
@@ -107,8 +109,8 @@ for unit in "${UNITS[@]}"; do
   release_render_unit "$unit"
 done
 systemctl --user daemon-reload
-systemctl --user enable --quiet "${LONG_RUNNING[@]}" tauceti-queue-monitoring-history.timer
-systemctl --user start tauceti-queue-monitoring-history.timer
+systemctl --user enable --quiet "${LONG_RUNNING[@]}" tauceti-queue-monitoring-history.timer tauceti-queue-forgejo-team-sync.timer
+systemctl --user start tauceti-queue-monitoring-history.timer tauceti-queue-forgejo-team-sync.timer
 
 if [ "$RESTART" = 1 ]; then
   log "restarting ${LONG_RUNNING[*]}"

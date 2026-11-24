@@ -22,6 +22,7 @@ from .paths import HERE, fleet_data_root, legacy_data_root, login_home, user_dat
 VERIFY_TMP = Path("/tmp")  # verification.cache_root()'s default parent
 UNITS = (
     "tauceti-workers.service",
+    "tauceti-workers.slice",  # its limits, and the worker scopes a manager restart leaves running
     "tauceti-cleanup.timer",
     "tauceti-cleanup.service",
     "tauceti-activity.timer",

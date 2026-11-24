@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from tauceti_tools.claims import ForgejoGitClaim
 
@@ -38,12 +39,18 @@ class SourceClaims(Claims):
         actor = self.source.authenticated_actor()
         if current is None or actor is None or current["head"]["sha"] != head:
             return False
-        if current["user"]["id"] != int(actor.principal.native_id):
+        from .source_identity import maintains_author
+
+        if current["user"]["id"] != int(actor.principal.native_id) and not (
+            (current["head"].get("repo") or {}).get("id") == self.source.identity.native_id
+            and maintains_author(actor, self.source.repository.forge, current["user"]["id"])
+        ):
             return False
         repository = RepositoryRef(self.source.repository.forge, owner + "/" + repo)
         if current["head"]["repo"]["full_name"].casefold() != repository.name.casefold():
             return False
         self.lease = lease(self.source, self.cfg, f"branch/{pr}")
+        self.lease_started = time.time()
         result = self.lease.acquire()
         if result == 1:
             self.collisions += 1
@@ -93,6 +100,18 @@ class SourceClaims(Claims):
 
 
 def main():
+    """claim-source: 0 held/renewed, 1 held elsewhere or lost, 2 unavailable (including setup)."""
+    from tauceti_tools.forge import ForgeError
+
+    try:
+        return _main()
+    except (ForgeError, SourceUnavailable, OSError, KeyError, ValueError):
+        # A failed source binding or credential read says nothing about who holds the lease; an
+        # uncaught exception would exit 1, which reads as the lease being lost.
+        return 2
+
+
+def _main():
     import sys
     from pathlib import Path
     from types import SimpleNamespace

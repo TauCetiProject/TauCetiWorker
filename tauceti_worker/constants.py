@@ -33,6 +33,11 @@ MAX_FIX_ATTEMPTS = 3  # per-head: stop re-running the fixer on a commit it can't
 # The review-ROUND budget lives in CI now (TauCeti housekeeping closes a PR reviewed to its cap while
 # still blocking). The worker no longer caps its own review rounds — it keeps reviewing on every new
 # head until the PR merges or CI closes it — so every PR reaches a terminal state.
+# Per PR and host: once review has sent this many other heads of a PR back for a fix, the fleet
+# closes the PR if it maintains it (its own, or an adopted Forgejo author's) and otherwise stops
+# offering it fix rounds. An approved PR leaves the fix stage for the queue, so the count only grows
+# while review keeps asking for changes.
+MAX_FIX_ROUNDS_WITHOUT_APPROVAL = 6
 MAX_INFRA_REFUNDS = 20  # per-head: how many times a provider outage may hand an attempt back before
 # the budget starts charging anyway. Not a cost control — the escalating loop back-off already caps
 # retries at ~4/hour — but a stop on MISCLASSIFICATION: if some persistent, PR-specific failure ever
@@ -52,7 +57,7 @@ REVIEW_PROVIDER_DOWN_EXIT = 3
 # not recognise and every report wedges. Bump this together with the two pins in
 # TauCetiRoadmap/.github/workflows/progress-*.yml.
 PROGRESS = os.environ.get("TAUCETI_PROGRESS_REPO", "TauCetiProject/TauCetiProgress")
-PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "70e8970f917cd5e1e06473ffef21385c2e94db91")
+PROGRESS_REF = os.environ.get("TAUCETI_PROGRESS_REF", "ddaaed27a70d9f376d300edf32d521843c27cc16")
 # A repaired tool gets a fresh error budget. Failures of an older pinned release must not
 # permanently suppress progress after an upgrade; the attempt gap still limits retries.
 # Keep the usual immutable SHA readable, and hash other refs so a branch name containing
@@ -250,11 +255,17 @@ SBCACHE_BACKSTOP_S = int(os.environ.get("TAUCETI_META_BACKSTOP", "1800"))
 
 COMMENTS_MEMO_S = 5  # in-memory window over which one survey pass coalesces its issue-comment fetches
 
-# Native source surveys list every open PR once, then read review history for at most this many PRs
-# that no cached observation describes at their current (head, updatedAt). Every other PR is
-# classified from the cache or left for a later survey, so a survey's cost does not grow with the
-# number of open PRs. Explicit `--pr` targets are always read.
-SURVEY_DETAIL_READS = max(1, int(os.environ.get("TAUCETI_SURVEY_DETAIL_READS", "4")))
+# Native source surveys list every open PR once and classify every one of them from the host-shared
+# review-state index (review_state.shared_index_root), reading only the PRs whose (updatedAt, head)
+# the index does not yet describe. One worker refreshes at a time; a peer waits at most this long for
+# the refresh lock before classifying from the index as it stands.
+REFRESH_LOCK_WAIT_S = 900
+# Consecutive failed reads that end a refresh: the source is unavailable, so stop rather than fail
+# once per PR. The next survey continues.
+REFRESH_FAILURE_LIMIT = 3
+# Ambiguous owned mergeability checks per automatic survey. Each is a Git fetch, not a review-state
+# read, so it stays small; explicit `--pr` targets are always checked.
+MERGEABILITY_CHECKS = 4
 
 # How long a native source's discussion and review-thread observation, keyed on the PR's
 # (updatedAt, head), may answer survey triage. Forgejo does not move updatedAt for comment edits or

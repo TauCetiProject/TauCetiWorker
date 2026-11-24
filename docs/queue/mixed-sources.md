@@ -209,9 +209,9 @@ primary; otherwise every rule below is off.
   under `scripts/` changes Lake build inputs: it gets no cache hit and the next
   head waits for its base cache to be published.
 - **No repair.** A control-file input gets `no_repair`, which no label event
-  clears. Repair agents never edit it: a failing lane head is handled by the
-  ordinary escalation (attribution, withdrawal, bisection), and a repair may only
-  empty a member, which the queue then withdraws as `problem-anticipated`. The
+  clears. Repair agents never edit it: a failing lane head goes to repair like
+  any other, and a repair may only empty a member, which the queue then
+  withdraws as `problem-anticipated`. The
   withdrawal comment says the queue does not edit control files.
 
 Status shows `lane` on every open batch and on the head, `control` on each

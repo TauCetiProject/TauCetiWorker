@@ -1,0 +1,23 @@
+# Mirror the GitHub claim repository's collaborators into the Forgejo `contributor-fleets` team
+# (docs/forgejo-worker.md, "Claim access for contributor fleets"), run every ten minutes by
+# tauceti-queue-forgejo-team-sync.timer. `services/queue/install-monitoring.sh` installs both.
+#
+# WARNING: never add a systemd drop-in (*.service.d/*.conf) for this unit: drop-ins silently
+# override what install-monitoring.sh installs, and the installer refuses to run while one exists.
+# The installer renders this file with the code paths below pointing at the unit's own release
+# directory, ~/TauCetiQueue-releases/<sha>-<time> (services/queue/release.sh). It runs origin/main
+# HEAD; running any other revision requires explicit permission from a human operator and must be
+# undone as soon as the change lands on main.
+
+[Unit]
+Description=Mirror Tau Ceti claim access from GitHub to the Forgejo contributor-fleets team
+Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/forgejo-worker.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/TauCetiQueue
+Environment=PYTHONUNBUFFERED=1
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ExecStart=%h/TauCetiQueue/.venv/bin/python -m tauceti_queue.forgejo_team_sync --github-user tauceti-ai-for-science --forgejo-token-file %h/.config/tauceti-queue/forgejo-team-sync-token
+TimeoutStartSec=5min
+UMask=0077

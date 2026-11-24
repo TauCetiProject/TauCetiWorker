@@ -100,6 +100,85 @@ def checkout(args, source):
     return 0
 
 
+# PR fields the issue index carries. Forgejo renders an issue row without the git work (head,
+# base and diff stat) it does for each row of a pull listing.
+INDEX_FIELDS = frozenset(
+    {"number", "title", "body", "url", "state", "labels", "author", "createdAt", "updatedAt", "closedAt", "mergedAt"}
+)
+
+
+def list_command(command, source):
+    """`gh pr list --json` without a native pull listing, when its fields allow.
+
+    Agents list every open PR (often with `--limit 1000`) and the merged ones to avoid duplicate
+    work, and each native pull listing costs Forgejo seconds of git work per page. Open PRs come
+    from the host's shared survey inventory; other states, or fields it lacks, from the issue
+    index, where "merged" includes PRs the queue landed. Filters, other fields and plain-text
+    output go to Tools as before (None).
+    """
+    from tauceti_tools.forge import Incomplete
+    from tauceti_tools.forge_read import project, pull_record
+
+    from .github import BORS_MERGED_PREFIX
+
+    options = command.options
+    if command.args or "json" not in options or set(options) - {"json", "jq", "limit", "state", "repo"}:
+        return None
+    host_repo = urlsplit(source.repository.forge.url).netloc + "/" + source.repo
+    # Only an explicitly selected source repository: without one, Tools picks the repository of
+    # the working directory's checkout, which may be another.
+    if (options.get("repo") or os.environ.get("GH_REPO")) not in (source.repo, source.repository.url, host_repo):
+        return None
+    fields, state, limit = options["json"].split(","), options.get("state", "open"), int(options.get("limit", "30"))
+    if state == "open" and set(fields) <= set(source.inventory_fields):
+        from .source_survey import discovery_inventory
+
+        source.shared_inventory = True
+        # The inventory keeps PR-number order (a corrected row is reinserted by number), which is
+        # gh's newest-first order: only imported PRs can be created out of number order, and the
+        # native listing of every open PR showed none (21 Nov: no inversion among 1,272).
+        rows = discovery_inventory(source)
+        if rows is None:
+            raise ForgeError("Forgejo open inventory unavailable")
+    elif state in ("open", "closed", "merged", "all") and set(fields) <= INDEX_FIELDS:
+        from urllib.parse import urlencode
+
+        rows, seen = [], set()
+        query = urlencode({"type": "pulls", "state": "closed" if state == "merged" else state})
+        for batch in source.api.pages(f"repos/{source.repo}/issues?{query}"):
+            for issue in batch:
+                pull = issue.get("pull_request") if isinstance(issue, dict) else None
+                if not isinstance(pull, dict) or not isinstance(pull.get("merged"), bool):
+                    raise Incomplete("issue index did not identify a PR")
+                # The queue lands a PR by squashing it and closing it unmerged under the Bors
+                # prefix (as ForgejoWorkerSource.merged_prs counts landings), so natively merged
+                # PRs are rare here and "merged" means landed. Landed PRs are not "closed".
+                landed = pull["merged"] or (
+                    issue.get("state") == "closed" and str(issue.get("title") or "").startswith(BORS_MERGED_PREFIX)
+                )
+                if issue["number"] in seen or state in ("closed", "merged") and landed != (state == "merged"):
+                    continue
+                seen.add(issue["number"])
+                merged_at = pull.get("merged_at") or (issue.get("closed_at") if landed else None)
+                rows.append(pull_record({**issue, "merged": landed, "merged_at": merged_at}, source.repository, fields))
+                if len(rows) == limit:
+                    break
+            if len(rows) == limit:
+                break
+    else:
+        return None
+    rendered = json.dumps([project(row, fields) for row in rows[:limit]], ensure_ascii=False) + "\n"
+    if options.get("jq"):
+        if options["jq"].startswith("-"):
+            return None  # Tools explains this
+        result = subprocess.run(["jq", "-r", options["jq"]], input=rendered, text=True, capture_output=True)
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        return result.returncode
+    sys.stdout.write(rendered)
+    return 0
+
+
 def api_command(command, source):
     """Only worker-specific thread reads and comment writes bypass shared routing."""
     options = command.options
@@ -166,6 +245,10 @@ def main(argv=None):
         if args[:2] == ["pr", "checkout"]:
             return checkout(args[2:], source)
         command = parse_command(args)
+        if command.key == ("pr", "list"):
+            result = list_command(command, source)
+            if result is not None:
+                return result
         if command.group == "api":
             result = api_command(command, source)
             if result is not None:

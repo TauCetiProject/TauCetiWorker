@@ -49,17 +49,25 @@ DATA_PARTS = ("state", "checkouts", "logs", "host-repositories")
 FLEET_RUNTIMES = "worker-runtimes"
 
 
-def fleet_data_root() -> Path | None:
-    """The fixed data root of a Fleet-installed worker, or None outside Fleet.
+def fleet_dir() -> Path | None:
+    """The Fleet installation that staged this worker runtime, or None outside Fleet.
 
-    Fleet stages each worker revision as a virtualenv under <fleet>/worker-runtimes/<revision>/;
-    every revision shares <fleet>/worker-data/root, so switching revisions never moves data."""
+    Fleet stages each worker revision as a virtualenv under <fleet>/worker-runtimes/<revision>/,
+    and may delete a revision once it is no longer pinned."""
     if not INSTALLED:
         return None
     for parent in HERE.parents:
         if parent.parent.name == FLEET_RUNTIMES:
-            return parent.parent.parent / "worker-data" / "root"
+            return parent.parent.parent
     return None
+
+
+def fleet_data_root() -> Path | None:
+    """The fixed data root of a Fleet-installed worker, or None outside Fleet.
+
+    Every revision shares <fleet>/worker-data/root, so switching revisions never moves data."""
+    fleet = fleet_dir()
+    return None if fleet is None else fleet / "worker-data" / "root"
 
 
 def virtualenv_of(path: Path) -> Path | None:

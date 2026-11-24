@@ -12,6 +12,8 @@ import time
 import uuid
 from pathlib import Path
 
+from .excerpt import ends
+
 SLICE_ENV = "TAUCETI_WORKER_SLICE"
 
 
@@ -81,7 +83,7 @@ def enter(worker_id: str, runtime_dir: Path) -> dict:
             timeout=3,
         )
         if result.returncode:
-            raise OSError(f"scope registration exited {result.returncode}: {result.stderr.strip()[-500:]}")
+            raise OSError(f"scope registration exited {result.returncode}: {ends(result.stderr, 500)}")
         # StartTransientUnit returns a queued job, not its completion. Only this
         # wrapper waits, briefly; the manager and all other workers keep running.
         deadline = time.monotonic() + 2
@@ -185,7 +187,7 @@ def collect_oom_events(config: Path, since: float) -> bool:
             check=True,
         )
         if result.stderr.strip():
-            raise OSError("System journal coverage unavailable: " + result.stderr.strip()[-500:])
+            raise OSError("System journal coverage unavailable: " + ends(result.stderr, 500))
         for line in result.stdout.splitlines():
             record = json.loads(line)
             message = record.get("MESSAGE", "")

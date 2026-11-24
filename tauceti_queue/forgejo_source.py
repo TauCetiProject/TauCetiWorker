@@ -489,11 +489,11 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             result = self.client.post_comment(self.repository, number, full)
         return str(self._positive(result.get("id")) if isinstance(result, dict) else self._positive(None))
 
-    def post_comment(self, repo, number, body, marker):
+    def post_comment(self, repo, number, body, marker, *, recovery_head=None):
         self._bound(repo)
         actor = SourceActor.from_native(self.repository.forge, self.client.current_user())
         # The queue's account carries recovery authority; quoted text never adds markers.
-        body = body.replace("<!--tauceti-", "&lt;!--tauceti-")
+        body = ports.recovery_body(body, recovery_head)
         return self._upsert_comment(number, f"{body.rstrip()}\n\n{comment_marker(marker)}\n", marker, actor)
 
     def _labels(self):

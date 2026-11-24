@@ -33,7 +33,7 @@ from tauceti_queue.controller import (  # noqa: E402
     TaskError,
     live_progress_at,
 )
-from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
+from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller, run_git  # noqa: E402
 from tauceti_queue.ports import AGENT_INSTRUCTION  # noqa: E402
 from tauceti_queue.store import loads  # noqa: E402
 
@@ -64,30 +64,17 @@ class ControllerCase(unittest.TestCase):
 
 
 class RepairCheckOwnership(ControllerCase):
-    def claimed_repair(self, diagnostic):
+    def test_claims_name_no_check_owner(self):
+        """Every worker verification runs the complete check set; no claim hands checks to staging."""
         self.approve(101, {"A.lean": "a\n"})
         self.controller.tick()
         head = self.controller._head()
-        self.controller._create_task(head, "repair", head["base"], [diagnostic], self.clock())
-        return self.controller.claim_task("worker", "admin-worker")
-
-    def test_a_diagnosed_audit_repair_runs_checks_before_resubmission(self):
-        task = self.claimed_repair({"kind": "audit", "module": "TauCeti.A", "message": "import collision"})
-        self.assertEqual(task.extra["checks_owner"], "worker")
-        self.controller.renew_task(task.task_id, task.claim_token)
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
-
-    def test_a_diagnosed_lint_repair_runs_checks_before_resubmission(self):
-        task = self.claimed_repair({"kind": "lint", "module": "TauCeti.A", "message": "unused hypothesis"})
-        self.assertEqual(task.extra["checks_owner"], "worker")
-
-    def test_compiler_only_repairs_still_defer_full_checks_to_staging(self):
-        task = self.claimed_repair({"kind": "compiler", "module": "TauCeti.A", "message": "type mismatch"})
-        self.assertEqual(task.extra["checks_owner"], "staging")
-
-    def test_admission_predictions_do_not_require_a_second_full_check(self):
-        task = self.claimed_repair({"kind": "admission_predictions", "proactive": True, "records": []})
-        self.assertEqual(task.extra["checks_owner"], "staging")
+        for kind in ("compiler", "audit", "lint"):
+            diagnostic = {"kind": kind, "module": "TauCeti.A", "message": "finding"}
+            self.controller._create_task(head, "repair", head["base"], [diagnostic], self.clock())
+            task = self.controller.claim_task("worker", "admin-worker")
+            self.assertNotIn("checks_owner", task.extra)
+            self.controller.release_task(task.task_id, task.claim_token, "released")
 
 
 class DeclarationNames(ControllerCase):
@@ -380,6 +367,42 @@ class Verdicts(ControllerCase):
         self.assertEqual(json.loads(task["diagnostics"]), findings[:1])
         self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
 
+    def oom_findings(self, *located):
+        return diagnostics.parse_log(
+            [
+                *located,
+                "error: Lean process for /work/pr/TauCeti/A/B.lean was killed by signal 9 after 712s, likely out of memory",
+                "Some required targets logged failures:",
+                "- TauCeti.A.B",
+                "error: build failed",
+            ]
+        )
+
+    def test_lean_killed_out_of_memory_is_an_infrastructure_failure(self):
+        self.github.ci_policy = lambda *_: ("fail", self.oom_findings())
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "infrastructure")
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+
+    def test_lean_killed_out_of_memory_beside_a_compiler_error_creates_repair(self):
+        findings = self.oom_findings("TauCeti/C.lean:3:4: error: unknown identifier 'x'")
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        task = self.controller.store.row("tasks", {"batch_id": head["id"], "state": "open"})
+        self.assertEqual(task["kind"], "repair")
+        self.assertEqual(
+            [(f["kind"], f["module"]) for f in json.loads(task["diagnostics"])], [("compiler", "TauCeti.C")]
+        )
+
     def test_bound_failure_with_failed_finalizer_and_no_parsed_finding_creates_repair(self):
         # The finalizer exits 1 after posting build=failure; a bound failed status is a source verdict
         # even when no log line parses into a finding.
@@ -398,6 +421,43 @@ class Verdicts(ControllerCase):
         [finding] = json.loads(task["diagnostics"])
         self.assertEqual(finding["kind"], "status")
         self.assertEqual(len(self.github.dispatches), 1, "source errors must not consume infrastructure retries")
+
+    def test_incomplete_sandboxed_build_with_failed_finalizer_is_infrastructure(self):
+        # The `sandboxed-build` runner was OOM-killed before its report step (attempt 278): the
+        # finalizer posts a bound failed `build` saying the build did not complete, then exits 1.
+        findings = diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("incomplete", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        attempt = self.attempt(head)
+        self.assertEqual(attempt["outcome"], "infrastructure")
+        self.assertIn("did not complete", attempt["outcome_detail"])
+        self.assertEqual(self.controller.store.count("tasks", {}), 0)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        self.clock.advance(self.controller.setting("infrastructure_retry_backoff_seconds") + 1)
+        self.controller.tick()
+        self.assertEqual(len(self.github.dispatches), 2, "an incomplete build is re-dispatched")
+
+    def test_failed_build_verdict_with_compiler_finding_stays_source_failure(self):
+        # The same failed finalizer, but the build reported its own verdict: a source failure.
+        findings = diagnostics.parse_log(["TauCeti/A.lean:1:0: error: unknown identifier 'x'"])
+        self.assertEqual(findings[0]["kind"], "compiler")
+        findings += diagnostics.infrastructure_findings(
+            {"conclusion": "failure"}, [{"name": "finalize-merge-group-build", "conclusion": "failure"}]
+        )
+        self.github.ci_policy = lambda *_: ("fail", findings)
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.github.complete_runs()
+        self.controller.tick()
+        self.assertEqual(self.attempt(head)["outcome"], "source-failure")
+        self.assertEqual(self.controller.store.row("tasks", {"batch_id": head["id"]})["kind"], "repair")
 
     def test_dependency_audit_collision_with_failed_finalizer_creates_repair(self):
         findings = diagnostics.parse_log(
@@ -834,6 +894,8 @@ CREATE TABLE ci_attempts (
 
 # Columns declared on `ci_attempts` for runs the controller cancels.
 CANCEL_COLUMNS = ("cancelled_at", "cancelled_by", "cancel_reason", "cancel_result")
+# The early-staging columns (decisions 199 B and 200).
+EARLY_COLUMNS = ("early", "generation", "dispatch_kind")
 
 # Columns declared on `batches` and `tasks` after those tables existed.
 PRE_REBASED_CHAIN_COLUMNS = (("batches", "pre_rebase_prepared"), ("tasks", "pre_rebase_source"))
@@ -859,6 +921,7 @@ class OlderStore(ControllerCase):
             "dispatch_retryable",
             "dispatch_failures",
             *CANCEL_COLUMNS,
+            *EARLY_COLUMNS,
         ):
             columns.remove(column)
         listed = ", ".join(columns)
@@ -885,6 +948,7 @@ class OlderStore(ControllerCase):
             "dispatch_retryable",
             "dispatch_failures",
             *CANCEL_COLUMNS,
+            *EARLY_COLUMNS,
         ):
             self.assertIn(column, present)
         for table, column in PRE_REBASED_CHAIN_COLUMNS:
@@ -1169,6 +1233,33 @@ class LostRuns(ControllerCase):
                 break
             time.sleep(0.01)
         self.assertFalse(self.controller._live_reading)
+
+    def test_failing_reads_are_logged_once_and_their_recovery_too(self):
+        advanced, _reads, inline = self.live_reports()
+        self.github.start_runs()
+        advanced["at"] = self.clock()
+        with inline:
+            self.observe()
+            outcomes = iter([RuntimeError("HTTP 403: blocked"), OSError("timed out"), None, RuntimeError("HTTP 500")])
+
+            def failing(run_id, run_attempt):
+                outcome = next(outcomes)
+                if outcome is not None:
+                    raise outcome
+                return None
+
+            working = self.controller.live_progress
+            self.controller.live_progress = failing
+            with self.assertLogs(self.controller.log, "WARNING") as logged:
+                for _ in range(4):
+                    self.observe(LIVE_PROGRESS_SECONDS)
+            # Different errors and a missing report within one outage: still one line.
+            self.assertEqual(len([m for m in logged.output if "unavailable" in m]), 1, logged.output)
+            self.controller.live_progress = working
+            advanced["at"] = self.clock()
+            with self.assertLogs(self.controller.log, "INFO") as logged:
+                self.observe(LIVE_PROGRESS_SECONDS)
+            self.assertTrue(any("readable again" in m for m in logged.output))
 
     def test_a_failed_watermark_write_does_not_stop_polling(self):
         advanced, reads, inline = self.live_reports()
@@ -1596,32 +1687,230 @@ class PreRebase(ControllerCase):
         self.assertEqual(self.controller.claim_task("w", "admin-worker").kind, "pre_rebase")
         self.assertIsNone(batch["prepared_version"])
 
+    def test_the_next_heads_pre_rebase_takes_the_newest_later_preparations_slot(self):
+        """Background slots full of later batches' preparations: the next head's pre-rebase takes the
+        newest one's slot, and the slot kept for head work stays free."""
+        for name, value in (
+            ("repair_concurrency", 3),
+            ("background_start_limit", 3),
+            ("open_batch_limit", 3),
+            ("prepare_open_batches", False),
+        ):
+            self.controller.set_setting(name, value, "kim")
+        self.controller.set_setting("publication_enabled", False, "kim")  # holds the pre-rebase off
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        for number in (102, 103, 104):  # each conflicts with the open batches before it
+            self.approve(number, {"Shared.lean": f"line one\nline two by {number}\nline three\n"})
+            self.controller.tick()
+        successor, later, last = self.controller.store.rows("batches", {"state": "open"}, order="id")
+        for batch in (later, last):
+            self.controller._create_task(batch, "prepare", batch["base"], [], self.clock())
+        first = self.controller.claim_task("w1", "admin-worker")
+        self.clock.advance(1)
+        second = self.controller.claim_task("w2", "admin-worker")
+        self.assertEqual(
+            {(first.kind, first.batch_id), (second.kind, second.batch_id)},
+            {("prepare", later["id"]), ("prepare", last["id"])},
+        )
+        self.controller.set_setting("publication_enabled", True, "kim")
+        self.controller.tick()
+        [pre_rebase] = [t for t in self.open_tasks(successor) if t["kind"] == "pre_rebase"]
+        third = self.controller.claim_task("w3", "admin-worker")
+        self.assertEqual((third.kind, third.task_id), ("pre_rebase", pre_rebase["id"]))
+        released = self.controller.store.row("tasks", {"id": second.task_id})
+        self.assertEqual((released["state"], released["resolution"]), ("superseded", "pre-rebase-first"))
+        self.assertEqual(
+            self.controller.store.row("tasks", {"id": first.task_id})["state"], "open", "the older one keeps its slot"
+        )
+        self.assertEqual(len(self.controller._active_task_claims()), 2, "the claims did not grow")
+        self.assertIsNone(self.controller.claim_task("w4", "admin-worker"), "the slot kept for head work stays free")
+        self.assertEqual(len(self.controller.store.journal_entries("pre-rebase-first")), 1)
+
     def test_background_checks_yield_when_the_predecessor_lands(self):
         self.conflicting_batch()
         task = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(task.kind, "pre_rebase")
-        self.assertEqual(task.extra["checks_owner"], "worker")
-        self.assertEqual(self.controller.task_check_policy(task.task_id), {"checks_owner": "worker", "renew_after": 15})
+        self.assertEqual(task.extra["renew_after"], 15)
         self.github.complete_runs()
         for context in VERDICT_CONTEXTS:
             self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
         self.controller.tick()
         self.assertIsNone(self.controller._head(), "the source claim still owns the successor")
         self.controller.renew_task(task.task_id, task.claim_token)
+
+    def test_a_pre_rebase_in_flight_when_the_head_lands_is_what_the_next_head_seals_with(self):
+        """Its work is not lost: promotion waits for the claim, and the submitted chain, already on the
+        landed head's tip (now `main`), becomes the head without another rebase."""
+        self.conflicting_batch()
+        batch = self.open_batch()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution({"Shared.lean": resolved}, explanation="Kept both edits.")},
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual((head["id"], head["base"]), (batch["id"], self.repo.main_sha()))
+        self.assertEqual(self.repo.file_at(head["tip"], "Shared.lean"), resolved)
         self.assertEqual(
-            self.controller.task_check_policy(task.task_id), {"checks_owner": "staging", "renew_after": 15}
+            self.controller.store.rows("tasks", {"batch_id": batch["id"], "kind": "rebase_conflict"}),
+            [],
+            "no new rebase",
         )
 
-    def test_background_checks_continue_while_head_selection_is_held(self):
+    def assert_pre_rebase_kept_past_the_landed_tip(self, land):
+        """`main` is past the head's tip when the next head seals: the claimed task, made on that tip, is
+        preserved rather than superseded, and its result is carried onto `main`."""
         self.conflicting_batch()
-        task = self.controller.claim_task("w", "admin-worker")
+        batch = self.open_batch()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution({"Shared.lean": resolved}, explanation="Kept both edits.")},
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        land(self.controller._head())
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        self.assertEqual(
+            [e["detail"] for e in self.controller.store.journal_entries("landing-preserved")],
+            [{"tasks": [task.task_id]}],
+        )
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual((head["id"], head["base"]), (batch["id"], self.repo.main_sha()))
+        self.assertEqual(self.repo.file_at(head["tip"], "Shared.lean"), resolved)
+        self.assertEqual(self.repo.file_at(head["tip"], "Other.lean"), "other\n")
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+
+    def test_a_pre_rebase_in_flight_is_kept_when_main_moves_on_after_the_landing(self):
+        def land(head):
+            self.github.complete_runs()
+            for context in VERDICT_CONTEXTS:
+                self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+            self.controller.tick()  # promotes the head and records the landing
+            self.repo.advance_main({"Other.lean": "other\n"})
+            self.controller.tick()
+
+        self.assert_pre_rebase_kept_past_the_landed_tip(land)
+
+    def claimed_pre_rebase_adding_extra(self):
+        """The conflicting batch's pre-rebase, claimed, whose resolution of 102 also adds `Extra.lean`."""
+        self.conflicting_batch()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {
+                f"{PROJECT}#102": Resolution(
+                    {"Shared.lean": resolved, "Extra.lean": "from the pre-rebase\n"}, explanation="Kept both edits."
+                )
+            },
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        return agent, task
+
+    def assert_pre_rebase_unused(self, batch, reason, source_pr):
+        """The head's own chain was replayed onto `main`, and the journal says why its pre-rebase was not used."""
+        head = self.controller._head()
+        self.assertEqual(head["id"], batch["id"])
+        self.assertEqual(
+            [t["kind"] for t in self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})],
+            ["rebase_conflict"],
+        )
+        [entry] = self.controller.store.journal_entries("pre-rebase-unused", batch["id"])
+        detail = entry["detail"]
+        self.assertEqual((detail["reason"], detail["source_pr"], detail["paths"]), (reason, source_pr, ["Extra.lean"]))
+        self.assertEqual(detail["onto"], self.repo.main_sha())
+        # The head-time task starts from the pre-rebased chain: the worker reuses its resolutions and
+        # resolves only what is left (`repair_task.seed_pre_rebased`).
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        [pre_rebased] = [d for d in loads(task["diagnostics"]) if d.get("kind") == "pre_rebased_chain"]
+        self.assertEqual(
+            pre_rebased,
+            {
+                "kind": "pre_rebased_chain",
+                "base": detail["pre_rebase_onto"],
+                "tip": detail["pre_rebase_tip"],
+                "source": detail["pre_rebase_source"],
+            },
+        )
+        ref = self.controller.pre_rebased_ref(batch["id"], pre_rebased["tip"])
+        self.assertEqual(chain.resolve_commit(self.controller.clone, ref), pre_rebased["tip"])
+        claimed = self.controller.claim_task("head-worker", "admin-worker")
+        self.assertEqual((claimed.task_id, claimed.kind), (task["id"], "rebase_conflict"))
+        self.assertIn(ref, claimed.retained_refs)
+        # A ref retained while publication was off reaches GitHub with the live batches' refs.
+        key = f"retain:{ref}:{pre_rebased['tip']}"
+        self.controller.store.execute("DELETE FROM outbox WHERE key=?", (key,))
+        self.controller._republish_retained_refs(self.clock())
+        self.assertIsNotNone(self.controller.store.row("outbox", {"key": key}))
+        # A later pass that declines again for the same head version, `main` and reason adds nothing.
+        self.assertFalse(self.controller._seal_from_pre_rebase(head, self.repo.main_sha(), self.clock()))
+        self.assertEqual(len(self.controller.store.journal_entries("pre-rebase-unused")), 1, "journaled once")
+        self.assertEqual(self.controller.status()["counters"]["pre_rebases_unused"], 1)
+
+    def test_a_pre_rebase_whose_extension_conflicts_at_the_seal_is_journaled_as_unused(self):
+        """Batch 484: a member inserted while the pre-rebase was claimed replays onto the open batch's own
+        chain but not onto the adopted pre-rebase, so the seal replays the whole chain onto `main`."""
+        agent, task = self.claimed_pre_rebase_adding_extra()
+        batch = self.open_batch()
+        self.approve(103, {"Extra.lean": "from 103\n"})
+        self.controller.tick()
+        self.assertEqual([m["number"] for m in self.controller.members(batch["id"])], [102, 103])
+        self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        self.assert_pre_rebase_unused(batch, "extension-conflict", f"{PROJECT}#103")
+
+    def test_a_pre_rebase_whose_carry_conflicts_at_the_seal_is_journaled_as_unused(self):
+        """Batch 479: `main` moved past the tip the pre-rebase was made on, and it does not replay onto
+        `main`."""
+        agent, task = self.claimed_pre_rebase_adding_extra()
+        batch = self.open_batch()
         self.github.complete_runs()
         for context in VERDICT_CONTEXTS:
             self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+        self.controller.tick()  # promotes the head and records the landing
+        self.repo.advance_main({"Extra.lean": "from main\n"})
         self.controller.tick()
-        self.assertIsNone(self.controller._head())
-        self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "held"})
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        self.assert_pre_rebase_unused(batch, "carry-conflict", f"{PROJECT}#102")
+
+    def test_a_pre_rebase_in_flight_is_kept_when_the_landing_is_observed_past_the_tip(self):
+        def land(head):
+            # The head lands outside the controller, with a commit on top of it.
+            self.repo.commit_branch(
+                {"Other.lean": "other\n"}, "admin change", start=head["tip"], push_to="refs/heads/main"
+            )
+            self.assertEqual(self.controller.store.journal_entries("landing-preserved"), [])
+            self.controller.tick()
+
+        self.assert_pre_rebase_kept_past_the_landed_tip(land)
 
     def batch_conflicting_in_the_middle(self):
         """A head waiting on CI and an open batch [103, 102, 104] whose member 102 conflicts with it."""
@@ -1678,15 +1967,44 @@ class PreRebase(ControllerCase):
         self.assertEqual((task["onto"], task["base"]), (head["tip"], left["base"]))
         return head
 
-    def test_a_claimed_pre_rebase_conflict_seals_the_clean_prefix_when_the_head_lands(self):
+    def test_a_claimed_pre_rebase_conflict_is_kept_when_the_head_lands(self):
+        """The claimed task was made on the tip that landed: the seal waits for it rather than splitting
+        off the clean prefix, and the whole batch becomes the head from its resolution."""
+        batch = self.batch_conflicting_in_the_middle()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution({"Shared.lean": resolved}, explanation="Kept both edits.")},
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual(task.kind, "pre_rebase")
+        self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the pre-rebase")
+        self.assertEqual(self.controller.store.journal_entries("clean-prefix-sealed"), [])
+        self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["state"], "open")
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual((head["id"], head["base"]), (batch["id"], self.repo.main_sha()))
+        self.assertEqual([m["number"] for m in self.controller.members(head["id"])], [103, 102, 104])
+        self.assertEqual(self.repo.file_at(head["tip"], "Shared.lean"), resolved)
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "rebase_conflict"}), 0)
+
+    def test_a_released_pre_rebase_conflict_seals_the_clean_prefix(self):
         batch = self.batch_conflicting_in_the_middle()
         task = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(task.kind, "pre_rebase")
         self.land_head()
+        self.assertIsNone(self.controller._head(), "promotion waits for the claim")
+        self.controller.release_task(task.task_id, task.claim_token, "worker-stopped")
+        self.controller.tick()
         self.assert_clean_prefix_sealed(batch)
         row = self.controller.store.row("tasks", {"id": task.task_id})
         self.assertEqual((row["state"], row["resolution"]), ("superseded", "clean-prefix"))
-        self.assertFalse(self.controller.submit_task(task.task_id, task.claim_token, task.tip).accepted)
 
     def test_an_unclaimed_pre_rebase_conflict_seals_the_clean_prefix_too(self):
         batch = self.batch_conflicting_in_the_middle()
@@ -1717,7 +2035,6 @@ class PreRebase(ControllerCase):
         )
         task = agent.claim(self.controller)
         tip = agent.produce(task)
-        self.assertEqual(task.extra["checks_owner"], "worker")
         evidence = {"tip": tip, "base": task.onto, "tools": f"org/Tools@{ref}", "scope": "build"}
         row = self.controller.store.row("tasks", {"id": task.task_id})
         for stale in ({"tip": task.tip}, {"base": task.base}, {"tools": "org/Tools@" + "b" * 40}):
@@ -1727,11 +2044,16 @@ class PreRebase(ControllerCase):
             task.task_id, task.claim_token, tip, json.dumps({"pre_rebase_verification": evidence})
         )
         self.assertTrue(result.accepted, result)
+        # On a head tip that passed its own verification (decision 174), the mark stands.
+        head = self.controller._head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         self.controller.tick()
         self.assertEqual(self.open_batch()["pre_rebase_prepared"], tip)
         self.assertEqual(self.open_tasks(self.open_batch()), [])
 
-    def test_compiling_repair_is_retained_for_the_next_claim_without_adoption(self):
+    def test_a_pre_rebase_saves_no_repair_checkpoint(self):
+        """Decision 153 (S1): a `pre_rebase` task resolves conflicts only, so it has no repair to checkpoint;
+        the next claim gets the task as it was, and the resolved chain is adopted as usual."""
         self.conflicting_batch()
         agent = ScriptedAgent(
             "w",
@@ -1743,25 +2065,12 @@ class PreRebase(ControllerCase):
             },
         )
         task = agent.claim(self.controller)
+        self.assertNotIn("can_checkpoint_repair", task.extra)
         tip = agent.produce(task)
-        findings = [{"kind": "lint", "module": "Shared", "message": "unused argument"}]
-        notes = json.dumps({"repair_checkpoint": findings})
-        before = self.open_batch()
+        notes = json.dumps({"repair_checkpoint": [{"kind": "lint", "module": "Shared", "message": "unused"}]})
         result = self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True)
-        self.assertFalse(result.accepted, result)
-        self.assertEqual(result.reason, "repair-checkpoint")
-        self.assertEqual(self.open_batch(), before)
-        self.assertEqual(
-            self.controller.submit_task(task.task_id, task.claim_token, tip, notes, checkpoint=True).reason,
-            "repair-checkpoint",
-        )
-        self.assertEqual(self.controller.store.count("submissions", {"task_id": task.task_id}), 1)
-        next_task = self.controller.claim_task("next", "admin-worker")
-        self.assertEqual(next_task.extra["repair_checkpoint"], {"tip": tip, "diagnostics": findings})
-        self.assertEqual(next_task.warm_revs[0], tip)
-        self.assertIn(result.retained_ref, next_task.retained_refs)
-        self.assertEqual(next_task.tip, task.tip, "the original membership and validation baseline survive")
-        adoption = self.controller.submit_task(task.task_id, next_task.claim_token, tip)
+        self.assertEqual((result.accepted, result.reason), (False, "invalid-repair-checkpoint"))
+        adoption = self.controller.submit_task(task.task_id, task.claim_token, tip)
         self.assertTrue(adoption.accepted, adoption)
         self.assertEqual(self.open_batch()["pre_rebase_tip"], tip)
 
@@ -1774,15 +2083,10 @@ class PreRebase(ControllerCase):
         self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"], "one background kind per batch")
         task = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(task.kind, "prepare")
-        self.assertEqual(task.extra["checks_owner"], "worker", "rebasing is not enabled yet")
         self.controller.set_setting("pre_rebase_enabled", True, "kim")
         self.controller.tick()
         self.assertEqual(self.open_batch()["pre_rebase_state"], "conflict")
         self.assertEqual([t["kind"] for t in self.open_tasks(batch)], ["prepare"])
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "staging")
-        self.controller._set_state("inference_hold", {"since": self.clock(), "last_error": "held"})
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
-        self.controller._set_state("inference_hold", None)
         # The preparation edits 102 (so the chain is rewritten) and reports an error it left.
         agent = ScriptedAgent(
             "preparer",
@@ -1821,19 +2125,6 @@ class PreRebase(ControllerCase):
         self.assertEqual((background["active"]["kind"], background["waiting"]), ("pre_rebase", None))
         rebasing = self.controller.claim_task("w", "admin-worker")
         self.assertEqual(rebasing.kind, "pre_rebase")
-        self.assertEqual(rebasing.extra["checks_owner"], "worker", "full checks resume on the rebased chain")
-
-    def test_old_base_checks_continue_when_the_head_is_not_ready_for_rebasing(self):
-        self.controller.set_setting("prepare_min_members", 1, "kim")
-        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
-        self.controller.set_setting("pre_rebase_enabled", False, "kim")
-        self.conflicting_batch()
-        task = self.controller.claim_task("w", "admin-worker")
-        self.assertEqual(task.kind, "prepare")
-        self.controller.set_setting("pre_rebase_enabled", True, "kim")
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "staging")
-        self.assertTrue(self.controller.rebuild_head(PROJECT, "kim")["rebuilt"])
-        self.assertEqual(self.controller.task_check_policy(task.task_id)["checks_owner"], "worker")
 
     def test_a_pre_rebase_task_names_the_heads_tips_then_its_base_to_warm_from(self):
         self.conflicting_batch()
@@ -1885,6 +2176,158 @@ class PreRebase(ControllerCase):
         self.approve(102, {"B.lean": "b\n"})
         self.controller.tick()
         self.assertEqual(self.pre_rebased(), [])
+
+
+class RebaseOrdering(ControllerCase):
+    """Decision 153: the next batch is rebased once per handoff, onto the head's tip, not onto `main` first.
+
+    R1: no rebase onto `main` for the next batch unless the head has failed CI. R2: none for the batch
+    behind it in the handoff window (no head, or a head never dispatched). R3: the pre-rebase takes over
+    an unclaimed rebase onto `main`, or one claimed less than `pre_rebase_takeover_seconds` ago."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 3, "kim")
+        # Every open batch is due for preparation, so one behind `main` is rebased there first unless a rule holds it.
+        self.controller.set_setting("prepare_min_members", 1, "kim")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "kim")
+
+    def open_batches(self):
+        return self.controller.store.rows("batches", {"state": "open"}, order="id")
+
+    def tasks(self, batch, kind, state=None):
+        where = {"batch_id": batch["id"], "kind": kind}
+        if state is not None:
+            where["state"] = state
+        return self.controller.store.rows("tasks", where, order="id")
+
+    def land_head(self):
+        self.github.complete_runs()
+        for context in VERDICT_CONTEXTS:
+            self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
+        self.controller.tick()  # promotes the head
+        return self.controller.tick()  # observes the landing
+
+    def test_r1_holds_the_next_batch_off_main_until_the_head_fails_ci(self):
+        held = self.controller._successor_rebase_held
+        self.assertTrue(held(None), "no head: the handoff window")
+        head = self.failing_head()
+        self.assertFalse(held(head), "after a source failure the head's repair may take hours")
+        self.controller.set_setting("pre_rebase_enabled", False, "kim")
+        self.assertFalse(held(None), "without pre-rebase a rebase onto main is the only one")
+
+    def test_r1_no_rebase_onto_main_before_the_head_is_dispatched(self):
+        """`main` moves while the head waits for dispatch: the head rebases, the next batch does not. Once
+        the head is dispatched the next batch is rebased once, onto the head's tip."""
+        self.controller.set_setting("publication_enabled", False, "kim")  # holds the head's dispatch
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"Shared.lean": "line one\nline two by 102\nline three\n"})
+        self.controller.tick()
+        [batch] = self.open_batches()
+        self.repo.advance_main({"Shared.lean": "line one\nline two on main\nline three\n"})
+        self.controller.tick()
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual(head["base"], self.repo.main_sha(), "the head itself is rebased")
+        self.assertEqual(self.tasks(batch, "rebase_conflict"), [], "the next batch is not rebased onto main")
+        self.assertEqual(self.controller.store.journal_entries("open-rebase-conflict"), [])
+        self.controller.set_setting("publication_enabled", True, "kim")
+        self.controller.tick()
+        [task] = self.tasks(batch, "pre_rebase", "open")
+        self.assertEqual(task["onto"], self.controller._head()["tip"])
+        self.assertEqual(self.tasks(batch, "rebase_conflict"), [])
+
+    def test_r2_no_rebase_onto_main_behind_the_next_batch_in_the_handoff_window(self):
+        """Batches 465, 477 and 484: the head lands while the next batch is held by its claimed pre-rebase,
+        and the batch behind it, now behind `main` and conflicting there, got a rebase onto `main` that
+        then blocked its own pre-rebase for the whole of the next head's CI run. Now it waits, and is
+        pre-rebased onto the new head's tip once that is dispatched."""
+        self.controller.set_setting("open_batch_limit", 3, "kim")
+        self.approve(101, {"Shared.lean": "line one\nline two by 101\nline three\n"})
+        self.controller.tick()
+        for number in (102, 103):  # each conflicts with the batches before it
+            self.approve(number, {"Shared.lean": f"line one\nline two by {number}\nline three\n"})
+            self.controller.tick()
+        successor, behind = self.open_batches()
+        resolved = "line one\nline two by 101 and 102\nline three\n"
+        agent = ScriptedAgent(
+            "w",
+            "admin-worker",
+            self.repo,
+            self.root / "agent",
+            lambda task: {f"{PROJECT}#102": Resolution({"Shared.lean": resolved}, explanation="Kept both edits.")},
+        )
+        task = agent.claim(self.controller)
+        self.assertEqual((task.kind, task.batch_id), ("pre_rebase", successor["id"]))
+        reasons = self.land_head()
+        self.assertIsNone(self.controller._head(), "the seal waits for the claimed pre-rebase")
+        self.assertNotEqual(self.controller.store.row("batches", {"id": behind["id"]})["base"], self.repo.main_sha())
+        self.assertEqual(self.tasks(behind, "rebase_conflict"), [], "no rebase onto main in the handoff window")
+        self.assertIn(
+            f"open batch {behind['id']}: no rebase onto main until the head is dispatched (handoff window)", reasons
+        )
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task)).accepted)
+        self.controller.tick()
+        head = self.controller._head()
+        self.assertEqual(head["id"], successor["id"])
+        self.controller.tick()
+        [pre_rebase] = self.tasks(behind, "pre_rebase", "open")
+        self.assertEqual(pre_rebase["onto"], head["tip"], "one rebase per handoff, onto the head's tip")
+        self.assertEqual(self.tasks(behind, "rebase_conflict"), [])
+
+    def rebase_onto_main(self, *, claim_age=None):
+        """A dispatched head held back by `publication_enabled`, and an open batch with an open
+        `rebase_conflict` task onto `main` (made before R1 and R2), claimed `claim_age` seconds before
+        the head is dispatched when given."""
+        self.controller.set_setting("publication_enabled", False, "kim")
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.controller.tick()
+        [batch] = self.open_batches()
+        task_id = self.controller._create_task(batch, "rebase_conflict", self.repo.main_sha(), [], self.clock())
+        claimed = None
+        if claim_age is not None:
+            claimed = self.controller.claim_task("w", "admin-worker")
+            self.assertEqual(claimed.task_id, task_id)
+            for _ in range(int(claim_age // 600)):
+                self.clock.advance(600)
+                self.controller.renew_task(claimed.task_id, claimed.claim_token)
+            self.clock.advance(claim_age % 600)
+        self.controller.set_setting("publication_enabled", True, "kim")
+        reasons = self.controller.tick()
+        return batch, self.controller.store.row("tasks", {"id": task_id}), claimed, reasons
+
+    def assert_taken_over(self, batch, task, claimed):
+        self.assertEqual((task["state"], task["resolution"]), ("superseded", "pre-rebase-first"))
+        [entry] = self.controller.store.journal_entries("rebase-taken-over", batch["id"])
+        self.assertEqual((entry["detail"]["task_id"], entry["detail"]["claimed"]), (task["id"], claimed))
+        self.assertEqual(
+            [e["detail"]["onto"] for e in self.controller.store.journal_entries("pre-rebased", batch["id"])],
+            [self.controller._head()["tip"]],
+        )
+
+    def test_r3_an_unclaimed_rebase_onto_main_is_taken_over(self):
+        batch, task, _, _ = self.rebase_onto_main()
+        self.assert_taken_over(batch, task, False)
+
+    def test_r3_a_rebase_onto_main_claimed_recently_is_taken_over_and_its_claim_released(self):
+        """1401 (17 s old) and 1446 (40 s old) would have been taken over."""
+        batch, task, claimed, _ = self.rebase_onto_main(claim_age=300)
+        self.assert_taken_over(batch, task, True)
+        claim = self.controller.store.row("claims", {"token": claimed.claim_token})
+        self.assertEqual(claim["release_reason"], "superseded")
+        with self.assertRaises(TaskError):
+            self.controller.renew_task(claimed.task_id, claimed.claim_token)
+
+    def test_r3_a_rebase_onto_main_claimed_longer_runs_to_the_end(self):
+        batch, task, claimed, reasons = self.rebase_onto_main(claim_age=1260)
+        self.assertEqual(task["state"], "open")
+        self.assertIn(f"open batch {batch['id']} waits for its rebase onto main", reasons)
+        self.assertEqual(self.controller.store.journal_entries("rebase-taken-over"), [])
+        self.assertEqual(self.controller.store.journal_entries("pre-rebased", batch["id"]), [])
+        self.controller.renew_task(claimed.task_id, claimed.claim_token)  # still its owner's
 
 
 class Tasks(ControllerCase):
@@ -2245,6 +2688,65 @@ class Preparation(ControllerCase):
         self.assertEqual(claimed.extra["renew_after"], 15, "background checks promptly yield for head handoff")
         self.assertIsNone(self.controller.claim_task("worker-2", "admin-worker"), "within repair_concurrency")
 
+    def test_an_open_batch_behind_main_is_replayed_onto_it_before_it_is_prepared(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"Admin.lean": "x\n"})
+        self.quiet()
+        self.controller.tick()
+        [task] = self.prepare_tasks()
+        rebased = self.controller.store.row("batches", {"id": batch["id"]})
+        self.assertEqual((rebased["base"], rebased["version"]), (main, batch["version"] + 1))
+        self.assertEqual((task["base"], task["onto"], task["tip"]), (main, main, rebased["tip"]))
+        self.assertEqual(task["batch_version"], rebased["version"])
+        self.assertEqual(
+            sorted(c.source_pr for c in chain.chain_commits(self.controller.clone, main, rebased["tip"])),
+            [f"{PROJECT}#201", f"{PROJECT}#202", f"{PROJECT}#203"],
+        )
+        self.assertEqual(len(self.controller.store.journal_entries("open-rebased")), 1)
+
+    def test_an_unclaimed_preparation_on_a_base_main_moved_past_is_superseded_and_not_offered(self):
+        self.open_batch()
+        self.quiet()
+        [stale] = self.prepare_tasks()
+        main = self.repo.advance_main({"Admin.lean": "x\n"})
+        self.controller.set_setting("prepare_open_batches", False, "t")
+        self.controller.tick()
+        self.assertEqual(self.controller.store.row("tasks", {"id": stale["id"]})["resolution"], "base-behind")
+        self.assertEqual(self.prepare_tasks(), [], "the setting off: no new preparation")
+        self.controller.set_setting("prepare_open_batches", True, "t")
+        self.controller.tick()
+        [task] = self.prepare_tasks()
+        self.assertEqual(task["base"], main)
+
+    def test_an_open_batch_whose_replay_onto_main_conflicts_is_not_prepared_on_its_old_base(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"P201.lean": "main's own\n"})
+        self.quiet()
+        self.controller.tick()
+        self.assertEqual(self.prepare_tasks(), [])
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["base"], batch["base"])
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
+        [diagnostic] = loads(task["diagnostics"])
+        self.assertEqual(diagnostic["source_pr"], f"{PROJECT}#201")
+        self.controller.tick()
+        self.assertEqual(len(self.controller.store.journal_entries("open-rebase-conflict")), 1, "replayed once")
+        self.assertTrue(
+            any("waits for a worker to resolve its rebase onto main" in r for r in self.controller.status()["reasons"])
+        )
+
+    def test_a_conflict_recorded_before_the_background_rebase_existed_still_gets_its_task(self):
+        batch = self.open_batch()
+        main = self.repo.advance_main({"P201.lean": "main's own\n"})
+        self.controller._set_state(
+            f"open_rebase_conflict:{batch['id']}",
+            {"version": batch["version"], "onto": main, "source_pr": f"{PROJECT}#201"},
+        )
+        self.quiet()
+        self.controller.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
+
     def test_small_batches_and_the_setting_turned_off_get_no_prepare_task(self):
         self.controller.set_setting("prepare_min_members", 4, "t")
         self.open_batch()
@@ -2528,15 +3030,16 @@ class Preparation(ControllerCase):
         self.assertEqual(self.controller.claim_task("worker-1", "admin-worker").task_id, task.task_id)
 
 
-class PreRebasedPreparation(ControllerCase):
-    """A `prepare` task of the next batch's pre-rebased chain on the head's tip, so the head it seals as
-    reaches CI with published outputs for its exact tip."""
+class PreRebasedCase(ControllerCase):
+    """A head waiting on CI and an open batch pre-rebased onto its tip, with the helpers the preparation
+    of that pre-rebased chain is tested with."""
 
     def setUp(self):
         super().setUp()
         self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
         self.controller.set_setting("prepare_min_members", 2, "t")
         self.controller.set_setting("prepare_quiet_seconds", 0, "t")
+        self.assertTrue(DEFAULT_SETTINGS["prepare_pre_rebased"], "on by default again (decision 174)")
 
     def open_batch(self):
         """A head waiting on CI and an open batch of 201 and 202, prepared on its own base and pre-rebased
@@ -2559,6 +3062,14 @@ class PreRebasedPreparation(ControllerCase):
     def head(self):
         return self.controller.store.row("batches", {"state": "head"})
 
+    def row(self, batch):
+        return self.controller.store.row("batches", {"id": batch["id"]})
+
+    def verify_head(self):
+        """The head's tip passed its own verification."""
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
+
     def pre_rebased_tasks(self, state="open"):
         return [
             t
@@ -2576,6 +3087,24 @@ class PreRebasedPreparation(ControllerCase):
         self.controller.tick()  # observes the verdict and promotes
         self.controller.tick()  # seals the next head
 
+
+class PreRebasedPreparation(PreRebasedCase):
+    """A `prepare` task of the next batch's pre-rebased chain on the head's tip, so the head it seals as
+    reaches CI with published outputs for its exact tip."""
+
+    def setUp(self):
+        super().setUp()
+        # These cases are about the preparation itself: every head tip counts as having passed its own
+        # verification until CI fails it on the source. `KnownGoodHeadTip` covers that rule.
+        real = self.controller._head_tip_verified
+
+        def verified(head):
+            return real(dict(head, verified_tip=head["tip"]) if head is not None else None)
+
+        patcher = mock.patch.object(self.controller, "_head_tip_verified", side_effect=verified)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_the_pre_rebased_preparation_warms_from_the_heads_tips_then_the_batchs_own(self):
         batch = self.open_batch()
         head = self.head()
@@ -2589,14 +3118,12 @@ class PreRebasedPreparation(ControllerCase):
         ]
         claimed = self.controller.claim_task("worker-1", "admin-worker")
         self.assertIn("pre_rebased", claimed.extra)
-        self.assertEqual(claimed.extra["checks_owner"], "worker", "this preparation is already on its intended parent")
         self.assertEqual(claimed.warm_revs[:2], [head["tip"], "1" * 40], "the head's tip, then its previous tip")
         self.assertEqual(claimed.warm_revs[2], batch["tip"], "then the batch tip the pre-rebase covers")
         self.assertEqual(claimed.warm_revs[3:], [t for t in own_tips if t != batch["tip"]][:4])
         self.assertEqual(len(claimed.warm_revs), len(set(claimed.warm_revs)))
 
     def test_adopting_the_pre_rebase_creates_a_prepare_task_for_the_pre_rebased_chain(self):
-        self.assertTrue(DEFAULT_SETTINGS["prepare_pre_rebased"])
         batch = self.open_batch()
         head = self.head()
         [task] = self.pre_rebased_tasks()
@@ -2809,6 +3336,1064 @@ class PreRebasedPreparation(ControllerCase):
         self.assertEqual(self.repo.file_at(tip, "P202.lean"), "fixed on the head\n")
         self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["resolution"], "adopted")
         self.assertEqual(self.github.runs[-1].head_sha, tip)
+
+
+class KnownGoodHeadTip(PreRebasedCase):
+    """Decision 174: the next batch is verified and repaired only on a head tip that has passed its own
+    verification, and that work is discarded, not carried, once the head fails CI or its tip moves."""
+
+    def fail_head(self):
+        """The head's running CI round fails on the source."""
+        run = self.github.runs[-1]
+        self.assertEqual(run.head_sha, self.head()["tip"])
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "A.lean", "message": "boom"}]
+        self.github.complete_runs()
+        self.controller.handle_event("status", {"sha": run.head_sha, "context": "build"})
+        self.controller.tick()
+        self.assertEqual(self.controller._current_attempt(self.head())["outcome"], "source-failure")
+
+    def agent(self, name, member, content, *, verified=True):
+        return ScriptedAgent(
+            name,
+            "admin-worker",
+            self.repo,
+            self.root / name,
+            lambda _: {f"{PROJECT}#{member}": Resolution({f"{content[0]}": content[1]}, explanation="Fixed.")},
+            verified=verified,
+        )
+
+    def test_known_good_means_a_workers_pass_on_the_exact_tip_that_ci_has_not_failed(self):
+        self.open_batch()
+        head = self.head()
+        known_good = self.controller._head_tip_verified
+        self.assertFalse(known_good(None))
+        self.assertFalse(known_good(head), "dispatched, but no worker built this tip")
+        self.assertFalse(known_good(dict(head, verified_tip="0" * 40)), "a pass on another tip does not count")
+        self.assertTrue(known_good(dict(head, verified_tip=head["tip"])))
+        attempt = self.controller._current_attempt(head)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="source-failure")
+        self.assertFalse(known_good(dict(head, verified_tip=head["tip"])), "CI failed it since")
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass")
+        self.assertTrue(known_good(dict(head, verified_tip=head["tip"])))
+        self.assertFalse(known_good(head), "a CI pass alone does not qualify: the head is about to land")
+
+    def test_no_preparation_on_a_head_tip_without_its_own_verification(self):
+        batch = self.open_batch()
+        head = self.head()
+        self.assertEqual((batch["pre_rebase_state"], batch["pre_rebase_onto"]), ("clean", head["tip"]))
+        self.assertEqual(self.pre_rebased_tasks(), [], "the conflicts-only pre-rebase still runs, nothing more")
+        self.assertEqual(
+            self.preparation()["prepare_blocked"],
+            f"head {head['id']}'s tip {head['tip'][:12]} has not passed its own verification",
+        )
+        self.verify_head()
+        self.controller.tick()
+        [task] = self.pre_rebased_tasks()
+        self.assertEqual(task["onto"], head["tip"])
+
+    def test_no_preparation_starts_once_the_heads_ci_has_passed(self):
+        """A preparation started in the landing window would be preserved across the landing, and the seal
+        would wait for it with staging idle: once the head's CI has passed, none starts."""
+        batch = self.open_batch()
+        self.verify_head()
+        head = self.head()
+        attempt = self.controller._current_attempt(head)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass")
+        self.assertEqual(
+            self.controller._pre_rebased_prepare_blocked(self.row(batch)), f"head {head['id']} passed CI and is landing"
+        )
+        self.controller._prepare_pre_rebased(self.clock())
+        self.assertEqual(self.pre_rebased_tasks(), [])
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pending")
+        self.controller.tick()
+        self.assertEqual(len(self.pre_rebased_tasks()), 1, "while CI runs, the known-good tip is prepared on")
+
+    def test_an_offer_made_while_ci_ran_is_not_claimed_once_it_passed(self):
+        self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        [offer] = self.pre_rebased_tasks()
+        attempt = self.controller._current_attempt(self.head())
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass")
+        self.assertIsNone(
+            self.controller.claim_task("worker-1", "admin-worker"), "not newly claimed in the landing window"
+        )
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="infrastructure")
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual(task.task_id, offer["id"], "an infrastructure outcome keeps it eligible")
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass")
+        self.controller.renew_task(task.task_id, task.claim_token)  # an owner already holding it finishes
+
+    def test_a_head_repair_qualifies_its_tip_only_when_the_worker_verified_it(self):
+        batch = self.open_batch()
+        for attempt, verified in ((1, False), (2, True)):
+            self.fail_head()
+            repair = self.agent(f"repairer-{attempt}", 101, ("A.lean", f"fixed {attempt}\n"), verified=verified)
+            result = repair.run(self.controller)
+            self.assertEqual(repair.tasks[0].kind, "repair")
+            self.assertTrue(result.accepted, result)
+            self.controller.tick()
+            self.controller.tick()
+            head = self.head()
+            self.assertEqual(head["verified_tip"], head["tip"] if verified else None)
+            self.assertEqual(self.row(batch)["pre_rebase_onto"], head["tip"], "pre-rebased onto the new tip")
+            self.assertEqual(len(self.pre_rebased_tasks()), int(verified))
+
+    def test_a_head_that_fails_ci_discards_the_repairs_made_on_its_tip(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        failed_tip = self.head()["tip"]
+        preparer = self.agent("preparer", 202, ("P202.lean", "fixed on the head\n"))
+        result = preparer.run(self.controller)
+        self.assertIn("pre_rebased", preparer.tasks[0].extra)
+        self.assertTrue(result.accepted, result)
+        prepared = self.row(batch)
+        self.assertEqual(
+            (prepared["pre_rebase_state"], prepared["pre_rebase_prepared"], prepared["pre_rebase_verified"]),
+            ("adopted", result.tip, result.tip),
+        )
+        self.fail_head()
+        discarded = self.row(batch)
+        self.assertEqual((discarded["pre_rebase_state"], discarded["pre_rebase_tip"]), ("", None))
+        self.assertEqual(loads(discarded["pre_rebase_edits"], {}), {})
+        [entry] = self.controller.store.journal_entries("pre-rebase-discarded")
+        self.assertEqual((entry["detail"]["reason"], entry["detail"]["onto"]), ("head-failed", failed_tip))
+        # The head's repair moves its tip: the batch is replayed afresh, without the discarded edit, and
+        # prepared again once the new tip has passed its own verification.
+        repair = self.agent("repairer", 101, ("A.lean", "fixed\n"))
+        self.assertTrue(repair.run(self.controller).accepted)
+        self.controller.tick()
+        self.controller.tick()
+        head = self.head()
+        replayed = self.row(batch)
+        self.assertEqual((replayed["pre_rebase_state"], replayed["pre_rebase_onto"]), ("clean", head["tip"]))
+        self.assertEqual(chain.git(self.controller.clone, "show", f"{replayed['pre_rebase_tip']}:P202.lean"), "202\n")
+        [again] = self.pre_rebased_tasks()
+        self.assertEqual((again["onto"], again["tip"]), (head["tip"], replayed["pre_rebase_tip"]))
+
+    def test_a_conflicts_only_pre_rebase_is_kept_when_the_head_fails(self):
+        batch = self.open_batch()
+        before = self.row(batch)
+        self.fail_head()
+        self.assertEqual(self.row(batch)["pre_rebase_tip"], before["pre_rebase_tip"], "nothing verified to discard")
+        self.assertEqual(self.controller.store.journal_entries("pre-rebase-discarded"), [])
+
+    def test_a_claimed_preparation_is_taken_back_when_the_head_fails_ci(self):
+        self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertIn("pre_rebased", task.extra)
+        self.fail_head()
+        [superseded] = self.pre_rebased_tasks("superseded")
+        self.assertEqual((superseded["id"], superseded["resolution"]), (task.task_id, "head-unverified"))
+        result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
+        self.assertFalse(result.accepted, result)
+
+    def test_a_clean_preparation_loses_its_marks_when_the_head_fails_and_a_restaged_tip_stays_unverified(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], task.tip)
+        failed = self.head()
+        self.fail_head()
+        kept = self.row(batch)
+        self.assertEqual(
+            (kept["pre_rebase_tip"], kept["pre_rebase_prepared"], kept["pre_rebase_verified"]),
+            (task.tip, None, None),
+            "the chain is kept; it is no longer prepared or verified",
+        )
+        [entry] = self.controller.store.journal_entries("pre-rebase-discarded")
+        self.assertEqual((entry["detail"]["reason"], entry["detail"]["chain_kept"]), ("head-failed", True))
+        # The same tip staged again unchanged at a later version, with a fresh local pass, is still not
+        # known-good: CI failed it once.
+        version = failed["version"] + 1
+        self.controller._record_tip(failed["id"], version, failed["tip"], self.clock())
+        self.controller.store.update("batches", {"id": failed["id"]}, version=version, verified_tip=failed["tip"])
+        self.assertFalse(self.controller._head_tip_verified(self.head()))
+
+    def test_a_preserved_preparation_on_a_failed_tip_is_not_current(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        self.controller._set_state("emergency_preserved", {str(task.task_id): row["onto"]})
+        self.assertTrue(self.controller._pre_rebased_prepare_current(row, self.row(batch)))
+        attempt = self.controller._current_attempt(self.head())
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="source-failure")
+        self.assertFalse(self.controller._pre_rebased_prepare_current(row, self.row(batch)))
+
+    def test_sealing_from_a_verified_preparation_makes_the_new_head_known_good(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], task.tip)
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"], head["verified_tip"]), (batch["id"], task.tip, task.tip))
+        self.assertTrue(self.controller._head_tip_verified(head))
+        [rebased] = [e for e in self.controller.store.journal_entries("rebased") if e["batch_id"] == batch["id"]]
+        self.assertTrue(rebased["detail"]["verified"])
+
+    def test_sealing_from_an_unverified_preparation_leaves_the_new_head_unverified(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        preparer = self.agent("preparer", 202, ("P202.lean", "fixed on the head\n"), verified=False)
+        result = preparer.run(self.controller)
+        self.assertTrue(result.accepted, result)
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], None)
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"], head["verified_tip"]), (batch["id"], result.tip, None))
+
+
+class VerificationSnapshot(PreRebasedCase):
+    """Decision 174, step 3: the next batch's verification on the head's tip is a frozen snapshot. Its
+    membership is sealed when the preparation is created, later arrivals go to the following batch,
+    and the next head seals as exactly the verified tip."""
+
+    def test_later_arrivals_go_to_the_following_batch_and_the_head_seals_as_the_verified_tip(self):
+        batch = self.open_batch()
+        self.assertFalse(batch["sealed"])
+        self.verify_head()
+        self.controller.tick()
+        [prepare] = self.pre_rebased_tasks()
+        frozen = self.row(batch)
+        self.assertTrue(frozen["sealed"], "sealed when its verification starts")
+        [entry] = [
+            e
+            for e in self.controller.store.journal_entries("successor-sealed")
+            if e["detail"].get("reason") == "verification-snapshot"
+        ]
+        self.assertEqual((entry["batch_id"], entry["detail"]["size"]), (batch["id"], 2))
+        self.approve(203, {"P203.lean": "203\n"})
+        self.controller.tick()
+        following = self.controller.input_for(PROJECT, 203)["batch_id"]
+        self.assertNotEqual(following, batch["id"], "a later arrival goes to the following batch")
+        self.assertEqual([m["number"] for m in self.controller._members(batch["id"])], [201, 202])
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual(task.task_id, prepare["id"])
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"], head["verified_tip"]), (batch["id"], task.tip, task.tip))
+        self.assertEqual(self.github.runs[-1].head_sha, task.tip, "staging builds the exact verified tip")
+        self.assertEqual(self.controller.store.row("batches", {"id": following})["state"], "open")
+
+    def test_an_already_sealed_batch_is_not_sealed_again(self):
+        batch = self.open_batch()
+        self.controller.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=self.clock())
+        self.verify_head()
+        self.controller.tick()
+        self.assertEqual(len(self.pre_rebased_tasks()), 1)
+        snapshots = [
+            e
+            for e in self.controller.store.journal_entries("successor-sealed")
+            if e["detail"].get("reason") == "verification-snapshot"
+        ]
+        self.assertEqual(snapshots, [])
+
+    def test_without_a_verification_the_batch_keeps_taking_members(self):
+        batch = self.open_batch()
+        self.assertEqual(self.pre_rebased_tasks(), [], "the head is not known-good")
+        self.approve(203, {"P203.lean": "203\n"})
+        self.controller.tick()
+        self.assertFalse(self.row(batch)["sealed"])
+        self.assertEqual(self.controller.input_for(PROJECT, 203)["batch_id"], batch["id"])
+
+
+class EarlyStaging(PreRebasedCase):
+    """Decisions 199 B and 200: the next batch's verified preparation on the head's tip is staged at once,
+    based on the head's tip, and adopted when the head lands as that base."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("early_staging_enabled", True, "t")
+
+    def prepared(self):
+        """A head staging a known-good tip, and the next batch prepared clean on it; one more tick."""
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertIn("pre_rebased", task.extra)
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], task.tip)
+        self.controller.tick()
+        return self.row(batch), task.tip
+
+    def early(self, batch):
+        return [
+            a for a in self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id") if a["early"]
+        ]
+
+    def run_for(self, sha):
+        [run] = [r for r in self.github.runs if r.head_sha == sha]
+        return run
+
+    def finish(self, *runs):
+        """Complete exactly `runs` and deliver their status events."""
+        held = [(r, r.verdict) for r in self.github.runs if r not in runs and r.status != "completed"]
+        for run, _ in held:
+            run.verdict = "lost"
+        try:
+            self.github.complete_runs()
+        finally:
+            for run, verdict in held:
+                run.verdict = verdict
+        for run in runs:
+            for context in VERDICT_CONTEXTS:
+                self.controller.handle_event("status", {"sha": run.head_sha, "context": context})
+
+    def requested(self, batch):
+        return feeds.observation_feed(feeds.feed_source(self.controller), PROJECT, "main", batch["id"])[
+            "requested_batch"
+        ]
+
+    def test_off_by_default_and_nothing_is_sent_while_off(self):
+        self.assertFalse(DEFAULT_SETTINGS["early_staging_enabled"], "an operator turns it on")
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        batch, tip = self.prepared()
+        self.assertEqual(self.early(batch), [])
+        self.assertEqual([r.head_sha for r in self.github.runs], [self.head()["tip"]])
+
+    def test_the_prepared_tip_is_staged_on_the_heads_tip_and_reported_running(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        [attempt] = self.early(batch)
+        self.assertEqual(
+            (attempt["head_sha"], attempt["base_sha"], attempt["batch_version"], attempt["generation"]),
+            (tip, head["tip"], batch["version"], batch["version"] + 1),
+        )
+        self.assertEqual(
+            (attempt["early"], attempt["dispatch_kind"], attempt["dispatch_state"]), (1, "staging", "accepted")
+        )
+        run = self.run_for(tip)
+        self.assertEqual((run.base_sha, run.batch_id), (head["tip"], str(batch["id"])))
+        self.assertEqual(loads(attempt["repair_outputs_revs"], [])[0], head["tip"], "warm from the head's tip")
+        requested = self.requested(batch)
+        self.assertEqual(
+            (requested["state"], requested["head_sha"], requested["base_sha"]), ("running", tip, head["tip"])
+        )
+        branch = requested["train"]["staging_ref"]
+        self.assertEqual(branch, f"staging-candidate-{attempt['id']}-{batch['version'] + 1}")
+        self.assertIn(("update_ref", (f"refs/heads/{branch}", tip)), self.github.calls)
+        self.assertIsNone(self.row(batch)["first_dispatch_at"], "not yet the head's dispatch")
+        self.assertEqual(self.controller.status()["open_batches"][0]["early_staging"]["attempt_id"], attempt["id"])
+        self.controller.tick()
+        self.assertEqual(len(self.early(batch)), 1, "sent once")
+
+    def test_a_passed_early_run_lands_as_soon_as_the_head_has(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        self.finish(self.run_for(tip))
+        self.controller.tick()
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["outcome"], "pass")
+        self.assertEqual(self.requested(batch)["state"], "waiting", "no longer running once it finished")
+        runs = len(self.github.runs)
+        self.finish(self.run_for(head["tip"]))
+        self.controller.tick()  # the head lands
+        self.controller.tick()  # the next batch seals as the prepared tip, adopts its pass and promotes
+        self.controller.tick()
+        self.assertEqual(len(self.github.runs), runs, "no second run of the same tip")
+        landed = self.row(batch)
+        self.assertEqual((landed["state"], landed["tip"]), ("landed", tip))
+        self.assertEqual(self.repo.main_sha(), tip)
+        adopted = self.controller.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual((adopted["early"], adopted["batch_version"]), (2, landed["version"]))
+        [entry] = self.controller.store.journal_entries("early-staging-adopted")
+        self.assertEqual((entry["batch_id"], entry["detail"]["outcome"]), (batch["id"], "pass"))
+
+    def test_a_running_early_run_becomes_the_heads_run(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        self.finish(self.run_for(head["tip"]))
+        self.controller.tick()
+        self.controller.tick()
+        sealed = self.head()
+        self.assertEqual((sealed["id"], sealed["tip"], sealed["base"]), (batch["id"], tip, head["tip"]))
+        [attempt] = self.early(batch)
+        self.assertEqual(self.controller._current_attempt(sealed)["id"], attempt["id"])
+        requested = self.requested(sealed)
+        self.assertEqual((requested["state"], requested["head_sha"]), ("running", tip))
+        self.assertEqual(
+            requested["train"]["staging_ref"], f"staging-candidate-{attempt['id']}-{attempt['generation']}"
+        )
+        self.assertIsNotNone(self.head()["first_dispatch_at"])
+        runs = len(self.github.runs)
+        self.finish(self.run_for(tip))
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(len(self.github.runs), runs)
+        self.assertEqual(self.row(batch)["state"], "landed")
+
+    def test_an_early_source_failure_goes_straight_to_the_heads_repair(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        run = self.run_for(tip)
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "P202.lean", "message": "boom"}]
+        self.finish(run)
+        self.controller.tick()
+        self.assertEqual(self.early(batch)[0]["outcome"], "source-failure")
+        self.finish(self.run_for(head["tip"]))
+        self.controller.tick()
+        self.controller.tick()
+        sealed = self.head()
+        self.assertEqual(sealed["id"], batch["id"])
+        self.assertFalse(self.controller._head_tip_verified(sealed), "CI failed the tip")
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open", "kind": "repair"})
+        [adopted] = self.early(batch)
+        self.assertEqual((task["ci_attempt_id"], adopted["early"]), (adopted["id"], 2), "the early run's own findings")
+        self.assertEqual(loads(task["diagnostics"], [])[0]["message"], "boom")
+
+    def test_the_early_run_is_cancelled_when_the_head_fails(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        run = self.run_for(head["tip"])
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "A.lean", "message": "boom"}]
+        self.finish(run)
+        self.controller.tick()
+        self.controller.tick()
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["outcome"], "superseded")
+        self.assertIsNotNone(attempt["cancelled_at"])
+        self.assertEqual(self.run_for(tip).conclusion, "cancelled")
+        self.assertNotEqual(self.requested(batch)["state"], "running", "it can no longer post a verdict")
+        [entry] = self.controller.store.journal_entries("early-staging-cancelled")
+        # #999 discards the preparation made on the failed tip in the same pass.
+        self.assertIn(
+            entry["detail"]["reason"],
+            ("the batch's prepared tip changed", f"head {head['id']} failed CI on the source"),
+        )
+
+    def test_the_early_run_is_cancelled_when_the_heads_tip_moves(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, tip="1" * 40)
+        self.controller._early_staging(self.clock())
+        [attempt] = self.early(batch)
+        self.assertEqual((attempt["outcome"], self.run_for(tip).conclusion), ("superseded", "cancelled"))
+        [entry] = self.controller.store.journal_entries("early-staging-cancelled")
+        self.assertEqual(entry["detail"]["reason"], f"head {head['id']}'s tip moved")
+
+    def test_a_completed_run_awaiting_its_statuses_is_settled_when_invalid(self):
+        batch, tip = self.prepared()
+        run = self.run_for(tip)
+        run.status = "completed"  # GitHub reports it done; its statuses are not delivered yet
+        [attempt] = self.early(batch)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, run_status="completed")
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        self.controller._early_staging(self.clock())
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["outcome"], "superseded")
+        self.assertIsNotNone(attempt["cancelled_at"])
+        self.assertNotEqual(self.requested(batch)["state"], "running")
+
+    def test_an_early_pass_never_promotes_a_head_that_sealed_without_it(self):
+        batch, tip = self.prepared()
+        self.finish(self.run_for(tip))
+        self.controller.tick()
+        self.assertEqual(self.early(batch)[0]["outcome"], "pass")
+        # The batch becomes the head at the same version without adopting (the head ahead was removed).
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, state="removed")
+        self.controller.store.update("batches", {"id": batch["id"]}, state="head")
+        sealed = self.row(batch)
+        self.assertIsNone(self.controller._current_attempt(sealed), "the early pass is not the head's attempt")
+        self.controller._promote(sealed, self.early(batch)[0], self.clock())
+        self.assertIsNone(self.controller.store.row("outbox", {"kind": "promote"}), "another tip: not promoted")
+
+    def test_rejected_early_dispatches_do_not_use_the_retry(self):
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+        batch, tip = self.prepared()
+        [attempt] = self.early(batch)
+        for _ in range(3):
+            self.controller.store.insert(
+                "ci_attempts",
+                **{
+                    k: v
+                    for k, v in attempt.items()
+                    if k not in ("id", "run_id", "outcome", "dispatch_state", "cancelled_at")
+                },
+                outcome="infrastructure",
+                dispatch_state="rejected",
+            )
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="infrastructure")
+        self.assertIsNone(self.controller._early_staging_blocked(self.row(batch), self.head()))
+
+    def test_no_early_run_on_a_control_lane_head(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.store.update("batches", {"id": self.head()["id"]}, lane="control")
+        self.assertEqual(
+            self.controller._early_staging_blocked(dict(self.row(batch), sealed=1), self.head()),
+            f"head {self.head()['id']} is not an ordinary batch",
+        )
+
+    def test_turning_it_off_cancels_the_live_run(self):
+        batch, tip = self.prepared()
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        self.controller.tick()
+        [attempt] = self.early(batch)
+        self.assertEqual((attempt["outcome"], self.run_for(tip).conclusion), ("superseded", "cancelled"))
+        self.finish(self.run_for(self.head()["tip"]))
+        self.controller.tick()
+        self.controller.tick()
+        sealed = self.head()
+        self.assertEqual(sealed["id"], batch["id"])
+        self.assertNotEqual(self.controller._current_attempt(sealed)["id"], attempt["id"], "staged afresh")
+
+    def test_an_unverified_preparation_is_not_sent_early(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        preparer = ScriptedAgent(
+            "preparer",
+            "admin-worker",
+            self.repo,
+            self.root / "preparer",
+            lambda _: {f"{PROJECT}#202": Resolution({"P202.lean": "fixed\n"}, explanation="Fixed.")},
+            verified=False,
+        )
+        self.assertTrue(preparer.run(self.controller).accepted)
+        self.controller.tick()
+        self.assertEqual(self.early(batch), [])
+
+    def test_a_queued_early_run_gives_way_to_the_heads_rerun(self):
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+        batch, tip = self.prepared()
+        head = self.head()
+        run = self.run_for(head["tip"])
+        run.verdict = "infrastructure"
+        self.finish(run)
+        self.controller.tick()
+        first = self.early(batch)[0]
+        self.assertEqual(first["outcome"], "superseded")
+        self.assertEqual(
+            [r for r in self.github.runs if r.head_sha == tip][0].conclusion, "cancelled", "it had not started"
+        )
+        self.controller.tick()
+        head_runs = [r for r in self.github.runs if r.head_sha == head["tip"]]
+        early_runs = [r for r in self.github.runs if r.head_sha == tip]
+        self.assertEqual((len(head_runs), len(early_runs)), (2, 2))
+        self.assertLess(self.github.runs.index(head_runs[1]), self.github.runs.index(early_runs[1]), "sent behind it")
+        self.assertEqual(self.early(batch)[-1]["outcome"], "pending")
+
+    def test_infrastructure_failures_of_the_early_run_are_retried_once(self):
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+        batch, tip = self.prepared()
+        for _ in range(2):
+            run = [r for r in self.github.runs if r.head_sha == tip][-1]
+            run.verdict = "infrastructure"
+            self.finish(run)
+            self.controller.tick()
+            self.controller.tick()
+        self.assertEqual(len(self.early(batch)), 2, "the first run and one retry")
+        self.assertEqual(
+            [a["outcome"] for a in self.early(batch)], ["infrastructure", "infrastructure"], self.early(batch)
+        )
+
+
+class Attestation(PreRebasedCase):
+    """Decision 200: the worker's checks take main's pin and policy (the offer's `policy_commit`), and the
+    controller keeps the worker's attestation of a passing verification for the tip it names."""
+
+    POLICY = {
+        "README.md": "readme\n",
+        "Shared.lean": "line one\nline two\nline three\n",
+        "tauceti.toml": '[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "main"\n',
+        "scripts/lint-baseline.txt": "",
+    }
+
+    def setUp(self):
+        ControllerCase.setUp(self)
+        self.controller.store.close()
+        self.tmp2 = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp2.cleanup)
+        self.root = Path(self.tmp2.name)
+        self.controller, self.github, self.repo, self.clock = make_controller(self.root, files=self.POLICY)
+        self.addCleanup(self.controller.store.close)
+        self.github.admins.add("admin-worker")
+        self.controller.set_setting("repair_concurrency", 2, "t")
+        self.controller.set_setting("prepare_min_members", 2, "t")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "t")
+
+    def note(self, of, **changes):
+        shown = chain._git(self.repo.clone, "rev-parse", f"{of}^{{tree}}")
+        tree = shown.stdout.strip() if shown.returncode == 0 else "0" * 40
+        note = {
+            "schema": "tauceti-queue.attestation/v1",
+            "tip": of,
+            "tree": tree,
+            "policy_commit": self.controller._canonical,
+            "tools_commit": "TauCetiProject/TauCetiTools@" + "a" * 40,
+            "lint_scope": "full",
+            "sandbox": True,
+            "verifier_isolated": True,
+            "toolchain": "",
+            "outputs_published": True,
+        }
+        note.update(changes)
+        return note
+
+    def problem(self, checked, **changes):
+        return self.controller._attestation_problem(json.dumps(self.note(checked, **changes)), checked)
+
+    def test_the_offer_names_main_as_the_policy_commit(self):
+        self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual(task.extra["policy_commit"], self.controller._canonical)
+
+    def test_an_attestation_counts_only_when_it_used_mains_policy_on_exactly_the_tip(self):
+        self.open_batch()
+        tip = self.head()["tip"]
+        self.assertIsNone(self.problem(tip))
+        self.assertEqual(self.controller._attestation_problem(None, tip), "no attestation")
+        self.assertEqual(self.problem(tip, tip="0" * 40), "the attestation is of another tip")
+        self.assertEqual(self.problem(tip, tree="0" * 40), "the attestation names another tree")
+        self.assertEqual(self.problem(tip, sandbox=False), "the verification ran outside the build sandbox")
+        self.assertEqual(
+            self.problem(tip, verifier_isolated=False),
+            "the verification's scripts and drivers were writable by candidate code",
+        )
+        for commit in (
+            "TauCetiProject/TauCetiTools@",
+            "TauCetiProject/TauCetiTools@main",
+            "TauCetiProject/TauCetiTools@x",
+        ):
+            self.assertEqual(self.problem(tip, tools_commit=commit), "the verification used another TauCetiTools")
+        self.assertEqual(self.problem(tip, lint_scope="changed"), "the verification did not run the whole-library lint")
+        self.assertEqual(
+            self.problem(tip, policy_commit=None), "the verification used the candidate's own tools and policy"
+        )
+        self.assertEqual(
+            self.problem(tip, tools_commit="someone/TauCetiTools@" + "a" * 40),
+            "the verification used another TauCetiTools",
+        )
+        # A policy commit whose scripts/ differ from main's does not count.
+        self.repo.write_files({"scripts/lint-baseline.txt": "TauCeti.x\n"})
+
+        def run(*a):
+            return run_git(self.repo.scratch, *a)
+
+        run("add", "-A")
+        run("commit", "-q", "-m", "other policy")
+        other = run("rev-parse", "HEAD").strip()
+        run("push", "-q", "origin", f"{other}:refs/heads/elsewhere")
+        chain.git(self.repo.clone, "fetch", "-q", "origin", "elsewhere")
+        self.assertEqual(self.problem(tip, policy_commit=other), "the verification's scripts is not main's")
+
+    def test_a_clean_preparation_attests_its_tip_and_the_seal_carries_it_to_the_head(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip)}
+        )
+        self.assertEqual(json.loads(self.row(batch)["pre_rebase_attestation"])["tip"], task.tip)
+        self.assertIsNone(self.controller.status()["open_batches"][0]["pre_rebase"]["attestation_problem"])
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"]), (batch["id"], task.tip))
+        self.assertIsNone(self.controller._attestation_problem(head["attestation"], head["tip"]))
+        self.assertIsNone(self.controller.status()["head"]["attestation_problem"])
+
+    def test_an_attestation_of_another_tip_is_not_kept(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note("0" * 40)}
+        )
+        self.assertIsNone(self.row(batch)["pre_rebase_attestation"])
+        self.assertEqual(
+            self.controller.status()["open_batches"][0]["pre_rebase"]["attestation_problem"], "no attestation"
+        )
+
+    def test_the_attestation_is_discarded_with_the_verified_mark(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip)}
+        )
+        head = self.head()
+        attempt = self.controller._current_attempt(head)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="source-failure")
+        self.controller._discard_unverified_pre_rebase(self.clock())
+        self.assertIsNone(self.row(batch)["pre_rebase_attestation"])
+
+
+class AttestedLanding(Attestation):
+    """Decision 200: a tip whose accepted attestation counts is sent as an attested landing, which pr-build
+    lands without rebuilding; an attested run that does not pass falls back to full staging."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("early_staging_enabled", True, "t")
+        self.controller.set_setting("attested_landing_enabled", True, "t")
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+
+    def prepared(self, **note):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip, **note)}
+        )
+        self.controller.tick()
+        return self.row(batch), task.tip
+
+    def early(self, batch):
+        return [
+            a for a in self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id") if a["early"]
+        ]
+
+    def runs_for(self, sha):
+        return [r for r in self.github.runs if r.head_sha == sha]
+
+    def finish(self, *runs):
+        held = [(r, r.verdict) for r in self.github.runs if r not in runs and r.status != "completed"]
+        for run, _ in held:
+            run.verdict = "lost"
+        try:
+            self.github.complete_runs()
+        finally:
+            for run, verdict in held:
+                run.verdict = verdict
+        for run in runs:
+            for context in VERDICT_CONTEXTS:
+                self.controller.handle_event("status", {"sha": run.head_sha, "context": context})
+
+    def test_off_by_default_an_attested_tip_is_staged_in_full(self):
+        self.assertFalse(DEFAULT_SETTINGS["attested_landing_enabled"], "an operator turns it on")
+        self.controller.set_setting("attested_landing_enabled", False, "t")
+        batch, tip = self.prepared()
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["dispatch_kind"], "staging")
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-staging")
+
+    def test_an_accepted_attestation_is_sent_as_an_attested_landing_and_reported_to_pr_build(self):
+        batch, tip = self.prepared()
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["dispatch_kind"], "attested")
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-attested")
+        requested = feeds.observation_feed(feeds.feed_source(self.controller), PROJECT, "main", batch["id"])[
+            "requested_batch"
+        ]
+        tree = chain.git(self.repo.clone, "rev-parse", f"{tip}^{{tree}}").strip()
+        self.assertEqual(
+            (requested["state"], requested["attestation"]["tip"], requested["attestation"]["tree"]),
+            ("running", tip, tree),
+        )
+        # It lands as the head's run once the head has landed.
+        head = self.head()
+        self.finish(self.runs_for(tip)[0])
+        self.controller.tick()
+        self.finish(self.runs_for(head["tip"])[0])
+        for _ in range(3):
+            self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), tip)
+        self.assertEqual(len(self.runs_for(tip)), 1, "no full staging run")
+
+    def test_an_attestation_that_does_not_count_is_staged_in_full(self):
+        batch, tip = self.prepared(verifier_isolated=False)
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["dispatch_kind"], "staging")
+        requested = feeds.observation_feed(feeds.feed_source(self.controller), PROJECT, "main", batch["id"])[
+            "requested_batch"
+        ]
+        self.assertNotIn("attestation", requested)
+
+    def test_an_attested_run_that_fails_is_an_infrastructure_failure_and_falls_back_to_full_staging(self):
+        batch, tip = self.prepared()
+        run = self.runs_for(tip)[0]
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "P202.lean", "message": "out-of-date"}]
+        self.finish(run)
+        self.controller.tick()
+        self.controller.tick()
+        first, second = self.early(batch)
+        self.assertEqual((first["dispatch_kind"], first["outcome"]), ("attested", "infrastructure"))
+        self.assertTrue(first["outcome_detail"].startswith("attested-fallback: "))
+        self.assertFalse(self.controller._tip_failed(tip), "an attested failure says nothing about the source")
+        self.assertEqual(second["dispatch_kind"], "staging", "then the tip is staged in full")
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-staging")
+        [entry] = self.controller.store.journal_entries("attested-landing-fallback")
+        self.assertEqual(entry["detail"]["tip"], tip)
+
+    def test_the_fallback_holds_after_an_operator_supersedes_the_failed_attempt(self):
+        batch, tip = self.prepared()
+        run = self.runs_for(tip)[0]
+        run.verdict = "fail"
+        self.finish(run)
+        self.controller.tick()
+        first = self.early(batch)[0]
+        self.controller.store.update("ci_attempts", {"id": first["id"]}, outcome="superseded")
+        self.assertEqual(
+            self.controller._dispatch_kind(
+                self.row(batch), tip, first["base_sha"], self.row(batch)["pre_rebase_attestation"]
+            ),
+            "staging",
+        )
+
+    def test_a_head_that_changes_the_policy_files_gets_no_attested_early_run(self):
+        batch = self.open_batch()
+        self.verify_head()
+        head = self.head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip)}
+        )
+        with mock.patch.object(self.controller, "_policy_unchanged", return_value=False) as unchanged:
+            self.controller.tick()
+            unchanged.assert_any_call(head["tip"])
+        [attempt] = self.early(self.row(batch))
+        self.assertEqual(attempt["dispatch_kind"], "staging")
+
+    def test_a_passed_attested_run_whose_attestation_stopped_counting_is_staged_in_full(self):
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        batch, tip = self.prepared()
+        self.land_head()
+        head = self.head()
+        attempt = self.controller._current_attempt(head)
+        self.assertEqual(attempt["dispatch_kind"], "attested")
+        self.finish(self.runs_for(tip)[-1])
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass", run_status="completed")
+        runs = len(self.github.runs)
+        with mock.patch.object(self.controller, "_attested_still_counts", return_value=False):
+            self.controller._ci(self.head(), self.clock())
+        self.assertEqual(self.controller.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "superseded")
+        promotions = [
+            r
+            for r in self.controller.store.rows("outbox", {"kind": "promote"})
+            if loads(r["payload"], {})["batch_id"] == batch["id"]
+        ]
+        self.assertEqual(promotions, [], "not promoted")
+        self.assertEqual(len(self.github.runs), runs + 1)
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-staging")
+
+    def test_a_head_that_seals_attested_is_dispatched_as_an_attested_landing(self):
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        batch, tip = self.prepared()
+        self.assertEqual(self.early(batch), [])
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"]), (batch["id"], tip))
+        attempt = self.controller._current_attempt(head)
+        self.assertEqual(attempt["dispatch_kind"], "attested")
+        self.assertEqual(self.controller.status()["head"]["ci"]["kind"], "attested")
+
+
+class ParallelHeadCheck(PreRebasedCase):
+    """Decision 174, step 4 (decision 172's A): a head dispatched to staging on a tip no worker verified
+    is verified locally at the same time; a clean check makes the tip known-good, errors are repaired
+    and the repaired tip replaces the running staging run."""
+
+    def checks(self, state="open"):
+        return [
+            t
+            for t in self.controller.store.rows("tasks", {"kind": "repair", "state": state}, order="id")
+            if any(d.get("kind") == "parallel_check" for d in loads(t["diagnostics"], []))
+        ]
+
+    def dispatched(self):
+        batch = self.open_batch()
+        self.assertFalse(DEFAULT_SETTINGS["parallel_check_enabled"], "an operator turns it on")
+        self.controller.set_setting("parallel_check_enabled", True, "t")
+        self.controller.tick()
+        head = self.head()
+        [check] = self.checks()
+        self.assertEqual((check["batch_id"], check["tip"], check["base"]), (head["id"], head["tip"], head["base"]))
+        self.assertEqual(check["ci_attempt_id"], self.controller._current_attempt(head)["id"])
+        return batch, head, check
+
+    def test_an_unverified_head_is_checked_while_staging_runs_and_a_clean_check_makes_it_known_good(self):
+        batch, head, check = self.dispatched()
+        self.assertIsNone(self.controller._pre_rebase_blocked(head), "the check does not hold the pre-rebase back")
+        self.assertEqual(self.pre_rebased_tasks(), [], "the next batch waits for the check")
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual((task.kind, task.task_id), ("repair", check["id"]))
+        self.assertTrue(next(d for d in task.diagnostics if d["kind"] == "parallel_check")["proactive"])
+        notes = json.dumps({"local_verification": {"tip": task.tip, "checks_passed": True}})
+        result = self.controller.submit_task(task.task_id, task.claim_token, task.tip, worker_notes=notes)
+        self.assertTrue(result.accepted, result)
+        row = self.controller.store.row("tasks", {"id": check["id"]})
+        self.assertEqual((row["state"], row["resolution"]), ("submitted", "parallel-check-clean"))
+        self.assertEqual((self.head()["version"], self.head()["verified_tip"]), (head["version"], head["tip"]))
+        self.assertEqual(len(self.github.runs), 1, "the running staging run is kept")
+        self.controller.tick()
+        [prepare] = self.pre_rebased_tasks()
+        self.assertEqual(prepare["onto"], head["tip"], "the next batch is prepared on the checked tip")
+        self.controller.tick()
+        self.assertEqual(len(self.checks("open")), 0, "one check per head version")
+
+    def test_an_unverified_clean_result_does_not_make_the_tip_known_good(self):
+        _, head, _ = self.dispatched()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        notes = json.dumps({"local_verification": {"tip": task.tip, "checks_passed": False}})
+        self.assertTrue(
+            self.controller.submit_task(task.task_id, task.claim_token, task.tip, worker_notes=notes).accepted
+        )
+        self.assertIsNone(self.head()["verified_tip"])
+        self.controller.tick()
+        self.assertEqual(self.pre_rebased_tasks(), [])
+
+    def test_errors_are_repaired_and_the_repaired_tip_replaces_the_staging_run(self):
+        _, head, check = self.dispatched()
+        repair = ScriptedAgent(
+            "checker",
+            "admin-worker",
+            self.repo,
+            self.root / "checker",
+            lambda _: {f"{PROJECT}#101": Resolution({"A.lean": "fixed\n"}, explanation="Fixed A.")},
+            verified=True,
+        )
+        result = repair.run(self.controller)
+        self.assertEqual(repair.tasks[0].task_id, check["id"])
+        self.assertTrue(result.accepted, result)
+        self.controller.tick()
+        repaired = self.head()
+        self.assertEqual((repaired["version"], repaired["verified_tip"]), (head["version"] + 1, result.tip))
+        self.assertEqual(self.github.runs[-1].head_sha, result.tip, "the repaired tip is staged")
+        first = self.controller.store.rows("ci_attempts", {"batch_id": head["id"]}, order="id")[0]
+        self.assertEqual(first["outcome"], "superseded", "the running staging run was cancelled")
+        self.assertEqual(self.checks(), [], "a known-good tip gets no check")
+
+    def test_a_staging_failure_first_turns_the_check_into_the_repair(self):
+        _, head, check = self.dispatched()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        run = self.github.runs[-1]
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "A.lean", "message": "boom"}]
+        self.github.complete_runs()
+        self.controller.handle_event("status", {"sha": run.head_sha, "context": "build"})
+        self.controller.tick()
+        row = self.controller.store.row("tasks", {"id": check["id"]})
+        self.assertEqual(row["state"], "open")
+        self.assertFalse(self.controller._prediction_task(row), "now the head's ordinary repair task")
+        self.assertIn("boom", row["diagnostics"])
+        result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
+        self.assertFalse(result.accepted, "an unchanged chain cannot answer a source failure")
+
+    def test_a_staging_pass_first_supersedes_the_check(self):
+        _, head, check = self.dispatched()
+        self.controller.claim_task("worker-1", "admin-worker")
+        self.land_head()
+        row = self.controller.store.row("tasks", {"id": check["id"]})
+        self.assertEqual((row["state"], row["resolution"]), ("superseded", "prediction-ci-passed"))
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+
+    def test_a_released_check_is_not_offered_again(self):
+        _, head, check = self.dispatched()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(task.task_id, task.claim_token, "agent_failed", "no progress")
+        row = self.controller.store.row("tasks", {"id": check["id"]})
+        self.assertEqual((row["state"], row["resolution"]), ("superseded", "parallel-check-released"))
+        self.controller.tick()
+        self.assertEqual(self.checks(), [])
+
+    def test_a_claimed_check_gives_way_when_the_head_must_be_rebased(self):
+        _, head, check = self.dispatched()
+        self.controller.claim_task("worker-1", "admin-worker")
+        runs = len(self.github.runs)
+        self.repo.advance_main({"Z.lean": "z\n"})
+        self.controller.tick()
+        row = self.controller.store.row("tasks", {"id": check["id"]})
+        self.assertEqual((row["state"], row["resolution"]), ("superseded", "head-rebasing"))
+        for _ in range(3):
+            self.controller.tick()
+        rebased = self.head()
+        self.assertNotEqual(rebased["tip"], head["tip"])
+        stale = [r for r in self.github.runs[runs:] if r.head_sha == head["tip"]]
+        self.assertEqual(stale, [], "the old tip is never dispatched again on its old base")
+        [again] = self.checks()
+        self.assertEqual(again["tip"], rebased["tip"], "the rebased tip gets its own check")
+
+    def test_a_known_good_head_or_the_setting_off_gets_no_check(self):
+        self.open_batch()  # the setting is off by default
+        self.controller.tick()
+        self.assertEqual(self.checks(), [])
+        self.controller.set_setting("parallel_check_enabled", True, "t")
+        self.verify_head()
+        self.controller.tick()
+        self.assertEqual(self.checks(), [])
+
+
+class NextHeadPreparationPriority(ControllerCase):
+    """Decision 174: the next head's preparation on the head's tip is offered ahead of later batches'
+    own-base preparations, and takes the newest one's slot when the background slots are full."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (
+            ("repair_concurrency", 3),
+            ("background_start_limit", 3),
+            ("open_batch_limit", 3),
+            ("prepare_open_batches", False),  # the tasks below are created by hand
+        ):
+            self.controller.set_setting(name, value, "kim")
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        for number in (102, 103, 104):  # each conflicts with the open batches before it, not with the head
+            self.approve(number, {"Shared.lean": f"line one\nline two by {number}\nline three\n"})
+            self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
+        self.successor, self.later, self.last = self.controller.store.rows("batches", {"state": "open"}, order="id")
+        self.assertEqual(self.successor["pre_rebase_state"], "clean")
+
+    def own_base(self, batch):
+        return self.controller._create_task(batch, "prepare", batch["base"], [], self.clock())
+
+    def next_heads(self):
+        batch = self.controller.store.row("batches", {"id": self.successor["id"]})
+        tip = batch["pre_rebase_tip"]
+        self.controller._retain(self.controller.pre_rebased_ref(batch["id"], tip), tip)
+        return self.controller._create_task(
+            batch, "prepare", batch["pre_rebase_onto"], [], self.clock(), pre_rebased=(tip, batch["tip"])
+        )
+
+    def test_it_is_offered_before_older_own_base_preparations(self):
+        self.own_base(self.later)
+        self.clock.advance(1)
+        self.own_base(self.last)
+        self.clock.advance(1)
+        self.next_heads()
+        first = self.controller.claim_task("w1", "admin-worker")
+        self.assertEqual(
+            (first.kind, first.batch_id, "pre_rebased" in first.extra), ("prepare", self.successor["id"], True)
+        )
+        second = self.controller.claim_task("w2", "admin-worker")
+        self.assertEqual((second.batch_id, "pre_rebased" in second.extra), (self.later["id"], False))
+
+    def test_it_takes_the_newest_later_preparations_slot(self):
+        self.own_base(self.later)
+        self.own_base(self.last)
+        first = self.controller.claim_task("w1", "admin-worker")
+        self.clock.advance(1)
+        second = self.controller.claim_task("w2", "admin-worker")
+        self.assertEqual({first.batch_id, second.batch_id}, {self.later["id"], self.last["id"]})
+        self.next_heads()
+        third = self.controller.claim_task("w3", "admin-worker")
+        self.assertEqual((third.batch_id, "pre_rebased" in third.extra), (self.successor["id"], True))
+        released = self.controller.store.row("tasks", {"id": second.task_id})
+        self.assertEqual((released["state"], released["resolution"]), ("superseded", "pre-rebase-first"))
+        self.assertEqual(self.controller.store.row("tasks", {"id": first.task_id})["state"], "open")
+        self.assertEqual(len(self.controller._active_task_claims()), 2, "the claims did not grow")
 
 
 class Holds(ControllerCase):
@@ -3302,7 +4887,7 @@ class StatusSnapshot(ControllerCase):
         def hold():
             with self.controller._lock:
                 held.set()
-                release.wait(10)
+                release.wait(60)
 
         thread = threading.Thread(target=hold)
         thread.start()
@@ -3317,7 +4902,8 @@ class StatusSnapshot(ControllerCase):
         release = self.hold_lock()
         started = time.monotonic()
         status = self.controller.status(wait=0.2)
-        self.assertLess(time.monotonic() - started, 1.5)
+        # The lock is held for a minute; the margin over the 0.2 s wait is for a loaded runner.
+        self.assertLess(time.monotonic() - started, 10)
         self.assertEqual((status["snapshot"], status["head"]["size"]), (True, 1), "the snapshot the tick took")
         self.assertGreaterEqual(status["stale_seconds"], 0)
         json.dumps(status)

@@ -107,8 +107,9 @@ file records an operator completion and avoids repeated historical lookups.
 An item is eligible when it is open under the live view and every item it needs
 is done. With no area pinned, the worker considers every area that has an
 eligible item, minus `--roadmap-skip`, in random order, and each area's items
-in file order. `--roadmap-only AREA` restricts it to that area. Fleet roadmap
-focus does not apply to a worker with a list.
+in file order. `--roadmap-only AREA` restricts it to that area, and an
+[umbrella](umbrellas.md) to its members that are roadmap areas now, outside
+`--roadmap-skip`. Fleet roadmap focus does not apply to a worker with a list.
 
 For each candidate in turn the worker first searches each forge's closed pull
 requests for that slug's marker (on Forgejo, the keyword search), and passes over an item that a merged pull request of
