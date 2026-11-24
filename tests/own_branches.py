@@ -116,6 +116,25 @@ def listing_outage(pattern, totals, *, cached=False):
     return {"rebase": [c.pr for c in sv.rebaseable.actionable], "open": sv.n_mine_open, "max": sv.max_open_prs}
 
 
+def github_from_forgejo(pattern, *, listing=True, totals=None):
+    """The account's GitHub count as a Forgejo-surveying worker reads it for the shared limit."""
+    from tauceti_worker.account_pressure import github_open
+
+    def open_prs():
+        if not listing:
+            raise GitHubError("open PR query failed: HTTP 504")
+        return RAW
+
+    rows = SurveyRows([], totals) if totals is not None else None
+    with (
+        scope(pattern),
+        patch("tauceti_worker.github.me", return_value="me"),
+        patch("tauceti_worker.github_state.enabled", return_value=rows is not None),
+        patch("tauceti_worker.github_state.read_survey", return_value=(rows is not None, rows)),
+    ):
+        return github_open(SimpleNamespace(repo="TauCetiProject/TauCeti", open_prs=open_prs), [])
+
+
 def forgejo(pattern):
     """A Forgejo source: the account's conflicting #1 and #2 and a peer's #3, all awaiting review."""
     repo = RepositoryRef(Forge("forgejo", "https://git.example.org"), "one/project")
@@ -257,6 +276,14 @@ def main():
             listing_outage("-alpha$", None),
             {"rebase": [3], "open": survey_mod.configured_max_open_prs(), "max": survey_mod.configured_max_open_prs()},
         ),
+        ("other forge, unset: the shared per-author total", github_from_forgejo(None, totals={"me": 140}), 140),
+        ("other forge, set: matching branches from the listing", github_from_forgejo("-alpha$", totals={"me": 140}), 2),
+        (
+            "other forge, set, listing fails: the unscoped total bounds the count",
+            github_from_forgejo("-alpha$", listing=False, totals={"me": 140}),
+            140,
+        ),
+        ("other forge, set, listing fails with no total: unknown", github_from_forgejo("-alpha$", listing=False), None),
         ("dashboard worker, unset: no flag", dashboard_worker(None), []),
         ("dashboard worker, set: the dashboard's pattern", dashboard_worker("-alpha$"), ["--own-branches=-alpha$"]),
         ("dashboard worker, set empty: explicitly every branch", dashboard_worker(""), ["--own-branches="]),

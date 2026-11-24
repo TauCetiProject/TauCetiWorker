@@ -14,7 +14,7 @@ import time
 
 from tauceti_tools.forge import ForgeError
 
-from .config import Die, log
+from .config import Die, log, own_branches
 from .constants import TAUCETI
 
 
@@ -51,8 +51,10 @@ def github_open(gh, skip) -> int | None:
     from .github_state import StateQueryError, read_survey
     from .github_state import enabled as github_state_enabled
     from .github_transport import read_context
-    from .survey import PRInfo, roadmap_open_count
+    from .survey import PRInfo, own_branch, roadmap_open_count
 
+    errors = (Die, GitHubError, StateQueryError, ForgeError, OSError, RuntimeError, ValueError, KeyError, TypeError)
+    total = None
     try:
         with read_context(retry=False):
             login = me()
@@ -61,13 +63,18 @@ def github_open(gh, skip) -> int | None:
                 # alone; one shared response serves every worker on the host.
                 available, rows = read_survey(gh.repo, "any", skip, numbers=(NO_PR,), stages=())
                 if available and not rows.cached and rows.author_counts is not None:
-                    return rows.author_counts.get(login, 0)
+                    total = rows.author_counts.get(login, 0)
+                    if own_branches() is None:
+                        return total
             prs = [PRInfo.from_json(row) for row in gh.open_prs()]
-    except (Die, GitHubError, StateQueryError, ForgeError, OSError, RuntimeError, ValueError, KeyError, TypeError):
-        return None
+    except errors:
+        # Under --own-branches the author total carries no branch names; it still bounds the count.
+        return total
     if not login:
         return None
-    return roadmap_open_count([p for p in prs if not p.is_draft and p.author == login], "auto", list(skip))
+    return roadmap_open_count(
+        [p for p in prs if not p.is_draft and p.author == login and own_branch(p)], "auto", list(skip)
+    )
 
 
 def forgejo_open(cfg, skip) -> int | None:

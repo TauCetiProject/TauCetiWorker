@@ -63,7 +63,10 @@ under: roadmap branches end in `-<worker id>`, so `--own-branches='-(alpha|beta)
 keeps the workers `alpha` and `beta` to the pull requests those two opened and
 leaves the account's other pull requests, and bot pull requests such as
 `bump-mathlib/...`, to whoever else tends them. Add an alternative such as
-`^bump-mathlib/` to keep tending those.
+`^bump-mathlib/` to keep tending those. The other forge's count is narrowed too:
+on GitHub it then comes from the open-PR listing, since the shared author counts
+carry no branch names, and falls back to the account's whole total if that
+listing fails.
 
 ## The claim namespace
 
