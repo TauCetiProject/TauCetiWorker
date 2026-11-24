@@ -112,10 +112,11 @@ def configure(args):
         == "https://git.taucetiproject.org"
     ):
         os.environ["TAUCETI_FORGEJO_TOKEN_FILE"] = str(Path.home() / ".config/tauceti-forgejo/worker-token")
-    from .source_identity import adopted_author_ids
+    from .source_identity import adopted_author_ids, github_adopted_authors
 
     try:
         adopted_author_ids()
+        github_adopted_authors()
     except ValueError as error:
         raise Die(str(error)) from None
     preference = resolve_preference(requested, getattr(args, "prefer_forge", None))

@@ -186,6 +186,28 @@ def adopted_author_ids() -> frozenset[int]:
     return frozenset(ids)
 
 
+GITHUB_ADOPTED_AUTHORS_ENV = "TAUCETI_GITHUB_ADOPTED_AUTHORS"
+
+
+def github_adopted_authors() -> frozenset[str]:
+    """Case-folded GitHub logins whose open PRs this worker repairs as if they were its own.
+
+    For a contributor whose own fleet stopped: the worker rebases, fixes review findings and
+    repairs red builds on their PRs, pushing to the PR branch, but never closes them. Authoring
+    pressure and the "mine" counts still cover only the worker's own PRs.
+    """
+    raw = os.environ.get(GITHUB_ADOPTED_AUTHORS_ENV, "")
+    logins = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", item):
+            raise ValueError(f"{GITHUB_ADOPTED_AUTHORS_ENV} must be comma-separated GitHub logins")
+        logins.add(item.casefold())
+    return frozenset(logins)
+
+
 RECOVERY_AUTHORS_ENV = "TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS"
 
 

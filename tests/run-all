@@ -89,6 +89,7 @@ RUN_STDLIB=(
   agent_transcript.py
   auto_stage_priority.py
   automatic_bump.py
+  github_adopted_authors.py
   bump_attestation.py
   self_tested_label.py
   native_self_tested.py

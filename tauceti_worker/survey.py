@@ -550,6 +550,42 @@ def owns_author(survey, author: dict | None) -> bool:
     return bool(isinstance(login, str) and login and me_login and login.casefold() == me_login.casefold())
 
 
+def _adopted_github_authors(sv, nondraft, enabled, supports_external_repair):
+    """Predicate for open PRs by TAUCETI_GITHUB_ADOPTED_AUTHORS that this identity can push to.
+
+    A fork branch accepts our push when the account can push to that fork, or through the author's
+    "allow edits by maintainers" when it can push to TauCeti. Without either, adoption stays off:
+    a round could not publish its repair. Close authority is unchanged (`owns` stays own-only).
+    """
+    from .source_identity import github_adopted_authors
+
+    logins = github_adopted_authors() if supports_external_repair else frozenset()
+    if not logins or not enabled & {"rebase", "fix", "fix-ci"}:
+        return lambda p: False
+    candidates = [
+        p
+        for p in nondraft
+        if not p.author_is_bot and p.author.casefold() in logins and not sv.owns(p) and p.head_owner and p.head_repo
+    ]
+    if not candidates:
+        return lambda p: False
+    canonical = can_push(TAUCETI) is True
+    writable = {}
+    for p in candidates:
+        repo = f"{p.head_owner}/{p.head_repo}"
+        if repo not in writable:
+            writable[repo] = canonical or can_push(repo) is True
+    adopted = {p.number for p in candidates if writable[f"{p.head_owner}/{p.head_repo}"]}
+    if adopted:
+        log(f"adopted authors: tending {len(adopted)} open PR(s) by {', '.join(sorted(logins))}")
+    if len(adopted) < len(candidates):
+        log(
+            f"adopted authors: {len(candidates) - len(adopted)} open PR(s) skipped; "
+            "this account cannot push to their branches"
+        )
+    return lambda p: p.number in adopted
+
+
 def bucket_status_labels(nondraft: list[PRInfo], me_login: str, *, owns=None) -> tuple[list[tuple[str, int, int]], int]:
     """Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order). Returns
     (buckets, unlabeled) where each bucket is (label, total, mine) — total carrying that label, and the
@@ -1073,10 +1109,11 @@ def classify_survey(
         p.author_is_bot and p.head_owner == TAUCETI_OWNER for p in nondraft
     )
     tend_bot = supports_external_repair and bot_on_canonical and can_push(TAUCETI) is True
+    adopts = _adopted_github_authors(sv, nondraft, enabled, supports_external_repair)
     tended = [
         p
         for p in nondraft
-        if (sv.owns(p) or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER))
+        if (sv.owns(p) or (tend_bot and p.author_is_bot and p.head_owner == TAUCETI_OWNER) or adopts(p))
         and not {label.lower() for label in p.labels} & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
         and (allow_queue_owned or "bors-staging" not in {label.lower() for label in p.labels})
     ]

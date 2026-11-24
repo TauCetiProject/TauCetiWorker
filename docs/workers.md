@@ -160,6 +160,18 @@ replace that candidate CI. For live deployments, preserve every per-worker
 `env` entry, including any `TAUCETI_ROUND_WORKTREES=0` opt-out; the verification
 helper can also be enabled in the worker manager's service environment.
 
+## Adopted GitHub authors
+
+Set `TAUCETI_GITHUB_ADOPTED_AUTHORS` in a worker's `env` to a comma-separated list of
+GitHub logins to maintain those authors' open PRs as if they were the worker's own:
+rebases, review fixes and red-build repairs, pushed to the PR branch. Use it when a
+contributor's own fleet has stopped. A fork branch accepts the push only when the
+worker's account can push to the fork, or can push to TauCeti and the author allows
+edits by maintainers; otherwise the worker skips those PRs and logs why. The worker
+never closes an adopted PR, and authoring pressure and the "mine" counts still cover
+only PRs the account opened. Holds, budgets and branch claims apply as usual. A
+malformed value stops the worker at startup.
+
 ## Dependency bumps
 
 Bot-authored `bump-mathlib/` PRs hosted on TauCeti are repaired until they land.
