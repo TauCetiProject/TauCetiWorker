@@ -1082,6 +1082,12 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             raise
         p.stderr = parse_trace(p.stderr or "", identity=scope(effective), records=records)
         p.github_records = records
+        if effective.get("_TAUCETI_REVIEW_APP_TOKEN") == "1" and (
+            "HTTP 401" in p.stderr or any(r.get("status") == 401 for r in records if isinstance(r, dict))
+        ):
+            from tauceti_worker import review_app
+
+            review_app.invalidate(effective.get("GH_TOKEN", ""))  # The token this send used.
         if gql:
             traced = next((r["graphql_cost"] for r in reversed(records) if "graphql_cost" in r), None)
             try:
@@ -1552,8 +1558,6 @@ if __name__ == "__main__":
         try:
             app_env = review_app.request_environment(args)
             p = execute(["gh", *args], env=app_env, wait=os.environ.get("TAUCETI_GITHUB_EPHEMERAL") != "1")
-            if app_env is not None and "HTTP 401" in (p.stderr or ""):
-                review_app.invalidate(app_env["GH_TOKEN"])
         except GitHubUnavailable as error:
             # The shell caller cannot catch Python exceptions. Preserve the
             # infrastructure wait marker for its owning worker's stage guard.

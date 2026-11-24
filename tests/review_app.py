@@ -279,6 +279,32 @@ class Proxy(unittest.TestCase):
             self.assertEqual(github_transport.migrated_identity(query).returncode, 1)
 
 
+class Rejection(unittest.TestCase):
+    def test_a_rejected_send_forgets_the_token_it_actually_used(self):
+        old = {"GH_TOKEN": "ghs_old", "_TAUCETI_REVIEW_APP_TOKEN": "1", "TAUCETI_GH_PROXY_WAIT": "0"}
+        new = {**old, "GH_TOKEN": "ghs_new"}
+        sent = []
+
+        def run(argv, **kwargs):
+            sent.append(kwargs["env"]["GH_TOKEN"])
+            return SimpleNamespace(returncode=1, stdout="", stderr="gh: Bad credentials (HTTP 401)\n")
+
+        with (
+            patch.object(github_transport, "cooldown", return_value=0),
+            patch.object(github_transport, "observed_budget", return_value={}),
+            patch.object(github_transport, "mutation_slot", return_value=0),
+            patch.object(github_transport, "invalidate"),
+            patch.object(github_transport, "secondary_result", return_value=0),
+            patch.object(github_transport, "parse_trace", side_effect=lambda text, **k: text),
+            patch.object(github_transport.subprocess, "run", side_effect=run),
+            patch.object(review_app, "refreshed", return_value=new),
+            patch.object(review_app, "invalidate") as invalidate,
+        ):
+            github_transport._execute(["gh", "api", "-X", "PATCH", "/repos/o/r/issues/comments/1"], env=old)
+        self.assertEqual(sent, ["ghs_new"])
+        invalidate.assert_called_with("ghs_new")
+
+
 class EngineEnvironment(unittest.TestCase):
     def test_overrides_replace_the_github_identity_of_the_engine_only(self):
         from tauceti_worker import agents
