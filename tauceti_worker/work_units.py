@@ -71,13 +71,18 @@ from .config import (
 from .constants import (
     AGENT_NAMES,
     AUTO_STAGES,
+    BUMP_HEAD_PREFIX,
     CLAIM_TTL_S,
     CONTEST_CLAIM_TTL,
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
+    LINT_REPAIR_HEAD_PREFIX,
+    MAX_CI_ATTEMPTS,
+    MAX_CI_PR_ATTEMPTS,
     MAX_FIX_ATTEMPTS,
     MAX_FIX_ROUNDS_WITHOUT_APPROVAL,
     MAX_INFRA_REFUNDS,
+    MAX_REBASE_ATTEMPTS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -117,6 +122,7 @@ from .survey import (
     Candidate,
     Counters,
     PRInfo,
+    RebaseBudgetUnavailable,
     Survey,
     age_spread,
     bump_prs,
@@ -1765,6 +1771,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
         return _close_spent_pr(w, sv, c, explicit=explicit)
+    if stage in ("rebase", "fix-ci") and getattr(c, "final_resolution", False):
+        return _close_spent_pr(w, sv, c, stage=stage, explicit=explicit)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -2665,19 +2673,65 @@ def _adopted_authors_note(sv) -> str:
     return f", or a PR from a branch of this repository whose live author has Forgejo user ID {listed}"
 
 
-def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:
-    """Retire an owned, still-blocked head after its existing repair attempts; no model call."""
-    if w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS:
+def _budget_spent(stage, w, c) -> bool:
+    if stage == "fix":
+        return w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS
+    if stage == "fix-ci":
+        return (
+            w.counters.read(f"ci-{c.pr}-{c.head[:12]}") >= MAX_CI_ATTEMPTS
+            or w.counters.read(f"ci-pr-{c.pr}") >= MAX_CI_PR_ATTEMPTS
+        )
+    key_for = getattr(w.counters, "rebase_budget_key", None)
+    try:
+        # A verified progress checkpoint since the survey starts a new budget under a new key.
+        key = key_for(c.pr) if key_for else f"rebase-pr-{c.pr}"
+        return bool(c.rebase_budget_key) and key == c.rebase_budget_key and w.counters.read(key) >= MAX_REBASE_ATTEMPTS
+    except RebaseBudgetUnavailable:
+        return False
+
+
+def _claim_held(w, pr) -> bool:
+    held = getattr(w.claims, "held", None)
+    lost = getattr(w.claims, "lost", None)
+    return bool(held) and held[0] == f"branch/{pr}" and not (lost is not None and lost.is_set())
+
+
+def _close_spent_pr(w, sv, c, *, stage="fix", explicit=False) -> int | None:
+    """Retire an owned, still-blocked head after its existing repair, rebase or CI attempts; no model call."""
+    if not _budget_spent(stage, w, c):
         return None
+    if stage == "rebase":
+        base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+        detail = "closing owned PR after spent rebase attempts"
+        comment = (
+            f"Closing because {MAX_REBASE_ATTEMPTS} attempts could not bring this branch up to date "
+            f"with `{base}` at head `{c.head}`. The branch is retained; a fresh attempt can start "
+            f"from current `{base}`."
+        )
+    elif stage == "fix-ci":
+        base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+        detail = "closing owned PR after spent CI repair attempts"
+        comment = (
+            f"Closing because repeated attempts could not make CI pass at head `{c.head}`. "
+            f"The branch is retained; a fresh attempt can start from current `{base}`."
+        )
+    else:
+        detail = "closing owned PR after spent repair attempts"
+        comment = (
+            f"Closing after {MAX_FIX_ATTEMPTS} repair attempts left review findings unresolved "
+            f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
+            "remaining findings using the current review rubric."
+        )
     return _close_owned_pr(
         w,
         sv,
         c,
         explicit=explicit,
-        detail="closing owned PR after spent repair attempts",
-        comment=f"Closing after {MAX_FIX_ATTEMPTS} repair attempts left review findings unresolved "
-        f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
-        "remaining findings using the current review rubric.",
+        detail=detail,
+        comment=comment,
+        stage=stage,
+        # A budget renewed during the claim or the fresh reads cancels the closure.
+        still_due=lambda: _budget_spent(stage, w, c),
     )
 
 
@@ -2715,7 +2769,7 @@ def _close_capped_pr(w, sv, c, *, explicit=False) -> int | None:
     return rc
 
 
-def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
+def _close_owned_pr(w, sv, c, *, explicit, detail, comment, stage="fix", still_due=None) -> int | None:
     """Close an owned PR still blocked at `c.head` with `comment`, after fresh checks; no model call."""
     from .github_transport import read_context
 
@@ -2725,33 +2779,59 @@ def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
     try:
+        # A claim error lets ordinary branch work proceed unclaimed behind its push CAS; a close has none.
+        if not _claim_held(w, c.pr):
+            log(f"{stage} #{c.pr}: no confirmed branch claim; leaving the PR open")
+            return None
         with read_context(fresh=True, direct=True):
-            if not _still_actionable("fix", w, sv, replace(c, partial_history=False), explicit=explicit):
+            if not _still_actionable(stage, w, sv, replace(c, partial_history=False), explicit=explicit):
                 return None
-            live = w.gh.pr_view(c.pr, ["state", "headRefOid", "author", "labels", "isDraft"])
+            fields = ["state", "headRefOid", "author", "labels", "isDraft"]
+            extra = {"rebase": ["mergeable"], "fix-ci": ["statusCheckRollup", "headRefName", "baseRefName"]}
+            live = w.gh.pr_view(c.pr, [*fields, *extra.get(stage, [])])
             if (
                 not live
                 or live.get("state") != "OPEN"
                 or live.get("headRefOid") != c.head
                 or live.get("isDraft") is not False
-                or _selected_pr_matches("fix", c, live, explicit=explicit) is not True
+                or _selected_pr_matches(stage, c, live, explicit=explicit) is not True
                 or not owns_author(sv, live.get("author"))
                 or {str(label.get("name", "")).lower() for label in live.get("labels", [])}
                 & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
             ):
                 return None
+            if stage == "rebase":
+                resolver = getattr(type(w.gh), "resolve_mergeability", None)
+                if live.get("mergeable") == "UNKNOWN" and resolver is not None:
+                    live["mergeable"] = resolver(w.gh, w.cfg.state, c.pr, c.head)
+                # A mergeable head with a requested integration repair is a handoff, never closed here.
+                if live.get("mergeable") != "CONFLICTING":
+                    return None
+            if stage == "fix-ci":
+                info = PRInfo.from_json({**live, "number": c.pr})
+                # Pending or re-running CI, an ERROR status or a self-tested head is not evidence.
+                if (
+                    not info.needs_ci_repair
+                    or not info.build_failure_only
+                    or info.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX))
+                ):
+                    return None
+            if (still_due is not None and not still_due()) or not _claim_held(w, c.pr):
+                return None
             from .activity import select
 
-            select("fix")
-            report_runtime("running", phase="fix", target=f"PR #{c.pr}", detail=detail)
+            select(stage)
+            report_runtime("running", phase=stage, target=f"PR #{c.pr}", detail=detail)
             # The selected source's own repository: gh_run routes a Forgejo source's name to its forge.
             repo = getattr(w.gh, "repo", "") or TAUCETI
             gh_run(["gh", "pr", "close", str(c.pr), "--repo", repo, "--comment", comment])
             after = w.gh.pr_view(c.pr, ["state"])
             if not after or after.get("state") not in {"CLOSED", "MERGED"}:
-                raise NoProgress(f"fix #{c.pr}: automatic closure not confirmed; retrying without another model call")
+                raise NoProgress(
+                    f"{stage} #{c.pr}: automatic closure not confirmed; retrying without another model call"
+                )
         w.rs.bust(c.pr)
-        log(f"fix #{c.pr}: confirmed closure ({detail})")
+        log(f"{stage} #{c.pr}: confirmed closure ({detail})")
         return 0
     finally:
         w.claims.stop_heartbeat()
