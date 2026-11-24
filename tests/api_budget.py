@@ -455,6 +455,8 @@ if sys.argv[1:3] == ['auth', 'status']:
     print(json.dumps({'authMethod': 'api_key'}))
     sys.exit(0)
 print(json.dumps({'type': 'system', 'subtype': 'init', 'pid': os.getpid()}), flush=True)
+if os.environ.get('FAKE_STARTED'):
+    pathlib.Path(os.environ['FAKE_STARTED']).touch()
 time.sleep(float(os.environ.get('FAKE_DELAY', '0')))
 if os.environ.get('FAKE_CRASH'):
     sys.exit(1)
@@ -900,10 +902,21 @@ with ClaudeAPIContext("crash-fixture", "fix"):
             self.assertTrue(list(namespace.glob("*.json")))
 
     def test_finished_sessions_never_cut_off_on_balance_change(self):
-        os.environ["FAKE_DELAY"] = "0.6"
+        os.environ["FAKE_DELAY"] = "3"
         os.environ["FAKE_COST"] = "150"
+        started = self.root / "native-started"
+        os.environ["FAKE_STARTED"] = str(started)
+
+        def cut_funding_once_running():
+            # After admission, not after a fixed delay that a loaded runner can spend just starting
+            # the wrapper, which would test a denial instead.
+            deadline = time.monotonic() + 120
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.budget.configure(set_grant=0, rate=0)
+
         with ClaudeAPIContext("worker1", "fix"):
-            thread = threading.Thread(target=lambda: (time.sleep(0.3), self.budget.configure(set_grant=0, rate=0)))
+            thread = threading.Thread(target=cut_funding_once_running)
             thread.start()
             result = self.run_claude()
             thread.join()
