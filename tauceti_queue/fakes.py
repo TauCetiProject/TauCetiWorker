@@ -506,6 +506,7 @@ class FakeGitHub:
         batch_id: str,
         members: Sequence[int],
         repair_outputs_revs: Sequence[str] = (),
+        attested: bool = False,
     ) -> str:
         with self.lock:
             self._call("dispatch_candidate", head_sha, base_sha, batch_id)
@@ -536,7 +537,7 @@ class FakeGitHub:
             )
             self.runs.append(run)
             dispatch = {
-                "event_type": "tauceti-bors-staging",
+                "event_type": "tauceti-bors-attested" if attested else "tauceti-bors-staging",
                 "client_payload": {
                     "head_sha": head_sha,
                     "base_sha": base_sha,

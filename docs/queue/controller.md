@@ -428,8 +428,20 @@ sandbox on, a verifier out of candidate code's reach (`verifier_isolated`, which
 yet, so no attestation counts), the whole-library lint, and a policy commit whose `tauceti.toml` and
 `scripts/` are `main`'s now, with the exact tools commit from the repository (and, for a SHA pin,
 the commit) `main` pins. Status
-shows it as `head.attestation_problem` and `pre_rebase.attestation_problem`. No step acts on it
-yet.
+shows it as `head.attestation_problem` and `pre_rebase.attestation_problem`.
+
+The attested landing (decision 200, setting `attested_landing_enabled`, default false) acts on it:
+a head's dispatch, and the next batch's early run (`_early_staging`), is sent with event
+`tauceti-bors-attested` instead of `tauceti-bors-staging` (`ci_attempts.dispatch_kind` `attested`,
+`_dispatch_kind`) when the batch's stored attestation of exactly that tip counts, the batch is
+GitHub-only, and no attested run of that tip and base has already failed. pr-build then builds
+nothing: it requires the observation feed to name the attestation of exactly that commit and tree
+(the feed adds `attestation` `{tip, tree, policy_commit}` to a running attested batch), restores every
+output with `lake build --no-build`, which fails if any module would need building, runs no audit or
+lint, and publishes and posts statuses as staging does (TauCetiTools `bors_attested.py`). An attested
+run that does not pass is an infrastructure failure (`attested-fallback: ...`, journal
+`attested-landing-fallback`), never a source failure, so the tip is not marked failed; the next
+dispatch of that tip and base is full staging. Status shows the attempt's `ci.kind` and `ci.early`.
 No preparation starts once the head's CI has passed (`prepare_blocked`: `head N passed CI and is landing`): it would be preserved across the landing and the seal would wait for it with staging idle. On a head that is not known-good, the next batch's conflicts-only pre-rebase still runs, but
 `prepare_blocked` says `head N's tip <sha> has not passed its own verification`, and a claimed
 preparation is superseded (`head-unverified`) and its submission refused, a preserved one included
@@ -844,6 +856,7 @@ and reported in status:
 | `parallel_check_enabled` | false | verify a head dispatched on a tip no worker verified on a repair worker alongside its staging run, and repair what fails (`_schedule_parallel_check`) |
 | `early_staging_enabled` | false | send the next batch's verified prepared tip to its trusted run while the head is staging, and adopt that run when it seals as that tip (`_early_staging`) |
 | `early_staging_infrastructure_retries` | 1 | re-sends of an early run that failed on infrastructure before the batch waits to be staged as the head |
+| `attested_landing_enabled` | false | send a tip whose accepted worker attestation counts as an attested landing, which pr-build lands without rebuilding; a failed one falls back to full staging (`_dispatch_kind`) |
 | `base_cache_endpoint` | `https://cache.taucetiproject.org/revisions` | public Lake revision endpoint a head's base must be published at before staging is dispatched (CI section above); empty disables the requirement |
 | `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
 | `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |

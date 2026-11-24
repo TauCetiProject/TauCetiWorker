@@ -61,6 +61,9 @@ API_VERSION = "2022-11-28"
 DEFAULT_BACKGROUND_FLOOR = 1000
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
+# Decision 200: a staging run of a candidate the queue's trusted worker verified, which pr-build lands
+# without rebuilding once the queue's observation attests it (TauCetiTools `bors_attested.py`).
+ATTESTED_EVENT = "tauceti-bors-attested"
 # The queue's idle-capacity test of an accepted head on current main (decision 175 B).
 MAIN_INTEGRATION_EVENT = "tauceti-main-integration"
 MAIN_INTEGRATION_CONTEXT = "main-integration"
@@ -938,14 +941,16 @@ class GitHubAdapter:
         batch_id,
         members: Sequence,
         repair_outputs_revs: Sequence[str] = (),
+        attested: bool = False,
     ) -> str:
         """`repository_dispatch` of pr-build.yml as Bors sends it; returns the run title.
 
         The payload adds `repair_outputs_revs`, the revisions whose published build outputs CI may
-        restore when none are published for `head_sha` (empty when the caller names none).
+        restore when none are published for `head_sha` (empty when the caller names none). `attested`
+        sends it as an attested landing (`ATTESTED_EVENT`); the run title is the same.
         """
         payload = {
-            "event_type": STAGING_EVENT,
+            "event_type": ATTESTED_EVENT if attested else STAGING_EVENT,
             "client_payload": {
                 "head_sha": head_sha,
                 "base_sha": base_sha,
