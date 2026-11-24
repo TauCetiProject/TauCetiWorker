@@ -382,6 +382,51 @@ def foreign_inputs(download, cwd):
     return foreign - native
 
 
+SEED_PER_WALK = 2  # pool maps taken from each history walk the fetch will make
+SEED_RECENT = 4  # newest pool maps, for a revision CI published after this host last fetched
+NAMED_ARCHIVE = re.compile(r'"([0-9a-f]{16}\.ltar)"')
+
+
+def named_archives(pool, cwd, env):
+    """The archive names this round's `lake cache get` can want, or None to seed every archive.
+
+    Seeding hard-links each candidate into a throwaway download directory, and the directory's
+    removal unlinks it again. Linking the whole pool (137,924 archives on tauchonki) cost 276,000
+    metadata operations a round, serialised on XFS's per-user quota record. The fetch only reads
+    archives that the revision map it picks names: the first published revision walking back from
+    HEAD, then from the base branch (`warm_host_build_caches`). Pool maps for the nearest revisions
+    on those walks name nearly all of them; the newest pool maps cover a revision CI published since
+    this host last fetched. An archive this misses is a download Lake makes, never a wrong result.
+    None (no git history, or no pool map on either walk) keeps the old seed of everything.
+    """
+    revisions = pool / "revisions/TauCeti"
+    maps = {p.stem: p for p in revisions.glob("*.jsonl") if REVISION.fullmatch(p.stem)}
+    if not maps:
+        return None
+    max_revs = env.get("LAKE_CACHE_MAX_REVS", "100")
+    count = [] if max_revs == "0" or not max_revs.isdigit() else [f"--max-count={max_revs}"]
+    chosen = []
+    for ref in ("HEAD", "origin/" + os.environ.get("TAUCETI_BASE_BRANCH", "main")):
+        try:
+            walk = subprocess.run(["git", "rev-list", *count, ref], cwd=cwd, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if walk.returncode != 0:
+            continue
+        hits = [maps[revision] for revision in walk.stdout.split() if revision in maps]
+        chosen.extend(hits[:SEED_PER_WALK])
+    if not chosen:
+        return None
+    chosen.extend(sorted(maps.values(), key=revision_mtime, reverse=True)[:SEED_RECENT])
+    names = set()
+    for path in dict.fromkeys(chosen):
+        try:
+            names.update(NAMED_ARCHIVE.findall(path.read_text()))
+        except FileNotFoundError:
+            continue  # Another preparation trimmed this revision hint.
+    return names
+
+
 def expand(
     download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None, deadline=None, ci_outputs=None
 ):
@@ -716,16 +761,23 @@ def preparation(cwd, env, *, refetch=None, report=None):
         seeded = set()
         seed_started = clock()
         try:
-            for source in (pool / "archives", private / "artifacts"):
-                for path in source.glob("*.ltar"):
-                    if path.name in seeded:
-                        continue
-                    try:
-                        if ARTIFACT.fullmatch(path.name) and not path.is_symlink():
-                            link(path, download / "artifacts" / path.name)
-                            seeded.add(path.name)
-                    except FileNotFoundError:
-                        continue  # Pool GC won the race; native Lake can fetch this file.
+            wanted = named_archives(pool, cwd, env)
+            report["seed_selection"] = "all" if wanted is None else "named"
+            sources = (pool / "archives", private / "artifacts")
+            candidates = (
+                (path for source in sources for path in source.glob("*.ltar"))
+                if wanted is None
+                else (source / name for name in sorted(wanted) for source in sources)
+            )
+            for path in candidates:
+                if path.name in seeded:
+                    continue
+                try:
+                    if ARTIFACT.fullmatch(path.name) and not path.is_symlink():
+                        link(path, download / "artifacts" / path.name)
+                        seeded.add(path.name)
+                except FileNotFoundError:
+                    continue  # Pool GC won the race, or this source lacks it; Lake can fetch it.
             # Reuse only the host-owned immutable revision maps, never agent-created metadata.
             revisions = pool / "revisions/TauCeti"
             recent = sorted(revisions.glob("*.jsonl"), key=revision_mtime, reverse=True)[:64]
