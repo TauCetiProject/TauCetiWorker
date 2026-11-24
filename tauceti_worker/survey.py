@@ -1430,7 +1430,7 @@ def classify_survey(
     #    still PENDING: a full rebuild against a new Mathlib takes hours of CI, and a worker with a
     #    warm cache finds the breakage in minutes. It stays actionable until CI is green or a round
     #    has verified the head locally (`self-tested`).
-    for p in tended if "bump" in enabled else []:
+    for p in (p for p in tended if not adopts(p)) if "bump" in enabled else []:
         integration = p.build_success and p.bump_integration_failed
         branch = p.head_ref.startswith(BUMP_HEAD_PREFIX) or (integration and p.head_ref == "hopscotch/lkg-bump")
         pending = p.automatic_bump and not (p.build_success or p.build_failed or p.self_tested)
@@ -1472,7 +1472,7 @@ def classify_survey(
     #    by the review bot) whose build is RED — main carries environment-lint violations that PR
     #    builds, which lint only changed modules, could not see, and TauCeti/ needs fixing. Like bump:
     #    we repair it and never author one (the daily lint owns opening them, CI owns merging).
-    for p in tended if "lint-repair" in enabled else []:
+    for p in (p for p in tended if not adopts(p)) if "lint-repair" in enabled else []:
         if not (p.head_ref.startswith(LINT_REPAIR_HEAD_PREFIX) and p.build_failed):
             continue
         c = Candidate(p.number, p.head_oid, "lint-repair, build red")

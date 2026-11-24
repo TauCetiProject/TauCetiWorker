@@ -62,6 +62,10 @@ fork = {"mo271/TauCeti": True}
 for push in (canonical, fork):
     assert classify(raw(), ["rebase"], push=push).rebaseable.count == 1, push
     assert classify(raw(mergeable="MERGEABLE"), ["fix-ci"], push=push).red_ci.count == 1, push
+# Adoption covers rebase, fix and fix-ci only, whatever the branch is called.
+for branch in ("bump-mathlib/" + "b" * 40, "lint-repair/x"):
+    sv = classify(raw(headRefName=branch, mergeable="MERGEABLE"), ["bump", "lint-repair"], push=canonical)
+    assert sv.bump.count == 0 and sv.lint_repair.count == 0, branch
 # Push access to TauCeti admits the push only while the PR allows edits by maintainers.
 assert classify(raw(), ["rebase"], push=canonical, edits=False).rebaseable.count == 0
 assert classify(raw(), ["rebase"], push=canonical, edits=None).rebaseable.count == 0
