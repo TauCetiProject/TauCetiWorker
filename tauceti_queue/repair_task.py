@@ -3233,8 +3233,10 @@ def _run_task(
                     cancel=cancel,
                 )
             except SourcesUnavailable:
-                if stopping() and not lease.lost.is_set():
-                    return cancelled("the worker stopped while the sources were fetched")
+                # A lost claim cancels the fetch too: that attempt is discarded as claim_lost, not
+                # released as unavailable sources under a claim the worker no longer holds.
+                if stopping() or lease.lost.is_set():
+                    return cancelled("the claim was lost or the worker stopped while the sources were fetched")
                 raise
             from tauceti_queue import repair_cleanup
 
