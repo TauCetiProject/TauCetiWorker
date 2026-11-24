@@ -19,7 +19,7 @@
 #             docs      only the modules that assert on README.md, docs/*.md and workers.toml.example,
 #                       which is all a documentation-only change can break (see DOCS_CONTRACT)
 set -uo pipefail
-INVOKED_FROM="$PWD"
+INVOKED_FROM="$(pwd -P)"  # physical, as Git resolves a relative GIT_CONFIG_SYSTEM
 cd "$(dirname "$0")/.." || exit 1
 
 # Unit fixtures use their mocked transport, never the public production mirror.
