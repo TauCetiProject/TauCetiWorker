@@ -530,12 +530,25 @@ NETWORK_FILES = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf")
 CA_VARIABLES = ("SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")
 
 
+def _system(path: Path) -> bool:
+    return any(path.is_relative_to(root) for root in SYSTEM_ROOTS if Path(root).is_dir())
+
+
 def _network_binds(env: dict) -> list[str]:
+    """The resolver's files at their resolved paths (the system path is then a link into the bind),
+    and each CA variable's file at the path the variable names, which is what a TLS client opens."""
     args: list[str] = []
-    paths = [*NETWORK_FILES, *(env[key] for key in CA_VARIABLES if env.get(key))]
-    for path in paths:
+    for path in NETWORK_FILES:
         target = Path(path).resolve()
-        if target.is_file() and not any(target.is_relative_to(root) for root in SYSTEM_ROOTS if Path(root).is_dir()):
+        if target.is_file() and not _system(target):
+            args += ["--ro-bind", str(target), str(target)]
+    for path in dict.fromkeys(env[key] for key in CA_VARIABLES if env.get(key)):
+        named, target = Path(os.path.abspath(path)), Path(path).resolve()
+        if not target.is_file():
+            continue
+        if not _system(named):
+            args += ["--ro-bind", str(target), str(named)]
+        elif not _system(target):
             args += ["--ro-bind", str(target), str(target)]
     return args
 
@@ -560,6 +573,38 @@ def ensure_toolchain(worktree: Path, env: dict, timeout: float = 1800) -> None:
         return
     clean = {k: env[k] for k in ("PATH", "HOME", "ELAN_HOME", "LANG", *NETWORK_ENV) if env.get(k)}
     subprocess.run([elan, "toolchain", "install", name], env=clean, cwd="/", capture_output=True, timeout=timeout)
+
+
+def sandboxed_python(code: str, args: list[str], tree: Path, env: dict | None = None) -> list[str]:
+    """``python -I -c code args...`` of this worker's own interpreter and package, offline, with only
+    ``tree`` writable (one bind, so hard links inside it work) and nothing else of the host but the
+    system roots: for host-side maintenance of build-writable state, where a planted symlink must not
+    resolve to the worker's files. Raises :class:`SandboxUnavailable` like :func:`sandbox_argv`."""
+    env = dict(os.environ if env is None else env)
+    bwrap = shutil.which("bwrap", path=env.get("PATH"))
+    if not bwrap:
+        raise SandboxUnavailable(f"bwrap is not on PATH; install bubblewrap or set {DISABLE_VARIABLE}=0")
+    package = Path(__file__).resolve().parent.parent
+    # The real interpreter and this process's import path, all at their real paths (a venv or a
+    # versioned install is often reached through links that would not resolve inside), and the
+    # outermost of those trees bound read-only.
+    python = Path(sys.executable).resolve()
+    trees = {package, Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), python.parent.parent}
+    # Only import-path entries inside those trees: `python -m` puts the working directory first.
+    entries = (Path(p).resolve() for p in sys.path if p and Path(p).exists())
+    path = [str(package), *dict.fromkeys(str(e) for e in entries if any(e.is_relative_to(t) for t in trees))]
+    found = sorted(trees)
+    roots = [r for r in found if not any(r != o and r.is_relative_to(o) for o in found) and not _system(r)]
+    argv = [shutil.which("env") or "/usr/bin/env", "-i", bwrap, "--tmpfs", "/", *_system_binds()]
+    argv += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    for root in roots:
+        argv += ["--ro-bind", str(root), str(root)]
+    tree = Path(tree).resolve()
+    argv += ["--bind", str(tree), str(tree)]
+    argv += _credential_masks(_binds(argv), env)
+    argv += ["--remount-ro", "/", "--setenv", "PATH", "/usr/bin:/bin", "--chdir", str(tree), *NAMESPACE_FLAGS]
+    code = f"import sys; sys.path[:] = {path!r}\n" + code
+    return [*argv, "--", str(python), "-I", "-c", code, *args]
 
 
 def sandboxed_fetch(argv: list[str], worktree: Path, env: dict | None = None) -> list[str]:

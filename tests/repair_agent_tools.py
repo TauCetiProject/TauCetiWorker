@@ -465,6 +465,10 @@ class Fetches(Fixture):
         ca.write_text("public trust")
         args = repair_sandbox._network_binds({"SSL_CERT_FILE": str(ca)})
         self.assertIn(["--ro-bind", str(ca), str(ca)], [args[i : i + 3] for i in range(len(args))])
+        link = self.tmp / "ca-link.pem"
+        link.symlink_to(ca)
+        args = repair_sandbox._network_binds({"CURL_CA_BUNDLE": str(link)})
+        self.assertIn(["--ro-bind", str(ca), str(link)], [args[i : i + 3] for i in range(len(args))])
         for path in repair_sandbox.NETWORK_FILES:
             target = Path(path).resolve()
             if target.is_file() and not any(target.is_relative_to(r) for r in repair_sandbox.SYSTEM_ROOTS):
@@ -496,6 +500,32 @@ class Fetches(Fixture):
             with repair_cache.downloads({"LAKE_CACHE_DIR": str(pool)}) as env:
                 (Path(env["LAKE_CACHE_DIR"]) / "outputs").symlink_to(secret)
         self.assertEqual([p.name for p in pool.rglob("auth.json")], [])
+
+    @unittest.skipUnless(real_bwrap_works(), "needs bwrap with unprivileged user namespaces")
+    def test_the_transfer_into_the_pool_runs_where_planted_links_reach_nothing(self):
+        from tauceti_queue import repair_cache
+
+        pool = self.tmp / "shared" / "lake-cache"
+        (pool / "outputs").mkdir(parents=True)
+        (pool.parent / "cache-users").mkdir()
+        target = self.home / ".ssh"
+        target.mkdir()
+        (pool / "outputs" / "escape").symlink_to(target)  # planted by an earlier build
+        env = {**os.environ, "LAKE_CACHE_DIR": str(pool)}
+        env.pop(repair_sandbox.DISABLE_VARIABLE, None)
+        with self.assertRaises(OSError):
+            with repair_cache.downloads(env) as fetch:
+                view = Path(fetch["LAKE_CACHE_DIR"])
+                (view / "outputs" / "escape").mkdir(parents=True)
+                (view / "outputs" / "escape" / "authorized_keys").write_text("attacker")
+        self.assertEqual(list(target.iterdir()), [], "nothing was written through the planted link")
+        # An ordinary download still reaches the pool.
+        os.unlink(pool / "outputs" / "escape")
+        with repair_cache.downloads(env) as fetch:
+            view = Path(fetch["LAKE_CACHE_DIR"])
+            (view / "outputs" / "TauCeti").mkdir(parents=True)
+            (view / "outputs" / "TauCeti" / "note.txt").write_text("output")
+        self.assertEqual((pool / "outputs" / "TauCeti" / "note.txt").read_text(), "output")
 
     def test_the_workers_mathlib_cache_is_their_own(self):
         env = repair.lake_env(self.root, {"HOME": str(self.home)}, cache_root=self.tmp / "shared")

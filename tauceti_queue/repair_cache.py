@@ -16,6 +16,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -123,6 +124,22 @@ def _artifacts(data) -> set[str]:
             raise ValueError("unknown Lake output facets")
         return set().union(*(_artifacts(value) for key, value in data.items() if key != "m"))
     raise ValueError("invalid Lake artifact description")
+
+
+def _transfer(view: Path, pool: Path, env: dict) -> None:
+    from tauceti_queue import repair_sandbox
+    from tauceti_worker.expanded_cache import transfer
+
+    if repair_sandbox.disabled(env):
+        transfer(view, pool)
+        return
+    common = Path(os.path.commonpath([view.resolve(), pool.resolve()]))
+    code = "from pathlib import Path\nfrom tauceti_worker.expanded_cache import transfer\ntransfer(Path(sys.argv[1]), Path(sys.argv[2]))"
+    argv = repair_sandbox.sandboxed_python(code, [str(view.resolve()), str(pool.resolve())], common, env)
+    done = subprocess.run(argv, capture_output=True, text=True, timeout=1800, check=False)
+    if done.returncode:
+        detail = (done.stderr or done.stdout).strip().splitlines()
+        raise OSError(f"cache transfer exited {done.returncode}: {detail[-1] if detail else 'no output'}")
 
 
 def _symlink_in(directory: Path) -> Path | None:
@@ -344,7 +361,7 @@ def downloads(env: dict):
     if pool is None or not (pool.parent / "cache-users").is_dir():
         yield env
         return
-    from tauceti_worker.expanded_cache import link, transfer
+    from tauceti_worker.expanded_cache import link
 
     staging = pool.parent / "cache-downloads"
     staging.mkdir(exist_ok=True)
@@ -366,11 +383,12 @@ def downloads(env: dict):
                     _mapping(mapping)
                 except (ValueError, TypeError):
                     mapping.unlink()
-            # The fetch ran in the sandbox, which could write the view: copy nothing from it into the
-            # pool unless it holds no symlink at all, so a planted link cannot draw host files in.
+            # The fetch ran in the sandbox, which could write the view, and builds can write the pool:
+            # copy nothing unless the view holds no symlink at all, and copy in a sandbox of its own
+            # that sees only the two, so a link planted in either cannot reach the worker's files.
             if _symlink_in(view):
                 raise ValueError(f"symlink in the cache download view {view}; nothing transferred")
-            transfer(view, pool)
+            _transfer(view, pool, env)
 
 
 def migrate(database: Path, roots: list[Path], shared: Path, *, apply=False) -> list[dict]:
