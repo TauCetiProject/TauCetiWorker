@@ -13,6 +13,12 @@ recorded or read.
 The store also keeps, per PR, the heads that review sent back for a fix on this host, so the host can
 see a PR that fix and review keep handing back and forth (constants.MAX_FIX_ROUNDS_WITHOUT_APPROVAL).
 One empty file per head makes concurrent records race-free.
+
+A head that the review engine declined because its diff fails the PR-level guards (too large to
+review, oversized new files) is recorded here too, for GUARD_TTL_S. The engine's verdict depends
+on the head, its merge base and whether the head's build is green. Peers skip that head until a
+push gives the PR a new one or its build turns green; the TTL covers a merge base that moves under
+an unchanged head (a retargeted PR), at a few declined reviews a day rather than hundreds.
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ HINT_TTL_S = 600
 # A selected PR whose source could not be fetched is skipped host-wide this long (the per-worker
 # retry deadline, github_state.MAX_RETRY_AFTER), so one fetch failure does not draw every peer to it.
 UNAVAILABLE_TTL_S = 300
+GUARD_TTL_S = 8 * 3600
 
 
 def _root() -> Path | None:
@@ -146,3 +153,44 @@ def clear_fixed_heads(scope: str, pr: int) -> None:
             path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _guard_path(scope: str, pr: int, head: str) -> Path | None:
+    shared = os.environ.get("TAUCETI_GITHUB_SHARED_DIR")
+    if not shared or not pr or not head:
+        return None
+    return Path(shared) / "review-diff-guards" / (_key(scope, f"diff-guard/{pr}/{head}") + ".json")
+
+
+def note_diff_guard(scope: str, pr: int, head: str, *, now: float | None = None) -> None:
+    """Record that the review engine declined this exact head on the PR-level diff guards."""
+    path = _guard_path(scope, pr, head)
+    if path is None:
+        return
+    stamp = time.time() if now is None else now
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        temporary.write_text(json.dumps({"expires_at": stamp + GUARD_TTL_S}))
+        os.replace(temporary, path)
+        if random.random() < 0.02:
+            for old in path.parent.glob("*.json"):
+                try:
+                    if stamp - old.stat().st_mtime > GUARD_TTL_S:
+                        old.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass  # without the record, peers each pay one more declined review
+
+
+def diff_guarded(scope: str, pr: int, head: str, *, now: float | None = None) -> bool:
+    path = _guard_path(scope, pr, head)
+    if path is None:
+        return False
+    try:
+        expires = json.loads(path.read_text()).get("expires_at")
+    except (OSError, ValueError, AttributeError):
+        return False
+    stamp = time.time() if now is None else now
+    return isinstance(expires, (int, float)) and stamp < expires <= stamp + GUARD_TTL_S

@@ -514,6 +514,20 @@ class SharedIndexSurveys(unittest.TestCase):
         self.assertEqual(self.detail, [], "the first survey refreshed the index for the host")
         self.assertEqual({c.pr for c in result.needs_fix.actionable}, {n for n in self.heads if n % 2})
 
+    def test_only_this_accounts_never_reviewed_prs_get_an_own_first_review(self):
+        from tauceti_worker.survey import LANDING_TIERS, landing_tier
+
+        # 1 and 2 were reviewed at an earlier head; the rest never were. Odd PRs are this account's.
+        self.reviewed = {1: "b" * 40, 2: "b" * 40}
+        result = self.survey(seed=0)
+        reviews = {c.pr: c for c in result.reviewable.actionable}
+        self.assertEqual(set(reviews), set(self.heads))
+        self.assertEqual({n for n, c in reviews.items() if c.own_first_review}, {n for n in self.heads if n % 2} - {1})
+        self.assertEqual({n for n, c in reviews.items() if c.rereview}, {1, 2})
+        tiers = {n: landing_tier("review", c) for n, c in reviews.items()}
+        self.assertEqual(tiers[3], tiers[1], "a first review of our own PR ranks with the re-reviews")
+        self.assertEqual(tiers[4], LANDING_TIERS["review"], "another author's first review keeps its tier")
+
     def test_changed_prs_are_read_again_and_owned_blocking_reviews_become_fixes(self):
         self.reviewed = {n: "a" * 40 for n in self.heads}
         self.survey(seed=0)

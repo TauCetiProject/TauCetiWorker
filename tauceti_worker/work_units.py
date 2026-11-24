@@ -220,6 +220,49 @@ def _fix_loop_escalated(w, c: Candidate) -> bool:
     return True
 
 
+def _github_clone_url(owner: str, repo: str) -> str:
+    return f"https://github.com/{owner}/{repo}.git"
+
+
+def _pull_ref_missing(result, pr: int) -> bool:
+    """`gh pr checkout` failed because GitHub has no refs/pull/<pr>/head for this PR. GitHub
+    occasionally never creates or loses that ref (GitHub #43663, 22 Nov 2026) while the PR and its
+    head branch are intact; without a fallback every rebase of the PR fails the same way."""
+    from .worker_sources import current
+
+    detail = (result.stderr or "") + (result.stdout or "")
+    return current() is None and f"refs/pull/{pr}/head" in detail and "find remote ref" in detail
+
+
+def _checkout_head_branch(co, p: PRInfo, head: str, branch: str) -> subprocess.CompletedProcess:
+    """Check out a GitHub PR from its head repository's branch, as gh pr checkout would from the
+    pull ref: the exact selected head on `branch`, tracking the head branch. Pushes still go only
+    where the branch claim's TAUCETI_PUSH_REMOTE says."""
+    url = _github_clone_url(p.head_owner, p.head_repo)
+    steps = [
+        ["git", "check-ref-format", "--branch", branch],
+        ["git", "check-ref-format", "--branch", p.head_ref],
+        ["git", "fetch", "--no-tags", url, "refs/heads/" + p.head_ref],
+    ]
+    for step in steps:
+        result = subprocess.run(step, cwd=co, capture_output=True, text=True, timeout=600)
+        if result.returncode:
+            return result
+    fetched = subprocess.run(["git", "rev-parse", "FETCH_HEAD"], cwd=co, capture_output=True, text=True)
+    if fetched.returncode or fetched.stdout.strip() != head:
+        return subprocess.CompletedProcess(fetched.args, 1, "", "PR head branch is not at the selected head")
+    for step in (
+        ["git", "checkout", "--force", "-B", branch, head],
+        ["git", "config", f"branch.{branch}.remote", url],
+        ["git", "config", f"branch.{branch}.merge", "refs/heads/" + p.head_ref],
+    ):
+        result = subprocess.run(step, cwd=co, capture_output=True, text=True, timeout=600)
+        if result.returncode:
+            return result
+    log(f"  #{p.number}: GitHub has no refs/pull/{p.number}/head; checked out its head branch instead")
+    return result
+
+
 def _review_claimed_elsewhere(w, candidate: Candidate) -> bool:
     """Read the engine's existing exact-head lease before preflight API reads."""
     if getattr(getattr(w, "gh", None), "worker_capable", False) is True:
@@ -878,6 +921,15 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head, unavailable=True):
             log(f"Global PR work: {stage} #{c.pr} source recently unavailable on this host — selecting other work")
             w.selection_changed = True
+            continue
+        if (
+            stage == "review"
+            and not opts.dry_run
+            and peer_claims.diff_guarded(_claim_scope(w), c.pr, c.head)
+            and not any(p.number == c.pr and p.build_success for p in sv.open_prs)
+        ):
+            # The engine declined this head on the diff guards and would again: no work, not a
+            # passing collision. A green build at the head lifts the guards in the engine, so it does here.
             continue
         if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head):
             log(f"Global PR work: {stage} #{c.pr} recently found claimed by a peer — skipping before fresh PR reads")
@@ -2081,6 +2133,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 result = json.loads(result_file.read_text())
             except (OSError, ValueError):
                 result = None
+            if isinstance(result, dict) and result.get("head_sha") == head and result.get("outcome") == "diff-guard":
+                log(f"  review #{pr}: head fails the PR-level diff guards; peers skip it until a push")
+                peer_claims.note_diff_guard(_claim_scope(w), pr, head)
             if isinstance(result, dict) and result.get("head_sha") == head and result.get("changed") is False:
                 log(f"  review #{pr}: published verdict unchanged — selecting other work")
                 record = getattr(w.counters, "record_unchanged_review", None)
@@ -2516,6 +2571,8 @@ def _do_fixlike(
         # In-process routing: a Forgejo round reaches its own runtime's shim, never
         # whichever gh happens to be first on PATH.
         chk = gh_run(["gh", "pr", "checkout", str(pr), "--force", *unique], cwd=co)
+        if chk.returncode and _pull_ref_missing(chk, pr):
+            chk = _checkout_head_branch(co, p, head, unique[1] if unique else p.head_ref)
         if chk.returncode:
             detail = ends((chk.stderr or "") + (chk.stdout or ""), 200)
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")

@@ -230,6 +230,52 @@ class GlobalMaintenance(unittest.TestCase):
             self.assertFalse(peer_claims.hinted("forgejo:one/project", "fix", 7, HEAD, now=1001, unavailable=True))
             self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1301, unavailable=True))
 
+    def test_diff_guard_records_are_per_head_and_outlast_claim_hints(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            self.assertFalse(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000))
+            peer_claims.note_diff_guard("forgejo:one/project", 7, HEAD, now=1000)
+            self.assertTrue(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000 + 3600))
+            self.assertFalse(peer_claims.diff_guarded("forgejo:one/project", 7, "b" * 40, now=1001), "a push")
+            self.assertFalse(peer_claims.diff_guarded("github:one/project", 7, HEAD, now=1001))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001))
+            self.assertFalse(
+                peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000 + peer_claims.GUARD_TTL_S + 1)
+            )
+        self.assertFalse(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD), "no shared directory")
+
+    def test_a_diff_guarded_review_head_is_skipped_as_no_work(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.survey import Candidate, Survey
+
+        prepared = Survey(worker_id="test", roadmap_only="auto")
+        prepared._round_scope = (True, False)
+        prepared.reviewable.actionable = [Candidate(10, HEAD)]
+        self.opts.only = ["review"]
+        with (
+            patch.object(peer_claims, "diff_guarded", return_value=True) as guarded,
+            patch.object(work, "dispatch") as dispatch,
+        ):
+            with self.assertRaises(work.NoEligibleWork):
+                run_round(self.w, self.opts, prepared_survey=prepared)
+        guarded.assert_called_once()
+        self.assertEqual(guarded.call_args.args[1:], (10, HEAD))
+        dispatch.assert_not_called()
+        # A green build at the same head lifts the engine's guards: the review is offered again.
+        prepared.open_prs = [
+            PRInfo(10, HEAD, "roadmap/work", "science", "TauCeti", False, "MERGEABLE", "science", True, False)
+        ]
+        prepared.reviewable.actionable = [Candidate(10, HEAD)]
+        with (
+            patch.object(peer_claims, "diff_guarded", return_value=True),
+            patch.object(work, "dispatch", return_value=0) as dispatch,
+        ):
+            run_round(self.w, self.opts, prepared_survey=prepared)
+        dispatch.assert_called_once()
+
     def test_fixed_heads_are_recorded_per_pr_and_scope_and_expire(self):
         from tauceti_worker import peer_claims
 
