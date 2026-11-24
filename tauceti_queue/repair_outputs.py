@@ -96,9 +96,8 @@ def expected(worktree: Path) -> list[tuple[Path, object, list[tuple[Path, str]]]
                 for extension, name in zip(extensions, names if isinstance(names, list) else [names], strict=False):
                     if not isinstance(name, str) or not re.fullmatch(NAME.pattern + r"\." + re.escape(extension), name):
                         continue
-                    path = (ir if extension in IR_EXTENSIONS else lib) / (str(stem) + "." + extension)
-                    if _regular(path):
-                        pairs.append((path, name))
+                    # Listed even when the build file is missing: its cache copy is checked either way.
+                    pairs.append(((ir if extension in IR_EXTENSIONS else lib) / (str(stem) + "." + extension), name))
             modules.append((stem, value.get("depHash"), pairs))
     return modules
 
@@ -178,9 +177,7 @@ def damaged(worktree: Path, env: dict, *, hasher=None) -> list[dict]:
     checks: list[tuple[Path | None, object, Path, str]] = []
     for stem, dep_hash, pairs in modules:
         for path, name in pairs:
-            checks.append((stem, dep_hash, path, name))
-            if _regular(artifacts / name):
-                checks.append((stem, dep_hash, artifacts / name, name))
+            checks += [(stem, dep_hash, file, name) for file in (path, artifacts / name) if _regular(file)]
     # `lake cache stage` copies the archives the output map names without reading them, and a
     # module's trace often has no "l" entry for its archive.
     for dep_hash, name in published_archives(worktree):

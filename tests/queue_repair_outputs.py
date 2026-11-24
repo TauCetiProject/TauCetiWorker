@@ -162,6 +162,13 @@ class Outputs(unittest.TestCase):
                 repair_outputs.damaged(self.root, {}, hasher=hasher)
             self.assertFalse(repair_outputs.discard_damaged(self.root, {}, hasher=hasher)["checked"])
 
+    def test_a_cache_copy_is_checked_when_the_build_file_is_missing(self):
+        basic = self.module("Basic", "4366fd23170e9e25", "a")
+        (self.lib / "Basic.olean.private").unlink()
+        (self.artifacts / basic["olean.private"]).write_bytes(b"truncated")
+        found = repair_outputs.damaged(self.root, {}, hasher=hasher)
+        self.assertEqual([Path(d["path"]).name for d in found], [basic["olean.private"]])
+
     def test_an_unavailable_hasher_is_reported_not_raised(self):
         self.module("Basic", "4366fd23170e9e25", "a")
 
