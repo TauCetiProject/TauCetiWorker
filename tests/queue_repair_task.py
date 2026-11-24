@@ -6210,8 +6210,8 @@ class WorkerAudits(Fixture):
         self.assertEqual(outcome["status"], "adopted", outcome)
         checks = outcome["verification"][-1]["checks"]
         self.assertEqual((checks["status"], checks["policy_commit"], checks["sandbox"]), ("passed", policy, True))
-        tree = cfg.root / repair_audit.TOOLS_DIR / repair_audit.POLICY_DIR / policy
-        self.assertTrue((tree / "tauceti.toml").is_file() and (tree / "scripts" / "lint-baseline.txt").is_file())
+        # Read fresh for each check, at an unpredictable path, and removed afterwards.
+        self.assertEqual(list((cfg.root / repair_audit.TOOLS_DIR / repair_audit.POLICY_DIR).iterdir()), [])
         notes = json.loads(self.service.results[0]["worker_notes"])
         attested = notes["attestation"]
         self.assertEqual(
@@ -6225,6 +6225,7 @@ class WorkerAudits(Fixture):
             (repair_task.ATTESTATION_SCHEMA, outcome["tip"], policy, "full", True),
         )
         self.assertEqual(attested["tools_commit"], f"TauCetiProject/TauCetiTools@{TOOLS_REF}")
+        self.assertIs(attested["verifier_isolated"], False, "not yet: the controller counts none")
         self.assertEqual(
             attested["tree"], repair.git(self.content.clone, "rev-parse", f"{outcome['tip']}^{{tree}}").strip()
         )

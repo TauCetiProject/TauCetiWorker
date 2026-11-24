@@ -192,10 +192,11 @@ def tools_checkout(tools_root: Path, repo: str, ref: str) -> Path:
 
 
 def policy_tree(worktree: Path, commit: str, tools_root: Path) -> Path:
-    """``tools_root/policy/<commit>``, holding ``tauceti.toml`` and ``scripts/`` exactly as ``commit`` has
-    them, read from the worktree's object store (fetched from ``origin`` when missing), never from the
-    worktree's files: the trusted TauCetiTools pin and policy files a verification uses (decision 200).
-    It is made once per commit, beside the TauCetiTools checkouts and outside every sandbox bind."""
+    """A fresh directory under ``tools_root/policy`` holding ``tauceti.toml`` and ``scripts/`` exactly as
+    ``commit`` has them, read from the worktree's object store (fetched from ``origin`` when missing),
+    never from the worktree's files: the trusted TauCetiTools pin and policy files a verification uses
+    (decision 200). It is made for each check at an unpredictable path outside every sandbox bind, so no
+    earlier candidate code can have planted anything in it or aimed a link at it; the caller removes it."""
 
     def run(argv: list) -> subprocess.CompletedProcess:
         try:
@@ -205,38 +206,32 @@ def policy_tree(worktree: Path, commit: str, tools_root: Path) -> Path:
 
     if not SHA.match(commit):
         raise Unavailable(f"policy commit {commit!r} is not a commit SHA")
-    dest = tools_root / POLICY_DIR / commit
-    if (dest / "tauceti.toml").is_file() and (dest / "scripts").is_dir():
-        return dest
     if run(["cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
         run(["fetch", "--quiet", "origin", commit])
         if run(["cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
             raise Unavailable(f"the policy commit {commit[:12]} is not in the clone")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    scratch = Path(tempfile.mkdtemp(prefix=f".{commit[:12]}-", dir=dest.parent))
+    parent = tools_root / POLICY_DIR
+    parent.mkdir(parents=True, exist_ok=True)
+    dest = Path(tempfile.mkdtemp(prefix=f"{commit[:12]}-", dir=parent))
     try:
         shown = run(["show", f"{commit}:tauceti.toml"])
         if shown.returncode != 0:
             raise Unavailable(f"the policy commit {commit[:12]} has no tauceti.toml")
-        (scratch / "tauceti.toml").write_text(shown.stdout)
-        archive = scratch / "scripts.tar"
+        (dest / "tauceti.toml").write_text(shown.stdout)
+        archive = dest / "scripts.tar"
         listed = run(["archive", "--format=tar", "-o", str(archive), commit, "scripts"])
         if listed.returncode != 0:
             raise Unavailable(f"the policy commit {commit[:12]} has no scripts/: {_tail(listed.stderr)}")
         try:
-            unpacked = _run(["tar", "-xf", archive, "-C", scratch], timeout=300)
+            unpacked = _run(["tar", "-xf", archive, "-C", dest], timeout=300)
         except subprocess.TimeoutExpired as error:
             raise Unavailable(f"unpacking the policy commit's scripts/: {error}") from error
         archive.unlink(missing_ok=True)
-        if unpacked.returncode != 0 or not (scratch / "scripts").is_dir():
+        if unpacked.returncode != 0 or not (dest / "scripts").is_dir():
             raise Unavailable(f"unpacking the policy commit's scripts/: {_tail(unpacked.stderr)}")
-        try:
-            os.rename(scratch, dest)
-        except OSError:
-            if not (dest / "tauceti.toml").is_file():  # another check's rename did not win either
-                raise
-    finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
     return dest
 
 
@@ -448,14 +443,18 @@ def check(
                 record["policy_commit"] = policy_commit
             except Unavailable as error:
                 record["policy_error"] = str(error)
-        repo, ref = tools_pin(source)
-        record["tools"] = f"{repo}@{ref}"
-        checkout = tools_checkout(tools_root, repo, ref)
-        ref = checkout.name  # the exact commit, which keys the compiled drivers
-        record["tools_commit"] = f"{repo}@{ref}"
-        record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
-        materialize_started = time.monotonic()
-        scripts = materialize(checkout, source, work / "scripts")
+        try:
+            repo, ref = tools_pin(source)
+            record["tools"] = f"{repo}@{ref}"
+            checkout = tools_checkout(tools_root, repo, ref)
+            ref = checkout.name  # the exact commit, which keys the compiled drivers
+            record["tools_commit"] = f"{repo}@{ref}"
+            record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
+            materialize_started = time.monotonic()
+            scripts = materialize(checkout, source, work / "scripts")
+        finally:
+            if source != worktree:
+                shutil.rmtree(source, ignore_errors=True)
         record["materialize_seconds"] = round(time.monotonic() - materialize_started, 3)
         drivers_started = time.monotonic()
         drivers, built = build_drivers(worktree, scripts, env, ref, logdir / "audit-drivers.log", timeout)

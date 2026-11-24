@@ -3640,6 +3640,7 @@ class Attestation(PreRebasedCase):
             "tools_commit": "TauCetiProject/TauCetiTools@" + "a" * 40,
             "lint_scope": "full",
             "sandbox": True,
+            "verifier_isolated": True,
             "toolchain": "",
             "outputs_published": True,
         }
@@ -3664,6 +3665,16 @@ class Attestation(PreRebasedCase):
         self.assertEqual(self.problem(tip, tip="0" * 40), "the attestation is of another tip")
         self.assertEqual(self.problem(tip, tree="0" * 40), "the attestation names another tree")
         self.assertEqual(self.problem(tip, sandbox=False), "the verification ran outside the build sandbox")
+        self.assertEqual(
+            self.problem(tip, verifier_isolated=False),
+            "the verification's scripts and drivers were writable by candidate code",
+        )
+        for commit in (
+            "TauCetiProject/TauCetiTools@",
+            "TauCetiProject/TauCetiTools@main",
+            "TauCetiProject/TauCetiTools@x",
+        ):
+            self.assertEqual(self.problem(tip, tools_commit=commit), "the verification used another TauCetiTools")
         self.assertEqual(self.problem(tip, lint_scope="changed"), "the verification did not run the whole-library lint")
         self.assertEqual(
             self.problem(tip, policy_commit=None), "the verification used the candidate's own tools and policy"

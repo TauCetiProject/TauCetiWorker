@@ -7095,6 +7095,8 @@ class Controller:
             return "the attestation names another tree"
         if note.get("sandbox") is not True:
             return "the verification ran outside the build sandbox"
+        if note.get("verifier_isolated") is not True:
+            return "the verification's scripts and drivers were writable by candidate code"
         if note.get("lint_scope") != "full":
             return "the verification did not run the whole-library lint"
         policy = note.get("policy_commit")
@@ -7113,8 +7115,10 @@ class Controller:
         except Unavailable:
             return f"{self.canonical_branch} names no TauCetiTools pin"
         commit = str(note.get("tools_commit") or "")
-        # A `main` pin is resolved when the checks run, as staging's reusable workflow resolves it.
-        if not commit.startswith(repo + "@") or (ref != "main" and commit != f"{repo}@{ref}"):
+        # A `main` pin is resolved when the checks run, as staging's reusable workflow resolves it; either
+        # way the attestation names the exact commit.
+        exact = re.fullmatch(re.escape(repo) + r"@([0-9a-f]{40})", commit)
+        if exact is None or (ref != "main" and exact[1] != ref):
             return "the verification used another TauCetiTools"
         return None
 
