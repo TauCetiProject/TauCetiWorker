@@ -19,6 +19,7 @@
 #             docs      only the modules that assert on README.md, docs/*.md and workers.toml.example,
 #                       which is all a documentation-only change can break (see DOCS_CONTRACT)
 set -uo pipefail
+INVOKED_FROM="$PWD"
 cd "$(dirname "$0")/.." || exit 1
 
 # Unit fixtures use their mocked transport, never the public production mirror.
@@ -59,7 +60,7 @@ trap 'rm -rf "$RUN_ROOT"' EXIT
 # Git's own writer quotes the path. It is made absolute, so it does not resolve against $RUN_ROOT,
 # but not normalized: Git reads the path as given, symlinks and `..` included.
 system_gitconfig="${GIT_CONFIG_SYSTEM:-/etc/gitconfig}"
-[[ "$system_gitconfig" == /* ]] || system_gitconfig="$PWD/$system_gitconfig"
+[[ "$system_gitconfig" == /* ]] || system_gitconfig="$INVOKED_FROM/$system_gitconfig"
 git config --file "$RUN_ROOT/gitconfig" include.path "$system_gitconfig" || exit 1
 git config --file "$RUN_ROOT/gitconfig" maintenance.auto false || exit 1
 git config --file "$RUN_ROOT/gitconfig" gc.auto 0 || exit 1
