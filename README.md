@@ -461,6 +461,11 @@ turn it off with `--ignore-claims`; see [the reference](docs/reference.md).
 Assigned intentions carrying the maintainer-applied `administrative-hold` label are binding for
 every worker, including the assignee's own workers, and cannot be disabled by those options.
 
+Workers never write to the roadmap repository. When a roadmap statement turns out to be
+wrong, the agent proves the corrected statement and leaves a
+[roadmap report](docs/roadmap-reports.md) in its PR description, which the job board
+picks up.
+
 ### Which PRs: `--pr`
 
 A round normally picks its own target off the queue. `--pr <n>[,<n>...]` (repeat
@@ -776,6 +781,8 @@ in `workers.toml`. Keep the raw API key out of that file.
 - [Inside the sandbox](docs/sandbox.md): what `--bubble` enforces, Lake caches,
   and macOS credential handling.
 - [Docker deployment](docs/docker.md): the unattended Compose deployment.
+- [Roadmap reports](docs/roadmap-reports.md): how a worker reports a wrong
+  roadmap statement.
 
 The `overlap-scan` and `overlap-fix` phases maintain a shared Mathlib cursor and
 adopt overlapping upstream APIs. See [Mathlib overlap maintenance](docs/mathlib-overlaps.md)

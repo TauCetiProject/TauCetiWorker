@@ -25,6 +25,8 @@ cd "$(dirname "$0")/.." || exit 1
 # Unit fixtures use their mocked transport, never the public production mirror.
 # Service tests explicitly override this; default-resolution tests remove it.
 export TAUCETI_GITHUB_STATE_URL=""
+# Nor the job board's register of roadmap reports; tests/roadmap_reports.py serves its own.
+export TAUCETI_ROADMAP_REPORT_REGISTER=""
 # Rounds start a background cleanup collector on hosts without the systemd timer. Fixtures and
 # lifecycle scripts must never launch one against the checkout's or the host's real data.
 export TAUCETI_BACKGROUND_CLEANUP=off
@@ -294,6 +296,7 @@ RUN_STDLIB=(
   staging_journal_report.py
   status_labels.py
   target_list.py
+  roadmap_reports.py
   target_landings.py
   target_maintenance.py
   tend_bot_permissions.py

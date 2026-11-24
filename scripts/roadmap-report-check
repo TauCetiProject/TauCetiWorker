@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Check the roadmap report markers in a pull request or issue body (docs/roadmap-reports.md).
+
+usage: roadmap-report-check [--roadmaps DIR] [FILE]
+"""
+
+import sys
+from pathlib import Path
+
+if __name__ == "__main__":
+    directory = Path(__file__).resolve().parent
+    # Staged beside this script in Bubble, the package directory in a checkout, its parent in a wheel.
+    for candidate in (directory, directory.parent / "tauceti_worker", directory.parent):
+        if (candidate / "roadmap_reports.py").is_file():
+            sys.path.insert(0, str(candidate))
+            break
+    from roadmap_reports import main
+
+    raise SystemExit(main(sys.argv[1:]))
