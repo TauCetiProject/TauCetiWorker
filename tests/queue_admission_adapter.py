@@ -824,7 +824,6 @@ class SingleReadTests(unittest.TestCase):
 
         transport.add("POST", "https://api.github.com/graphql", 200, fence(raw))
         adapter = self.adapter(transport)
-        adapter.team_member_read = lambda path: {"state": "active"}
         with self.assertRaises(ga.GitHubError):
             adapter.admission_snapshot_single(TAUCETI, 42)
         # The same fence at the same update time passes.
@@ -832,7 +831,6 @@ class SingleReadTests(unittest.TestCase):
         transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
         transport.add("POST", "https://api.github.com/graphql", 200, fence({**raw, "updated_at": self.TS}))
         adapter = self.adapter(transport)
-        adapter.team_member_read = lambda path: {"state": "active"}
         self.assertEqual(adapter.admission_snapshot_single(TAUCETI, 42).pull.head_sha, self.head)
 
     def test_live_self_tested_reads_are_fenced_again(self):
@@ -843,13 +841,12 @@ class SingleReadTests(unittest.TestCase):
         moved["data"]["repository"]["pullRequest"]["labels"] = connection([{"name": "self-tested"}, {"name": "wip"}])
         transport.add("POST", "https://api.github.com/graphql", 200, moved)
         adapter = self.adapter(transport)
-        adapter.team_member_read = lambda path: {"state": "active"}
         with self.assertRaises(ga.GitHubError):
             adapter.admission_snapshot_single(TAUCETI, 42)
 
 
 class BumpGuardFloorTests(unittest.TestCase):
-    """PR #43422: a self-tested Mathlib bump's guard needs 19 reads, and restarts from its first."""
+    """PR #43422: a self-tested Mathlib bump's guard needs 17 reads, and restarts from its first."""
 
     REPO = "TauCetiProject/TauCeti"
 
@@ -862,9 +859,8 @@ class BumpGuardFloorTests(unittest.TestCase):
         environment = mock.patch.dict("os.environ")
         environment.start()
         self.addCleanup(environment.stop)
-        for name in ("SELF_TESTED_TEAM_TOKEN", "TAUCETI_TEAM_TOKEN", "TAUCETI_SELF_TESTED_TEAM", "TAUCETI_BASE_BRANCH"):
+        for name in ("TAUCETI_SELF_TESTED_REPO", "TAUCETI_BASE_BRANCH"):
             os.environ.pop(name, None)
-        self_tested._MEMBERS.clear()
         guard = self_tested._bump_policy()
 
         def run_guard(api, command, directory, env):
@@ -885,11 +881,7 @@ class BumpGuardFloorTests(unittest.TestCase):
             state["remaining"] -= 1
             path = url.removeprefix("https://api.github.com/")
             state["calls"].append(path)
-            if "/issues/7/events" in path:
-                data = [{"id": 1, "event": "labeled", "label": {"name": "self-tested"}, "actor": {"login": "kim-em"}}]
-            elif "/teams/self-tested/memberships/" in path:
-                data = {"state": "active"}
-            elif path.endswith("/branches/main"):
+            if path.endswith("/branches/main"):
                 data = {"commit": {"sha": "b" * 40}}
             elif "/compare/" in path:
                 data = {"merge_base_commit": {"sha": "c" * 40}}
@@ -941,7 +933,7 @@ class BumpGuardFloorTests(unittest.TestCase):
         c = ga.GitHubClient(StaticTokens(), transport, clock=clock, sleep=clock.sleep)
         attempts, verdict = self.evaluate(c, clock)
         self.assertEqual((attempts, verdict), (1, True))
-        self.assertEqual(len(state["calls"]), 19)
+        self.assertEqual(len(state["calls"]), 17)
         self.assertEqual(clock.slept, [])
 
     def test_bump_guard_near_the_floor_defers_cleanly_and_completes_after_reset(self):
@@ -952,8 +944,8 @@ class BumpGuardFloorTests(unittest.TestCase):
         attempts, verdict = self.evaluate(c, clock)
         self.assertEqual((attempts, verdict), (2, True))
         # The first pass stopped at the floor, spending nothing below it. The restart after the
-        # reset ran the whole guard again; only the team membership came from the one-minute cache.
-        self.assertEqual(len(state["calls"]), 10 + 18)
+        # reset ran the whole guard again.
+        self.assertEqual(len(state["calls"]), 10 + 17)
         self.assertEqual(clock.now, reset + 1)
         self.assertEqual(clock.slept, [])
 

@@ -43,6 +43,15 @@ READMIT_REFUSED = frozenset({"closed", "draft", "review-unsafe"})
 CONTEXTS = ("build", "scope", "bump-guard")
 HUMAN_INFRASTRUCTURE_APPROVAL_VERSION = 1
 LARGE_REFACTOR_APPROVAL_VERSION = 1
+# Tools' self-tested eligibility is not part of the review policy's source. Bump this when its rules
+# change: startup then evaluates again, once, each head last refused for evidence the label may now
+# stand in for (its build, scope or bump guard). 2: any author's label counts.
+SELF_TESTED_POLICY_VERSION = 2
+SELF_TESTED_REFUSALS = (  # The pinned review policy's refusal reasons (admission_policy.py).
+    "build is not green on HEAD",
+    "trusted CI scope status is not green on HEAD",
+    "PR changes a Lake pin but bump-guard is not green",
+)
 
 
 # The Lake pins a Mathlib bump changes; a waived large refactor may change them only with a passing bump check.
@@ -294,10 +303,19 @@ class AdmissionPoller:
             if not isinstance(row["number"], SourceNumber)
         ]
         waiting_numbers = {row["number"] for row in waiting}
+        # Unlike a policy change, a self-tested rule change re-reads only these refusals, not every PR.
+        retest_key = f"state:self_tested_policy:{repo}"
+        retest = controller.store.get_setting(retest_key) != SELF_TESTED_POLICY_VERSION
         for work in controller.store.rows("admission_work", {"repository": repo}):
-            previous_policy = loads(work["decision"], {}).get("evidence", {}).get("policy_digest")
-            if work["generation"] == work["evaluated_generation"] and previous_policy != self.policy.revision:
+            decision = loads(work["decision"], {})
+            previous_policy = decision.get("evidence", {}).get("policy_digest")
+            refused_evidence = retest and str(decision.get("reason", "")).startswith(SELF_TESTED_REFUSALS)
+            if work["generation"] == work["evaluated_generation"] and (
+                previous_policy != self.policy.revision or refused_evidence
+            ):
                 self.state.dirty(work["number"], head=work["head_sha"], urgent=work["number"] in waiting_numbers)
+        if retest:
+            controller.store.set_setting(retest_key, SELF_TESTED_POLICY_VERSION)
         for row in waiting:
             if self.state.get(row["number"]) is None:
                 self.state.dirty(row["number"], head=row["head_sha"], urgent=True)
