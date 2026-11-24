@@ -1087,14 +1087,18 @@ def run_agent_host(
             "shared sources cannot be changed from this round. If merging/rebasing changes the Mathlib "
             "pin in `lake-manifest.json`, `lake` refuses to build until it matches the shared build "
             "again; stop and report instead of working around it. The public `tauceti-public` Lake "
-            "service remains configured during this run. After merging/rebasing, fetch TauCeti's cache "
-            "before building:\n"
+            "service remains configured during this run. When TAUCETI_PR_CACHE_INSTALLED=1, TauCeti's "
+            "published outputs for this checkout and for current main are already installed from "
+            "this host's shared cache: after merging/rebasing onto main, build directly, without "
+            "`lake cache get` (this round's `lake` answers it as done, because a fetch of its own "
+            "would replace the shared outputs with private archive copies). Otherwise the worker "
+            "could not fetch for this workspace; once it loads, fetch TauCeti's cache before building:\n"
             f"lake cache get --service {TAUCETI_CACHE_SERVICE} --repo {TAUCETI} "
             f"--max-revs={lake_cache_max_revs(os.environ)}\n"
             "A transport or incomplete-artifact download failure is infrastructure trouble: report "
             "it instead of falling back to a full source compilation."
             " If TAUCETI_PR_CACHE_MISS=1, your PR history is uncached: merge/rebase onto current main "
-            "and fetch again before building; if that cannot be done, report the cache miss and stop."
+            "before building; if that cannot be done, report the cache miss and stop."
         )
     argv, env, stdin_text = host_agent_launch(prompt, profile)
     if resume:
@@ -1652,6 +1656,11 @@ class BuildCacheWait(BuildCacheUnavailable):
 _LAKE_FALSE = {"0", "false", "no", "off", "n", "f"}
 
 
+# Set (to "1") for an agent once the worker has fetched and installed TauCeti's outputs for this
+# round; scripts/lake-guard.py reads it. `finish` in expanded_cache copies TAUCETI_PR_CACHE_* back.
+PR_CACHE_INSTALLED = "TAUCETI_PR_CACHE_INSTALLED"
+
+
 def lake_cache_max_revs(env: dict) -> str:
     value = env.get("LAKE_CACHE_MAX_REVS", "100")
     if not re.fullmatch(r"[0-9]+", value):
@@ -1721,6 +1730,7 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
         )
         env["LAKE_CONFIG"] = str(config)
         env.pop("TAUCETI_PR_CACHE_MISS", None)
+        env.pop(PR_CACHE_INSTALLED, None)
         env.setdefault("LAKE_ARTIFACT_CACHE", "1")
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         from . import expanded_cache, shared_mathlib
@@ -2062,6 +2072,10 @@ def warm_host_build_caches(cwd: Path, env: dict, logdir: Path, *, report=None) -
     if result == "miss":
         env["TAUCETI_PR_CACHE_MISS"] = "1"
         log("warning: PR history is uncached; current main artifacts are ready for the rebase")
+    # The agent's `lake` (scripts/lake-guard.py) answers its own `lake cache get` as done from here
+    # on. Run with this round's private LAKE_CACHE_DIR, that fetch would rewrite every mapping the
+    # preparation expanded back to an archive, and Lake would unpack a private copy of each module.
+    env[PR_CACHE_INSTALLED] = "1"
 
 
 def bubble_cmd() -> list[str]:

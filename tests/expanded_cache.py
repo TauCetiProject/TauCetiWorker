@@ -330,6 +330,18 @@ class Cache(unittest.TestCase):
         self.assertEqual(report["seed_selection"], "named")
         self.assertEqual(report["seeded_artifacts"], 2)
 
+    def test_preparation_hands_the_installed_marker_to_the_round(self):
+        from tauceti_worker.agents import PR_CACHE_INSTALLED
+
+        # The fetch runs on a copy of the round's environment; the agent's `lake` reads the marker
+        # from the round's, so a successful fetch must reach it and nothing else of the copy may.
+        env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        with patch.object(cache, "expand"), cache.preparation(self.root, env) as warm:
+            self.assertIsNot(warm, env)
+            warm[PR_CACHE_INSTALLED] = "1"
+        self.assertEqual(env[PR_CACHE_INSTALLED], "1")
+        self.assertEqual(env["LAKE_CACHE_DIR"], str(self.root / "private"))
+
     def test_seed_falls_back_to_every_archive_without_history(self):
         archives = self.pool / "archives"
         archives.mkdir(exist_ok=True)
