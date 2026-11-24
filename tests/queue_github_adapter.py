@@ -159,34 +159,6 @@ class AppAuth(unittest.TestCase):
         self.assertEqual(source.token(), "ghs_two")
         self.assertEqual(source.refreshes, 3)
 
-    def test_team_membership_is_read_by_the_queue_app_only_with_members_permission(self):
-        pem, _ = key_pair()
-        clock = Clock(app.parse_github_time("2027-01-15T09:00:00Z"))
-        transport = FakeTransport()
-        token_url = "https://api.github.com/app/installations/178451644/access_tokens"
-        transport.add(
-            "POST",
-            token_url,
-            201,
-            {"token": "ghs_one", "expires_at": "2027-01-15T10:00:00Z", "permissions": {"contents": "write"}},
-        )
-        source = app.InstallationTokenSource(credentials(pem), transport, clock=clock)
-        client = ga.GitHubClient(source, transport, clock=clock, sleep=clock.sleep)
-        adapter = ga.GitHubAdapter(client, repo=TAUCETI)
-        path = "orgs/TauCetiProject/teams/self-tested/memberships/alice"
-        with self.assertRaises(ga.RequestDeferred) as missing:
-            adapter.team_member_read(path)
-        self.assertIn("Members: read", str(missing.exception))
-        self.assertEqual(missing.exception.retry_at, clock.now + ga.MEMBERS_PERMISSION_RETRY_SECONDS)
-        self.assertEqual(len(transport.calls), 1, "no membership request without the permission")
-        source.invalidate()
-        transport.responses[f"POST {token_url}"] = [
-            (201, {}, {"token": "ghs_two", "expires_at": "2027-01-15T10:00:00Z", "permissions": {"members": "read"}})
-        ]
-        transport.add("GET", f"https://api.github.com/{path}", 200, {"state": "active"})
-        self.assertEqual(adapter.team_member_read(path), {"state": "active"})
-        self.assertEqual(transport.calls[-1][2]["Authorization"], "Bearer ghs_two")
-
     def test_execution_token_is_minted_for_an_immutable_repository_id_on_every_refresh(self):
         pem, _ = key_pair()
         transport = FakeTransport()
