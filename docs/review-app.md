@@ -10,12 +10,20 @@ reviews through an installation token of the App, and the rest as the account.
 - `tauceti_worker/review_app.py` assigns each TauCeti PR to the App or the account by a hash of
   its number (`TAUCETI_REVIEW_APP_SHARE`, default 0.5). Every worker posts a PR's threads and
   scoreboard as the same identity, so no PR alternates between them.
-- Only the review engine invocation runs as the App. Fixes, rebases, labels, reactions, the
-  TauCetiData archive and Forgejo work stay on the account. Bubble reviews stay on the account.
+- For a routed review the engine still runs as the account, so its reads and claims are
+  unchanged. The worker sets `TAUCETI_REVIEW_APP_PUBLISH=1` for it, and the worker's `gh` proxy
+  then answers the engine's identity query with the App's bot and sends each publication request
+  (comment creates, edits and deletes, and thread resolution) with the App's installation token.
+  Fixes, rebases, labels, reactions, the TauCetiData archive, Forgejo and Bubble reviews stay on
+  the account.
 - The scoreboard's `submitted_by` stays the account, so reviewer affinity still matches.
-- The `gh` proxy paces, retains and replays the App's writes under the App's own identity, and the
-  round start drains the App's retained writes as it does the account's.
-- Retained review output is recovered by the identity that rendered it (the receipt's actor).
+- Installation tokens are cached per host in a 0600 file under the shared GitHub state directory,
+  keyed by App, installation and key, and replaced before each send once fewer than 10 minutes
+  remain, or after GitHub answers 401. Every token maps to one pacing identity, so the proxy paces,
+  retains and replays the App's writes as one GitHub identity, and the round start drains the
+  App's retained writes as it does the account's.
+- Retained review output is recovered by the identity that rendered it: the receipt's actor, or
+  the review context's publisher before a receipt exists.
 - On a PR the App takes over, the App posts its own current-head scoreboard and threads. Readers
   order scoreboards by update time, so the newest wins; the account's older comments stay but no
   longer decide anything. The labels, readiness, survey and merge queue read scoreboards whoever

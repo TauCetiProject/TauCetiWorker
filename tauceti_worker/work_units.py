@@ -1930,13 +1930,13 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             km = _kiro_review_model(reviewers)
             from .retention import review_workspace
 
-            # A share of GitHub reviews posts as the review App, a second GitHub identity with its
-            # own comment limit. The scoreboard keeps the account as its submitter, so reviewer
-            # affinity still matches every worker of this account.
+            # A share of GitHub reviews publishes as the review App, a second GitHub identity with
+            # its own comment limit; the engine otherwise runs as the account. The scoreboard keeps
+            # the account as its submitter, so reviewer affinity still matches.
             repository = getattr(w.gh, "review_repository", w.gh.repo)
             if review_app.routes(repository, pr):
-                app_env = review_app.overrides()
-                log(f"  review #{pr}: posting as {app_env['TAUCETI_GITHUB_ACCOUNT']}")
+                app_env = review_app.engine_overrides()
+                log(f"  review #{pr}: publishing as {app_env[review_app.LOGIN_ENV]}")
             with review_workspace(w.cfg) as scratch:
                 rc = run_to_logfile(
                     [
@@ -2049,7 +2049,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
             w.rs.bust(pr)
-        elif blocked_since(github_started) or (app_env and blocked_since(github_started, env=app_env)):
+        elif blocked_since(github_started) or (app_env and review_app.blocked_since(github_started)):
             raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
         elif rc == 2 and strict_file_flags:
             raise NoProgress(

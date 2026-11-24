@@ -563,8 +563,8 @@ def record_block(resource, reset, identity=None):
         pass
 
 
-def blocking_event_since(start, env=None):
-    identity = quota_scope(scope(env))
+def blocking_event_since(start):
+    identity = quota_scope(scope())
     if not identity:
         return None
     worker = hashlib.sha256(os.environ.get("TAUCETI_WORKER_ID", "unknown").encode()).hexdigest()
@@ -578,8 +578,8 @@ def blocking_event_since(start, env=None):
         return None
 
 
-def blocked_since(start, env=None):
-    return blocking_event_since(start, env) is not None
+def blocked_since(start):
+    return blocking_event_since(start) is not None
 
 
 def observed_budget(env=None):
@@ -1070,6 +1070,11 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
 
                 sending(_intent)
                 sent_intent = True
+            if effective.get("_TAUCETI_REVIEW_APP_TOKEN") == "1":
+                from tauceti_worker import review_app
+
+                # A pacing wait can outlast the review App's token; send with a current one.
+                effective = {**review_app.refreshed(effective), "GH_DEBUG": "api"}
             p = subprocess.run(argv, env=effective, capture_output=True, text=True, **kwargs)
         except subprocess.TimeoutExpired as e:
             raw = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else e.stderr or ""
@@ -1426,6 +1431,15 @@ def migrated_history(args):
 def migrated_identity(args):
     if args not in (["api", "user", "--jq", ".login"], ["api", "/user", "--jq", ".login"]):
         return None
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from tauceti_worker import review_app
+
+    if review_app.publishing():
+        # A review publishing through the App edits only the comments the App's bot wrote.
+        bot = review_app.publishing_login()
+        if bot is None:
+            return subprocess.CompletedProcess(args, 1, "", "gh: review App login is not configured\n")
+        return subprocess.CompletedProcess(args, 0, bot + "\n", "")
     login = os.environ.get("_TAUCETI_PINNED_GITHUB_ACCOUNT")
     if (
         login
@@ -1529,12 +1543,17 @@ if __name__ == "__main__":
         if not readonly:
             invalidate(args)
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tauceti_worker import review_app
         from tauceti_worker.config import GitHubUnavailable
         from tauceti_worker.constants import EX_GITHUB_WAIT
         from tauceti_worker.github_outbox import NOT_POSTED
 
+        app_env = None
         try:
-            p = execute(["gh", *args], wait=os.environ.get("TAUCETI_GITHUB_EPHEMERAL") != "1")
+            app_env = review_app.request_environment(args)
+            p = execute(["gh", *args], env=app_env, wait=os.environ.get("TAUCETI_GITHUB_EPHEMERAL") != "1")
+            if app_env is not None and "HTTP 401" in (p.stderr or ""):
+                review_app.invalidate(app_env["GH_TOKEN"])
         except GitHubUnavailable as error:
             # The shell caller cannot catch Python exceptions. Preserve the
             # infrastructure wait marker for its owning worker's stage guard.
