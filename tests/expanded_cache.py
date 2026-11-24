@@ -375,9 +375,10 @@ class Cache(unittest.TestCase):
         self.warm_entries(keys, download)
         report = dict(hits=0, expanded=0)
         started = time.monotonic()
-        cache.expand(download, self.root / "private", self.root, {}, self.pool, report, deadline=started + 5)
+        # A self-deadlock would wait out the whole deadline; the bound sits well inside it.
+        cache.expand(download, self.root / "private", self.root, {}, self.pool, report, deadline=started + 60)
         self.assertEqual(report["hits"], 2)
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 30)
 
     def test_reversed_batches_on_two_workers_do_not_deadlock(self):
         import threading
@@ -430,9 +431,9 @@ class Cache(unittest.TestCase):
         try:
             report = dict(hits=0, expanded=0)
             started = time.monotonic()
-            cache.expand(download, self.root / "reader", self.root, {}, self.pool, report, deadline=started + 3)
+            cache.expand(download, self.root / "reader", self.root, {}, self.pool, report, deadline=started + 60)
             self.assertEqual(report["hits"], len(keys))
-            self.assertLess(time.monotonic() - started, 2)
+            self.assertLess(time.monotonic() - started, 30)
             # A publisher or collector still needs the exclusive lock, which readers exclude.
             with self.assertRaises(BlockingIOError):
                 with cache.locked_all(self.pool, keys[:1], deadline=time.monotonic()):

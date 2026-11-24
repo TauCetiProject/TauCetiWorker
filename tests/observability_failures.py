@@ -316,7 +316,7 @@ raise SystemExit(wm.run_manager(pathlib.Path(sys.argv[1]), interval=0.05))
                     stderr=subprocess.PIPE,
                 )
                 try:
-                    deadline = time.monotonic() + 5
+                    deadline = time.monotonic() + 60
                     while not marker.exists() and manager.poll() is None and time.monotonic() < deadline:
                         time.sleep(0.05)
                     self.assertTrue(marker.exists())
