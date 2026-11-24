@@ -507,11 +507,14 @@ def grant_launch(budget, path, value, event):
 def grant_launches(budget, handled):
     """Serve every admitted host gate that is waiting for its permit; errors are left to recovery.
 
-    External (VM) invocations keep their liveness bookkeeping in recover_invocation's ordered pass."""
+    Only invocations whose ledger session is still active qualify, as in recover_invocation, which
+    archives settled ones without a permit. External (VM) invocations keep their liveness
+    bookkeeping in recover_invocation's ordered pass."""
     try:
         recovery_mode(budget.directory)
     except ValueError:
         return  # An invalid policy never permits inference; recover_invocation reports it.
+    waiting = []
     for path in (budget.directory / "lifecycles").glob("*.json"):
         if path.stem in handled:
             continue
@@ -519,8 +522,25 @@ def grant_launches(budget, handled):
             value = read_lifecycle(budget.directory, path.stem)
             if not value or value["phase"] != "admitted" or value.get("external"):
                 continue
-            if not (Path(value["bridge"]) / "inbox" / (value["id"] + ".launch")).exists():
-                continue
+            bridge = Path(value["bridge"])
+            if (bridge / "inbox" / (value["id"] + ".launch")).exists() and not (
+                bridge / "outbox" / (value["id"] + ".permit")
+            ).exists():
+                waiting.append((path, value))
+        except Exception:
+            continue  # recover_invocation reports the same lifecycle's error on its own pass
+    if not waiting:
+        return
+    try:
+        with budget.locked():
+            sessions = budget.current()["sessions"]
+            active = {path.stem for path, _ in waiting if (sessions.get(path.stem) or {}).get("status") == "active"}
+    except ACCOUNTING_ERRORS:
+        return  # Without a readable ledger, permits wait for recover_invocation's own checks.
+    for path, value in waiting:
+        if path.stem not in active:
+            continue
+        try:
             changed = False
 
             def event(kind, value=value, **fields):
@@ -534,7 +554,7 @@ def grant_launches(budget, handled):
             if value["phase"] == "permitted":
                 handled.add(path.stem)
         except Exception:
-            continue  # recover_invocation reports the same lifecycle's error on its own pass
+            continue
 
 
 def recover_invocation(budget, path, *, cache=None, session=None):

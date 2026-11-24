@@ -260,7 +260,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertFalse((self.bridge / "outbox" / (self.id + ".permit")).exists())
 
     def admitted_invocation(self):
-        """A second admitted invocation with its own bridge, shim and usage journal."""
+        """A second admitted invocation with its own bridge, shim and usage journal; settles the first."""
         bridge = self.root / "bridges" / uuid.uuid4().hex
         (bridge / "inbox").mkdir(parents=True)
         (bridge / "outbox").mkdir()
@@ -274,9 +274,12 @@ class SupervisorTests(unittest.TestCase):
             owner=self.owner,
             parent=identity(),
         )
-        self.budget.admit(
+        # A settled cost for the model lets a second live session past calibration.
+        self.budget.settle_receipt(dict(id=self.id, totals={self.id: "1"}, outcome="exit:0"))
+        admission = self.budget.admit(
             invocation, "fixture-2", MODEL, "fix", bridge=str(bridge), owner=self.owner, lifecycle=lifecycle
         )
+        self.assertTrue(admission["allowed"])
         register(self.root, lifecycle)
         UsageJournal(self.root / "usage" / bridge.name, invocation, model=MODEL)
         return bridge, invocation
@@ -289,6 +292,15 @@ class SupervisorTests(unittest.TestCase):
         with patch("tauceti_worker.usage_supervisor.recover_invocation", lambda *a, **k: seen.append(permit.exists())):
             tick(self.budget)
         self.assertEqual(seen, [True])
+
+    def test_fast_pass_never_permits_a_settled_session(self):
+        native = self.sleeper()
+        durable(self.bridge / "inbox" / (self.id + ".launch"), dict(id=self.id, native=identity(native.pid)))
+        self.budget.settle_receipt(dict(id=self.id, totals={self.id: "0"}, outcome="launch-failed"))
+        self.assertEqual(self.saved()["status"], "settled")
+        with patch("tauceti_worker.usage_supervisor.recover_invocation"):
+            tick(self.budget)
+        self.assertFalse((self.bridge / "outbox" / (self.id + ".permit")).exists())
 
     def test_gate_that_starts_waiting_during_slow_recovery_is_served_before_the_next_item(self):
         bridge, invocation = self.admitted_invocation()
