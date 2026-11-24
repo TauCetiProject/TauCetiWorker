@@ -163,7 +163,7 @@ def deduplicate(observations):
 def run_round(w, opts, *, use_fleet_focus=True):
     import os
 
-    from .work_units import NoEligibleWork, want
+    from .work_units import NoEligibleWork, note_spent_budgets, want
     from .work_units import run_round as ordinary_round
 
     if use_fleet_focus and isinstance(getattr(opts, "unavailable_sources", None), list):
@@ -199,6 +199,8 @@ def run_round(w, opts, *, use_fleet_focus=True):
                 waits.append(
                     SharedStateUnavailable("; ".join(result.errors) or f"{name} unavailable", result.dependency_wait)
                 )
+    for _, worker, result in healthy:
+        note_spent_budgets(worker, result, opts)
     if not healthy:
         if waits:
             raise waits[0]
