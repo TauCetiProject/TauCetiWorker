@@ -203,7 +203,7 @@ class ActivityTests(unittest.TestCase):
             )
             self.assertEqual(sync.call_count, 1)
         with patch("tauceti_worker.activity_live.atomic_json", wraps=a.atomic_json) as publish:
-            a.prepare(now=self.now + 1)
+            a.prepare(now=time.time() + 1)
         views = [call for call in publish.call_args_list if call.args[0].name != "preparation-error.json"]
         self.assertTrue(views)
         self.assertTrue(all(call.kwargs.get("durable") is False for call in views), views)
@@ -211,7 +211,7 @@ class ActivityTests(unittest.TestCase):
         for path in (a.root() / "summary.json", a.scope_path("workers", "worker"), a.scope_path("groups", "machine")):
             path.write_text("")  # Simulate a disposable cache lost during a power failure.
         self.assertFalse(a.cached()["available"])
-        a.prepare(now=self.now + 2)
+        a.prepare(now=time.time() + 2)
         for selection in ({}, {"worker": "worker"}, {"group": "machine"}):
             restored = a.cached(**selection)
             self.assertTrue(restored["available"], restored)
@@ -401,7 +401,11 @@ class ActivityTests(unittest.TestCase):
             outbox.finish(path, subprocess.CompletedProcess(argv, 1, "", "rate limit exceeded"), before_request=True)
             a.observation("unconfirmed")
             r.finish()
-            a.prepare(now=self.now + 1)
+            # Preparation counts only what happened by its `now`. Rounds and receipts record the real
+            # clock, which a loaded runner can carry seconds past setUp's, so a preparation that must
+            # see them is timed from the clock rather than from self.now (as below and elsewhere).
+            prepared = time.time() + 1
+            a.prepare(now=prepared)
             with contextlib.closing(a._connect()) as db:
                 before = dict(db.execute("SELECT * FROM rounds WHERE id=?", (original,)).fetchone())
                 self.assertEqual(before["outcome"], "unconfirmed")
@@ -418,7 +422,7 @@ class ActivityTests(unittest.TestCase):
                 ),
             ):
                 self.assertEqual(outbox.drain(env), [])
-        a.prepare(now=self.now + 2)
+        a.prepare(now=max(prepared + 1, time.time() + 1))
         with contextlib.closing(a._connect()) as db:
             after = dict(db.execute("SELECT * FROM rounds WHERE id=?", (original,)).fetchone())
             self.assertEqual(after, {**before, "outcome": "completed"})
@@ -541,7 +545,7 @@ class ActivityTests(unittest.TestCase):
                 self.assertEqual(outbox.drain(env), [])
                 self.assertEqual(read.call_count, 1)
                 self.assertEqual(read.call_args.args[0][:3], ["gh", "api", "graphql"])
-        a.prepare(now=self.now + 1)
+        a.prepare(now=time.time() + 1)
         self.assertEqual(a.cached()["summary"]["rounds"]["total"]["roadmap"], dict(finished=1, failed=0, unknown=0))
 
     def test_legacy_publication_does_not_borrow_the_draining_round(self):
@@ -566,7 +570,7 @@ class ActivityTests(unittest.TestCase):
                 {"argv": ["pr", "create"]}, SimpleNamespace(stdout="https://github.com/org/repo/pull/7")
             )
         with patch.object(a, "observe", side_effect=AssertionError("No configured endpoint")):
-            a.prepare(now=self.now + 1)
+            a.prepare(now=time.time() + 1)
         s = a.cached()["summary"]
         self.assertEqual(s["pr_windows"]["total"]["authored"], 1)
         self.assertEqual(s["unknown_prs"], 1)
