@@ -4863,6 +4863,7 @@ class SandboxedBuilds(Fixture):
 
     def test_the_wrapper_composes_ci_sandbox(self):
         worktree, seed, env = self.worktree()
+        env[repair_sandbox.READ_ONLY_VARIABLE] = str(seed)  # the worker's --seed-packages
         argv = repair_sandbox.sandboxed_lake(["lake", "build", "--iofail"], worktree, env)
         self.assertEqual(argv[1:3], ["-i", str(BIN / "bwrap")], "bwrap starts from an empty environment")
         self.assertEqual(argv[argv.index("--") :], ["--", "lake", "build", "--iofail"])

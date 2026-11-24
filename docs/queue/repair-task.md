@@ -439,7 +439,11 @@ has a time budget holds because the service re-exposes the task.
    queue App's directory, the worker token file, the repair-cache write key, the provider and `gh`
    config directories, `~/.ssh` and the like) that lies inside a bound tree is covered by an empty
    tmpfs or `/dev/null`, at every path a bind exposes it under (a symlinked bind source shows its
-   target's files under its own name). The preflight's "build sandbox" check fails when any of them that holds
+   target's files under its own name); the targets of symlinks directly inside a credential
+   directory are masked too. A worktree's `.lake/packages` link is build state the batch can rewrite,
+   so its target is bound read-only only when it is the worker's `--seed-packages` tree
+   (`TAUCETI_SANDBOX_READONLY`, which the worker exports at start); a worktree inside that tree is
+   refused. The preflight's "build sandbox" check fails when any of them that holds
    something can be read from inside.
 
    **The agent's toolchain commands.** The batch's Lean can run code whenever it is elaborated, so the
@@ -454,7 +458,10 @@ has a time budget holds because the service re-exposes the task.
    Claude Code's `CLAUDE_ENV_FILE`): before each command it puts the shims back first on `PATH` and
    refuses a command line naming a toolchain executable by path (under the elan home, or the elan
    proxy's resolved file) or giving a toolchain command a `PATH` of its own (a `PATH=` prefix not led
-   by the shims, `env -i`, `env -u PATH`, `command -p`). What the agent's unconfined shell leaves uncovered: a non-bash program that
+   by the shims, `env -i`, `env -u PATH`, `command -p`). A bash whose stdin is a socket reads the system bashrc instead of `BASH_ENV`
+   (bash takes it to be run by `sshd`); Claude Code's Bash is covered through `CLAUDE_ENV_FILE`, and
+   that file points the shell's stdin at `/dev/null` for everything it starts. What the agent's
+   unconfined shell leaves uncovered: a non-bash program that
    executes a toolchain binary by absolute path, a path assembled at run time, and deliberate evasion;
    closing those needs the agent itself confined, with builds requested from outside.
    The agent's scoped builds through `.tauceti-repair/build` import the same function from the

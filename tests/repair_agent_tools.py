@@ -79,6 +79,9 @@ class Fixture(unittest.TestCase):
             [shutil.which("bash"), "-c", command],
             cwd=cwd,
             env={**self.agent_env, **extra},
+            # A bash whose stdin is a socket reads the system bashrc instead of BASH_ENV, as if run
+            # by sshd; the worker never gives its agent one.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
         )
@@ -128,7 +131,9 @@ class Shims(Fixture):
         (self.worktree / ".lake").mkdir()
         (self.worktree / ".lake" / "packages").symlink_to(seed)
         logical = self.worktree / ".lake" / "packages" / "mathlib"
-        run = self.run_agent(f"cd {logical} && lake build", self.worktree)
+        run = self.run_agent(
+            f"cd {logical} && lake build", self.worktree, **{repair_sandbox.READ_ONLY_VARIABLE: str(seed)}
+        )
         self.assertEqual(run.returncode, 0, run.stderr)
         argv = self.bwrap_calls()[-1]["argv"]
         self.assertEqual(argv[argv.index("--chdir") + 1], str(logical))
@@ -137,10 +142,20 @@ class Shims(Fixture):
             [argv[i : i + 3] for i in range(len(argv))],
         )
         self.assertNotIn(str(seed / "mathlib" / ".lake"), argv)
+        self.assertIn(["--ro-bind", str(seed), str(seed)], [argv[i : i + 3] for i in range(len(argv))])
         # Reached by its physical path, the seed is refused as a worktree of its own.
         run = self.run_agent("lake build", seed / "mathlib", **{repair_sandbox.READ_ONLY_VARIABLE: str(seed)})
         self.assertEqual(run.returncode, 127)
         self.assertIn("which builds may only read", run.stderr)
+
+    def test_a_packages_link_the_build_rewrote_binds_nothing(self):
+        (self.worktree / ".lake").mkdir()
+        (self.worktree / ".lake" / "packages").symlink_to("/proc")
+        env = {**self.env, repair_sandbox.READ_ONLY_VARIABLE: str(self.tmp / "seed")}
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, env, bwrap=str(self.bin / "bwrap"))
+        self.assertNotIn(["--ro-bind", "/proc", "/proc"], [argv[i : i + 3] for i in range(len(argv))])
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
+        self.assertNotIn(["--ro-bind", "/proc", "/proc"], [argv[i : i + 3] for i in range(len(argv))])
 
     def test_outside_a_lake_project_the_shims_refuse(self):
         run = self.run_agent("lean --version", self.tmp)
@@ -280,6 +295,19 @@ class Credentials(Fixture):
         self.assertIn(pool / "token", repair_sandbox.credential_paths(env))
         argv = repair_sandbox.sandbox_argv(["true"], self.worktree, env, bwrap=str(self.bin / "bwrap"))
         self.assertIn(["--ro-bind", "/dev/null", str(pool / "token")], [argv[i : i + 3] for i in range(len(argv))])
+
+    def test_a_key_linked_into_a_credential_directory_is_masked_at_its_target(self):
+        pool = self.tmp / "pool"
+        pool.mkdir()
+        (pool / "private-key.pem").write_text("secret")
+        app = self.tmp / "app"
+        app.mkdir()
+        (app / "github-private-key.pem").symlink_to(pool / "private-key.pem")
+        env = {**self.env, "LAKE_CACHE_DIR": str(pool), "TAUCETI_QUEUE_GITHUB_APP": str(app)}
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, env, bwrap=str(self.bin / "bwrap"))
+        self.assertIn(
+            ["--ro-bind", "/dev/null", str(pool / "private-key.pem")], [argv[i : i + 3] for i in range(len(argv))]
+        )
 
     def test_a_credential_value_that_is_not_a_path_is_never_copied(self):
         env = {**self.env, "TAUCETI_REPAIR_CACHE_KEY_FILE": "id:secret"}

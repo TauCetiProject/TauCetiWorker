@@ -2032,8 +2032,6 @@ def run_repair_agent(
             profile = provider_profile(cfg, provider)
             telemetry_provider = getattr(profile, "provider", "claude")
             changes = repair.isolation_env(cfg.root, env_lake, provider, api_key=cfg.api_key)
-            if cfg.seed_packages:
-                changes[repair_sandbox.READ_ONLY_VARIABLE] = str(cfg.seed_packages)
             changes["TAUCETI_ROUND_DEADLINE"] = str(time.time() + cfg.agent_timeout)
             changes["TAUCETI_SHELL_LIMIT_SECONDS"] = str(int(cfg.shell_limit))
             started = time.monotonic()
@@ -4860,6 +4858,9 @@ def main(argv: list[str] | None = None) -> int:
     # The api provider's key, from the environment file; taken out of this process's environment so
     # only the api provider's agent ever sees it (and nothing logs it).
     api_key = (os.environ.pop("ANTHROPIC_API_KEY", "") or "").strip() or None
+    if args.seed_packages:
+        # The one tree every sandbox of this worker and its agents may bind through `.lake/packages`.
+        os.environ[repair_sandbox.READ_ONLY_VARIABLE] = str(args.seed_packages)
 
     clone = args.clone
     if clone is None:

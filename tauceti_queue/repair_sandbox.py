@@ -181,6 +181,23 @@ def _binds(args: list[str]) -> list[tuple[str, str]]:
     ]
 
 
+def linked_credentials(paths: list[Path], limit: int = 256) -> list[Path]:
+    """The targets of the symlinks directly inside each credential directory (a key file kept
+    elsewhere and linked in): masked wherever a bind exposes them, though never a reason to refuse."""
+    found: list[Path] = []
+    for directory in paths:
+        try:
+            entries = list(os.scandir(directory)) if directory.is_dir() else []
+        except OSError:
+            continue
+        for entry in entries[:limit]:
+            if entry.is_symlink():
+                target = Path(entry.path).resolve()
+                if target not in paths and target not in found:
+                    found.append(target)
+    return found
+
+
 def exposures(binds: list[tuple[str, str]], env: dict) -> list[tuple[Path, Path]]:
     """Where each credential path would appear inside the sandbox: ``(inside, host)`` for every bind
     whose resolved source contains the credential's resolved path, the inside path being that bind's
@@ -188,11 +205,12 @@ def exposures(binds: list[tuple[str, str]], env: dict) -> list[tuple[Path, Path]
     name). Raises :class:`SandboxUnavailable` when a bound source lies inside a credential directory
     (or is one), which no mask could repair."""
     found: list[tuple[Path, Path]] = []
-    for credential in credential_paths(env):
+    named = credential_paths(env)
+    for credential in [*named, *linked_credentials(named)]:
         host = credential.resolve()
         for source, destination in binds:
             resolved = Path(source).resolve()
-            if resolved == host or resolved.is_relative_to(host):
+            if credential in named and (resolved == host or resolved.is_relative_to(host)):
                 raise SandboxUnavailable(f"the sandbox would bind {source}, inside the credential path {credential}")
             if host.is_relative_to(resolved):
                 pair = (Path(destination) / host.relative_to(resolved), host)
@@ -320,8 +338,9 @@ def sandbox_argv(
     directory = worktree if cwd is None else Path(os.path.abspath(cwd))
     if not (directory.is_relative_to(worktree) or directory.resolve().is_relative_to(worktree)):
         raise SandboxUnavailable(f"{directory} is outside the sandboxed worktree {worktree}")
-    shared = [*(env.get(READ_ONLY_VARIABLE) or "").split(os.pathsep), env.get("TAUCETI_QUEUE_SEED_PACKAGES") or ""]
-    for tree in (Path(t).resolve() for t in shared if t.strip()):
+    trees = [*(env.get(READ_ONLY_VARIABLE) or "").split(os.pathsep), env.get("TAUCETI_QUEUE_SEED_PACKAGES") or ""]
+    read_only = [Path(t).resolve() for t in trees if t.strip()]
+    for tree in read_only:
         if worktree.is_relative_to(tree):
             raise SandboxUnavailable(f"{worktree} is inside {tree}, which builds may only read")
     lake_dir = worktree / ".lake"
@@ -348,8 +367,10 @@ def sandbox_argv(
     args += ["--ro-bind", str(worktree), str(worktree), "--bind", str(lake_dir), str(lake_dir)]
     packages = lake_dir / "packages"
     if packages.is_symlink():  # the shared extracted Mathlib (--seed-packages), read-only for every build
+        # The link is build state the batch's code can rewrite, so its target is bound only when it is
+        # one of the configured read-only trees; any other target stays outside (the link dangles).
         shared = packages.resolve()
-        if shared.is_dir():
+        if shared.is_dir() and any(shared == tree or shared.is_relative_to(tree) for tree in read_only):
             args += ["--ro-bind", str(shared), str(shared)]
     args += _credential_masks(_binds(args), env)
     args += ["--remount-ro", "/"]
