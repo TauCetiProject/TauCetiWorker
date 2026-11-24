@@ -39,6 +39,7 @@ from pathlib import Path
 
 from . import expanded_cache
 from .config import log
+from .excerpt import ends
 from .runtime_status import read_json
 
 NAMESPACE = "canonical-v1"
@@ -488,7 +489,7 @@ def probe(checkout, private_store, directory, *, prefix=(), env=None):
         middle.unlink(missing_ok=True)
         final.unlink(missing_ok=True)
     if result.returncode:
-        detail = (result.stdout + result.stderr).strip()[-400:]
+        detail = ends(result.stdout + result.stderr, 400)
         raise Unavailable(f"hard links unavailable in the agent namespace: {detail}")
 
 
@@ -1246,13 +1247,15 @@ def boundary(checkout, env, *, phase, prefix=()):
     return report
 
 
-def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60, opened=()):
+def sweep(
+    pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60, opened=(), deadline=None
+):
     """Evict canonical objects only their own pool names link to, under the exclusive object lock.
 
     Link counts are evidence, not a refcount: a checkout or private store that links an object
     keeps it alive. Names a checkout recorded at a recent relink are kept unless under pressure.
     """
-    from .retention import note
+    from .retention import note, past
 
     now = time.time() if now is None else now
     directory = store(pool)
@@ -1266,10 +1269,16 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
     refused = rejected(pool)
     reconciling_until = time.monotonic() + reconcile_budget
     for lease in (directory / "uses").glob("*.list"):
+        if past(deadline):
+            break
         with contextlib.suppress(FileNotFoundError):
             if now - lease.stat().st_mtime > lifetime:
                 remove(lease, pool, report, dry=dry, check_users=False, mounts=[])
-    for path in objects.iterdir():
+    for entry in os.scandir(objects):  # Lazily: the store can hold millions of objects.
+        path = Path(entry.path)
+        if past(deadline):
+            report.setdefault("deferred", []).append("canonical-objects")
+            break
         name = path.name
         try:
             info = path.lstat()
@@ -1282,6 +1291,7 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
                     old.lstat().st_ino != info.st_ino
                     and not dry
                     and time.monotonic() < reconciling_until
+                    and not past(deadline)
                     # Busy shards wait for the next sweep.
                     and reconcile(pool, name, old, blocking=False, guard=guard, refused=refused)
                 ):
@@ -1294,8 +1304,12 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
                 if leased is None:
                     leased = set()
                     for lease in (directory / "uses").glob("*.list"):
+                        if past(deadline):
+                            break
                         with contextlib.suppress(FileNotFoundError):
                             leased.update(lease.read_text().split())
+                if past(deadline):
+                    continue  # A partial lease set protects nothing; the loop stops at its next check.
                 if name in leased:
                     continue
             with object_lock(directory, name, exclusive=True, blocking=False):
@@ -1319,6 +1333,8 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
         except OSError as error:
             note(report, "errors", f"{path}: {error}")
     for meta in (directory / "meta").glob("*/*.json"):
+        if past(deadline):
+            break
         with contextlib.suppress(FileNotFoundError):
             if not (objects / meta.name[: -len(".json")]).exists() and now - meta.stat().st_mtime > 3600:
                 if not dry:

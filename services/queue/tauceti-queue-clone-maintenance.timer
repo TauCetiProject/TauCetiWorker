@@ -1,0 +1,10 @@
+[Unit]
+Description=Maintain the Tau Ceti AI merge queue's content clone hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

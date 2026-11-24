@@ -159,34 +159,6 @@ class AppAuth(unittest.TestCase):
         self.assertEqual(source.token(), "ghs_two")
         self.assertEqual(source.refreshes, 3)
 
-    def test_team_membership_is_read_by_the_queue_app_only_with_members_permission(self):
-        pem, _ = key_pair()
-        clock = Clock(app.parse_github_time("2027-01-15T09:00:00Z"))
-        transport = FakeTransport()
-        token_url = "https://api.github.com/app/installations/178451644/access_tokens"
-        transport.add(
-            "POST",
-            token_url,
-            201,
-            {"token": "ghs_one", "expires_at": "2027-01-15T10:00:00Z", "permissions": {"contents": "write"}},
-        )
-        source = app.InstallationTokenSource(credentials(pem), transport, clock=clock)
-        client = ga.GitHubClient(source, transport, clock=clock, sleep=clock.sleep)
-        adapter = ga.GitHubAdapter(client, repo=TAUCETI)
-        path = "orgs/TauCetiProject/teams/self-tested/memberships/alice"
-        with self.assertRaises(ga.RequestDeferred) as missing:
-            adapter.team_member_read(path)
-        self.assertIn("Members: read", str(missing.exception))
-        self.assertEqual(missing.exception.retry_at, clock.now + ga.MEMBERS_PERMISSION_RETRY_SECONDS)
-        self.assertEqual(len(transport.calls), 1, "no membership request without the permission")
-        source.invalidate()
-        transport.responses[f"POST {token_url}"] = [
-            (201, {}, {"token": "ghs_two", "expires_at": "2027-01-15T10:00:00Z", "permissions": {"members": "read"}})
-        ]
-        transport.add("GET", f"https://api.github.com/{path}", 200, {"state": "active"})
-        self.assertEqual(adapter.team_member_read(path), {"state": "active"})
-        self.assertEqual(transport.calls[-1][2]["Authorization"], "Bearer ghs_two")
-
     def test_execution_token_is_minted_for_an_immutable_repository_id_on_every_refresh(self):
         pem, _ = key_pair()
         transport = FakeTransport()
@@ -547,21 +519,6 @@ class Adapter(unittest.TestCase):
         self.assertEqual(a.pr_merge_base(TAUCETI, 42, HEAD), "d" * 40)
         self.assertIsNone(a.pr_merge_base(TAUCETI, 42, "e" * 40), "a moved head gets no merge base")
 
-    def test_main_ci_run_is_one_unretried_call(self):
-        transport = FakeTransport()
-        url = f"https://api.github.com/repos/{TAUCETI}/actions/workflows/ci.yml/runs?head_sha={BASE}&event=push&per_page=1"
-        run = {"id": 7, "status": "completed", "conclusion": "failure", "html_url": "https://github.com/x/runs/7"}
-        transport.add("GET", url, 200, {"workflow_runs": [run]})
-        transport.add("GET", url.replace(BASE, HEAD), 200, {"workflow_runs": []})
-        transport.add("GET", url.replace(BASE, "d" * 40), 502, {})
-        a = adapter(transport)
-        found = a.main_ci_run(TAUCETI, BASE)
-        self.assertEqual((found.run_id, found.conclusion, found.html_url), ("7", "failure", run["html_url"]))
-        self.assertIsNone(a.main_ci_run(TAUCETI, HEAD))
-        with self.assertRaises(ga.GitHubError):
-            a.main_ci_run(TAUCETI, "d" * 40)
-        self.assertEqual(sum("/actions/workflows/ci.yml/" in call[1] for call in transport.calls), 3)
-
     def test_cancel_run(self):
         transport = FakeTransport()
         base = f"https://api.github.com/repos/{TAUCETI}/actions/runs"
@@ -573,6 +530,47 @@ class Adapter(unittest.TestCase):
         self.assertEqual(a.cancel_run(TAUCETI, "2"), "already-completed")
         with self.assertRaises(ga.GitHubError):
             a.cancel_run(TAUCETI, "3")
+
+    def test_main_integration_dispatch_and_graphql_status_read(self):
+        transport = FakeTransport()
+        transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/dispatches", 204)
+        a = adapter(transport)
+        a.dispatch_main_integration(TAUCETI, pr=7, head_sha=HEAD, main_sha=BASE)
+        self.assertEqual(
+            json.loads(transport.calls[0][3]),
+            {"event_type": "tauceti-main-integration", "client_payload": {"pr": 7, "head_sha": HEAD, "main_sha": BASE}},
+        )
+        with self.assertRaises(ValueError):
+            a.dispatch_main_integration(TAUCETI, pr=7, head_sha="main", main_sha=BASE)
+        url = f"https://github.com/{TAUCETI}/actions/runs/99"
+        transport.add(
+            "POST",
+            "https://api.github.com/graphql",
+            200,
+            {
+                "data": {
+                    "repository": {
+                        "h0": {
+                            "status": {
+                                "context": {
+                                    "state": "FAILURE",
+                                    "description": "B=abc failed",
+                                    "targetUrl": url,
+                                    "createdAt": "2026-11-24T04:00:00Z",
+                                }
+                            }
+                        },
+                        "h1": None,
+                    }
+                }
+            },
+        )
+        statuses = a.main_integration_statuses(TAUCETI, [HEAD, TIP, HEAD])
+        query = json.loads(transport.calls[-1][3])["query"]
+        self.assertIn('context(name: "main-integration")', query)
+        self.assertEqual(query.count("object(oid:"), 2)
+        self.assertEqual((statuses[HEAD].state, statuses[HEAD].run_id), ("failure", "99"))
+        self.assertIsNone(statuses[TIP])
 
     def test_dispatch_candidate_sends_the_bors_payload(self):
         transport = FakeTransport()

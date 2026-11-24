@@ -239,6 +239,7 @@ def test_roadmap():
     check("roadmap: URL clone is mounted read-only", f"{cloned['dest']}:/opt/source:ro" in cap.get("mounts", []))
 
     host_cap = {}
+    tc.work_units.claims_repo = lambda: FORK
     tc.work_units.fetch_git_source = fake_fetch_source
     tc.work_units.prepare_checkout = lambda cfg, **_: True
     tc.work_units.run_agent_host = lambda cwd, prompt, model, logdir, **_kwargs: host_cap.update(prompt=prompt) or 0

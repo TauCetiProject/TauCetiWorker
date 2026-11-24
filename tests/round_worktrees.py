@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +45,16 @@ def worker(root, wid):
     state.mkdir(parents=True, exist_ok=True)
     (state / "round.lock").touch()
     return SimpleNamespace(wid=wid, state=state, checkout=state / "checkout", data_home=root / "home" / wid)
+
+
+def settled(tree, timeout=60):
+    """Wait until no process uses ``tree``. A commit or fetch leaves git's detached auto-maintenance
+    running in it for a moment, and a round end rightly defers removing a tree that is in use."""
+    deadline = time.monotonic() + timeout
+    while users := live_use.live_users(tree):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"{tree} is still in use after {timeout}s: {', '.join(users)}")
+        time.sleep(0.05)
 
 
 def legacy_absent(cfg):
@@ -95,6 +106,7 @@ def main():
         (one.checkout / ".lake/build").mkdir(parents=True)
         (one.checkout / ".lake/build/A.olean").write_text("warm build")
         os.environ["TAUCETI_ROUND_WORKTREES"] = "1"
+        settled(one.checkout)
         # A live round holds its worker's round lock, as RoundContext does.
         live = (one.state / "round.lock").open("a+")
         fcntl.flock(live, fcntl.LOCK_EX)
@@ -110,6 +122,7 @@ def main():
         (one.checkout / "A.lean").write_text("theorem lost : True := trivial\n")
         git(one.checkout, "commit", "-qam", "commit then reset away")
         (one.checkout / "Draft.lean").write_text("unpushed draft\n")
+        settled(one.checkout)
         rw.release(one)
         check("round end removed the worktree", not one.checkout.exists())
         check("nothing unpushed was saved", legacy_absent(one))
@@ -152,6 +165,7 @@ def main():
             agents.prepare_checkout(one, work="fix", pr=1)
             check("a held round lock protects a live round's worktree", two.checkout.exists())
             crashed.close()  # the round dies without its cleanup
+            settled(two.checkout)
             rw.release(one)
             check("the next round prepares", agents.prepare_checkout(one, work="fix", pr=1))
             check("a crashed round's worktree is removed", not two.checkout.exists())
@@ -182,6 +196,7 @@ def main():
         agents.CHECKOUT_URL = str(origin)
         check("the source checkout belongs to another host clone", source_clone != rw.host_clone())
         check("it is not a worktree of the default clone", not rw.owns(source.checkout))
+        settled(source.checkout)
         rw.release(one)
         check("round end removed the source worktree", not source.checkout.exists())
         listed = subprocess.run(

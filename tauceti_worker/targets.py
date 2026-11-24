@@ -516,25 +516,38 @@ def describe_targets(targets: Targets) -> dict:
     }
 
 
-def candidates(targets: Targets, only: str, skip: Iterable[str]) -> list[TargetItem]:
+def candidates(
+    targets: Targets, only: str, skip: Iterable[str], within: Iterable[str] | None = None
+) -> list[TargetItem]:
     """The eligible items in claim order. `only` is the round's roadmap area, or `auto`, `any` or
     empty for none: a pinned area is taken alone, even when `skip` names it; otherwise every area
     outside `skip`, shuffled so that workers started together spread out, in file order within an
-    area. NothingOffered, saying why, when the list offers nothing."""
-    pinned = only not in ("auto", "any", "")
-    eligible = eligible_areas(targets)
-    areas = [a for a in eligible if (a == only if pinned else a not in skip)]
+    area. `within`, for an umbrella (docs/umbrellas.md), keeps only those of the umbrella's areas that
+    are roadmap areas now, which are then taken like all areas; `only` is the umbrella's name.
+    NothingOffered, saying why, when the list offers nothing."""
+    pinned = within is None and only not in ("auto", "any", "")
+    within = None if within is None else set(within)
+
+    def scoped(area):
+        return area == only if pinned else within is None or area in within
+
+    eligible = [a for a in eligible_areas(targets) if scoped(a)]
+    areas = [a for a in eligible if pinned or a not in skip]
     if areas:
         random.shuffle(areas)
         return [it for a in areas for it in eligible_items(targets, a)]
-    waiting = sum(it.status == "open" for it in targets.items() if not pinned or it.area == only)
+    waiting = sum(it.status == "open" for it in targets.items() if scoped(it.area))
+    outside = [] if within is None else [a for a in eligible_areas(targets) if a not in within]
     if eligible and not pinned:
         why = f"every area with an eligible item is in --roadmap-skip: {', '.join(eligible)}"
     elif waiting:
         why = f"{waiting} open item(s) wait on needs that have not landed"
+    elif outside:
+        why = f"its eligible items are only in areas outside {only}'s current roadmap areas: {', '.join(outside)}"
     else:
         why = "no open items"
-    raise NothingOffered(f"roadmap: the target list offers nothing to author{f' in {only}' if pinned else ''} ({why})")
+    named = only not in ("auto", "any", "")
+    raise NothingOffered(f"roadmap: the target list offers nothing to author{f' in {only}' if named else ''} ({why})")
 
 
 def render_item(targets: Targets, item: TargetItem) -> str:

@@ -61,6 +61,26 @@ class NativeSelfTested(unittest.TestCase):
         self.assertIsNone(self.source.pull_for_head("team", "roadmap/x"))
         self.assertEqual(self.source.reader.pulls.call_count, 5)
 
+    def test_open_pr_numbers_come_from_the_issue_index_without_a_pull_listing(self):
+        from tauceti_worker.github_transport import read_context
+
+        pull = {"merged": False}
+        self.source.api.pages = Mock(
+            return_value=iter([[dict(number=3, pull_request=pull), dict(number=1, pull_request=pull)]])
+        )
+        self.source.reader.pulls = Mock(return_value=[dict(number=3, title="Proof")])
+        with read_context(fresh=True, direct=True, retry=False):
+            self.assertEqual(self.source.pr_list(["number"]), [dict(number=3), dict(number=1)])
+            self.source.api.pages.assert_called_once_with(
+                "repos/" + self.source.repository.name + "/issues?type=pulls&state=open"
+            )
+            self.source.reader.pulls.assert_not_called()
+            # Other fields still come from the pull listing.
+            self.assertEqual(self.source.pr_list(["number", "title"]), [dict(number=3, title="Proof")])
+            self.source.api.pages.return_value = iter([[dict(number=2)]])
+            with self.assertRaises(ForgeError):
+                self.source.pr_list(["number"])
+
     def inventory_row(self, number, head="a" * 40):
         return {field: None for field in self.source.inventory_fields} | dict(number=number, headRefOid=head)
 
@@ -614,6 +634,66 @@ class SharedDiscovery(unittest.TestCase):
         self.source.open_prs.side_effect = [None, [dict(number=3)]]
         self.assertIsNone(self.read())
         self.assertEqual(self.read(), [dict(number=3)])
+
+    def test_an_expired_wait_behind_a_running_leader_is_unavailable_not_a_second_fetch(self):
+        from tauceti_worker import github_transport as transport
+
+        key, identity = ["listing"], self.source.cache_namespace
+        fetch = Mock(return_value=[dict(number=1)])
+        with transport.locked(transport._shared_path(key, identity).with_suffix(".lock")):
+            self.assertIsNone(
+                transport.shared_read(key, fetch, identity=identity, lock_timeout=0.1, coalesce_failures=True)
+            )
+            fetch.assert_not_called()
+            # Without coalescing, a caller still makes its own fetch, as before.
+            self.assertEqual(transport.shared_read(key, fetch, identity=identity, lock_timeout=0.1), [dict(number=1)])
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_a_listing_invalidated_while_it_was_fetched_is_a_base_but_never_an_answer(self):
+        from tauceti_worker import github_transport as transport
+        from tauceti_worker.source_identity import discovery_scope
+
+        bases = []
+
+        def inventory(previous):
+            bases.append(previous)
+            if len(bases) == 1:
+                transport.invalidate_shared(discovery_scope(self.source))  # a write during the listing
+            return {"rows": [dict(number=len(bases))], "since": 1.0, "sweep": len(bases)}
+
+        self.source = type("Source", (SimpleNamespace,), {"inventory": lambda _, previous: inventory(previous)})(
+            **vars(self.source)
+        )
+        self.assertEqual(self.read(), [dict(number=1)], "the caller still gets its own listing")
+        self.assertEqual(self.read(), [dict(number=2)], "the next read does not answer from it")
+        self.assertEqual([base and base["sweep"] for base in bases], [None, 1], "but refreshes it")
+        self.assertEqual(self.read(), [dict(number=2)])
+
+    def test_an_expired_or_invalidated_listing_is_refreshed_from_the_stored_one(self):
+        from tauceti_worker import github_transport as transport
+        from tauceti_worker.source_identity import discovery_scope
+
+        bases = []
+
+        def inventory(previous):
+            bases.append(previous)
+            return {"rows": [dict(number=len(bases))], "since": 1.0, "sweep": len(bases)}
+
+        self.source = type("Source", (SimpleNamespace,), {"inventory": lambda _, previous: inventory(previous)})(
+            **vars(self.source)
+        )
+        self.assertEqual(self.read(), [dict(number=1)])
+        self.assertEqual(self.read(), [dict(number=1)], "a current listing is shared as before")
+        transport.invalidate_shared(discovery_scope(self.source))
+        self.assertEqual(self.read(), [dict(number=2)])
+        with patch("tauceti_worker.github_transport.time.time", return_value=time.time() + 61):
+            self.assertEqual(self.read(), [dict(number=3)])
+        with transport.read_context(fresh=True):
+            self.assertEqual(self.read(), [dict(number=4)])
+        self.assertEqual(
+            [base and base["sweep"] for base in bases], [None, 1, 2, None], "a fresh read lists without a base"
+        )
+        self.source.open_prs.assert_not_called()
 
     def concurrent(self, outcome="success"):
         context = multiprocessing.get_context("fork")

@@ -897,6 +897,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if SCHEMA in schemas:
                 kwargs["mixed_capable"] = True
+        revision = body.get("revision")
+        if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{7,64}", revision):
+            # The code the worker runs: a stalled repair is offered at once to a revision that has not tried it.
+            kwargs["worker_revision"] = revision
         self._call(lambda: self.server.controller.claim_task(self._worker_identity(body), login, **kwargs))
 
     def _task(self, task_id: str, action: str) -> None:
@@ -914,9 +918,7 @@ class Handler(BaseHTTPRequestHandler):
         controller = self.server.controller
         if action == "renew":
             self._call(
-                lambda: _renewal(
-                    tid, controller.renew_task(tid, token, **self._source_task_kwargs(refresh=True)), controller
-                )
+                lambda: _renewal(tid, controller.renew_task(tid, token, **self._source_task_kwargs(refresh=True)))
             )
         elif action == "release":
             self._call(
@@ -925,6 +927,8 @@ class Handler(BaseHTTPRequestHandler):
                     token,
                     str(body.get("reason") or "released"),
                     str(body.get("error") or ""),
+                    # A clean preparation's attestation (decision 200), passed only when sent.
+                    **({"notes": body["notes"]} if isinstance(body.get("notes"), dict) else {}),
                     **self._source_task_kwargs(),
                 )
             )
@@ -1160,12 +1164,8 @@ class Handler(BaseHTTPRequestHandler):
         self._call(revoke)
 
 
-def _renewal(task_id, result, controller=None) -> dict:  # noqa: E302
-    result = dict(result) if isinstance(result, dict) else {"task_id": task_id, "expires_at": result}
-    policy = getattr(controller, "task_check_policy", None)
-    if callable(policy):
-        result.update(policy(task_id))
-    return result
+def _renewal(task_id, result) -> dict:  # noqa: E302
+    return dict(result) if isinstance(result, dict) else {"task_id": task_id, "expires_at": result}
 
 
 def server_config(config, *, adapter=None, app=None, controller=None) -> ServerConfig:

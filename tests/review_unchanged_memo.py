@@ -65,13 +65,20 @@ with tempfile.TemporaryDirectory() as tmp:
         path.write_text(json.dumps(outcome))
         return 0
 
-    for outcome, expected in (
-        ({"head_sha": HEAD, "changed": False}, [(42, HEAD)]),
-        ({"head_sha": HEAD, "changed": True}, []),
-        ({"head_sha": OTHER, "changed": False}, []),
+    guarded = []
+    for outcome, expected, expected_guard in (
+        ({"head_sha": HEAD, "changed": False}, [(42, HEAD)], []),
+        ({"head_sha": HEAD, "changed": True}, [], []),
+        ({"head_sha": OTHER, "changed": False}, [], []),
+        ({"head_sha": HEAD, "changed": False, "outcome": "diff-guard"}, [(42, HEAD)], [(42, HEAD)]),
+        ({"head_sha": OTHER, "changed": False, "outcome": "diff-guard"}, [], []),
     ):
         recorded.clear()
+        guarded.clear()
         with (
+            patch.object(
+                wu.peer_claims, "note_diff_guard", side_effect=lambda _s, pr, head: guarded.append((pr, head))
+            ),
             patch.object(wu.time, "strftime", return_value="fixed"),
             patch.object(wu, "run_to_logfile", side_effect=engine),
             patch.object(wu, "me", return_value="tester"),
@@ -83,5 +90,9 @@ with tempfile.TemporaryDirectory() as tmp:
             rc = wu.do_review(w, None, c, SimpleNamespace(work_model="claude"), False)
             round.finish(NoProgress("other candidates exhausted") if rc is None else None)
         assert recorded == expected, (outcome, recorded)
+        assert guarded == expected_guard, (outcome, guarded)
 
-print("PASS: unchanged review results suppress partial-history re-dispatch for that head only, and expire")
+print(
+    "PASS: unchanged review results suppress partial-history re-dispatch for that head only, and expire;"
+    " a diff-guard result is recorded host-wide for that head"
+)
