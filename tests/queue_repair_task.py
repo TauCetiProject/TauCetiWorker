@@ -529,11 +529,15 @@ while i < split:
         i += 2
     else:
         i += 1
+command = args[split + 1 :]
+if command[1:3] in (["cache", "get"], ["exe", "cache"]):
+    # A cache fetch, unsandboxed before: the test's STUB_* settings reach the lake stub through the
+    # env stub, which carries them across `env -i` as CALLER_STUB_*.
+    env.update({k[len("CALLER_") :]: v for k, v in os.environ.items() if k.startswith("CALLER_STUB_")})
 env.update(extra)
 env["PATH"] = f"{here}:{env.get('PATH', '')}"
 if cwd:
     os.chdir(cwd)
-command = args[split + 1 :]
 if command[:2] == ["sh", "-c"] and command[2].startswith("for p; do"):
     # The preflight's credential probe: emulate the mounts, keeping only paths a bind would show.
     pairs = [(a, args[i + 1], args[i + 2]) for i, a in enumerate(args[:split]) if a in ("--ro-bind", "--bind")]
@@ -552,8 +556,30 @@ if [ -f "$STUB_DIR/module-system-findings" ]; then cat "$STUB_DIR/module-system-
 echo "module-system: all TauCeti module(s) opt into the module system."
 """
 
+ENV = r'''#!PYTHON
+"""env stub: `env -i COMMAND...` (how the sandbox starts bwrap) keeps the test's STUB_* settings as
+CALLER_STUB_*, for the bwrap stub to hand a cache fetch; anything else runs the real env."""
+import os, shutil, sys
+from pathlib import Path
+here = str(Path(__file__).resolve().parent)
+args = sys.argv[1:]
+if args[:1] == ["-i"] and len(args) > 1:
+    keep = {f"CALLER_{k}": v for k, v in os.environ.items() if k.startswith("STUB_")}
+    os.execve(args[1], args[1:], keep)
+search = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep) if d and str(Path(d).resolve()) != here)
+real = shutil.which("env", path=search) or "/usr/bin/env"
+os.execv(real, [real, *args])
+'''.replace("PYTHON", sys.executable)
+
+# elan stub: the fetch sandbox installs a missing official toolchain first; record it, never download.
+ELAN = r"""#!/bin/sh
+echo "$*" >> "${STUB_DIR:-/dev/null}/elan-calls.log" 2>/dev/null || true
+"""
+
 for name, text in (
     ("lake", LAKE),
+    ("elan", ELAN),
+    ("env", ENV),
     ("gh", GH),
     ("claude", CLAUDE),
     ("codex", CLAUDE),
@@ -1420,12 +1446,23 @@ class HappyPath(Fixture):
         self.assertEqual(lake[0], "exe cache get")
         self.assertIn(f"--rev={self.content.base}", lake[1])
         self.assertTrue(lake[2].startswith("build --iofail"))
-        # Only the build ran in the sandbox, from a cleared environment; the cache fetches need the network.
+        # Every Lake command ran in the sandbox, from a cleared environment: the cache fetches online, the
+        # streaming build and the worker's verification build of the agent's chain offline.
         sandboxed = self.bwrap_calls()
-        # The streaming build, then the worker's verification build of the agent's chain.
-        self.assertEqual(
-            [c["argv"][c["argv"].index("--") + 1 :] for c in sandboxed], [["lake", "build", "--iofail"]] * 2
-        )
+        commands = [c["argv"][c["argv"].index("--") + 1 :] for c in sandboxed]
+        self.assertEqual(commands[0], ["lake", "exe", "cache", "get"])
+        self.assertEqual(commands[1][:3], ["lake", "cache", "get"])
+        self.assertEqual(commands[2:], [["lake", "build", "--iofail"]] * 2)
+        for call, command in zip(sandboxed, commands, strict=True):
+            argv = call["argv"]
+            fetch = command[1] in ("exe", "cache")
+            self.assertEqual("--unshare-net" in argv, not fetch, command)
+            setenv = dict(pairs(argv, "--setenv"))
+            self.assertEqual("LAKE_NO_CACHE" in setenv, not fetch, command)
+            if fetch:
+                mathlib = setenv["MATHLIB_CACHE_DIR"]
+                self.assertIn((mathlib, mathlib), pairs(argv, "--bind"), "Mathlib's cache is the workers' own")
+                self.assertNotIn(str(HOME / ".cache" / "mathlib"), mathlib)
         self.assertEqual(len(outcome["verification"]), 1)
         self.assertTrue(outcome["verification"][0]["ok"])
         self.assertEqual(outcome["verification"][0]["checks"]["status"], "unavailable", "this fixture has no pin")

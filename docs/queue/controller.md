@@ -478,6 +478,31 @@ the check back. When `main` advances while a check is claimed, the check is supe
 (`head-rebasing`) so the head is rebased at once, and the rebased tip gets its own check; a
 speculative task never re-dispatches a head that is behind `main`.
 
+
+Early staging (decisions 199 B and 200; `_early_staging`, setting `early_staging_enabled`, default
+false): once the oldest open batch is sealed, its preparation on the head's tip has been adopted
+with a passing local verification of exactly the chain it seals as (`pre_rebase_verified` equal to
+`pre_rebase_tip`, `pre_rebase_source` equal to its tip), and the head is an ordinary batch based
+on `main` whose known-good tip is staging or has passed, the controller sends the trusted run of
+that prepared tip at once, based on the head's tip: a `ci_attempts` row with `early` 1 at the
+batch's current version, `generation` one more than it (the staging candidate branch's name, which
+pr-build's train identity needs positive and which the attempt keeps), and `dispatch_kind`
+`staging`. It is not held for the base's published cache (the base is the head's tip, published
+only at the end of its own run; the run is warm from the preparation's outputs). The observation
+feed reports the batch `running` with that tip and base while the attempt is pending, so pr-build's
+identity check and the finalizer's revalidation accept it, and stops as soon as it is cancelled.
+Each tick observes pending early attempts and cancels one (`_cancel_superseded_runs(only=...)`,
+journal `early-staging-cancelled`) once it no longer describes what the batch will seal as
+(`_early_invalid`): the batch changed, its pre-rebase changed (for example `_discard_unverified_pre_rebase`
+after the head failed), the head's tip moved or failed, `main` moved past the base, the setting was
+turned off, or, with one staging slot, the head needs a re-run while the early run is still queued
+(it is sent again behind the head's). When the head lands as the base, `_seal_from_pre_rebase`
+seals the batch as exactly that tip and adopts the attempt (`early` 2, `batch_version` the new
+version, journal `early-staging-adopted`): a pass is promoted in the same pass, a pending run is
+the head's run, and a source failure goes straight to the head's repair. Infrastructure failures
+of an early run are re-sent `early_staging_infrastructure_retries` (1) times; then the batch is
+staged as the head. Verdicts are journaled `early-staging-verdict`; the open batch's status carries
+`early_staging`.
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
 `base_sha`, `batch_id`, `members`, `base_ref`, `repair_outputs_revs`). Observation reads `find_candidate_run` when an event
@@ -817,6 +842,8 @@ and reported in status:
 | `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
 | `prepare_pre_rebased` | true | create a `prepare` task for the oldest open batch's usable pre-rebase on the head's tip (with `prepare_open_batches`, for the batches it applies to) |
 | `parallel_check_enabled` | false | verify a head dispatched on a tip no worker verified on a repair worker alongside its staging run, and repair what fails (`_schedule_parallel_check`) |
+| `early_staging_enabled` | false | send the next batch's verified prepared tip to its trusted run while the head is staging, and adopt that run when it seals as that tip (`_early_staging`) |
+| `early_staging_infrastructure_retries` | 1 | re-sends of an early run that failed on infrastructure before the batch waits to be staged as the head |
 | `base_cache_endpoint` | `https://cache.taucetiproject.org/revisions` | public Lake revision endpoint a head's base must be published at before staging is dispatched (CI section above); empty disables the requirement |
 | `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
 | `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |

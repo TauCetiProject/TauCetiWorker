@@ -39,6 +39,10 @@ Tables:
   whose live run the controller cancelled because a newer dispatch, a landing, a removal or a
   rebuild superseded it records when (`cancelled_at`), the attempt that superseded it
   (`cancelled_by`, empty otherwise), why (`cancel_reason`) and GitHub's answer (`cancel_result`).
+  An `early` attempt (1) is the trusted run of an open batch's prepared tip on the head's tip,
+  dispatched before that batch is the head; 2 once the batch sealed as that tip and adopted it.
+  `generation` names its staging candidate branch (the batch version at dispatch, kept when the
+  attempt is adopted under a later version); `dispatch_kind` is the workflow it was sent as.
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
 - `failures`: history only, no longer written: one row per failed CI attempt of a head from when
@@ -334,7 +338,10 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     cancelled_at REAL,
     cancelled_by INTEGER,
     cancel_reason TEXT NOT NULL DEFAULT '',
-    cancel_result TEXT NOT NULL DEFAULT ''
+    cancel_result TEXT NOT NULL DEFAULT '',
+    early INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER,
+    dispatch_kind TEXT NOT NULL DEFAULT 'staging'
 );
 CREATE INDEX IF NOT EXISTS ci_batch ON ci_attempts (batch_id, batch_version);
 CREATE INDEX IF NOT EXISTS ci_head_sha ON ci_attempts (head_sha);
