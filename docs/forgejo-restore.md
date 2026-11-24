@@ -122,6 +122,24 @@ python3 -I ~/.local/share/tauceti-forgejo-mirror/bin/forgejo_restore.py verify
 rm ~/.config/tauceti-forgejo/main-sync-token
 ```
 
+Open PRs from forks need one more step. Forgejo writes a fork PR's `refs/pull/N/head` only when
+the PR is opened or its fork branch is pushed, and refuses that ref from anyone else, so after a
+restore the base repository lacks those heads' commits. Until it has them, fetching the head from
+the base repository fails (`upload-pack: not our ref`), Forgejo cannot post inline review comments
+on the PR (reviews stay `PENDING`), and the queue cannot compute the PR's merge base. `verify`
+fails while any open fork PR is in this state and lists them. Publish their heads, as the bot
+(`~/.config/tauceti-forgejo/bot-token`, which can push to the base repository but not to the
+forks), to `refs/tauceti-fork-heads/N`:
+
+```sh
+python3 -I ~/.local/share/tauceti-forgejo-mirror/bin/forgejo_restore.py pull-refs --publish
+```
+
+`pull-refs` alone only reports. It fetches each head from its fork and publishes it only if the
+fork branch is still at the PR's head. Once the fork branch is pushed again, Forgejo writes the
+pull ref, and `pull-refs --prune` deletes fork-head refs that no open PR needs. The mirror copies
+`refs/tauceti-fork-heads/*` like any other base ref, so a later restore brings them back.
+
 If a fork lost refs too, `forgejo_restore.py --fork OWNER[/NAME] restore` restores it from the
 mirror's `refs/forks/OWNER/*`, with a token that can write to that fork (`--user`, `--token-file`).
 
