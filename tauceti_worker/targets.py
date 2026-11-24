@@ -28,6 +28,7 @@ import random
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from functools import cached_property
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -38,6 +39,10 @@ MARKER_RE = re.compile(r"<!--\s*tauceti-targets:v1\s*-->")
 MARKER_TAG = "tauceti-target:v1"
 MERGED_SEARCH = f'"{MARKER_TAG}" in:body'
 MERGED_LIMIT = 200
+# Items searched one by one per round for a landing older than the recent listing.
+PREREQUISITE_SEARCHES = 40
+# The largest area listing (UTF-8 bytes) the prompt carries whole.
+ASSIGNMENT_LISTING_BYTES = 32_000
 _ID_PHRASE = re.compile(r'"id":"(.*)"')
 _ID_TERM = '\\"id\\":\\"{}\\"'
 _AREA_RE = re.compile(r"[A-Za-z0-9_-]+")
@@ -78,8 +83,15 @@ class Targets:
     def items(self) -> Iterable[TargetItem]:
         return (it for items in self.areas.values() for it in items)
 
+    @cached_property
+    def _by_slug(self) -> dict[str, TargetItem]:
+        index: dict[str, TargetItem] = {}
+        for it in self.items():
+            index.setdefault(it.slug, it)
+        return index
+
     def find(self, slug: str) -> TargetItem | None:
-        return next((it for it in self.items() if it.slug == slug), None)
+        return self._by_slug.get(slug)
 
 
 def _parse_item(line: str, area: str) -> TargetItem | None:
@@ -308,8 +320,10 @@ def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
     """`overlay_live` from the pull requests of `gh` and of each source in `others` (GitHub or
     Forgejo): an open one whose marker names an item puts it in flight, a merged one that completes
     it (`landed`) makes it done. Missing prerequisite completions are also searched by item, so an
-    old landing still unlocks its children after it leaves the recent listing. Raises GitHubError
-    or SourceUnavailable when a required source read fails."""
+    old landing still unlocks its children after it leaves the recent listing: at most
+    PREREQUISITE_SEARCHES items a round, those whose own needs are done first, in random order
+    within each group so that successive rounds cover the rest. Raises GitHubError or
+    SourceUnavailable when a required source read fails."""
     inflight: set[Key] = set()
     done: set[Key] = set()
     sources = (gh, *others)
@@ -327,12 +341,24 @@ def live_targets(targets: Targets, gh, others: Iterable = ()) -> Targets:
     # Resolve dependencies BEFORE eligibility, rather than only searching already eligible
     # candidates. Otherwise an old completed parent stays open and its children remain blocked.
     live = overlay_live(targets, inflight, done)
+    if not incomplete:
+        return live
     needed = {slug for item in live.items() if item.status == "open" for slug in item.needs}
-    for item in targets.items():
-        key = (item.area, item.slug)
-        if item.slug in needed and item.status != "done" and key not in done:
-            if any(landed_pr(item, source) is not None for source in incomplete):
-                done.add(key)
+    pending = [item for item in live.items() if item.slug in needed and item.status != "done"]
+    random.shuffle(pending)
+
+    def waits(item: TargetItem) -> bool:
+        return any((dep := live.find(slug)) is None or dep.status != "done" for slug in item.needs)
+
+    pending.sort(key=waits)
+    if len(pending) > PREREQUISITE_SEARCHES:
+        log(
+            f"target list: {len(pending)} unresolved prerequisite(s) are missing from the recent landings; "
+            f"searching {PREREQUISITE_SEARCHES} this round. Ticking `[x]` in the file avoids these searches."
+        )
+    for item in pending[:PREREQUISITE_SEARCHES]:
+        if any(landed_pr(item, source) is not None for source in incomplete):
+            done.add((item.area, item.slug))
     return overlay_live(targets, inflight, done)
 
 
@@ -562,11 +588,33 @@ def target_markers(item: TargetItem) -> tuple[str, str]:
     return f"<!--tauceti-target:v1 {ident}}}-->", f'<!--tauceti-target:v1 {ident},"partial":true}}-->'
 
 
+def _assignment_listing(targets: Targets, item: TargetItem) -> tuple[list[str], str]:
+    """The entries the prompt shows for `item`, and the sentence that introduces them: its whole
+    area while that fits ASSIGNMENT_LISTING_BYTES, otherwise the item and the entries it needs, and
+    the item alone when those do not fit either."""
+
+    def size(lines: list[str]) -> int:
+        return sum(len(line.encode()) + 1 for line in lines)
+
+    area = targets.areas.get(item.area, [])
+    whole = [render_item(targets, it) for it in area]
+    if size(whole) <= ASSIGNMENT_LISTING_BYTES:
+        return whole, f"The list's entries for `{item.area}` follow"
+    own = render_item(targets, item)
+    needs = [render_item(targets, dep) for slug in dict.fromkeys(item.needs) if (dep := targets.find(slug))]
+    if needs and size([own, *needs]) <= ASSIGNMENT_LISTING_BYTES:
+        return [
+            own,
+            *needs,
+        ], f"The entry for `{item.slug}` and the entries it needs follow, out of {len(area)} for `{item.area}`"
+    return [own], f"The entry for `{item.slug}` follows, out of {len(area)} for `{item.area}`"
+
+
 def render_assignment(targets: Targets, item: TargetItem) -> str:
     """The bullet that opens the roadmap prompt's "Choose a target" section under a target list."""
     area, slug = item.area, item.slug
     marker, partial = target_markers(item)
-    block = [render_item(targets, it) for it in targets.areas.get(area, [])]
+    block, shown = _assignment_listing(targets, item)
     if targets.preamble:
         block = [*targets.preamble.splitlines(), "", *block]
     listing = "\n".join(f"  {line}".rstrip() for line in block)
@@ -574,7 +622,7 @@ def render_assignment(targets: Targets, item: TargetItem) -> str:
 - **Your target is assigned: `{slug}` in `{area}`.** This worker authors from an operator's target list: milestones on the path to one goal, with the order they depend on each other. It chose `{slug}` for this round and made the claim `author/{area}/{slug}` before starting you. This replaces your own choice of target in the bullets below; the rest of this prompt applies unchanged.
   - Author `{slug}`, or a prerequisite inside `{area}` that it cannot land without. Do not take another item of the list, and do not switch to another roadmap. If an open or merged PR already covers the target, if it appears among the claimed targets below, or if it waits on work that has not landed, stop without a PR and say which.
   - Skip the `claim.sh acquire` step below, and use `{slug}` as the `<slug>`. The PR body carries exactly `{marker}` when the PR completes the target, and `{partial}` when it lands only a part or a prerequisite of it: a merged marker without `"partial":true` tells every worker on the list that the target is done.
-  - The list's entries for `{area}` follow, with the operator's note on the list above them when there is one. `[ ]` is open, `[~]` in flight and `[x]` landed, as of this round; `needs:` names the items an entry waits on, and one marked `[?]` is not in the list.
+  - {shown}, with the operator's note on the list above them when there is one. `[ ]` is open, `[~]` in flight and `[x]` landed, as of this round; `needs:` names the items an entry waits on, and one marked `[?]` is not in the list.
   ```
 {listing}
   ```

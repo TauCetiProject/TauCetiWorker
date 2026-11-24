@@ -188,6 +188,53 @@ class LiveView(unittest.TestCase):
             self.assertEqual(status(live), {"old": "done", "next": "open"})
             self.assertEqual([it.slug for it in t.candidates(live, "auto", ())], ["next"])
 
+    def test_prerequisite_searches_are_bounded_and_start_with_those_ready_to_land(self):
+        lines = ["<!-- tauceti-targets:v1 -->", "## Algebra", "- [x] `base` — done", "- [ ] `root` — open"]
+        for i in range(60):
+            lines.append(f"- [ ] `blocked{i}` — waits (needs: root)")
+            lines.append(f"- [ ] `child{i}` — result (needs: blocked{i})")
+        lines.append("- [ ] `ready` — may have landed (needs: base)")
+        lines.append("- [ ] `last` — result (needs: ready)")
+        listed = t.parse_targets("\n".join(lines) + "\n")
+        source = github(
+            merged=[(500 + i, marker("Algebra", f"unrelated{i}")) for i in range(200)],
+            older=[(7, marker("Algebra", "ready"))],
+        )
+        source.merged_prs = Mock(wraps=source.merged_prs)
+        with patch.object(t, "log") as logged:
+            live = t.live_targets(listed, source)
+        self.assertEqual(status(live)["ready"], "done")
+        self.assertEqual(source.merged_prs.call_count, 1 + t.PREREQUISITE_SEARCHES)
+        self.assertIn("62 unresolved prerequisite(s)", logged.call_args[0][0])
+
+    def test_a_long_area_is_assigned_with_the_item_and_its_needs_only(self):
+        lines = ["<!-- tauceti-targets:v1 -->", "Goal: one theorem.", "## Algebra", "- [x] `base` — the foundation"]
+        lines += [f"- [ ] `filler{i}` — {'x' * 60} (needs: base)" for i in range(600)]
+        lines.append("- [ ] `goal` — the result (needs: base, filler0)")
+        listed = t.parse_targets("\n".join(lines) + "\n")
+        text = t.render_assignment(listed, listed.find("goal"))
+        self.assertLess(len(text.encode()), 4000)
+        self.assertIn("Goal: one theorem.", text)
+        self.assertIn("- [ ] `goal` — the result (needs: `base` [x], `filler0` [ ])", text)
+        self.assertIn("- [x] `base` — the foundation (needs: none)", text)
+        self.assertNotIn("filler1`", text)
+        self.assertIn("the entries it needs follow, out of 602 for `Algebra`", text)
+        short = t.parse_targets(EXAMPLE)
+        item = next(iter(short.items()))
+        whole = t.render_assignment(short, item)
+        self.assertIn(f"The list's entries for `{item.area}` follow", whole)
+        for it in short.areas[item.area]:
+            self.assertIn(f"`{it.slug}`", whole)
+
+    def test_an_item_with_too_many_needs_is_assigned_alone(self):
+        lines = ["<!-- tauceti-targets:v1 -->", "## Algebra"]
+        lines += [f"- [x] `dep{i}` — {'x' * 200}" for i in range(400)]
+        lines.append("- [ ] `goal` — the result (needs: " + ", ".join(f"dep{i}" for i in range(400)) + ")")
+        listed = t.parse_targets("\n".join(lines) + "\n")
+        text = t.render_assignment(listed, listed.find("goal"))
+        self.assertIn("The entry for `goal` follows, out of 401 for `Algebra`", text)
+        self.assertNotIn("xxxx", text)
+
     def test_old_partial_or_other_base_does_not_unlock_children(self):
         listed = t.parse_targets(
             "<!-- tauceti-targets:v1 -->\n## Algebra\n- [ ] `old` — prerequisite\n- [ ] `next` — result (needs: old)\n"

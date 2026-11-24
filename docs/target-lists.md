@@ -99,7 +99,10 @@ prerequisite, so it continues to unlock dependent items after leaving this recen
 window. Candidate items are also checked before assignment. These reads preserve
 partial-marker, explicit `partial:` and base-branch checks. Complete recent
 listings avoid these per-item reads, and completed/in-flight items do not trigger
-searches for their own prerequisites. Ticking `[x]` in the
+searches for their own prerequisites. A round searches at most 40 unresolved
+prerequisites, those whose own needs are done first and in random order within
+each group, so a long list is covered over successive rounds; the log says when
+the limit applies. Ticking `[x]` in the
 file records an operator completion and avoids repeated historical lookups.
 
 ## Selection
@@ -131,7 +134,7 @@ review are unaffected by the list.
 A roadmap round under a list costs, on each forge it reads, one listing of
 open pull requests, one search for recent landings, and one search per candidate
 tried, plus one item search per unresolved prerequisite missing from the recent
-landings, and one claim push per candidate. The GitHub searches are shared
+landings (at most 40), and one claim push per candidate. The GitHub searches are shared
 between workers of one account on a host for two minutes.
 
 ## What the agent sees
@@ -141,6 +144,9 @@ assigned slug and area, the instruction to author that item or a prerequisite
 inside the same roadmap and nothing else, the exact marker for the pull request
 body (with `"partial":true` when the pull request lands only part of the item),
 and the area's items with their live statuses under the file's preamble.
+When the area's entries exceed 32 kB, the prompt carries the assigned entry and
+the entries it needs instead, or the assigned entry alone when those are also
+too large.
 `gh-safe-pr-create` refuses a body that does not carry the assigned item's
 marker; in a Forgejo round its `gh pr create` goes through the source-bound
 `gh`, so the check is the same on both forges.
