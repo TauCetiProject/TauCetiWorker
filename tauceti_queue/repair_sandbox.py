@@ -231,17 +231,43 @@ def _credential_masks(binds: list[tuple[str, str]], env: dict) -> list[str]:
     return masks
 
 
-# Where ``repair.link_shared_packages`` records the target it linked ``.lake/packages`` to: in the
-# worktree's tools directory, which a sandbox binds read-only, unlike ``.lake``.
-PACKAGES_RECORD = ".tauceti-repair/packages-link"
+# ``repair.link_shared_packages`` records the target it linked a worktree's ``.lake/packages`` to in
+# this directory of the worker's root (the worktrees directory's parent), outside the checkout (which
+# a candidate commit could fill) and outside every bind (so no sandbox can write it).
+PACKAGES_RECORDS = "packages-links"
+
+
+def packages_record(worktree: Path) -> Path:
+    worktree = Path(os.path.abspath(worktree))
+    return worktree.parent.parent / PACKAGES_RECORDS / worktree.parent.name / worktree.name
+
+
+def _read_only_trees(env: dict) -> list[Path]:
+    trees = [*(env.get(READ_ONLY_VARIABLE) or "").split(os.pathsep), env.get("TAUCETI_QUEUE_SEED_PACKAGES") or ""]
+    return [Path(t).resolve() for t in trees if t.strip()]
+
+
+def shareable_packages(target: Path, env: dict | None = None) -> bool:
+    """Whether ``target`` may be bound read-only as a worktree's ``.lake/packages``: a real directory
+    with no symlink on its path, never under ``/proc``, ``/dev``, ``/sys`` or ``/run``, and either
+    inside a configured read-only tree or another worktree's own ``.lake/packages``."""
+    env = os.environ if env is None else env
+    target = Path(os.path.abspath(target))
+    if target != target.resolve() or not target.is_dir():
+        return False
+    if any(target.is_relative_to(root) for root in ("/proc", "/dev", "/sys", "/run")):
+        return False
+    if any(target.is_relative_to(tree) for tree in _read_only_trees(env)):
+        return True
+    return target.name == "packages" and target.parent.name == ".lake"
 
 
 def linked_packages(worktree: Path) -> list[Path]:
-    """The ``.lake/packages`` targets the worker itself linked in ``worktree`` (``PACKAGES_RECORD``),
+    """The ``.lake/packages`` targets the worker itself linked in ``worktree`` (:func:`packages_record`),
     as recorded: canonical when written and never resolved again, since a target inside another
     worktree's ``.lake`` is build state that could since have been replaced by a link elsewhere."""
     try:
-        text = (worktree / PACKAGES_RECORD).read_text()
+        text = packages_record(worktree).read_text()
     except OSError:
         return []
     return [Path(line) for line in text.splitlines() if line.startswith("/")]
@@ -354,8 +380,7 @@ def sandbox_argv(
     directory = worktree if cwd is None else Path(os.path.abspath(cwd))
     if not (directory.is_relative_to(worktree) or directory.resolve().is_relative_to(worktree)):
         raise SandboxUnavailable(f"{directory} is outside the sandboxed worktree {worktree}")
-    trees = [*(env.get(READ_ONLY_VARIABLE) or "").split(os.pathsep), env.get("TAUCETI_QUEUE_SEED_PACKAGES") or ""]
-    read_only = [Path(t).resolve() for t in trees if t.strip()]
+    read_only = _read_only_trees(env)
     for tree in read_only:
         if worktree.is_relative_to(tree):
             raise SandboxUnavailable(f"{worktree} is inside {tree}, which builds may only read")
@@ -383,12 +408,11 @@ def sandbox_argv(
     args += ["--ro-bind", str(worktree), str(worktree), "--bind", str(lake_dir), str(lake_dir)]
     packages = lake_dir / "packages"
     if packages.is_symlink():  # the shared extracted Mathlib (--seed-packages), read-only for every build
-        # The link is build state the batch's code can rewrite, so its target is bound only when it is
-        # one of the configured read-only trees; any other target stays outside (the link dangles).
+        # The link is build state the batch's code can rewrite, so its target is bound only when the
+        # worker recorded it or it is in a configured read-only tree; otherwise the link dangles.
         shared = packages.resolve()
-        if shared.is_dir() and (
-            shared in linked_packages(worktree) or any(shared.is_relative_to(t) for t in read_only)
-        ):
+        trusted = shared in linked_packages(worktree) or any(shared.is_relative_to(t) for t in read_only)
+        if trusted and shareable_packages(shared, env):
             args += ["--ro-bind", str(shared), str(shared)]
     args += _credential_masks(_binds(args), env)
     args += ["--remount-ro", "/"]

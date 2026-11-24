@@ -151,14 +151,10 @@ class Shims(Fixture):
     def test_a_packages_link_the_worker_made_is_bound(self):
         parent = self.tmp / "task" / ".lake" / "packages"
         (parent / "mathlib").mkdir(parents=True)
-        subprocess.run(["git", "init", "-q", str(self.worktree)], check=True)
         repair.link_shared_packages(self.worktree, parent)
+        self.assertFalse((self.worktree / ".tauceti-repair").exists(), "the record is outside the checkout")
         argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
         self.assertIn(["--ro-bind", str(parent), str(parent)], [argv[i : i + 3] for i in range(len(argv))])
-        excluded = subprocess.run(
-            ["git", "-C", str(self.worktree), "check-ignore", "-q", repair_sandbox.PACKAGES_RECORD], check=False
-        )
-        self.assertEqual(excluded.returncode, 0, "the record stays out of Git")
         # The parent's build replaces the recorded directory by a link elsewhere: nothing is bound.
         parent.rename(parent.with_name("moved"))
         parent.symlink_to(self.home)
@@ -169,6 +165,22 @@ class Shims(Fixture):
         (self.worktree / ".lake" / "packages").symlink_to(self.home)
         argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
         self.assertNotIn(str(self.home), [argv[i + 1] for i, a in enumerate(argv) if a == "--ro-bind"])
+
+    def test_a_parent_link_rewritten_before_the_helper_exists_is_not_recorded(self):
+        for target in (Path("/proc"), self.home):
+            with self.subTest(target=target):
+                repair.link_shared_packages(self.worktree, target)
+                self.assertEqual(repair_sandbox.linked_packages(self.worktree), [])
+                argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
+                self.assertNotIn(str(target), [argv[i + 1] for i, a in enumerate(argv) if a == "--ro-bind"])
+
+    def test_a_record_committed_into_the_checkout_is_ignored(self):
+        (self.worktree / ".tauceti-repair").mkdir()
+        (self.worktree / ".tauceti-repair" / "packages-link").write_text("/proc\n")
+        (self.worktree / ".lake").mkdir()
+        (self.worktree / ".lake" / "packages").symlink_to("/proc")
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
+        self.assertNotIn(["--ro-bind", "/proc", "/proc"], [argv[i : i + 3] for i in range(len(argv))])
 
     def test_a_packages_link_the_build_rewrote_binds_nothing(self):
         (self.worktree / ".lake").mkdir()

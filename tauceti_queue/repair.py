@@ -819,12 +819,14 @@ def link_shared_packages(worktree: Path, seed_packages: Path) -> None:
         else:
             shutil.rmtree(target)
     target.symlink_to(seed_packages)
-    # The sandbox binds a packages link's target only when the worker recorded it here, outside the
-    # build-writable `.lake` (repair_sandbox.linked_packages).
-    listings_path(worktree)  # keeps the tools directory, and so the record, out of Git
-    record = worktree / repair_sandbox.PACKAGES_RECORD
+    # The sandbox binds a packages link's target only when the worker recorded it, outside the
+    # checkout and every bind (repair_sandbox.linked_packages), and only a target that may be shared
+    # at all: a parent worktree's `.lake/packages` is build state the parent's build could have
+    # replaced by a link elsewhere before this call.
+    record = repair_sandbox.packages_record(worktree)
     record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text(f"{Path(seed_packages).resolve()}\n")
+    shared = Path(seed_packages)
+    record.write_text(f"{shared}\n" if repair_sandbox.shareable_packages(shared) else "")
 
 
 def lake_env(root: Path, base_env: dict | None = None, *, cache_root: Path | None = None) -> dict:
