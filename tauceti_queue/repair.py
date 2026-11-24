@@ -844,6 +844,8 @@ def lake_env(root: Path, base_env: dict | None = None, *, cache_root: Path | Non
     env["LAKE_CACHE_DIR"] = str((cache_root or root) / "lake-cache")
     env["LAKE_ARTIFACT_CACHE"] = "1"
     env["LAKE_RESTORE_ARTIFACTS"] = "1"
+    # The workers' own Mathlib cache: fetches run in the sandbox, which may write it (repair_sandbox).
+    env[repair_sandbox.MATHLIB_CACHE_VARIABLE] = str((cache_root or root) / "mathlib-cache")
     env.pop("TAUCETI_PR_CACHE_MISS", None)
     return env
 
@@ -1014,7 +1016,13 @@ def _fetch_mapping(
     argv = [*lake, "cache", "get", "--service", service, "--repo", repository, f"--rev={revision}"]
     if mappings_only:
         argv.append("--mappings-only")
-    fetch = run_logged(argv, worktree, log, env=env, timeout=600 if mappings_only else 1800)
+    fetch = run_logged(
+        repair_sandbox.sandboxed_fetch(argv, worktree, env),
+        worktree,
+        log,
+        env=env,
+        timeout=600 if mappings_only else 1800,
+    )
     with log.open("rb") as handle:
         handle.seek(offset)
         text = handle.read().decode(errors="replace")
@@ -1143,7 +1151,11 @@ def prepare_artifacts(
         with downloads(env) as fetch_env:
             if mathlib_cache:
                 deps = run_logged(
-                    [*lake, "exe", "cache", "get"], worktree, logdir / "cache-get-mathlib.log", fetch_env, 1800
+                    repair_sandbox.sandboxed_fetch([*lake, "exe", "cache", "get"], worktree, fetch_env),
+                    worktree,
+                    logdir / "cache-get-mathlib.log",
+                    fetch_env,
+                    1800,
                 )
                 record["mathlib_cache"] = deps
                 seconds += deps["seconds"]

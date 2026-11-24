@@ -432,8 +432,15 @@ has a time budget holds because the service re-exposes the task.
    own additions are its artifact pool (`LAKE_CACHE_DIR`, writable, since Lake stores every built
    artifact there), `LAKE_CONFIG` and a shared `--seed-packages` tree (read-only), and the content
    clone's Git directory (read-only, so Lake's Git queries resolve). The arguments, `--iofail`
-   included, and the exit status pass through unchanged. Only the build is sandboxed: the cache
-   fetches before it need the network, and the agent's own shell is not confined.
+   included, and the exit status pass through unchanged. The worker's cache fetches (`lake cache get`,
+   and `lake exe cache get` for Mathlib) run in the same sandbox online (`repair_sandbox.sandboxed_fetch`:
+   no `--unshare-net`, no `LAKE_NO_CACHE`, TLS and proxy variables passed): a fetch loads the
+   workspace's and its packages' Lake configurations and may run Mathlib's cache executable, all from
+   `.lake`, which the batch's code could have written during an earlier build of the same tree.
+   Mathlib's cache tool writes the workers' own directory (`MATHLIB_CACHE_DIR`, `mathlib-cache` beside
+   the artifact pool), never the host's `~/.cache/mathlib`, which unsandboxed Lean elsewhere on the
+   host imports from. Online, the sandbox reaches the network and the host's loopback services as the
+   worker would, but still no credential. The agent's own shell is not confined.
    No credential is visible inside: the sandbox binds nothing of the home directory but the
    toolchains, and every credential path the worker knows (`repair_sandbox.credential_paths`: the
    queue App's directory, the worker token file, the repair-cache write key, the provider and `gh`

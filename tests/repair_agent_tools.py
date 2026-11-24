@@ -58,7 +58,20 @@ class Fixture(unittest.TestCase):
         # The host's tools the commands need, and nothing else: no real bwrap, elan or Lean.
         system = self.tmp / "system"
         system.mkdir()
-        for name in ("bash", "sh", "env", "readlink", "basename", "grep", "nice", "ls", "mkdir", "cat", "echo"):
+        for name in (
+            "bash",
+            "sh",
+            "env",
+            "readlink",
+            "basename",
+            "grep",
+            "nice",
+            "ls",
+            "mkdir",
+            "cat",
+            "echo",
+            "flock",
+        ):
             if where := shutil.which(name):
                 (system / name).symlink_to(where)
         self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:{system}", "LANG": "C.UTF-8"}
@@ -435,6 +448,119 @@ class Credentials(Fixture):
             ok, detail = repair_sandbox.check(self.tmp / "scratch", env)
         self.assertFalse(ok)
         self.assertIn(str(key), detail)
+
+
+class Fetches(Fixture):
+    def test_a_fetch_runs_in_the_sandbox_online(self):
+        mathlib = self.tmp / "mathlib-cache"
+        env = {
+            **self.env,
+            "MATHLIB_CACHE_DIR": str(mathlib),
+            "SSL_CERT_FILE": "/etc/ssl/certs/ca.crt",
+            "RUST_MIN_STACK": "268435456",
+        }
+        with patch.dict(os.environ, {"PATH": env["PATH"]}):
+            argv = repair_sandbox.sandboxed_fetch(["lake", "exe", "cache", "get"], self.worktree, env)
+            offline = repair_sandbox.sandboxed_lake(["lake", "build"], self.worktree, env)
+        self.assertEqual(argv[argv.index("--") :], ["--", "lake", "exe", "cache", "get"])
+        if shutil.which("flock", path=env["PATH"]):
+            self.assertEqual(argv[1], str(self.tmp / "mathlib-cache.lock"), "Mathlib fetches take turns")
+        self.assertNotIn("--unshare-net", argv)
+        self.assertIn("--unshare-user", argv)
+        setenv = dict((argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == "--setenv")
+        self.assertNotIn("LAKE_NO_CACHE", setenv)
+        self.assertEqual(setenv["MATHLIB_CACHE_DIR"], str(mathlib))
+        self.assertEqual(setenv["SSL_CERT_FILE"], "/etc/ssl/certs/ca.crt")
+        self.assertEqual(setenv["RUST_MIN_STACK"], "268435456")
+        self.assertIn(["--bind", str(mathlib), str(mathlib)], [argv[i : i + 3] for i in range(len(argv))])
+        self.assertTrue(mathlib.is_dir())
+        self.assertIn(
+            ["--ro-bind", str(self.worktree), str(self.worktree)], [argv[i : i + 3] for i in range(len(argv))]
+        )
+        # The offline build neither reaches the network nor sees Mathlib's cache.
+        self.assertIn("--unshare-net", offline)
+        self.assertNotIn(str(mathlib), offline)
+
+    def test_resolver_and_ca_files_outside_the_system_roots_are_bound(self):
+        ca = self.tmp / "ca.pem"
+        ca.write_text("public trust")
+        args = repair_sandbox._network_binds({"SSL_CERT_FILE": str(ca)})
+        self.assertIn(["--ro-bind", str(ca), str(ca)], [args[i : i + 3] for i in range(len(args))])
+        link = self.tmp / "ca-link.pem"
+        link.symlink_to(ca)
+        args = repair_sandbox._network_binds({"CURL_CA_BUNDLE": str(link)})
+        self.assertIn(["--ro-bind", str(ca), str(link)], [args[i : i + 3] for i in range(len(args))])
+        for path in repair_sandbox.NETWORK_FILES:
+            target = Path(path).resolve()
+            if target.is_file() and not any(target.is_relative_to(r) for r in repair_sandbox.SYSTEM_ROOTS):
+                self.assertIn(str(target), args)
+
+    def test_the_toolchain_is_installed_outside_the_sandbox_only_by_its_official_name(self):
+        log = self.tmp / "elan.log"
+        (self.bin / "elan").write_text(f'#!/bin/sh\necho "$*" >> {log}\n')
+        (self.worktree / "lean-toolchain").write_text("leanprover/lean4:v4.99.0-rc1\n")
+        repair_sandbox.ensure_toolchain(self.worktree, self.env)
+        self.assertEqual(log.read_text(), "toolchain install leanprover/lean4:v4.99.0-rc1\n")
+        log.unlink()
+        (self.elan / "toolchains" / "leanprover--lean4---v4.99.0-rc1").mkdir()
+        repair_sandbox.ensure_toolchain(self.worktree, self.env)
+        (self.worktree / "lean-toolchain").write_text("someone/lean4:v1\n")
+        repair_sandbox.ensure_toolchain(self.worktree, self.env)
+        self.assertFalse(log.exists(), "installed already, or not an official release: nothing runs")
+
+    def test_a_symlink_in_the_download_view_stops_the_transfer(self):
+        from tauceti_queue import repair_cache
+
+        pool = self.tmp / "shared" / "lake-cache"
+        (pool / "artifacts").mkdir(parents=True)
+        (pool.parent / "cache-users").mkdir()
+        secret = self.home / ".codex"
+        secret.mkdir()
+        (secret / "auth.json").write_text("secret")
+        with self.assertRaisesRegex(ValueError, "symlink in the cache download view"):
+            with repair_cache.downloads({"LAKE_CACHE_DIR": str(pool)}) as env:
+                (Path(env["LAKE_CACHE_DIR"]) / "outputs").symlink_to(secret)
+        self.assertEqual([p.name for p in pool.rglob("auth.json")], [])
+
+    @unittest.skipUnless(real_bwrap_works(), "needs bwrap with unprivileged user namespaces")
+    def test_the_transfer_into_the_pool_runs_where_planted_links_reach_nothing(self):
+        from tauceti_queue import repair_cache
+
+        pool = self.tmp / "shared" / "lake-cache"
+        (pool / "outputs").mkdir(parents=True)
+        (pool.parent / "cache-users").mkdir()
+        target = self.home / ".ssh"
+        target.mkdir()
+        (pool / "outputs" / "escape").symlink_to(target)  # planted by an earlier build
+        env = {**os.environ, "LAKE_CACHE_DIR": str(pool)}
+        env.pop(repair_sandbox.DISABLE_VARIABLE, None)
+        with self.assertRaises(OSError):
+            with repair_cache.downloads(env) as fetch:
+                view = Path(fetch["LAKE_CACHE_DIR"])
+                (view / "outputs" / "escape").mkdir(parents=True)
+                (view / "outputs" / "escape" / "authorized_keys").write_text("attacker")
+        self.assertEqual(list(target.iterdir()), [], "nothing was written through the planted link")
+        # A link to the users' registrations beside the pool reaches them read-only.
+        os.unlink(pool / "outputs" / "escape")
+        (pool.parent / "cache-users" / "worker.json").write_text("{}")
+        (pool / "outputs" / "users").symlink_to("../../cache-users")
+        with self.assertRaises(OSError):
+            with repair_cache.downloads(env) as fetch:
+                view = Path(fetch["LAKE_CACHE_DIR"])
+                (view / "outputs" / "users").mkdir(parents=True)
+                (view / "outputs" / "users" / "worker.json").write_text('{"root": "/attacker"}')
+        self.assertEqual((pool.parent / "cache-users" / "worker.json").read_text(), "{}")
+        os.unlink(pool / "outputs" / "users")
+        # An ordinary download still reaches the pool.
+        with repair_cache.downloads(env) as fetch:
+            view = Path(fetch["LAKE_CACHE_DIR"])
+            (view / "outputs" / "TauCeti").mkdir(parents=True)
+            (view / "outputs" / "TauCeti" / "note.txt").write_text("output")
+        self.assertEqual((pool / "outputs" / "TauCeti" / "note.txt").read_text(), "output")
+
+    def test_the_workers_mathlib_cache_is_their_own(self):
+        env = repair.lake_env(self.root, {"HOME": str(self.home)}, cache_root=self.tmp / "shared")
+        self.assertEqual(env["MATHLIB_CACHE_DIR"], str(self.tmp / "shared" / "mathlib-cache"))
 
 
 if __name__ == "__main__":

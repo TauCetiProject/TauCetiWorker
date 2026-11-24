@@ -24,6 +24,8 @@ that none of them can be read.
 The repair agent's own ``lake``, ``lean`` and ``elan`` commands reach the same sandbox through the
 shims of ``repair_agent_tools``, which pass the caller's directory as ``cwd``.
 
+The worker's cache fetches go through :func:`sandboxed_fetch`, the same sandbox online.
+
 ``TAUCETI_QUEUE_SANDBOX=0`` turns the sandbox off for hosts without ``bwrap``; every build then logs
 a warning that it ran unsandboxed. ``python -m tauceti_queue.repair_sandbox [--worktree DIR] -- lake
 build ...`` runs one command under the sandbox (the helper scripts' entry point); ``--check`` runs
@@ -36,6 +38,7 @@ import argparse
 import hashlib
 import logging
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -56,6 +59,26 @@ PRESSURE_WRAPPER = "/opt/tauceti/tauceti-lean"
 SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/nix", "/run/current-system")
 # Lake's artifact-cache settings, passed through from the build's environment as CI passes them.
 PASSED_ENV = ("LAKE_ARTIFACT_CACHE", "LAKE_RESTORE_ARTIFACTS", "LAKE_CACHE_DIR", "LAKE_CONFIG", "ELAN_HOME")
+# Passed through to a networked sandbox (``network=True``): TLS trust and proxies for the fetch.
+NETWORK_ENV = (
+    # leantar, which unpacks the fetched archives, needs the worker's Rust thread stack size
+    # (tauceti_queue/__init__.py).
+    "RUST_MIN_STACK",
+    "SSL_CERT_FILE",
+    "NIX_SSL_CERT_FILE",
+    "CURL_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+)
+# Mathlib's cache tool (``lake exe cache get``) reads and writes this directory; ``repair.lake_env``
+# points it at the workers' own one, never the host's ``~/.cache/mathlib``, which unsandboxed Lean
+# elsewhere on the host imports from.
+MATHLIB_CACHE_VARIABLE = "MATHLIB_CACHE_DIR"
 # Retain the caller's cgroup namespace: the pressure wrapper needs every capped ancestor,
 # with /proc/self/cgroup paths matching the read-only host cgroup mount.
 NAMESPACE_FLAGS = (
@@ -391,8 +414,11 @@ def sandbox_argv(
     bwrap: str | None = None,
     extra_env: dict | None = None,
     cwd: Path | None = None,
+    network: bool = False,
 ) -> list[str]:
-    """``argv`` wrapped in the offline sandbox, run from ``worktree`` (or ``cwd``, a directory inside
+    """``argv`` wrapped in the offline sandbox (with ``network``, the same sandbox online, for the
+    worker's cache fetches: no ``--unshare-net``, no ``LAKE_NO_CACHE``, ``NETWORK_ENV`` passed and
+    Mathlib's cache directory ``MATHLIB_CACHE_DIR`` writable), run from ``worktree`` (or ``cwd``, a directory inside
     it), with ``extra_env`` set inside it (the audit and lint scripts' inputs, ``repair_audit``). Raises
     :class:`SandboxUnavailable` when ``bwrap`` is not on PATH, when ``cwd`` lies outside ``worktree``
     or when a bound tree lies inside a credential directory."""
@@ -429,6 +455,12 @@ def sandbox_argv(
         cache = Path(env["LAKE_CACHE_DIR"])
         cache.mkdir(parents=True, exist_ok=True)
         args += ["--bind", str(cache), str(cache)]
+    if network and env.get(MATHLIB_CACHE_VARIABLE):
+        mathlib = Path(env[MATHLIB_CACHE_VARIABLE])
+        mathlib.mkdir(parents=True, exist_ok=True)
+        args += ["--bind", str(mathlib), str(mathlib)]
+    if network:
+        args += _network_binds(env)
     args += ["--ro-bind", str(worktree), str(worktree), "--bind", str(lake_dir), str(lake_dir)]
     packages = lake_dir / "packages"
     if packages.is_symlink():  # the shared extracted Mathlib (--seed-packages), read-only for every build
@@ -436,16 +468,19 @@ def sandbox_argv(
     args += _credential_masks(_binds(args), env)
     args += ["--remount-ro", "/"]
     args += ["--setenv", "PATH", _inside_path(env, elan), "--setenv", "HOME", home]
-    # The sandbox is always offline: Lake restores only from the local pool, never a remote cache.
-    args += ["--setenv", "LAKE_NO_CACHE", "true", "--setenv", "TMPDIR", str(lake_dir / "tmp")]
-    for key in PASSED_ENV:
+    # Offline, Lake restores only from the local pool, never a remote cache.
+    if not network:
+        args += ["--setenv", "LAKE_NO_CACHE", "true"]
+    args += ["--setenv", "TMPDIR", str(lake_dir / "tmp")]
+    for key in PASSED_ENV + ((*NETWORK_ENV, MATHLIB_CACHE_VARIABLE) if network else ()):
         if env.get(key):
             args += ["--setenv", key, env[key]]
     for key, value in (extra_env or {}).items():
         args += ["--setenv", key, str(value)]
     for key, value in _pressure_env(worktree, PRESSURE_WRAPPER).items():
         args += ["--setenv", key, value]
-    args += ["--chdir", str(directory), *NAMESPACE_FLAGS, "--", *argv]
+    flags = [f for f in NAMESPACE_FLAGS if not (network and f == "--unshare-net")]
+    args += ["--chdir", str(directory), *flags, "--", *argv]
     return args
 
 
@@ -461,7 +496,13 @@ def prioritized(argv: list[str]) -> list[str]:
 
 
 def sandboxed_lake(
-    argv: list[str], worktree: Path, env: dict | None = None, *, extra_env: dict | None = None, cwd: Path | None = None
+    argv: list[str],
+    worktree: Path,
+    env: dict | None = None,
+    *,
+    extra_env: dict | None = None,
+    cwd: Path | None = None,
+    network: bool = False,
 ) -> list[str]:
     """The command to run for ``argv`` (a ``lake build ...``) from ``worktree``: wrapped in the
     sandbox, or an environment wrapper with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0``
@@ -483,7 +524,120 @@ def sandboxed_lake(
                 *argv,
             ]
         )
-    return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env, cwd=cwd))
+    return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env, cwd=cwd, network=network))
+
+
+# Files name resolution and TLS read, bound read-only into an online sandbox wherever they resolve
+# (``/etc/resolv.conf`` often links into ``/run``, which is not bound); the CA variables' files too.
+NETWORK_FILES = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf")
+CA_VARIABLES = ("SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")
+
+
+def _system(path: Path) -> bool:
+    return any(path.is_relative_to(root) for root in SYSTEM_ROOTS if Path(root).is_dir())
+
+
+def _network_binds(env: dict) -> list[str]:
+    """The resolver's files at their resolved paths (the system path is then a link into the bind),
+    and each CA variable's file at the path the variable names, which is what a TLS client opens."""
+    args: list[str] = []
+    for path in NETWORK_FILES:
+        target = Path(path).resolve()
+        if target.is_file() and not _system(target):
+            args += ["--ro-bind", str(target), str(target)]
+    for path in dict.fromkeys(env[key] for key in CA_VARIABLES if env.get(key)):
+        named, target = Path(os.path.abspath(path)), Path(path).resolve()
+        if not target.is_file():
+            continue
+        if not _system(named):
+            args += ["--ro-bind", str(target), str(named)]
+        elif not _system(target):
+            args += ["--ro-bind", str(target), str(target)]
+    return args
+
+
+# An elan toolchain name the worker installs itself: the official releases and nightlies only.
+TOOLCHAIN = re.compile(r"leanprover/lean4(?:-nightly)?:(?:v\d+\.\d+\.\d+(?:-rc\d+)?|nightly-\d{4}-\d{2}-\d{2})")
+
+
+def ensure_toolchain(worktree: Path, env: dict, timeout: float = 1800) -> None:
+    """Install the toolchain ``worktree`` names, from outside the sandbox (whose elan home is
+    read-only), when it is an official release that is not installed yet. Any other name is left to
+    fail inside the sandbox. Installing runs nothing from the worktree."""
+    try:
+        name = (worktree / "lean-toolchain").read_text().strip()
+    except OSError:
+        return
+    if not TOOLCHAIN.fullmatch(name):
+        return
+    directory = _elan_home(env) / "toolchains" / name.replace("/", "--").replace(":", "---")
+    elan = shutil.which("elan", path=env.get("PATH"))
+    if directory.is_dir() or not elan:
+        return
+    clean = {k: env[k] for k in ("PATH", "HOME", "ELAN_HOME", "LANG", *NETWORK_ENV) if env.get(k)}
+    subprocess.run([elan, "toolchain", "install", name], env=clean, cwd="/", capture_output=True, timeout=timeout)
+
+
+def sandboxed_python(
+    code: str, args: list[str], tree: Path, env: dict | None = None, *, writable: tuple[str, ...] | None = None
+) -> list[str]:
+    """``python -I -c code args...`` of this worker's own interpreter and package, offline, with only
+    ``tree`` writable (one bind, so hard links inside it work) and nothing else of the host but the
+    system roots: for host-side maintenance of build-writable state, where a planted symlink must not
+    resolve to the worker's files. Raises :class:`SandboxUnavailable` like :func:`sandbox_argv`."""
+    env = dict(os.environ if env is None else env)
+    bwrap = shutil.which("bwrap", path=env.get("PATH"))
+    if not bwrap:
+        raise SandboxUnavailable(f"bwrap is not on PATH; install bubblewrap or set {DISABLE_VARIABLE}=0")
+    package = Path(__file__).resolve().parent.parent
+    # The real interpreter and this process's import path, all at their real paths (a venv or a
+    # versioned install is often reached through links that would not resolve inside), and the
+    # outermost of those trees bound read-only.
+    python = Path(sys.executable).resolve()
+    trees = {package, Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), python.parent.parent}
+    # Only import-path entries inside those trees: `python -m` puts the working directory first.
+    entries = (Path(p).resolve() for p in sys.path if p and Path(p).exists())
+    path = [str(package), *dict.fromkeys(str(e) for e in entries if any(e.is_relative_to(t) for t in trees))]
+    found = sorted(trees)
+    roots = [r for r in found if not any(r != o and r.is_relative_to(o) for o in found) and not _system(r)]
+    argv = [shutil.which("env") or "/usr/bin/env", "-i", bwrap, "--tmpfs", "/", *_system_binds()]
+    argv += ["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]
+    for root in roots:
+        argv += ["--ro-bind", str(root), str(root)]
+    tree = Path(tree).resolve()
+    argv += ["--bind", str(tree), str(tree)]
+    if writable is not None:
+        # Only these children of ``tree`` stay writable; the rest are bound read-only over themselves,
+        # so a link planted in a writable one cannot redirect a write into them.
+        for child in sorted(tree.iterdir()):
+            if child.name not in writable and not child.is_symlink():
+                argv += ["--ro-bind", str(child), str(child)]
+    argv += _credential_masks(_binds(argv), env)
+    argv += ["--remount-ro", "/", "--setenv", "PATH", "/usr/bin:/bin", "--chdir", str(tree), *NAMESPACE_FLAGS]
+    code = f"import sys; sys.path[:] = {path!r}\n" + code
+    return [*argv, "--", str(python), "-I", "-c", code, *args]
+
+
+def sandboxed_fetch(argv: list[str], worktree: Path, env: dict | None = None) -> list[str]:
+    """A cache fetch (``lake cache get``, ``lake exe cache get``) from ``worktree``: the build sandbox
+    online. A fetch loads the workspace's and its packages' Lake configurations and may run Mathlib's
+    cache executable, all from ``.lake``, which the batch's code could write during an earlier build of
+    the same tree; outside the sandbox that would run with the worker's credentials in reach. The
+    toolchain is installed first (:func:`ensure_toolchain`)."""
+    env = dict(os.environ if env is None else env)
+    if not disabled(env):
+        try:
+            ensure_toolchain(Path(worktree), env)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            LOGGER.warning("installing the toolchain for %s failed: %s", worktree, error)
+    wrapped = sandboxed_lake(argv, worktree, env, network=True)
+    # Mathlib's cache tool names its temporary files by process id, and every sandbox has its own pid
+    # namespace, so two fetches sharing MATHLIB_CACHE_DIR could collide: they take its lock in turn.
+    flock = shutil.which("flock", path=env.get("PATH"))
+    if env.get(MATHLIB_CACHE_VARIABLE) and argv[1:3] == ["exe", "cache"] and flock and not disabled(env):
+        lock = Path(env[MATHLIB_CACHE_VARIABLE]).parent / (Path(env[MATHLIB_CACHE_VARIABLE]).name + ".lock")
+        wrapped = [flock, str(lock), *wrapped]
+    return wrapped
 
 
 # Inside the sandbox: exit 1 naming the first argument that is a non-empty file or directory.

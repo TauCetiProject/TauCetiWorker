@@ -2716,7 +2716,7 @@ def resolve_one(
 
         with downloads(env_lake) as fetch_env:
             repair.run_logged(
-                [*cfg.lake, "exe", "cache", "get"],
+                repair_sandbox.sandboxed_fetch([*cfg.lake, "exe", "cache", "get"], worktree, fetch_env),
                 worktree,
                 logdir / f"cache-get-mathlib-{commit[:12]}.log",
                 fetch_env,
