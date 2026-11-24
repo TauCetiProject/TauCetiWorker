@@ -126,7 +126,6 @@ class AdmissionTests(unittest.TestCase):
         del self.github.statuses[(head, "build")]
         del self.github.statuses[(head, "scope")]
         self.github.labels[1].add("self-tested")
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         self.assertEqual(self.intake.run_once()["approved"], 1)
         self.controller.tick()
         self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
@@ -137,7 +136,6 @@ class AdmissionTests(unittest.TestCase):
         head = self.github.create_pr(1, files)
         self.review(1)
         self.github.labels[1].add("self-tested")
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         return head
 
     def test_self_tested_heads_must_pass_the_pr_level_diff_guards(self):
@@ -244,17 +242,40 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(self.intake.run_once()["approved"], 1)
         measure.assert_not_called()
 
-    def test_untrusted_label_and_label_removal_cannot_bypass_ci(self):
+    def test_any_authors_label_stands_in_for_ci_until_removed(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]
-        self.github.labels[1].add("self-tested")
         self.assertEqual(self.intake.run_once()["approved"], 0)
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
+        self.github.labels[1].add("self-tested")
         self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.run_once()["approved"], 1)
         generation = self.intake.state.get(1)["generation"]
         self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
+
+    def test_a_self_tested_rule_change_re_evaluates_only_evidence_refusals_once(self):
+        for number, missing in ((1, "build"), (3, "scope")):
+            head = self.ready(number)
+            del self.github.statuses[(head, missing)]
+            self.github.labels[number].add("self-tested")
+        self.ready(2)
+        unlabelled = self.ready(4)
+        del self.github.statuses[(unlabelled, "build")]
+        with mock.patch("tauceti_tools.self_tested.accepted", return_value=False):  # the old team rule
+            self.assertEqual(self.intake.run_once()["approved"], 1)
+        reasons = {n: json.loads(self.intake.state.get(n)["decision"])["reason"] for n in (1, 3, 4)}
+        self.assertTrue(reasons[1].startswith("build is not green"), reasons)
+        self.assertTrue(reasons[3].startswith("trusted CI scope status is not green"), reasons)
+        # A database from before the current self-tested rules.
+        self.controller.store.execute("DELETE FROM settings WHERE key LIKE 'state:self_tested_policy:%'")
+        approved = self.intake.state.get(2)["generation"]
+        self.restart()
+        self.assertEqual(self.intake.state.get(2)["generation"], approved, "an admitted head is not re-read")
+        self.assertEqual(self.intake.run_once()["approved"], 2)
+        self.assertEqual({row["number"] for row in self.controller.inputs()}, {1, 2, 3})
+        refused = self.intake.state.get(4)["generation"]
+        self.restart()
+        self.assertEqual(self.intake.state.get(4)["generation"], refused, "once per rule version")
 
     def test_primary_intake_uses_published_review_and_unchanged_inputs_cost_no_evaluation(self):
         self.ready()
