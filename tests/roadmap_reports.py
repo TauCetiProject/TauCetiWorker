@@ -210,9 +210,22 @@ class Wiring(unittest.TestCase):
                     text = path.read_text()
                     self.assertIn("Never write to the roadmaps.", text)
                     self.assertTrue("roadmap report (below)" in text or "reported in this PR's description" in text)
-        outcome = tc.agents.fill_prompt(prompts / "pr-outcome.md", PR=5, HEAD="b" * 40, BIN="/bin", CLOSE_AUTHORITY="")
-        self.assertIn('"/bin/roadmap-report-check"', outcome)
-        self.assertIn("### Roadmap report", outcome)
+        staged = (Path("/srv/state/refs/roadmap"), "c" * 40)
+        for roadmap, bubble, words in (
+            (staged, True, '"/opt/round/roadmap-report-check" --roadmaps /opt/roadmap/TauCetiRoadmap <file>'),
+            (staged, False, f"read-only at `/srv/state/refs/roadmap/TauCetiRoadmap`, at commit `{'c' * 40}`"),
+            (None, True, "add the `### Roadmap report` section without a marker"),
+        ):
+            outcome = tc.agents.fill_prompt(
+                prompts / "pr-outcome.md",
+                PR=5,
+                HEAD="b" * 40,
+                ROADMAP_CHECKOUT=tc.work_units.repair_roadmap_text(roadmap, bubble),
+                CLOSE_AUTHORITY="",
+            )
+            self.assertIn("### Roadmap report", outcome)
+            self.assertIn(words, outcome)
+            self.assertNotIn("gh api repos/TauCetiProject/TauCetiRoadmap", outcome)
 
     def test_the_checker_is_staged_for_bubble(self):
         tmp = Path(tempfile.mkdtemp(prefix="roadmap-report-bubble-"))

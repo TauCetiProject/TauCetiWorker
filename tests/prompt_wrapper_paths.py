@@ -53,7 +53,7 @@ CALL_SITES = {
     "pr-outcome.md": dict(
         PR=123,
         HEAD="a" * 40,
-        BIN="/bin",
+        ROADMAP_CHECKOUT="The roadmaps are checked out read-only.",
         CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),

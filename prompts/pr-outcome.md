@@ -83,20 +83,15 @@ marker line per error (at most five):
 ```
 <!--tauceti-roadmap-report:v1 {"roadmap":"<folder>","file":"README.md","roadmap_sha":"<40-hex commit>","anchor":"<quote>","kind":"false-statement","effect":"worked-around","refutes":["TauCeti.<counterexample>"],"replaces":["TauCeti.<corrected>"]}-->
 ```
-`roadmap` is the roadmap's folder under the `TauCetiRoadmap/` directory of
-TauCetiProject/TauCetiRoadmap (`Parent/Child` for a nested one) and `file` is `README.md` or
-`Suggested.lean`. `roadmap_sha` is the full commit you read the file at: take it from
-`gh api repos/TauCetiProject/TauCetiRoadmap/commits/main --jq .sha` and read the file at that
-commit. `anchor` is, for `Suggested.lean`, the declaration's name and, for `README.md`, a
-verbatim quote of the statement or its distinctive part, at most 300 characters, copied from that
-file. `kind` is one of `false-statement`, `missing-hypothesis`, `unprovable-pin`,
+__ROADMAP_CHECKOUT__ `roadmap` is the roadmap's folder (`Parent/Child` for a nested one) and
+`file` is `README.md` or `Suggested.lean`. `anchor` is, for `Suggested.lean`, the declaration's
+name and, for `README.md`, a verbatim quote of the statement or its distinctive part, at most 300
+characters. `kind` is one of `false-statement`, `missing-hypothesis`, `unprovable-pin`,
 `wrong-definition`, `circular-dependency`, `stale-name`; `effect` is `worked-around` when the PR
 proves a corrected statement in its place, `blocked` when it lands only a partial piece and the
 error still blocks the target; `refutes` and `replaces` optionally name (at
 most 10 each) the fully qualified declarations that refute the roadmap's statement and that state
-the corrected one. Check the edited description with `"__BIN__/roadmap-report-check" <file>`. If
-you cannot read the roadmap repository from here, write the section without the marker and say so
-in your final answer. This is the only sanctioned way to report a roadmap error; report only what
+the corrected one. This is the only sanctioned way to report a roadmap error; report only what
 you have proved or can show.
 
 Transient provider/GitHub failures and lost claims use the existing retry handling. A withdrawn request, changed head or lost claim needs no repetitive comment: stop

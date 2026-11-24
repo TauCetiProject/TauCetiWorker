@@ -151,6 +151,40 @@ with patch.object(w, "run_in_bubble", return_value=0) as launch:
     assert "CI red" in prompt
     assert "You may NOT close this PR" in prompt
 
+# A repair round gets the roadmaps read-only in Bubble, for a roadmap report; without them it still repairs.
+roadmap_state = Path(tempfile.mkdtemp(prefix="automatic-bump-roadmap-"))
+worker.cfg = SimpleNamespace(state=roadmap_state)
+
+
+def staged_roadmap(repo, dest):
+    dest = Path(dest)
+    (dest / "TauCetiRoadmap" / "Topology").mkdir(parents=True, exist_ok=True)
+    (dest / "TauCetiRoadmap" / "Topology" / "README.md").write_text("# Topology\n")
+    git = ["git", "-C", str(dest), "-c", "user.name=t", "-c", "user.email=t@example.org"]
+    for args in (["init", "-q"], ["add", "."], ["commit", "-qm", "roadmap"]):
+        __import__("subprocess").run([*git, *args], check=True)
+    return True
+
+
+def unreachable(repo, dest):
+    raise OSError("no network")
+
+
+repair = (worker, sv, sv.needs_fix.actionable[0], SimpleNamespace(agent_name="Codex"), True)
+with patch.object(w, "run_in_bubble", return_value=0) as launch, patch.object(w, "fetch_ref", staged_roadmap):
+    assert w._do_fixlike(*repair, prompt_file="fix.md", label="fix") == 0
+    sha = w.roadmap_head(roadmap_state / "refs" / "roadmap")
+    assert launch.call_args.kwargs["mounts"] == [f"{roadmap_state / 'refs' / 'roadmap'}:/opt/roadmap:ro"]
+    prompt = launch.call_args.args[2]
+    assert f"checked out read-only at `/opt/roadmap/TauCetiRoadmap`, at commit `{sha}`" in prompt
+    assert '"/opt/round/roadmap-report-check" --roadmaps /opt/roadmap/TauCetiRoadmap <file>' in prompt
+    assert "gh api repos/TauCetiProject/TauCetiRoadmap" not in prompt
+for fetch in (unreachable, lambda repo, dest: False):
+    with patch.object(w, "run_in_bubble", return_value=0) as launch, patch.object(w, "fetch_ref", fetch):
+        assert w._do_fixlike(*repair, prompt_file="fix.md", label="fix") == 0
+        assert launch.call_args.kwargs["mounts"] == []
+        assert "No roadmap checkout is available this round" in launch.call_args.args[2]
+
 # Comment-only activity cannot classify an automatic repair as productive.
 worker.gh.pr_progress_state = lambda _: {"head": HEAD, "ncomments": 2}
 pre = {"head": HEAD, "ncomments": 1, "require_push": True}

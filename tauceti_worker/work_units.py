@@ -2363,11 +2363,23 @@ def _do_fixlike(
             )
     # Every PR repair runs unattended: repair, answer the finding, or close owned work.
     may_close = not foreign and not getattr(p, "automatic_bump", False) and owns_pr(sv, p, casefold_legacy=True)
+    # The roadmaps, read-only, for a repair that finds the PR's roadmap statement wrong. They are
+    # staged just before the agent starts (stage_roadmap), so a stale selection fetches nothing; an
+    # unguessable slot keeps text quoted into the prompt from standing in for it.
+    roadmap_slot = f"\0roadmap-checkout-{os.urandom(8).hex()}\0"
+
+    def stage_roadmap(prompt):
+        """The prompt with the roadmap paragraph filled in, and the Bubble mounts it needs. Optional:
+        without the checkout the repair goes ahead and the paragraph says the marker must wait."""
+        roadmap = roadmap_snapshot(w)
+        mounts = [f"{roadmap[0]}:/opt/roadmap:ro"] if roadmap else []
+        return prompt.replace(roadmap_slot, repair_roadmap_text(roadmap, bubble)), mounts
+
     prompt += "\n" + fill_prompt(
         HERE / "prompts" / "pr-outcome.md",
         PR=pr,
         HEAD=head,
-        BIN=wrapper_bin(bubble),
+        ROADMAP_CHECKOUT=roadmap_slot,
         CLOSE_AUTHORITY=(
             "You may close this PR only while its live author is the authenticated account on this source forge"
             + _adopted_authors_note(sv)
@@ -2413,9 +2425,16 @@ def _do_fixlike(
     if bubble:
         # The PR's head repo (its own fork, for a fork-PR) gets git fetch/push in the bubble. bubble also
         # auto-derives this from a PR target, so it's explicit/testable belt-and-suspenders (kim-em/bubble#320).
+        prompt, roadmap_mounts = stage_roadmap(prompt)
         with MaintenanceStop(w, c, explicit=explicit) as stop:
             rc = run_in_bubble(
-                w, f"{TAUCETI}/pull/{pr}", prompt, opts, allow_push=f"{p.head_owner}/{p.head_repo}", cancel_event=stop
+                w,
+                f"{TAUCETI}/pull/{pr}",
+                prompt,
+                opts,
+                mounts=roadmap_mounts,
+                allow_push=f"{p.head_owner}/{p.head_repo}",
+                cancel_event=stop,
             )
     else:
         if not prepare_checkout(w.cfg, work=label, pr=pr):
@@ -2458,6 +2477,7 @@ def _do_fixlike(
         push_scope = current_round_id() or os.urandom(16).hex()
         scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
         scoped_published_before = _rev(co, scoped_push_marker)
+        prompt, _ = stage_roadmap(prompt)
         try:
             with (
                 environment(TAUCETI_PUSH_SCOPE=push_scope),
@@ -3428,6 +3448,39 @@ def roadmap_head(path: Path) -> str:
     head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True)
     sha = head.stdout.strip() if head.returncode == 0 else ""
     return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else ""
+
+
+def roadmap_snapshot(w) -> tuple[Path, str] | None:
+    """The worker's read-only roadmap checkout and its commit, refreshed as roadmap rounds refresh it
+    (one shared shallow fetch per host and hour); None when it cannot be had. Never raises."""
+    path = w.cfg.state / "refs" / "roadmap"
+    try:
+        if fetch_ref(ROADMAP, path) and (sha := roadmap_head(path)):
+            return path, sha
+    except Exception as error:  # The roadmap serves an optional report; it must never stop a repair.
+        log(f"roadmap checkout unavailable ({type(error).__name__}); repairing without it")
+        return None
+    log("roadmap checkout unavailable; repairing without it")
+    return None
+
+
+def repair_roadmap_text(roadmap: tuple[Path, str] | None, bubble: bool) -> str:
+    """How a repair round's roadmap report finds `roadmap`, `roadmap_sha` and its anchor (pr-outcome.md)."""
+    if roadmap is None:
+        return (
+            "No roadmap checkout is available this round, so a marker cannot be anchored: make the repair, "
+            "add the `### Roadmap report` section without a marker, and say in your final answer that the "
+            "marker is still missing; a later round, which has the checkout, adds it."
+        )
+    active = (
+        ("/opt/roadmap" if bubble else str(roadmap[0])) + "/" + os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap")
+    )
+    return (
+        f"The roadmaps are checked out read-only at `{active}`, at commit `{roadmap[1]}`: `roadmap` is a "
+        f"folder under `{active}/`, `roadmap_sha` is `{roadmap[1]}`, and the anchor is copied from that "
+        f'file. Check the edited description with `"{wrapper_bin(bubble)}/roadmap-report-check" --roadmaps '
+        f"{active} <file>`."
+    )
 
 
 def do_roadmap(w, sv, c, opts, bubble) -> int:
