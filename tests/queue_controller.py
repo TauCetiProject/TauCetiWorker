@@ -33,7 +33,7 @@ from tauceti_queue.controller import (  # noqa: E402
     TaskError,
     live_progress_at,
 )
-from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
+from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller, run_git  # noqa: E402
 from tauceti_queue.ports import AGENT_INSTRUCTION  # noqa: E402
 from tauceti_queue.store import loads  # noqa: E402
 
@@ -3984,7 +3984,7 @@ class Attestation(PreRebasedCase):
         self.repo.write_files({"scripts/lint-baseline.txt": "TauCeti.x\n"})
 
         def run(*a):
-            return chain.git(self.repo.scratch, *a)
+            return run_git(self.repo.scratch, *a)
 
         run("add", "-A")
         run("commit", "-q", "-m", "other policy")
