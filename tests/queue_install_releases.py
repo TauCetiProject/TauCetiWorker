@@ -671,7 +671,7 @@ class CloneMaintenance(unittest.TestCase):
         for _ in range(2):  # loose-objects packs them, and deletes the packed copies the next time
             result = self.run_script()
             self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.git("config", "maintenance.auto").strip(), "false")
+        self.assertEqual(self.git("config", "--local", "maintenance.auto").strip(), "false")
         self.assertIn("refs/x/2", (self.clone / ".git/packed-refs").read_text(), "pack-refs ran")
         self.assertEqual(self.git("count-objects", "-v").split("count: ")[1].split("\n")[0], "0", "loose-objects ran")
         self.assertFalse(self.lock.exists())

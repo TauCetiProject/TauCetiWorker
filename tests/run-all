@@ -51,6 +51,15 @@ case "$JOBS" in ''|*[!0-9]*|0) echo "run-all: -j wants a positive integer, got '
 RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-run-XXXXXX")"
 trap 'rm -rf "$RUN_ROOT"' EXIT
 
+# Fixture commits must not start detached automatic `git maintenance`: on a loaded runner one
+# outlives its command, holds objects/maintenance.lock and keeps its cwd in the fixture's checkout,
+# which retention's and review recovery's process scans then see as a live user. The host's system
+# configuration still applies through the include; a module that opts out of system configuration
+# opts out of this too.
+system_gitconfig="${GIT_CONFIG_SYSTEM:-/etc/gitconfig}"
+printf '[include]\n\tpath = %s\n[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n' "$system_gitconfig" >"$RUN_ROOT/gitconfig"
+export GIT_CONFIG_SYSTEM="$RUN_ROOT/gitconfig"
+
 # stdlib-only python tests, run with the project interpreter
 RUN_STDLIB=(
   build_resources.py
