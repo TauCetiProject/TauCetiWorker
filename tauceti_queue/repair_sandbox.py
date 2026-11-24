@@ -595,9 +595,12 @@ def sandboxed_python(
     # outermost of those trees bound read-only.
     python = Path(sys.executable).resolve()
     trees = {package, Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(), python.parent.parent}
-    # Only import-path entries inside those trees: `python -m` puts the working directory first.
+    # Only import-path entries inside those trees or the always-bound system roots (a Nix python's
+    # lib-dynload resolves into another store path than its prefix): `python -m` puts the working
+    # directory first.
     entries = (Path(p).resolve() for p in sys.path if p and Path(p).exists())
-    path = [str(package), *dict.fromkeys(str(e) for e in entries if any(e.is_relative_to(t) for t in trees))]
+    kept = (e for e in entries if _system(e) or any(e.is_relative_to(t) for t in trees))
+    path = [str(package), *dict.fromkeys(str(e) for e in kept)]
     found = sorted(trees)
     roots = [r for r in found if not any(r != o and r.is_relative_to(o) for o in found) and not _system(r)]
     argv = [shutil.which("env") or "/usr/bin/env", "-i", bwrap, "--tmpfs", "/", *_system_binds()]
