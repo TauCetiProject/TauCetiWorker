@@ -441,10 +441,13 @@ has a time budget holds because the service re-exposes the task.
    tmpfs or `/dev/null`, at every path a bind exposes it under (a symlinked bind source shows its
    target's files under its own name); the targets of symlinks directly inside a credential
    directory are masked too. A worktree's `.lake/packages` link is build state the batch can rewrite,
-   so its target is bound read-only only when the worker made the link itself (it records the target in
-   `packages-links/` under the worker root, outside the checkout and every bind, through `repair.link_shared_packages`, and only for a real directory that is another worktree's `.lake/packages`) or the
-   target is in the worker's `--seed-packages` tree (`TAUCETI_SANDBOX_READONLY`, which the worker
-   exports at start); a worktree inside that tree is refused. The preflight's "build sandbox" check fails when any of them that holds
+   so it is never followed on the host to pick a bind source. A link the worker made itself
+   (`repair.link_shared_packages` records it in `packages-links/` under the worker root, outside the
+   checkout and every bind, and only for another worktree's real `.lake/packages`) must still name
+   that path literally, and then that worktree's `.lake` is bound read-only: no sandbox can replace
+   it, and a later swap of its `packages` entry resolves inside the sandbox. A link into the worker's
+   `--seed-packages` tree (`TAUCETI_SANDBOX_READONLY`, which the worker exports at start) is bound at
+   its resolved path; any other link dangles, and a worktree inside that tree is refused. The preflight's "build sandbox" check fails when any of them that holds
    something can be read from inside.
 
    **The agent's toolchain commands.** The batch's Lean can run code whenever it is elaborated, so the

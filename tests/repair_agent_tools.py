@@ -154,7 +154,9 @@ class Shims(Fixture):
         repair.link_shared_packages(self.worktree, parent)
         self.assertFalse((self.worktree / ".tauceti-repair").exists(), "the record is outside the checkout")
         argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
-        self.assertIn(["--ro-bind", str(parent), str(parent)], [argv[i : i + 3] for i in range(len(argv))])
+        # The parent's `.lake` is bound, which no sandbox can replace, not its rewritable `packages`.
+        lake = parent.parent
+        self.assertIn(["--ro-bind", str(lake), str(lake)], [argv[i : i + 3] for i in range(len(argv))])
         # The parent's build replaces the recorded directory by a link elsewhere: nothing is bound.
         parent.rename(parent.with_name("moved"))
         parent.symlink_to(self.home)

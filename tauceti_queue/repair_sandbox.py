@@ -273,6 +273,30 @@ def linked_packages(worktree: Path) -> list[Path]:
     return [Path(line) for line in text.splitlines() if line.startswith("/")]
 
 
+def _packages_binds(packages: Path, worktree: Path, read_only: list[Path], env: dict) -> list[str]:
+    """The bind that makes a worktree's ``.lake/packages`` link resolve inside the sandbox, if any.
+
+    The link is build state the batch's code can rewrite, so it is never followed on the host to pick
+    a bind source. A link the worker recorded (:func:`linked_packages`) to another worktree's
+    ``.lake/packages`` must still name that path literally; that worktree's ``.lake`` is bound, a
+    directory no sandbox can rename or replace (its worktree is read-only inside every sandbox), so a
+    later swap of its ``packages`` entry for a link resolves inside the sandbox, never on the host. A
+    link into a configured read-only tree is bound at its resolved path, which no sandbox can change.
+    Any other link dangles."""
+    try:
+        literal = Path(os.readlink(packages))
+    except OSError:
+        return []
+    if literal.is_absolute() and literal in linked_packages(worktree) and literal.name == "packages":
+        lake = literal.parent
+        if lake.name == ".lake" and not lake.is_symlink() and lake.is_dir() and lake == lake.resolve():
+            return ["--ro-bind", str(lake), str(lake)]
+    shared = packages.resolve()
+    if any(shared.is_relative_to(tree) for tree in read_only) and shareable_packages(shared, env):
+        return ["--ro-bind", str(shared), str(shared)]
+    return []
+
+
 def _system_binds() -> list[str]:
     args: list[str] = []
     for root in SYSTEM_ROOTS:
@@ -408,12 +432,7 @@ def sandbox_argv(
     args += ["--ro-bind", str(worktree), str(worktree), "--bind", str(lake_dir), str(lake_dir)]
     packages = lake_dir / "packages"
     if packages.is_symlink():  # the shared extracted Mathlib (--seed-packages), read-only for every build
-        # The link is build state the batch's code can rewrite, so its target is bound only when the
-        # worker recorded it or it is in a configured read-only tree; otherwise the link dangles.
-        shared = packages.resolve()
-        trusted = shared in linked_packages(worktree) or any(shared.is_relative_to(t) for t in read_only)
-        if trusted and shareable_packages(shared, env):
-            args += ["--ro-bind", str(shared), str(shared)]
+        args += _packages_binds(packages, worktree, read_only, env)
     args += _credential_masks(_binds(args), env)
     args += ["--remount-ro", "/"]
     args += ["--setenv", "PATH", _inside_path(env, elan), "--setenv", "HOME", home]
