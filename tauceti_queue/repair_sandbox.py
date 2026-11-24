@@ -61,6 +61,9 @@ SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/n
 PASSED_ENV = ("LAKE_ARTIFACT_CACHE", "LAKE_RESTORE_ARTIFACTS", "LAKE_CACHE_DIR", "LAKE_CONFIG", "ELAN_HOME")
 # Passed through to a networked sandbox (``network=True``): TLS trust and proxies for the fetch.
 NETWORK_ENV = (
+    # leantar, which unpacks the fetched archives, needs the worker's Rust thread stack size
+    # (tauceti_queue/__init__.py).
+    "RUST_MIN_STACK",
     "SSL_CERT_FILE",
     "NIX_SSL_CERT_FILE",
     "CURL_CA_BUNDLE",
@@ -619,7 +622,14 @@ def sandboxed_fetch(argv: list[str], worktree: Path, env: dict | None = None) ->
             ensure_toolchain(Path(worktree), env)
         except (OSError, subprocess.TimeoutExpired) as error:
             LOGGER.warning("installing the toolchain for %s failed: %s", worktree, error)
-    return sandboxed_lake(argv, worktree, env, network=True)
+    wrapped = sandboxed_lake(argv, worktree, env, network=True)
+    # Mathlib's cache tool names its temporary files by process id, and every sandbox has its own pid
+    # namespace, so two fetches sharing MATHLIB_CACHE_DIR could collide: they take its lock in turn.
+    flock = shutil.which("flock", path=env.get("PATH"))
+    if env.get(MATHLIB_CACHE_VARIABLE) and argv[1:3] == ["exe", "cache"] and flock and not disabled(env):
+        lock = Path(env[MATHLIB_CACHE_VARIABLE]).parent / (Path(env[MATHLIB_CACHE_VARIABLE]).name + ".lock")
+        wrapped = [flock, str(lock), *wrapped]
+    return wrapped
 
 
 # Inside the sandbox: exit 1 naming the first argument that is a non-empty file or directory.

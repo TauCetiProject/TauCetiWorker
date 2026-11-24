@@ -58,7 +58,20 @@ class Fixture(unittest.TestCase):
         # The host's tools the commands need, and nothing else: no real bwrap, elan or Lean.
         system = self.tmp / "system"
         system.mkdir()
-        for name in ("bash", "sh", "env", "readlink", "basename", "grep", "nice", "ls", "mkdir", "cat", "echo"):
+        for name in (
+            "bash",
+            "sh",
+            "env",
+            "readlink",
+            "basename",
+            "grep",
+            "nice",
+            "ls",
+            "mkdir",
+            "cat",
+            "echo",
+            "flock",
+        ):
             if where := shutil.which(name):
                 (system / name).symlink_to(where)
         self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:{system}", "LANG": "C.UTF-8"}
@@ -440,17 +453,25 @@ class Credentials(Fixture):
 class Fetches(Fixture):
     def test_a_fetch_runs_in_the_sandbox_online(self):
         mathlib = self.tmp / "mathlib-cache"
-        env = {**self.env, "MATHLIB_CACHE_DIR": str(mathlib), "SSL_CERT_FILE": "/etc/ssl/certs/ca.crt"}
+        env = {
+            **self.env,
+            "MATHLIB_CACHE_DIR": str(mathlib),
+            "SSL_CERT_FILE": "/etc/ssl/certs/ca.crt",
+            "RUST_MIN_STACK": "268435456",
+        }
         with patch.dict(os.environ, {"PATH": env["PATH"]}):
             argv = repair_sandbox.sandboxed_fetch(["lake", "exe", "cache", "get"], self.worktree, env)
             offline = repair_sandbox.sandboxed_lake(["lake", "build"], self.worktree, env)
         self.assertEqual(argv[argv.index("--") :], ["--", "lake", "exe", "cache", "get"])
+        if shutil.which("flock", path=env["PATH"]):
+            self.assertEqual(argv[1], str(self.tmp / "mathlib-cache.lock"), "Mathlib fetches take turns")
         self.assertNotIn("--unshare-net", argv)
         self.assertIn("--unshare-user", argv)
         setenv = dict((argv[i + 1], argv[i + 2]) for i, a in enumerate(argv) if a == "--setenv")
         self.assertNotIn("LAKE_NO_CACHE", setenv)
         self.assertEqual(setenv["MATHLIB_CACHE_DIR"], str(mathlib))
         self.assertEqual(setenv["SSL_CERT_FILE"], "/etc/ssl/certs/ca.crt")
+        self.assertEqual(setenv["RUST_MIN_STACK"], "268435456")
         self.assertIn(["--bind", str(mathlib), str(mathlib)], [argv[i : i + 3] for i in range(len(argv))])
         self.assertTrue(mathlib.is_dir())
         self.assertIn(
