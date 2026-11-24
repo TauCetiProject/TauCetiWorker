@@ -76,7 +76,9 @@ from .constants import (
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
     MAX_FIX_ATTEMPTS,
+    MAX_FIX_ROUNDS_WITHOUT_APPROVAL,
     MAX_INFRA_REFUNDS,
+    NEEDS_HUMAN_LABEL,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -189,6 +191,33 @@ def _claim_scope(w) -> str:
     repository = getattr(gh, "repository", None)
     key = getattr(repository, "key", None)
     return key if isinstance(key, str) else str(getattr(gh, "repo", ""))
+
+
+def _fix_loop_escalated(w, c: Candidate) -> bool:
+    """Count the heads of this PR that review sent back for a fix on this host, and stop at the cap.
+
+    Called once the PR's live review state confirms a fix at `c.head`. Each distinct head here is one
+    review that asked for changes after a push, so MAX_FIX_ROUNDS_WITHOUT_APPROVAL other heads mean
+    that many fix and review cycles without an approval. The PR is then labelled for a person (the
+    label pauses fix and review fleet-wide) and this host's count starts again, so removing the label
+    resumes fixing with a fresh budget."""
+    scope = _claim_scope(w)
+    fixed = peer_claims.fixed_heads(scope, c.pr) - {c.head}
+    if len(fixed) < MAX_FIX_ROUNDS_WITHOUT_APPROVAL:
+        peer_claims.note_fixed_head(scope, c.pr, c.head)
+        return False
+    try:
+        labelled = w.gh.add_label(c.pr, NEEDS_HUMAN_LABEL) is not False
+    except Exception as error:  # the cap holds on this host whether or not the label lands
+        log(f"  fix #{c.pr}: could not add the {NEEDS_HUMAN_LABEL!r} label ({type(error).__name__})")
+        labelled = False
+    if labelled:
+        peer_claims.clear_fixed_heads(scope, c.pr)
+    log(
+        f"  fix #{c.pr}: review sent back {len(fixed)} earlier heads on this host without an approval; "
+        f"{'labelled' if labelled else 'could not label'} it {NEEDS_HUMAN_LABEL!r} for a person instead of fixing"
+    )
+    return True
 
 
 def _github_clone_url(owner: str, repo: str) -> str:
@@ -1781,6 +1810,16 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # configured account), so it stays ahead of a network read that only matters if we get this far.
     actionable = _still_actionable(stage, w, sv, c, explicit=explicit)
     if actionable is False:
+        return None
+    # Count only a fix confirmed against the live scoreboard: a partial-history candidate is let
+    # through to investigate without one, so it says nothing about whether review sent this head back.
+    if (
+        stage == "fix"
+        and actionable is True
+        and not c.partial_history
+        and c.pr not in bump_prs(sv)
+        and _fix_loop_escalated(w, c)
+    ):
         return None
     from .claude_api import admission_failure
     from .fleet_capacity import admission_reason

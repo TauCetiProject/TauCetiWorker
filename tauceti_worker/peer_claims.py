@@ -10,6 +10,10 @@ The store lives under the explicitly configured shared read directory
 ($TAUCETI_GITHUB_SHARED_DIR, which the fleet's worker manager sets); without it no hint is
 recorded or read.
 
+The store also keeps, per PR, the heads that review sent back for a fix on this host, so the host can
+see a PR that fix and review keep handing back and forth (constants.MAX_FIX_ROUNDS_WITHOUT_APPROVAL).
+One empty file per head makes concurrent records race-free.
+
 A head that the review engine declined because its diff fails the PR-level guards (too large to
 review, oversized new files) is recorded here too, for GUARD_TTL_S. The engine's verdict depends
 on the head, its merge base and whether the head's build is green. Peers skip that head until a
@@ -96,6 +100,59 @@ def _prune(root: Path, now: float) -> None:
                 path.unlink()
         except OSError:
             pass
+
+
+# Long enough to outlive any PR the fleet still works on; only bounds stale records.
+FIXED_HEAD_TTL_S = 60 * 86400
+
+
+def _fixed_dir(scope: str, pr: int) -> Path | None:
+    shared = os.environ.get("TAUCETI_GITHUB_SHARED_DIR")
+    if not shared or not pr:
+        return None
+    return Path(shared) / "fixed-heads" / _key(scope, f"fixed/{pr}")
+
+
+def note_fixed_head(scope: str, pr: int, head: str) -> None:
+    """Record that review sent `head` of PR `pr` back for a fix on this host."""
+    directory = _fixed_dir(scope, pr)
+    if directory is None or not head or "/" in head:
+        return
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        (directory / head).touch()
+    except OSError:
+        pass  # an unrecorded head only delays the escalation by one round
+
+
+def fixed_heads(scope: str, pr: int, *, now: float | None = None) -> set[str]:
+    """The heads of PR `pr` sent back for a fix on this host in the last FIXED_HEAD_TTL_S."""
+    directory = _fixed_dir(scope, pr)
+    if directory is None:
+        return set()
+    stamp = time.time() if now is None else now
+    heads = set()
+    try:
+        for path in directory.iterdir():
+            try:
+                if stamp - path.stat().st_mtime <= FIXED_HEAD_TTL_S:
+                    heads.add(path.name)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return heads
+
+
+def clear_fixed_heads(scope: str, pr: int) -> None:
+    directory = _fixed_dir(scope, pr)
+    if directory is None:
+        return
+    try:
+        for path in directory.iterdir():
+            path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _guard_path(scope: str, pr: int, head: str) -> Path | None:

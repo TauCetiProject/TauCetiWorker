@@ -276,6 +276,68 @@ class GlobalMaintenance(unittest.TestCase):
             run_round(self.w, self.opts, prepared_survey=prepared)
         dispatch.assert_called_once()
 
+    def test_fixed_heads_are_recorded_per_pr_and_scope_and_expire(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), set())
+            peer_claims.note_fixed_head("forgejo:one/project", 7, HEAD)
+            peer_claims.note_fixed_head("forgejo:one/project", 7, HEAD)
+            peer_claims.note_fixed_head("forgejo:one/project", 7, "b" * 40)
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), {HEAD, "b" * 40})
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 8), set())
+            self.assertEqual(peer_claims.fixed_heads("github:one/project", 7), set())
+            later = os.path.getmtime(peer_claims._fixed_dir("forgejo:one/project", 7) / HEAD)
+            self.assertEqual(
+                peer_claims.fixed_heads("forgejo:one/project", 7, now=later + peer_claims.FIXED_HEAD_TTL_S + 1), set()
+            )
+        self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), set(), "no shared directory")
+
+    def test_fix_rounds_stop_and_label_after_the_cap_of_sent_back_heads(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL, NEEDS_HUMAN_LABEL
+        from tauceti_worker.survey import Candidate
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        labels = []
+        self.w.gh.add_label = lambda pr, name: labels.append((pr, name)) or True
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            heads = [f"{n:040x}" for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL + 1)]
+            for head in heads[:-1]:
+                self.assertFalse(work._fix_loop_escalated(self.w, Candidate(10, head)))
+                self.assertFalse(work._fix_loop_escalated(self.w, Candidate(10, head)), "a retry at one head")
+            self.assertEqual(len(peer_claims.fixed_heads(scope, 10)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+            self.assertFalse(work._fix_loop_escalated(self.w, Candidate(11, heads[-1])), "per PR")
+            self.assertEqual(labels, [])
+            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(10, heads[-1])))
+            self.assertEqual(labels, [(10, NEEDS_HUMAN_LABEL)])
+            self.assertEqual(peer_claims.fixed_heads(scope, 10), set(), "a person removing the label resumes fixes")
+
+            # A label that cannot be added keeps the cap on this host and the count, so the next try labels.
+            for head in heads[:-1]:
+                work._fix_loop_escalated(self.w, Candidate(12, head))
+            self.w.gh.add_label = Mock(side_effect=OSError("down"))
+            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(12, heads[-1])))
+            self.assertEqual(len(peer_claims.fixed_heads(scope, 12)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+            self.w.gh.add_label = Mock(return_value=False)
+            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(12, heads[-1])))
+            self.assertEqual(len(peer_claims.fixed_heads(scope, 12)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+
+    def test_the_fix_cap_is_counted_only_after_the_live_recheck_confirms_the_fix(self):
+        import inspect
+
+        source = inspect.getsource(work.dispatch)
+        recheck = source.index("actionable = _still_actionable(stage, w, sv, c, explicit=explicit)")
+        cap = source.index("_fix_loop_escalated(w, c)")
+        self.assertLess(recheck, cap)
+        guard = source[source.rindex('stage == "fix"', 0, cap) : cap]
+        for condition in ("actionable is True", "not c.partial_history", "c.pr not in bump_prs(sv)"):
+            self.assertIn(condition, guard)
+
     def test_peer_claim_hints_expire_and_are_scoped(self):
         from tauceti_worker import peer_claims
 
