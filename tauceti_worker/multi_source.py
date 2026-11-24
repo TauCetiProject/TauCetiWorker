@@ -258,6 +258,15 @@ def run_round(w, opts, *, use_fleet_focus=True):
             }
         publishable, unpublishable = result, None
         if waiting:
+            # The review throttles judge the whole queue, so apply them before splitting it, as
+            # ordinary_round would have once, and recompute what is left to wait.
+            if not getattr(result, "_review_throttle_applied", False):
+                from .work_units import throttle_review
+
+                throttle_review(result, opts)
+                result._review_throttle_applied = True
+            waiting = {c.pr for c in result.reviewable.actionable} & waiting
+        if waiting:
             publishable, unpublishable = (
                 _with_reviews(result, [c for c in result.reviewable.actionable if c.pr not in keep])
                 for keep in (waiting, {c.pr for c in result.reviewable.actionable} - waiting)
