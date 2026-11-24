@@ -445,6 +445,23 @@ before and the head is not known-good; the batch stays sealed at its snapshot. A
 such preparation keeps taking members until the usual `sealed_successor_min_members` threshold. The
 cost: a batch can be frozen smaller than that threshold (from `prepare_min_members`, 20).
 
+The head's parallel check (decision 174, step 4; decision 172's A): when the head's attempt is
+dispatched and pending on a tip that is not known-good and that CI never failed,
+`_schedule_parallel_check` creates one speculative `repair` task per head version, whose only
+diagnostic is `{kind: parallel_check, proactive: true, attempt_id}` (journal
+`parallel-check-started`, counter `parallel_checks`; setting `parallel_check_enabled`, default false, turned on in production as a runtime setting).
+It runs alongside the staging run like a predicted repair (`_prediction_task`): it does not hold the
+next batch's pre-rebase back, a staging pass supersedes it (`prediction-ci-passed`) and promotes the
+head, and a source failure turns it into the head's ordinary repair task with CI's diagnostics (an
+unchanged submission is then refused). The worker builds warm and, when the streamed build is clean,
+verifies the chain unchanged without an agent; a clean unchanged submission with a passing
+`local_verification` records the tip as `verified_tip` (`parallel-check-clean`, journal
+`parallel-check-finished`), so the next batch is prepared on it. When the build or the checks fail,
+the worker repairs as for any repair task, and the repaired tip becomes the head's next version,
+whose dispatch cancels the running staging run (`_cancel_superseded_runs`) and stages the repaired
+tip. A released check is superseded (`parallel-check-released`) rather than offered again: staging
+remains the authority.
+
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
 `base_sha`, `batch_id`, `members`, `base_ref`, `repair_outputs_revs`). Observation reads `find_candidate_run` when an event
@@ -783,6 +800,7 @@ and reported in status:
 | `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
 | `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
 | `prepare_pre_rebased` | true | create a `prepare` task for the oldest open batch's usable pre-rebase on the head's tip (with `prepare_open_batches`, for the batches it applies to) |
+| `parallel_check_enabled` | false | verify a head dispatched on a tip no worker verified on a repair worker alongside its staging run, and repair what fails (`_schedule_parallel_check`) |
 | `base_cache_endpoint` | `https://cache.taucetiproject.org/revisions` | public Lake revision endpoint a head's base must be published at before staging is dispatched (CI section above); empty disables the requirement |
 | `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
 | `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |
