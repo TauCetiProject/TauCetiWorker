@@ -32,10 +32,12 @@ followed by one marker line per error:
 | `anchor` | yes | For `Suggested.lean` the declaration's name, for `README.md` a verbatim quote of the statement or its distinctive part, at most 300 characters. It must occur in that file at `roadmap_sha`, compared with runs of whitespace as one space. |
 | `kind` | yes | `false-statement`, `missing-hypothesis`, `unprovable-pin`, `wrong-definition`, `circular-dependency` or `stale-name`. |
 | `effect` | yes | `worked-around` (the PR proves a corrected statement in its place) or `blocked` (it lands only a partial piece, and the error still blocks the target). |
-| `refutes`, `replaces` | no | At most 10 fully qualified declaration names each: the counterexample theorems, and the corrected statements. |
+| `refutes`, `replaces` | no | At most 10 fully qualified declaration names each: the counterexample theorems, and the corrected statements. A name is at most 200 characters of non-empty parts joined by single dots, no part holding whitespace, a backtick, `<`, `>` or `@`. |
 
 A reader finds the literal prefix `<!--tauceti-roadmap-report:v1 `, takes the text up to
-the next `-->`, and decodes it as one JSON object; unknown fields are ignored. A body
+the next `-->`, and decodes it as one JSON object; unknown fields are ignored. Nothing is
+trimmed or case-folded before it is checked, and JSON that fails to decode for any reason,
+nesting too deep included, is an invalid marker, never an error. A body
 carries at most five markers: a sixth and later marker, or one that fails to parse or
 validate, is invalid and the others still count. Two reports are the same report when
 they agree on roadmap, file and anchor, the anchor compared case-folded with whitespace

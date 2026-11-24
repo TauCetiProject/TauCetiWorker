@@ -96,6 +96,53 @@ class Reader(unittest.TestCase):
         self.assertEqual(reports, [])
         self.assertIn("not one JSON object", errors[0])
 
+    # The disagreement cases the review runner's suite (TauCetiReview tests/test_roadmap_reports.py)
+    # and the board's reader settled: all three readers refuse these, so whatever this checker calls
+    # valid, the board harvests and the review runner accepts.
+    AGREED_INVALID = [
+        ({"roadmap": "Quadratic-Forms"}, "`roadmap`"),
+        ({"roadmap": "1Forms"}, "`roadmap`"),
+        ({"roadmap": " QuadraticFormInvariants "}, "`roadmap`"),
+        ({"roadmap": "QuadraticFormInvariants/"}, "`roadmap`"),
+        ({"roadmap_sha": "A" * 40}, "`roadmap_sha`"),
+        ({"roadmap_sha": " " + SHA}, "`roadmap_sha`"),
+        ({"roadmap_sha": "abc123"}, "`roadmap_sha`"),
+        ({"anchor": "x " + " " * 150 + "y" * 150}, "longer than 300"),
+        ({"refutes": "TauCeti.x"}, "`refutes`"),
+        ({"refutes": [3]}, "`refutes`"),
+        ({"refutes": ["`TauCeti.x`"]}, "`refutes`"),
+        ({"refutes": ["TauCeti..x"]}, "`refutes`"),
+        ({"refutes": ["TauCeti.x."]}, "`refutes`"),
+        ({"refutes": ["TauCeti.<x>"]}, "`refutes`"),
+        ({"refutes": ["TauCeti.<counterexample>"]}, "`refutes`"),  # the prompt's placeholder, left in
+        ({"replaces": ["@TauCeti.x"]}, "`replaces`"),
+        ({"replaces": ["TauCeti.x y"]}, "`replaces`"),
+        ({"replaces": [f"TauCeti.x{i}" for i in range(11)]}, "`replaces`"),
+        ({"replaces": ["TauCeti." + "x" * 200]}, "`replaces`"),
+    ]
+
+    def test_the_readers_agree_on_these(self):
+        for fields, expected in self.AGREED_INVALID:
+            with self.subTest(fields=fields):
+                reports, errors = rr.read(body(marker(**fields), marker(anchor="another")))
+                self.assertEqual([r.anchor for r in reports], ["another"])
+                self.assertTrue(errors and all(e.startswith("report marker 1: ") for e in errors), errors)
+                self.assertTrue(any(expected in e for e in errors), errors)
+        for name in ("TauCeti.x", "x", "Set.image_preimage_eq", "TauCeti.α₁'", "TauCeti." + "x" * 192):
+            with self.subTest(name=name):
+                self.assertEqual(rr.read(body(marker(refutes=[name])))[1], [])
+        lean = 'theorem foo {R : Type*} [CommRing R] (x : R) : f {x} = "}"'
+        reports, errors = rr.read(body(marker(file="Suggested.lean", anchor=lean)))
+        self.assertEqual((len(reports), errors), (1, []))
+        self.assertEqual(rr.read("<!--tauceti-roadmap-report:v2 {}-->"), ([], []))
+
+    def test_deep_nesting_is_an_invalid_marker_not_a_crash(self):
+        deep = body(rr.PREFIX + "[" * 100000 + "]" * 100000 + "-->", marker())
+        reports, errors = rr.read(deep)
+        self.assertEqual(len(reports), 1)
+        self.assertIn("not one JSON object", errors[0])
+        self.assertIn("report marker 1: not one JSON object", rr.check(deep)[0])
+
 
 class Checks(unittest.TestCase):
     def setUp(self):
@@ -123,6 +170,10 @@ class Checks(unittest.TestCase):
         bad = subprocess.run([script], input=body(marker(kind="typo")), capture_output=True, text=True)
         self.assertEqual(bad.returncode, 1)
         self.assertIn("`kind`", bad.stderr)
+        deep = subprocess.run([script], input=body(rr.PREFIX + "[" * 100000 + "-->"), capture_output=True, text=True)
+        self.assertEqual(deep.returncode, 1)
+        self.assertNotIn("Traceback", deep.stderr)
+        self.assertIn("not one JSON object", deep.stderr)
 
     def test_the_pr_wrapper_warns_and_still_opens_the_pr(self):
         bin_dir = self.roadmaps / "bin"
@@ -139,6 +190,11 @@ class Checks(unittest.TestCase):
         good = subprocess.run([script, "--body", body(marker())], env=env, capture_output=True, text=True)
         self.assertEqual(good.returncode, 0)
         self.assertNotIn("malformed", good.stderr)
+        deep = body(rr.PREFIX + "[" * 100000 + "-->")
+        nested = subprocess.run([script, "--body", deep], env=env, capture_output=True, text=True)
+        self.assertEqual(nested.returncode, 0)
+        self.assertIn("created pr create", nested.stdout)
+        self.assertNotIn("Traceback", nested.stderr)
 
 
 class Round(unittest.TestCase):

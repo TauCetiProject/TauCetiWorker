@@ -38,7 +38,14 @@ EFFECTS = ("blocked", "worked-around")
 
 _SEGMENT = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 _SHA = re.compile(r"[0-9a-f]{40}")
-_NAME = re.compile(r"[^\s`]{1,200}")
+# A declaration name: non-empty parts joined by single dots, none holding whitespace, `, <, > or @.
+_NAME = re.compile(r"[^.\s`<>@]+(?:\.[^.\s`<>@]+)*")
+MAX_NAME = 200
+
+
+def declaration_name(value) -> bool:
+    """Whether `value` is a declaration name as `refutes` and `replaces` hold them (at most 200 characters)."""
+    return isinstance(value, str) and len(value) <= MAX_NAME and _NAME.fullmatch(value) is not None
 
 
 def normalise(text: str) -> str:
@@ -83,7 +90,7 @@ def problems(value) -> list[str]:
         names = value.get(key, [])
         if not isinstance(names, list) or len(names) > MAX_NAMES:
             found.append(f"`{key}` must be a list of at most {MAX_NAMES} declaration names")
-        elif not all(isinstance(name, str) and _NAME.fullmatch(name) for name in names):
+        elif not all(declaration_name(name) for name in names):
             found.append(f"`{key}` must hold fully qualified declaration names")
     return found
 
@@ -108,7 +115,7 @@ def read(body: str) -> tuple[list[Report], list[str]]:
             continue
         try:
             value = json.loads(body[begin + len(PREFIX) : end])
-        except ValueError:
+        except (ValueError, RecursionError):  # deep nesting must be an invalid marker, never a crash
             errors.append(f"report marker {index}: not one JSON object")
             continue
         found = problems(value)

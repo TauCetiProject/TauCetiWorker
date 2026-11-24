@@ -91,8 +91,9 @@ characters. `kind` is one of `false-statement`, `missing-hypothesis`, `unprovabl
 proves a corrected statement in its place, `blocked` when it lands only a partial piece and the
 error still blocks the target; `refutes` and `replaces` optionally name (at
 most 10 each) the fully qualified declarations that refute the roadmap's statement and that state
-the corrected one. This is the only sanctioned way to report a roadmap error; report only what
-you have proved or can show.
+the corrected one. Replace every `<…>` placeholder in the template with real values: the
+checker rejects a name such as `TauCeti.<corrected>`. This is the only sanctioned way to report a
+roadmap error; report only what you have proved or can show.
 
 Transient provider/GitHub failures and lost claims use the existing retry handling. A withdrawn request, changed head or lost claim needs no repetitive comment: stop
 safely; the changed shared state already routes future work.
