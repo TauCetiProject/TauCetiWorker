@@ -387,7 +387,43 @@ class ChainCommit:
 
 def read_commit(repo: str | os.PathLike[str], sha: str) -> ChainCommit:
     """Parse a raw commit object (headers, including multi-line ones such as gpgsig, then message)."""
-    raw = git(repo, "cat-file", "commit", sha)
+    return _parse_commit(sha, git(repo, "cat-file", "commit", sha))
+
+
+def read_commits(repo: str | os.PathLike[str], shas: Sequence[str]) -> list[ChainCommit]:
+    """`read_commit` for each of `shas`, in order, from one `git cat-file --batch`: a 1,000-member
+    chain is one process instead of a thousand. ChainError when one is missing or not a commit."""
+    if not shas:
+        return []
+    full_env = dict(os.environ)
+    full_env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"})
+    result = subprocess.run(
+        ["git", "-C", os.fspath(repo), "cat-file", "--batch"],
+        input="".join(f"{sha}\n" for sha in shas).encode(),
+        capture_output=True,
+        env=full_env,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ChainError(
+            f"git cat-file --batch failed ({result.returncode}): {result.stderr.decode(errors='replace').strip()}"
+        )
+    out, offset, commits = result.stdout, 0, []
+    for sha in shas:
+        end = out.index(b"\n", offset)
+        header = out[offset:end].decode().split()
+        if len(header) != 3 or header[1] != "commit":
+            raise ChainError(f"not a commit in {os.fspath(repo)}: {sha} ({' '.join(header[1:])})")
+        start = end + 1
+        size = int(header[2])
+        raw = out[start : start + size].decode("utf-8", errors="surrogateescape")
+        # As `git`'s text mode reads it (universal newlines), so both readers see the same message.
+        commits.append(_parse_commit(sha, raw.replace("\r\n", "\n").replace("\r", "\n")))
+        offset = start + size + 1
+    return commits
+
+
+def _parse_commit(sha: str, raw: str) -> ChainCommit:
     headers: list[tuple[str, str]] = []
     lines = raw.split("\n")
     index = 0
@@ -417,7 +453,51 @@ def chain_commits(repo: str | os.PathLike[str], base: str, tip: str) -> list[Cha
     if not is_ancestor(repo, base, tip):
         raise ChainError(f"{base} is not an ancestor of {tip}")
     shas = git(repo, "rev-list", "--first-parent", "--reverse", f"{base}..{tip}").split()
-    return [read_commit(repo, sha) for sha in shas]
+    return read_commits(repo, shas)
+
+
+_COMMIT_PATHS: dict[str, frozenset[str]] = {}  # by commit SHA: a commit and its parent never change
+_COMMIT_PATHS_LIMIT = 200_000
+
+
+def commit_paths(repo: str | os.PathLike[str], shas: Sequence[str]) -> dict[str, frozenset[str]]:
+    """The paths each of `shas` (single-parent commits) changes from its parent, without rename
+    detection, read with one `git diff-tree --stdin` for those not seen before in this process. An
+    empty commit changes none."""
+    known = {sha: _COMMIT_PATHS[sha] for sha in dict.fromkeys(shas) if sha in _COMMIT_PATHS}
+    missing = [sha for sha in dict.fromkeys(shas) if sha not in known]
+    if missing:
+        records = git(
+            repo,
+            "diff-tree",
+            "--stdin",
+            "-r",
+            "-z",
+            "--no-renames",
+            "--raw",
+            input="".join(f"{sha}\n" for sha in missing),
+        ).split("\0")
+        found: dict[str, set[str]] = {sha: set() for sha in missing}
+        current: set[str] | None = None
+        index = 0
+        while index < len(records):
+            record = records[index]
+            if record.startswith(":"):  # a change record; the path is the next field
+                if current is None or index + 1 >= len(records):
+                    raise ChainError(f"unexpected git diff-tree output near {record!r}")
+                current.add(records[index + 1])
+                index += 2
+                continue
+            if record:  # the commit the following records belong to
+                current = found.get(record)
+                if current is None:
+                    raise ChainError(f"git diff-tree named an unexpected commit {record!r}")
+            index += 1
+        if len(_COMMIT_PATHS) + len(found) > _COMMIT_PATHS_LIMIT:
+            _COMMIT_PATHS.clear()
+        for sha, changed in found.items():
+            known[sha] = _COMMIT_PATHS[sha] = frozenset(changed)
+    return {sha: known[sha] for sha in shas}
 
 
 # --- writing commits ------------------------------------------------------------------------------

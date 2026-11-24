@@ -52,6 +52,12 @@ def canonical_mathematics_source():
     )
 
 
+def activity_repository():
+    """The activity report's key for the selected TauCeti repository; Forgejo keys name their forge."""
+    source = current()
+    return source.repository.key if source else TAUCETI
+
+
 def pull_url(number):
     source = current()
     return (source.repository if source else RepositoryRef(GITHUB, TAUCETI)).pull_url(number)
@@ -68,6 +74,17 @@ def resolve_selection(github, forgejo, new_pr_forge=None):
     if requested != "both" and destination != requested and new_pr_forge is not None:
         raise Die("the new PR forge must be among the selected forges")
     return requested, destination
+
+
+def resolve_preference(requested, prefer_forge=None):
+    """Validate a forge preference: which selected forge a both-forge worker offers first."""
+    if prefer_forge is None:
+        return None
+    if prefer_forge not in ("github", "forgejo"):
+        raise Die("preferred forge must be github or forgejo")
+    if requested not in ("both", prefer_forge):
+        raise Die("the preferred forge must be among the selected forges")
+    return prefer_forge
 
 
 def configure(args):
@@ -101,8 +118,17 @@ def configure(args):
         adopted_author_ids()
     except ValueError as error:
         raise Die(str(error)) from None
+    preference = resolve_preference(requested, getattr(args, "prefer_forge", None))
     os.environ["TAUCETI_WORKER_FORGES"] = requested
     os.environ["TAUCETI_NEW_PR_FORGE"] = destination
+    if preference is None:
+        os.environ.pop("TAUCETI_PREFER_FORGE", None)
+    else:
+        os.environ["TAUCETI_PREFER_FORGE"] = preference
+    if getattr(args, "review_first", False):
+        os.environ["TAUCETI_REVIEW_FIRST"] = "1"
+    else:
+        os.environ.pop("TAUCETI_REVIEW_FIRST", None)
 
 
 def selection_arguments():
@@ -115,6 +141,10 @@ def selection_arguments():
     destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
     if selected == "both" or selected == destination:
         arguments += ["--new-pr-forge", destination]
+    if preference := os.environ.get("TAUCETI_PREFER_FORGE"):
+        arguments += ["--prefer-forge", preference]
+    if os.environ.get("TAUCETI_REVIEW_FIRST") == "1":
+        arguments += ["--review-first"]
     return arguments
 
 
@@ -166,6 +196,8 @@ def native_source(cfg):
 
 
 def source_config(cfg, source):
+    from .review_state import shared_index_root
+
     suffix = hashlib.sha256(
         json.dumps({"repository": source.repository.key, "id": source.identity.native_id}, sort_keys=True).encode()
     ).hexdigest()[:24]
@@ -177,6 +209,7 @@ def source_config(cfg, source):
         store_dir=cfg.store_dir / "sources" / suffix,
         sbcache=state / "cache/scoreboard",
         logdir=cfg.logdir / "sources" / suffix,
+        review_index=shared_index_root(),
     )
 
 

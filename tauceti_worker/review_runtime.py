@@ -160,7 +160,8 @@ def recover(worker, *, numbers=()):
                     shutil.rmtree(work)
                     continue
                 if receipt.get("state") == "prepared" or not receipt and plan:
-                    eligible.append(work.name)
+                    # The receipt's actor, or before a receipt the context's publisher.
+                    eligible.append((work.name, record.get("pr"), receipt.get("actor") or context.get("publisher")))
         except (BlockingIOError, FileNotFoundError):
             continue
     if not eligible:
@@ -168,21 +169,39 @@ def recover(worker, *, numbers=()):
             raise NoProgress("retained review publication record is unreadable; preserving workspace")
         return False
     runtime = worker.review_runtime = resolve(worker.cfg)
-    command = runtime.command(
-        "--recover-only",
-        "--repo",
-        getattr(worker.gh, "review_repository", worker.gh.repo),
-        "--workdir",
-        root,
-        "--store",
-        worker.cfg.store_dir,
-        *[arg for name in eligible for arg in ("--recover-work", name)],
-        *([str(numbers[0])] if len(numbers) == 1 else []),
-    )
-    result = subprocess.run(command)
+    from . import review_app
+
+    repository = getattr(worker.gh, "review_repository", worker.gh.repo)
+    # A retained review is published only by the identity that rendered it: the account, or the
+    # review App for the PRs the App posts. Recover each identity's work in its own invocation.
+    # Retained work names its publisher; work without one follows the PR's current assignment.
+    app_login = review_app.app_login()
+    groups = {}
+    for name, pr, actor in eligible:
+        if isinstance(actor, str) and actor:
+            app = app_login is not None and actor == app_login
+        else:
+            app = isinstance(pr, int) and review_app.routes(repository, pr)
+        groups.setdefault(app, []).append(name)
+    results = []
+    for app, names in sorted(groups.items()):
+        command = runtime.command(
+            "--recover-only",
+            "--repo",
+            repository,
+            "--workdir",
+            root,
+            "--store",
+            worker.cfg.store_dir,
+            *[arg for name in names for arg in ("--recover-work", name)],
+            *([str(numbers[0])] if len(numbers) == 1 else []),
+        )
+        env = {**os.environ, **review_app.engine_overrides()} if app else None
+        results.append(subprocess.run(command, **({"env": env} if env is not None else {})).returncode)
+    result = subprocess.CompletedProcess([], next((code for code in results if code), 0))
     if result.returncode == 0:
         return True
-    if result.returncode == 86:
+    if 86 in results:
         from .config import log
 
         log("review recovery: paid output awaits its original publisher or record repair; affected heads withheld")

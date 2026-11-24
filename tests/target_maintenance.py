@@ -81,6 +81,86 @@ class Ordering(unittest.TestCase):
             ],
         )
 
+    def test_landing_tiers_put_rereviews_before_fixes_before_first_reviews(self):
+        sv = survey()
+        sv.kind("review").actionable.append(Candidate(60, HEAD, rereview=True))
+        pairs = order(cascade(sv, AUTO_STAGES))
+        stages = [stage for stage, _ in pairs]
+        self.assertEqual(pairs[:4], [("rebase", 9), ("rebase", 1), ("rebase", 2), ("review", 60)])
+        self.assertLess(stages.index("fix"), stages.index("review", 4), "fixes come before first reviews")
+        self.assertEqual(order(cascade(sv, AUTO_STAGES, tier=1))[-1], ("review", 60))
+        self.assertNotIn("review", [stage for stage, _ in cascade(sv, AUTO_STAGES, tier=2)])
+
+    def test_own_first_reviews_share_the_rereview_tier_in_review_order(self):
+        sv = survey()
+        sv.kind("review").actionable = [
+            Candidate(61, HEAD, own_first_review=True),
+            Candidate(60, HEAD, rereview=True),
+            Candidate(50, HEAD),
+            Candidate(62, HEAD, own_first_review=True),
+            Candidate(63, HEAD, rereview=True),
+        ]
+        pairs = order(cascade(sv, AUTO_STAGES))
+        # After the rebases, re-reviews and our own first reviews keep the review stage's (spread)
+        # order, so neither kind starves the other; then fixes; then other first reviews.
+        self.assertEqual(
+            pairs[:8],
+            [
+                ("rebase", 9),
+                ("rebase", 1),
+                ("rebase", 2),
+                ("review", 61),
+                ("review", 60),
+                ("review", 62),
+                ("review", 63),
+                ("lint-repair", 7),
+            ],
+        )
+        self.assertEqual(pairs[-1], ("review", 50))
+        self.assertEqual(
+            order(cascade(sv, AUTO_STAGES, tier=1)),
+            [("rebase", 1), ("rebase", 2), ("review", 61), ("review", 60), ("review", 62), ("review", 63)],
+        )
+        self.assertEqual(
+            order(cascade(sv, AUTO_STAGES, review_first=True))[1:5],
+            [("review", 61), ("review", 60), ("review", 62), ("review", 63)],
+        )
+
+    def test_review_first_offers_rereviews_then_first_reviews_after_bumps(self):
+        sv = survey()
+        sv.kind("review").actionable.append(Candidate(60, HEAD, rereview=True))
+        sv.kind("review").actionable.append(Candidate(9, HEAD))
+        pairs = order(cascade(sv, AUTO_STAGES, review_first=True))
+        self.assertEqual(
+            pairs[:8],
+            [
+                ("rebase", 9),
+                ("review", 9),
+                ("review", 60),
+                ("review", 50),
+                ("review", 1),
+                ("review", 2),
+                ("review", 5),
+                ("review", 6),
+            ],
+        )
+        # The rest keeps the landing order: rebases, then fixes.
+        self.assertEqual(pairs[8:], [pair for pair in order(cascade(sv, AUTO_STAGES)) if pair[0] != "review"][1:])
+        # A one-tier round still keeps only its tier, re-reviews first.
+        self.assertEqual(
+            order(cascade(sv, AUTO_STAGES, tier=1, review_first=True)), [("review", 60), ("rebase", 1), ("rebase", 2)]
+        )
+
+    def test_age_spread_favours_old_prs_without_fixing_their_order(self):
+        import random
+
+        from tauceti_worker.survey import age_spread
+
+        candidates = [Candidate(n, HEAD) for n in range(1, 11)]
+        firsts = [age_spread(candidates, random.Random(seed))[0].pr for seed in range(2000)]
+        self.assertGreater(firsts.count(1), 2 * firsts.count(10), "older PRs come first more often")
+        self.assertGreater(len(set(firsts)), 5, "peers still spread over the queue")
+
     def test_automatic_bumps_keep_global_stage_order_even_when_owned(self):
         sv = survey()
         sv.open_prs += [pr(10, bump=True)]
@@ -279,6 +359,7 @@ class Dispatch(unittest.TestCase):
             patch.object(work, "roadmap_only", return_value="any"),
             patch.object(work, "github_state_enabled", return_value=False),
             patch.object(work, "spread_candidates", side_effect=list),
+            patch.object(work, "age_spread", side_effect=list),
             patch.object(work, "prioritize_review_candidates", side_effect=lambda queue, *a, **k: (list(queue), [])),
             patch.object(work, "log"),
         ):

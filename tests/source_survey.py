@@ -321,8 +321,8 @@ class SourceSurveys(unittest.TestCase):
         self.assertEqual(other.last_failure.status, 403)
 
 
-class BudgetedSurveys(unittest.TestCase):
-    """An automatic survey lists once and reads review history for at most K PRs."""
+class SharedIndexSurveys(unittest.TestCase):
+    """An automatic survey lists once and classifies every PR from the host's review-state index."""
 
     OPEN = 40  # PR numbers 1..40; odd ones are this worker's own
 
@@ -348,6 +348,28 @@ class BudgetedSurveys(unittest.TestCase):
         self.reviewed = {}  # PR -> head its scoreboard reviewed; verdicts in self.states
         self.states = {}
         self.api.pulls.side_effect = lambda *args, **kwargs: [self.row(n) for n in sorted(self.heads, reverse=True)]
+        self.pages = []  # paths of single listing pages and issue index reads
+
+        def request(method, path, *args, **kwargs):
+            from urllib.parse import parse_qsl, urlsplit
+
+            if not path.startswith(f"repos/{self.repo.name}/pulls?"):
+                return {"id": 3, "login": "worker"}
+            self.pages.append(path)
+            query = dict(parse_qsl(urlsplit(path).query))
+            rows = self.api.pulls.side_effect()
+            if query.get("sort") == "recentupdate":
+                rows.sort(key=lambda row: row["updated_at"], reverse=True)
+            page = int(query["page"])
+            return rows[(page - 1) * 50 : page * 50]
+
+        def pages(path):
+            self.pages.append(path)
+            if "state=open" in path:
+                yield [{"number": n, "pull_request": {"merged": False}} for n in self.heads]
+
+        self.api.request.side_effect = request
+        self.api.pages.side_effect = pages
         self.detail = []  # (endpoint, PR) for every per-PR read
 
         def comments(repository, number):
@@ -418,18 +440,38 @@ class BudgetedSurveys(unittest.TestCase):
             "updated_at": self.updated[number],
         }
 
-    def survey(self, *, numbers=(), seed=0):
+    def peer(self, wid):
+        """Another worker on the same host: its own state, the same source and credential."""
+        from tauceti_worker.config import Config
+        from tauceti_worker.worker_sources import source_config
+
+        root = Path(self.temporary.name) / wid
+        base = Config(
+            wid,
+            root,
+            root,
+            root / "state",
+            root / "checkout",
+            root / "store",
+            root / "scoreboard",
+            root / "logs",
+            root / "quota",
+        )
+        return source_config(base, self.source)
+
+    def survey(self, *, numbers=(), seed=0, cfg=None):
         from tauceti_worker.review_state import ReviewState
         from tauceti_worker.source_survey import worker_survey
         from tauceti_worker.survey import Counters
 
+        cfg = self.cfg if cfg is None else cfg
         self.detail.clear()
         with patch("tauceti_worker.source_survey.random", random.Random(seed)):
             return worker_survey(
-                self.cfg,
+                cfg,
                 self.source,
-                ReviewState(self.cfg, self.source),
-                Counters(self.cfg),
+                ReviewState(cfg, self.source),
+                Counters(cfg),
                 roadmap="any",
                 skip=[],
                 deep=True,
@@ -441,44 +483,55 @@ class BudgetedSurveys(unittest.TestCase):
     def read_prs(self):
         return {number for _, number in self.detail}
 
-    def test_survey_makes_one_listing_and_at_most_k_detail_reads(self):
-        from tauceti_worker.constants import SURVEY_DETAIL_READS
-
+    def test_one_survey_reads_every_unobserved_pr_and_peers_reuse_it(self):
         self.reviewed = {n: "a" * 40 for n in self.heads}  # nothing to do anywhere
-        covered = set()
-        for seed in range(3):
-            listings = self.api.pulls.call_count
-            result = self.survey(seed=seed)
-            self.assertLessEqual(self.api.pulls.call_count - listings, 1)
-            self.assertFalse(result.github_failed)
-            self.assertEqual(len(result.open_prs), self.OPEN)
-            self.assertEqual(len(self.read_prs()), SURVEY_DETAIL_READS)
-            self.assertEqual(result.detail_reads, SURVEY_DETAIL_READS)
-            # A PR already read at its (updatedAt, head) is answered from the shared cache.
-            self.assertFalse(self.read_prs() & covered)
-            covered |= self.read_prs()
-            self.assertFalse(result.reviewable.actionable or result.needs_fix.actionable)
+        result = self.survey(seed=0)
+        self.assertFalse(result.github_failed)
+        self.assertEqual(len(result.open_prs), self.OPEN)
+        self.assertEqual({n for endpoint, n in self.detail if endpoint == "comments"}, set(self.heads))
+        self.assertEqual(result.detail_deferred, 0)
+        self.assertFalse(result.reviewable.actionable or result.needs_fix.actionable)
+        # Another worker on the host classifies from the shared index, without a single read.
+        result = self.survey(seed=1, cfg=self.peer("peer"))
+        self.assertEqual(self.detail, [])
+        self.assertEqual(result.detail_reads, 0)
         self.assertEqual(self.api.pulls.call_count, 1, "one shared listing serves surveys within its TTL")
 
-    def test_survey_stops_at_the_first_eligible_read_and_keeps_cached_work(self):
-        result = self.survey(seed=1)  # no PR has a scoreboard: the first PR read needs review
-        self.assertEqual(len(self.read_prs()), 1)
-        first = {c.pr for c in result.reviewable.actionable}
-        self.assertEqual(first, self.read_prs())
-        # The next survey classifies that PR from the cache, so it is still offered without a read.
-        result = self.survey(seed=2)
-        self.assertEqual(len(self.read_prs()), 1)
-        self.assertTrue(first <= {c.pr for c in result.reviewable.actionable})
-        self.assertFalse(self.read_prs() & first)
+    def test_every_survey_sees_all_review_and_fix_work(self):
+        # No PR has a scoreboard: every one needs review, and every worker is offered all of them.
+        result = self.survey(seed=1)
+        self.assertEqual({c.pr for c in result.reviewable.actionable}, set(self.heads))
+        # Blocking findings at head on every owned PR: every worker sees every fix.
+        self.reviewed = {n: "a" * 40 for n in self.heads}
+        self.states = {n: {"style": "blocking_request"} for n in self.heads}
+        self.updated = {n: "2026-11-08T00:00:00Z" for n in self.heads}
+        from tauceti_worker.github_transport import invalidate_shared
+        from tauceti_worker.source_identity import discovery_scope
+
+        invalidate_shared(discovery_scope(self.source))
+        self.survey(seed=2)
+        result = self.survey(seed=3, cfg=self.peer("peer"))
+        self.assertEqual(self.detail, [], "the first survey refreshed the index for the host")
+        self.assertEqual({c.pr for c in result.needs_fix.actionable}, {n for n in self.heads if n % 2})
+
+    def test_only_this_accounts_never_reviewed_prs_get_an_own_first_review(self):
+        from tauceti_worker.survey import LANDING_TIERS, landing_tier
+
+        # 1 and 2 were reviewed at an earlier head; the rest never were. Odd PRs are this account's.
+        self.reviewed = {1: "b" * 40, 2: "b" * 40}
+        result = self.survey(seed=0)
+        reviews = {c.pr: c for c in result.reviewable.actionable}
+        self.assertEqual(set(reviews), set(self.heads))
+        self.assertEqual({n for n, c in reviews.items() if c.own_first_review}, {n for n in self.heads if n % 2} - {1})
+        self.assertEqual({n for n, c in reviews.items() if c.rereview}, {1, 2})
+        tiers = {n: landing_tier("review", c) for n, c in reviews.items()}
+        self.assertEqual(tiers[3], tiers[1], "a first review of our own PR ranks with the re-reviews")
+        self.assertEqual(tiers[4], LANDING_TIERS["review"], "another author's first review keeps its tier")
 
     def test_changed_prs_are_read_again_and_owned_blocking_reviews_become_fixes(self):
         self.reviewed = {n: "a" * 40 for n in self.heads}
-        warmed = set()
-        for seed in range(20):
-            self.survey(seed=seed)
-            warmed |= self.read_prs()
-        self.assertEqual(warmed, set(self.heads))
-        self.assertEqual(self.survey(seed=99).detail_reads, 0, "a warm cache needs no detail reads")
+        self.survey(seed=0)
+        self.assertEqual(self.survey(seed=99).detail_reads, 0, "a warm index needs no reads")
         # A blocking review on an owned PR moves its clock; only that PR is read.
         self.states[7] = {"style": "blocking_request"}
         self.updated[7] = "2026-11-08T00:00:00Z"
@@ -487,18 +540,91 @@ class BudgetedSurveys(unittest.TestCase):
 
         invalidate_shared(discovery_scope(self.source))
         result = self.survey(seed=5)
+        self.assertEqual(self.api.pulls.call_count, 1, "an invalidated listing is refreshed, not listed again")
         self.assertEqual(self.read_prs(), {7})
         self.assertEqual([c.pr for c in result.needs_fix.actionable], [7])
-        # A push to another PR is a new head: review work, again for one read.
+        # A push to another PR is a new head (and moves its clock): review work, again for one read.
         self.heads[8] = "b" * 40
+        self.updated[8] = "2026-11-08T00:00:00Z"
         invalidate_shared(discovery_scope(self.source))
-        result = self.survey(seed=6)
+        result = self.survey(seed=6, cfg=self.peer("peer"))
         self.assertEqual(self.read_prs(), {8})
         self.assertEqual([c.pr for c in result.reviewable.actionable], [8])
         self.assertEqual([c.pr for c in result.needs_fix.actionable], [7])
 
-    def test_ambiguous_owned_mergeability_checks_share_the_detail_budget(self):
-        from tauceti_worker.constants import SURVEY_DETAIL_READS
+    def test_a_held_refresh_lock_leaves_unobserved_prs_unread(self):
+        from tauceti_worker.github_transport import locked
+        from tauceti_worker.review_state import ReviewState
+
+        rs = ReviewState(self.cfg, self.source)
+        with patch("tauceti_worker.source_survey.REFRESH_LOCK_WAIT_S", 0.1):
+            with locked(rs.sbcache.parent / (rs.sbcache.name + ".refresh.lock"), timeout=1):
+                result = self.survey(seed=0, cfg=self.peer("peer"))
+        self.assertEqual(self.detail, [], "a waiting peer never reads around the refresh")
+        self.assertEqual(result.detail_deferred, self.OPEN)
+        self.assertFalse(result.reviewable.actionable)
+
+    def test_failing_reads_end_the_refresh(self):
+        from tauceti_tools.forge import Incomplete
+
+        def failing(repository, number):
+            self.detail.append(("comments", number))
+            raise Incomplete("transient", status=502)
+
+        self.api.comments.side_effect = failing
+        result = self.survey(seed=0)
+        self.assertEqual(len(self.detail), 3)
+        self.assertEqual(result.detail_deferred, self.OPEN - 3)
+
+    def test_failing_thread_reads_end_the_refresh(self):
+        from tauceti_tools.forge import Incomplete
+
+        self.reviewed = {n: "a" * 40 for n in self.heads}  # clean heads: every thread is read
+
+        def failing(repository, number):
+            self.detail.append(("reviews", number))
+            raise Incomplete("transient", status=502)
+
+        self.api.reviews.side_effect = failing
+        result = self.survey(seed=0)
+        self.assertEqual(len([1 for endpoint, _ in self.detail if endpoint == "reviews"]), 3)
+        self.assertEqual(result.detail_deferred, self.OPEN - 3)
+
+    def test_a_read_that_started_before_a_peers_bust_cannot_republish(self):
+        import time
+
+        from tauceti_worker.review_state import ReviewState
+
+        self.reviewed = {n: "a" * 40 for n in self.heads}
+        self.survey(seed=0)
+        reader, writer = ReviewState(self.cfg, self.source), ReviewState(self.peer("peer"), self.source)
+        prs = [p for p in self.survey(seed=0).open_prs]
+        reader.observe(prs)
+        writer.observe(prs)
+        self.assertTrue(reader.current(5))
+        started = time.time() - 1
+        writer.bust(5)
+        self.assertFalse(reader.current(5))
+        reader._write_sidecar(reader._key_path(5), 5, {"status": "present", "meta": {}}, observed_at=started)
+        self.assertFalse(writer.current(5), "the older observation must not land over the bust")
+        # A bust waits for a busy index directory rather than dropping its tombstone.
+        import fcntl
+        import os
+        import threading
+
+        directory = os.open(writer.sbcache, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        threading.Timer(0.2, lambda: fcntl.flock(directory, fcntl.LOCK_UN)).start()
+        started = time.time() - 1
+        writer.bust(6)
+        os.close(directory)
+        reader._write_sidecar(reader._key_path(6), 6, {"status": "present", "meta": {}}, observed_at=started)
+        self.assertFalse(writer.current(6))
+        reader._write_sidecar(reader._key_path(5), 5, {"status": "present", "meta": {}})
+        self.assertTrue(writer.current(5), "a read after the bust is indexed")
+
+    def test_ambiguous_owned_mergeability_checks_are_bounded(self):
+        from tauceti_worker.constants import MERGEABILITY_CHECKS
         from tauceti_worker.forgejo_worker import ForgejoWorkerSource
 
         self.reviewed = {n: "a" * 40 for n in self.heads}
@@ -512,10 +638,8 @@ class BudgetedSurveys(unittest.TestCase):
 
         with patch.object(ForgejoWorkerSource, "resolve_mergeability", resolve):
             result = self.survey(seed=3)
-            self.assertEqual(len(checked), SURVEY_DETAIL_READS)
+            self.assertEqual(len(checked), MERGEABILITY_CHECKS)
             self.assertTrue(all(number % 2 for number in checked), "only owned PRs are checked")
-            # Conflict checks spent the budget; only those PRs may also read their history.
-            self.assertLessEqual(self.read_prs(), set(checked))
             self.assertFalse(result.rebaseable.actionable)
             checked.clear()
             conflicting = {9}
@@ -525,7 +649,7 @@ class BudgetedSurveys(unittest.TestCase):
             with patch.object(ForgejoWorkerSource, "resolve_mergeability", resolve_conflicts):
                 for seed in range(30):
                     result = self.survey(seed=seed)
-                    self.assertLessEqual(len(set(checked)), SURVEY_DETAIL_READS)
+                    self.assertLessEqual(len(set(checked)), MERGEABILITY_CHECKS)
                     if result.rebaseable.actionable:
                         break
                     checked.clear()
@@ -548,7 +672,7 @@ class BudgetedSurveys(unittest.TestCase):
         self.assertTrue(failed)
         self.api.reviews.side_effect = reviews
         self.survey(seed=4)
-        # Same order, scoreboards now cached: the walk spends its reads on the missing threads.
+        # Scoreboards now indexed: the refresh reads the missing threads.
         self.assertLessEqual(failed, {number for endpoint, number in self.detail if endpoint == "reviews"})
 
     def test_a_reused_thread_observation_keeps_its_age(self):
@@ -560,15 +684,15 @@ class BudgetedSurveys(unittest.TestCase):
         rs = ReviewState(self.cfg, self.source)
         for number in read:
             rs._contest_path(number).unlink()
-        self.survey(seed=0)
+        result = self.survey(seed=0)
         self.assertFalse(self.read_prs() & read, "answered from the shared cache")
+        self.assertEqual(result.detail_deferred, 0, "a reused thread read is not a failure")
         # Rewriting the sidecar now would restart the clock on an observation the shared cache aged.
         self.assertFalse(any(rs._contest_path(number).exists() for number in read))
 
     def test_explicit_targets_are_read_in_full(self):
         result = self.survey(numbers=(2, 4, 6, 8, 10, 12))
         self.assertEqual(self.read_prs(), {2, 4, 6, 8, 10, 12})
-        self.assertEqual(result.detail_reads, 0)
         self.assertEqual({c.pr for c in result.reviewable.actionable}, {2, 4, 6, 8, 10, 12})
 
 

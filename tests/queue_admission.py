@@ -126,7 +126,6 @@ class AdmissionTests(unittest.TestCase):
         del self.github.statuses[(head, "build")]
         del self.github.statuses[(head, "scope")]
         self.github.labels[1].add("self-tested")
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         self.assertEqual(self.intake.run_once()["approved"], 1)
         self.controller.tick()
         self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
@@ -137,7 +136,6 @@ class AdmissionTests(unittest.TestCase):
         head = self.github.create_pr(1, files)
         self.review(1)
         self.github.labels[1].add("self-tested")
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         return head
 
     def test_self_tested_heads_must_pass_the_pr_level_diff_guards(self):
@@ -244,17 +242,40 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(self.intake.run_once()["approved"], 1)
         measure.assert_not_called()
 
-    def test_untrusted_label_and_label_removal_cannot_bypass_ci(self):
+    def test_any_authors_label_stands_in_for_ci_until_removed(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]
-        self.github.labels[1].add("self-tested")
         self.assertEqual(self.intake.run_once()["approved"], 0)
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
+        self.github.labels[1].add("self-tested")
         self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.run_once()["approved"], 1)
         generation = self.intake.state.get(1)["generation"]
         self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
+
+    def test_a_self_tested_rule_change_re_evaluates_only_evidence_refusals_once(self):
+        for number, missing in ((1, "build"), (3, "scope")):
+            head = self.ready(number)
+            del self.github.statuses[(head, missing)]
+            self.github.labels[number].add("self-tested")
+        self.ready(2)
+        unlabelled = self.ready(4)
+        del self.github.statuses[(unlabelled, "build")]
+        with mock.patch("tauceti_tools.self_tested.accepted", return_value=False):  # the old team rule
+            self.assertEqual(self.intake.run_once()["approved"], 1)
+        reasons = {n: json.loads(self.intake.state.get(n)["decision"])["reason"] for n in (1, 3, 4)}
+        self.assertTrue(reasons[1].startswith("build is not green"), reasons)
+        self.assertTrue(reasons[3].startswith("trusted CI scope status is not green"), reasons)
+        # A database from before the current self-tested rules.
+        self.controller.store.execute("DELETE FROM settings WHERE key LIKE 'state:self_tested_policy:%'")
+        approved = self.intake.state.get(2)["generation"]
+        self.restart()
+        self.assertEqual(self.intake.state.get(2)["generation"], approved, "an admitted head is not re-read")
+        self.assertEqual(self.intake.run_once()["approved"], 2)
+        self.assertEqual({row["number"] for row in self.controller.inputs()}, {1, 2, 3})
+        refused = self.intake.state.get(4)["generation"]
+        self.restart()
+        self.assertEqual(self.intake.state.get(4)["generation"], refused, "once per rule version")
 
     def test_primary_intake_uses_published_review_and_unchanged_inputs_cost_no_evaluation(self):
         self.ready()
@@ -762,6 +783,86 @@ class AdmissionTests(unittest.TestCase):
                 self.intake.invalidate(1)
                 self.intake.run_once()
                 self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+
+    def large_refactor_approval(self, *, files=None, labelled=True, bump=True, admin=True):
+        """An admin's exact-head `bors r+` on a large refactor that also bumps the Lake pins."""
+        files = files or {"TauCeti/P1.lean": "-- renamed projections\n", "lean-toolchain": "v-next\n"}
+        head = self.human_approval(files=files, admin=admin)
+        if labelled:
+            self.github.large_refactor_heads = {head}
+            self.github.labels[1] = {"large-refactor"}
+        self.github.bump_verdicts = {head: bump}
+        return head
+
+    def test_admin_approved_large_refactor_is_kept_despite_a_negative_scoreboard(self):
+        head = self.large_refactor_approval()
+        self.review(state="red")
+        result = self.intake.run_once()
+        self.assertEqual(result["revoked"], 0)
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.assertTrue(self.intake.is_current(1, head))
+        decision = json.loads(self.intake.state.get(1)["decision"])
+        self.assertEqual(decision["reason"], "large refactor approved by repository admin")
+        waiver = decision["evidence"]["large_refactor_approval"]
+        self.assertEqual((waiver["actor_id"], waiver["head_sha"], waiver["bump_guard"]), (42, head, True))
+        self.assertIn(("bump_guard", (head,)), self.github.calls)
+        # Admin permission was established once, when the command was recorded; admission reads none.
+        self.assertNotIn("repository_admin", [name for name, _ in self.github.calls])
+        # The emergency lane sees a live approved input, so it no longer refuses `not-approved`.
+        self.controller.set_setting("emergency_enabled", True, "t")
+        request = self.controller.request_emergency(REPO, 1, "human", surface="test")
+        self.assertTrue(request["accepted"], request)
+        self.intake.run_once()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+
+    def test_library_only_large_refactor_needs_no_bump_check(self):
+        self.large_refactor_approval(files={"TauCeti/P1.lean": "-- renamed projections\n"}, bump=False)
+        self.intake.run_once()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.assertNotIn("bump_guard", [name for name, _ in self.github.calls])
+
+    def test_large_refactor_waiver_stays_narrow(self):
+        for case in (
+            "unlabelled",
+            "not-admin",
+            "stale-base",
+            "wrong-head",
+            "bump-fails",
+            "lakefile",
+            "root-file",
+            "new-file-cap",
+        ):
+            with self.subTest(case=case):
+                if self.controller.input_for(REPO, 1):
+                    self.controller.cancel(REPO, 1, "fixture")
+                self.github.review_comments.pop(1, None)
+                files = None
+                if case == "lakefile":
+                    files = {"TauCeti/P1.lean": "-- x\n", "lakefile.toml": "# changed\n"}
+                elif case == "root-file":
+                    files = {"TauCeti/P1.lean": "-- x\n", "TauCeti.lean": "import TauCeti.P1\n"}
+                elif case == "new-file-cap":
+                    lines = diff_guard.ci_git.NEW_FILE_LINE_CAP + 50  # the one cap the label never lifts
+                    files = {"TauCeti/Big.lean": "".join(f"-- {i}\n" for i in range(lines))}
+                self.large_refactor_approval(
+                    files=files, labelled=case != "unlabelled", bump=case != "bump-fails", admin=case != "not-admin"
+                )
+                if case in ("stale-base", "wrong-head"):
+                    current = self.controller.input_for(REPO, 1)
+                    evidence = json.loads(current["evidence"])
+                    evidence["merge_base_sha" if case == "stale-base" else "head_sha"] = "f" * 40
+                    self.controller.store.update("inputs", {"id": current["id"]}, evidence=json.dumps(evidence))
+                self.review(state="red")
+                self.intake.invalidate(1)
+                self.intake.run_once()
+                self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+
+    def test_unreadable_bump_check_defers_the_large_refactor_waiver(self):
+        head = self.large_refactor_approval(bump=None)
+        self.review(state="red")
+        self.assertTrue(self.intake.run_once()["errors"])
+        self.assertFalse(self.intake.is_current(1, head))
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
 
     def test_permission_read_failure_defers_human_approval_and_blocks_insertion(self):
         head = self.human_approval()

@@ -186,9 +186,14 @@ class ReviewRuntime(unittest.TestCase):
             record["source"]["name"] = "other/repository"
             (foreign / "publication.json").write_text(json.dumps(record))
             runtime = review_runtime.ReviewRuntime(root / "engine", "a" * 40)
+            from tauceti_worker import live_use
+
             with (
                 patch.object(review_runtime, "resolve", return_value=runtime),
                 patch("subprocess.run", return_value=SimpleNamespace(returncode=86)) as run,
+                # Liveness scans every process of the user, which concurrent test modules share; this
+                # test is about receipt ordering, so no process holds the workspaces.
+                patch.object(live_use, "live_users", return_value=[]),
             ):
                 self.assertFalse(review_runtime.recover(worker))
             self.assertIn("z-good", run.call_args.args[0])

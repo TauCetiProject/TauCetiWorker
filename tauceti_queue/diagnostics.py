@@ -20,10 +20,12 @@ defining module path):
 | `MEMBER-POLICY-REJECTED {...}` (the source member review-size policy's JSON record of one member) | `policy` naming that member by its accepted head and source identity |
 
 Infrastructure findings come from the run and jobs rather than the log: a cancelled, timed out or
-startup-failed run, a lost runner (the job log says so), and a failed finalizer, which may not have
-published the `build` status (it also exits nonzero after posting a failed one, so the controller
-ignores this finding once the run's own `build` status is bound). Logs are untrusted text: they are
-matched, never executed, and the read is bounded.
+startup-failed run, a lost runner (the job log says so), a Lean process the watchdog reports killed
+by signal 9 before its deadline (`reason` `lean_killed` on that module, whose failed-target entry is
+then dropped; located findings elsewhere still make the run a source failure), and a failed
+finalizer, which may not have published the `build` status (it also exits nonzero after posting a
+failed one, so the controller ignores this finding once the run's own `build` status is bound). Logs
+are untrusted text: they are matched, never executed, and the read is bounded.
 """
 
 from __future__ import annotations
@@ -78,6 +80,12 @@ IMPORT_HEADER = re.compile(
 )
 FAILED_TARGETS_HEADER = "Some required targets logged failures:"
 FAILED_TARGET = re.compile(r"- (TauCeti(?:\.[A-Za-z_][A-Za-z0-9_']*)+)")
+# TauCetiTools' Lean watchdog reports a Lean process SIGKILLed before its wall-clock deadline, almost
+# always by the kernel's out-of-memory killer: a fault of the runner, not of the source. Its path is
+# absolute (the checkout's), so the project path is its last `TauCeti/...` suffix.
+LEAN_KILLED = re.compile(
+    r"^error: Lean process for (?:\S*/)?(" + PATH + r") was killed by signal 9 after \d+s, likely out of memory$"
+)
 RUNNER_LOST = re.compile(
     r"The runner has received a shutdown signal|lost communication with the server|"
     r"The hosted runner .* lost communication|runner has stopped responding|No space left on device",
@@ -105,6 +113,7 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
     fallback: dict[tuple, dict] = {}
     in_targets = False
     runner_lost: dict | None = None
+    killed: dict[str, dict] = {}
     for raw in lines:
         if len(located) >= MAX_FINDINGS:
             break
@@ -188,6 +197,10 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
                 ),
             )
             continue
+        if (oom := LEAN_KILLED.match(line)) and len(oom.group(1)) <= 512:
+            module = module_of(oom.group(1))
+            killed.setdefault(module, _finding("infrastructure", module, line, path=oom.group(1), reason="lean_killed"))
+            continue
         if line.startswith("LINT-ENV: FAIL"):
             fallback.setdefault(("lint", line[:MAX_MESSAGE]), _finding("lint", "", line))
             continue
@@ -205,7 +218,9 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
             in_targets = False
         if runner_lost is None and RUNNER_LOST.search(line):
             runner_lost = _finding("infrastructure", "", line, reason="runner_lost")
-    findings = list(located.values()) or list(fallback.values())
+    # Lake lists a killed module among its failed targets too; that entry is no source finding.
+    findings = list(located.values()) or [f for f in fallback.values() if f["module"] not in killed]
+    findings.extend(killed.values())
     if runner_lost is not None:
         findings.append(runner_lost)
     return findings

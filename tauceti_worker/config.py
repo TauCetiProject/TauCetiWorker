@@ -168,6 +168,8 @@ def _only_label(sv=None) -> str:
     v = sv.roadmap_only if (sv is not None and sv.roadmap_only) else roadmap_only()
     if v is None or v == "auto":
         return "auto (random each round)"
+    if getattr(sv, "umbrella", None) is not None:
+        return f"{v} (umbrella)"
     return "all areas" if v in ("", "any") else v
 
 
@@ -276,6 +278,9 @@ class Config:
     sbcache: Path  # scoreboard meta cache dir
     logdir: Path  # HERE/logs/<wid>
     quota_cache: Path  # raw provider usage responses
+    # A direct source's host-shared review-state index root (worker_sources.source_config sets it);
+    # None keeps the review state under this worker's own sbcache.
+    review_index: Path | None = None
 
     @property
     def store(self) -> Path:
@@ -462,6 +467,10 @@ class NoProgress(Exception):
 
 class ClaimCollision(NoProgress):
     """Available candidates were claimed by peers; reselect without failure backoff."""
+
+
+class ReviewSourceUnavailable(NoProgress):
+    """A selected review's source could not be prepared before inference; other PRs may still be workable."""
 
 
 class ProgressPreparationUnavailable(NoProgress):

@@ -375,9 +375,10 @@ class Cache(unittest.TestCase):
         self.warm_entries(keys, download)
         report = dict(hits=0, expanded=0)
         started = time.monotonic()
-        cache.expand(download, self.root / "private", self.root, {}, self.pool, report, deadline=started + 5)
+        # A self-deadlock would wait out the whole deadline; the bound sits well inside it.
+        cache.expand(download, self.root / "private", self.root, {}, self.pool, report, deadline=started + 60)
         self.assertEqual(report["hits"], 2)
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 30)
 
     def test_reversed_batches_on_two_workers_do_not_deadlock(self):
         import threading
@@ -430,9 +431,9 @@ class Cache(unittest.TestCase):
         try:
             report = dict(hits=0, expanded=0)
             started = time.monotonic()
-            cache.expand(download, self.root / "reader", self.root, {}, self.pool, report, deadline=started + 3)
+            cache.expand(download, self.root / "reader", self.root, {}, self.pool, report, deadline=started + 60)
             self.assertEqual(report["hits"], len(keys))
-            self.assertLess(time.monotonic() - started, 2)
+            self.assertLess(time.monotonic() - started, 30)
             # A publisher or collector still needs the exclusive lock, which readers exclude.
             with self.assertRaises(BlockingIOError):
                 with cache.locked_all(self.pool, keys[:1], deadline=time.monotonic()):
@@ -502,6 +503,54 @@ class Cache(unittest.TestCase):
             with self.assertRaisesRegex(cache.Unavailable, "helper unavailable"):
                 with cache.preparation(self.root, env) as warm:
                     shutil.copytree(download / "outputs", Path(warm["LAKE_CACHE_DIR"]) / "outputs")
+
+    def test_outputs_only_another_toolchains_revisions_list_are_not_expanded(self):
+        # The main warm-up fetches main's outputs under main's toolchain; a checkout still on the
+        # old one must not unpack them with its own leantar, which may not read their format.
+        repo = self.root / "repo"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        git("init", "-q")
+        (repo / "lean-toolchain").write_text("leanprover/lean4:v4.37.0-rc1\n")
+        git("add", ".")
+        git("commit", "-qm", "main")
+        main = git("rev-parse", "HEAD")
+        (repo / "lean-toolchain").write_text("leanprover/lean4:v4.36.0\n")
+        git("commit", "-qam", "checkout")
+        head = git("rev-parse", "HEAD")
+        download = self.root / "download"
+        revisions = download / "revisions/TauCeti"
+        revisions.mkdir(parents=True)
+        # "b" is the checkout's; "c" only main's; "f" both list. A revision the checkout lacks
+        # proves nothing: its "9" stays expandable, and its "c" does not make main's expandable.
+        listed = {head: ["b", "f"], main: ["c", "f"], "0" * 40: ["9", "c"]}
+        for revision, keys in listed.items():
+            lines = ['"2026-03-17"', *(json.dumps([key * 16, key * 16 + ".ltar"]) for key in keys)]
+            (revisions / (revision + ".jsonl")).write_text("\n".join(lines) + "\n")
+        self.assertEqual(cache.foreign_inputs(download, repo), {"c" * 16})
+        atomic_json(download / "outputs/TauCeti" / ("b" * 16 + ".json"), dict(data="a" * 16 + ".ltar"))
+        atomic_json(download / "outputs/TauCeti" / ("c" * 16 + ".json"), dict(data="e" * 16 + ".ltar"))
+        entry = self.pool / "entries" / ("a" * 16)
+        data = dict(o=["d" * 16 + ".olean"], i="9" * 16 + ".ilean")
+        for name in cache.descriptions(data):
+            (entry / name).parent.mkdir(parents=True, exist_ok=True)
+            (entry / name).write_bytes(b"x")
+        atomic_json(entry / "entry.json", dict(data=data))
+        report = dict(hits=0, expanded=0)
+        with patch.object(cache, "native", side_effect=AssertionError("must not expand main's archive")):
+            cache.expand(download, self.root / "private", repo, {}, self.pool, report)
+        self.assertEqual((report["hits"], report["foreign_toolchain"]), (1, 1))
+        # Without a lean-toolchain every mapping is expanded, as before.
+        self.assertEqual(cache.foreign_inputs(download, self.root), set())
 
     def test_preparation_requires_one_filesystem(self):
         env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))

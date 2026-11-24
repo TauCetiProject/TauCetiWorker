@@ -18,6 +18,7 @@ from pathlib import Path
 
 from .config import Die, log
 from .constants import CLAIM_HEARTBEAT_S, CLAIM_TTL_S, CLAIMS
+from .excerpt import ends
 from .overlap_support import locked
 
 CURSOR_REF = "refs/tauceti-state/mathlib-overlap"
@@ -29,7 +30,7 @@ def git(*args: str, cwd: Path | None = None, data: str | None = None, check: boo
         ["git", *map(str, args)], cwd=cwd, input=data, capture_output=True, text=True, timeout=180, env=env
     )
     if check and result.returncode:
-        raise Die(f"overlap git failed: {(result.stderr or result.stdout).strip()[-600:]}")
+        raise Die(f"overlap git failed: {ends(result.stderr or result.stdout, 600)}")
     return result
 
 
@@ -90,7 +91,7 @@ class State:
                 return True
             if observed != previous:
                 return False
-            raise Die(f"overlap: state push failed: {result.stderr.strip()[-500:]}")
+            raise Die(f"overlap: state push failed: {ends(result.stderr, 500)}")
         if ref == CURSOR_REF:
             from .overlap_support import invalidate
 

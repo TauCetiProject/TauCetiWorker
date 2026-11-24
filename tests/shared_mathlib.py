@@ -400,6 +400,46 @@ class OpenFileLimitTests(unittest.TestCase):
         self.assertEqual(resource.getrlimit(resource.RLIMIT_NOFILE), (expected, hard))
 
 
+class StackLimitTests(unittest.TestCase):
+    def test_queue_package_raises_the_soft_stack_limit_for_children(self):
+        import resource
+        import subprocess
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_STACK)
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_STACK, (soft, hard))
+        low = 8 * 1024 * 1024 if hard == resource.RLIM_INFINITY else min(8 * 1024 * 1024, hard)
+        resource.setrlimit(resource.RLIMIT_STACK, (low, hard))
+        import tauceti_queue
+
+        tauceti_queue._raise_stack_limit()
+        self.assertEqual(resource.getrlimit(resource.RLIMIT_STACK), (hard, hard))
+        child = subprocess.run(["sh", "-c", "ulimit -s"], capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(child, "unlimited" if hard == resource.RLIM_INFINITY else str(hard // 1024))
+
+    def test_both_packages_size_rust_thread_stacks_for_children(self):
+        # leantar unpacks a multi-archive batch on Rust threads, which RLIMIT_STACK does not size.
+        import os
+        import subprocess
+        from unittest import mock
+
+        import tauceti_queue
+        import tauceti_worker
+
+        for package in (tauceti_queue, tauceti_worker):
+            with self.subTest(package=package.__name__), mock.patch.dict(os.environ):
+                os.environ.pop("RUST_MIN_STACK", None)
+                package._raise_stack_limit()
+                self.assertEqual(os.environ["RUST_MIN_STACK"], str(256 * 1024 * 1024))
+                child = subprocess.run(
+                    ["sh", "-c", 'printf %s "$RUST_MIN_STACK"'], capture_output=True, text=True, check=True
+                ).stdout
+                self.assertEqual(child, str(256 * 1024 * 1024))
+                # An operator's explicit setting wins.
+                os.environ["RUST_MIN_STACK"] = "1048576"
+                package._raise_stack_limit()
+                self.assertEqual(os.environ["RUST_MIN_STACK"], "1048576")
+
+
 class SignatureTests(Fixture):
     def key(self):
         _, closure = self.attach()
