@@ -186,6 +186,25 @@ def adopted_author_ids() -> frozenset[int]:
     return frozenset(ids)
 
 
+RECOVERY_AUTHORS_ENV = "TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS"
+
+
+def recovery_author_ids() -> frozenset[int]:
+    """Forgejo user IDs whose head-bound merge-queue recovery requests this worker acts on.
+
+    The merge queue's Forgejo publisher. Unset, no Forgejo request is trusted, as before."""
+    raw = os.environ.get(RECOVERY_AUTHORS_ENV, "")
+    ids = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if not re.fullmatch(r"[1-9][0-9]*", item):
+            raise ValueError(f"{RECOVERY_AUTHORS_ENV} must be comma-separated positive Forgejo user IDs")
+        ids.add(int(item))
+    return frozenset(ids)
+
+
 def maintains_author(actor: SourceActor | None, forge: Forge, author_id) -> bool:
     """Whether the authenticated actor maintains PRs by this user ID on `forge`."""
     if actor is None or type(author_id) is not int or actor.principal.forge != forge:

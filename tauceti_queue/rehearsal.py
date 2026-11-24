@@ -1102,8 +1102,8 @@ class LocalAdapter:
     def eligibility_checks(self, repo: str, head: str) -> list[dict]:
         return [dict(check) for check in self.checks if check["head_sha"] == head]
 
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
-        return self.github.post_comment(repo, number, body, marker)
+    def post_comment(self, repo: str, number: int, body: str, marker: str, **kwargs: Any) -> str:
+        return self.github.post_comment(repo, number, body, marker, **kwargs)
 
     def labels(self, repo: str, number: int) -> list[str]:
         return sorted(self.github.labels.get(number, set()))

@@ -154,7 +154,9 @@ def display(value, default_kinds=()):
     prs = []
     for key, label in (
         ("authored", "PRs authored"),
+        ("authored_forgejo", "  on Forgejo"),
         ("landed", "Authored PRs landed"),
+        ("landed_forgejo", "  from Forgejo"),
         ("assisted", "PRs assisted"),
         ("reviews", "Reviews completed"),
     ):
@@ -544,6 +546,10 @@ def combine(values):
     for w in report_windows:
         for key in ("authored", "landed", "reviews", "fixes"):
             s["pr_windows"][w][key] = sum(v["pr_windows"][w].get(key, 0) for v in known)
+        for key in ("authored_forgejo", "landed_forgejo"):
+            # Hosts whose collector predates the forge breakdown leave it unknown, not zero.
+            counts = [v["pr_windows"][w].get(key) for v in known]
+            s["pr_windows"][w][key] = None if None in counts else sum(counts)
         # Unique assisted PR counts are per-host; review events are additive.
         s["pr_windows"][w]["assisted"] = known[0]["pr_windows"][w].get("assisted") if len(known) == 1 else None
     for w in cost_windows:

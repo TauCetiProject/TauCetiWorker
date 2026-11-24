@@ -14,91 +14,11 @@ from unittest.mock import DEFAULT, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_worker import audit_alerts as alerts
-from tauceti_worker import audit_clients as clients
-from tauceti_worker import cli
+from tauceti_worker import audit_evidence, cli
 from tauceti_worker import security_audit as sa
 from tauceti_worker import work_units as wu
 from tauceti_worker.config import Die, NoProgress
 from tauceti_worker.work_units import want
-
-
-def append_native(home, answer, thread="11111111-2222-4333-8444-555555555555"):
-    sessions = home / ".codex/sessions"
-    sessions.mkdir(parents=True, exist_ok=True)
-    files = list(sessions.rglob("*.jsonl"))
-    if not files:
-        path = sessions / "rollout.jsonl"
-        path.write_text(sa.serialize({"type": "session_meta", "payload": {"id": thread}}) + "\n")
-    else:
-        path = files[0]
-    with path.open("a") as native:
-        native.write(
-            sa.serialize(
-                {
-                    "type": "response_item",
-                    "payload": {
-                        "role": "assistant",
-                        "type": "message",
-                        "phase": "final_answer",
-                        "content": [{"type": "output_text", "text": sa.serialize(answer)}],
-                    },
-                }
-            )
-            + "\n"
-        )
-
-
-CAPACITY_RETRY = {
-    "type": "error",
-    "message": "Retrying model request in 300 seconds... (Selected model is at capacity. Please try a different model.)",
-}
-
-
-class RetryEvents(unittest.TestCase):
-    def final(self, events):
-        return sa.codex_final("\n".join(map(sa.serialize, events)), True)
-
-    def test_server_retry_notices_followed_by_a_completed_answer_are_progress(self):
-        answer = {"verdict": "pass", "findings": [], "read_token": "token"}
-        for message in (
-            CAPACITY_RETRY["message"],
-            "Retrying model request in 600 seconds... (An error occurred while processing your request. Request ID abc)",
-        ):
-            with self.subTest(message=message):
-                self.assertEqual(
-                    self.final(
-                        [
-                            {"type": "turn.started"},
-                            {"type": "error", "message": message},
-                            CAPACITY_RETRY,
-                            {"type": "item.completed", "item": {"type": "agent_message", "text": sa.serialize(answer)}},
-                            {"type": "turn.completed"},
-                        ]
-                    ),
-                    answer,
-                )
-
-    def test_terminal_unknown_unfinished_and_out_of_order_errors_never_pass(self):
-        answer = {"type": "item.completed", "item": {"type": "agent_message", "text": '{"verdict":"pass"}'}}
-        completed = {"type": "turn.completed"}
-        for events in (
-            [CAPACITY_RETRY, answer],
-            [answer, completed, CAPACITY_RETRY],
-            [answer, CAPACITY_RETRY, completed],
-            [CAPACITY_RETRY, completed, answer],
-            [answer, completed, {"type": "turn.started"}, completed],
-            [{"type": "error", "message": "unknown error"}, answer, completed],
-            [{"type": "turn.failed", "error": {"message": CAPACITY_RETRY["message"]}}, answer, completed],
-            [{**CAPACITY_RETRY, "unknown": True}, answer, completed],
-            [
-                {"type": "error", "message": "Retrying model request in 300 seconds... (unknown failure)"},
-                answer,
-                completed,
-            ],
-            [CAPACITY_RETRY, {"type": "item.completed", "item": {"type": "command_execution"}}, answer, completed],
-        ):
-            with self.subTest(events=events), self.assertRaises(Die):
-                self.final(events)
 
 
 class History(unittest.TestCase):
@@ -181,13 +101,63 @@ class History(unittest.TestCase):
         batch = sa.plan_batch(self.repo, self.base, head)
         self.assertEqual([c["sha"] for c in batch["commits"]], [small])
 
-    def test_single_large_commit_gets_one_complete_compacting_session(self):
+    def test_single_large_commit_is_inspected_alone_and_complete(self):
         content = "-- Ordinary mathematical source\n" * 45000
         head = self.commit("large", "TauCeti/A.lean", content)
         batch = sa.plan_batch(self.repo, self.base, head)
         self.assertGreater(len(sa.serialize(batch).encode()), sa.MAX_BYTES)
         self.assertEqual([c["sha"] for c in batch["commits"]], [head])
         self.assertEqual(batch["commits"][0]["files"][0]["after"], content)
+
+    def test_oversized_commit_keeps_deleted_and_renamed_source_visible_in_its_diffs(self):
+        content = "theorem a : True := trivial\n" * (sa.MAX_BYTES // 40)
+        self.commit("large baseline", "TauCeti/A.lean", content)
+        self.commit("executable", "TauCeti/B.lean", '#eval IO.println "removed"\n')
+        baseline = self.commit("to rename", "TauCeti/C.lean", "run_cmd pure ()\n")
+        (self.root / "TauCeti/A.lean").write_text(content + "theorem b : True := trivial\n")
+        self.command("rm", "-q", "TauCeti/B.lean")
+        self.command("mv", "TauCeti/C.lean", "TauCeti/D.lean")
+        self.command("add", "-A")
+        self.command("commit", "-qm", "large edit, deletion and rename")
+        head = self.command("rev-parse", "HEAD")
+        batch = sa.plan_batch(self.repo, baseline, head)
+        self.assertEqual([c["sha"] for c in batch["commits"]], [head])
+        bundle, note = sa.reviewed_bundle(batch)
+        self.assertEqual(note, sa.AFTER_ONLY)
+        files = {f["path"]: f for f in bundle["commits"][0]["files"]}
+        self.assertEqual(set(files), {"TauCeti/A.lean", "TauCeti/B.lean", "TauCeti/C.lean", "TauCeti/D.lean"})
+        self.assertTrue(all("before" not in f for f in files.values()))
+        self.assertEqual(files["TauCeti/A.lean"]["after"], content + "theorem b : True := trivial\n")
+        self.assertIsNone(files["TauCeti/B.lean"]["after"])
+        self.assertIn('-#eval IO.println "removed"', files["TauCeti/B.lean"]["diff"])
+        self.assertIn("-run_cmd pure ()", files["TauCeti/C.lean"]["diff"])
+        self.assertEqual(files["TauCeti/D.lean"]["after"], "run_cmd pure ()\n")
+        self.assertIn("+run_cmd pure ()", files["TauCeti/D.lean"]["diff"])
+
+    def test_gitattributes_in_audited_commits_cannot_hide_lean_diffs(self):
+        # Production's bare store reads attributes from a tree; make the fixture do so too.
+        self.command("config", "attr.tree", "HEAD")
+        baseline = self.commit("attributes", ".gitattributes", "*.lean binary -diff\n")
+        self.assertIn("diff: unset", self.command("check-attr", "diff", "--", "TauCeti/A.lean"))
+        head = self.commit("hidden", "TauCeti/A.lean", '#eval IO.println "hidden"\n')
+        batch = sa.plan_batch(self.repo, baseline, head)
+        bundle, _ = sa.reviewed_bundle(sa.build_batch(self.repo, baseline, head, [head]))
+        for data in (batch, bundle):
+            (f,) = data["commits"][0]["files"]
+            self.assertIn('+#eval IO.println "hidden"', f["diff"])
+            self.assertIn("-theorem a : True := trivial", f["diff"])
+            self.assertNotIn("Binary files", f["diff"])
+
+    def test_binary_markers_inside_source_lines_are_ordinary_text(self):
+        content = "/-\rBinary files a and b differ\rGIT binary patch\r-/\ntheorem b : True := trivial\n"
+        p = self.root / "TauCeti/A.lean"
+        p.write_bytes(content.encode())
+        self.command("add", "--", "TauCeti/A.lean")
+        self.command("commit", "-qm", "carriage returns")
+        head = self.command("rev-parse", "HEAD")
+        (f,) = sa.plan_batch(self.repo, self.base, head)["commits"][0]["files"]
+        self.assertEqual(f["after"], content)
+        self.assertIn("\rBinary files a and b differ\r", f["diff"])
 
     def test_normal_multifile_edit_fits_with_complete_images(self):
         content = "-- A reasonably sized mathematical file with explanation\n" * 800
@@ -370,15 +340,6 @@ class PrivateAlerts(unittest.TestCase):
         finding = {**self.block, "outcome": "finding", "verdict": {"verdict": "finding", "findings": ["run_cmd"]}}
         self.assertEqual(alerts.report(self.work, finding)["details"], ["run_cmd"])
         self.assertEqual(alerts.report(self.work, {**self.block, "outcome": "not-judged"})["kind"], "Operational stall")
-
-    def test_every_block_writer_records_its_outcome(self):
-        from tauceti_worker.audit_evidence import NotJudged, Unreadable, outcome_of
-
-        finding = {"verdict": "finding", "findings": ["IO"]}
-        self.assertEqual(outcome_of(finding, Die("x")), {"outcome": "finding", "verdict": finding})
-        self.assertEqual(outcome_of(None, Unreadable("x")), {"outcome": "unreadable"})
-        self.assertEqual(outcome_of(None, NotJudged("x")), {"outcome": "not-judged"})
-        self.assertEqual(outcome_of({"verdict": "pass", "findings": []}, Die("ref")), {"outcome": "not-judged"})
 
     def test_code_uncertainty_notifies_immediately_during_operational_delay(self):
         (self.work / "ledger.jsonl").unlink()
@@ -726,6 +687,95 @@ class Authority(unittest.TestCase):
             else:
                 self.assertEqual(r["bypass_actors"], [])
 
+    def app_fixture(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        directory = Path(tmp.name)
+        (directory / "github-app.json").write_text(json.dumps({"id": 42, "slug": "tauceti-security-audit"}))
+        self.addCleanup(setattr, sa, "_app_source", None)
+        return directory
+
+    def test_audit_app_pushes_cursor_with_its_own_token(self):
+        directory = self.app_fixture()
+        old, target = "a" * 40, "c" * 40
+        with (
+            patch.dict(sa.os.environ, {sa.APP_ENV: str(directory), "GH_TOKEN": "ghp-personal"}),
+            patch.object(sa, "app_token", return_value="ghs-app-token"),
+            patch.object(sa.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout="", stderr="")) as run,
+        ):
+            sa.push_cursor(Path("repo"), old, target)
+        self.assertEqual(run.call_args.kwargs["env"]["TAUCETI_AUDIT_PUSH_TOKEN"], "ghs-app-token")
+        self.assertNotIn("ghs-app-token", " ".join(run.call_args.args[0]))
+        with (
+            patch.dict(sa.os.environ, {sa.APP_ENV: str(directory), "GH_TOKEN": "ghp-personal"}),
+            patch.object(sa, "app_token", side_effect=NoProgress("no App token")),
+            patch.object(sa.subprocess, "run") as run,
+            self.assertRaises(NoProgress),
+        ):
+            sa.push_cursor(Path("repo"), old, target)
+        run.assert_not_called()  # never falls back to the personal token
+
+    def test_audit_app_authority_and_dispatch(self):
+        directory = self.app_fixture()
+        installed = {"full_name": "TauCetiProject/TauCeti"}
+        source = SimpleNamespace(granted_permissions=lambda: {"contents": "write", "metadata": "read"})
+        ok = SimpleNamespace(returncode=0, stdout=json.dumps(installed), stderr="")
+        with (
+            patch.dict(sa.os.environ, {sa.APP_ENV: str(directory), "GH_TOKEN": "ghp-personal"}),
+            patch.object(sa, "app_token", return_value="ghs-app-token"),
+            patch.object(sa, "_app_source", source),
+            patch.object(sa, "execute", return_value=ok) as call,
+        ):
+            self.assertEqual(sa.admin_login(), "tauceti-security-audit[bot]")
+            self.assertEqual(call.call_args.kwargs["env"]["GH_TOKEN"], "ghs-app-token")
+            self.assertNotIn("graphql", call.call_args.args[0])
+            self.assertIn(f"repos/{sa.TAUCETI}", call.call_args.args[0])
+            call.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+            sa.dispatch_advanced(Path("unused"), "d" * 40)
+            self.assertIn(f"repos/{sa.TAUCETI}/dispatches", call.call_args.args[0])
+            self.assertEqual(call.call_args.kwargs["env"]["GH_TOKEN"], "ghs-app-token")
+        for repository, granted in (
+            ({"full_name": "other/repo"}, {"contents": "write"}),
+            (installed, {"contents": "read"}),
+        ):
+            with (
+                self.subTest(repository=repository, granted=granted),
+                patch.dict(sa.os.environ, {sa.APP_ENV: str(directory)}),
+                patch.object(sa, "app_token", return_value="ghs-app-token"),
+                patch.object(sa, "_app_source", SimpleNamespace(granted_permissions=lambda g=granted: g)),
+                patch.object(
+                    sa, "execute", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(repository), stderr="")
+                ),
+                self.assertRaises(Die),
+            ):
+                sa.admin_login()
+
+    def test_attestation_needs_a_human_admin_even_with_the_audit_app(self):
+        directory = self.app_fixture()
+        target = "b" * 40
+        with (
+            patch.dict(sa.os.environ, {sa.APP_ENV: str(directory)}),
+            patch.object(sa, "app_login", return_value="tauceti-security-audit[bot]") as app,
+            patch.object(sa, "human_admin_login", side_effect=Die("not an administrator")) as human,
+            patch.object(sa, "advance") as advance,
+            self.assertRaises(Die),
+        ):
+            sa.attest(Path("unused"), target, "reviewed by hand")
+        human.assert_called_once()
+        app.assert_not_called()
+        advance.assert_not_called()
+
+    def test_audit_app_bypasses_only_the_cursor_ruleset(self):
+        directory = self.app_fixture()
+        with patch.dict(sa.os.environ, {sa.APP_ENV: str(directory)}):
+            rules = {r["name"]: r["bypass_actors"] for r in sa.protections()}
+        admin = {"actor_type": "RepositoryRole", "actor_id": 5, "bypass_mode": "always"}
+        self.assertEqual(
+            rules["security-audit-admins"],
+            [admin, {"actor_type": "Integration", "actor_id": 42, "bypass_mode": "always"}],
+        )
+        self.assertEqual(rules["toolchain-tags-admins"], [admin])
+
     def test_invalid_verdict_is_never_approval(self):
         batch = {"input_digest": "digest", "commits": [{"sha": "a" * 40}]}
         good = {"input_digest": "digest", "commits": ["a" * 40], "verdict": "pass", "findings": []}
@@ -740,63 +790,249 @@ class Authority(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(Die):
                 sa.validate_verdict({**good, **changes}, batch)
 
-    def test_launcher_isolated_from_github_and_config(self):
-        batch = {"input_digest": "digest", "commits": [{"sha": "a" * 40}]}
-        verdict = {"input_digest": "digest", "commits": ["a" * 40], "verdict": "pass", "findings": []}
+    def test_reviewer_is_one_api_request_carrying_the_whole_bundle_and_no_secrets(self):
+        files = [
+            {
+                "path": "TauCeti/A.lean",
+                "before": "",
+                "after": "@[stacks 0BE9, simp] theorem t : True := trivial\n",
+                "diff": "",
+            }
+        ]
+        batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "b" * 40,
+            "commits": [{"sha": "b" * 40, "parent": "a" * 40, "files": files}],
+        }
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        seen = {}
+
+        def reviewer(request, key):
+            seen.update(request=request, key=key)
+            answer = {"verdict": "pass", "findings": []}
+            return {"content": [{"type": "text", "text": json.dumps(answer)}], "stop_reason": "end_turn"}
+
         with tempfile.TemporaryDirectory() as tmp:
             work = Path(tmp)
-            auth = work / "auth.json"
-            auth.write_text('{"tokens":{"access_token":"only-the-provider","refresh_token":"real-refresh-secret"}}')
-
-            def model(argv, **kwargs):
-                self.assertNotIn("GH_TOKEN", kwargs["env"])
-                self.assertNotIn("GITHUB_TOKEN", kwargs["env"])
-                self.assertNotIn("ANTHROPIC_API_KEY", kwargs["env"])
-                self.assertNotIn("TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG", kwargs["env"])
-                self.assertNotEqual(kwargs["cwd"], work)
-                credentials = json.loads((kwargs["cwd"] / ".codex/auth.json").read_text())
-                self.assertEqual(credentials["tokens"]["refresh_token"], sa.CODEX_RT_PLACEHOLDER)
-                self.assertNotIn("real-refresh-secret", json.dumps(credentials))
-                self.assertIn("--output-schema", argv)
-                catalog = json.loads((kwargs["cwd"] / "model-catalog.json").read_text())["models"][0]
-                self.assertIsNone(catalog["apply_patch_tool_type"])
-                self.assertEqual(catalog["shell_type"], "disabled")
-                self.assertEqual(catalog["experimental_supported_tools"], [])
-                self.assertTrue(any(a.startswith("model_catalog_json=") for a in argv))
-                append_native(kwargs["cwd"], {k: verdict[k] for k in ("verdict", "findings")})
-                events = [
-                    {
-                        "type": "item.completed",
-                        "item": {
-                            "type": "agent_message",
-                            "text": json.dumps({k: verdict[k] for k in ("verdict", "findings")}),
-                        },
-                    },
-                    {"type": "turn.completed"},
-                ]
-                return SimpleNamespace(returncode=0, stdout="\n".join(map(json.dumps, events)), stderr="")
-
+            key = work / "key"
+            key.write_text("sk-test-secret\n")
+            key.chmod(0o600)
+            attempt = work / "attempt-1"
+            attempt.mkdir()
             with (
-                patch.dict(
-                    os.environ,
-                    {
-                        "GH_TOKEN": "admin-secret",
-                        "GITHUB_TOKEN": "secret",
-                        "TAUCETI_SECURITY_AUDIT_ZULIP_CONFIG": "/private/bot.json",
-                    },
-                ),
-                patch.object(sa, "codex_dir", return_value=work),
-                patch.object(sa, "run_process", side_effect=model),
-                patch.object(clients, "selected_protocol", return_value=sa.PROTOCOL),
+                patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key), "GH_TOKEN": "admin-secret"}),
+                patch.object(sa, "call_reviewer", side_effect=reviewer),
             ):
-                attempt = work / "attempt-1"
-                attempt.mkdir()
-                self.assertEqual(sa.inspect(batch, "codex", attempt), verdict)
-        self.assertIn("--ignore-user-config", sa.reviewer_argv("codex"))
-        self.assertIn("shell_tool", sa.reviewer_argv("codex"))
-        args = sa.reviewer_argv("claude")
-        self.assertEqual(args[args.index("--tools") + 1], "")
-        self.assertIn("--safe-mode", args)
+                verdict = sa.inspect(batch, attempt)
+            self.assertEqual(verdict["verdict"], "pass")
+            self.assertEqual(seen["key"], "sk-test-secret")
+            retained = "".join(p.read_text() for p in attempt.iterdir())
+            self.assertNotIn("sk-test-secret", retained)
+            self.assertNotIn("admin-secret", retained)
+            self.assertEqual(json.loads((attempt / "request.json").read_text()), seen["request"])
+            execution = json.loads((attempt / "execution.json").read_text())
+            self.assertEqual(execution["protocol_version"], sa.PROTOCOL)
+            self.assertEqual(
+                execution["stages"],
+                [
+                    {
+                        "stage": "triage",
+                        "model": sa.TRIAGE_MODEL,
+                        "request_digest": hashlib.sha256((attempt / "request.json").read_bytes()).hexdigest(),
+                    }
+                ],
+            )
+        self.assertEqual(seen["request"]["model"], "claude-haiku-5-5")
+        user = seen["request"]["messages"][0]["content"]
+        self.assertIn(sa.serialize(batch), user)
+        self.assertIn("(determined by the trusted Worker): simp, stacks.", user)
+        self.assertNotIn("tools", seen["request"])
+
+    def escalation_case(self, answers, *, escalate=False):
+        """Run inspect with these answers in order; return (verdict or exception, models asked, attempt)."""
+        files = [{"path": "TauCeti/A.lean", "before": "", "after": "x", "diff": ""}]
+        batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "b" * 40,
+            "commits": [{"sha": "b" * 40, "parent": "a" * 40, "files": files}],
+        }
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        models, answers = [], list(answers)
+
+        def reviewer(request, key):
+            models.append(request["model"])
+            answer = answers.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return {"content": [{"type": "text", "text": json.dumps(answer)}], "stop_reason": "end_turn"}
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        key = Path(tmp.name) / "key"
+        key.write_text("k")
+        key.chmod(0o600)
+        attempt = Path(tmp.name) / "state" / "attempt-1"
+        attempt.mkdir(parents=True)
+        with (
+            patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key)}),
+            patch.object(sa, "call_reviewer", side_effect=reviewer),
+        ):
+            try:
+                result = sa.inspect(batch, attempt, escalate=escalate)
+            except Exception as exc:  # noqa: BLE001
+                result = exc
+        return result, models, attempt
+
+    def test_a_triage_pass_is_not_escalated(self):
+        result, models, _ = self.escalation_case([{"verdict": "pass", "findings": []}])
+        self.assertEqual((result["verdict"], models), ("pass", [sa.TRIAGE_MODEL]))
+
+    def test_a_triage_finding_escalates_once_and_the_escalation_decides(self):
+        finding = {"verdict": "finding", "findings": ["commit 1: origin of `stacks`"]}
+        result, models, attempt = self.escalation_case([finding, {"verdict": "pass", "findings": []}])
+        self.assertEqual((result["verdict"], models), ("pass", [sa.TRIAGE_MODEL, sa.ESCALATION_MODEL]))
+        stages = json.loads((attempt / "execution.json").read_text())["stages"]
+        self.assertEqual([s["model"] for s in stages], [sa.TRIAGE_MODEL, sa.ESCALATION_MODEL])
+        self.assertTrue((attempt / "response.json").exists())  # The triage judgment is kept.
+        record = sa.review_record(
+            "admin",
+            json.loads(json.dumps({"input_digest": "d", "from_sha": "a", "commits": [{"sha": "b"}]})),
+            attempt,
+            result,
+        )
+        self.assertEqual((record["model"], record["triage"]["judgments"]), (sa.ESCALATION_MODEL, [finding]))
+        result, models, _ = self.escalation_case([finding, {"verdict": "finding", "findings": ["IO"]}])
+        self.assertEqual((result["findings"], models), (["IO"], [sa.TRIAGE_MODEL, sa.ESCALATION_MODEL]))
+
+    def test_a_failed_escalation_needs_escalation_and_a_retry_never_asks_triage(self):
+        import httpx2
+
+        finding = {"verdict": "finding", "findings": ["x"]}
+        result, models, _ = self.escalation_case([finding, httpx2.ReadTimeout("t")])
+        self.assertIsInstance(result, audit_evidence.NeedsEscalation)
+        result, models, _ = self.escalation_case([{"verdict": "pass", "findings": []}], escalate=True)
+        self.assertEqual((result["verdict"], models), ("pass", [sa.ESCALATION_MODEL]))
+
+    def test_the_automation_never_asks_opus(self):
+        self.assertNotIn("opus", sa.TRIAGE_MODEL + sa.ESCALATION_MODEL)
+        source = Path(sa.__file__).read_text() + Path(sa.__file__).with_name("audit_pool.py").read_text()
+        self.assertNotIn("claude-opus", source)
+
+    def test_baseline_attributes_never_vouch_for_flagged_or_locally_defined_attributes(self):
+        def batch(text):
+            return {"commits": [{"files": [{"before": None, "after": text, "diff": ""}]}]}
+
+        self.assertEqual(
+            sa.baseline_attributes(batch("@[simp, stacks 0BE9] theorem t := x\nattribute [local ext] f")),
+            ["ext", "simp", "stacks"],
+        )
+        self.assertEqual(sa.baseline_attributes(batch('@[extern "f", implemented_by g, csimp] def f := 1')), [])
+        local = 'syntax (name := stacksLocal) "stacks" ident : attr\n@[stacks 1] theorem t := x\n'
+        self.assertEqual(sa.baseline_attributes(batch(local)), [])
+        registered = "initialize registerBuiltinAttribute { name := `simp }\n@[simp] theorem t := x\n"
+        self.assertEqual(sa.baseline_attributes(batch(registered)), [])
+        multiline = 'initialize customAttr : TagAttribute ←\n  registerTagAttribute\n    `stacks\n    "c"\n@[stacks 1] theorem t := x\n'
+        self.assertEqual(sa.baseline_attributes(batch(multiline)), [])
+
+    def test_a_request_too_large_for_the_context_splits_or_holds(self):
+        import anthropic
+        import httpx2
+
+        files = [{"path": "TauCeti/A.lean", "before": "", "after": "x", "diff": ""}]
+
+        def batch(n):
+            value = {
+                "from_sha": "a" * 40,
+                "main_sha": "b" * 40,
+                "commits": [{"sha": str(i) * 40, "parent": "a" * 40, "files": files} for i in range(n)],
+            }
+            value["input_digest"] = hashlib.sha256(sa.serialize(value).encode()).hexdigest()
+            return value
+
+        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+        too_long = "prompt is too long: 1157582 tokens > 1000000 maximum"
+        errors = {
+            "context": anthropic.BadRequestError(too_long, response=httpx2.Response(400, request=request), body=None),
+            "413": anthropic.APIStatusError(
+                "request too large", response=httpx2.Response(413, request=request), body=None
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "key"
+            key.write_text("k")
+            key.chmod(0o600)
+            for name, error in errors.items():
+                with (
+                    patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key)}),
+                    patch.object(sa, "call_reviewer", side_effect=error),
+                ):
+                    for n, raised in ((2, sa.NotJudged), (1, sa.Unreadable)):
+                        attempt = Path(tmp) / f"attempt-{name}-{n}"
+                        attempt.mkdir()
+                        with self.subTest(error=name, commits=n), self.assertRaises(raised):
+                            sa.inspect(batch(n), attempt)
+                        if n == 2:
+                            self.assertTrue(audit_evidence.engaged(attempt))
+
+    def test_a_single_commit_beyond_the_target_is_reviewed_from_its_after_images_and_diffs(self):
+        def batch(before, after, n=1):
+            files = [{"path": "TauCeti/A.lean", "before": before, "after": after, "diff": "+new line\n"}]
+            value = {
+                "from_sha": "a" * 40,
+                "main_sha": "b" * 40,
+                "commits": [{"sha": str(i) * 40, "parent": "a" * 40, "files": files} for i in range(n)],
+            }
+            value["input_digest"] = hashlib.sha256(sa.serialize(value).encode()).hexdigest()
+            return value
+
+        small = batch("theorem a : True := trivial\n", "theorem a : True := trivial\n-- x\n")
+        self.assertEqual(sa.reviewed_bundle(small), (small, ""))
+        content = "theorem a : True := trivial\n" * (sa.MAX_BYTES // 40)
+        added = "@[simp] theorem b : True := trivial\n"
+        large = batch(content, content + added)
+        self.assertGreater(len(sa.serialize(large).encode()), sa.MAX_BYTES)
+        # Several commits beyond the target are split, never trimmed.
+        several = batch(content, content + added, n=2)
+        self.assertEqual(sa.reviewed_bundle(several), (several, ""))
+        bundle, note = sa.reviewed_bundle(large)
+        self.assertEqual(note, sa.AFTER_ONLY)
+        self.assertLessEqual(len(sa.serialize(bundle).encode()), sa.MAX_BYTES)
+        (reviewed,) = bundle["commits"][0]["files"]
+        self.assertEqual(reviewed, {"path": "TauCeti/A.lean", "after": content + added, "diff": "+new line\n"})
+        self.assertEqual(bundle["input_digest"], large["input_digest"])
+        self.assertIn("before", large["commits"][0]["files"][0])  # The retained input stays complete.
+        user = sa.judgment_request(large, sa.TRIAGE_MODEL)["messages"][0]["content"]
+        self.assertIn(sa.AFTER_ONLY + "Bundle:\n" + sa.serialize(bundle), user)
+        self.assertIn("(determined by the trusted Worker): simp.", user)
+        # Provenance reads the before images too: a registration there still withholds it.
+        registering = batch('syntax (name := s) "s" : attr\n' + content, content + added)
+        user = sa.judgment_request(registering, sa.TRIAGE_MODEL)["messages"][0]["content"]
+        self.assertIn("(determined by the trusted Worker): none.", user)
+        self.assertNotIn("syntax (name := s)", user)
+
+    def test_a_transport_failure_is_not_a_judgment_and_never_holds(self):
+        import httpx2
+
+        files = [{"path": "TauCeti/A.lean", "before": "", "after": "x", "diff": ""}]
+        batch = {
+            "from_sha": "a" * 40,
+            "main_sha": "b" * 40,
+            "commits": [{"sha": "b" * 40, "parent": "a" * 40, "files": files}],
+        }
+        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            key = Path(tmp) / "key"
+            key.write_text("k")
+            key.chmod(0o600)
+            attempt = Path(tmp) / "attempt-1"
+            attempt.mkdir()
+            with (
+                patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(key)}),
+                patch.object(sa, "call_reviewer", side_effect=httpx2.ReadTimeout("read timed out")),
+                self.assertRaises(sa.NotJudged),
+            ):
+                sa.inspect(batch, attempt)
+            self.assertFalse(audit_evidence.engaged(attempt))
 
     def test_publications_do_not_enter_the_replay_outbox(self):
         with patch.object(sa, "execute", return_value=SimpleNamespace(returncode=0, stdout="{}", stderr="")) as execute:
@@ -835,9 +1071,6 @@ class Run(unittest.TestCase):
         self.old, self.target = "a" * 40, "b" * 40
         self.batch = {"from_sha": self.old, "input_digest": "digest", "commits": [{"sha": self.target, "files": [{}]}]}
         self.opts = SimpleNamespace(dry_run=False, work_model="codex")
-        protocol = patch.object(clients, "selected_protocol", return_value=3)
-        protocol.start()
-        self.addCleanup(protocol.stop)
         for name, kwargs in (
             ("require_admin", {}),
             ("remote_sha", {"return_value": self.old}),
@@ -846,6 +1079,7 @@ class Run(unittest.TestCase):
             ("plan_batch", {"return_value": self.batch}),
             ("api", {"return_value": {"login": "admin"}}),
             ("admin_login", {"return_value": "admin"}),
+            ("human_admin_login", {"return_value": "admin"}),
         ):
             mock = patch.object(sa, name, **kwargs)
             mock.start()
@@ -866,72 +1100,6 @@ class Run(unittest.TestCase):
         with patch.object(sa, "advance") as advance, self.assertRaises(Die):
             sa.attest(self.state, self.target, "   ")
         advance.assert_not_called()
-
-    def retained_incomplete(self, *, finding=False):
-
-        work = self.state / sa.CURSOR
-        original = work / "attempt-1"
-        original.mkdir(parents=True)
-        batch = {
-            "from_sha": self.old,
-            "main_sha": self.target,
-            "commits": [{"sha": self.target, "parent": self.old, "files": [{}]}],
-        }
-        batch["input_digest"] = hashlib.sha256(sa.serialize(batch).encode()).hexdigest()
-        (original / "input.json").write_text(sa.serialize(batch))
-        (work / "blocked.json").write_text(
-            sa.serialize(
-                {
-                    "from_sha": self.old,
-                    "to_sha": self.target,
-                    "attempt": str(original),
-                    "reason": "security-audit: Unable to inspect pages 19–20: the available reader token could not be validated, so the final two pages and their source changes remain unreviewed.",
-                }
-            )
-        )
-        verdict = {
-            "input_digest": batch["input_digest"],
-            "commits": [self.target],
-            "verdict": "finding" if finding else "incomplete",
-            "findings": [
-                "IO"
-                if finding
-                else "Unable to inspect pages 19–20: the available reader token could not be validated, so the final two pages and their source changes remain unreviewed."
-            ],
-        }
-        sa.record(
-            work / "ledger.jsonl",
-            {
-                "batch": batch["input_digest"],
-                "provider": "codex",
-                "model": "gpt-6-luna",
-                "verdict": verdict,
-                "execution_record": str(original / "execution.json"),
-                "reader_digest": sa.LEGACY_READER_DIGEST,
-            },
-        )
-        return work, original, batch
-
-    def service_evidence(self, work, original):
-
-        batch = json.loads((original / "input.json").read_text())
-        prompt = sa.inspection_prompt(batch, False, policy=sa.PROMPT)
-        (original / "prompt.txt").write_text(prompt)
-        (original / "execution.json").write_text(
-            sa.serialize(
-                {
-                    **sa.inspection_profile(),
-                    "argv": sa.codex_launch(original / "home", False),
-                    "environment": {"HOME": str(original / "home")},
-                    "paged": False,
-                    "prompt_digest": hashlib.sha256(prompt.encode()).hexdigest(),
-                }
-            )
-        )
-        blocked = work / "blocked.json"
-        value = json.loads(blocked.read_text())
-        value["reason"] = f"security-audit: codex failed; see {original}/model-stderr.txt"
-        blocked.write_text(sa.serialize(value))
 
 
 if __name__ == "__main__":

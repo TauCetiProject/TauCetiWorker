@@ -37,11 +37,15 @@ an already-started agent session runs to completion. Workers report
 the environment variable behave as before.
 
 Each round also records, in the worker's runtime status, the authoring
-backpressure it enforces: `authoring` holds the open non-draft PRs it counts as
-its own on every healthy source (`sources`, `count`), the `limit`, whether roadmap
-authoring is `blocked`, the roadmap `scope` the count covers and its `skip`
-list, and `observed_at`. The count comes from that round's own survey, so it is
-current on any forge. A starting loop clears the previous report.
+backpressure it enforces: `authoring` holds the account's open non-draft PRs on
+every forge it counts (`sources`, per forge, and their sum `count`), the forges
+it counted (`forges`) and whether every one of those counts was known
+(`complete`), the `limit`, whether roadmap authoring is `blocked`, the roadmap
+`scope` the count covers and its `skip` list, and `observed_at`. A forge the
+round surveys counts from that survey; a project forge it does not survey is
+read cheaply (see [roadmap backpressure](reference.md#roadmap-backpressure)), so
+workers with different forge selections report the same account total. A
+starting loop clears the previous report.
 
 `TAUCETI_FLEET_MACHINE_ID` and `TAUCETI_FLEET_EVENTS` opt into a private JSONL
 provenance journal. Successful PR creation and GitHub mutations record machine,
@@ -107,6 +111,39 @@ These fields are available in `workers.toml`. Credentials use the existing
 private Forgejo token-file configuration. Source changes wait for the worker's
 current round to finish; other workers retain their running processes and settings.
 
+A both-source worker offers existing PR work by closeness to landing across both
+forges. A first review of the worker's own Forgejo PR (one its account authored,
+not an adopted author's) counts as close to landing as a re-review: both kinds are
+drawn together in one age-weighted random order, ahead of fixes, so neither starves
+the other. Set `prefer_forge = "github"` (or `"forgejo"`, or `--prefer-forge` for
+`tauceti work`) to offer that forge's rebases, re-reviews, fixes and first reviews
+before any of the other forge's. Automatic bumps still come first and overlap work
+last on either forge, and the worker falls back to the other forge when its
+preferred forge has nothing claimable. Giving part of a pool a preference keeps
+one forge's backlog from starving behind the other's higher-tier work.
+
+Set `review_first = true` (or `--review-first` for `tauceti work`) to have a worker
+offer re-reviews, then first reviews, on either forge before any other PR work. Automatic
+bumps still come first and overlap work last, a forge preference still orders the forges
+inside each step, and the worker falls back to the normal landing order (rebases and the
+rest) when no review is claimable. A few review-first workers keep approvals flowing into
+the queue while the rest of the pool works through long conflict rebases.
+
+Each host remembers which heads of a PR review sent back for a fix. Once review has
+sent back 6 earlier heads of a PR on a host and asks for changes again, the next worker
+there that confirms the fix on the live PR closes the PR instead of fixing it, if the
+fleet maintains it: the account's own PRs and adopted Forgejo authors' PRs. The closing
+comment says the branch is kept and that the `keep` label keeps the PR open. Any other
+PR the fleet fixes, such as a contributor's, stays open, and the host stops offering it
+fix rounds. The count is per host, so a PR fixed on several hosts can take more rounds
+before it closes.
+
+While GitHub is rejecting the account's comments and the host's publication pacer is
+backing off, a both-source worker offers GitHub reviews after all its other work,
+including review-first workers. A review started then would finish its model work and
+then wait, holding its slot, until GitHub accepted its comments again. Automatic bump
+reviews keep their lead, and the review is still offered when nothing else is claimable.
+
 ## Locally verified publications
 
 With `self_tested = true` and `TAUCETI_VERIFY_HELPER=1`, the worker applies
@@ -156,8 +193,8 @@ After a host round pushes a new bump head, the worker runs the full local
 verifier (`tauceti verify`, bump policy) on that exact commit with the same
 build-cache view the agent used. If it succeeds and GitHub still reports that
 commit as the PR head, the worker applies `self-tested`. Review and queue admission
-validate eligibility directly (the labeler's team membership, bump-only paths
-and the real `bump-guard` validation), without waiting for an Actions receipt or
+validate eligibility directly (bump-only paths and the real `bump-guard`
+validation), without waiting for an Actions receipt or
 the ordinary PR build. The agent's
 own claims are never consulted. Bubble rounds, a dirty checkout, a moved head,
 or a failed or incomplete verification (capped at 45 minutes) leave the PR on

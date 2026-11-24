@@ -15,10 +15,12 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 from tauceti_tools.forge import ForgeError
 
+from . import peer_claims
 from .agents import (
     AuthoringProfile,
     BuildCacheUnavailable,
@@ -26,6 +28,7 @@ from .agents import (
     _claude_review_model,
     _codex_review_model_override,
     _kiro_review_model,
+    claude_review_file_flags,
     fetch_git_source,
     fetch_ref,
     fill_prompt,
@@ -51,6 +54,7 @@ from .config import (
     Die,
     GitHubUnavailable,
     NoProgress,
+    ReviewSourceUnavailable,
     SharedStateUnavailable,
     environment,
     extra_roadmap_prompt,
@@ -73,6 +77,7 @@ from .constants import (
     EX_NOPROGRESS,
     EXPLICIT_TASKS,
     MAX_FIX_ATTEMPTS,
+    MAX_FIX_ROUNDS_WITHOUT_APPROVAL,
     MAX_INFRA_REFUNDS,
     OPENROUTER_MODELS,
     PR_TASKS,
@@ -92,6 +97,7 @@ from .constants import (
     SANDBOX_DEFAULT,
     TAUCETI,
 )
+from .excerpt import ends
 from .github import GitHub, GitHubError, can_push, claims_repo, ensure_fork, gh_run, me, review_publisher
 from .github_state import enabled as github_state_enabled
 from .intentions import avoid_list
@@ -113,6 +119,7 @@ from .survey import (
     Counters,
     PRInfo,
     Survey,
+    age_spread,
     bump_prs,
     bust_progress_cache,
     cascade,
@@ -139,6 +146,7 @@ from .targets import (
     render_assignment,
     target_markers,
 )
+from .umbrellas import UmbrellaRound, umbrella_prompt, umbrella_scope
 from .worker_sources import pull_url as source_pull_url
 from .worker_sources import repository_url as source_repository_url
 
@@ -175,6 +183,75 @@ def _branch_claimed_elsewhere(w, pr: int) -> bool:
     if getattr(getattr(w, "gh", None), "worker_capable", False) is True:
         return False
     return _claim_held_elsewhere(w, f"branch/{pr}", claims_repo())
+
+
+def _claim_scope(w) -> str:
+    """The repository a candidate's leases belong to, qualified by forge where the source has one."""
+    gh = getattr(w, "gh", None)
+    repository = getattr(gh, "repository", None)
+    key = getattr(repository, "key", None)
+    return key if isinstance(key, str) else str(getattr(gh, "repo", ""))
+
+
+def _fix_cap_spent(w, c: Candidate) -> bool:
+    """Whether review already sent back MAX_FIX_ROUNDS_WITHOUT_APPROVAL other heads of this PR on this host."""
+    return len(peer_claims.fixed_heads(_claim_scope(w), c.pr) - {c.head}) >= MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+
+
+def _fix_cap_reached(w, c: Candidate) -> bool:
+    """Count the heads of this PR that review sent back for a fix on this host, and stop at the cap.
+
+    Called once the PR's live review state confirms a fix at `c.head`. Each distinct head here is one
+    review that asked for changes after a push, so MAX_FIX_ROUNDS_WITHOUT_APPROVAL other heads mean
+    that many fix and review cycles without an approval. At the cap the fleet closes a PR it maintains
+    (_close_capped_pr) and stops offering fix rounds for anyone else's."""
+    if _fix_cap_spent(w, c):
+        return True
+    peer_claims.note_fixed_head(_claim_scope(w), c.pr, c.head)
+    return False
+
+
+def _github_clone_url(owner: str, repo: str) -> str:
+    return f"https://github.com/{owner}/{repo}.git"
+
+
+def _pull_ref_missing(result, pr: int) -> bool:
+    """`gh pr checkout` failed because GitHub has no refs/pull/<pr>/head for this PR. GitHub
+    occasionally never creates or loses that ref (GitHub #43663, 22 Nov 2026) while the PR and its
+    head branch are intact; without a fallback every rebase of the PR fails the same way."""
+    from .worker_sources import current
+
+    detail = (result.stderr or "") + (result.stdout or "")
+    return current() is None and f"refs/pull/{pr}/head" in detail and "find remote ref" in detail
+
+
+def _checkout_head_branch(co, p: PRInfo, head: str, branch: str) -> subprocess.CompletedProcess:
+    """Check out a GitHub PR from its head repository's branch, as gh pr checkout would from the
+    pull ref: the exact selected head on `branch`, tracking the head branch. Pushes still go only
+    where the branch claim's TAUCETI_PUSH_REMOTE says."""
+    url = _github_clone_url(p.head_owner, p.head_repo)
+    steps = [
+        ["git", "check-ref-format", "--branch", branch],
+        ["git", "check-ref-format", "--branch", p.head_ref],
+        ["git", "fetch", "--no-tags", url, "refs/heads/" + p.head_ref],
+    ]
+    for step in steps:
+        result = subprocess.run(step, cwd=co, capture_output=True, text=True, timeout=600)
+        if result.returncode:
+            return result
+    fetched = subprocess.run(["git", "rev-parse", "FETCH_HEAD"], cwd=co, capture_output=True, text=True)
+    if fetched.returncode or fetched.stdout.strip() != head:
+        return subprocess.CompletedProcess(fetched.args, 1, "", "PR head branch is not at the selected head")
+    for step in (
+        ["git", "checkout", "--force", "-B", branch, head],
+        ["git", "config", f"branch.{branch}.remote", url],
+        ["git", "config", f"branch.{branch}.merge", "refs/heads/" + p.head_ref],
+    ):
+        result = subprocess.run(step, cwd=co, capture_output=True, text=True, timeout=600)
+        if result.returncode:
+            return result
+    log(f"  #{p.number}: GitHub has no refs/pull/{p.number}/head; checked out its head branch instead")
+    return result
 
 
 def _review_claimed_elsewhere(w, candidate: Candidate) -> bool:
@@ -249,6 +326,12 @@ class RoundOpts:
     ignore_quota: bool = False
     quota_cmd: str | None = None  # current external admission policy, including source recovery
     loop_paced: bool = False  # soft pacing handoff; never permits telemetry-outage work
+    # Offer only this landing tier's work (survey.LANDING_TIERS); multi_source walks tiers across
+    # sources. None offers every tier in order.
+    landing_tier: int | None = None
+    # Review sources found unavailable this round, shared by the per-tier copies multi_source makes
+    # (dataclasses.replace keeps this list), so the outage cutoff spans the whole round.
+    unavailable_sources: list = dataclass_field(default_factory=list)
 
     @property
     def agent_name(self) -> str:
@@ -273,6 +356,8 @@ class Worker:
     rc: RoundContext
     claims: Claims
     selection_changed: bool = False
+    # Set by round_scope: the umbrella this round's --roadmap-only names (docs/umbrellas.md), if any.
+    umbrella: UmbrellaRound | None = None
 
 
 def _bubble(stage: str, opts: RoundOpts) -> bool:
@@ -484,12 +569,19 @@ class NoEligibleWork(NoProgress):
     """Selection exhausted its candidates without launching a paid unit."""
 
 
-def round_scope(w, opts, use_fleet_focus=True):
+def round_scope(w, opts, use_fleet_focus=True, *, display=False):
+    """This round's roadmap scope (scope, global_pick, focused_round), leaving in `w.umbrella` the
+    umbrella an explicit --roadmap-only names, if any. `display` (status, the dashboard) resolves the
+    umbrella without drawing an area or failing on a broken file."""
     scope = roadmap_only()
     global_pick = focused_round = False
+    w.umbrella = None
     if getattr(opts, "prs", ()):
         scope = "any"  # explicit targets override the ambient roadmap
     else:
+        # An umbrella is an explicit choice like a pinned area, so it takes no fleet focus either:
+        # the scope stays its name, and its member areas widen the survey (Survey.covers).
+        w.umbrella = umbrella_round(w, opts, scope, display=display)
         # A target list names its own areas, so its worker takes no fleet focus.
         if use_fleet_focus and scope in (None, "auto") and roadmap_targets() is None:
             from .fleet_capacity import roadmap_focus
@@ -506,6 +598,64 @@ def round_scope(w, opts, use_fleet_focus=True):
         # loop clears it between rounds and a fallback round clears it here.
         report_runtime(roadmap_focus=scope if focused_round else None)
     return scope, global_pick, focused_round
+
+
+def umbrella_round(w, opts, scope, *, display=False) -> UmbrellaRound | None:
+    """The umbrella `scope` names (docs/umbrellas.md), or None for an area or any other value. A round
+    that may author learns now, before any model starts, which members are roadmap areas, and draws
+    one of them unless a target list chooses among them; a round without the roadmap phase only
+    maintains the members' pull requests."""
+    umbrella = umbrella_scope(w.gh, scope, display=display)
+    if umbrella is None or display:
+        return umbrella
+    if getattr(opts, "source", None) is not None:
+        raise Die(
+            f"--source needs one roadmap area, and {scope} is an umbrella of {len(umbrella.umbrella.members)} areas"
+        )
+    if not want(opts.only, "roadmap"):
+        return umbrella
+    umbrella = replace(umbrella, current=frozenset(m.area for m in umbrella_members_now(w, umbrella)))
+    if roadmap_targets() is not None:
+        return umbrella
+    return replace(umbrella, area=random_umbrella_area(w, umbrella))
+
+
+def umbrella_members_now(w, umbrella: UmbrellaRound) -> list:
+    """The members an umbrella round may author in: those in its scope (outside --roadmap-skip) that
+    are roadmap areas now, read like random_roadmap_area reads them. Members whose roadmaps have not
+    merged are left out silently, so they are picked up when they land; NoProgress when none is left."""
+    members = umbrella.umbrella.members
+    areas = set(roadmap_areas(w.gh))
+    eligible = [m for m in members if m.area in umbrella.scope and m.area in areas]
+    name = umbrella.umbrella.name
+    if not eligible:
+        skipped = [m.area for m in members if m.area not in umbrella.scope]
+        missing = [m.area for m in members if m.area in umbrella.scope]
+        why = "; ".join(
+            part
+            for part in (
+                f"in --roadmap-skip: {', '.join(skipped)}" if skipped else "",
+                f"not roadmap areas now: {', '.join(missing)}" if missing else "",
+            )
+            if part
+        )
+        raise NoProgress(f"roadmap: no member of umbrella {name} is eligible ({why}) — nothing to work on")
+    return eligible
+
+
+def random_umbrella_area(w, umbrella: UmbrellaRound) -> str:
+    """Draw an umbrella round's member area at random by weight among umbrella_members_now: the
+    operator's own focus list, beside random_roadmap_area's Fleet focus."""
+    members = umbrella.umbrella.members
+    eligible = (
+        [m for m in members if m.area in umbrella.current] if umbrella.current else umbrella_members_now(w, umbrella)
+    )
+    area = random.choices([m.area for m in eligible], weights=[m.weight for m in eligible])[0]
+    log(
+        f"ROADMAP area: {area} (umbrella {umbrella.umbrella.name}: picked from {len(eligible)} of "
+        f"{len(members)} members)"
+    )
+    return area
 
 
 def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_survey=None) -> int:
@@ -594,6 +744,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             # An expanded scan must not create per-PR hydration demand or
             # silently fall back to thousands of direct comment requests.
             cached_only=global_pick and github_state_enabled(),
+            umbrella=getattr(w, "umbrella", None),
         )
     if sv.dependency_wait:
         # Unknown global coverage is neither an empty backlog nor a failed round. Nothing is selected,
@@ -608,6 +759,11 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         # credential when the answer was an HTTP 504 from the GraphQL gateway, retried out of a round.
         why = one_line("; ".join(sv.errors)) or "the open PR query failed (GitHub API?)"
         raise NoProgress(f"{why} — aborting round, not falling through to authoring")
+    if prepared_survey is None and want(opts.only, "roadmap") and not getattr(opts, "prs", ()):
+        # The authoring limit is the account's across every project forge, not this forge's share.
+        from .account_pressure import count_account, report
+
+        report(count_account(w, {"github": sv}), sv)
 
     log(f"open PRs: {sv.status_label_line()}")
     # `--pr` scopes what this round SAYS as well as what it does. Every note below is about one named
@@ -677,14 +833,20 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         if stage in ("review", "overlap-scan", "overlap-fix"):
             continue
         candidates = sv.kind(stage).actionable
-        sv.kind(stage).actionable = spread_candidates(candidates)
+        sv.kind(stage).actionable = (
+            age_spread(candidates) if stage in ("rebase", "fix-ci", "fix") else spread_candidates(candidates)
+        )
 
     # The undocumented review throttles, off unless an expert asked for them. Applied here rather than
     # in survey() so they steer only what this round PICKS: the survey (and so `status`, the dashboard,
     # and every other stage) keeps reporting the queue as it really is. Skipped outright when this
     # worker isn't reviewing anyway, so a `--only fix` round never logs a review it was not going to do.
     if want(opts.only, "review"):
-        throttle_review(sv, opts)
+        # multi_source offers one prepared survey once per landing tier; throttle its queue once,
+        # or each pass would judge the queue depth the previous pass already reduced.
+        if not getattr(sv, "_review_throttle_applied", False):
+            throttle_review(sv, opts)
+            sv._review_throttle_applied = True
         stamp = time.time()
         affinity_present = any(
             c.preferred_reviewer and c.ready_at is not None and max(0.0, stamp - c.ready_at) < REVIEW_AFFINITY_GRACE_S
@@ -727,6 +889,13 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
+    unavailable_sources = getattr(opts, "unavailable_sources", None)
+    if unavailable_sources is None:
+        unavailable_sources = []  # option objects without the field count for this call only
+    elif prepared_survey is None and use_fleet_focus:
+        # The outer round. multi_source clears it once for all of its tiers, and the unfocused
+        # fallback keeps the focused attempt's count.
+        unavailable_sources.clear()
     from .state_repair import retry_key
 
     # `reconcile` is about the operator's target list, not a pull request, so like `roadmap` it is
@@ -742,9 +911,37 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             return rc
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
-    for stage, c in cascade(sv, stages, target_list_prs(w, sv, stages)):
+    for stage, c in cascade(
+        sv,
+        stages,
+        target_list_prs(w, sv, stages),
+        tier=getattr(opts, "landing_tier", None),
+        review_first=os.environ.get("TAUCETI_REVIEW_FIRST") == "1",
+    ):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
+            continue
+        if stage == "fix" and not opts.dry_run and c.pr and c.pr not in bump_prs(sv) and _fix_cap_spent(w, c):
+            p = next((p for p in sv.open_prs if p.number == c.pr), None)
+            if not p or not owns_pr(sv, p):
+                continue  # someone else's PR at the cap: no more fix rounds, and no reads to find that out
+        if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head, unavailable=True):
+            log(f"Global PR work: {stage} #{c.pr} source recently unavailable on this host — selecting other work")
+            w.selection_changed = True
+            continue
+        if (
+            stage == "review"
+            and not opts.dry_run
+            and peer_claims.diff_guarded(_claim_scope(w), c.pr, c.head)
+            and not any(p.number == c.pr and p.build_success for p in sv.open_prs)
+        ):
+            # The engine declined this head on the diff guards and would again: no work, not a
+            # passing collision. A green build at the head lifts the guards in the engine, so it does here.
+            continue
+        if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head):
+            log(f"Global PR work: {stage} #{c.pr} recently found claimed by a peer — skipping before fresh PR reads")
+            claim_collision = True
+            declined.append((stage, c.pr))
             continue
         if stage == "review" and not opts.dry_run and _review_claimed_elsewhere(w, c):
             log(f"Global PR work: review #{c.pr} claimed by a peer — skipping before fresh PR reads")
@@ -768,8 +965,25 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
             log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
         collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
-        rc = dispatch(stage, w, sv, c, opts)
-        claim_collision |= getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
+        w.review_claimed_by_peer = False
+        try:
+            rc = dispatch(stage, w, sv, c, opts)
+        except ReviewSourceUnavailable as error:
+            # One PR's source failing to fetch says nothing about the rest: spare peers the same
+            # attempt and move on. Repeated failures in one round look like an outage; back off.
+            peer_claims.note(_claim_scope(w), stage, c.pr, c.head, unavailable=True)
+            unavailable_sources.append((stage, c.pr))
+            if len(unavailable_sources) >= MAX_UNAVAILABLE_SOURCES:
+                raise
+            log(f"{error}; selecting other work")
+            w.selection_changed = True
+            declined.append((stage, c.pr))
+            continue
+        collided = getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
+        if rc is None and not opts.dry_run and (collided or w.review_claimed_by_peer):
+            # Spare every other worker on the host the fresh reads that found this collision.
+            peer_claims.note(_claim_scope(w), stage, c.pr, c.head)
+        claim_collision |= collided
         if rc is not None:
             return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
         declined.append((stage, c.pr))
@@ -796,7 +1010,10 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             if scope in (None, "auto") and not opts.dry_run and roadmap_targets() is None:
                 sv.roadmap_only = random_roadmap_area(w, focus=[])
                 log(f"Authoring roadmap: {sv.roadmap_only} (selected after existing PR work)")
-        rc = dispatch("roadmap", w, sv, Candidate(0, "", sv.roadmap_only), opts)
+        # An umbrella round authors in its drawn member; under a target list the list chooses.
+        umbrella = getattr(sv, "umbrella", None)
+        area = umbrella.area if umbrella is not None and umbrella.area else sv.roadmap_only
+        rc = dispatch("roadmap", w, sv, Candidate(0, "", area), opts)
         if rc is not None:
             return rc
 
@@ -844,6 +1061,8 @@ FILE_CHANGE_STAGES = {"rebase", "fix", "fix-ci", "bump", "lint-repair", "roadmap
 # Stages whose pushes the worker labels `self-tested` itself; automatic bumps use bump_attestation.
 SELF_TESTED_STAGES = {"rebase", "fix", "fix-ci", "lint-repair", "roadmap"}
 _MAX_CHANGED_FILES = 25
+# Source-preparation failures one round absorbs before backing off as a probable outage.
+MAX_UNAVAILABLE_SOURCES = 3
 
 
 def _checkout_head(cfg: Config) -> str | None:
@@ -1015,6 +1234,28 @@ def _description_repaired(w: Worker, c: Candidate, pre: dict, st: dict) -> bool 
     return repair(c.pr, pre["edited"], pre["ncomments"]) if repair else False
 
 
+def _published_branch_pr(w: Worker, c: Candidate, pre: dict) -> bool:
+    """Whether a branch this round published heads a new open PR carrying a tauceti-target marker.
+
+    git-safe-push records each branch a roadmap round pushes (`published_branches`), so the PR it
+    opened is one narrow head lookup away. That answer does not depend on listing every open PR,
+    which on a large source is many pages long and fails whenever any page does. False means only
+    that this lookup found nothing; the caller still compares the open PR listings."""
+    progress = getattr(c, "progress", None) or pre
+    owner = str(progress.get("published_owner") or "")
+    if not owner:
+        return False
+    before = pre.get("prs") or set()
+    for branch in sorted(progress.get("published_branches") or {}):
+        number = w.gh.pull_for_head(owner, branch)
+        if number is None or number in before:
+            continue
+        view = w.gh.pr_view(number, ["body"])
+        if view is not None and TARGET_MARKER_RE.search(view.get("body") or ""):
+            return True
+    return False
+
+
 def _progressed(w: Worker, c: Candidate, pre: dict | None) -> bool | None:
     # This post-spend acknowledgement can run before the write's webhook arrives.
     # Ordinary surveys still use the freshest mirrored data without age gates.
@@ -1031,7 +1272,8 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
     """True if the round left an observable mark (push / new PR / new issue-or-review comment).
     Missing evidence stays unknown; it never becomes an admission dependency."""
     if pre is None:
-        return None
+        # A roadmap round's own published branch still identifies its PR without a baseline.
+        return True if not c.pr and getattr(c, "progress", None) and _published_branch_pr(w, c, {}) else None
     if c.pr:
         if pre.get("published"):
             return True
@@ -1052,6 +1294,8 @@ def _progressed_direct(w: Worker, c: Candidate, pre: dict | None) -> bool | None
             # taken after the branch claim; unclaimed work stays unattributed.
             return True if pre.get("claimed_bubble") else None
         return False
+    if _published_branch_pr(w, c, pre):
+        return True
     now = _open_pr_numbers(w)
     if now is None:
         return None
@@ -1477,6 +1721,17 @@ def model_free_selection(only) -> bool:
     return bool(only) and all(_model_free(stage) for stage in only)
 
 
+def roadmap_round_target(sv, c) -> str:
+    """What a roadmap round's log line and runtime status name as its target; an umbrella round also
+    names its umbrella, and leaves the area to a target list when one chooses it."""
+    umbrella = getattr(sv, "umbrella", None)
+    if umbrella is None:
+        return f"new PR (area: {c.reason or 'any'})"
+    if umbrella.area is None:
+        return f"new PR (umbrella {umbrella.umbrella.name})"
+    return f"new PR (area: {umbrella.area}, umbrella {umbrella.umbrella.name})"
+
+
 def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -> int | None:
     """Perform one stage. Return its rc, or None to decline this candidate and try another.
 
@@ -1527,6 +1782,10 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         log(f"{stage} #{c.pr}: merge queue owns this PR; skipping ordinary maintenance")
         return None
     os.environ["TAUCETI_GITHUB_PR"] = str(c.pr or "")
+    from .worker_sources import activity_repository
+
+    # Activity receipts (push hook, admissions) key the PR by its forge.
+    os.environ["TAUCETI_GITHUB_REPOSITORY"] = activity_repository()
     _check_stage_read_quota(stage)
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
@@ -1572,6 +1831,16 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     actionable = _still_actionable(stage, w, sv, c, explicit=explicit)
     if actionable is False:
         return None
+    # Count only a fix confirmed against the live scoreboard: a partial-history candidate is let
+    # through to investigate without one, so it says nothing about whether review sent this head back.
+    if (
+        stage == "fix"
+        and actionable is True
+        and not c.partial_history
+        and c.pr not in bump_prs(sv)
+        and _fix_cap_reached(w, c)
+    ):
+        return _close_capped_pr(w, sv, c, explicit=explicit)
     from .claude_api import admission_failure
     from .fleet_capacity import admission_reason
 
@@ -1611,7 +1880,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     if c.pr:
         what = f"PR #{c.pr}  {source_pull_url(c.pr)}"
     elif stage == "roadmap":
-        what = f"new PR (area: {c.reason or 'any'})"
+        what = roadmap_round_target(sv, c)
     elif stage == "progress":
         what = c.reason or "roadmap progress report"
     else:
@@ -1741,7 +2010,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         with contextlib.suppress(Exception):
             from .fleet_events import emit
 
-            emit("pr_activity", repository=TAUCETI, pr=c.pr, activity=stage, head_sha=c.head)
+            emit("pr_activity", repository=activity_repository(), pr=c.pr, activity=stage, head_sha=c.head)
     return rc
 
 
@@ -1767,11 +2036,14 @@ def do_reconcile(w, sv, c, opts, bubble):
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
+    from . import review_app
     from .github_transport import blocked_since
 
+    app_env = None
     github_started = time.time()
     pr, head = c.pr, c.head
     reviewers = opts.work_model
+    strict_file_flags = claude_review_file_flags(reviewers)
     if reviewers in ("auto", ""):
         raise Die("review needs a concrete reviewer model (resolve --agent / quota first)")
     errkey = f"review-err-{pr}"
@@ -1809,19 +2081,27 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             km = _kiro_review_model(reviewers)
             from .retention import review_workspace
 
+            # A share of GitHub reviews publishes as the review App, a second GitHub identity with
+            # its own comment limit; the engine otherwise runs as the account. The scoreboard keeps
+            # the account as its submitter, so reviewer affinity still matches.
+            repository = getattr(w.gh, "review_repository", w.gh.repo)
+            if review_app.routes(repository, pr):
+                app_env = review_app.engine_overrides()
+                log(f"  review #{pr}: publishing as {app_env[review_app.LOGIN_ENV]}")
             with review_workspace(w.cfg) as scratch:
                 rc = run_to_logfile(
                     [
                         *runtime.command(),
                         str(pr),
                         "--repo",
-                        getattr(w.gh, "review_repository", w.gh.repo),
+                        repository,
                         "--workdir",
                         str(scratch),
                         "--store",
                         str(w.cfg.store_dir),
                         "--post",
                         "--no-sync",
+                        *strict_file_flags,
                         "--reviewer",
                         reviewers,
                         *(["--auth", "api"] if os.environ.get("TAUCETI_CLAUDE_BILLING") == "api" else []),
@@ -1830,9 +2110,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                         *(["--claude-model", claude_model] if claude_model else []),
                         *(["--codex-model", cm] if cm else []),
                         *(["--kiro-model", km] if km else []),
+                        *(["--submitted-by", review_publisher()] if app_env else []),
                     ],
                     logf,
                     f"review #{pr}",
+                    **({"env_overrides": app_env} if app_env else {}),
                 )
         log(f"  review #{pr}: engine rc={rc}")
         from .claude_api import check_result
@@ -1857,6 +2139,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             return None
         if rc == EX_CLAIM_COLLISION:  # Review engine: another run already owns this head; no inference or verdict.
             log(f"  review #{pr}: claimed by a peer — selecting other work")
+            w.review_claimed_by_peer = True
             return None
         if rc in (85, 86):
             reason = "publisher/record repair" if rc == 86 else "publication retry"
@@ -1869,7 +2152,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
 
             w.counters.write(retry_key(pr, head), int(time.time() + MAX_RETRY_AFTER) + 1)
             w.rs.bust(pr)
-            raise NoProgress(f"review #{pr}: source preparation unavailable before inference — not charged to the PR")
+            raise ReviewSourceUnavailable(
+                f"review #{pr}: source preparation unavailable before inference — not charged to the PR"
+            )
         if rc == 0:
             # Both changed and unchanged success prove the review is published.
             w.counters.write(errkey, 0)
@@ -1878,6 +2163,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 result = json.loads(result_file.read_text())
             except (OSError, ValueError):
                 result = None
+            if isinstance(result, dict) and result.get("head_sha") == head and result.get("outcome") == "diff-guard":
+                log(f"  review #{pr}: head fails the PR-level diff guards; peers skip it until a push")
+                peer_claims.note_diff_guard(_claim_scope(w), pr, head)
             if isinstance(result, dict) and result.get("head_sha") == head and result.get("changed") is False:
                 log(f"  review #{pr}: published verdict unchanged — selecting other work")
                 record = getattr(w.counters, "record_unchanged_review", None)
@@ -1917,8 +2205,13 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
             w.rs.bust(pr)
-        elif blocked_since(github_started):
+        elif blocked_since(github_started) or (app_env and review_app.blocked_since(github_started)):
             raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
+        elif rc == 2 and strict_file_flags:
+            raise NoProgress(
+                f"review #{pr}: Review command rejected the required Claude file-route configuration; "
+                "update the configured Review runtime — machine-wide, not charged to the PR"
+            )
         elif rc == REVIEW_PROVIDER_DOWN_EXIT:
             # The engine stopped because the reviewer's provider is unusable — a revoked credential or
             # an exhausted subscription window — and it deliberately posted nothing (TauCetiReview#117).
@@ -2308,8 +2601,10 @@ def _do_fixlike(
         # In-process routing: a Forgejo round reaches its own runtime's shim, never
         # whichever gh happens to be first on PATH.
         chk = gh_run(["gh", "pr", "checkout", str(pr), "--force", *unique], cwd=co)
+        if chk.returncode and _pull_ref_missing(chk, pr):
+            chk = _checkout_head_branch(co, p, head, unique[1] if unique else p.head_ref)
         if chk.returncode:
-            detail = ((chk.stderr or "") + (chk.stdout or "")).strip()[-200:]
+            detail = ends((chk.stderr or "") + (chk.stdout or ""), 200)
             log(f"  {label} #{pr}: gh pr checkout failed — skipping this attempt ({detail})")
             report_failure(f"{label} #{pr}: gh pr checkout failed: {detail or 'no diagnostic'}", code=1)
             return 1
@@ -2408,16 +2703,60 @@ def _adopted_authors_note(sv) -> str:
 
 def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:
     """Retire an owned, still-blocked head after its existing repair attempts; no model call."""
+    if w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS:
+        return None
+    return _close_owned_pr(
+        w,
+        sv,
+        c,
+        explicit=explicit,
+        detail="closing owned PR after spent repair attempts",
+        comment=f"Closing after {MAX_FIX_ATTEMPTS} repair attempts left review findings unresolved "
+        f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
+        "remaining findings using the current review rubric.",
+    )
+
+
+FIX_CAP_COMMENT = (
+    "Closing automatically: review has asked for changes again after {rounds} fix rounds, with no "
+    "approval in between, so the fleet is retiring this PR to keep things moving. The branch is kept, "
+    "so nothing is lost. It is completely fine to open a fresh PR with a different approach. Add the "
+    "`keep` label if you would rather it stay open; the fleet then leaves it unfixed."
+)
+
+
+def _close_capped_pr(w, sv, c, *, explicit=False) -> int | None:
+    """At the fix-round cap: close a PR the fleet maintains, and only stop fixing anyone else's.
+
+    Maintained PRs are the account's own and adopted Forgejo authors' (owns_pr). Any other PR the fleet
+    fixes, such as a contributor's, stays open; this host just stops offering it fix rounds."""
+    p = next((p for p in sv.open_prs if p.number == c.pr), None)
+    if not p or not owns_pr(sv, p) or p.automatic_bump or c.foreign_repair_base:
+        log(f"  fix #{c.pr}: {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds without an approval; no more fix rounds")
+        return None
+    rc = _close_owned_pr(
+        w,
+        sv,
+        c,
+        explicit=explicit,
+        detail=f"closing owned PR after {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds without an approval",
+        comment=FIX_CAP_COMMENT.format(rounds=MAX_FIX_ROUNDS_WITHOUT_APPROVAL),
+    )
+    if rc == 0:
+        peer_claims.clear_fixed_heads(_claim_scope(w), c.pr)  # a reopened PR starts a fresh count
+    else:
+        log(
+            f"  fix #{c.pr}: {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds without an approval; not closed, no more fix rounds"
+        )
+    return rc
+
+
+def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
+    """Close an owned PR still blocked at `c.head` with `comment`, after fresh checks; no model call."""
     from .github_transport import read_context
 
     p = next((p for p in sv.open_prs if p.number == c.pr), None)
-    if (
-        not p
-        or not owns_pr(sv, p)
-        or p.automatic_bump
-        or c.foreign_repair_base
-        or w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
-    ):
+    if not p or not owns_pr(sv, p) or p.automatic_bump or c.foreign_repair_base:
         return None
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
@@ -2440,28 +2779,15 @@ def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:
             from .activity import select
 
             select("fix")
-            report_runtime(
-                "running", phase="fix", target=f"PR #{c.pr}", detail="closing owned PR after spent repair attempts"
-            )
-            gh_run(
-                [
-                    "gh",
-                    "pr",
-                    "close",
-                    str(c.pr),
-                    "--repo",
-                    TAUCETI,
-                    "--comment",
-                    f"Closing after {MAX_FIX_ATTEMPTS} repair attempts left review findings unresolved "
-                    f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
-                    "remaining findings using the current review rubric.",
-                ]
-            )
+            report_runtime("running", phase="fix", target=f"PR #{c.pr}", detail=detail)
+            # The selected source's own repository: gh_run routes a Forgejo source's name to its forge.
+            repo = getattr(w.gh, "repo", "") or TAUCETI
+            gh_run(["gh", "pr", "close", str(c.pr), "--repo", repo, "--comment", comment])
             after = w.gh.pr_view(c.pr, ["state"])
             if not after or after.get("state") not in {"CLOSED", "MERGED"}:
                 raise NoProgress(f"fix #{c.pr}: automatic closure not confirmed; retrying without another model call")
         w.rs.bust(c.pr)
-        log(f"fix #{c.pr}: confirmed closure after spent repair attempts")
+        log(f"fix #{c.pr}: confirmed closure ({detail})")
         return 0
     finally:
         w.claims.stop_heartbeat()
@@ -3249,9 +3575,10 @@ def _open_link(item, source) -> str | None:
     return _pull_link(source, open_pr(item, source))
 
 
-def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, TargetItem]:
+def assign_target(w, path: Path, only: str, skip: list[str], within=None) -> tuple[Targets, TargetItem]:
     """Choose and claim this round's item of the operator's target list (docs/target-lists.md).
-    Returns the list under its live statuses and the item; NoProgress when there is none to take."""
+    Returns the list under its live statuses and the item; NoProgress when there is none to take.
+    `within` restricts the list to an umbrella's areas, which `only` then names (targets.candidates)."""
     from .config import SourceUnavailable
 
     listed = load_targets(path)
@@ -3264,7 +3591,7 @@ def assign_target(w, path: Path, only: str, skip: list[str]) -> tuple[Targets, T
         live = live_targets(listed, sources[0], sources[1:])
         # A multi-source round's inventory also names the other forge's open pull requests.
         live = overlay_live(live, inventory_keys(getattr(w, "cross_source_targets", None) or ()), set())
-        offered = candidates(live, only, skip)
+        offered = candidates(live, only, skip, within)
         for item in offered[:MAX_TARGET_TRIES]:
             name = f"{item.area}/{item.slug}"
             merged = next((link for source in sources if (link := _landed_link(item, source)) is not None), None)
@@ -3301,12 +3628,21 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     skip = roadmap_skip()
     assignment = ""
     targets_path = roadmap_targets()
+    # An umbrella round (docs/umbrellas.md) brings the member it drew as `c.reason`; a target list
+    # chooses among the umbrella's areas instead. Either way the area is then treated as pinned.
+    umbrella = getattr(sv, "umbrella", None)
     if targets_path is not None:
-        live, item = assign_target(w, targets_path, only, skip)
+        # An umbrella's list items count only in members that are roadmap areas now; the others wait.
+        within = None
+        if umbrella is not None:
+            within = umbrella.current or frozenset(m.area for m in umbrella_members_now(w, umbrella))
+        live, item = assign_target(w, targets_path, only, skip, within)
         only = item.area
         assignment = render_assignment(live, item)
         os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))
         report_runtime(target=f"new PR (target: {only}/{item.slug})", roadmap_target=f"{only}/{item.slug}")
+    elif umbrella is not None:
+        only = umbrella.area or random_umbrella_area(w, umbrella)
     elif only == "auto":  # no area pinned: pick a fresh random area this round (per-round, in-child)
         only = random_roadmap_area(w, focus=[])
         log(f"→ ROADMAP area: {only} (auto-picked, skipping {len(skip)})")
@@ -3386,6 +3722,7 @@ other contributors' claims, or the hard rules of the repo.
 {guidance}
 
 """
+    umbrella_text = umbrella_prompt(umbrella, only, assigned=targets_path is not None)
     if bubble:
         mounts = [f"{refs / 'roadmap'}:/opt/roadmap:ro", f"{refs / 'review'}:/opt/review:ro"]
         if bundle is not None:
@@ -3414,6 +3751,7 @@ other contributors' claims, or the hard rules of the repo.
                 ),
                 SOURCE_GUIDANCE=source_guidance,
                 EXTRA_ROADMAP_PROMPT=extra_guidance,
+                UMBRELLA=umbrella_text,
                 TARGET_LIST=assignment,
                 LOCAL_VERIFICATION=local_verification("ordinary", bubble),
                 QUALITY_SCOPE=quality_scope(),
@@ -3438,6 +3776,7 @@ other contributors' claims, or the hard rules of the repo.
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
         EXTRA_ROADMAP_PROMPT=extra_guidance,
+        UMBRELLA=umbrella_text,
         TARGET_LIST=assignment,
         LOCAL_VERIFICATION=local_verification("ordinary", bubble),
         QUALITY_SCOPE=quality_scope(),

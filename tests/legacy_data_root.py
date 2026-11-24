@@ -27,6 +27,35 @@ def _parent(pid):
             return None
 
 
+_REAL_PROCESSES = retention._processes  # fixtures patch the module attribute
+
+
+def _own_processes(mine, *, children=True):
+    """retention._processes limited to `mine` (and their children), read without touching others.
+
+    Unrelated processes that refuse inspection (a CI runner's own helpers, or another test's
+    sandboxed children) must not make these fixtures report "cannot be inspected".
+    """
+    if not Path("/proc/self/fd").is_dir():  # macOS: filter the full observation instead
+        observed = _REAL_PROCESSES()
+        if observed is None:
+            return None
+        kids = {pid for *_rest, pid in observed if children and _parent(pid) in mine}
+        return [entry for entry in observed if entry[3] in mine | kids]
+    observed = []
+    for process in Path("/proc").glob("[0-9]*"):
+        pid = int(process.name)
+        if pid not in mine and not (children and _parent(pid) in mine):
+            continue
+        try:
+            entry = retention._linux_process(process, os.getuid())
+        except OSError:
+            return None
+        if entry is not None:
+            observed.append(entry)
+    return observed
+
+
 class LegacyDataRoot(unittest.TestCase):
     def test_code_upgrade_reuses_data_and_cleanup_inventory(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -320,17 +349,8 @@ class LegacyDataRoot(unittest.TestCase):
         stack.enter_context(patch.object(purge, "VERIFY_TMP", base / "tmp"))
         stack.enter_context(patch.object(purge, "stop_services", return_value=[]))
         # Only this test's processes: real workers running on the host must not affect fixtures.
-        real = retention._processes
         mine = {os.getpid()}
-
-        def fixture_processes():
-            observed = real()
-            if observed is None:
-                return None
-            children = {pid for *_rest, pid in observed if _parent(pid) in mine}
-            return [entry for entry in observed if entry[3] in mine | children]
-
-        stack.enter_context(patch.object(retention, "_processes", side_effect=fixture_processes))
+        stack.enter_context(patch.object(retention, "_processes", side_effect=lambda: _own_processes(mine)))
         return stack
 
     def test_purge_removes_only_what_is_provably_ours(self):
@@ -798,11 +818,9 @@ class LegacyDataRoot(unittest.TestCase):
                 (alias / part).symlink_to(fixed / part)
             (fleet / "worker-data/roots.json").write_text(json.dumps(dict(roots={"alias": str(alias)})))
             mine = {os.getpid()}
-            real = retention._processes
 
             def fixture_processes():
-                observed = real()
-                return None if observed is None else [entry for entry in observed if entry[3] in mine]
+                return _own_processes(mine, children=False)
 
             for selected in (fixed, old):  # the drop-in updated; a worker not yet restarted
                 seen = []

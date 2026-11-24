@@ -6,6 +6,7 @@ a controllable clock and no inference. The tests are named after the acceptance 
 `docs/redesign/specs/ai-merge-queue.md`; the mapping is in `docs/queue/controller.md`.
 """
 
+import io
 import json
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import time
 import types
 import unittest
 import unittest.mock
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -25,6 +27,7 @@ from tauceti_queue import (  # noqa: E402
     escalation,
     feeds,
     monitoring,
+    repair_stall,
     stuck_heads,
 )
 from tauceti_queue import runtime as rt  # noqa: E402
@@ -33,6 +36,7 @@ from tauceti_queue.controller import (  # noqa: E402
     CANDIDATE_BUILD_STEP,
     CANDIDATE_HANDOFF_STEP,
     CANDIDATE_PUBLICATION_JOB,
+    DEFAULT_SETTINGS,
     LOG_GRACE_SECONDS,
     MERGED_TITLE_PREFIX,
     MISSING_SOURCE_WATCH,
@@ -690,6 +694,67 @@ class EscalationNotifier(unittest.TestCase):
                 escalation.notifier_from_environment({escalation.ZULIP_CONFIG_ENV: str(path)})
 
 
+class ProgressAlertNotifier(unittest.TestCase):
+    """The progress alert target reads TauCetiFleet's `fleet-alert --zulip-config` format."""
+
+    def test_a_stream_topic_target_posts_there_and_reconciles_in_that_topic(self):
+        calls = []
+
+        config = {
+            "site": "https://z.example",
+            "email": "bot@z",
+            "api_key": "k",
+            "stream": "ops",
+            "topic": "fleet health",
+        }
+        notifier = escalation.ZulipNotifier(config, streams=True)
+
+        class Opener:
+            def open(self, req, timeout):
+                calls.append((req.get_method(), req.full_url, req.data))
+                body = (
+                    {"result": "success", "messages": []}
+                    if req.get_method() == "GET"
+                    else {"result": "success", "id": 7}
+                )
+                return io.BytesIO(json.dumps(body).encode())
+
+        calls = []
+        # Through the real transport: a stream target names no recipient and still passes its checks.
+        with patch("tauceti_worker.audit_alerts.urllib.request.build_opener", lambda *_: Opener()):
+            self.assertEqual(notifier.send("m1", "hello m1", reconcile=True), "zulip 7")
+        self.assertIn("ops", urllib.parse.unquote(calls[0][1]))
+        posted = urllib.parse.parse_qs(calls[1][2].decode())
+        self.assertEqual(
+            posted, {"type": ["stream"], "to": ["ops"], "topic": ["fleet health"], "content": ["hello m1"]}
+        )
+        from tauceti_worker import audit_alerts
+
+        with (
+            self.assertRaises(ValueError),
+            patch("tauceti_worker.audit_alerts.urllib.request.build_opener", lambda *_: Opener()),
+        ):
+            audit_alerts.request(config, "POST", {})  # audit direct messages still need a recipient
+        with self.assertRaises(ValueError):
+            escalation.ZulipNotifier({k: v for k, v in config.items() if k != "stream"}, streams=True)
+
+    def test_the_target_comes_from_its_own_variable_and_must_be_private(self):
+        self.assertIsNone(escalation.progress_notifier_from_environment({}))
+        self.assertIsNone(
+            escalation.progress_notifier_from_environment({escalation.ZULIP_CONFIG_ENV: "/nonexistent"}),
+            "the escalation direct messages' configuration is not a progress alert target",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "fleet-alert-zulip.json"
+            path.write_text(json.dumps({"site": "https://z.example", "email": "e", "api_key": "k", "recipient_id": 5}))
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                escalation.progress_notifier_from_environment({escalation.PROGRESS_ALERT_CONFIG_ENV: str(path)})
+            path.chmod(0o600)
+            notifier = escalation.progress_notifier_from_environment({escalation.PROGRESS_ALERT_CONFIG_ENV: str(path)})
+            self.assertFalse(notifier.stream)
+
+
 class LoopTermination(QueueFixture):
     """A failing head is repaired by agents however often it fails: the queue never withdraws, bisects
     or evicts a member on its own (docs/queue/escalation.md). Infrastructure failures back off
@@ -795,7 +860,14 @@ class LoopTermination(QueueFixture):
         status = self.controller.status()
         self.assertEqual(status["head"]["stage"], "repair")
         self.assertFalse(any("holds after escalation" in alert for alert in status["alerts"]), status["alerts"])
-        self.assertEqual(status["loop_termination"], {"infrastructure_backoff": None})
+        self.assertEqual(
+            status["loop_termination"],
+            {
+                "infrastructure_backoff": None,
+                "repair_stalls": [],
+                "head_progress": status["loop_termination"]["head_progress"],
+            },
+        )
 
     def test_repeated_infrastructure_failures_back_off_automatically_and_recover(self):
         self.controller.set_setting("infrastructure_failure_limit", 2, "test")
@@ -892,6 +964,435 @@ class LoopTermination(QueueFixture):
         self.assertTrue(any("escalation (infrastructure-backoff)" in a for a in alerts), alerts)
 
 
+# The agent's last message on batch 465's repair task 1415, one of the 109 that said a human was needed.
+TASK_1415_CONCLUSION = """I made no changes to the batch: HEAD is still `cc0e44e29450`, the same chain the queue already rejected. No content change in the PRs will fix this failure, so the queue will reject this chain again. The batch has to be split, or `lint-env.sh` fixed, which a human has to do because `scripts/` is human-owned.
+
+**Why it fails.** It is the same LINT-ENV failure as every earlier attempt on this task:
+- `tasks/1415/logs/lint-env.log` shows `DocScanDriver.lean:3436/3437:0: error: maximum recursion depth reached in the code generator`.
+
+**Focused checks:**
+- `python3 .tauceti-repair/check`: `ok` (linear on `b608709b45f2`, trailers and subjects intact, clean tree)."""
+
+DRIVER_FAILURE = {
+    "kind": "lint",
+    "message": "LINT-ENV: FAIL — driver failure: the docstring-scan driver did not elaborate cleanly — see output above",
+    "module": "",
+}
+
+
+class StallSignature(unittest.TestCase):
+    """The failure signature and the agent's conclusion (`tauceti_queue/repair_stall.py`)."""
+
+    def test_identical_failures_share_a_signature_whatever_varies_between_runs(self):
+        first = {
+            "kind": "lint",
+            "module": "TauCeti.A",
+            "message": "A.lean:3436:0: error at deadbeef1 after 31.2s in /tmp/x1/y",
+        }
+        again = {
+            "kind": "lint",
+            "module": "TauCeti.A",
+            "message": "A.lean:12:0:  error at cafe0042 after 30.9s in /tmp/z9/y",
+        }
+        other = {"kind": "audit", "module": "TauCeti.A", "message": first["message"]}
+        elsewhere = dict(first, module="TauCeti.B")
+        tip = "c" * 40
+        self.assertEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [again]))
+        self.assertEqual(
+            repair_stall.signature(tip, [first, DRIVER_FAILURE]), repair_stall.signature(tip, [DRIVER_FAILURE, again])
+        )
+        self.assertNotEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [other]), "another check")
+        self.assertNotEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [elsewhere]))
+        self.assertNotEqual(
+            repair_stall.signature(tip, [first]), repair_stall.signature("d" * 40, [first]), "a new tip"
+        )
+        self.assertNotEqual(
+            repair_stall.signature(tip, [first]),
+            repair_stall.signature(tip, [dict(first, message="unused variable `x`")]),
+            "another message",
+        )
+
+    def test_the_conclusion_keeps_why_the_agent_cannot_progress(self):
+        text = repair_stall.conclusion(TASK_1415_CONCLUSION)
+        self.assertIn("a human has to do", text)
+        self.assertIn("No content change in the PRs will fix this failure", text)
+        self.assertNotIn("Focused checks", text)
+        self.assertLessEqual(len(text), repair_stall.CONCLUSION_LIMIT)
+        self.assertEqual(repair_stall.conclusion("Fixed the import.\n\nAll checks pass."), "Fixed the import.")
+        self.assertEqual(repair_stall.conclusion(None), "")
+
+    def test_the_backoff_doubles_up_to_its_maximum(self):
+        self.assertEqual(
+            [repair_stall.retry_delay(n, 1800, 14400) for n in range(6)], [1800, 3600, 7200, 14400, 14400, 14400]
+        )
+
+
+class StalledRepair(QueueFixture):
+    """A head repair that keeps checkpointing the same tip with the same findings is stalled: one
+    journal-only progress alert quoting the agent, a backoff before the next claim, and a resume when
+    its inputs change (docs/queue/escalation.md, "Stalled repair")."""
+
+    REVISION = "a" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+        self.github.ci_policy = lambda head, _base, _members: (
+            ("fail", [DRIVER_FAILURE]) if self.repo.file_at(head, "Bad.lean") is not None else ("pass", [])
+        )
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+
+    def checkpoint(self, revision=REVISION, findings=(DRIVER_FAILURE,), conclusion=TASK_1415_CONCLUSION):
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision=revision)
+        self.assertIsNotNone(task, "the task is offered")
+        notes = {"repair_checkpoint": list(findings), "worker_revision": revision, "agent_conclusion": conclusion}
+        result = self.controller.submit_task(
+            task.task_id, task.claim_token, task.tip, json.dumps(notes), checkpoint=True
+        )
+        self.assertEqual(result.reason, "repair-checkpoint")
+        self.clock.advance(780)  # each of 1415's claims took about 13 minutes
+        return task
+
+    def escalated(self, action):
+        return [e for e in self.controller.store.journal_entries("escalated") if e["detail"]["action"] == action]
+
+    def test_three_identical_checkpoints_alert_once_journal_only_and_back_off(self):
+        task = self.checkpoint()
+        self.checkpoint()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.checkpoint()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.tick()
+        # Journal-only until decision 135 configures a target: nothing goes to the operator's direct messages.
+        self.assertEqual(self.notifier.messages, [])
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "notify"}), 0)
+        entry = self.controller.store.row("outbox", {"kind": "progress-alert"})
+        self.assertEqual((entry["state"], entry["result"]), ("done", "journal-only"))
+        content = json.loads(entry["payload"])["content"]
+        self.assertIn("repair-stalled", content)
+        self.assertIn("a human has to do", content)
+        self.assertIn("driver failure", content)
+        status = self.controller.status()
+        alerts = [a for a in status["alerts"] if a.startswith("repair stalled")]
+        self.assertEqual(len(alerts), 1, status["alerts"])
+        self.assertIn(f"task {task.task_id}", alerts[0])
+        self.assertIn("AEDT", alerts[0])
+        self.assertIn("agent: ", alerts[0])
+        self.assertFalse(any("unclaimed for" in a for a in status["alerts"]), "backed off on purpose")
+        self.assertEqual(status["head"]["repair_stall"]["checkpoints"], 3)
+        # Backed off: the same code is not offered the task for 30 minutes, then 60, ...
+        self.assertIsNone(self.controller.claim_task("repair-3", "admin-worker", worker_revision=self.REVISION))
+        self.clock.advance(1800 - 780 - 60)
+        self.tick()
+        self.assertIsNone(self.controller.claim_task("repair", "admin-worker", worker_revision=self.REVISION))
+        self.clock.advance(60)
+        self.checkpoint()
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual((stall["checkpoints"], stall["retries"]), (4, 1))
+        self.assertEqual(stall["retry_at"] - (self.clock() - 780), 3600)
+        self.assertEqual(len(self.escalated("repair-stalled")), 1, "one alert per stall")
+        self.assertEqual(len(self.controller.store.journal_entries("repair-stall-backoff")), 1)
+
+    def test_a_worker_on_new_code_is_offered_the_stalled_task_at_once(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.assertIsNone(self.controller.claim_task("repair-3", "admin-worker", worker_revision=self.REVISION))
+        self.assertIsNone(self.controller.claim_task("old", "admin-worker"), "an unknown revision waits too")
+        # The fix is installed on one unit: its revision has not tried the task.
+        self.checkpoint(revision="b" * 40)
+        claimed = self.controller.store.journal_entries("repair-stall-claimed")
+        self.assertEqual(claimed[-1]["detail"]["reason"], "new-worker-revision")
+        # Same failure on the new code: still stalled, and both revisions now wait for the backoff.
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(stall["revisions"], [self.REVISION, "b" * 40])
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40))
+
+    def test_other_findings_end_the_stall_with_one_recovery_message(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.checkpoint(revision="b" * 40, findings=({"kind": "lint", "module": "TauCeti.A", "message": "simpNF"},))
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.assertFalse(any(a.startswith("repair stalled") for a in self.controller.status()["alerts"]))
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+
+    def test_a_new_head_version_ends_the_stall(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.clock.advance(1800)
+        self.tick()
+        task = self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        resolution = Resolution({"Bad.lean": "good\n"}, explanation="Fixed.")
+        agent = self.agent(script=lambda _task: {f"{PROJECT}#101": resolution})
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_disabled_stall_detection_keeps_offering_the_task(self):
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        for _ in range(5):
+            self.checkpoint()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+
+    def test_turning_detection_off_releases_a_stall_at_once(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+        self.tick()
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+
+    def test_every_revision_in_the_identical_run_has_tried_the_task(self):
+        self.checkpoint(revision="b" * 40)
+        self.checkpoint()
+        self.checkpoint()
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(stall["revisions"], ["b" * 40, self.REVISION])
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40))
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision="c" * 64))
+
+    def test_a_stall_that_recurs_is_told_again(self):
+        other = ({"kind": "lint", "module": "TauCeti.A", "message": "simpNF"},)
+        for findings in ((DRIVER_FAILURE,), other, (DRIVER_FAILURE,)):
+            for _ in range(3):
+                self.clock.advance(4 * 3600)
+                self.checkpoint(findings=findings)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stalled")), 3)
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "progress-alert"}), 5, "3 starts, 2 ends")
+
+    def test_a_configured_target_receives_the_progress_alert(self):
+        target = self.controller.progress_notifier = RecordingNotifier()
+        for _ in range(3):
+            self.checkpoint()
+        self.tick()
+        self.assertEqual(len(target.messages), 1)
+        self.assertIn("The agent's own conclusion", target.messages[0])
+        self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
+
+    def test_turning_the_head_alert_off_clears_an_active_one(self):
+        self.tick()
+        self.clock.advance(3 * 3600)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+        self.controller.set_setting("head_progress_alert_seconds", 0, "test")
+        self.tick()
+        self.assertFalse(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+        self.assertIsNone(self.controller.status()["loop_termination"]["head_progress"])
+
+    def test_revisions_from_a_long_identical_run_are_all_remembered(self):
+        for n in range(25):
+            self.clock.advance(4 * 3600)
+            self.checkpoint(revision=f"{n:040x}")
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(len(stall["revisions"]), 25)
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision=f"{0:040x}"))
+
+    def test_a_restart_starts_the_head_progress_period_again(self):
+        self.tick()
+        self.clock.advance(4 * 3600)  # the controller was down
+        self.controller._head_progress_anchored = False
+        self.tick()
+        self.assertEqual(self.escalated("head-no-progress"), [])
+        self.clock.advance(3 * 3600)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+
+    def test_a_head_without_progress_alerts_once_and_recovers(self):
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        self.tick()
+        for _ in range(3 * 3600 // 780 + 1):
+            self.checkpoint()
+            self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+        self.assertTrue(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+        self.tick(3)
+        self.assertEqual(len(self.escalated("head-no-progress")), 1, "one alert per period")
+        task = self.controller.claim_task("w", "admin-worker")
+        self.github.ci_policy = lambda *_: ("pass", [])
+        agent = self.agent(
+            script=lambda _task: {f"{PROJECT}#101": Resolution({"Bad.lean": "ok\n"}, explanation="Fixed.")}
+        )
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task)).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-progress-resumed")), 1)
+        self.assertFalse(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+
+
+class RepairReleaseStall(QueueFixture):
+    """A head repair whose claims keep ending as releases with the same error is stalled too: one
+    progress alert within a few claims, the task stays offered, and the stall ends when the error
+    changes or the task is settled (docs/queue/escalation.md, "Stalled repair"). Batch 506's repair
+    task 1521 was released 332 times in 7 hours with `KeyError: 'members'` and nobody was told."""
+
+    ERROR = "KeyError: 'members'"
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+        self.github.ci_policy = lambda head, _base, _members: (
+            ("fail", [DRIVER_FAILURE]) if self.repo.file_at(head, "Bad.lean") is not None else ("pass", [])
+        )
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+
+    def release(self, reason="artifacts_unavailable", error=ERROR, revision="a" * 40):
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision=revision)
+        self.assertIsNotNone(task, "the task stays offered")
+        self.controller.release_task(task.task_id, task.claim_token, reason, error)
+        self.clock.advance(120)  # task 1521's claims were given back every two minutes or so
+        return task
+
+    def escalated(self, action):
+        return [e for e in self.controller.store.journal_entries("escalated") if e["detail"]["action"] == action]
+
+    def test_identical_releases_alert_once_and_keep_the_task_offered(self):
+        task = None
+        for _ in range(3):
+            task = self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.tick()
+        entry = self.controller.store.row("outbox", {"kind": "progress-alert"})
+        self.assertEqual((entry["state"], entry["result"]), ("done", "journal-only"))
+        content = json.loads(entry["payload"])["content"]
+        self.assertIn("repair-stalled", content)
+        self.assertIn("KeyError: 'members'", content)
+        self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
+        alerts = [a for a in self.controller.status()["alerts"] if a.startswith("repair stalled")]
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn(f"task {task.task_id} given back 4 times", alerts[0])
+        self.assertIn("AEDT", alerts[0])
+        for _ in range(5):
+            self.release()  # no backoff: the same revision is offered the task at once
+        self.assertEqual(len(self.escalated("repair-stalled")), 1, "one alert per stall")
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual((stall["source"], stall["releases"]), ("releases", 9))
+        self.assertEqual(self.controller.store.journal_entries("repair-stall-claimed"), [])
+
+    def test_volatile_detail_and_stops_do_not_break_the_run(self):
+        self.release(error="SourcesUnavailable: ref /tmp/abc123/x (after 13 attempt(s))")
+        self.release(reason="worker-stopped", error="stopped")
+        self.release(error="SourcesUnavailable: ref /tmp/def456/y (after 12 attempt(s))")
+        self.release(reason="inference_unavailable", error="429")
+        self.release(error="SourcesUnavailable: ref /tmp/0987/z (after 13 attempt(s))")
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release(error="SourcesUnavailable: ref /tmp/fff/w (after 2 attempt(s))")
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+
+    def test_another_error_breaks_the_run_and_ends_a_stall(self):
+        for _ in range(3):
+            self.release()
+        self.release(error="ValueError: something else")
+        self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [], "the run restarted")
+        for _ in range(3):
+            self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.release(reason="agent_failed", error="the agent exited 1")
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_a_submission_breaks_the_run(self):
+        for _ in range(3):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="a" * 40)
+        notes = {"repair_checkpoint": [DRIVER_FAILURE], "worker_revision": "a" * 40}
+        self.controller.submit_task(task.task_id, task.claim_token, task.tip, json.dumps(notes), checkpoint=True)
+        self.clock.advance(120)
+        for _ in range(3):
+            self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+
+    def test_a_rejected_submission_ends_the_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="b" * 40)
+        result = self.controller.submit_task(task.task_id, task.claim_token, "0" * 40, "{}")
+        self.assertFalse(result.accepted)
+        self.controller.release_task(task.task_id, task.claim_token, "worker-stopped", "stopped")
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_identical_releases_after_a_submission_are_a_new_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="b" * 40)
+        self.assertFalse(self.controller.submit_task(task.task_id, task.claim_token, "0" * 40, "{}").accepted)
+        self.controller.release_task(task.task_id, task.claim_token, "artifacts_unavailable", self.ERROR)
+        self.clock.advance(120)
+        for _ in range(2):
+            self.release()  # no loop pass in between
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 2)
+        self.tick()
+        self.assertEqual(len(self.controller.status()["loop_termination"]["repair_stalls"]), 1)
+
+    def test_many_ignored_releases_do_not_hide_the_run(self):
+        for _ in range(3):
+            self.release()
+        for _ in range(30):
+            self.release(reason="worker-stopped", error="stopped")
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+
+    def test_settling_the_task_ends_the_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        agent = self.agent(
+            script=lambda _task: {f"{PROJECT}#101": Resolution({"Bad.lean": "ok\n"}, explanation="Fixed.")}
+        )
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task)).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_turning_release_detection_off(self):
+        self.controller.set_setting("repair_stall_releases", 0, "test")
+        for _ in range(6):
+            self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.controller.set_setting("repair_stall_releases", 4, "test")
+        for _ in range(4):
+            self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.controller.set_setting("repair_stall_releases", 0, "test")
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+
+    def test_the_head_alert_names_the_release_stall(self):
+        self.tick()
+        for _ in range(3 * 3600 // 120 + 2):
+            self.release()
+            self.tick()
+        entries = self.escalated("head-no-progress")
+        self.assertEqual(len(entries), 1)
+        self.assertIn("given back", entries[0]["detail"]["detail"])
+
+
 class WithdrawnAtAdoption(QueueFixture):
     """An adopted repair that empties an ordinary member sends it back to its author at once."""
 
@@ -935,6 +1436,9 @@ class WithdrawnAtAdoption(QueueFixture):
         self.assertIn(f"Accepted revision: `{row['head_sha']}`", body)
         self.assertIn("> Dropped F102.lean: it cannot compile against #101.", body)
         self.assertIn("What to do next: rebase onto `main`", body)
+        self.assertTrue(body.startswith(f"Merge-queue recovery for head `{row['head_sha'][:7]}`: "))
+        self.assertIn(f"<!--tauceti-rebase:v1 {row['head_sha']}-->", body.splitlines())
+        self.assertIn("needs-rebase", self.github.labels[102])
         self.assertNotIn("bors-staging", self.github.labels[102])
         self.assertEqual(self.controller.store.journal_entries("member-withdrawn-empty")[0]["detail"]["number"], 102)
         # The batch lands without it: no second comment, no close, not counted as landed or rejected.
@@ -967,8 +1471,8 @@ class WithdrawnAtAdoption(QueueFixture):
     def test_comment_delivery_survives_a_lost_response_and_restart_without_duplicates(self):
         post = self.github.post_comment
 
-        def post_then_fail(*args):
-            post(*args)
+        def post_then_fail(*args, **kwargs):
+            post(*args, **kwargs)
             raise RuntimeError("lost comment response")
 
         with patch.object(self.github, "post_comment", side_effect=post_then_fail):
@@ -980,7 +1484,7 @@ class WithdrawnAtAdoption(QueueFixture):
         restarted.recover()
         self.clock.advance(restarted.setting("outbox_retry_max_seconds"))
         restarted.tick()
-        self.assertEqual(restarted.store.count("outbox", {"key": "withdrawn-comment:2", "state": "done"}), 1)
+        self.assertEqual(restarted.store.count("outbox", {"key": "recovery-withdrawn:2", "state": "done"}), 1)
         self.assertEqual(len(self.github.comments_for(102)), 1)
 
     def test_a_withdrawn_member_merged_outside_the_queue_lands_with_its_batch(self):
@@ -1710,8 +2214,55 @@ class HeadOperations(QueueFixture):
         self.assertEqual(self.controller.inputs()[0]["state"], "cancelled")
         self.assertEqual(self.controller.inputs()[0]["reason"], "conflicts-with-main")
         self.tick()
-        self.assertIn("conflicts with `main`", self.github.comments_for(101)[0]["body"])
+        head = self.controller.inputs()[0]["head_sha"]
+        body = self.github.comments_for(101)[0]["body"]
+        self.assertIn("conflicts with `main`", body)
+        # A head-bound recovery request: workers rebase exactly this head, and the status labels stop
+        # calling it ready to merge.
+        self.assertTrue(body.startswith(f"Merge-queue recovery for head `{head[:7]}`: "))
+        self.assertIn(f"<!--tauceti-rebase:v1 {head}-->", body.splitlines())
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertNotIn("ready-to-merge", self.github.labels[101])
         self.assertIsNone(self.head())
+
+    def conflicting_approval(self):
+        self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
+        self.approve(
+            101, {"Shared.lean": "line one\nline two by 101\nline three\n"}, start=self.repo.rev_parse("main~1")
+        )
+
+    def test_a_failed_recovery_comment_leaves_the_labels_for_its_retry(self):
+        self.conflicting_approval()
+        with patch.object(self.github, "post_comment", side_effect=RuntimeError("comment refused")):
+            self.tick(2)
+        self.assertNotIn("needs-rebase", self.github.labels.get(101, set()), "labels never precede the comment")
+        self.clock.advance(self.controller.setting("outbox_retry_max_seconds"))
+        self.tick()
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertEqual(len(self.github.comments_for(101)), 1)
+
+    def test_a_recovery_request_for_a_head_already_replaced_is_dropped(self):
+        self.conflicting_approval()
+        self.tick(2)
+        entry = self.controller.store.row("outbox", {"kind": "recovery"})
+        payload = json.loads(entry["payload"])
+        self.github.labels[101] = {"ready-to-merge"}
+        self.github.prs[101]["head_sha"] = "f" * 40  # delivery delayed past a push
+        self.assertEqual(self.controller._perform("recovery", payload, self.clock()), "stale-head")
+        self.assertEqual(self.github.labels[101], {"ready-to-merge"}, "the new head's labels are not touched")
+        self.assertEqual(len(self.github.comments_for(101)), 1)
+
+    def test_a_conflict_request_removes_ready_to_merge_and_quotes_no_markers(self):
+        self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
+        self.approve(
+            101, {"Shared.lean": "line one\nline two by 101\nline three\n"}, start=self.repo.rev_parse("main~1")
+        )
+        self.github.labels.setdefault(101, set()).add("ready-to-merge")
+        self.tick(2)
+        self.assertEqual(self.github.labels[101] & {"needs-rebase", "ready-to-merge"}, {"needs-rebase"})
+        [comment] = self.github.comments_for(101)
+        markers = [line for line in comment["body"].splitlines() if line.startswith("<!--tauceti-")]
+        self.assertEqual(markers, [f"<!--tauceti-rebase:v1 {self.controller.inputs()[0]['head_sha']}-->"])
 
 
 class MissingSource(QueueFixture):
@@ -1811,6 +2362,9 @@ class MissingSource(QueueFixture):
         self.controller.set_setting("prepare_quiet_seconds", 0, "t")
         self.approve(101, {"TauCeti/Provider.lean": None, "TauCeti/Importer.lean": None})
         self.tick()
+        # A claimed preparation on the head's tip holds the batch; it needs a known-good tip (decision 174).
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         self.approve(102, {"TauCeti/Unrelated.lean": "module\ndef unrelated := 1\n"})
         self.tick()
         claim = self.controller.claim_task("preparer", "admin-worker")
@@ -1892,6 +2446,35 @@ class MissingSource(QueueFixture):
             self.drive()
         self.assertEqual(self.states(101), ["landed"])
         self.assertEqual(len(self.github.comments_for(101)), 2, "the refusal and the landing")
+
+    def test_a_long_standing_refusal_is_handed_to_its_worker_and_still_rechecked(self):
+        self.approve(101, {"TauCeti/Consumer.lean": "module\nimport TauCeti.Later\n"})
+        self.tick(2)
+        self.assertTrue(self.refused(101))
+        head = next(r for r in self.controller.inputs() if r["number"] == 101)["head_sha"]
+        [refusal] = self.github.comments_for(101)
+        self.assertNotIn("<!--tauceti-rebase:v1", refusal["body"], "the recheck gets the first window")
+        self.assertNotIn("needs-rebase", self.github.labels.get(101, set()))
+        row = next(r for r in self.controller.inputs() if r["number"] == 101)
+        evidence = json.loads(row["evidence"])
+        # The grace period runs from the first refusal, which survives truncated selection history.
+        self.assertEqual(evidence["missing_source_first_refused"], evidence["merge_selection"][0]["at"])
+        evidence["merge_selection"] = [dict(evidence["merge_selection"][0], at=self.clock() + 10**6)]
+        self.controller.store.update("inputs", {"id": row["id"]}, evidence=json.dumps(evidence))
+        self.clock.advance(self.controller.setting("missing_source_handoff_seconds"))
+        self.tick(2)
+        handoffs = [c for c in self.github.comments_for(101) if c["body"].startswith("Merge-queue recovery for head")]
+        self.assertEqual(len(handoffs), 1)
+        self.assertIn(f"<!--tauceti-rebase:v1 {head}-->", handoffs[0]["body"].splitlines())
+        self.assertIn("imports `TauCeti.Later`, but no source provides it", handoffs[0]["body"])
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertEqual(self.controller.store.count("journal", {"kind": "missing-source-handoff"}), 1)
+        self.tick(2)
+        self.assertEqual(self.controller.store.count("journal", {"kind": "missing-source-handoff"}), 1, "once per head")
+        # The refusal is still watched: the provider landing re-admits the unchanged head.
+        self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
+        self.tick()
+        self.assertEqual(self.states(101)[-1], "inserted")
 
     def test_removal_is_readmitted_once_main_drops_the_import(self):
         self.approve(101, {"TauCeti/Provider.lean": None})
@@ -2164,15 +2747,22 @@ class Preparation(QueueFixture):
 
         return policy
 
-    def scenario(self, prepare):
-        """A head in CI and an open batch with one broken member behind it; returns the batch and the agent."""
+    def scenario(self, prepare, pre_rebased=None, head_verified=True):
+        """A head in CI and an open batch with one broken member behind it; returns the batch and the agent.
+        The pre-rebased chain is prepared with `prepare` unless `pre_rebased` says otherwise, and only
+        on a head tip that passed its own verification (`head_verified`, decision 174)."""
         self.controller.set_setting("prepare_open_batches", prepare, "t")
+        if pre_rebased is not None:
+            self.controller.set_setting("prepare_pre_rebased", pre_rebased, "t")
         self.controller.set_setting("prepare_min_members", 3, "t")
         self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
         self.github.ci_policy = self.broken_content_policy()
         self.approve(101, {"TauCeti/Pr101.lean": "head\n"})
         self.tick()
         self.assertEqual(self.controller.status()["head"]["stage"], "ci")
+        if head_verified:
+            head = self.head()
+            self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         for number in (201, 202, 203):
             body = "BROKEN\n" if number == 202 else f"{number}\n"
             self.approve(number, {f"TauCeti/Pr{number}.lean": body})
@@ -2238,6 +2828,22 @@ class Preparation(QueueFixture):
         self.drive_until_landed(batch, [agent])
         self.assertEqual(self.source_failures(batch), 1)
         self.assertEqual([t.kind for t in agent.tasks], ["repair"])
+
+    def test_the_next_batch_is_not_verified_on_a_head_tip_without_its_own_verification(self):
+        """Decision 174: preparation of the pre-rebased chain is on by default, but only on a head tip that
+        passed its own local verification. On a head no worker verified, the next batch is pre-rebased
+        but neither built nor repaired there; it seals from that pre-rebase, its own CI round on `main`
+        finds the broken member, and the head's repair fixes it."""
+        self.assertTrue(DEFAULT_SETTINGS["prepare_pre_rebased"])
+        batch, agent = self.scenario(prepare=True, head_verified=False)
+        self.tick()
+        self.assertIsNone(agent.claim(self.controller), "nothing is verified on the head's tip")
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["pre_rebase_state"], "clean")
+        self.assertIn("has not passed its own verification", self.controller._pre_rebased_prepare_blocked(batch))
+        self.drive_until_landed(batch, [agent])
+        self.assertEqual(self.source_failures(batch), 1, "found by its own CI round, as the head")
+        self.assertEqual([t.kind for t in agent.tasks], ["repair"])
+        self.assertEqual(self.repo.file_at(self.repo.main_sha(), "TauCeti/Pr202.lean"), "202\n")
 
     def test_insertion_during_preparation_goes_to_the_next_batch_and_the_head_task_comes_first(self):
         batch, agent = self.scenario(prepare=True)
@@ -2305,6 +2911,115 @@ class Preparation(QueueFixture):
         self.drive_until_landed(batch, [repairer, preparer])
         self.assertEqual(self.source_failures(batch), 0, "prepared while the head was repaired")
         self.assertEqual([t.kind for t in preparer.tasks], ["prepare"])
+
+
+class OpenBatchRebaseOntoMain(QueueFixture):
+    """An open batch whose replay onto `main` conflicts gets a background `rebase_conflict` task onto
+    `main`; adopting it re-bases the batch, which is then prepared on `main`."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
+        self.controller.set_setting("prepare_min_members", 2, "t")
+        self.controller.set_setting("pre_rebase_enabled", False, "t")
+
+    def test_a_conflicting_open_batch_is_rebased_onto_main_by_a_worker_then_prepared_there(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        batch = self.open_batch()
+        main = self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"], task["base"]), ("rebase_conflict", main, batch["base"]))
+        self.tick()
+        self.assertEqual(
+            len(self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})), 1, "one task"
+        )
+
+        def resolve(claimed):
+            self.assertEqual(
+                (claimed.kind, claimed.batch_id, claimed.extra.get("background")),
+                ("rebase_conflict", batch["id"], True),
+            )
+            return {
+                f"{PROJECT}#202": Resolution(
+                    {"Shared.lean": "one\ntwo on main and by 202\nthree\n"}, explanation="Kept both line two edits."
+                )
+            }
+
+        resolver = self.agent("resolver", script=resolve)
+        self.assertTrue(resolver.run(self.controller).accepted)
+        rebased = self.open_batch()
+        self.assertEqual(rebased["id"], batch["id"])
+        self.assertEqual(rebased["base"], main)
+        self.assertGreater(rebased["version"], batch["version"])
+        self.assertIsNone(rebased["prepared_version"], "a rebase is not a preparation")
+        self.tick()
+        [prepare] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((prepare["kind"], prepare["base"]), ("prepare", main))
+
+    def prepared_batch(self):
+        """A head in CI and an open batch 202/203 prepared clean on its base."""
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        task = self.controller.claim_task("preparer", "admin-worker")
+        self.assertEqual(task.kind, "prepare")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        batch = self.open_batch()
+        self.assertEqual(batch["prepared_version"], batch["version"])
+        return batch
+
+    def test_a_prepared_batch_whose_replay_onto_main_conflicts_is_rebased_onto_main(self):
+        batch = self.prepared_batch()
+        main = self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
+
+    def test_a_prepared_batch_whose_replay_onto_main_is_clean_keeps_its_preparation(self):
+        batch = self.prepared_batch()
+        self.repo.advance_main({"Elsewhere.lean": "x\n"})
+        self.tick()
+        self.tick()
+        kept = self.open_batch()
+        self.assertEqual(
+            (kept["version"], kept["base"], kept["prepared_version"]),
+            (batch["version"], batch["base"], batch["version"]),
+        )
+        self.assertEqual(self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"}), [])
+        rebase_claims = self.controller.store.rows("claims", {"batch_id": batch["id"], "operation": "rebase"})
+        self.assertEqual(len(rebase_claims), 1, "replayed once, then remembered")
+
+    def test_insertion_goes_around_an_open_batch_being_rebased(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        batch = self.open_batch()
+        self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        claimed = self.agent("holder").claim(self.controller)
+        self.assertEqual((claimed.kind, claimed.batch_id), ("rebase_conflict", batch["id"]))
+        self.approve(204, {"TauCeti/P204.lean": "204\n"})
+        self.tick()
+        self.assertNotIn(
+            f"{PROJECT}#204",
+            [m["source_pr"] for m in self.members(self.controller.store.row("batches", {"id": batch["id"]}))],
+        )
 
 
 class SequencedBackgroundTasks(QueueFixture):

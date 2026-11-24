@@ -39,9 +39,9 @@ WHEN = ("after", "before", "off")  # TAUCETI_REPAIR_PUBLISH: after the submissio
 NICE = 10  # the niceness of the rehash and the upload
 # A publisher in a transient unit starts from the user manager, not the worker, so it inherits none
 # of the worker unit's priority: it joins the workers' slice (services/queue/tauceti-repair.slice)
-# and takes the same niceness and IO class as services/queue/tauceti-queue-repair.service.
+# and takes the same niceness, IO class and OOM score as services/queue/tauceti-queue-repair.service.
 SLICE = "tauceti-repair.slice"
-UNIT_PRIORITY = ("Nice=10", "IOSchedulingClass=best-effort", "IOSchedulingPriority=7")
+UNIT_PRIORITY = ("Nice=10", "IOSchedulingClass=best-effort", "IOSchedulingPriority=7", "OOMScoreAdjust=1000")
 RECORD = "publish.json"  # the background publication's record, in the task's logs/
 BACKGROUND_LOG = "publish.log"
 SPEC = "publish-spec.json"
@@ -321,6 +321,22 @@ def freeze_outputs(worktree: Path, revision: str, env: dict, logdir: Path, lake:
         return None
     if repair.git(worktree, "status", "--porcelain", "--untracked-files=no").strip():
         return None
+    # Lake trusts an output whose trace matches without reading it, so a truncated or empty output
+    # left by an interrupted write would be packed and published (batch 506, 24 Nov 2026). Publish
+    # nothing unless every output is the bytes its trace names.
+    from tauceti_queue import repair_outputs
+
+    try:
+        damaged = repair_outputs.damaged(worktree, env)
+    except (repair_outputs.Unavailable, OSError) as error:
+        log(f"not publishing {revision[:12]}: its outputs could not be checked ({error})")
+        return None
+    if damaged:
+        log(
+            f"not publishing {revision[:12]}: {len(damaged)} output(s) differ from their traces, "
+            + ", ".join(f"{d['module']} {Path(d['path']).name} ({d['size']} bytes)" for d in damaged[:5])
+        )
+        return None
     stage = worktree / ".lake/publication-stage"
     shutil.rmtree(stage, ignore_errors=True)
     argv = [*lake, "cache", "stage", ".lake/outputs.jsonl", ".lake/publication-stage"]
@@ -590,12 +606,15 @@ def start_background(
     systemd: bool | None = None,
     frozen: dict | None = None,
     python: str | None = None,
+    batch_id: str = "",
+    park: bool = False,
 ) -> dict:
     """Publish the worktree's outputs for ``revision`` in a process of its own and return at once.
 
     The publisher runs ``publish_outputs``, writes its record to ``logs/publish.json`` (``state``
-    ``published``, ``skipped`` or ``failed``) and its output to ``logs/publish.log``, and then removes
-    the worktree when ``remove_worktree`` (the caller leaves it in place for it). Under systemd
+    ``published``, ``skipped`` or ``failed``) and its output to ``logs/publish.log``, and then, when
+    ``remove_worktree`` (the caller leaves it in place for it), parks the worktree as the tree of
+    ``batch_id`` when ``park`` (its artifacts were prepared) or removes it (``repair_cleanup.retire``). Under systemd
     (``systemd``, by default when the worker runs in a unit) it is a transient unit of its own, so a
     stop or restart of the worker does not kill it. The returned record says whether it was
     ``launched``; when it was not, the worktree is still the caller's. Never raises.
@@ -630,6 +649,8 @@ def start_background(
         "lake": list(lake),
         "clone": str(clone) if clone else None,
         "remove_worktree": bool(remove_worktree and clone),
+        "batch_id": str(batch_id),
+        "park": bool(park),
         "nice": nice,
         "record": dict(record, state="running", launched=True),
     }
@@ -713,7 +734,7 @@ def run_spec(spec_path: Path) -> int:
 
 
 def _run_spec(spec_path: Path) -> int:
-    """The background publisher: publish as the spec says, write the record, then remove the worktree."""
+    """The background publisher: publish as the spec says, write the record, then park or remove the worktree."""
     spec = json.loads(spec_path.read_text())
     path = Path(spec["record"]["record"])
     worktree = Path(spec["worktree"])
@@ -741,10 +762,19 @@ def _run_spec(spec_path: Path) -> int:
     record["finished_at"] = time.time()
     repair.write_record(path, record)
     if spec.get("remove_worktree") and spec.get("clone"):
+        from tauceti_queue import repair_cleanup
+
         try:
-            repair.remove_worktree(Path(spec["clone"]), worktree)
+            repair_cleanup.retire(
+                Path(spec["clone"]),
+                worktree.parent.parent,
+                spec.get("batch_id", ""),
+                spec["task_id"],
+                worktree,
+                keep=bool(spec.get("park")),
+            )
         except Exception as error:
-            log(f"could not remove {worktree}: {type(error).__name__}: {error}")
+            log(f"could not park or remove {worktree}: {type(error).__name__}: {error}")
     return 0
 
 

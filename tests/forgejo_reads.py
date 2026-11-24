@@ -849,6 +849,154 @@ repository="one/Project"
             self.assertFalse(transport.update_shared(["other"], lambda rows: rows, **options))
 
 
+class IncrementalInventory(unittest.TestCase):
+    """A stored listing is refreshed from what changed, not listed again."""
+
+    def setUp(self):
+        from datetime import UTC, datetime
+        from urllib.parse import parse_qsl, urlsplit
+
+        from tauceti_tools.forge import Forgejo
+
+        self.forge = Forge("forgejo", "https://git.example.org")
+        self.repo = RepositoryRef(self.forge, "one/project")
+        self.client = Forgejo(self.forge, token="t" * 8)
+        self.now = time.time()
+        # number -> native state; three listing pages of open PRs, older ones last updated longer ago
+        self.prs = {
+            n: dict(open=True, updated=self.now - 3600 - 60 * (121 - n), head="a" * 40, mergeable=True)
+            for n in range(1, 121)
+        }
+        self.calls = []
+
+        def stamp(value):
+            return datetime.fromtimestamp(value, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        def native(n):
+            pr = self.prs[n]
+            return {
+                "number": n,
+                "title": "Proof",
+                "body": "",
+                "html_url": self.repo.pull_url(n),
+                "flow": 0,
+                "state": "open" if pr["open"] else "closed",
+                "merged": False,
+                "draft": False,
+                "mergeable": pr["mergeable"],
+                "user": {"id": 2, "login": "worker"},
+                "head": {
+                    "sha": pr["head"],
+                    "ref": f"roadmap/{n}",
+                    "label": f"roadmap/{n}",
+                    "repo": {
+                        "id": 7,
+                        "name": "project",
+                        "full_name": self.repo.name,
+                        "html_url": self.repo.url,
+                        "owner": {"id": 10, "login": "one"},
+                    },
+                },
+                "labels": [],
+                "updated_at": stamp(pr["updated"]),
+                "pull_request": {"merged": False},
+            }
+
+        def request(method, path, *args, **kwargs):
+            self.calls.append(path)
+            parsed = urlsplit(path)
+            query = dict(parse_qsl(parsed.query))
+            numbers = sorted(self.prs, reverse=True)
+            if parsed.path.endswith("/issues"):
+                wanted = query["state"] == "open"
+                numbers = [n for n in numbers if self.prs[n]["open"] == wanted]
+                if "since" in query:
+                    since = datetime.fromisoformat(query["since"]).timestamp()
+                    numbers = [n for n in numbers if self.prs[n]["updated"] >= since]
+            else:
+                numbers = [n for n in numbers if self.prs[n]["open"]]
+                if query.get("sort") == "recentupdate":
+                    numbers.sort(key=lambda n: self.prs[n]["updated"], reverse=True)
+            page, limit = int(query["page"]), int(query["limit"])
+            return [native(n) for n in numbers[(page - 1) * limit : page * limit]]
+
+        self.client.request = request
+        self.source = ForgejoReadSource(self.repo, self.client)
+
+    def numbers(self, inventory):
+        return [row["number"] for row in inventory["rows"]]
+
+    def test_a_refresh_reads_closures_changes_and_one_page_instead_of_the_whole_listing(self):
+        full = self.source.inventory(None)
+        self.assertEqual(self.numbers(full), list(range(120, 0, -1)))
+        self.assertEqual(full["sweep"], 1)
+        self.assertLess(full["since"], self.now - 3660)
+        self.assertEqual(len(self.calls), 4, "three pages and the empty page that ends them")
+        self.calls.clear()
+        self.prs[5].update(updated=time.time(), head="b" * 40)
+        self.prs[7].update(updated=time.time(), open=False)
+        refreshed = self.source.inventory(full)
+        self.assertNotIn(7, self.numbers(refreshed))
+        self.assertEqual(next(r for r in refreshed["rows"] if r["number"] == 5)["headRefOid"], "b" * 40)
+        self.assertEqual(self.numbers(refreshed), sorted(self.numbers(refreshed), reverse=True))
+        self.assertEqual(refreshed["sweep"], 2)
+        self.assertGreater(refreshed["since"], full["since"])
+        self.assertEqual(
+            [path.split("?")[0].rsplit("/", 1)[1] for path in self.calls], ["issues", "issues", "pulls", "pulls"]
+        )
+        self.assertEqual(sum("sort=recentupdate" in path for path in self.calls), 1)
+
+    def test_the_sweep_sees_unmoved_changes_and_drops_closures_the_index_missed(self):
+        inventory = self.source.inventory(None)
+        self.prs[15]["mergeable"] = False  # on the last page; its update time does not move
+        self.prs[60]["open"] = False  # closed without a newer update, so the closed feed misses it
+        for sweep in (1, 2):
+            self.assertEqual(inventory["sweep"], sweep)
+            inventory = self.source.inventory(inventory)
+            self.assertEqual(next(r for r in inventory["rows"] if r["number"] == 15)["mergeable"], "MERGEABLE")
+        inventory = self.source.inventory(inventory)
+        self.assertEqual(next(r for r in inventory["rows"] if r["number"] == 15)["mergeable"], "UNKNOWN")
+        self.assertIn(60, self.numbers(inventory), "absence from one page proves nothing")
+        self.calls.clear()
+        inventory = self.source.inventory(inventory)  # page 4 is empty: the sweep comes round
+        self.assertEqual(inventory["sweep"], 1)
+        self.assertNotIn(60, self.numbers(inventory))
+        self.assertEqual(len(self.numbers(inventory)), 119)
+        self.assertEqual(sum("state=open" in path and "/issues" in path for path in self.calls), 4)
+
+    def test_an_unusable_base_lists_in_full_and_a_failed_refresh_is_unavailable(self):
+        for previous in (
+            None,
+            [],
+            {"rows": []},
+            {"rows": [], "since": None, "sweep": 1},
+            {"rows": {}, "since": 1.0, "sweep": 1},
+        ):
+            self.calls.clear()
+            self.assertEqual(len(self.source.inventory(previous)["rows"]), 120)
+            self.assertNotIn("issues", " ".join(self.calls))
+        full = self.source.inventory(None)
+        from tauceti_worker import forgejo_reads
+
+        request = self.client.request
+        self.client.request = Mock(side_effect=ForgeError("busy", status=502))
+        with patch.dict(forgejo_reads._page_retrying.__kwdefaults__, sleep=lambda _: None):
+            self.assertIsNone(self.source.inventory(full))
+        self.assertEqual(self.client.request.call_count, 3, "one retried page; no full listing behind it")
+        self.assertEqual((self.source.last_failure.operation, self.source.last_failure.status), ("open_inventory", 502))
+
+        def rejecting(method, path, *args, **kwargs):
+            if "/issues?" in path:
+                raise ForgeError("unprocessable", status=422)
+            return request(method, path, *args, **kwargs)
+
+        # A refresh the server rejects would fail every time, so it lists in full instead.
+        self.client.request = rejecting
+        self.calls.clear()
+        self.assertEqual(len(self.source.inventory(full)["rows"]), 120)
+        self.assertEqual(sum("/pulls?" in path and "sort" not in path for path in self.calls), 4)
+
+
 class ListingPageRetries(unittest.TestCase):
     def setUp(self):
         from tauceti_tools.forge import Forgejo
