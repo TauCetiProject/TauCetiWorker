@@ -1915,8 +1915,10 @@ def do_overlap_fix(w, sv, c, opts, bubble):
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
+    from . import review_app
     from .github_transport import blocked_since
 
+    app_env = None
     github_started = time.time()
     pr, head = c.pr, c.head
     reviewers = opts.work_model
@@ -1958,13 +1960,20 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             km = _kiro_review_model(reviewers)
             from .retention import review_workspace
 
+            # A share of GitHub reviews publishes as the review App, a second GitHub identity with
+            # its own comment limit; the engine otherwise runs as the account. The scoreboard keeps
+            # the account as its submitter, so reviewer affinity still matches.
+            repository = getattr(w.gh, "review_repository", w.gh.repo)
+            if review_app.routes(repository, pr):
+                app_env = review_app.engine_overrides()
+                log(f"  review #{pr}: publishing as {app_env[review_app.LOGIN_ENV]}")
             with review_workspace(w.cfg) as scratch:
                 rc = run_to_logfile(
                     [
                         *runtime.command(),
                         str(pr),
                         "--repo",
-                        getattr(w.gh, "review_repository", w.gh.repo),
+                        repository,
                         "--workdir",
                         str(scratch),
                         "--store",
@@ -1980,9 +1989,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                         *(["--claude-model", claude_model] if claude_model else []),
                         *(["--codex-model", cm] if cm else []),
                         *(["--kiro-model", km] if km else []),
+                        *(["--submitted-by", review_publisher()] if app_env else []),
                     ],
                     logf,
                     f"review #{pr}",
+                    **({"env_overrides": app_env} if app_env else {}),
                 )
         log(f"  review #{pr}: engine rc={rc}")
         from .claude_api import check_result
@@ -2070,7 +2081,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
             w.rs.bust(pr)
-        elif blocked_since(github_started):
+        elif blocked_since(github_started) or (app_env and review_app.blocked_since(github_started)):
             raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
         elif rc == 2 and strict_file_flags:
             raise NoProgress(
