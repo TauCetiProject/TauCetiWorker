@@ -71,19 +71,25 @@ def register(**roadmaps):
 class Served:
     """A local HTTP server answering every GET with `status` and `payload`."""
 
-    def __init__(self, status=200, payload=b""):
+    def __init__(self, status=200, payload=b"", truncated=False):
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 self.send_response(outer.status)
+                if outer.truncated:  # one chunk of a chunked body, then the connection closes
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(outer.payload), outer.payload))
+                    self.close_connection = True
+                    return
                 self.end_headers()
                 self.wfile.write(outer.payload)
 
             def log_message(self, *_args):
                 pass
 
-        self.status, self.payload = status, payload
+        self.status, self.payload, self.truncated = status, payload, truncated
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/reports/register.json"
@@ -247,8 +253,8 @@ class Checks(unittest.TestCase):
 
 
 class Register(unittest.TestCase):
-    def fetch(self, status=200, payload=b""):
-        served = Served(status, payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+    def fetch(self, status=200, payload=b"", truncated=False):
+        served = Served(status, payload if isinstance(payload, bytes) else json.dumps(payload).encode(), truncated)
         self.addCleanup(served.close)
         log = []
         return rr.fetch_register(served.url, log.append, timeout=5), log
@@ -268,6 +274,12 @@ class Register(unittest.TestCase):
                 self.assertIsNone(value)
                 self.assertEqual(len(log), 1)
                 self.assertIn(words, log[0])
+        value, log = self.fetch(payload=b'{"version": 1, "roadmaps": {', truncated=True)
+        self.assertIsNone(value)
+        self.assertEqual(log, ["roadmap report register: unreadable (IncompleteRead); proceeding without it"])
+        value, log = self.fetch(payload=b"[" * 100000)
+        self.assertIsNone(value)
+        self.assertEqual(log, ["roadmap report register: not a version 1 register; proceeding without it"])
         log = []
         self.assertIsNone(rr.fetch_register("", log.append))
         self.assertIsNone(rr.fetch_register("http://127.0.0.1:9/none", log.append, timeout=2))
@@ -300,6 +312,10 @@ class Register(unittest.TestCase):
             "refuted by: `TauCeti.exists_rankOne_equivalent_not_diagonalChain`",
         )
         self.assertNotIn("rm -rf", block)
+        names = rr.known_reports(
+            register(A=[entry(replaces=["TauCeti..x", "TauCeti.<x>", "@TauCeti.x", "TauCeti.x", "TauCeti.x."])])
+        )
+        self.assertEqual(names[0].replaces, ("TauCeti.x",))  # the marker's own name rule
         self.assertNotIn("fixed one", block)
         self.assertNotIn("elsewhere", block)
         self.assertIn("elsewhere", rr.known_block(known, None))
@@ -390,6 +406,9 @@ class Round(unittest.TestCase):
         with patch.dict(os.environ, TAUCETI_ROADMAP_REPORT_REGISTER=served.url):
             self.round()
         self.assertIn('(false-statement, open): "known statement"; corrected by:', self.prompt)
+        # Known is not a reason to omit the report: the PR still carries section and marker.
+        self.assertIn("Your PR still carries the `### Roadmap report` section and its marker", self.prompt)
+        self.assertNotIn("do not report it again", self.prompt)
         self.assertNotIn("gone", self.prompt)
         self.assertNotIn("elsewhere", self.prompt)
         with patch.dict(os.environ, TAUCETI_ROADMAP_REPORT_REGISTER=served.url):
@@ -422,6 +441,9 @@ class Wiring(unittest.TestCase):
                 with self.subTest(path=path):
                     text = path.read_text()
                     self.assertIn("Never write to the roadmaps.", text)
+                    if name == "roadmap.md":
+                        self.assertIn("Your PR still carries the `### Roadmap report` section", text)
+                        self.assertIn("do not depart from the roadmap on that ground", text)
                     self.assertTrue("roadmap report (below)" in text or "reported in this PR's description" in text)
         staged = (Path("/srv/state/refs/roadmap"), "c" * 40)
         for roadmap, bubble, words in (

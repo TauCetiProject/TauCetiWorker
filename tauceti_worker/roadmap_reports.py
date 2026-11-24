@@ -15,6 +15,7 @@ gh-safe-pr-create run inside the sandbox, loads this file on its own.
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import sys
@@ -50,6 +51,7 @@ def declaration_name(value) -> bool:
     """Whether `value` is a declaration name as `refutes` and `replaces` hold them (at most 200 characters)."""
     return isinstance(value, str) and len(value) <= MAX_NAME and _NAME.fullmatch(value) is not None
 
+
 # The board's register of known reports (docs/roadmap-reports.md). Blank turns the read off.
 REGISTER_URL = "https://raw.githubusercontent.com/TauCetiProject/TauCetiRoadmapJobs/main/reports/register.json"
 REGISTER_LIMIT = 1 << 20  # bytes read at most; a larger register is ignored
@@ -57,8 +59,6 @@ REGISTER_STATES = ("open", "confirmed", "rejected", "fixed")
 # What the authoring prompt shows of the register, at most.
 MAX_KNOWN = 20
 MAX_KNOWN_CHARS = 6000
-# A name the prompt shows unquoted: a Lean declaration name, nothing that could carry markup.
-_DECLARATION = re.compile(r"[^\W\d][\w.'!?₀-₉]{0,199}")
 
 
 def normalise(text: str) -> str:
@@ -115,7 +115,9 @@ def fetch_register(url: str, log, *, timeout: float = 10) -> dict | None:
         if error.code != 404:
             log(f"roadmap report register: HTTP {error.code}; proceeding without it")
         return None
-    except (urllib.error.URLError, OSError, ValueError) as error:
+    # Any failure while reading the body too: a truncated chunked response raises IncompleteRead,
+    # an HTTPException; a timeout mid-read is an OSError.
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as error:
         log(f"roadmap report register: unreadable ({type(error).__name__}); proceeding without it")
         return None
     if len(data) > REGISTER_LIMIT:
@@ -123,7 +125,7 @@ def fetch_register(url: str, log, *, timeout: float = 10) -> dict | None:
         return None
     try:
         value = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         value = None
     if not isinstance(value, dict) or value.get("version") != 1 or not isinstance(value.get("roadmaps"), dict):
         log("roadmap report register: not a version 1 register; proceeding without it")
@@ -154,7 +156,7 @@ def known_reports(register: dict | None) -> list[Known]:
                 key: tuple(
                     name
                     for name in (entry.get(key) if isinstance(entry.get(key), list) else ())[:MAX_NAMES]
-                    if isinstance(name, str) and _DECLARATION.fullmatch(name)
+                    if declaration_name(name)
                 )
                 for key in ("refutes", "replaces")
             }

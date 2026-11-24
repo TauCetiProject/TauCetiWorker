@@ -80,11 +80,17 @@ The prompt lists the register's entries for the round's roadmap and the roadmaps
 in it, or for every roadmap when the round's roadmap is `any`, at most 20 entries and
 6000 characters, with a count of the rest. Each line is built from validated fields only:
 the roadmap and file, the kind, the state, the anchor JSON-quoted on one line, and the
-`replaces` and `refutes` names that look like declaration names. The prompt frames them as
-untrusted data. `open` and `confirmed` entries are not to be reported again, and a target
-that depends on one builds on the corrected statement it names. `rejected` entries were
-found not to be errors and are reported again only with more than a claim. `fixed`
-entries, and entries in states or with fields the worker does not recognise, are left out.
+`replaces` and `refutes` names that pass the marker's declaration-name rule. The prompt frames them as
+untrusted data. The register saves rediscovery, not the report: an `open` or `confirmed`
+entry is a known error the agent need not re-derive, and a target that depends on one
+builds on the corrected statement it names; a PR that departs from its roadmap because
+of that error still carries the section and marker, and the board records the PR as a
+further source of the same report. A `rejected` entry was checked and the roadmap found
+right as written, so the agent departs from the roadmap on that ground only if it can
+prove more than a claim, and then reports it with the proving declaration in `refutes`.
+`fixed` entries, and entries in states or with fields the worker does not recognise, are
+left out. The register is read fail-open: a truncated or interrupted response, a timeout
+or undecodable JSON counts as no register.
 
 A round that opens no pull request leaves no report: reports travel only in pull request
 descriptions, where the work behind them is checked and reviewed.
