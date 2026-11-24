@@ -145,6 +145,7 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert all(r["cache_dir"] == env["LAKE_CACHE_DIR"] and r["restore"] == "1" for r in records)
     assert not Path(launched[0][1]["env"]["LAKE_CONFIG"]).exists()  # cleaned after the agent exits
     assert all(r["cwd"] == str(co) for r in records)
+    assert launched[0][1]["env"].get(agents.PR_CACHE_INSTALLED) == "1"  # the agent's wrapper skips its fetch
     print("[OK] TauCeti's cache fetched before launch in the selected workspace, Mathlib never")
 
     rc, records, _ = run("Mathlib-fail")
@@ -174,11 +175,15 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
     assert rc == 0 and len(launched) == 1 and len(records) == 3
     assert records[1]["args"][-4:] == ["--rev", "b" * 40, "--toolchain", "leanprover/lean4:v4.35.0-rc3"]
     assert records[2]["args"][-4:] == ["--rev", "c" * 40, "--toolchain", "leanprover/lean4:v4.35.0-rc3"]
+    assert launched[0][1]["env"].get(agents.PR_CACHE_INSTALLED) == "1"
     rc, records, text = run("workspace-error")
     assert rc == 0 and len(launched) == 1 and len(records) == 1
-    for mode in ("dependency-error", "invalid-toolchain"):
-        rc, records, _ = run(mode)
+    # Nothing was installed, so the repair agent fetches itself once the workspace loads; an
+    # inherited marker from an earlier round never survives into this one.
+    for mode in ("workspace-error", "dependency-error", "invalid-toolchain"):
+        rc, records, _ = run(mode, **{agents.PR_CACHE_INSTALLED: "1"})
         assert rc == 0 and len(launched) == 1 and len(records) == 1
+        assert agents.PR_CACHE_INSTALLED not in launched[0][1]["env"], mode
     for mode in (
         "dependency-network",
         "dependency-network-connect",
@@ -549,13 +554,16 @@ with tempfile.TemporaryDirectory() as tmp:
     marker.parent.mkdir(parents=True)
     marker.write_text(json.dumps({"pool": str(root / "pool"), "key": "k", "rev": "abc"}))
 
-    def lake(*args, view=True, pin="abc", path=None, cwd=None):
+    def lake(*args, view=True, pin="abc", path=None, cwd=None, installed=False):
         (co / "lake-manifest.json").write_text(json.dumps({"packages": [{"name": "mathlib", "rev": pin}]}))
         path = path or f"{wrapper}:{real}"
         env = {**os.environ, "PATH": f"{path}:{os.environ['PATH']}", "TAUCETI_VERIFY_PYTHON": sys.executable}
         env.pop("TAUCETI_SHARED_MATHLIB_VIEW", None)
+        env.pop(agents.PR_CACHE_INSTALLED, None)
         if view:
             env["TAUCETI_SHARED_MATHLIB_VIEW"] = json.dumps(["bwrap"])
+        if installed:
+            env[agents.PR_CACHE_INSTALLED] = "1"
         return agents.subprocess.run(
             [str(wrapper / "lake"), *args], cwd=cwd or co, env=env, capture_output=True, text=True, timeout=30
         )
@@ -577,6 +585,27 @@ with tempfile.TemporaryDirectory() as tmp:
     update = lake("update")
     assert update.returncode == 1 and "only the worker resolves" in update.stderr and not update.stdout, update
     assert lake("update", view=False).stdout.strip() == "real-lake update"
+    # Once the worker installed TauCeti's outputs, the agent's own TauCeti fetch is answered as done:
+    # run, it would rewrite the expanded private mappings to archives and unpack private copies.
+    fetch = ("cache", "get", "--service", "tauceti-public", "--repo", "TauCetiProject/TauCeti", "--max-revs=100")
+    for view in (True, False):
+        for args in (fetch, ("-q", *fetch), ("--dir", str(co), *fetch), ("cache", "get", "--rev", "abc")):
+            done = lake(*args, view=view, installed=True, cwd=root if "--dir" in args else None)
+            assert done.returncode == 0 and "real-lake" not in done.stdout, (view, args, done)
+            assert "nothing to fetch" in done.stderr, done
+        # Without the marker (the worker could not fetch for this workspace) the fetch runs.
+        assert lake(*fetch, view=view).stdout.strip() == "real-lake " + " ".join(fetch)
+        # Help is help, and a `get` after `--` is not the subcommand.
+        for args in (("cache", "get", "--help"), ("-h", "cache", "get"), ("cache", "--", "get")):
+            shown = lake(*args, view=view, installed=True)
+            assert shown.stdout.strip() == "real-lake " + " ".join(args), (args, shown)
+        # Only Lake's own `cache get`: other cache subcommands and builds run as before.
+        assert lake("cache", "put", "x", view=view, installed=True).stdout.strip() == "real-lake cache put x"
+        assert lake("build", "Foo", view=view, installed=True).stdout.strip() == "real-lake build Foo"
+    # Outside a shared view the marker never brings in the Mathlib refusals.
+    assert lake("exe", "cache", "get", view=False, installed=True).stdout.strip() == "real-lake exe cache get"
+    assert lake("update", view=False, installed=True).stdout.strip() == "real-lake update"
+    assert lake("build", "Foo", pin="def", view=False, installed=True).stdout.strip() == "real-lake build Foo"
     # Every spelling of the extraction is refused: options, aliases, qualified names, forced unpack.
     for args in (
         ("-q", "exe", "cache", "get"),
@@ -609,6 +638,9 @@ with tempfile.TemporaryDirectory() as tmp:
     nested = lake("env", "lake", "exe", "cache", "get")
     assert nested.returncode == 0 and "real-lake" not in nested.stdout, nested
     assert lake("env", "lake", "build").stdout.strip() == "real-lake build"
+    for view in (True, False):
+        nested = lake("env", "lake", *fetch, view=view, installed=True)
+        assert nested.returncode == 0 and "real-lake" not in nested.stdout, nested
     assert lake("--config", "c.json", "env", "lake", "build").stdout.strip() == "real-lake build"
     assert lake("env", "", "lake", "build").stdout.strip() == "real-lake build"
     # Aliases of the wrapper's own directory never make it exec itself.
@@ -616,3 +648,18 @@ with tempfile.TemporaryDirectory() as tmp:
         looped = lake("build", path=f"{alias}:{real}", view=False, cwd=wrapper.parent if alias == "scripts" else None)
         assert looped.stdout.strip() == "real-lake build", (alias, looped)
 print("[OK] the agent's lake wrapper refuses Mathlib cache fetches inside a shared view")
+
+# The worker's own fetches (a corrupt-archive refetch runs after the marker is set) never see it,
+# so the wrapper on PATH cannot answer them without fetching.
+with tempfile.TemporaryDirectory() as tmp:
+    out = Path(tmp) / "out"
+    with out.open("wb") as output:
+        rc = agents._cache_fetch(
+            ["sh", "-c", 'echo "marker=${TAUCETI_PR_CACHE_INSTALLED:-unset}"'],
+            Path(tmp),
+            {**os.environ, agents.PR_CACHE_INSTALLED: "1"},
+            output,
+            30,
+        )
+    assert rc == 0 and out.read_text().strip() == "marker=unset", out.read_text()
+print("[OK] the worker's own cache fetches never carry the agent's installed marker")

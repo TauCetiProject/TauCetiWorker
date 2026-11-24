@@ -489,6 +489,15 @@ restores CI's outputs by hard link. Modules CI has not published are the agent's
 are left alone. The receipt counts `ci_disagreeing_traces`, `ci_disagreeing_removed` and
 `ci_disagreeing_skipped` (deferred because a file was busy).
 
+Agents do not fetch TauCeti's cache themselves. Run with the worker's private `LAKE_CACHE_DIR`,
+`lake cache get` would rewrite every mapping preparation expanded back to its archive, Lake would
+unpack a private copy of each module it then builds, and the next preparation would rewrite the
+mappings again. Once preparation has fetched for the checkout and current main, the agent gets
+`TAUCETI_PR_CACHE_INSTALLED=1`, and its `lake` wrapper (`scripts/lake-guard.py`) answers
+`lake cache get` as done without running Lake. A round whose workspace the worker could not load
+(left to the agent to repair) gets no marker, and the agent's own fetch runs as before. Outputs a
+rebase needs from a main commit newer than preparation's are built locally.
+
 #### Waiting for a matching TauCeti cache
 
 `lake cache get --max-revs=N` installs the newest published revision in the last N commits.

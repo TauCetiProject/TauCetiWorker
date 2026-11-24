@@ -1,15 +1,22 @@
-"""The shared-Mathlib-view half of the agent's `lake` wrapper (see scripts/lake).
+"""The guarded half of the agent's `lake` wrapper (see scripts/lake).
 
 argv: REAL_LAKE WRAPPER_DIR LAKE_ARGS...
 
-Refuses `lake update` (dependency resolution belongs to the worker's trusted publisher, and the
-shared sources are read-only) and every spelling of Mathlib's archive extraction (`lake [opts] exe|exec [opts]
-[pkg/]cache [opts] get|get!|unpack|unpack!`): if the workspace's Mathlib pin still matches the
-shared entry there is nothing to fetch (exit 0); if it has moved, building would compile Mathlib
-privately, so the agent must stop and report (exit 1). `lake env CMD...` would put the
-toolchain's own `lake` first on CMD's PATH, so CMD runs with this wrapper restored in front.
-Everything else runs the real `lake` unchanged. This is a guard against accidental private
-copies, not the enforcement boundary: the per-round quota is.
+Once the worker has fetched and installed TauCeti's outputs for the round
+(`TAUCETI_PR_CACHE_INSTALLED=1`), Lake's own `lake cache get` exits 0 without running: the
+worker's preparation already expanded those outputs into the host's shared pool and pointed this
+round's private Lake cache at them. A fetch into that private cache would rewrite each expanded
+mapping back to its archive, Lake would unpack a private copy of every module it then builds, and
+the next preparation would rewrite the mappings again.
+
+Inside a shared Mathlib view it also refuses `lake update` (dependency resolution belongs to the
+worker's trusted publisher, and the shared sources are read-only) and every spelling of Mathlib's
+archive extraction (`lake [opts] exe|exec [opts] [pkg/]cache [opts] get|get!|unpack|unpack!`): if
+the workspace's Mathlib pin still matches the shared entry there is nothing to fetch (exit 0); if
+it has moved, building would compile Mathlib privately, so the agent must stop and report (exit 1).
+`lake env CMD...` would put the toolchain's own `lake` first on CMD's PATH, so CMD runs with this
+wrapper restored in front. Everything else runs the real `lake` unchanged. This is a guard against
+accidental private copies, not the enforcement boundary: the per-round quota is.
 """
 
 import json
@@ -82,10 +89,21 @@ def pin_matches(workspace):
     return found is not None and found[0] == found[1]
 
 
+def fetch(args, words):
+    """Is this Lake's own `cache get`, as its first two words, both before any `--`?"""
+    end = args.index("--") if "--" in args else len(args)
+    return len(words) >= 2 and words[1] < end and [args[i] for i in words[:2]] == ["cache", "get"]
+
+
+def shared_view():
+    return os.environ.get("TAUCETI_SHARED_MATHLIB_VIEW", "") not in ("", "[]")
+
+
 def main(real, wrapper, args):
     workspace, words = parse(args)
     command = [args[i] for i in words]
-    if sub := extraction(command):
+    view = shared_view()
+    if view and (sub := extraction(command)):
         if pin_matches(workspace):
             print(
                 f"lake exe cache {sub}: Mathlib is provided by this host's shared build; nothing to fetch.",
@@ -98,7 +116,7 @@ def main(real, wrapper, args):
         )
         print("Do not build or fetch Mathlib here. Stop and report that the Mathlib pin changed.", file=sys.stderr)
         return 1
-    if command[:1] == ["update"] and pins(workspace) is not None:
+    if view and command[:1] == ["update"] and pins(workspace) is not None:
         # Resolution rewrites lake-manifest.json and fetches into the shared, read-only sources.
         print(
             "lake update: Mathlib and its dependencies come from this host's shared build, which only the"
@@ -106,7 +124,7 @@ def main(real, wrapper, args):
             file=sys.stderr,
         )
         return 1
-    found = pins(workspace)
+    found = pins(workspace) if view else None
     if found and found[0] != found[1] and not ({"--version", "-h", "--help"} & set(args) or command[:1] == ["help"]):
         # Typically a rebase round before it has integrated main: the shared build is main's
         # Mathlib, and running Lake on the old pin would compile that old Mathlib privately.
@@ -117,6 +135,18 @@ def main(real, wrapper, args):
             file=sys.stderr,
         )
         return 1
+    if (
+        os.environ.get("TAUCETI_PR_CACHE_INSTALLED") == "1"
+        and fetch(args, words)
+        and not ({"--help", "-h"} & set(args[: args.index("--")] if "--" in args else args))
+    ):
+        print(
+            "lake cache get: the worker already installed TauCeti's published outputs for this checkout"
+            " and for current main from this host's shared cache; nothing to fetch. Build directly: a"
+            " fetch here would replace them with private archive copies.",
+            file=sys.stderr,
+        )
+        return 0
     if command and command[0] == "env" and len(words) > 1:
         cut = words[1]
         shim = 'PATH="$0:$PATH"; export PATH; exec "$@"'

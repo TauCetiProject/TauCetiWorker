@@ -89,7 +89,9 @@ process. Lock waits are bounded to 25 minutes, then the round stops with the rea
 
 Agents never fetch or resolve Mathlib: the agent-facing `lake` wrapper refuses
 `lake exe cache get` and `lake update` inside a view, and refuses every Lake command while
-the checkout's Mathlib pin differs from the view's. Rebase and repair rounds whose pin is
+the checkout's Mathlib pin differs from the view's. It also answers TauCeti's own
+`lake cache get` as done once the worker has installed those outputs (docs/workers.md, after
+the description of hydration). Rebase and repair rounds whose pin is
 refused prepare main's Mathlib before the agent starts, so integrating main brings the pins
 back into agreement. Verification snapshots keep the package links and copy no Mathlib
 bytes.
