@@ -461,6 +461,10 @@ class ClaimCollision(NoProgress):
     """Available candidates were claimed by peers; reselect without failure backoff."""
 
 
+class ReviewSourceUnavailable(NoProgress):
+    """A selected review's source could not be prepared before inference; other PRs may still be workable."""
+
+
 class ProgressPreparationUnavailable(NoProgress):
     """Mechanical progress preparation needs time or infrastructure, without a paid attempt."""
 
