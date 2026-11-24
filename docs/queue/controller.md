@@ -432,6 +432,15 @@ batch's preparation of its pre-rebased chain ranks with its `pre_rebase`, ahead 
 own-base preparation, and when the background slots are full it takes the newest such preparation's
 slot (`pre-rebase-first`), as the `pre_rebase` does.
 
+Sealing only what was verified (decision 174, step 3; it replaces decision 172's B): the preparation
+of the next batch's pre-rebased chain is a frozen snapshot of that batch. Creating the task also seals
+the batch's membership (`sealed`, journal `successor-sealed` with reason `verification-snapshot`,
+counter `successors_sealed_for_verification`), so insertion sends later arrivals to the following
+batch and the run finishes on exactly the members the next head will have. When the head lands, the
+batch seals from its pre-rebase unchanged, as exactly the verified tip, known-good, and its first
+staging run builds a tip a worker already built, checked and published. A batch that gets no such
+preparation (its head never became known-good) keeps taking members and seals whole as before.
+
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
 `base_sha`, `batch_id`, `members`, `base_ref`, `repair_outputs_revs`). Observation reads `find_candidate_run` when an event
