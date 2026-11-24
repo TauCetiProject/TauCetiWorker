@@ -2358,11 +2358,13 @@ class MissingSource(QueueFixture):
 
     def test_old_open_batch_does_not_supply_a_module_deleted_on_main(self):
         self.controller.set_setting("repair_concurrency", 2, "t")
-        self.controller.set_setting("prepare_pre_rebased", True, "t")  # a claimed preparation holds the batch
         self.controller.set_setting("prepare_min_members", 1, "t")
         self.controller.set_setting("prepare_quiet_seconds", 0, "t")
         self.approve(101, {"TauCeti/Provider.lean": None, "TauCeti/Importer.lean": None})
         self.tick()
+        # A claimed preparation on the head's tip holds the batch; it needs a known-good tip (decision 174).
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         self.approve(102, {"TauCeti/Unrelated.lean": "module\ndef unrelated := 1\n"})
         self.tick()
         claim = self.controller.claim_task("preparer", "admin-worker")
@@ -2745,18 +2747,22 @@ class Preparation(QueueFixture):
 
         return policy
 
-    def scenario(self, prepare, pre_rebased=None):
+    def scenario(self, prepare, pre_rebased=None, head_verified=True):
         """A head in CI and an open batch with one broken member behind it; returns the batch and the agent.
-        The pre-rebased chain is prepared with `prepare` unless `pre_rebased` says otherwise."""
+        The pre-rebased chain is prepared with `prepare` unless `pre_rebased` says otherwise, and only
+        on a head tip that passed its own verification (`head_verified`, decision 174)."""
         self.controller.set_setting("prepare_open_batches", prepare, "t")
-        # Off by default (decision 153, S1).
-        self.controller.set_setting("prepare_pre_rebased", prepare if pre_rebased is None else pre_rebased, "t")
+        if pre_rebased is not None:
+            self.controller.set_setting("prepare_pre_rebased", pre_rebased, "t")
         self.controller.set_setting("prepare_min_members", 3, "t")
         self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
         self.github.ci_policy = self.broken_content_policy()
         self.approve(101, {"TauCeti/Pr101.lean": "head\n"})
         self.tick()
         self.assertEqual(self.controller.status()["head"]["stage"], "ci")
+        if head_verified:
+            head = self.head()
+            self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         for number in (201, 202, 203):
             body = "BROKEN\n" if number == 202 else f"{number}\n"
             self.approve(number, {f"TauCeti/Pr{number}.lean": body})
@@ -2823,15 +2829,17 @@ class Preparation(QueueFixture):
         self.assertEqual(self.source_failures(batch), 1)
         self.assertEqual([t.kind for t in agent.tasks], ["repair"])
 
-    def test_by_default_the_next_batch_is_verified_and_repaired_only_as_the_head(self):
-        """Decision 153 (S1): the next batch is pre-rebased onto the head's tip but neither built nor repaired
-        there. It seals from that pre-rebase, its own CI round on `main` finds the broken member, and the
-        head's repair fixes it."""
-        self.assertFalse(DEFAULT_SETTINGS["prepare_pre_rebased"])
-        batch, agent = self.scenario(prepare=True, pre_rebased=False)
+    def test_the_next_batch_is_not_verified_on_a_head_tip_without_its_own_verification(self):
+        """Decision 174: preparation of the pre-rebased chain is on by default, but only on a head tip that
+        passed its own local verification. On a head no worker verified, the next batch is pre-rebased
+        but neither built nor repaired there; it seals from that pre-rebase, its own CI round on `main`
+        finds the broken member, and the head's repair fixes it."""
+        self.assertTrue(DEFAULT_SETTINGS["prepare_pre_rebased"])
+        batch, agent = self.scenario(prepare=True, head_verified=False)
         self.tick()
         self.assertIsNone(agent.claim(self.controller), "nothing is verified on the head's tip")
         self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["pre_rebase_state"], "clean")
+        self.assertIn("has not passed its own verification", self.controller._pre_rebased_prepare_blocked(batch))
         self.drive_until_landed(batch, [agent])
         self.assertEqual(self.source_failures(batch), 1, "found by its own CI round, as the head")
         self.assertEqual([t.kind for t in agent.tasks], ["repair"])

@@ -329,7 +329,10 @@ previous incarnation of the same claim is replaced once against its observed oid
 names the tip; the controller fetches the ref when the tip is not in its clone and retains it under
 `refs/tauceti-queue/batches/<batch>/submissions/<sha>` whether or not it adopts it. `worker_notes` is
 a JSON string with the worker, the attempt number, the members whose provenance is `edited`, agent
-seconds and the estimated inference cost (from the host agent's telemetry and `cost_model`). The
+seconds, the estimated inference cost (from the host agent's telemetry and `cost_model`), and
+`local_verification` (`{tip, checks_passed}`: whether the worker's latest verification of exactly
+the submitted tip ran every check and passed, `verified_unchanged`). The controller verifies and
+repairs the next batch only on a head tip with such a pass (decision 174). The
 response is recorded in the checkpoint and the outcome.
 
 ## Claims and the renewal heartbeat
