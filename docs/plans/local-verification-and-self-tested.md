@@ -34,7 +34,7 @@ the author's nor the labeller's membership of a team is checked; the scope rules
 
 An author runs the Stage 1 commands and applies `self-tested`. The persistent label declares that the author runs local verification, including fix rounds. This rollout is manual opt-in only: do not add automatic worker labelling, contributor recommendations or announcements.
 
-One exception (operator decision, 2026-11-10): workers label automatic Mathlib bump PRs themselves after mechanically verifying the pushed head, because the bump otherwise waits a full PR build per repair round while main moves under it. The picker checks the labeler's team membership instead of the bot author's, allows exactly `lake-manifest.json` and `lean-toolchain` beside `TauCeti/`, and runs the real `bump-guard` validation. See [dependency bumps](../workers.md#dependency-bumps).
+One exception (operator decision, 2026-11-10; the labeller and author team checks below were removed on 2026-11-24): workers label automatic Mathlib bump PRs themselves after mechanically verifying the pushed head, because the bump otherwise waits a full PR build per repair round while main moves under it. The picker checks the labeler's team membership instead of the bot author's, allows exactly `lake-manifest.json` and `lean-toolchain` beside `TauCeti/`, and runs the real `bump-guard` validation. See [dependency bumps](../workers.md#dependency-bumps).
 
 Accept it for PRs whose **author belongs to a designated GitHub team**, the **TauCetiProject/self-tested** team, initially **kim-em, roed314, roed-math, CBirkbeck and tauceti-ai-for-science**. A nonmember author's PR remains ineligible even when a team member labels it.
 

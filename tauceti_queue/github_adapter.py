@@ -1365,7 +1365,7 @@ class GitHubAdapter:
         separate fence is needed for them; the merge base and paths come from the clone. A PR whose
         read cannot be complete in one response (over 100 comments or labels), whose head commit
         does not match, or whose merge base the clone cannot vouch for, takes the full read. Live
-        self-tested reads (membership, bump guard) happen after the response, so a self-tested
+        self-tested reads (the bump guard) happen after the response, so a self-tested
         request is fenced again exactly as the full read fences.
         """
         owner, name = repo.split("/", 1)
@@ -1431,7 +1431,7 @@ class GitHubAdapter:
         from tauceti_tools.self_tested import requested
 
         if requested(pull.labels) or exempt:
-            # Membership and bump reads came after the response: fence them as the full read does.
+            # Bump-guard reads came after the response: fence them as the full read does.
             fresh, statuses = self._admission_fence(repo, number, pull)
             if (fresh.head_sha, fresh.base_sha, fresh.base_ref, fresh.state, fresh.draft, sorted(fresh.labels)) != (
                 pull.head_sha,
