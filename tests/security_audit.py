@@ -109,6 +109,31 @@ class History(unittest.TestCase):
         self.assertEqual([c["sha"] for c in batch["commits"]], [head])
         self.assertEqual(batch["commits"][0]["files"][0]["after"], content)
 
+    def test_oversized_commit_keeps_deleted_and_renamed_source_visible_in_its_diffs(self):
+        content = "theorem a : True := trivial\n" * (sa.MAX_BYTES // 40)
+        self.commit("large baseline", "TauCeti/A.lean", content)
+        self.commit("executable", "TauCeti/B.lean", '#eval IO.println "removed"\n')
+        baseline = self.commit("to rename", "TauCeti/C.lean", "run_cmd pure ()\n")
+        (self.root / "TauCeti/A.lean").write_text(content + "theorem b : True := trivial\n")
+        self.command("rm", "-q", "TauCeti/B.lean")
+        self.command("mv", "TauCeti/C.lean", "TauCeti/D.lean")
+        self.command("add", "-A")
+        self.command("commit", "-qm", "large edit, deletion and rename")
+        head = self.command("rev-parse", "HEAD")
+        batch = sa.plan_batch(self.repo, baseline, head)
+        self.assertEqual([c["sha"] for c in batch["commits"]], [head])
+        bundle, note = sa.reviewed_bundle(batch)
+        self.assertEqual(note, sa.AFTER_ONLY)
+        files = {f["path"]: f for f in bundle["commits"][0]["files"]}
+        self.assertEqual(set(files), {"TauCeti/A.lean", "TauCeti/B.lean", "TauCeti/C.lean", "TauCeti/D.lean"})
+        self.assertTrue(all("before" not in f for f in files.values()))
+        self.assertEqual(files["TauCeti/A.lean"]["after"], content + "theorem b : True := trivial\n")
+        self.assertIsNone(files["TauCeti/B.lean"]["after"])
+        self.assertIn('-#eval IO.println "removed"', files["TauCeti/B.lean"]["diff"])
+        self.assertIn("-run_cmd pure ()", files["TauCeti/C.lean"]["diff"])
+        self.assertEqual(files["TauCeti/D.lean"]["after"], "run_cmd pure ()\n")
+        self.assertIn("+run_cmd pure ()", files["TauCeti/D.lean"]["diff"])
+
     def test_normal_multifile_edit_fits_with_complete_images(self):
         content = "-- A reasonably sized mathematical file with explanation\n" * 800
         self.commit("large baseline", "TauCeti/A.lean", content)
@@ -923,6 +948,42 @@ class Authority(unittest.TestCase):
                             sa.inspect(batch(n), attempt)
                         if n == 2:
                             self.assertTrue(audit_evidence.engaged(attempt))
+
+    def test_a_single_commit_beyond_the_target_is_reviewed_from_its_after_images_and_diffs(self):
+        def batch(before, after, n=1):
+            files = [{"path": "TauCeti/A.lean", "before": before, "after": after, "diff": "+new line\n"}]
+            value = {
+                "from_sha": "a" * 40,
+                "main_sha": "b" * 40,
+                "commits": [{"sha": str(i) * 40, "parent": "a" * 40, "files": files} for i in range(n)],
+            }
+            value["input_digest"] = hashlib.sha256(sa.serialize(value).encode()).hexdigest()
+            return value
+
+        small = batch("theorem a : True := trivial\n", "theorem a : True := trivial\n-- x\n")
+        self.assertEqual(sa.reviewed_bundle(small), (small, ""))
+        content = "theorem a : True := trivial\n" * (sa.MAX_BYTES // 40)
+        added = "@[simp] theorem b : True := trivial\n"
+        large = batch(content, content + added)
+        self.assertGreater(len(sa.serialize(large).encode()), sa.MAX_BYTES)
+        # Several commits beyond the target are split, never trimmed.
+        several = batch(content, content + added, n=2)
+        self.assertEqual(sa.reviewed_bundle(several), (several, ""))
+        bundle, note = sa.reviewed_bundle(large)
+        self.assertEqual(note, sa.AFTER_ONLY)
+        self.assertLessEqual(len(sa.serialize(bundle).encode()), sa.MAX_BYTES)
+        (reviewed,) = bundle["commits"][0]["files"]
+        self.assertEqual(reviewed, {"path": "TauCeti/A.lean", "after": content + added, "diff": "+new line\n"})
+        self.assertEqual(bundle["input_digest"], large["input_digest"])
+        self.assertIn("before", large["commits"][0]["files"][0])  # The retained input stays complete.
+        user = sa.judgment_request(large, sa.TRIAGE_MODEL)["messages"][0]["content"]
+        self.assertIn(sa.AFTER_ONLY + "Bundle:\n" + sa.serialize(bundle), user)
+        self.assertIn("(determined by the trusted Worker): simp.", user)
+        # Provenance reads the before images too: a registration there still withholds it.
+        registering = batch('syntax (name := s) "s" : attr\n' + content, content + added)
+        user = sa.judgment_request(registering, sa.TRIAGE_MODEL)["messages"][0]["content"]
+        self.assertIn("(determined by the trusted Worker): none.", user)
+        self.assertNotIn("syntax (name := s)", user)
 
     def test_a_transport_failure_is_not_a_judgment_and_never_holds(self):
         import httpx2
