@@ -10,7 +10,8 @@ canonical commit, without pushing anything (TauCetiTools `docs/main-integration.
   ordered by batch (the next to seal first), then by the cheap static check (`stale_check.py`:
   flagged first), then by the age of their base (oldest first). At most
   `main_integration_max_in_flight` builds are outstanding; CI itself runs one only on idle Fleet PR
-  capacity, and otherwise reports it deferred, after which it is asked again.
+  capacity, and otherwise reports it deferred. After a deferral nothing new is asked for
+  `main_integration_deferred_retry_seconds`; then one build at a time probes until one runs.
 - **Results** are the `main-integration` commit status on the accepted head, read for every
   outstanding head in one GraphQL query per pass. Only a status naming the main that was asked
   for and posted after the dispatch counts.
@@ -45,6 +46,8 @@ REASON = "main-integration-failed"
 CONFIRMATIONS = 2
 # Timeouts before an input is no longer asked about on the same main.
 MAX_EXPIRED = 3
+# Controller state while CI reports no idle capacity: {"until", "since"}.
+BUSY = "main_integration_busy"
 
 
 def record_of(row: dict[str, Any]) -> dict[str, Any]:
@@ -168,6 +171,10 @@ def _settle(ctl, row: dict[str, Any], record: dict[str, Any], status: ports.Stat
     if state == ERROR and "deferred" in status.description:
         state = DEFERRED
         record["retry_at"] = now + ctl.setting("main_integration_deferred_retry_seconds")
+        # CI has no idle capacity: ask nothing new until the retry time, then probe with one build.
+        ctl._set_state(BUSY, {"until": record["retry_at"], "since": (ctl._state(BUSY) or {}).get("since", now)})
+    elif ctl._state(BUSY) is not None:
+        ctl._set_state(BUSY, None)  # a build ran: capacity is back
     record.update(state=state, description=status.description[:200], url=status.target_url, observed_at=now)
     if status.target_url and state != DEFERRED:
         record["runs"] = [*record.get("runs", []), status.target_url][-8:]
@@ -344,6 +351,12 @@ def _dispatch(ctl, candidates, now: float) -> None:
         if record_of(row).get("state") == PENDING
     )
     budget = ctl.setting("main_integration_max_in_flight") - in_flight
+    busy = ctl._state(BUSY)
+    if busy is not None:
+        if now < busy.get("until", 0):
+            ctl._reasons.append(f"main-integration: CI has no idle PR capacity; next probe at {busy['until']:.0f}")
+            return
+        budget = min(budget, 1 - in_flight)  # one probe at a time until a build runs
     main = ctl._canonical
     if budget <= 0 or not main:
         return

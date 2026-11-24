@@ -796,7 +796,7 @@ and reported in status:
 | `main_integration_interval_seconds` | 120 | time between backfill passes |
 | `main_integration_fresh_seconds` | 21600 | a result younger than this is fresh evidence; older ones are asked again |
 | `main_integration_timeout_seconds` | 10800 | a build with no result after this long expires and is asked again (three times on the same head) |
-| `main_integration_deferred_retry_seconds` | 600 | how long a build CI deferred for lack of idle capacity waits before it is asked again |
+| `main_integration_deferred_retry_seconds` | 600 | after CI defers a build for lack of idle capacity, how long the backfill asks for nothing new (then it probes with one build) |
 | `main_integration_checks_per_pass` | 20 | static stale checks (`stale_check.py`) a pass runs to order candidates |
 
 ## Main-integration backfill
@@ -813,7 +813,9 @@ outstanding head in one GraphQL query per pass (`main_integration_statuses`).
   from GitHub (Forgejo members later), whose input has no result younger than
   `main_integration_fresh_seconds`. Order: a red result awaiting confirmation first, then the next
   batch to seal, then members the static check flags (or has not checked), then the oldest base.
-  CI runs a build only on idle Fleet PR capacity and otherwise reports it deferred.
+  CI runs a build only on idle Fleet PR capacity and otherwise reports it deferred. After a
+  deferral nothing new is asked for `main_integration_deferred_retry_seconds`; then one build at a
+  time probes until one runs, so a busy pool costs one short picker job per retry interval.
 - **Results** count only when the status names the main asked for and was posted after the
   dispatch. Green is fresh evidence on the input (`inputs.main_integration`). A first red result is
   asked again at once; a second takes the member out (below). An error (no verdict, a textual
