@@ -424,8 +424,7 @@ release's `notes`) is kept beside the verified mark: `batches.attestation` with 
 `pre_rebase_attestation` with `pre_rebase_verified`, carried to the head when it seals from that
 pre-rebase unchanged and discarded with the mark. `_attestation_problem` says why it would not stand
 in for staging's checks, or nothing when it would: it must name exactly the tip and its tree, the
-sandbox on, a verifier out of candidate code's reach (`verifier_isolated`, which no worker reports
-yet, so no attestation counts), the whole-library lint, and a policy commit whose `tauceti.toml` and
+sandbox on, a verifier out of candidate code's reach (`verifier_isolated`), the whole-library lint, and a policy commit whose `tauceti.toml` and
 `scripts/` are `main`'s now, with the exact tools commit from the repository (and, for a SHA pin,
 the commit) `main` pins. Status
 shows it as `head.attestation_problem` and `pre_rebase.attestation_problem`.

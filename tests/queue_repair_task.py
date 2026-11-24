@@ -6209,6 +6209,7 @@ class WorkerAudits(Fixture):
         ".gitignore": ".lake/\n",
         "tauceti.toml": f'[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "{TOOLS_REF}"\n',
         "scripts/lint-baseline.txt": "",
+        "lean-toolchain": "leanprover/lean4:v4.37.0-rc1\n",
     }
 
     def setUp(self):
@@ -6242,7 +6243,18 @@ class WorkerAudits(Fixture):
         and scripts/ from the object store, and the submission attests the passing verification."""
         policy = self.content.base
         self.service.tasks[1]["extra"]["policy_commit"] = policy
-        cfg = self.config()
+        # Shared read-only packages (with Batteries) and a resolvable toolchain `lean`: what lets the drivers
+        # be built from a root candidate code never wrote.
+        seed = self.root / "seed-packages"
+        (seed / "batteries" / "Batteries" / "Tactic").mkdir(parents=True)
+        (seed / "batteries" / "Batteries" / "Tactic" / "Lint.lean").write_text("")
+        seeded = patch.dict(os.environ, {"TAUCETI_QUEUE_SEED_PACKAGES": str(seed)})
+        seeded.start()
+        self.addCleanup(seeded.stop)
+        lean = patch.object(repair_audit, "toolchain_executable", return_value=str(BIN / "lean"))
+        lean.start()
+        self.addCleanup(lean.stop)
+        cfg = self.config(seed_packages=seed)
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         checks = outcome["verification"][-1]["checks"]
@@ -6262,7 +6274,21 @@ class WorkerAudits(Fixture):
             (repair_task.ATTESTATION_SCHEMA, outcome["tip"], policy, "full", True),
         )
         self.assertEqual(attested["tools_commit"], f"TauCetiProject/TauCetiTools@{TOOLS_REF}")
-        self.assertIs(attested["verifier_isolated"], False, "not yet: the controller counts none")
+        self.assertIs(attested["verifier_isolated"], True)
+        # The scripts and scope files lived in a host-only directory for the check, removed afterwards; the
+        # drivers are cached by key under the tools root; the checks mounted both read-only.
+        tools = cfg.root / repair_audit.TOOLS_DIR
+        self.assertEqual(list((tools / repair_audit.VERIFIER_DIR).iterdir()), [])
+        [drivers] = [d for d in (tools / repair_audit.DRIVERS_DIR).iterdir() if not d.name.startswith("root-")]
+        self.assertTrue(all((drivers / exe).is_file() for exe in repair_audit.DRIVER_EXES))
+        audits = [c["argv"] for c in self.bwrap_calls() if any(a.endswith("/audit-driver") for a in c["argv"])]
+        argv = audits[-1]
+        self.assertEqual(
+            argv[argv.index("--") + 1 :][:3], ["lake", "env", shutil.which("timeout")], "an absolute timeout"
+        )
+        self.assertIn(str(drivers.resolve()), [argv[i + 1] for i, a in enumerate(argv) if a == "--ro-bind"])
+        self.assertLess(argv.index("--ro-bind", argv.index(str(drivers.resolve())) - 1), argv.index("--remount-ro"))
+        self.assertNotIn(str(drivers.resolve()), [argv[i + 1] for i, a in enumerate(argv) if a == "--bind"])
         self.assertEqual(
             attested["tree"], repair.git(self.content.clone, "rev-parse", f"{outcome['tip']}^{{tree}}").strip()
         )
@@ -6276,8 +6302,59 @@ class WorkerAudits(Fixture):
         self.assertEqual(checks["status"], "passed")
         self.assertNotIn("policy_commit", checks)
         self.assertIn("not in the clone", checks["policy_error"])
+        self.assertIs(checks["drivers_isolated"], False, "no shared read-only packages: drivers built in the worktree")
+        self.assertIs(checks["verifier_isolated"], False)
         attested = json.loads(self.service.results[0]["worker_notes"])["attestation"]
         self.assertIsNone(attested["policy_commit"], "the controller will not count it")
+
+    def test_a_link_left_in_place_of_the_audit_work_directory_is_not_followed(self):
+        """Candidate code can write `.lake`; a link it leaves where the phase markers go is removed, not
+        followed, and nothing is written through it."""
+        target = self.root / "elsewhere"
+        target.mkdir()
+        work = self.content.clone / repair_audit.WORK_DIR
+        shutil.rmtree(work, ignore_errors=True)
+        work.parent.mkdir(parents=True, exist_ok=True)
+        work.symlink_to(target)
+        checks = repair_audit.check(
+            self.content.clone,
+            repair.lake_env(self.config().root),
+            base=self.content.base,
+            tools_root=self.root / "tools",
+            logdir=self.root / "logs",
+        )
+        self.assertEqual(checks["status"], "passed")
+        self.assertFalse(work.is_symlink())
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_a_changed_seed_or_manifest_never_reuses_an_older_driver_root(self):
+        worktree = self.root / "state" / "worktrees" / "task-9"
+        worktree.mkdir(parents=True)
+        (worktree / "lean-toolchain").write_text("leanprover/lean4:v4.37.0-rc1\n")
+        (worktree / "lake-manifest.json").write_text('{"packages": []}\n')
+        seed = self.root / "seed"
+        (seed / "batteries" / "Batteries" / "Tactic").mkdir(parents=True)
+        (seed / "batteries" / "Batteries" / "Tactic" / "Lint.lean").write_text("")
+        (seed / "batteries" / "lake-manifest.json").write_text("one\n")
+        record = repair_sandbox.packages_record(worktree)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(f"{seed}\n")
+        env = {"TAUCETI_QUEUE_SEED_PACKAGES": str(seed)}
+        tools = self.root / "tools"
+        first = repair_audit.pristine_driver_root(worktree, tools, "a" * 40, env)
+        self.assertIsNotNone(first)
+        self.assertEqual((first / "lake-manifest.json").read_text(), '{"packages": []}\n')
+        (seed / "batteries" / "lake-manifest.json").write_text("two\n")
+        second = repair_audit.pristine_driver_root(worktree, tools, "a" * 40, env)
+        (worktree / "lake-manifest.json").write_text('{"packages": [1]}\n')
+        third = repair_audit.pristine_driver_root(worktree, tools, "a" * 40, env)
+        self.assertEqual(len({first, second, third}), 3)
+        self.assertEqual(
+            len({repair_audit._driver_key(root, "a" * 40) for root in (first, second, third)}), 3, "nor its key"
+        )
+        self.assertIsNone(
+            repair_audit.pristine_driver_root(worktree, tools, "a" * 40, {}), "a seed outside read-only trees"
+        )
 
     def test_a_failed_verification_is_not_attested(self):
         self.findings("audit-findings-always", DUPLICATE_LINE)
@@ -6599,7 +6676,7 @@ class WorkerAudits(Fixture):
         self.assertIn("--unshare-net", audits[0])
         self.assertEqual(
             audits[0][audits[0].index("--") + 1 :][:6],
-            ["lake", "env", "timeout", "--signal=TERM", "--kill-after=30", "3000s"],
+            ["lake", "env", shutil.which("timeout"), "--signal=TERM", "--kill-after=30", "3000s"],
         )
         # Full lint includes unchanged source when no frozen scope policy is available.
         self.assertEqual(
