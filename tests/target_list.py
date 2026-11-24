@@ -339,7 +339,7 @@ class Round(unittest.TestCase):
             self.addCleanup(item.stop)
         self.claims = SimpleNamespace(begin_target_work=Mock(return_value=0))
         cfg = SimpleNamespace(state=self.tmp, wid="worker3", checkout=self.tmp / "checkout", logdir=self.tmp / "logs")
-        self.w = SimpleNamespace(cfg=cfg, gh=github(), claims=self.claims)
+        self.w = SimpleNamespace(cfg=cfg, gh=github(), claims=self.claims, counters=tc.Counters(cfg))
 
     def author(self, area="auto"):
         opts = SimpleNamespace(agent_name="Claude Code", work_model="claude", source=None)
