@@ -125,6 +125,17 @@ def _artifacts(data) -> set[str]:
     raise ValueError("invalid Lake artifact description")
 
 
+def _symlink_in(directory: Path) -> Path | None:
+    """The first symlink at or below ``directory``, never following one."""
+    if directory.is_symlink():
+        return directory
+    for parent, directories, files in os.walk(directory, followlinks=False):
+        for name in (*directories, *files):
+            if (Path(parent) / name).is_symlink():
+                return Path(parent) / name
+    return None
+
+
 def _mapping(path: Path) -> dict[str, set[str]]:
     lines = path.read_text().splitlines()
     if not lines or not isinstance(json.loads(lines[0]), str):
@@ -355,6 +366,10 @@ def downloads(env: dict):
                     _mapping(mapping)
                 except (ValueError, TypeError):
                     mapping.unlink()
+            # The fetch ran in the sandbox, which could write the view: copy nothing from it into the
+            # pool unless it holds no symlink at all, so a planted link cannot draw host files in.
+            if _symlink_in(view):
+                raise ValueError(f"symlink in the cache download view {view}; nothing transferred")
             transfer(view, pool)
 
 

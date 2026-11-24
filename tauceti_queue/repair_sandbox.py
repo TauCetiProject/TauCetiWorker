@@ -38,6 +38,7 @@ import argparse
 import hashlib
 import logging
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -455,6 +456,8 @@ def sandbox_argv(
         mathlib = Path(env[MATHLIB_CACHE_VARIABLE])
         mathlib.mkdir(parents=True, exist_ok=True)
         args += ["--bind", str(mathlib), str(mathlib)]
+    if network:
+        args += _network_binds(env)
     args += ["--ro-bind", str(worktree), str(worktree), "--bind", str(lake_dir), str(lake_dir)]
     packages = lake_dir / "packages"
     if packages.is_symlink():  # the shared extracted Mathlib (--seed-packages), read-only for every build
@@ -521,11 +524,56 @@ def sandboxed_lake(
     return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env, cwd=cwd, network=network))
 
 
+# Files name resolution and TLS read, bound read-only into an online sandbox wherever they resolve
+# (``/etc/resolv.conf`` often links into ``/run``, which is not bound); the CA variables' files too.
+NETWORK_FILES = ("/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf")
+CA_VARIABLES = ("SSL_CERT_FILE", "NIX_SSL_CERT_FILE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")
+
+
+def _network_binds(env: dict) -> list[str]:
+    args: list[str] = []
+    paths = [*NETWORK_FILES, *(env[key] for key in CA_VARIABLES if env.get(key))]
+    for path in paths:
+        target = Path(path).resolve()
+        if target.is_file() and not any(target.is_relative_to(root) for root in SYSTEM_ROOTS if Path(root).is_dir()):
+            args += ["--ro-bind", str(target), str(target)]
+    return args
+
+
+# An elan toolchain name the worker installs itself: the official releases and nightlies only.
+TOOLCHAIN = re.compile(r"leanprover/lean4(?:-nightly)?:(?:v\d+\.\d+\.\d+(?:-rc\d+)?|nightly-\d{4}-\d{2}-\d{2})")
+
+
+def ensure_toolchain(worktree: Path, env: dict, timeout: float = 1800) -> None:
+    """Install the toolchain ``worktree`` names, from outside the sandbox (whose elan home is
+    read-only), when it is an official release that is not installed yet. Any other name is left to
+    fail inside the sandbox. Installing runs nothing from the worktree."""
+    try:
+        name = (worktree / "lean-toolchain").read_text().strip()
+    except OSError:
+        return
+    if not TOOLCHAIN.fullmatch(name):
+        return
+    directory = _elan_home(env) / "toolchains" / name.replace("/", "--").replace(":", "---")
+    elan = shutil.which("elan", path=env.get("PATH"))
+    if directory.is_dir() or not elan:
+        return
+    clean = {k: env[k] for k in ("PATH", "HOME", "ELAN_HOME", "LANG", *NETWORK_ENV) if env.get(k)}
+    subprocess.run([elan, "toolchain", "install", name], env=clean, cwd="/", capture_output=True, timeout=timeout)
+
+
 def sandboxed_fetch(argv: list[str], worktree: Path, env: dict | None = None) -> list[str]:
     """A cache fetch (``lake cache get``, ``lake exe cache get``) from ``worktree``: the build sandbox
     online. A fetch loads the workspace's and its packages' Lake configurations and may run Mathlib's
     cache executable, all from ``.lake``, which the batch's code could write during an earlier build of
-    the same tree; outside the sandbox that would run with the worker's credentials in reach."""
+    the same tree; outside the sandbox that would run with the worker's credentials in reach. The
+    toolchain is installed first (:func:`ensure_toolchain`)."""
+    env = dict(os.environ if env is None else env)
+    if not disabled(env):
+        try:
+            ensure_toolchain(Path(worktree), env)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            LOGGER.warning("installing the toolchain for %s failed: %s", worktree, error)
     return sandboxed_lake(argv, worktree, env, network=True)
 
 

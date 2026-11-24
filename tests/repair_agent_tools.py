@@ -460,6 +460,43 @@ class Fetches(Fixture):
         self.assertIn("--unshare-net", offline)
         self.assertNotIn(str(mathlib), offline)
 
+    def test_resolver_and_ca_files_outside_the_system_roots_are_bound(self):
+        ca = self.tmp / "ca.pem"
+        ca.write_text("public trust")
+        args = repair_sandbox._network_binds({"SSL_CERT_FILE": str(ca)})
+        self.assertIn(["--ro-bind", str(ca), str(ca)], [args[i : i + 3] for i in range(len(args))])
+        for path in repair_sandbox.NETWORK_FILES:
+            target = Path(path).resolve()
+            if target.is_file() and not any(target.is_relative_to(r) for r in repair_sandbox.SYSTEM_ROOTS):
+                self.assertIn(str(target), args)
+
+    def test_the_toolchain_is_installed_outside_the_sandbox_only_by_its_official_name(self):
+        log = self.tmp / "elan.log"
+        (self.bin / "elan").write_text(f'#!/bin/sh\necho "$*" >> {log}\n')
+        (self.worktree / "lean-toolchain").write_text("leanprover/lean4:v4.99.0-rc1\n")
+        repair_sandbox.ensure_toolchain(self.worktree, self.env)
+        self.assertEqual(log.read_text(), "toolchain install leanprover/lean4:v4.99.0-rc1\n")
+        log.unlink()
+        (self.elan / "toolchains" / "leanprover--lean4---v4.99.0-rc1").mkdir()
+        repair_sandbox.ensure_toolchain(self.worktree, self.env)
+        (self.worktree / "lean-toolchain").write_text("someone/lean4:v1\n")
+        repair_sandbox.ensure_toolchain(self.worktree, self.env)
+        self.assertFalse(log.exists(), "installed already, or not an official release: nothing runs")
+
+    def test_a_symlink_in_the_download_view_stops_the_transfer(self):
+        from tauceti_queue import repair_cache
+
+        pool = self.tmp / "shared" / "lake-cache"
+        (pool / "artifacts").mkdir(parents=True)
+        (pool.parent / "cache-users").mkdir()
+        secret = self.home / ".codex"
+        secret.mkdir()
+        (secret / "auth.json").write_text("secret")
+        with self.assertRaisesRegex(ValueError, "symlink in the cache download view"):
+            with repair_cache.downloads({"LAKE_CACHE_DIR": str(pool)}) as env:
+                (Path(env["LAKE_CACHE_DIR"]) / "outputs").symlink_to(secret)
+        self.assertEqual([p.name for p in pool.rglob("auth.json")], [])
+
     def test_the_workers_mathlib_cache_is_their_own(self):
         env = repair.lake_env(self.root, {"HOME": str(self.home)}, cache_root=self.tmp / "shared")
         self.assertEqual(env["MATHLIB_CACHE_DIR"], str(self.tmp / "shared" / "mathlib-cache"))
