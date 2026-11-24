@@ -303,6 +303,7 @@ RUN_STDLIB=(
   workflow_backstop.py
   live_use.py
   round_worktrees.py
+  checkout_without_pull_ref.py
 )
 # special-cased python tests (handled explicitly in run_one)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
