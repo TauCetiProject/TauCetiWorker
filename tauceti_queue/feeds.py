@@ -720,6 +720,8 @@ class ControllerFeedSource:
             for a in self._attempts(row["id"])
             if a["batch_version"] == row["version"]
             and a.get("dispatch_state", "legacy") not in {"prepared", "rejected"}
+            # An unadopted early attempt describes the open batch's prepared tip, never a head's.
+            and (row["state"] == "open" or a.get("early") != 1)
         ]
         latest = attempts[-1] if attempts else None
         state = BATCH_STATES.get(row["state"], row["state"])

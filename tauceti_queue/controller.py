@@ -3580,9 +3580,9 @@ class Controller:
 
     def _current_attempt(self, head: dict[str, Any]) -> dict[str, Any] | None:
         rows = self.store.query(
-            "SELECT * FROM ci_attempts WHERE batch_id=? AND batch_version=? "
+            "SELECT * FROM ci_attempts WHERE batch_id=? AND batch_version=? AND early!=? "
             "AND NOT (dispatch_state='rejected' AND outcome='superseded') ORDER BY id DESC LIMIT 1",
-            (head["id"], head["version"]),
+            (head["id"], head["version"], EARLY_PENDING),
         )
         return rows[0] if rows else None
 
@@ -8027,7 +8027,8 @@ class Controller:
             if previous["outcome"] in (OUTCOME_PENDING, OUTCOME_PASS, OUTCOME_SOURCE_FAILURE):
                 return f"early attempt {previous['id']} already covers this tip"
             if previous["outcome"] == OUTCOME_INFRASTRUCTURE:
-                failures += 1
+                # A proven non-send (`rejected`) cost no run: it backs off but uses no retry.
+                failures += previous["dispatch_state"] != "rejected"
                 due = (previous["last_observed_at"] or previous["dispatched_at"]) + int(
                     self.setting("infrastructure_retry_backoff_seconds")
                 )
@@ -8060,6 +8061,8 @@ class Controller:
             return None if self._canonical == onto else f"{self.canonical_branch} moved past the base"
         if head["tip"] != onto:
             return f"head {head['id']}'s tip moved"
+        if head["base"] != self._canonical and self._canonical != onto:
+            return f"{self.canonical_branch} moved under head {head['id']}"
         if self._tip_failed(onto):
             return f"head {head['id']} failed CI on the source"
         current = self._current_attempt(head)
@@ -8086,6 +8089,22 @@ class Controller:
                 reason=reason,
             )
         self._cancel_superseded_runs(attempt["batch_id"], now, reason=f"early run: {reason}", only=attempt["id"])
+        # Whatever GitHub's run is doing (a completed run still waiting for its statuses is not cancelled
+        # there), the attempt is settled here, so the feed stops reporting it and it is never adopted.
+        with self.store.transaction():
+            self.store.update(
+                "ci_attempts",
+                {"id": attempt["id"], "outcome": OUTCOME_PENDING},
+                outcome=OUTCOME_SUPERSEDED,
+                outcome_detail=f"ci-superseded: early run: {reason}",
+            )
+            self.store.update(
+                "ci_attempts",
+                {"id": attempt["id"], "cancelled_at": None},
+                cancelled_at=now,
+                cancel_reason=f"early run: {reason}",
+                cancel_result="settled-locally",
+            )
 
     def _dispatch_early(self, batch: dict[str, Any], head: dict[str, Any], now: float) -> None:
         tip, onto = batch["pre_rebase_tip"], batch["pre_rebase_onto"]
@@ -8534,7 +8553,7 @@ class Controller:
         return [
             a
             for a in self.store.rows("ci_attempts", {"batch_id": head["id"], "batch_version": head["version"]})
-            if a["head_sha"] == head["tip"] and a["base_sha"] == head["base"]
+            if a["head_sha"] == head["tip"] and a["base_sha"] == head["base"] and a["early"] != EARLY_PENDING
         ]
 
     def _source_head_current(self, head, attempt=None):
@@ -10332,6 +10351,10 @@ class Controller:
     # --- promotion and landing ---------------------------------------------------------------------
 
     def _promote(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
+        if (attempt["head_sha"], attempt["base_sha"]) != (head["tip"], head["base"]):
+            # A pass promotes exactly the tip and base it verified, nothing else.
+            self._reasons.append(f"head {head['id']}: attempt {attempt['id']} verified another tip; not promoted")
+            return
         candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
         if self._mixed_inert_batch(head):
             self._reasons.append("Forgejo admission is disabled; retaining the mixed batch")

@@ -3784,6 +3784,51 @@ class EarlyStaging(PreRebasedCase):
         [entry] = self.controller.store.journal_entries("early-staging-cancelled")
         self.assertEqual(entry["detail"]["reason"], f"head {head['id']}'s tip moved")
 
+    def test_a_completed_run_awaiting_its_statuses_is_settled_when_invalid(self):
+        batch, tip = self.prepared()
+        run = self.run_for(tip)
+        run.status = "completed"  # GitHub reports it done; its statuses are not delivered yet
+        [attempt] = self.early(batch)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, run_status="completed")
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        self.controller._early_staging(self.clock())
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["outcome"], "superseded")
+        self.assertIsNotNone(attempt["cancelled_at"])
+        self.assertNotEqual(self.requested(batch)["state"], "running")
+
+    def test_an_early_pass_never_promotes_a_head_that_sealed_without_it(self):
+        batch, tip = self.prepared()
+        self.finish(self.run_for(tip))
+        self.controller.tick()
+        self.assertEqual(self.early(batch)[0]["outcome"], "pass")
+        # The batch becomes the head at the same version without adopting (the head ahead was removed).
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, state="removed")
+        self.controller.store.update("batches", {"id": batch["id"]}, state="head")
+        sealed = self.row(batch)
+        self.assertIsNone(self.controller._current_attempt(sealed), "the early pass is not the head's attempt")
+        self.controller._promote(sealed, self.early(batch)[0], self.clock())
+        self.assertIsNone(self.controller.store.row("outbox", {"kind": "promote"}), "another tip: not promoted")
+
+    def test_rejected_early_dispatches_do_not_use_the_retry(self):
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+        batch, tip = self.prepared()
+        [attempt] = self.early(batch)
+        for _ in range(3):
+            self.controller.store.insert(
+                "ci_attempts",
+                **{
+                    k: v
+                    for k, v in attempt.items()
+                    if k not in ("id", "run_id", "outcome", "dispatch_state", "cancelled_at")
+                },
+                outcome="infrastructure",
+                dispatch_state="rejected",
+            )
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="infrastructure")
+        self.assertIsNone(self.controller._early_staging_blocked(self.row(batch), self.head()))
+
     def test_no_early_run_on_a_control_lane_head(self):
         batch = self.open_batch()
         self.verify_head()
