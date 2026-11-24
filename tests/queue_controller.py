@@ -4037,6 +4037,168 @@ class Attestation(PreRebasedCase):
         self.assertIsNone(self.row(batch)["pre_rebase_attestation"])
 
 
+class AttestedLanding(Attestation):
+    """Decision 200: a tip whose accepted attestation counts is sent as an attested landing, which pr-build
+    lands without rebuilding; an attested run that does not pass falls back to full staging."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("early_staging_enabled", True, "t")
+        self.controller.set_setting("attested_landing_enabled", True, "t")
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+
+    def prepared(self, **note):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip, **note)}
+        )
+        self.controller.tick()
+        return self.row(batch), task.tip
+
+    def early(self, batch):
+        return [
+            a for a in self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id") if a["early"]
+        ]
+
+    def runs_for(self, sha):
+        return [r for r in self.github.runs if r.head_sha == sha]
+
+    def finish(self, *runs):
+        held = [(r, r.verdict) for r in self.github.runs if r not in runs and r.status != "completed"]
+        for run, _ in held:
+            run.verdict = "lost"
+        try:
+            self.github.complete_runs()
+        finally:
+            for run, verdict in held:
+                run.verdict = verdict
+        for run in runs:
+            for context in VERDICT_CONTEXTS:
+                self.controller.handle_event("status", {"sha": run.head_sha, "context": context})
+
+    def test_off_by_default_an_attested_tip_is_staged_in_full(self):
+        self.assertFalse(DEFAULT_SETTINGS["attested_landing_enabled"], "an operator turns it on")
+        self.controller.set_setting("attested_landing_enabled", False, "t")
+        batch, tip = self.prepared()
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["dispatch_kind"], "staging")
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-staging")
+
+    def test_an_accepted_attestation_is_sent_as_an_attested_landing_and_reported_to_pr_build(self):
+        batch, tip = self.prepared()
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["dispatch_kind"], "attested")
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-attested")
+        requested = feeds.observation_feed(feeds.feed_source(self.controller), PROJECT, "main", batch["id"])[
+            "requested_batch"
+        ]
+        tree = chain.git(self.repo.clone, "rev-parse", f"{tip}^{{tree}}").strip()
+        self.assertEqual(
+            (requested["state"], requested["attestation"]["tip"], requested["attestation"]["tree"]),
+            ("running", tip, tree),
+        )
+        # It lands as the head's run once the head has landed.
+        head = self.head()
+        self.finish(self.runs_for(tip)[0])
+        self.controller.tick()
+        self.finish(self.runs_for(head["tip"])[0])
+        for _ in range(3):
+            self.controller.tick()
+        self.assertEqual(self.repo.main_sha(), tip)
+        self.assertEqual(len(self.runs_for(tip)), 1, "no full staging run")
+
+    def test_an_attestation_that_does_not_count_is_staged_in_full(self):
+        batch, tip = self.prepared(verifier_isolated=False)
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["dispatch_kind"], "staging")
+        requested = feeds.observation_feed(feeds.feed_source(self.controller), PROJECT, "main", batch["id"])[
+            "requested_batch"
+        ]
+        self.assertNotIn("attestation", requested)
+
+    def test_an_attested_run_that_fails_is_an_infrastructure_failure_and_falls_back_to_full_staging(self):
+        batch, tip = self.prepared()
+        run = self.runs_for(tip)[0]
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "P202.lean", "message": "out-of-date"}]
+        self.finish(run)
+        self.controller.tick()
+        self.controller.tick()
+        first, second = self.early(batch)
+        self.assertEqual((first["dispatch_kind"], first["outcome"]), ("attested", "infrastructure"))
+        self.assertTrue(first["outcome_detail"].startswith("attested-fallback: "))
+        self.assertFalse(self.controller._tip_failed(tip), "an attested failure says nothing about the source")
+        self.assertEqual(second["dispatch_kind"], "staging", "then the tip is staged in full")
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-staging")
+        [entry] = self.controller.store.journal_entries("attested-landing-fallback")
+        self.assertEqual(entry["detail"]["tip"], tip)
+
+    def test_the_fallback_holds_after_an_operator_supersedes_the_failed_attempt(self):
+        batch, tip = self.prepared()
+        run = self.runs_for(tip)[0]
+        run.verdict = "fail"
+        self.finish(run)
+        self.controller.tick()
+        first = self.early(batch)[0]
+        self.controller.store.update("ci_attempts", {"id": first["id"]}, outcome="superseded")
+        self.assertEqual(
+            self.controller._dispatch_kind(
+                self.row(batch), tip, first["base_sha"], self.row(batch)["pre_rebase_attestation"]
+            ),
+            "staging",
+        )
+
+    def test_a_head_that_changes_the_policy_files_gets_no_attested_early_run(self):
+        batch = self.open_batch()
+        self.verify_head()
+        head = self.head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip)}
+        )
+        with mock.patch.object(self.controller, "_policy_unchanged", return_value=False) as unchanged:
+            self.controller.tick()
+            unchanged.assert_any_call(head["tip"])
+        [attempt] = self.early(self.row(batch))
+        self.assertEqual(attempt["dispatch_kind"], "staging")
+
+    def test_a_passed_attested_run_whose_attestation_stopped_counting_is_staged_in_full(self):
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        batch, tip = self.prepared()
+        self.land_head()
+        head = self.head()
+        attempt = self.controller._current_attempt(head)
+        self.assertEqual(attempt["dispatch_kind"], "attested")
+        self.finish(self.runs_for(tip)[-1])
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass", run_status="completed")
+        runs = len(self.github.runs)
+        with mock.patch.object(self.controller, "_attested_still_counts", return_value=False):
+            self.controller._ci(self.head(), self.clock())
+        self.assertEqual(self.controller.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "superseded")
+        promotions = [
+            r
+            for r in self.controller.store.rows("outbox", {"kind": "promote"})
+            if loads(r["payload"], {})["batch_id"] == batch["id"]
+        ]
+        self.assertEqual(promotions, [], "not promoted")
+        self.assertEqual(len(self.github.runs), runs + 1)
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-staging")
+
+    def test_a_head_that_seals_attested_is_dispatched_as_an_attested_landing(self):
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        batch, tip = self.prepared()
+        self.assertEqual(self.early(batch), [])
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"]), (batch["id"], tip))
+        attempt = self.controller._current_attempt(head)
+        self.assertEqual(attempt["dispatch_kind"], "attested")
+        self.assertEqual(self.controller.status()["head"]["ci"]["kind"], "attested")
+
+
 class ParallelHeadCheck(PreRebasedCase):
     """Decision 174, step 4 (decision 172's A): a head dispatched to staging on a tip no worker verified
     is verified locally at the same time; a clean check makes the tip known-good, errors are repaired

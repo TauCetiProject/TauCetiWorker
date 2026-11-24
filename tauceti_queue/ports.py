@@ -258,11 +258,13 @@ class ExecutionPort(Protocol):
         batch_id: str,
         members: Sequence[int],
         repair_outputs_revs: Sequence[str] = (),
+        attested: bool = False,
     ) -> str:
         """`repository_dispatch` of `pr-build.yml` with event `tauceti-bors-staging`; returns a dispatch id.
 
         `repair_outputs_revs` names the revisions whose published build outputs CI may restore when
-        none are published for `head_sha`, in the order to try them.
+        none are published for `head_sha`, in the order to try them. `attested` sends event
+        `tauceti-bors-attested` instead (decision 200): the attested landing, which builds nothing.
         """
         ...
 
