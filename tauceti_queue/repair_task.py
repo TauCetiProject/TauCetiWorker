@@ -1406,6 +1406,69 @@ def scope_only_repair(task: Task) -> bool:
     return bool(findings) and all(d.get("kind") == "status" and d.get("context") == "scope" for d in findings)
 
 
+def driver_failure_only(task: Task) -> bool:
+    """Every source finding is a check whose driver failed without naming a module or file.
+
+    CI reports a lint or audit driver that crashed or did not elaborate (``LINT-ENV: FAIL`` naming
+    ``driver failure``, an audit driver's segfault) as a finding with no module and no path. No Lean
+    edit is evidence against it, so an unchanged chain may be submitted, but only once the worker's
+    own whole-library build and every check pass on it (``verified_unchanged``): the controller then
+    stages the same chain again as the head's next version. Batch 506's repair task 1536 was released
+    ``agent_failed`` on every claim while its chain passed everything locally, with no other way to
+    stage it again.
+    """
+    if task.kind != "repair" or not isinstance(task.diagnostics, list):
+        return False
+    findings = []
+    for entry in task.diagnostics:
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("kind") == "admission_predictions":
+            if entry.get("was_proactive"):
+                return False
+        elif entry.get("kind") != "infrastructure":
+            findings.append(entry)
+    return bool(findings) and all(
+        d.get("kind") in ("lint", "audit")
+        and not d.get("module")
+        and not d.get("path")
+        and "driver failure" in str(d.get("message") or "")
+        for d in findings
+    )
+
+
+def verified_unchanged(tip: str, outcome: dict) -> bool:
+    """The worker's latest verification of ``tip`` ran every check and they passed.
+
+    Only the latest counts: a later verification under another checking policy that could not run
+    its checks must not be outvoted by an earlier pass."""
+    runs = [v for v in outcome.get("verification", []) if v.get("tip") == tip]
+    if runs:
+        latest = runs[-1]
+        return latest.get("ok") is True and (latest.get("checks") or {}).get("status") == "passed"
+    parallel = outcome.get("parallel") or {}
+    return parallel.get("verified_tip") == tip and (parallel.get("checks") or {}).get("status") == "passed"
+
+
+# One unchanged re-staging per batch and chain: a driver failure that CI reproduces every time
+# would otherwise alternate between staging and repair indefinitely. Each task that submits one
+# records a ref under the chain's prefix in the clone the repair workers share. The same task may
+# deliver again (a failed push, a later claim of it); a later task on the same chain, which only a
+# second CI failure creates, is released `agent_failed` as before, which the controller's
+# stalled-repair detection reports.
+RESTAGED_REF_PREFIX = "refs/tauceti-queue/restaged"
+
+
+def restaged_ref(task: Task) -> str:
+    return f"{RESTAGED_REF_PREFIX}/{task.batch_id}/{task.tip}/{task.task_id}"
+
+
+def restaged_by_other_task(clone: Path, task: Task) -> bool:
+    prefix = f"{RESTAGED_REF_PREFIX}/{task.batch_id}/{task.tip}/"
+    refs = git(clone, "for-each-ref", "--format=%(refname)", prefix, check=False).split()
+    return any(ref != restaged_ref(task) for ref in refs)
+
+
 def admission_verification(task: Task, tip: str, outcome: dict, stream_findings: list) -> dict | None:
     """Telemetry from scripted checks, never permission to skip the candidate's CI."""
     if not task_findings(task).get("admission_predictions"):
@@ -3650,7 +3713,7 @@ def _run_task(
             acceptable = (
                 report["ok"]
                 and not report["dirty"]
-                and (not report["unchanged"] or proactive or scope_only_repair(task))
+                and (not report["unchanged"] or proactive or scope_only_repair(task) or driver_failure_only(task))
             )
             if not acceptable:
                 detail = format_report(report)
@@ -3781,6 +3844,19 @@ def _run_task(
                             # The code that produced it, kept if a later process delivers it.
                             "worker_revision": STARTUP_REVISION,
                         }
+            if report["unchanged"] and driver_failure_only(task):
+                # Only a complete local pass makes an unchanged chain worth staging again, and only once.
+                if not verified_unchanged(tip, outcome):
+                    detail = "CI's check driver failed, but the worker could not verify the unchanged chain itself"
+                    return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+                if restaged_by_other_task(cfg.clone, task):
+                    detail = (
+                        "CI's check driver failed again on a chain already staged again unchanged after a driver "
+                        "failure; it needs an operator"
+                    )
+                    return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+                git(cfg.clone, "update-ref", restaged_ref(task), tip)
+                log(f"task {task.task_id}: CI's check driver failed; submitting the verified unchanged chain once")
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
             if cfg.publish.when == "before" and (outcome.get("publish") or {}).get("revision") != tip:

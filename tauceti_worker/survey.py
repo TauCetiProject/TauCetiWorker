@@ -300,7 +300,6 @@ class PRInfo:
 
         local = d.get("baseRefName", "main") == "main" and accepted(
             d.get("labels"),
-            member=True,
             branch=d.get("headRefName", ""),
         )
         build_states = [c.get("state") for c in rollup if c.get("context") == "build"]

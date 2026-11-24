@@ -181,8 +181,8 @@ After a host round pushes a new bump head, the worker runs the full local
 verifier (`tauceti verify`, bump policy) on that exact commit with the same
 build-cache view the agent used. If it succeeds and GitHub still reports that
 commit as the PR head, the worker applies `self-tested`. Review and queue admission
-validate eligibility directly (the labeler's team membership, bump-only paths
-and the real `bump-guard` validation), without waiting for an Actions receipt or
+validate eligibility directly (bump-only paths and the real `bump-guard`
+validation), without waiting for an Actions receipt or
 the ordinary PR build. The agent's
 own claims are never consulted. Bubble rounds, a dirty checkout, a moved head,
 or a failed or incomplete verification (capped at 45 minutes) leave the PR on
