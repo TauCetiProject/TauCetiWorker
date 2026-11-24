@@ -88,6 +88,22 @@ class Outputs(unittest.TestCase):
         self.assertTrue((self.lib / "Basic.Sub.olean").exists())
         self.assertEqual(repair_outputs.damaged(self.root, {}, hasher=hasher), [])
 
+    def test_a_shared_lake_cache_is_the_one_checked_and_cleaned(self):
+        # Repair workers point LAKE_CACHE_DIR at the pool's shared cache, not the worktree's.
+        pool = self.root / "pool"
+        (pool / "artifacts").mkdir(parents=True)
+        (pool / "outputs/TauCeti").mkdir(parents=True)
+        basic = self.module("Basic", "4366fd23170e9e25", "a")
+        (pool / "artifacts" / basic["ir.sig"]).write_bytes(b"")
+        (pool / "outputs/TauCeti/4366fd23170e9e25.json").write_text("{}")
+        env = {"LAKE_CACHE_DIR": str(pool)}
+        found = repair_outputs.damaged(self.root, env, hasher=hasher)
+        self.assertEqual([Path(d["path"]).parent for d in found], [pool / "artifacts"])
+        self.assertEqual(repair_outputs.discard_damaged(self.root, env, hasher=hasher)["removed_modules"], 1)
+        self.assertFalse((pool / "artifacts" / basic["ir.sig"]).exists())
+        self.assertFalse((pool / "outputs/TauCeti/4366fd23170e9e25.json").exists())
+        self.assertFalse((self.lib / "Basic.trace").exists())
+
     def test_an_unavailable_hasher_is_reported_not_raised(self):
         self.module("Basic", "4366fd23170e9e25", "a")
 

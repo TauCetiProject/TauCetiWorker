@@ -109,10 +109,16 @@ def native_hashes(worktree: Path, env: dict, paths: list[Path]) -> dict[str, str
     return hashes
 
 
+def cache_dir(worktree: Path, env: dict) -> Path:
+    """The Lake cache the worktree's builds use: the pool's shared one when ``LAKE_CACHE_DIR`` names it."""
+    configured = (env or {}).get("LAKE_CACHE_DIR")
+    return Path(configured) if configured else worktree / ".lake/cache"
+
+
 def damaged(worktree: Path, env: dict, *, hasher=None) -> list[dict]:
     """Every output (or same-named artifact cache file) whose bytes differ from its trace name."""
     worktree = worktree.resolve()
-    artifacts = worktree / ".lake/cache/artifacts"
+    artifacts = cache_dir(worktree, env) / "artifacts"
     modules = expected(worktree)
     paths: list[Path] = []
     for _, _, pairs in modules:
@@ -142,11 +148,16 @@ def damaged(worktree: Path, env: dict, *, hasher=None) -> list[dict]:
     return found
 
 
-def discard(worktree: Path, found: list[dict]) -> int:
-    """Remove each damaged module's build files and the cache records for its input hash."""
+def discard(worktree: Path, found: list[dict], env: dict | None = None) -> int:
+    """Remove each damaged module's build files and the cache records for its input hash.
+
+    A record in a shared pool is only a cache entry: without it the next build restores the
+    module from another record or compiles it.
+    """
     worktree = worktree.resolve()
     lib, ir = worktree / ".lake/build/lib/lean", worktree / ".lake/build/ir"
-    artifacts, records = worktree / ".lake/cache/artifacts", worktree / ".lake/cache/outputs"
+    cache = cache_dir(worktree, env or {})
+    artifacts, records = cache / "artifacts", cache / "outputs"
     removed: set[str] = set()
     for item in found:
         path = Path(item["path"])
@@ -182,5 +193,5 @@ def discard_damaged(worktree: Path, env: dict, *, hasher=None) -> dict:
         "checked": True,
         "damaged_count": len(found),
         "damaged": [{k: item[k] for k in ("module", "path", "expected", "actual", "size")} for item in found[:20]],
-        "removed_modules": discard(worktree, found) if found else 0,
+        "removed_modules": discard(worktree, found, env) if found else 0,
     }
