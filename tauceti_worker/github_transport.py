@@ -563,8 +563,8 @@ def record_block(resource, reset, identity=None):
         pass
 
 
-def blocking_event_since(start):
-    identity = quota_scope(scope())
+def blocking_event_since(start, env=None):
+    identity = quota_scope(scope(env))
     if not identity:
         return None
     worker = hashlib.sha256(os.environ.get("TAUCETI_WORKER_ID", "unknown").encode()).hexdigest()
@@ -578,8 +578,8 @@ def blocking_event_since(start):
         return None
 
 
-def blocked_since(start):
-    return blocking_event_since(start) is not None
+def blocked_since(start, env=None):
+    return blocking_event_since(start, env) is not None
 
 
 def observed_budget(env=None):
