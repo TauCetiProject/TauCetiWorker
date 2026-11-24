@@ -3417,7 +3417,7 @@ class KnownGoodHeadTip(PreRebasedCase):
         self.assertEqual((discarded["pre_rebase_state"], discarded["pre_rebase_tip"]), ("", None))
         self.assertEqual(loads(discarded["pre_rebase_edits"], {}), {})
         [entry] = self.controller.store.journal_entries("pre-rebase-discarded")
-        self.assertEqual((entry["detail"]["reason"], entry["detail"]["onto"]), ("head-unverified", failed_tip))
+        self.assertEqual((entry["detail"]["reason"], entry["detail"]["onto"]), ("head-failed", failed_tip))
         # The head's repair moves its tip: the batch is replayed afresh, without the discarded edit, and
         # prepared again once the new tip has passed its own verification.
         repair = self.agent("repairer", 101, ("A.lean", "fixed\n"))
@@ -3449,6 +3449,42 @@ class KnownGoodHeadTip(PreRebasedCase):
         self.assertEqual((superseded["id"], superseded["resolution"]), (task.task_id, "head-unverified"))
         result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
         self.assertFalse(result.accepted, result)
+
+    def test_a_clean_preparation_loses_its_marks_when_the_head_fails_and_a_restaged_tip_stays_unverified(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], task.tip)
+        failed = self.head()
+        self.fail_head()
+        kept = self.row(batch)
+        self.assertEqual(
+            (kept["pre_rebase_tip"], kept["pre_rebase_prepared"], kept["pre_rebase_verified"]),
+            (task.tip, None, None),
+            "the chain is kept; it is no longer prepared or verified",
+        )
+        [entry] = self.controller.store.journal_entries("pre-rebase-discarded")
+        self.assertEqual((entry["detail"]["reason"], entry["detail"]["chain_kept"]), ("head-failed", True))
+        # The same tip staged again unchanged at a later version, with a fresh local pass, is still not
+        # known-good: CI failed it once.
+        version = failed["version"] + 1
+        self.controller._record_tip(failed["id"], version, failed["tip"], self.clock())
+        self.controller.store.update("batches", {"id": failed["id"]}, version=version, verified_tip=failed["tip"])
+        self.assertFalse(self.controller._head_tip_verified(self.head()))
+
+    def test_a_preserved_preparation_on_a_failed_tip_is_not_current(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        self.controller._set_state("emergency_preserved", {str(task.task_id): row["onto"]})
+        self.assertTrue(self.controller._pre_rebased_prepare_current(row, self.row(batch)))
+        attempt = self.controller._current_attempt(self.head())
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="source-failure")
+        self.assertFalse(self.controller._pre_rebased_prepare_current(row, self.row(batch)))
 
     def test_sealing_from_a_verified_preparation_makes_the_new_head_known_good(self):
         batch = self.open_batch()

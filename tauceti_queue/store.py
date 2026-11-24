@@ -332,6 +332,7 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     cancel_result TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ci_batch ON ci_attempts (batch_id, batch_version);
+CREATE INDEX IF NOT EXISTS ci_head_sha ON ci_attempts (head_sha);
 CREATE TABLE IF NOT EXISTS ci_requests (
     id INTEGER PRIMARY KEY,
     attempt_id INTEGER NOT NULL DEFAULT 0,

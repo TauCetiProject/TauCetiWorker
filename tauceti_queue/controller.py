@@ -6923,12 +6923,17 @@ class Controller:
         (`verified_tip`: the head's own task, or the preparation it sealed from unchanged), and CI has
         not failed it on the source since. A tip no worker verified is not known-good. A CI pass alone
         does not qualify: the head lands within minutes, and a preparation started then would only
-        hold up the seal."""
+        hold up the seal. "Since" is durable (`_tip_failed`): a tip staged again unchanged after a
+        source failure, at a later version, stays not known-good."""
         if head is None or not head["verified_tip"] or head["verified_tip"] != head["tip"]:
             return False
-        attempt = self._current_attempt(head)
-        return not (
-            attempt is not None and attempt["head_sha"] == head["tip"] and attempt["outcome"] == OUTCOME_SOURCE_FAILURE
+        return not self._tip_failed(head["tip"])
+
+    def _tip_failed(self, tip: str | None) -> bool:
+        """CI ever failed `tip` on the source, at any version of any batch."""
+        return (
+            bool(tip)
+            and self.store.row("ci_attempts", {"head_sha": tip, "outcome": OUTCOME_SOURCE_FAILURE}) is not None
         )
 
     def _pre_rebase_target_verified(self) -> bool:
@@ -6947,31 +6952,49 @@ class Controller:
         return any((self.store.row("tasks", {"id": task_id}) or {}).get("kind") == TASK_PREPARE for task_id in task_ids)
 
     def _discard_unverified_pre_rebase(self, now: float) -> None:
-        """Discard an open batch's pre-rebase that carries verification or repair work done on a head
-        tip that is no longer known-good: the head failed CI on that tip, or a repair round or rebase
-        moved the head past it (decision 174). Its edits are never carried to the head's next tip,
-        so a later batch never keeps changes made against the head's own failures; `_pre_rebase`
-        replays the batch afresh once the head allows it, and the new tip is prepared again once it
-        has passed its own verification. A conflicts-only pre-rebase is kept and carried as before."""
+        """Discard the verification and repair work an open batch's pre-rebase carries from a head tip
+        that is no longer known-good: CI failed that tip on the source (`_tip_failed`, durable, so it
+        holds for an evicted head and across a restaging of the same tip), or a repair round or rebase
+        moved the current head past it, or the current head's tip never passed its own verification
+        (decision 174). A pre-rebase with a preparation's edits is cleared, so the edits are never
+        carried to the next tip and a later batch never keeps changes made against the head's own
+        failures; `_pre_rebase` replays the batch afresh once the head allows it. One prepared clean
+        (no edits) keeps its chain and loses only its prepared and verified marks. A conflicts-only
+        pre-rebase is kept and carried as before."""
         head = self._head()
-        if head is None:
-            return
         for batch in self._open_batches():
             onto = batch["pre_rebase_onto"]
             if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not onto:
                 continue
-            if onto == head["tip"] and self._head_tip_verified(head):
+            edited = self._pre_rebase_verification_work(batch)
+            if not edited and not batch["pre_rebase_prepared"] and not batch["pre_rebase_verified"]:
                 continue
-            if self.store.row("batch_tips", {"batch_id": head["id"], "tip": onto}) is None:
-                continue  # not on this head (an emergency lane's batch): left to its own rules
-            if not self._pre_rebase_verification_work(batch):
+            if self._tip_failed(onto):
+                reason = "head-failed"
+            elif head is None or self.store.row("batch_tips", {"batch_id": head["id"], "tip": onto}) is None:
+                continue  # landed, or another batch's tip (an emergency or lane head went ahead): kept
+            elif onto != head["tip"]:
+                reason = "head-moved"
+            elif not self._head_tip_verified(head):
+                reason = "head-unverified"
+            else:
                 continue
-            reason = "head-moved" if onto != head["tip"] else "head-unverified"
             with self.store.transaction():
-                self._set_pre_rebase(batch, "", now)
+                if edited:
+                    self._set_pre_rebase(batch, "", now)
+                else:
+                    self.store.update(
+                        "batches", {"id": batch["id"]}, pre_rebase_prepared=None, pre_rebase_verified=None
+                    )
                 self._count("pre_rebase_verification_discarded")
                 self.store.journal(
-                    now, "pre-rebase-discarded", batch["id"], reason=reason, onto=onto, head_tip=head["tip"]
+                    now,
+                    "pre-rebase-discarded",
+                    batch["id"],
+                    reason=reason,
+                    onto=onto,
+                    head_tip=head["tip"] if head is not None else None,
+                    chain_kept=not edited,
                 )
 
     def _open_pre_rebase_task(self, batch: dict[str, Any]) -> dict[str, Any] | None:
@@ -7304,6 +7327,7 @@ class Controller:
             and batch["pre_rebase_state"] in PRE_REBASE_USABLE
             and bool(batch["pre_rebase_tip"])
             and batch["pre_rebase_onto"] == task["onto"]
+            and not self._tip_failed(task["onto"])
             and (
                 task["onto"] == self._preserved_onto(task)
                 or (task["onto"] == self._pre_rebase_target() and self._pre_rebase_target_verified())
@@ -7322,8 +7346,8 @@ class Controller:
             if batch is None or batch["state"] != BATCH_OPEN or self._pre_rebased_prepare_current(task, batch):
                 continue
             moved = task["onto"] != self._pre_rebase_target()
-            unverified = not moved and not self._pre_rebase_target_verified()
-            resolution = "head-moved" if moved else "head-unverified" if unverified else "pre-rebase-changed"
+            unverified = self._tip_failed(task["onto"]) or (not moved and not self._pre_rebase_target_verified())
+            resolution = "head-unverified" if unverified else "head-moved" if moved else "pre-rebase-changed"
             with self.store.transaction():
                 self.store.update(
                     "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution

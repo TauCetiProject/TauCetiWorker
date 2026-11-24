@@ -408,7 +408,8 @@ leaves it unprepared until the next preparation.
 Known-good head tips (decision 174): the next batch is verified and repaired only on a head tip that
 has passed its own local verification, so it never acts on the head's own failures (task 1416), and
 no failure list passes between batches. `_head_tip_verified` holds when `batches.verified_tip` is the
-head's tip and CI has not failed that tip on the source. `verified_tip` is set when a task's adopted
+head's tip and CI has never failed that tip on the source (`_tip_failed`, any attempt of any batch,
+so a tip staged again unchanged after a failure stays not known-good). `verified_tip` is set when a task's adopted
 submission carries a `local_verification` note (`{tip, checks_passed}`, from the worker) with
 `checks_passed` true for exactly the submitted tip (the head's repair or `rebase_conflict`, an own-base
 preparation), and when the head seals from its pre-rebase unchanged (`onto` is `main`, no members
@@ -418,13 +419,15 @@ controller replay, a repair the worker could not verify) is not known-good, and 
 not count: the head lands minutes later, and a preparation started then would only hold up the seal.
 On a head that is not known-good, the next batch's conflicts-only pre-rebase still runs, but
 `prepare_blocked` says `head N's tip <sha> has not passed its own verification`, and a claimed
-preparation is superseded (`head-unverified`) and its submission refused. When the head fails CI on a
-tip, or a repair round or rebase moves its tip, `_discard_unverified_pre_rebase` clears an open
-batch's pre-rebase onto one of the head's tips that carries a preparation's edits (journal
-`pre-rebase-discarded` with reason `head-unverified` or `head-moved`, counter
-`pre_rebase_verification_discarded`) instead of carrying it to the next tip; `_pre_rebase` then
-replays the batch afresh, and it is prepared again once the new tip is known-good. A pre-rebase with
-only a `pre_rebase` task's conflict resolutions is carried as before. In `claim_task` the next
+preparation is superseded (`head-unverified`) and its submission refused, a preserved one included
+once its `onto` has failed. When CI fails the tip a pre-rebase is on, or a repair round or rebase
+moves the head past it, `_discard_unverified_pre_rebase` clears an open batch's pre-rebase that
+carries a preparation's edits (journal `pre-rebase-discarded` with reason `head-failed`,
+`head-moved` or `head-unverified`, counter `pre_rebase_verification_discarded`) instead of carrying
+it to the next tip; `_pre_rebase` then replays the batch afresh, and it is prepared again once the
+new tip is known-good. One prepared clean, with no edits, keeps its chain and loses only
+`pre_rebase_prepared` and `pre_rebase_verified` (`chain_kept` true). A pre-rebase with only a
+`pre_rebase` task's conflict resolutions is carried as before. In `claim_task` the next
 batch's preparation of its pre-rebased chain ranks with its `pre_rebase`, ahead of every later batch's
 own-base preparation, and when the background slots are full it takes the newest such preparation's
 slot (`pre-rebase-first`), as the `pre_rebase` does.
