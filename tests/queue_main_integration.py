@@ -87,9 +87,23 @@ class Backfill(unittest.TestCase):
         self.clock.advance(60)
         self.controller.tick()
         self.assertEqual(self.record(number)["state"], "deferred")
-        # Another member takes the free slot; the deferred one waits for its retry time.
+        # A busy pool pauses the backfill: nothing new is asked until the retry time.
+        self.assertEqual(len(self.github.main_integration_requests), 1)
+        self.clock.advance(300)
+        self.controller.tick()
+        self.assertEqual(len(self.github.main_integration_requests), 1)
+        # Then one probe at a time, even with more room, until a build runs.
+        self.controller.set_setting("main_integration_max_in_flight", 4, "test")
+        self.clock.advance(400)
+        self.controller.tick()
         self.assertEqual(len(self.github.main_integration_requests), 2)
-        self.assertNotEqual(self.github.main_integration_requests[1][0], number)
+        probe = self.github.main_integration_requests[1][0]
+        self.post(probe, "success")
+        self.clock.advance(60)
+        self.controller.tick()
+        # Capacity is back: the pause is over and the backfill fills its slots again.
+        self.assertIsNone(self.controller._state(main_integration.BUSY))
+        self.assertGreater(len(self.github.main_integration_requests), 2)
 
     def test_a_status_for_another_main_or_from_before_the_dispatch_is_not_an_answer(self):
         self.controller.tick()
