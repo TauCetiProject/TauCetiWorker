@@ -33,7 +33,7 @@ from tauceti_queue.controller import (  # noqa: E402
     TaskError,
     live_progress_at,
 )
-from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller  # noqa: E402
+from tauceti_queue.fakes import Resolution, ScriptedAgent, make_controller, reopen_controller, run_git  # noqa: E402
 from tauceti_queue.ports import AGENT_INSTRUCTION  # noqa: E402
 from tauceti_queue.store import loads  # noqa: E402
 
@@ -3900,6 +3900,141 @@ class EarlyStaging(PreRebasedCase):
         self.assertEqual(
             [a["outcome"] for a in self.early(batch)], ["infrastructure", "infrastructure"], self.early(batch)
         )
+
+
+class Attestation(PreRebasedCase):
+    """Decision 200: the worker's checks take main's pin and policy (the offer's `policy_commit`), and the
+    controller keeps the worker's attestation of a passing verification for the tip it names."""
+
+    POLICY = {
+        "README.md": "readme\n",
+        "Shared.lean": "line one\nline two\nline three\n",
+        "tauceti.toml": '[tools.tools]\nrepo = "TauCetiProject/TauCetiTools"\nref = "main"\n',
+        "scripts/lint-baseline.txt": "",
+    }
+
+    def setUp(self):
+        ControllerCase.setUp(self)
+        self.controller.store.close()
+        self.tmp2 = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp2.cleanup)
+        self.root = Path(self.tmp2.name)
+        self.controller, self.github, self.repo, self.clock = make_controller(self.root, files=self.POLICY)
+        self.addCleanup(self.controller.store.close)
+        self.github.admins.add("admin-worker")
+        self.controller.set_setting("repair_concurrency", 2, "t")
+        self.controller.set_setting("prepare_min_members", 2, "t")
+        self.controller.set_setting("prepare_quiet_seconds", 0, "t")
+
+    def note(self, of, **changes):
+        shown = chain._git(self.repo.clone, "rev-parse", f"{of}^{{tree}}")
+        tree = shown.stdout.strip() if shown.returncode == 0 else "0" * 40
+        note = {
+            "schema": "tauceti-queue.attestation/v1",
+            "tip": of,
+            "tree": tree,
+            "policy_commit": self.controller._canonical,
+            "tools_commit": "TauCetiProject/TauCetiTools@" + "a" * 40,
+            "lint_scope": "full",
+            "sandbox": True,
+            "verifier_isolated": True,
+            "toolchain": "",
+            "outputs_published": True,
+        }
+        note.update(changes)
+        return note
+
+    def problem(self, checked, **changes):
+        return self.controller._attestation_problem(json.dumps(self.note(checked, **changes)), checked)
+
+    def test_the_offer_names_main_as_the_policy_commit(self):
+        self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual(task.extra["policy_commit"], self.controller._canonical)
+
+    def test_an_attestation_counts_only_when_it_used_mains_policy_on_exactly_the_tip(self):
+        self.open_batch()
+        tip = self.head()["tip"]
+        self.assertIsNone(self.problem(tip))
+        self.assertEqual(self.controller._attestation_problem(None, tip), "no attestation")
+        self.assertEqual(self.problem(tip, tip="0" * 40), "the attestation is of another tip")
+        self.assertEqual(self.problem(tip, tree="0" * 40), "the attestation names another tree")
+        self.assertEqual(self.problem(tip, sandbox=False), "the verification ran outside the build sandbox")
+        self.assertEqual(
+            self.problem(tip, verifier_isolated=False),
+            "the verification's scripts and drivers were writable by candidate code",
+        )
+        for commit in (
+            "TauCetiProject/TauCetiTools@",
+            "TauCetiProject/TauCetiTools@main",
+            "TauCetiProject/TauCetiTools@x",
+        ):
+            self.assertEqual(self.problem(tip, tools_commit=commit), "the verification used another TauCetiTools")
+        self.assertEqual(self.problem(tip, lint_scope="changed"), "the verification did not run the whole-library lint")
+        self.assertEqual(
+            self.problem(tip, policy_commit=None), "the verification used the candidate's own tools and policy"
+        )
+        self.assertEqual(
+            self.problem(tip, tools_commit="someone/TauCetiTools@" + "a" * 40),
+            "the verification used another TauCetiTools",
+        )
+        # A policy commit whose scripts/ differ from main's does not count.
+        self.repo.write_files({"scripts/lint-baseline.txt": "TauCeti.x\n"})
+
+        def run(*a):
+            return run_git(self.repo.scratch, *a)
+
+        run("add", "-A")
+        run("commit", "-q", "-m", "other policy")
+        other = run("rev-parse", "HEAD").strip()
+        run("push", "-q", "origin", f"{other}:refs/heads/elsewhere")
+        chain.git(self.repo.clone, "fetch", "-q", "origin", "elsewhere")
+        self.assertEqual(self.problem(tip, policy_commit=other), "the verification's scripts is not main's")
+
+    def test_a_clean_preparation_attests_its_tip_and_the_seal_carries_it_to_the_head(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip)}
+        )
+        self.assertEqual(json.loads(self.row(batch)["pre_rebase_attestation"])["tip"], task.tip)
+        self.assertIsNone(self.controller.status()["open_batches"][0]["pre_rebase"]["attestation_problem"])
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"]), (batch["id"], task.tip))
+        self.assertIsNone(self.controller._attestation_problem(head["attestation"], head["tip"]))
+        self.assertIsNone(self.controller.status()["head"]["attestation_problem"])
+
+    def test_an_attestation_of_another_tip_is_not_kept(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note("0" * 40)}
+        )
+        self.assertIsNone(self.row(batch)["pre_rebase_attestation"])
+        self.assertEqual(
+            self.controller.status()["open_batches"][0]["pre_rebase"]["attestation_problem"], "no attestation"
+        )
+
+    def test_the_attestation_is_discarded_with_the_verified_mark(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip)}
+        )
+        head = self.head()
+        attempt = self.controller._current_attempt(head)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="source-failure")
+        self.controller._discard_unverified_pre_rebase(self.clock())
+        self.assertIsNone(self.row(batch)["pre_rebase_attestation"])
 
 
 class ParallelHeadCheck(PreRebasedCase):

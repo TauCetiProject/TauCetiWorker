@@ -100,8 +100,8 @@ class FakeController(FakeSource):
             retained_ref="refs/x",
         )
 
-    def release_task(self, task_id, claim_token, reason, error=""):
-        self.calls.append(("release_task", task_id, claim_token, reason, error))
+    def release_task(self, task_id, claim_token, reason, error="", **kwargs):
+        self.calls.append(("release_task", task_id, claim_token, reason, error, *kwargs.items()))
 
     def retry_ci(self, repo, actor, *, request_id=None):
         self.calls.append(("retry_ci", repo, actor) if request_id is None else ("retry_ci", repo, actor, request_id))
@@ -478,6 +478,17 @@ class ServerTest(unittest.TestCase):
             204,
         )
         self.assertEqual(self.controller.calls[-1], ("release_task", 17, "t1", "inference_unavailable", "429"))
+        note = {"attestation": {"tip": "c" * 40}}
+        self.assertEqual(
+            self.request(
+                "POST",
+                "/tasks/17/release",
+                {"claim_token": "t1", "reason": "prepared_clean", "error": "", "notes": note},
+                self.bearer("ghp_worker"),
+            )[0],
+            204,
+        )
+        self.assertEqual(self.controller.calls[-1], ("release_task", 17, "t1", "prepared_clean", "", ("notes", note)))
         self.assertEqual(
             self.request(
                 "POST", "/tasks/inference", {"worker": "w1", "ok": False, "error": "credits"}, self.bearer("ghp_worker")

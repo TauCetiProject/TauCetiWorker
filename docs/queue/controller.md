@@ -417,6 +417,19 @@ replayed onto it) and that pre-rebase's tip is `batches.pre_rebase_verified`: a 
 pre-rebased chain released `prepared_clean`, or adopted with such a note. Any other new tip (a
 controller replay, a repair the worker could not verify) is not known-good, and a CI pass alone does
 not count: the head lands minutes later, and a preparation started then would only hold up the seal.
+Every task offer names `extra.policy_commit`, the canonical commit at the claim, whose `tauceti.toml`
+and `scripts/` the worker's checks take their TauCetiTools pin and policy files from (decision 200).
+The worker's `attestation` of exactly the tip it verified (a submission's note, or a clean
+release's `notes`) is kept beside the verified mark: `batches.attestation` with `verified_tip`, and
+`pre_rebase_attestation` with `pre_rebase_verified`, carried to the head when it seals from that
+pre-rebase unchanged and discarded with the mark. `_attestation_problem` says why it would not stand
+in for staging's checks, or nothing when it would: it must name exactly the tip and its tree, the
+sandbox on, a verifier out of candidate code's reach (`verifier_isolated`, which no worker reports
+yet, so no attestation counts), the whole-library lint, and a policy commit whose `tauceti.toml` and
+`scripts/` are `main`'s now, with the exact tools commit from the repository (and, for a SHA pin,
+the commit) `main` pins. Status
+shows it as `head.attestation_problem` and `pre_rebase.attestation_problem`. No step acts on it
+yet.
 No preparation starts once the head's CI has passed (`prepare_blocked`: `head N passed CI and is landing`): it would be preserved across the landing and the seal would wait for it with staging idle. On a head that is not known-good, the next batch's conflicts-only pre-rebase still runs, but
 `prepare_blocked` says `head N's tip <sha> has not passed its own verification`, and a claimed
 preparation is superseded (`head-unverified`) and its submission refused, a preserved one included

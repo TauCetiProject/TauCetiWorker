@@ -927,6 +927,8 @@ class Handler(BaseHTTPRequestHandler):
                     token,
                     str(body.get("reason") or "released"),
                     str(body.get("error") or ""),
+                    # A clean preparation's attestation (decision 200), passed only when sent.
+                    **({"notes": body["notes"]} if isinstance(body.get("notes"), dict) else {}),
                     **self._source_task_kwargs(),
                 )
             )

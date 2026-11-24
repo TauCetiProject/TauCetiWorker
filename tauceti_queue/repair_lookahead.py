@@ -226,6 +226,7 @@ class Lookahead:
                 base=self.task.validation_base,
                 tools_root=self.cfg.root / repair_audit.TOOLS_DIR,
                 lake=tuple(self.cfg.lake),
+                policy_commit=self.task.extra.get("policy_commit"),
             )
         return path
 
