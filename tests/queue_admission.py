@@ -253,24 +253,29 @@ class AdmissionTests(unittest.TestCase):
         self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
 
-    def test_a_self_tested_rule_change_re_evaluates_only_build_refusals_once(self):
-        head = self.ready()
-        del self.github.statuses[(head, "build")]
-        self.github.labels[1].add("self-tested")
+    def test_a_self_tested_rule_change_re_evaluates_only_evidence_refusals_once(self):
+        for number, missing in ((1, "build"), (3, "scope")):
+            head = self.ready(number)
+            del self.github.statuses[(head, missing)]
+            self.github.labels[number].add("self-tested")
         self.ready(2)
+        unlabelled = self.ready(4)
+        del self.github.statuses[(unlabelled, "build")]
         with mock.patch("tauceti_tools.self_tested.accepted", return_value=False):  # the old team rule
             self.assertEqual(self.intake.run_once()["approved"], 1)
-        self.assertTrue(json.loads(self.intake.state.get(1)["decision"])["reason"].startswith("build is not green"))
+        reasons = {n: json.loads(self.intake.state.get(n)["decision"])["reason"] for n in (1, 3, 4)}
+        self.assertTrue(reasons[1].startswith("build is not green"), reasons)
+        self.assertTrue(reasons[3].startswith("trusted CI scope status is not green"), reasons)
         # A database from before the current self-tested rules.
-        self.controller.store.execute("DELETE FROM settings WHERE key = 'state:self_tested_policy'")
+        self.controller.store.execute("DELETE FROM settings WHERE key LIKE 'state:self_tested_policy:%'")
         approved = self.intake.state.get(2)["generation"]
         self.restart()
         self.assertEqual(self.intake.state.get(2)["generation"], approved, "an admitted head is not re-read")
-        self.assertEqual(self.intake.run_once()["approved"], 1)
-        self.assertEqual({row["number"] for row in self.controller.inputs()}, {1, 2})
-        refused = self.intake.state.get(1)["generation"]
+        self.assertEqual(self.intake.run_once()["approved"], 2)
+        self.assertEqual({row["number"] for row in self.controller.inputs()}, {1, 2, 3})
+        refused = self.intake.state.get(4)["generation"]
         self.restart()
-        self.assertEqual(self.intake.state.get(1)["generation"], refused, "once per rule version")
+        self.assertEqual(self.intake.state.get(4)["generation"], refused, "once per rule version")
 
     def test_primary_intake_uses_published_review_and_unchanged_inputs_cost_no_evaluation(self):
         self.ready()
