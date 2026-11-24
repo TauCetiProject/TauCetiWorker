@@ -3,6 +3,9 @@
 #
 #   tools-pin.sh apply   point this checkout's TauCetiTools dependency at the pin (CI only; it edits
 #                        pyproject.toml and the ./tauceti script header in place)
+#   tools-pin.sh apply --path DIR
+#                        the same, at the TauCetiTools checkout in DIR instead of the pin
+#                        (TauCetiTools' worker-contract CI tests a Tools pull request this way)
 #   tools-pin.sh bump    open a Worker pull request that moves the pin to TauCetiTools main
 #
 # The declared dependency stays TauCetiTools main, which production installs follow (see the
@@ -30,23 +33,34 @@ pinned() {
   printf '%s\n' "$rev"
 }
 
+# apply [--path DIR]
 apply() {
-  local rev file
-  rev="$(pinned)"
+  local target file
+  if [ "$#" = 0 ]; then
+    target="$TOOLS_URL@$(pinned)"
+  elif [ "$#" = 2 ] && [ "$1" = --path ]; then
+    [ -f "$2/pyproject.toml" ] || die "$2 is not a TauCetiTools checkout (no pyproject.toml)"
+    target="$(cd -- "$2" && pwd)"
+    # The path goes into a file:// URL unencoded and through sed, so allow only plain characters.
+    [[ "$target" =~ ^[A-Za-z0-9/._+-]+$ ]] || die "unsupported characters in the path $target"
+    target="file://$target"
+  else
+    die "usage: tools-pin.sh apply [--path DIR]"
+  fi
   # Check both files before changing either, so a refusal leaves the checkout as it was.
   for file in "$PYPROJECT" "$ROOT/tauceti"; do
     grep -qF "tauceti-tools @ $TOOLS_URL@main" "$file" || die "$file does not depend on TauCetiTools main"
   done
   if grep -q '^\[tool\.uv\]' "$PYPROJECT"; then die "pyproject.toml already has [tool.uv]; merge the override into it"; fi
   for file in "$PYPROJECT" "$ROOT/tauceti"; do
-    sed "s|tauceti-tools @ $TOOLS_URL@main|tauceti-tools @ $TOOLS_URL@$rev|" "$file" >"$file.pin"
+    sed "s|tauceti-tools @ $TOOLS_URL@main|tauceti-tools @ $target|" "$file" >"$file.pin"
   done
   # TauCetiReview depends on TauCetiTools main; the override replaces every requirement on it.
-  printf '\n[tool.uv]\noverride-dependencies = ["tauceti-tools @ %s@%s"]\n' "$TOOLS_URL" "$rev" >>"$PYPROJECT.pin"
+  printf '\n[tool.uv]\noverride-dependencies = ["tauceti-tools @ %s"]\n' "$target" >>"$PYPROJECT.pin"
   for file in "$PYPROJECT" "$ROOT/tauceti"; do
     cat "$file.pin" >"$file" && rm "$file.pin"
   done
-  echo "tools-pin: TauCetiTools pinned to $rev"
+  echo "tools-pin: TauCetiTools pinned to $target"
 }
 
 bump() {
@@ -75,7 +89,7 @@ Opened by \`.github/scripts/tools-pin.sh bump\`."
 }
 
 case "${1:-}" in
-  apply) apply ;;
+  apply) shift; apply "$@" ;;
   bump) bump ;;
-  *) die "usage: tools-pin.sh apply|bump" ;;
+  *) die "usage: tools-pin.sh apply [--path DIR] | bump" ;;
 esac

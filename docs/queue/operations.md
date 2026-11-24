@@ -209,6 +209,11 @@ authenticated, opens a pull request that moves the pin to Tools main; its CI run
 against the new commit. Bump after any TauCetiTools change the Worker relies on. A release still
 installs Tools main as it is at the time, which can be newer than the pin.
 
+`.github/scripts/tools-pin.sh apply --path DIR` points the dependency at a TauCetiTools checkout
+instead of the pin. TauCetiTools' `worker-contract` workflow uses it to run this repository's
+`queue_admission` and `queue_admission_adapter` tests against each Tools pull request, because
+production runs Tools main as soon as it merges.
+
 `services/queue/release.sh status` lists each queue unit with the revision its unit file names and
 the revision its running process runs (marked `*` when the process still runs another directory,
 for example after `--no-restart`). After a successful install the installer removes release
