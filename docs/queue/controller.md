@@ -436,10 +436,14 @@ Sealing only what was verified (decision 174, step 3; it replaces decision 172's
 of the next batch's pre-rebased chain is a frozen snapshot of that batch. Creating the task also seals
 the batch's membership (`sealed`, journal `successor-sealed` with reason `verification-snapshot`,
 counter `successors_sealed_for_verification`), so insertion sends later arrivals to the following
-batch and the run finishes on exactly the members the next head will have. When the head lands, the
-batch seals from its pre-rebase unchanged, as exactly the verified tip, known-good, and its first
-staging run builds a tip a worker already built, checked and published. A batch that gets no such
-preparation (its head never became known-good) keeps taking members and seals whole as before.
+batch and the run finishes on exactly the members the next head will have. When that preparation
+completes and passes, and the head lands as the tip it was made on with no replay needed, the batch
+seals from its pre-rebase unchanged, as exactly the verified tip, known-good, and its first staging
+run builds a tip a worker already built, checked and published. Otherwise (the preparation is
+superseded, fails or goes stale, or an emergency or lane landing forces a replay) promotion is as
+before and the head is not known-good; the batch stays sealed at its snapshot. A batch that gets no
+such preparation keeps taking members until the usual `sealed_successor_min_members` threshold. The
+cost: a batch can be frozen smaller than that threshold (from `prepare_min_members`, 20).
 
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,

@@ -3550,6 +3550,19 @@ class VerificationSnapshot(PreRebasedCase):
         self.assertEqual(self.github.runs[-1].head_sha, task.tip, "staging builds the exact verified tip")
         self.assertEqual(self.controller.store.row("batches", {"id": following})["state"], "open")
 
+    def test_an_already_sealed_batch_is_not_sealed_again(self):
+        batch = self.open_batch()
+        self.controller.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=self.clock())
+        self.verify_head()
+        self.controller.tick()
+        self.assertEqual(len(self.pre_rebased_tasks()), 1)
+        snapshots = [
+            e
+            for e in self.controller.store.journal_entries("successor-sealed")
+            if e["detail"].get("reason") == "verification-snapshot"
+        ]
+        self.assertEqual(snapshots, [])
+
     def test_without_a_verification_the_batch_keeps_taking_members(self):
         batch = self.open_batch()
         self.assertEqual(self.pre_rebased_tasks(), [], "the head is not known-good")
