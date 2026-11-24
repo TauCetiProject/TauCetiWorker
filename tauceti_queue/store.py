@@ -204,7 +204,9 @@ CREATE TABLE IF NOT EXISTS batches (
     pre_rebase_edits TEXT NOT NULL DEFAULT '{}',
     pre_rebase_at REAL,
     pre_rebase_prepared TEXT,
-    lane TEXT NOT NULL DEFAULT ''
+    lane TEXT NOT NULL DEFAULT '',
+    verified_tip TEXT,
+    pre_rebase_verified TEXT
 );
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,

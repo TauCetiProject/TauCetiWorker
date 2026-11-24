@@ -3887,6 +3887,9 @@ def _run_task(
                     a.get("estimated_cost_usd") or 0 for r in agent_records for a in r.get("attempts", [])
                 ),
             }
+            # Whether this exact tip passed the worker's own verification: the controller verifies and
+            # repairs the next batch only on a head tip with such a pass (decision 174).
+            notes["local_verification"] = {"tip": tip, "checks_passed": verified_unchanged(tip, outcome)}
             verification_note = admission_verification(
                 task, tip, outcome, stream.findings if stream is not None else []
             )

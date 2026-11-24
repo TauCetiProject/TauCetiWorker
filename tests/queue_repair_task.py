@@ -6382,6 +6382,8 @@ class WorkerAudits(Fixture):
         self.assertTrue(notes["checks_passed"])
         self.assertEqual(notes["tip"], outcome["tip"])
         self.assertEqual(notes["observed_duplicate_names"], ["Foo.bar"])
+        local = json.loads(self.service.results[0]["worker_notes"])["local_verification"]
+        self.assertEqual(local, {"tip": outcome["tip"], "checks_passed": True}, "the submitted tip passed")
         self.assertFalse(outcome["verification"][0]["ok"])
         self.assertTrue(outcome["verification"][-1]["ok"])
 
@@ -6526,6 +6528,8 @@ class WorkerAudits(Fixture):
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertNotIn("verification", outcome)
         self.assertFalse((self.stub_dir / "audit-runs.log").exists())
+        local = json.loads(self.service.results[0]["worker_notes"])["local_verification"]
+        self.assertEqual(local, {"tip": outcome["tip"], "checks_passed": False}, "an unchecked tip is not known-good")
 
     def test_the_build_helper_runs_the_audits_after_a_green_whole_library_build(self):
         worktree = self.root / "helper"

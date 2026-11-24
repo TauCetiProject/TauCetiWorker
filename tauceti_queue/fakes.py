@@ -14,6 +14,7 @@ no inference.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -823,7 +824,8 @@ class ScriptedAgent:
     replayed mechanically onto the new tip; a member whose mechanical replay conflicts and has no
     resolution makes the agent give up (it releases the task with the given reason). Explanations are
     appended to the existing message, as the agent instruction requires; `omit_explanation` leaves
-    them off to exercise the controller's `explanation-required` rejection.
+    them off to exercise the controller's `explanation-required` rejection. `verified` reports, as a
+    worker does, that its own verification of the submitted tip passed (`local_verification`).
     """
 
     def __init__(
@@ -835,8 +837,10 @@ class ScriptedAgent:
         script: Script,
         *,
         omit_explanation: bool = False,
+        verified: bool = False,
     ) -> None:
         self.name = name
+        self.verified = verified
         self.login = login
         self.repo = repo
         self.workdir = Path(workdir)
@@ -864,9 +868,15 @@ class ScriptedAgent:
         tip = self.produce(task)
         if before_submit:
             before_submit(task)
-        result = controller.submit_task(task.task_id, task.claim_token, tip, worker_notes=f"{self.name} fixture run")
+        result = controller.submit_task(task.task_id, task.claim_token, tip, worker_notes=self.notes(tip))
         self.results.append(result)
         return result
+
+    def notes(self, tip: str) -> str:
+        """The worker notes a submission of `tip` carries."""
+        if not self.verified:
+            return f"{self.name} fixture run"
+        return json.dumps({"worker": self.name, "local_verification": {"tip": tip, "checks_passed": True}})
 
     def produce(self, task: Task) -> str:
         """Build the replacement chain in the agent's clone and push it to the task's submission ref."""
