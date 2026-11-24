@@ -40,8 +40,10 @@ apply() {
     target="$TOOLS_URL@$(pinned)"
   elif [ "$#" = 2 ] && [ "$1" = --path ]; then
     [ -f "$2/pyproject.toml" ] || die "$2 is not a TauCetiTools checkout (no pyproject.toml)"
-    target="file://$(cd "$2" && pwd)"
-    case "$target" in *[\|\&\\\"[:space:]]*) die "unsupported characters in the path $target" ;; esac
+    target="$(cd -- "$2" && pwd)"
+    # The path goes into a file:// URL unencoded and through sed, so allow only plain characters.
+    [[ "$target" =~ ^[A-Za-z0-9/._+-]+$ ]] || die "unsupported characters in the path $target"
+    target="file://$target"
   else
     die "usage: tools-pin.sh apply [--path DIR]"
   fi
