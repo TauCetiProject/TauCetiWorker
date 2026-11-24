@@ -45,7 +45,7 @@ Once you have settled on a target, derive a short stable id for it and claim it 
   existing Lean or Mathlib type, put declarations in that type's existing namespace (e.g. root
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
   Classic `import Mathlib...` syntax is simplest.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Choose a target supported by an existing roadmap; if none is suitable, finish without opening a PR.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. Choose a target supported by an existing roadmap; if none is suitable, finish without opening a PR. When a roadmap itself is wrong, the one sanctioned channel is a roadmap report (below).
 - Aim for ~500–1200 lines of genuine, non-vacuous content. A shorter PR that closes a milestone beats a longer peripheral one, and smaller-but-green beats bigger-but-broken. No tautologies, no `True`-placeholder fields, no vacuous definitions. Follow Mathlib naming/docstring conventions, and never silence a linter or use `set_option`.
 - Must build green AND pass the axiom audit (allowlist: `propext`, `Classical.choice`, `Quot.sound`; no `sorry`/`native_decide`/new axioms/`maxHeartbeats`).
 
@@ -86,6 +86,16 @@ Never downgrade to a lookalike: a weakened statement, a degenerate special case,
 1. Land the largest coherent sorry-free piece that still makes genuine progress towards a milestone, stating in the PR body exactly what remains.
 2. If no such piece exists, release your claim and stop without a PR. Do not substitute unrelated or peripheral work merely to produce an artifact.
 
+## If the roadmap is wrong
+A roadmap statement or `Suggested.lean` pin can be wrong: false, missing a hypothesis, unprovable or ill-typed as pinned, a definition with the wrong body, a circular route, or a declaration that has since been renamed. Do not quietly prove a weaker statement in its place. Prove the corrected statement and, where feasible, the counterexample or obstruction as a theorem; then add a roadmap report to the PR body: a `### Roadmap report` section saying what is wrong, why (the counterexample or obstruction), and the corrected statement, followed by one marker line per error (at most five):
+```
+<!--tauceti-roadmap-report:v1 {"roadmap":"<folder>","file":"README.md","roadmap_sha":"__ROADMAP_SHA__","anchor":"<quote>","kind":"false-statement","effect":"worked-around","refutes":["TauCeti.<counterexample>"],"replaces":["TauCeti.<corrected>"]}-->
+```
+- `roadmap` is the roadmap's folder under `__ROADMAP_DIR__/` (`Parent/Child` for a nested one); `file` is `README.md` or `Suggested.lean`; `roadmap_sha` is `__ROADMAP_SHA__`, the roadmap commit you read.
+- `anchor` locates the error in that file: for `Suggested.lean`, the declaration's name; for `README.md`, a verbatim quote of the statement or its distinctive part, at most 300 characters. Copy it from the file: only whitespace may differ.
+- `kind` is one of `false-statement`, `missing-hypothesis`, `unprovable-pin`, `wrong-definition`, `circular-dependency`, `stale-name`. `effect` is `worked-around` when this PR proves a corrected statement in its place, `blocked` when it lands only a partial piece and the error still blocks the target. `refutes` and `replaces` are optional lists (at most 10) of the fully qualified declarations that refute the roadmap's statement and that state the corrected one. Replace every `<…>` placeholder in the template with real values: the checker rejects a name such as `TauCeti.<corrected>`.
+- Run `"__BIN__/roadmap-report-check" --roadmaps __ROADMAP_DIR__ <body-file>` and fix what it reports. Report only what you have proved or can show: reviewers judge the report with the rest of the PR.
+
 ## Submit
 You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`): the branch is pushed there, and the PR is opened from your fork to `TauCetiProject/TauCeti:main`. You do not need write access to the canonical repo. (The wrappers are already configured to push to your fork — just run them.)
 - Create a branch `roadmap/<short-slug>-__WORKERID__` off `main` (the `-__WORKERID__` suffix keeps concurrent workers on one account from colliding). Commit (message `feat: <subject>`; end the body with `Co-Authored-By: __AGENT__ <noreply@github.com>`).
@@ -98,7 +108,7 @@ You author from **your own fork** of TauCetiProject/TauCeti (`__FORK__/TauCeti`)
   ```
   "__BIN__/gh-safe-pr-create" --repo TauCetiProject/TauCeti --base main --head __FORK__:roadmap/<short-slug>-__WORKERID__ --title "feat: <subject>" --body-file <file>
   ```
-  Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, includes a standalone `Roadmap: <target-roadmap>` line (using the canonical top-level directory, never `any`), and, after an upstream switch, a standalone `Consumer roadmap: <designated-roadmap>` line plus the explicit dependency edge. When `.github/pull_request_template.md` has a `Quality pass:` block, the body carries it completed, one line per check in the template's format (the block is a line and a list, not a heading). It **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
+  Do NOT run a raw `gh pr create`. The PR body opens with a paragraph beginning "This PR …" in imperative present, cites the exact roadmap target, includes a standalone `Roadmap: <target-roadmap>` line (using the canonical top-level directory, never `any`), and, after an upstream switch, a standalone `Consumer roadmap: <designated-roadmap>` line plus the explicit dependency edge. When `.github/pull_request_template.md` has a `Quality pass:` block, the body carries it completed, one line per check in the template's format (the block is a line and a list, not a heading). It **includes the `<!--tauceti-target:v1 …-->` marker from the claim step** (the wrapper rejects the PR without it), names any Mathlib infrastructure you vendored (with attribution), has no section headings other than a `### Roadmap report` section, and ends with `🤖 Prepared with __AGENT__`. Title `feat: <subject>`.
 
 ## Report a submitted PR
 After opening a PR, end with a concise summary: the target and target roadmap you chose, the designated milestone it serves, why it was the most effective current step towards that milestone, the file(s) added and line count, the PR number/URL, the rubrics you read, and what your own review of the diff found and changed. Quote the `scope:` line and state that the build and audit you ran were local checks, not CI; CI verifies the pushed PR.

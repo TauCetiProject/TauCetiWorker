@@ -11,6 +11,8 @@
 #   TAUCETI_TARGET_MARKER      the exact <!--tauceti-target:v1 {...}--> string the PR body must contain,
 #                              or several such strings one per line, of which it must contain one
 #   TAUCETI_CLAIM_SH           path to claim.sh (default: alongside this script)
+# A roadmap report marker in the body is checked with roadmap-report-check (alongside this script);
+# a malformed one is reported on stderr and never stops the PR.
 # All `gh pr create` flags pass through unchanged.
 set -uo pipefail
 
@@ -59,6 +61,16 @@ elif [[ "$REQUIRE_MARKER" == "1" ]]; then
         || die "PR body is missing a target marker. Add a line like:
   <!--tauceti-target:v1 {\"focus\":\"<area>\",\"id\":\"<slug>\"}-->
 It lets other agents and the dup-sweeper recognize which roadmap target this PR authors."
+fi
+
+# 3) A roadmap report in the body is checked, but never blocks the PR: a malformed marker is only
+#    reported back, so the agent can fix it with `gh pr edit` (docs/roadmap-reports.md).
+body="$(pr_body_from_args "$@")"
+if [[ "$body" == *"<!--tauceti-roadmap-report:"* ]]; then
+    check="$(dirname "$0")/roadmap-report-check"
+    if [[ -x "$check" ]] && ! printf '%s' "$body" | "$check" >&2; then
+        echo "gh-safe-pr-create: the roadmap report above is malformed; the PR is opened anyway. Fix the body with \`gh pr edit --body-file\`." >&2
+    fi
 fi
 
 echo "gh-safe-pr-create: gh pr create $*" >&2
