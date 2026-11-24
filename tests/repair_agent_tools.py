@@ -558,6 +558,23 @@ class Fetches(Fixture):
             (view / "outputs" / "TauCeti" / "note.txt").write_text("output")
         self.assertEqual((pool / "outputs" / "TauCeti" / "note.txt").read_text(), "output")
 
+    def test_the_copy_sandbox_keeps_a_lib_dynload_that_resolves_to_another_system_path(self):
+        # A Nix python: its prefix is one store path and its lib-dynload a link into another.
+        elsewhere = next(Path(r) for r in ("/usr/lib", "/nix/store", "/lib") if Path(r).is_dir()).resolve()
+        prefix = self.tmp / "python-env"
+        (prefix / "lib" / "python3").mkdir(parents=True)
+        dynload = prefix / "lib" / "python3" / "lib-dynload"
+        dynload.symlink_to(elsewhere)
+        with (
+            patch.object(sys, "path", [str(prefix / "lib" / "python3"), str(dynload), str(self.home)]),
+            patch.object(sys, "base_prefix", str(prefix)),
+        ):
+            argv = repair_sandbox.sandboxed_python("pass", [], self.tmp, {**self.env, "PATH": f"{self.bin}"})
+        code = argv[argv.index("-c") + 1]
+        self.assertIn(repr(str(elsewhere)), code, "lib-dynload, resolved under a system root, stays on the path")
+        self.assertIn(repr(str((prefix / "lib" / "python3").resolve())), code)
+        self.assertNotIn(str(self.home), code, "the working directory `python -m` adds does not")
+
     def test_the_workers_mathlib_cache_is_their_own(self):
         env = repair.lake_env(self.root, {"HOME": str(self.home)}, cache_root=self.tmp / "shared")
         self.assertEqual(env["MATHLIB_CACHE_DIR"], str(self.tmp / "shared" / "mathlib-cache"))
