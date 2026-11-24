@@ -18,9 +18,14 @@ PYPROJECT="$ROOT/pyproject.toml"
 
 die() { echo "tools-pin: $*" >&2; exit 1; }
 
+# pinned [-]: the tools-rev in pyproject.toml, or in the pyproject.toml on stdin given -.
 pinned() {
   local rev
-  rev="$(sed -n 's/^tools-rev = "\([0-9a-f]\{40\}\)"$/\1/p' "$PYPROJECT")"
+  if [ "${1:-}" = - ]; then
+    rev="$(sed -n 's/^tools-rev = "\([0-9a-f]\{40\}\)"$/\1/p')"
+  else
+    rev="$(sed -n 's/^tools-rev = "\([0-9a-f]\{40\}\)"$/\1/p' "$PYPROJECT")"
+  fi
   [ "$(printf '%s\n' "$rev" | grep -c .)" = 1 ] || die "pyproject.toml needs exactly one tools-rev = \"<40-hex commit>\""
   printf '%s\n' "$rev"
 }
@@ -28,14 +33,19 @@ pinned() {
 apply() {
   local rev file
   rev="$(pinned)"
+  # Check both files before changing either, so a refusal leaves the checkout as it was.
   for file in "$PYPROJECT" "$ROOT/tauceti"; do
     grep -qF "tauceti-tools @ $TOOLS_URL@main" "$file" || die "$file does not depend on TauCetiTools main"
+  done
+  if grep -q '^\[tool\.uv\]' "$PYPROJECT"; then die "pyproject.toml already has [tool.uv]; merge the override into it"; fi
+  for file in "$PYPROJECT" "$ROOT/tauceti"; do
     sed "s|tauceti-tools @ $TOOLS_URL@main|tauceti-tools @ $TOOLS_URL@$rev|" "$file" >"$file.pin"
+  done
+  # TauCetiReview depends on TauCetiTools main; the override replaces every requirement on it.
+  printf '\n[tool.uv]\noverride-dependencies = ["tauceti-tools @ %s@%s"]\n' "$TOOLS_URL" "$rev" >>"$PYPROJECT.pin"
+  for file in "$PYPROJECT" "$ROOT/tauceti"; do
     cat "$file.pin" >"$file" && rm "$file.pin"
   done
-  grep -q '^\[tool\.uv\]' "$PYPROJECT" && die "pyproject.toml already has [tool.uv]; merge the override into it"
-  # TauCetiReview depends on TauCetiTools main; the override replaces every requirement on it.
-  printf '\n[tool.uv]\noverride-dependencies = ["tauceti-tools @ %s@%s"]\n' "$TOOLS_URL" "$rev" >>"$PYPROJECT"
   echo "tools-pin: TauCetiTools pinned to $rev"
 }
 
@@ -44,13 +54,12 @@ bump() {
   command -v gh >/dev/null || die "gh is required"
   [ -z "$(git -C "$ROOT" status --porcelain)" ] || die "the checkout has uncommitted changes"
   git -C "$ROOT" fetch --quiet origin main
-  old="$(pinned)"
+  old="$(git -C "$ROOT" show origin/main:pyproject.toml | pinned -)"
   new="$(git ls-remote --exit-code "$TOOLS_REPO" refs/heads/main | cut -f1)"
   [[ "$new" =~ ^[0-9a-f]{40}$ ]] || die "cannot resolve TauCetiTools main"
-  [ "$new" != "$old" ] || { echo "tools-pin: already at TauCetiTools main ($old)"; return 0; }
+  if [ "$new" = "$old" ]; then echo "tools-pin: Worker main already pins TauCetiTools main ($old)"; return 0; fi
   branch="chore/bump-tools-${new:0:12}"
   git -C "$ROOT" switch --quiet -c "$branch" origin/main
-  old="$(pinned)"
   sed "s/^tools-rev = \"$old\"$/tools-rev = \"$new\"/" "$PYPROJECT" >"$PYPROJECT.pin"
   cat "$PYPROJECT.pin" >"$PYPROJECT" && rm "$PYPROJECT.pin"
   [ "$(pinned)" = "$new" ] || die "failed to rewrite tools-rev"

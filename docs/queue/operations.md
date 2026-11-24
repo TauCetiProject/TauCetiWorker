@@ -203,8 +203,8 @@ they are.
 Releases follow TauCetiTools main on purpose: the shared CI harness and TauCeti's workflows run
 Tools main, and the controller's admission and result checks must agree with them. Worker CI does
 not: it tests against the TauCetiTools commit in `pyproject.toml`'s `[tool.tauceti-ci] tools-rev`
-(`.github/scripts/tools-pin.sh apply`), so a TauCetiTools merge cannot turn Worker `main` red on
-its own. `.github/scripts/tools-pin.sh bump`, run from a clean Worker checkout with `gh`
+(`.github/scripts/tools-pin.sh apply`), so a TauCetiTools merge cannot turn the test, build and
+macOS jobs red on their own. The `docker` job installs Tools main, as the production image does. `.github/scripts/tools-pin.sh bump`, run from a clean Worker checkout with `gh`
 authenticated, opens a pull request that moves the pin to Tools main; its CI runs the Worker suite
 against the new commit. Bump after any TauCetiTools change the Worker relies on. A release still
 installs Tools main as it is at the time, which can be newer than the pin.
