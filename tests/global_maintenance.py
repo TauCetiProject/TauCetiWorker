@@ -295,44 +295,99 @@ class GlobalMaintenance(unittest.TestCase):
             )
         self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), set(), "no shared directory")
 
-    def test_fix_rounds_stop_and_label_after_the_cap_of_sent_back_heads(self):
+    def test_the_fix_cap_counts_distinct_heads_per_pr(self):
         from tauceti_worker import peer_claims
-        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL, NEEDS_HUMAN_LABEL
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL
         from tauceti_worker.survey import Candidate
 
         shared = tempfile.TemporaryDirectory()
         self.addCleanup(shared.cleanup)
-        labels = []
-        self.w.gh.add_label = lambda pr, name: labels.append((pr, name)) or True
         with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
             scope = work._claim_scope(self.w)
             heads = [f"{n:040x}" for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL + 1)]
             for head in heads[:-1]:
-                self.assertFalse(work._fix_loop_escalated(self.w, Candidate(10, head)))
-                self.assertFalse(work._fix_loop_escalated(self.w, Candidate(10, head)), "a retry at one head")
+                self.assertFalse(work._fix_cap_reached(self.w, Candidate(10, head)))
+                self.assertFalse(work._fix_cap_reached(self.w, Candidate(10, head)), "a retry at one head")
             self.assertEqual(len(peer_claims.fixed_heads(scope, 10)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
-            self.assertFalse(work._fix_loop_escalated(self.w, Candidate(11, heads[-1])), "per PR")
-            self.assertEqual(labels, [])
-            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(10, heads[-1])))
-            self.assertEqual(labels, [(10, NEEDS_HUMAN_LABEL)])
-            self.assertEqual(peer_claims.fixed_heads(scope, 10), set(), "a person removing the label resumes fixes")
+            self.assertFalse(work._fix_cap_reached(self.w, Candidate(11, heads[-1])), "per PR")
+            self.assertFalse(work._fix_cap_spent(self.w, Candidate(10, heads[0])), "a recorded head is not counted")
+            self.assertTrue(work._fix_cap_spent(self.w, Candidate(10, heads[-1])))
+            self.assertTrue(work._fix_cap_reached(self.w, Candidate(10, heads[-1])))
+            self.assertNotIn(heads[-1], peer_claims.fixed_heads(scope, 10), "the capped head is not recorded")
 
-            # A label that cannot be added keeps the cap on this host and the count, so the next try labels.
-            for head in heads[:-1]:
-                work._fix_loop_escalated(self.w, Candidate(12, head))
-            self.w.gh.add_label = Mock(side_effect=OSError("down"))
-            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(12, heads[-1])))
-            self.assertEqual(len(peer_claims.fixed_heads(scope, 12)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
-            self.w.gh.add_label = Mock(return_value=False)
-            self.assertTrue(work._fix_loop_escalated(self.w, Candidate(12, heads[-1])))
-            self.assertEqual(len(peer_claims.fixed_heads(scope, 12)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+    def test_the_fix_cap_closes_a_maintained_pr(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        sv, c, live = self.spent_fixture()
+        self.counter_values.clear()  # the per-head attempt budget is not spent
+
+        def close(argv, **kwargs):
+            live["state"] = "CLOSED"
+            return SimpleNamespace(returncode=0)
+
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL):
+                peer_claims.note_fixed_head(scope, 10, f"{n:040x}")
+            with patch.object(work, "gh_run", side_effect=close) as mutation:
+                self.assertEqual(work._close_capped_pr(self.w, sv, c), 0)
+            argv = mutation.call_args.args[0]
+            self.assertEqual(argv[:4], ["gh", "pr", "close", "10"])
+            self.assertIn(f"after {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds", argv[argv.index("--comment") + 1])
+            self.assertEqual(peer_claims.fixed_heads(scope, 10), set(), "a reopened PR starts a fresh count")
+            self.w.claims.release.assert_called_once()
+
+    def test_the_fix_cap_never_closes_another_authors_pr_or_a_kept_one(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL):
+                peer_claims.note_fixed_head(scope, 10, f"{n:040x}")
+            for changes in ({"labels": [{"name": "keep"}]}, {"author": {"login": "peer"}}):
+                with self.subTest(changes=changes):
+                    sv, c, _ = self.spent_fixture(**changes)
+                    with patch.object(work, "gh_run") as mutation:
+                        self.assertIsNone(work._close_capped_pr(self.w, sv, c))
+                    mutation.assert_not_called()
+                    self.assertEqual(len(peer_claims.fixed_heads(scope, 10)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+            sv, c, _ = self.spent_fixture()
+            sv.me_login = "someone-else"  # a contributor's PR that the fleet fixes
+            self.w.claims.begin_branch_work = Mock(side_effect=AssertionError("no claim for a foreign PR"))
+            with patch.object(work, "gh_run") as mutation:
+                self.assertIsNone(work._close_capped_pr(self.w, sv, c))
+            mutation.assert_not_called()
+
+    def test_a_foreign_pr_at_the_fix_cap_is_skipped_before_any_read(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL):
+                peer_claims.note_fixed_head(scope, 10, f"{n:040x}")
+            # PR 10 stands for a contributor's PR that the fleet fixes but does not maintain.
+            with patch.object(work, "owns_pr", side_effect=lambda sv, p, **k: p.number != 10):
+                self.run_round([row(10, "Other"), row(20, "Other")])
+            self.assertEqual([call[:2] for call in self.calls], [("fix", 20)])
+            self.calls.clear()
+            self.run_round([row(10, "Other")])
+            self.assertEqual([call[:2] for call in self.calls], [("fix", 10)], "a maintained PR goes on to close")
 
     def test_the_fix_cap_is_counted_only_after_the_live_recheck_confirms_the_fix(self):
         import inspect
 
         source = inspect.getsource(work.dispatch)
         recheck = source.index("actionable = _still_actionable(stage, w, sv, c, explicit=explicit)")
-        cap = source.index("_fix_loop_escalated(w, c)")
+        cap = source.index("_fix_cap_reached(w, c)")
         self.assertLess(recheck, cap)
         guard = source[source.rindex('stage == "fix"', 0, cap) : cap]
         for condition in ("actionable is True", "not c.partial_history", "c.pr not in bump_prs(sv)"):

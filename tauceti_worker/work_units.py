@@ -78,7 +78,6 @@ from .constants import (
     MAX_FIX_ATTEMPTS,
     MAX_FIX_ROUNDS_WITHOUT_APPROVAL,
     MAX_INFRA_REFUNDS,
-    NEEDS_HUMAN_LABEL,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -193,31 +192,22 @@ def _claim_scope(w) -> str:
     return key if isinstance(key, str) else str(getattr(gh, "repo", ""))
 
 
-def _fix_loop_escalated(w, c: Candidate) -> bool:
+def _fix_cap_spent(w, c: Candidate) -> bool:
+    """Whether review already sent back MAX_FIX_ROUNDS_WITHOUT_APPROVAL other heads of this PR on this host."""
+    return len(peer_claims.fixed_heads(_claim_scope(w), c.pr) - {c.head}) >= MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+
+
+def _fix_cap_reached(w, c: Candidate) -> bool:
     """Count the heads of this PR that review sent back for a fix on this host, and stop at the cap.
 
     Called once the PR's live review state confirms a fix at `c.head`. Each distinct head here is one
     review that asked for changes after a push, so MAX_FIX_ROUNDS_WITHOUT_APPROVAL other heads mean
-    that many fix and review cycles without an approval. The PR is then labelled for a person (the
-    label pauses fix and review fleet-wide) and this host's count starts again, so removing the label
-    resumes fixing with a fresh budget."""
-    scope = _claim_scope(w)
-    fixed = peer_claims.fixed_heads(scope, c.pr) - {c.head}
-    if len(fixed) < MAX_FIX_ROUNDS_WITHOUT_APPROVAL:
-        peer_claims.note_fixed_head(scope, c.pr, c.head)
-        return False
-    try:
-        labelled = w.gh.add_label(c.pr, NEEDS_HUMAN_LABEL) is not False
-    except Exception as error:  # the cap holds on this host whether or not the label lands
-        log(f"  fix #{c.pr}: could not add the {NEEDS_HUMAN_LABEL!r} label ({type(error).__name__})")
-        labelled = False
-    if labelled:
-        peer_claims.clear_fixed_heads(scope, c.pr)
-    log(
-        f"  fix #{c.pr}: review sent back {len(fixed)} earlier heads on this host without an approval; "
-        f"{'labelled' if labelled else 'could not label'} it {NEEDS_HUMAN_LABEL!r} for a person instead of fixing"
-    )
-    return True
+    that many fix and review cycles without an approval. At the cap the fleet closes a PR it maintains
+    (_close_capped_pr) and stops offering fix rounds for anyone else's."""
+    if _fix_cap_spent(w, c):
+        return True
+    peer_claims.note_fixed_head(_claim_scope(w), c.pr, c.head)
+    return False
 
 
 def _github_clone_url(owner: str, repo: str) -> str:
@@ -918,6 +908,10 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
             w.selection_changed = True
             continue
+        if stage == "fix" and not opts.dry_run and c.pr and c.pr not in bump_prs(sv) and _fix_cap_spent(w, c):
+            p = next((p for p in sv.open_prs if p.number == c.pr), None)
+            if not p or not owns_pr(sv, p):
+                continue  # someone else's PR at the cap: no more fix rounds, and no reads to find that out
         if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head, unavailable=True):
             log(f"Global PR work: {stage} #{c.pr} source recently unavailable on this host — selecting other work")
             w.selection_changed = True
@@ -1818,9 +1812,9 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
         and actionable is True
         and not c.partial_history
         and c.pr not in bump_prs(sv)
-        and _fix_loop_escalated(w, c)
+        and _fix_cap_reached(w, c)
     ):
-        return None
+        return _close_capped_pr(w, sv, c, explicit=explicit)
     from .claude_api import admission_failure
     from .fleet_capacity import admission_reason
 
@@ -2673,16 +2667,58 @@ def _adopted_authors_note(sv) -> str:
 
 def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:
     """Retire an owned, still-blocked head after its existing repair attempts; no model call."""
+    if w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS:
+        return None
+    return _close_owned_pr(
+        w,
+        sv,
+        c,
+        explicit=explicit,
+        detail="closing owned PR after spent repair attempts",
+        comment=f"Closing after {MAX_FIX_ATTEMPTS} repair attempts left review findings unresolved "
+        f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
+        "remaining findings using the current review rubric.",
+    )
+
+
+FIX_CAP_COMMENT = (
+    "Closing automatically: review has asked for changes again after {rounds} fix rounds, with no "
+    "approval in between, so the fleet is retiring this PR to keep things moving. The branch is kept, "
+    "so nothing is lost. It is completely fine to open a fresh PR with a different approach. Add the "
+    "`keep` label if you would rather it stay open; the fleet then leaves it unfixed."
+)
+
+
+def _close_capped_pr(w, sv, c, *, explicit=False) -> int | None:
+    """At the fix-round cap: close a PR the fleet maintains, and only stop fixing anyone else's.
+
+    Maintained PRs are the account's own and adopted Forgejo authors' (owns_pr). Any other PR the fleet
+    fixes, such as a contributor's, stays open; this host just stops offering it fix rounds."""
+    p = next((p for p in sv.open_prs if p.number == c.pr), None)
+    if not p or not owns_pr(sv, p) or p.automatic_bump or c.foreign_repair_base:
+        log(f"  fix #{c.pr}: {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds without an approval; no more fix rounds")
+        return None
+    rc = _close_owned_pr(
+        w,
+        sv,
+        c,
+        explicit=explicit,
+        detail=f"closing owned PR after {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds without an approval",
+        comment=FIX_CAP_COMMENT.format(rounds=MAX_FIX_ROUNDS_WITHOUT_APPROVAL),
+    )
+    if rc == 0:
+        peer_claims.clear_fixed_heads(_claim_scope(w), c.pr)  # a reopened PR starts a fresh count
+    else:
+        log(f"  fix #{c.pr}: {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds without an approval; not closed, no more fix rounds")
+    return rc
+
+
+def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
+    """Close an owned PR still blocked at `c.head` with `comment`, after fresh checks; no model call."""
     from .github_transport import read_context
 
     p = next((p for p in sv.open_prs if p.number == c.pr), None)
-    if (
-        not p
-        or not owns_pr(sv, p)
-        or p.automatic_bump
-        or c.foreign_repair_base
-        or w.counters.read(f"fix-{c.pr}-{c.head[:12]}") < MAX_FIX_ATTEMPTS
-    ):
+    if not p or not owns_pr(sv, p) or p.automatic_bump or c.foreign_repair_base:
         return None
     if not w.claims.begin_branch_work(c.pr, c.head, p.head_ref, p.head_owner, p.head_repo):
         return None
@@ -2705,28 +2741,13 @@ def _close_spent_pr(w, sv, c, *, explicit=False) -> int | None:
             from .activity import select
 
             select("fix")
-            report_runtime(
-                "running", phase="fix", target=f"PR #{c.pr}", detail="closing owned PR after spent repair attempts"
-            )
-            gh_run(
-                [
-                    "gh",
-                    "pr",
-                    "close",
-                    str(c.pr),
-                    "--repo",
-                    TAUCETI,
-                    "--comment",
-                    f"Closing after {MAX_FIX_ATTEMPTS} repair attempts left review findings unresolved "
-                    f"at head `{c.head}`. The branch is retained; a fresh attempt can address the "
-                    "remaining findings using the current review rubric.",
-                ]
-            )
+            report_runtime("running", phase="fix", target=f"PR #{c.pr}", detail=detail)
+            gh_run(["gh", "pr", "close", str(c.pr), "--repo", TAUCETI, "--comment", comment])
             after = w.gh.pr_view(c.pr, ["state"])
             if not after or after.get("state") not in {"CLOSED", "MERGED"}:
                 raise NoProgress(f"fix #{c.pr}: automatic closure not confirmed; retrying without another model call")
         w.rs.bust(c.pr)
-        log(f"fix #{c.pr}: confirmed closure after spent repair attempts")
+        log(f"fix #{c.pr}: confirmed closure ({detail})")
         return 0
     finally:
         w.claims.stop_heartbeat()

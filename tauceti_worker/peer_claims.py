@@ -122,7 +122,7 @@ def note_fixed_head(scope: str, pr: int, head: str) -> None:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         (directory / head).touch()
     except OSError:
-        pass  # an unrecorded head only delays the escalation by one round
+        pass  # an unrecorded head only delays the cap by one round
 
 
 def fixed_heads(scope: str, pr: int, *, now: float | None = None) -> set[str]:
