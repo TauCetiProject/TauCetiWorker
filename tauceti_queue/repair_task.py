@@ -9,7 +9,7 @@ tip's build outputs to the workers' own cache namespace (``repair_publish``), wh
 Task protocol (``docs/queue/repair-task.md``), all JSON over HTTP with
 ``Authorization: Bearer <GitHub token of the worker's account>``:
 
-- ``POST /tasks/claim`` ``{worker}`` returns 204 when nothing is claimable, else the controller's
+- ``POST /tasks/claim`` ``{worker, revision}`` returns 204 when nothing is claimable, else the controller's
   ``Task`` record (``tauceti_queue/ports.py``: ``task_id``, ``kind``, ``base``, ``tip``, ``onto``,
   ``members``, ``diagnostics``, ``retained_refs``, ``submission_ref``, ``claim_token``, ``expires_at``,
   ``instruction``);
@@ -55,6 +55,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -69,10 +70,15 @@ import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
+from tauceti_queue import chain as chain_tool
+from tauceti_queue import diagnostics as diagnostics_tool
 from tauceti_queue import (
     repair,
+    repair_additive,
     repair_audit,
     repair_context,
+    repair_lookahead,
+    repair_numproj,
     repair_parallel,
     repair_publish,
     repair_sandbox,
@@ -93,6 +99,10 @@ from tauceti_queue.task_identity import (
 SCHEMA = "tauceti-queue.repair-task/v1"
 RESULT_REF_PREFIX = "refs/tauceti-queue/task"
 SUBMISSION_PREFIX = "refs/tauceti-queue/submissions"
+# A batch's accepted conflict resolutions, kept until one of its rebase tasks is answered so a rerun or a
+# later task of the batch resumes after them:
+# ``<prefix>/<batch_id>/<conflicting commit>-<clean prefix tree>`` (``store_resolution``).
+RESOLUTION_PREFIX = "refs/tauceti-queue/batch-resolutions"
 # ``prepare`` builds an open batch on its own base and repairs what fails before the batch is the head.
 TASK_KINDS = ("repair", *repair.REBASE_KINDS, "prepare")
 RELEASE_REASONS = (
@@ -113,6 +123,7 @@ IN_FLIGHT_STATES = (
     "artifacts_unavailable",
     "agent_running",
     "validated",
+    "conflict_validated",  # a rebase task between conflicts: nothing to deliver yet
     "delivery_pending",
     "verifying",
     "pushed",
@@ -191,6 +202,7 @@ class TaskMember:
     withdrawn: bool = False  # already withdrawn that way: it stays an empty commit
     declaration_names: dict = dataclasses.field(default_factory=dict)
     source_identity: str | dict = ""
+    large_refactor: bool = False  # an admin's label lifts the review-size caps for its commit
 
     def to_json(self) -> dict:
         return dataclasses.asdict(self)
@@ -312,6 +324,7 @@ class Task:
                     source_identity=raw.get("source_identity", "")
                     if binding is not None or mixed_binding is not None
                     else "",
+                    large_refactor=raw.get("large_refactor") is True,
                 )
             )
         extra = dict(data.get("extra") or {})
@@ -389,6 +402,11 @@ class Task:
     @property
     def member_keys(self) -> list[str]:
         return [m.source_pr for m in self.members]
+
+    @property
+    def large_refactor_heads(self) -> frozenset[tuple]:
+        """``(number, accepted_head)`` of the members whose review-size caps an admin's label lifts."""
+        return frozenset((m.number, m.accepted_head) for m in self.members if m.large_refactor)
 
     @property
     def validation_base(self) -> str:
@@ -513,6 +531,8 @@ class TaskClient:
 
     def claim(self) -> Task | None:
         body = {"worker": self.worker}
+        if re.fullmatch(r"[0-9a-f]{7,64}", STARTUP_REVISION or ""):
+            body["revision"] = STARTUP_REVISION  # a stalled repair is offered at once to code that has not tried it
         if self.binding is None:
             from .mixed_tasks import SCHEMA
 
@@ -560,9 +580,6 @@ class TaskClient:
         if not isinstance(value, (int, float)):
             raise ServiceError("renew: no expires_at in the response")
         if isinstance(payload, dict):
-            owner = payload.get("checks_owner")
-            if owner in ("worker", "staging"):
-                task.extra["checks_owner"] = owner
             interval = payload.get("renew_after")
             if type(interval) in (int, float) and 0 < interval <= 300:
                 task.renew_after = float(interval)
@@ -591,13 +608,14 @@ class TaskClient:
             payload["accepted"] = bool(payload["adopted"])
         return payload
 
-    def release(self, task: Task, reason: str, error: str = "") -> dict:
-        """``release_task(task_id, claim_token, reason, error)``."""
+    def release(self, task: Task, reason: str, error: str = "", notes: dict | None = None) -> dict:
+        """``release_task(task_id, claim_token, reason, error, notes)``; ``notes`` (the attestation of a
+        ``prepared_clean`` preparation) is sent only when given, so an older service just ignores it."""
         self._require_task(task)
-        status, payload = self._post(
-            f"/tasks/{task.task_id}/release",
-            {"worker": self.worker, "claim_token": task.claim_token, "reason": reason, "error": error or ""},
-        )
+        body = {"worker": self.worker, "claim_token": task.claim_token, "reason": reason, "error": error or ""}
+        if notes:
+            body["notes"] = notes
+        status, payload = self._post(f"/tasks/{task.task_id}/release", body)
         if status in (404, 405, 501) and not (isinstance(payload, dict) and payload.get("task_id")):
             raise EndpointMissing(f"release: HTTP {status}")
         if status in (401, 403, 409, 410):
@@ -676,7 +694,6 @@ class ClaimLease(threading.Thread):
         *,
         retry_interval: float = 15.0,
         clock=time.time,
-        check_settings: Path | None = None,
     ):
         super().__init__(name=f"claim-lease-{task.task_id}", daemon=True)
         self.client = client
@@ -694,7 +711,6 @@ class ClaimLease(threading.Thread):
         self.renewals = 0
         self.errors = 0
         self.lost_reason: str | None = None
-        self.check_settings = check_settings
 
     def run(self) -> None:
         interval = max(0.05, float(self.task.renew_after))
@@ -702,8 +718,6 @@ class ClaimLease(threading.Thread):
             try:
                 self.expires_at = self.client.renew(self.task)
                 self.task.expires_at = self.expires_at
-                if self.check_settings is not None:
-                    repair_audit.update_checks_owner(self.check_settings, self.task.extra.get("checks_owner"))
                 self.renewals += 1
                 interval = max(0.05, float(self.task.renew_after))
             except ClaimRefused as error:
@@ -724,8 +738,6 @@ class ClaimLease(threading.Thread):
         self.lost_reason = reason
         self.lost.set()
         self.cancel.set()
-        if self.check_settings is not None:
-            repair_audit.update_checks_owner(self.check_settings, "staging")
         log(f"claim lost: {reason}")
 
     def stop(self) -> None:
@@ -1064,7 +1076,7 @@ class RunnerConfig:
     token: str | None = None
     agent_timeout: float = 3 * 3600
     # The agent's foreground shell limit (``TAUCETI_SHELL_LIMIT_SECONDS``): a repair runs whole-library
-    # builds in the foreground, so it gets two hours where the fleet's authoring rounds keep ten minutes.
+    # builds in the foreground, so it gets two hours where the fleet's authoring rounds default to an hour per command.
     shell_limit: float = repair.SHELL_LIMIT_SECONDS
     build_timeout: float = 3 * 3600
     agent_attempts: int = 2  # ordinary agent failures or locally invalid chains
@@ -1083,6 +1095,13 @@ class RunnerConfig:
     # each in its own worktree (``TAUCETI_QUEUE_PARALLEL_AGENTS``, default 3); 0 or 1 keeps every
     # repair sequential.
     parallel_agents: int = dataclasses.field(default_factory=repair_parallel.parallel_agents_default)
+    # Helpers resolving a rebase task's later conflicts on its target meanwhile (``repair_lookahead``,
+    # ``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 16, half for background work); 0 resolves every
+    # conflict in turn.
+    lookahead_helpers: int = dataclasses.field(default_factory=repair_lookahead.helpers_default)
+    # Resolve conflicts in which both sides only added lines without the agent (``repair_additive``;
+    # ``TAUCETI_QUEUE_ADDITIVE_PREPASS=0`` turns it off).
+    additive_prepass: bool = dataclasses.field(default_factory=repair_additive.enabled)
     poll_seconds: float = 60.0
     # A positive admin answer is cached on disk (``admin-check.json``) this long; a check that could not
     # be made is retried after ``admin_retry_seconds``, not on every poll.
@@ -1388,6 +1407,122 @@ def scope_only_repair(task: Task) -> bool:
     return bool(findings) and all(d.get("kind") == "status" and d.get("context") == "scope" for d in findings)
 
 
+def parallel_check_task(task: Task) -> bool:
+    """The head's parallel local check while staging runs the same tip (decision 174, step 4): a
+    ``repair`` task whose ``parallel_check`` diagnostic is still proactive. The worker builds and runs
+    every check; when nothing fails it submits the chain unchanged, with its ``local_verification``,
+    and otherwise repairs what failed like any repair task."""
+    check = task_findings(task).get("parallel_check") if task.kind == "repair" else None
+    return isinstance(check, dict) and bool(check.get("proactive"))
+
+
+def driver_failure_only(task: Task) -> bool:
+    """Every source finding is a check whose driver failed without naming a module or file.
+
+    CI reports a lint or audit driver that crashed or did not elaborate (``LINT-ENV: FAIL`` naming
+    ``driver failure``, an audit driver's segfault) as a finding with no module and no path. No Lean
+    edit is evidence against it, so an unchanged chain may be submitted, but only once the worker's
+    own whole-library build and every check pass on it (``verified_unchanged``): the controller then
+    stages the same chain again as the head's next version. Batch 506's repair task 1536 was released
+    ``agent_failed`` on every claim while its chain passed everything locally, with no other way to
+    stage it again.
+    """
+    if task.kind != "repair" or not isinstance(task.diagnostics, list):
+        return False
+    findings = []
+    for entry in task.diagnostics:
+        if not isinstance(entry, dict):
+            return False
+        if entry.get("kind") == "admission_predictions":
+            if entry.get("was_proactive"):
+                return False
+        elif entry.get("kind") != "infrastructure":
+            findings.append(entry)
+    return bool(findings) and all(
+        d.get("kind") in ("lint", "audit")
+        and not d.get("module")
+        and not d.get("path")
+        and "driver failure" in str(d.get("message") or "")
+        for d in findings
+    )
+
+
+def verified_unchanged(tip: str, outcome: dict) -> bool:
+    """The worker's latest verification of ``tip`` ran every check and they passed.
+
+    Only the latest counts: a later verification under another checking policy that could not run
+    its checks must not be outvoted by an earlier pass."""
+    runs = [v for v in outcome.get("verification", []) if v.get("tip") == tip]
+    if runs:
+        latest = runs[-1]
+        return latest.get("ok") is True and (latest.get("checks") or {}).get("status") == "passed"
+    parallel = outcome.get("parallel") or {}
+    return parallel.get("verified_tip") == tip and (parallel.get("checks") or {}).get("status") == "passed"
+
+
+ATTESTATION_SCHEMA = "tauceti-queue.attestation/v1"
+
+
+def latest_checks(tip: str, outcome: dict) -> dict | None:
+    """The check record of the worker's latest verification of ``tip`` (`verified_unchanged`'s choice)
+    when its build passed, else None."""
+    runs = [v for v in outcome.get("verification", []) if v.get("tip") == tip]
+    if runs:
+        latest = runs[-1]
+        return latest.get("checks") if latest.get("ok") is True else None
+    parallel = outcome.get("parallel") or {}
+    return parallel.get("checks") if parallel.get("verified_tip") == tip else None
+
+
+def attestation(clone: Path, tip: str, checks: dict | None, publish: dict | None = None) -> dict | None:
+    """What the worker states about its passing verification of exactly ``tip`` (decision 200): the tip
+    and its tree, the policy commit whose TauCetiTools pin and policy files the checks used, the tools
+    commit, the lint scope, whether the build sandbox was on, the tip's toolchain and whether its
+    outputs were published for that revision. None unless every check passed. The controller decides
+    whether it counts (`Controller._attestation_problem`); this only reports."""
+    if not isinstance(checks, dict) or checks.get("status") != "passed":
+        return None
+    try:
+        tree = git(clone, "rev-parse", f"{tip}^{{tree}}").strip()
+        toolchain = git(clone, "show", f"{tip}:lean-toolchain", check=False).strip()
+    except (OSError, RuntimeError):
+        return None
+    return {
+        "schema": ATTESTATION_SCHEMA,
+        "tip": tip,
+        "tree": tree,
+        "policy_commit": checks.get("policy_commit"),
+        "tools_commit": checks.get("tools_commit"),
+        "lint_scope": (checks.get("lint") or {}).get("scope"),
+        "sandbox": checks.get("sandbox") is True,
+        "toolchain": toolchain,
+        "outputs_published": bool(publish and publish.get("revision") == tip and publish.get("published")),
+        # Whether the checks' scripts, scope files and drivers were outside every candidate-writable
+        # directory and mounted read-only (`repair_audit.check`).
+        "verifier_isolated": checks.get("verifier_isolated") is True,
+        "worker_revision": STARTUP_REVISION,
+    }
+
+
+# One unchanged re-staging per batch and chain: a driver failure that CI reproduces every time
+# would otherwise alternate between staging and repair indefinitely. Each task that submits one
+# records a ref under the chain's prefix in the clone the repair workers share. The same task may
+# deliver again (a failed push, a later claim of it); a later task on the same chain, which only a
+# second CI failure creates, is released `agent_failed` as before, which the controller's
+# stalled-repair detection reports.
+RESTAGED_REF_PREFIX = "refs/tauceti-queue/restaged"
+
+
+def restaged_ref(task: Task) -> str:
+    return f"{RESTAGED_REF_PREFIX}/{task.batch_id}/{task.tip}/{task.task_id}"
+
+
+def restaged_by_other_task(clone: Path, task: Task) -> bool:
+    prefix = f"{RESTAGED_REF_PREFIX}/{task.batch_id}/{task.tip}/"
+    refs = git(clone, "for-each-ref", "--format=%(refname)", prefix, check=False).split()
+    return any(ref != restaged_ref(task) for ref in refs)
+
+
 def admission_verification(task: Task, tip: str, outcome: dict, stream_findings: list) -> dict | None:
     """Telemetry from scripted checks, never permission to skip the candidate's CI."""
     if not task_findings(task).get("admission_predictions"):
@@ -1439,6 +1574,73 @@ def artifact_revisions(task: Task) -> list[str]:
     return revisions
 
 
+def toolchain_changed(worktree: Path, base: str, tip: str) -> bool:
+    """Whether the chain from ``base`` to ``tip`` changes ``lean-toolchain``.
+
+    Lake scopes a published cache mapping by the toolchain of the checkout that asks for it
+    (``.../tc/<toolchain>/<revision>.jsonl``), and the chain's checkout pins the new toolchain, so no
+    revision on main can answer, and outputs built by the old toolchain would not be reused anyway.
+    A repair of such a chain (a Lean or Mathlib bump) builds cold instead of being released as
+    ``artifacts_unavailable`` on every claim until the controller escalates it.
+    """
+    if not base or not tip or base == tip:
+        return False
+    return bool(git(worktree, "diff", "--name-only", base, tip, "--", "lean-toolchain", check=False).strip())
+
+
+def warm_tree(worktree: Path, task: Task, parked_at: str | None, start_tip: str) -> bool:
+    """Whether an adopted batch tree (parked at ``parked_at``) is warm for this task: its build and
+    dependencies hold for every revision the task builds, i.e. ``lean-toolchain`` and
+    ``lake-manifest.json`` are unchanged. A rebase also builds on ``onto``."""
+    if parked_at is None:
+        return False
+    targets = [start_tip, *([task.onto] if task.kind in repair.REBASE_KINDS else [])]
+    try:
+        return not any(
+            git(
+                worktree, "diff", "--name-only", parked_at, target, "--", "lean-toolchain", "lake-manifest.json"
+            ).strip()
+            for target in targets
+        )
+    except RuntimeError:
+        return False
+
+
+def dependencies_differ(worktree: Path, revision: str) -> bool:
+    """Whether the worktree's files change ``lean-toolchain`` or ``lake-manifest.json`` from ``revision``."""
+    return bool(
+        git(
+            worktree, "diff", "--name-only", revision, "--", "lean-toolchain", "lake-manifest.json", check=False
+        ).strip()
+    )
+
+
+def parkable(cfg: RunnerConfig, task: Task, artifacts: dict | None) -> bool:
+    """Whether the task's tree may be parked as warm: its artifacts were prepared, and its dependency
+    files are still those prepared (``onto``'s for a rebase, the starting tip's otherwise). A cold
+    tree, or one whose chain changed its dependencies after preparation, is removed instead."""
+    if not (artifacts or {}).get("available"):
+        return False
+    worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
+    continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits else None
+    prepared = task.onto if task.kind in repair.REBASE_KINDS else (continuation or {}).get("tip") or task.tip
+    return worktree.is_dir() and not dependencies_differ(worktree, prepared)
+
+
+def retire_worktree(cfg: RunnerConfig, task: Task, artifacts: dict | None) -> str:
+    """Park the task's tree as its batch's tree when it is ``parkable``, else remove it."""
+    from tauceti_queue import repair_cleanup
+
+    return repair_cleanup.retire(
+        cfg.clone,
+        cfg.root,
+        task.batch_id,
+        task.task_id,
+        cfg.root / "worktrees" / f"task-{task.task_id}",
+        keep=parkable(cfg, task, artifacts),
+    )
+
+
 @contextlib.contextmanager
 def artifact_checkout(worktree: Path, task: Task, start_tip: str):
     """Prepare changed rebase dependencies on the target, then restore the agent's input chain.
@@ -1474,6 +1676,14 @@ def artifact_checkout(worktree: Path, task: Task, start_tip: str):
 
 
 HEAD_KINDS = ("repair", "rebase_conflict")  # the head's own tasks, which warm from the head's tips
+
+
+def background_task(task: Task) -> bool:
+    """Work for a later batch (``prepare``, ``pre_rebase``, or any task the controller marks
+    ``background``, such as an open batch's rebase onto ``main``), whose builds yield the CPU to the
+    head's (``repair_sandbox.prioritized``). A proactive prediction repair is the head's own: when the
+    head's CI fails the controller turns that same task into its required repair."""
+    return task.kind in ("prepare", "pre_rebase") or bool(task.extra.get("background"))
 
 
 def describe_cache_revision(task: Task, artifacts: dict) -> str:
@@ -1524,7 +1734,8 @@ def describe_cache_revision(task: Task, artifacts: dict) -> str:
 
 def artifacts_cold(task: Task, artifacts: dict | None) -> bool:
     """Whether the agent builds without warm artifacts: a rebase conflict whose preparation found no
-    cache (a repair without artifacts is released instead, so it never gets this far)."""
+    cache, or a repair of a chain that changes the toolchain (``toolchain_changed``); any other repair
+    without artifacts is released instead, so it never gets this far."""
     if not artifacts:
         return False
     return bool(artifacts.get("cold")) or (task.kind in repair.REBASE_KINDS and not artifacts.get("available", True))
@@ -1571,6 +1782,7 @@ def prompt_context(
                 "landed_externally": getattr(m, "landed_externally", None),
                 "no_repair": m.no_repair,
                 "withdrawn": m.withdrawn,
+                "large_refactor": m.large_refactor,
             }
             for m in task.members
         ],
@@ -1578,7 +1790,6 @@ def prompt_context(
         artifacts_reason=(artifacts or {}).get("unavailable_reason") if cold else None,
         check_findings_known=known_check_failures(task),
         worker_verifies=worker_verifies and not cold,
-        staging_checks=repair_audit.staging_checks(task),
         listings_path=listings,
         shell_limit=shell_limit,
         pre_rebased=pre_rebased(task) is not None,
@@ -1622,6 +1833,16 @@ def rejected_members(response: dict) -> list[str]:
         if isinstance(violation, dict) and violation.get("source_pr"):
             members.append(str(violation["source_pr"]))
     return members
+
+
+def last_agent_conclusion(agent_records: list[dict], limit: int = 2000) -> str | None:
+    """The last agent attempt's final message (what it concluded about the task), cut to ``limit``."""
+    for record in reversed(agent_records or []):
+        for attempt in reversed((record or {}).get("attempts") or []):
+            text = (attempt or {}).get("final_text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()[:limit]
+    return None
 
 
 def read_telemetry(logdir: Path, provider: str) -> dict:
@@ -1683,13 +1904,13 @@ def subscription_status(cfg: RunnerConfig, provider: str) -> tuple[bool, str]:
     spends a request and never rotates a token. An unreadable or missing credential, a telemetry failure
     and a malformed usage response are all "not eligible", with the pacer's reason."""
     from tauceti_worker.config import environment
-    from tauceti_worker.quota import Quota, _unavail_reason
+    from tauceti_worker.quota import PACE_PROVIDERS, Quota, _unavail_reason, pace_env
 
     home = Path(os.environ.get("HOME", os.path.expanduser("~")))
     cache = cfg.root / "quota-cache"
     try:
         cache.mkdir(parents=True, exist_ok=True)
-        with environment(TAUCETI_PACE=cfg.rate):
+        with environment(TAUCETI_PACE=cfg.rate, **{pace_env(name): None for name in PACE_PROVIDERS}):
             quota = Quota(_QuotaHome(home, cache))
             verdict = quota.codex() if provider == "codex" else quota.claude()
     except Exception as error:  # the pacer must never take the task down with it
@@ -1888,7 +2109,7 @@ def run_repair_agent(
                         session_actor="queue-repair-task",
                         session_scope=task.task_id,
                         cache_note=False,
-                        queue_mathlib=True,  # this service prepares its own Mathlib until it shares too
+                        host_caches=False,  # the task prepared this tree; no per-round preparation or relinking
                     )
             except AgentLaunchUnavailable as error:
                 # Its own outcome, not the cache's: the artifacts were ready and the process never existed,
@@ -1943,6 +2164,7 @@ def run_repair_agent(
                 "session": session,
                 "infrastructure_failure": reason,
                 "telemetry": read_telemetry(logdir, telemetry_provider),
+                "final_text": (run or {}).get("final_text"),
             }
             usage = (record["telemetry"] or {}).get("usage") or {}
             record["estimated_cost_usd"] = repair.price_usage(
@@ -1979,6 +2201,83 @@ def _expire_attempt(expired: threading.Event, cancel: threading.Event) -> None:
     cancel.set()
 
 
+def rewrite_projections(
+    cfg: RunnerConfig,
+    task: Task,
+    worktree: Path,
+    findings: dict,
+    stream: repair_stream.StreamingBuild | None,
+    logdir: Path,
+    cancel: threading.Event,
+    env_lake: dict,
+) -> tuple[dict, dict] | None:
+    """Rewrite the numeric projections the findings report, in the members that wrote them
+    (``repair_numproj.rewrite_chain``), before an agent sees them. ``stream`` is the task's streaming
+    build when its error list counts too: when the lint is among the errors it has reported so far, this
+    waits for that build to end, so that its later projections are rewritten too and the rewrite's own
+    build can take the build lock. Otherwise the agent starts at the stream's first error as before, and
+    projections the stream reports later are rewritten after a failed verification. Returns the findings with those files' errors replaced by
+    what a scoped build of them still reports (the error list is updated the same way) and the record
+    for the outcome; None when there is nothing to rewrite or the rewrite does not apply, with the
+    worktree and findings as they were."""
+    directory = repair.listings_path(worktree).parent
+    errors = repair_parallel.read_errors(directory) if stream is not None else None
+    if not repair_numproj.lint_files(findings, errors):
+        return None
+    if stream is not None:
+        while not stream.finished.wait(0.5):
+            if cancel.is_set():
+                return None
+        errors = repair_parallel.read_errors(directory)
+    files = repair_numproj.lint_files(findings, errors)
+    tip = git(worktree, "rev-parse", "HEAD").strip()
+    never_edited = {m.number for m in task.members if m.no_repair or m.withdrawn}
+    frozen = frozenset(c.sha for c in read_chain(cfg.clone, task.validation_base, tip) if c.pr in never_edited)
+    started = time.monotonic()
+    rewrite = repair_numproj.rewrite_chain(
+        worktree,
+        task.validation_base,
+        files,
+        env_lake,
+        logdir,
+        frozen=frozen,
+        timeout=cfg.build_timeout,
+        lake=tuple(cfg.lake),
+    )
+    if rewrite is None:
+        log(f"task {task.task_id}: numeric projections in {len(files)} file(s) left to the agent")
+        return None
+    repair_numproj.replace_stream_errors(directory, rewrite)
+    record = {
+        "from": tip,
+        "tip": rewrite.tip,
+        "paths": rewrite.paths,
+        "edited": rewrite.edited,
+        "errors": len(rewrite.errors),
+        "seconds": round(time.monotonic() - started, 1),
+        "tool": rewrite.tool,
+    }
+    log(
+        f"task {task.task_id}: rewrote numeric projections in {len(rewrite.paths)} file(s) across "
+        f"{len(rewrite.edited)} commit(s); {len(rewrite.errors)} error(s) left in them"
+    )
+    return repair_numproj.replace_findings(findings, rewrite), record
+
+
+def findings_left(findings: dict, worktree: Path, streamed: bool) -> bool:
+    """Whether anything is left for an agent: findings, or the streaming build's errors."""
+    if (
+        findings["compiler_errors"]
+        or findings["lint"]["findings"]
+        or findings["duplicate_declarations"]
+        or findings["import_collisions"]
+        or findings["failed_modules"]
+        or findings.get("other")
+    ):
+        return True
+    return streamed and bool(repair_parallel.read_errors(repair.listings_path(worktree).parent))
+
+
 def run_parallel_groups(
     cfg: RunnerConfig,
     task: Task,
@@ -1990,26 +2289,15 @@ def run_parallel_groups(
     cancel: threading.Event,
     state: TaskState,
     env_lake: dict,
-    stream: repair_stream.StreamingBuild | None = None,
 ) -> tuple[dict, dict | None]:
-    """The parallel path of a repair (``repair_parallel``): split the findings into independent groups
-    and, with two or more and an eligible provider, run one agent per group in its own worktree and
-    child process, fold their fixups into the chain and run the verification build. With a streaming
-    build (``stream``) the path first waits for it to finish and takes the groups from its complete
-    error list, ``errors.jsonl``, merged with the task's diagnostics. Returns the record for the outcome
-    and the findings the sequential path still has to repair (None when nothing changes for it)."""
+    """The parallel path of a repair (``repair_parallel``): split the task's findings into independent
+    groups and, with two or more and an eligible provider, run one agent per group in its own worktree
+    and child process, fold their fixups into the chain and run the verification build. It never waits
+    for a streaming build: the groups come from the findings the task already has, and the agents start
+    at once. Returns the record for the outcome and the findings the sequential path still has to
+    repair (None when nothing changes for it)."""
     require_task_execution(cfg=cfg, task=task)
     record: dict = {"source": "diagnostics"}
-    if stream is not None:
-        waited = time.monotonic()
-        while not stream.finished.wait(0.5):
-            if cancel.is_set():
-                return {"status": "cancelled", "detail": "cancelled while the streaming build finished"}, None
-        record["stream_wait_seconds"] = round(time.monotonic() - waited, 1)
-    errors = repair_parallel.read_errors(repair.listings_path(worktree).parent)
-    if errors is not None:
-        findings = repair_parallel.merge_errors(findings, errors)
-        record.update(source=repair_stream.ERRORS_FILE, stream_errors=len(errors))
     groups, reason = repair_parallel.plan_groups(cfg.clone, chain, findings, worktree)
     if len(groups) < 2:
         log(f"task {task.task_id}: sequential repair ({reason})")
@@ -2077,7 +2365,6 @@ def delivery_identity(cfg: RunnerConfig, task: Task, tip: str) -> dict:
         "tip": tip,
         "base": task.validation_base,
         "audits": cfg.worker_audits,
-        "full_checks": cfg.worker_audits and not repair_audit.staging_checks(task),
         "lake": list(cfg.lake),
         "checker": hashlib.sha256(
             Path(repair_audit.__file__).read_bytes() + Path(repair_sandbox.__file__).read_bytes()
@@ -2162,6 +2449,7 @@ def release_task(
     detail,
     outcome: dict | None = None,
     lease: ClaimLease | None = None,
+    notes: dict | None = None,
 ) -> dict:
     """Give the task back with a reason; without a ``release`` endpoint the claim is left to expire."""
     assert reason in RELEASE_REASONS
@@ -2172,7 +2460,9 @@ def release_task(
     outcome.update(status="released", reason=reason, detail=detail)
     try:
         outcome["response"] = with_retries(
-            lambda: client.release(task, reason, error_text),
+            lambda: (
+                client.release(task, reason, error_text, notes) if notes else client.release(task, reason, error_text)
+            ),
             attempts=cfg.service_attempts,
             delays=cfg.service_delays,
             what="release",
@@ -2215,12 +2505,720 @@ def run_task(
     from tauceti_queue.repair_cleanup import worktree_lease
 
     require_task_execution(cfg=cfg, task=task)
+    if background_task(task):
+        os.environ[repair_sandbox.BACKGROUND_VARIABLE] = "1"
+    else:
+        os.environ.pop(repair_sandbox.BACKGROUND_VARIABLE, None)
     cache_root = task_cache(cfg.root, task.task_id)
     cache_cleanup = before_task(cache_root)
     if cache_cleanup["state"] != "busy":
         log(f"repair cache retention: {json.dumps(cache_cleanup, sort_keys=True)}")
     with cache_lease(cache_root), worktree_lease(cfg.root, task.task_id):
         return _run_task(cfg, task, client, resume_state=resume_state, stop=stop)
+
+
+def no_repair_problem(clone: Path, task: Task, source_pr: str, prefix: str, tip: str) -> str | None:
+    """The problem with a resolution ``tip`` of ``source_pr``'s commit on ``prefix`` when the member is
+    never edited (``no_repair`` or withdrawn) and the resolution changes the prefix, else None."""
+    member = next((m for m in task.members if m.source_pr == source_pr), None)
+    if (
+        member is not None
+        and (member.no_repair or member.withdrawn)
+        and chain_tool.tree_of(clone, tip) != chain_tool.tree_of(clone, prefix)
+    ):
+        return (
+            f"no-repair-edited: {source_pr} is never edited: reduce it to an empty commit whose "
+            "explanation names the interacting PR, file and finding"
+        )
+    return None
+
+
+def resolve_conflicts(
+    cfg: RunnerConfig,
+    task: Task,
+    worktree: Path,
+    logdir: Path,
+    cancel: threading.Event,
+    state: TaskState,
+    env_lake: dict,
+    *,
+    artifacts: dict | None,
+    agent_records: list[dict],
+    seeded: dict | None = None,
+) -> dict:
+    """Replay a rebase task's chain onto ``onto`` and resolve its conflicts one commit at a time.
+
+    The worker replays ``base..tip`` onto ``onto`` with ``chain.replay``, as the queue does, and stops
+    at the first conflicting commit. The agent gets that commit applied onto the clean prefix, with
+    git's conflict markers, and nothing after it: no rebase in progress, no step script, no later
+    commit. The worker commits the working tree as the resolution (``repair.commit_resolution``), so
+    nothing the agent does to HEAD, refs or history counts; checks it; replays the rest of the chain
+    onto it; and repeats at the next conflict, on the same claim and worktree. Nothing is submitted
+    until the replay reaches the end, so the queue keeps no state between conflicts.
+
+    With ``cfg.lookahead_helpers`` above 0, later conflicting members are resolved meanwhile on ``onto``
+    itself by ``repair_lookahead``; at its conflict a member's lookahead resolution is merged onto the
+    real prefix and checked like any other, and the agent resolves the member here only when there is
+    none, it does not merge cleanly or it is not acceptable.
+
+    Returns ``{"status": "ok", "tip", "agent", "resolved"}`` with the worktree checked out at the whole
+    chain, ``{"status": "cancelled"}``, or a release status with its ``reason``: an agent status in
+    ``RELEASED_AGENT_STATUSES``, or ``agent_failed`` when a conflict stays unresolved after
+    ``cfg.agent_attempts`` attempts.
+
+    ``seeded`` is ``seed_pre_rebased``'s record: a member resolved by the head's unused pre-rebase tries
+    that resolution (``applicable_resolution``) before waiting for a helper, and no helper is started for
+    one the replay meets on the very prefix it was made on (``exact``)."""
+    chain_ids: list[str] = []
+    resolved: list[dict] = []
+    agent: dict = {"status": "ok"}
+    lookahead = None
+    reusable = frozenset((seeded or {}).get("seeded") or ())
+    skip = frozenset((seeded or {}).get("exact") or ())
+
+    def replay(base: str, onto: str) -> chain_tool.ChainResult:
+        chain_id = f"worker-{task.task_id}-{secrets.token_hex(4)}"
+        chain_ids.append(chain_id)
+        return chain_tool.replay(cfg.clone, base, task.tip, onto, chain_id=chain_id)
+
+    def accepter(source_pr: str, prefix: str, commit: str):
+        def accept(tip: str, report: dict) -> chain_tool.ChainResult | None:
+            """The rest of the chain replayed onto the resolved ``tip`` when the resolution is
+            acceptable, else None, with the problems added to ``report``."""
+            if not report["ok"] or report["unexplained"]:
+                return None
+            problem = no_repair_problem(cfg.clone, task, source_pr, prefix, tip)
+            if problem:
+                report["problems"].append(problem)
+            rest = replay(commit, tip)
+            report["problems"] += absorbed_members(cfg.clone, prefix, commit, tip, task.tip, rest)
+            report["ok"] = not report["problems"]
+            return rest if report["ok"] else None
+
+        return accept
+
+    try:
+        result = replay(task.base, task.onto)
+        while result.status != chain_tool.CLEAN:
+            conflict = result.conflict
+            if conflict is None or conflict.replayed is None:
+                raise RuntimeError(f"the replay stopped without a conflicting commit: {result.status}")
+            prefix, commit, source_pr = result.tip, conflict.replayed, conflict.source_pr
+            if (
+                lookahead is None
+                and cfg.lookahead_helpers > 0
+                and not repair_lookahead.changes_dependencies(cfg.clone, task)
+            ):
+                lookahead = repair_lookahead.Lookahead(
+                    cfg, task, worktree, logdir, cancel, env_lake, artifacts, after=commit, skip=skip
+                )
+            accept = accepter(source_pr, prefix, commit)
+            paths = list(conflict.conflict_paths)
+            reuse = None
+            stored = stored_resolution(cfg.clone, task.batch_id, commit, prefix)
+            if stored is not None:
+                # An earlier run of a task of this batch (on any worker sharing the clone) accepted a
+                # resolution of this commit on this prefix; it goes through the same checks as a fresh one.
+                reuse = ("reused", stored, None)
+            elif commit in reusable and (earlier := applicable_resolution(cfg.clone, task.batch_id, commit, prefix)):
+                # The pre-rebase's resolution of the same conflict: no need to wait for a helper.
+                reuse = ("reused", earlier, git(cfg.clone, "rev-parse", f"{earlier}^").strip())
+            else:
+                if lookahead is not None:
+                    lookahead.wait(commit)
+                ahead = stored_resolution(cfg.clone, task.batch_id, commit, task.onto)
+                if ahead is not None:
+                    # Resolved on `onto` alone by the lookahead: its change merged onto this prefix.
+                    reuse = ("lookahead", ahead, task.onto)
+                else:
+                    # Resolved by an earlier task of the batch on another prefix with the same inputs,
+                    # such as a pre-rebase onto an earlier tip of the head.
+                    earlier = applicable_resolution(cfg.clone, task.batch_id, commit, prefix)
+                    if earlier is not None:
+                        reuse = ("reused", earlier, git(cfg.clone, "rev-parse", f"{earlier}^").strip())
+            if reuse is not None:
+                how, sha, made_on = reuse
+                recommitted = repair.recommit_resolution(
+                    cfg.clone, sha, prefix, commit, paths, task.large_refactor_heads, made_on=made_on
+                )
+                if recommitted is not None:
+                    tip, report = recommitted
+                    rest = accept(tip, report)
+                    state.write("conflict_validated", conflict=source_pr, attempt=0, tip=tip, report=report)
+                    if rest is not None:
+                        log(
+                            f"task {task.task_id}: {'reusing the stored' if how == 'reused' else 'using the lookahead'} resolution of {source_pr}'s commit {commit[:12]}"
+                        )
+                        if made_on is not None and not cancel.is_set():
+                            store_resolution(cfg.clone, task.batch_id, commit, prefix, tip)
+                        done = {"source_pr": source_pr, "commit": commit, "resolved": tip, how: True}
+                        if repair_additive.marked(chain_tool.read_commit(cfg.clone, tip).message):
+                            done["additive"] = {"paths": sorted(paths)}  # by the pre-pass, earlier or ahead
+                        resolved.append(done)
+                        result = rest
+                        continue
+                if how == "reused":
+                    forget_resolutions(cfg.clone, task.batch_id, sha)
+                else:
+                    log(
+                        f"task {task.task_id}: the lookahead resolution of {source_pr} does not compose; resolving it here"
+                    )
+            entry = {
+                "kind": "conflict",
+                "source_pr": source_pr,
+                "commit": commit,
+                "paths": paths,
+                "onto": task.onto,
+                "message": f"replaying the chain onto {task.onto[:12]} conflicts at {source_pr}",
+                "pending": [r.source_pr for r in result.commits if r.status == chain_tool.PENDING],
+                "clean_prefix_tip": prefix,
+                "landed_on_base": result.landed_on_base,
+            }
+            outcome = resolve_one(
+                cfg,
+                task,
+                worktree,
+                logdir,
+                cancel,
+                state,
+                env_lake,
+                prefix=prefix,
+                commit=commit,
+                entry=entry,
+                artifacts=artifacts,
+                agent_records=agent_records,
+                accept=accept,
+                label=f"conflict-{len(resolved) + 1}",
+            )
+            if outcome["status"] != "ok":
+                return {**outcome, "resolved": resolved}
+            agent = outcome.get("agent") or agent
+            if not cancel.is_set():  # a worker that lost its claim records nothing for the next claimant
+                store_resolution(cfg.clone, task.batch_id, commit, prefix, outcome["tip"])
+            resolved.append(
+                {"source_pr": source_pr, "commit": commit, "resolved": outcome["tip"]}
+                | ({"numproj": True} if outcome.get("numproj") else {})
+                | ({"additive": outcome["additive"]} if outcome.get("additive") else {})
+            )
+            result = outcome["accepted"]
+        git(worktree, "checkout", "--quiet", "--force", "--detach", result.tip)
+        return {"status": "ok", "tip": result.tip, "agent": agent, "resolved": resolved}
+    finally:
+        if lookahead is not None:
+            lookahead.close()
+            agent_records.extend(lookahead.agent_records)
+        for chain_id in chain_ids:
+            with contextlib.suppress(Exception):
+                chain_tool.delete_chain_ref(cfg.clone, chain_id)
+
+
+def resolve_one(
+    cfg: RunnerConfig,
+    task: Task,
+    worktree: Path,
+    logdir: Path,
+    cancel: threading.Event,
+    state,
+    env_lake: dict,
+    *,
+    prefix: str,
+    commit: str,
+    entry: dict,
+    artifacts: dict | None,
+    agent_records: list[dict],
+    accept,
+    label: str,
+    providers: list[str] | None = None,
+) -> dict:
+    """Resolve the one conflicting ``commit`` onto ``prefix`` in ``worktree``: the additive pre-pass
+    (``additive_prepass``), the numproj pre-pass, then the agent for up to ``cfg.agent_attempts``
+    attempts. ``accept(tip, report)`` is not None for an acceptable resolution (and adds its problems
+    to ``report`` otherwise). ``providers`` is the provider chain the worker chose
+    (``repair_lookahead``).
+
+    Returns ``{"status": "ok", "tip", "accepted", "agent"}`` (``additive`` or ``numproj`` when a
+    pre-pass resolved it), or ``{"status", "reason"}``: an agent status that ends the task, or
+    ``agent_failed``."""
+    source_pr = entry["source_pr"]
+    # Hunks in which both sides only added lines resolve without the agent (`repair_additive`); a
+    # conflict the pre-pass does not resolve acceptably goes to the agent exactly as before.
+    union = additive_prepass(cfg, task, worktree, state, prefix=prefix, commit=commit, entry=entry, accept=accept)
+    if union is not None:
+        return union
+    # The clean prefix and the one conflicting commit: the commits after it are the worker's to replay.
+    chain_before = [*read_chain(cfg.clone, task.onto, prefix), *read_chain(cfg.clone, f"{commit}^", commit)]
+    findings = conflict_findings(task, entry, {c.pr for c in chain_before if c.pr is not None})
+    ownership = repair_context.compute(
+        cfg.clone,
+        chain_before,
+        task.validation_base,
+        worktree,
+        declaration_names={m.number: m.declaration_names for m in task.members},
+        edited_prs={m.number for m in task.members if m.provenance == "edited"},
+    )
+    paths = repair.apply_conflict(worktree, prefix, commit)
+    if cfg.mathlib_cache and cfg.seed_packages is None and dependencies_differ(worktree, task.onto):
+        # A member before or at this conflict changes the dependencies prepared at `onto`; the
+        # agent's offline builds need this checkout's. A failed fetch leaves Lake to report it.
+        from tauceti_queue.repair_cache import downloads
+
+        with downloads(env_lake) as fetch_env:
+            repair.run_logged(
+                repair_sandbox.sandboxed_fetch([*cfg.lake, "exe", "cache", "get"], worktree, fetch_env),
+                worktree,
+                logdir / f"cache-get-mathlib-{commit[:12]}.log",
+                fetch_env,
+                1800,
+            )
+    # Projection-only conflicts after `main` renamed numeric projections resolve without the agent
+    # (`repair_numproj`); any other outcome leaves the agent the conflict as before, or what is left.
+    prepass = (
+        repair_numproj.prepass(worktree, prefix, commit, paths, env_lake, logdir, lake=tuple(cfg.lake))
+        if (artifacts or {}).get("available")
+        else None
+    )
+    if prepass is not None:
+        log(
+            f"task {task.task_id}: numproj pre-pass on {source_pr}'s commit {commit[:12]}: "
+            f"merged {prepass.merged}, remaining {prepass.remaining}"
+        )
+    if prepass is not None and prepass.clean:
+        repair.listings_path(worktree).parent.mkdir(exist_ok=True)  # excluded from the commit
+        (worktree / repair.LISTINGS_DIR / repair.EXPLANATION_FILE).write_text(prepass.note + "\n")
+        tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads)
+        accepted = accept(tip, report)
+        state.write("conflict_validated", conflict=source_pr, attempt=0, tip=tip, report=report, numproj=True)
+        if accepted is not None:
+            log(f"task {task.task_id}: resolved {source_pr}'s commit {commit[:12]} by the numproj pre-pass")
+            return {"status": "ok", "tip": tip, "accepted": accepted, "numproj": True}
+        # Not acceptable after all: the agent gets the conflict exactly as without the pre-pass.
+        paths = repair.apply_conflict(worktree, prefix, commit)
+        prepass = None
+    log(f"task {task.task_id}: resolving {source_pr}'s commit {commit[:12]} onto {prefix[:12]}")
+    feedback: str | None = None
+    tip, report = prefix, {}
+    for attempt in range(1, cfg.agent_attempts + 1):
+        if attempt > 1:
+            # The agent continues from its own files, on the clean prefix as before.
+            git(worktree, "checkout", "--quiet", "--force", "--detach", prefix)
+            git(worktree, "read-tree", "-u", "--reset", tip)
+        context = prompt_context(
+            task,
+            feedback,
+            findings,
+            artifacts=artifacts,
+            listings=repair.listings_path(worktree),
+            shell_limit=int(cfg.shell_limit),
+            worker_verifies=cfg.worker_audits,
+        )
+        context.repair_context = ownership
+        context.prepass = prepass.note if prepass is not None else None
+        prompt = repair.compose_prompt(context, findings, chain_before, cfg.clone)
+        agent = run_repair_agent(
+            cfg,
+            task,
+            worktree,
+            prompt,
+            logdir,
+            cancel,
+            state,
+            env_lake,
+            label=f"{label}-attempt-{attempt}",
+            preselected=providers,
+        )
+        agent_records.append(agent)
+        if agent["status"] == "cancelled" or agent["status"] in RELEASED_AGENT_STATUSES:
+            return {"status": agent["status"], "reason": agent.get("reason")}
+        tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads)
+        if report["ok"] and report["unexplained"] and not cancel.is_set():
+            follow = run_repair_agent(
+                cfg,
+                task,
+                worktree,
+                repair.resolution_explanation_prompt(source_pr),
+                logdir,
+                cancel,
+                state,
+                env_lake,
+                resume=agent.get("session"),
+                resume_provider=agent.get("provider"),
+                label=f"{label}-attempt-{attempt}-explanation",
+                # The resolving session's provider first, so its session is the one continued.
+                preselected=providers and [p for p in dict.fromkeys([agent.get("provider"), *providers]) if p],
+            )
+            agent_records.append(follow)
+            if follow["status"] == "cancelled" or follow["status"] in RELEASED_AGENT_STATUSES:
+                return {"status": follow["status"], "reason": follow.get("reason")}
+            tip, report = repair.commit_resolution(
+                cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads
+            )
+        accepted = accept(tip, report)
+        state.write("conflict_validated", conflict=source_pr, attempt=attempt, tip=tip, report=report)
+        if accepted is not None:
+            return {"status": "ok", "tip": tip, "accepted": accepted, "agent": agent}
+        feedback = "Local validation of the previous attempt's resolution:\n" + format_report(report)
+        log(f"task {task.task_id}: the resolution of {source_pr} is not acceptable (attempt {attempt})")
+    return {"status": "agent_failed", "reason": f"{source_pr}: the conflict stays unresolved\n{format_report(report)}"}
+
+
+ADDITIVE_REFUSED_PREFIX = "refs/tauceti-queue/additive-refused"
+
+
+def additive_refused_ref(batch_id: str, commit: str) -> str:
+    return f"{ADDITIVE_REFUSED_PREFIX}/{batch_id}/{commit}"
+
+
+def additive_prepass(
+    cfg: RunnerConfig, task: Task, worktree: Path, state, *, prefix: str, commit: str, entry: dict, accept
+) -> dict | None:
+    """``resolve_one``'s result when ``repair_additive`` resolves the conflict and ``accept`` takes it,
+    else None with the worktree left for the agent's path (which applies the conflict again). A
+    commit whose mechanical resolution an earlier verification build of the batch found errors in
+    (``refuse_additive``) is left to the agent."""
+    source_pr = entry["source_pr"]
+    if (
+        not cfg.additive_prepass
+        or git(
+            cfg.clone, "rev-parse", "--verify", "--quiet", additive_refused_ref(task.batch_id, commit), check=False
+        ).strip()
+    ):
+        return None
+    try:
+        union = repair_additive.resolve(worktree, prefix, commit, list(entry.get("paths") or []))
+    except Exception as error:  # noqa: BLE001 - the agent resolves it instead
+        union = f"{type(error).__name__}: {error}"
+    if isinstance(union, str):
+        log(f"task {task.task_id}: additive pre-pass left {source_pr}'s commit {commit[:12]}: {union}")
+        return None
+    paths = repair.apply_conflict(worktree, prefix, commit)
+    if set(paths) != set(union.files):
+        log(f"task {task.task_id}: additive pre-pass left {source_pr}: the replay conflicts in other paths")
+        return None
+    root = worktree.resolve()
+    for path, data in union.files.items():
+        target = worktree / path
+        # Each path is a regular file on every side (`repair_additive`), so `apply_conflict` checked
+        # out a regular file there; never write through a symlink out of the worktree.
+        if target.is_symlink() or not target.resolve().is_relative_to(root):
+            log(f"task {task.task_id}: additive pre-pass left {source_pr}: `{path}` is not a file of the worktree")
+            return None
+        target.write_bytes(data)
+    repair.listings_path(worktree).parent.mkdir(exist_ok=True)  # excluded from the commit
+    (worktree / repair.LISTINGS_DIR / repair.EXPLANATION_FILE).write_text(union.note + "\n")
+    tip, report = repair.commit_resolution(cfg.clone, worktree, prefix, commit, paths, task.large_refactor_heads)
+    accepted = accept(tip, report)
+    record = {"paths": sorted(union.files), "hunks": union.hunks, "kinds": union.kinds}
+    state.write("conflict_validated", conflict=source_pr, attempt=0, tip=tip, report=report, additive=record)
+    if accepted is None:
+        log(
+            f"task {task.task_id}: the additive resolution of {source_pr} is not acceptable: "
+            + "; ".join(report.get("problems") or ["unexplained"])
+        )
+        return None
+    log(
+        f"task {task.task_id}: resolved {source_pr}'s commit {commit[:12]} by the additive pre-pass "
+        f"({union.hunks} hunks in {', '.join(sorted(union.files))})"
+    )
+    return {"status": "ok", "tip": tip, "accepted": accepted, "additive": record}
+
+
+def additive_summary(resolved: list[dict]) -> dict | None:
+    """The task record's account of its mechanical resolutions (``resolve_conflicts`` marks those made
+    here and those reused or merged from a lookahead, whose commit carries ``repair_additive.MARKER``)."""
+    members = [
+        {"source_pr": e["source_pr"], "commit": e["commit"], "paths": e["additive"]["paths"]}
+        for e in resolved
+        if e.get("additive")
+    ]
+    if not members:
+        return None
+    return {"count": len(members), "files": sorted({p for m in members for p in m["paths"]}), "members": members}
+
+
+def additive_findings(summary: dict | None, diagnostics: list[dict]) -> list[dict]:
+    """The mechanically resolved members whose files have a finding of the verification build, with
+    those findings' paths."""
+    if not summary:
+        return []
+    found = set()
+    for d in diagnostics:
+        where = d.get("path") or d.get("module") or ""
+        if where:
+            found.add(where if where.endswith(".lean") else diagnostics_tool.path_of(where))
+    hits = []
+    for member in summary["members"]:
+        paths = sorted(found.intersection(member["paths"]))
+        if paths:
+            hits.append({**member, "paths": paths})
+    return hits
+
+
+def additive_feedback(hits: list[dict]) -> str:
+    """The repair round's note on findings in mechanically resolved files."""
+    lines = [
+        "The worker resolved these members' conflicts mechanically, keeping the lines both sides added "
+        "(the target's, then the member's); check those insertions first: declaration order, a "
+        "duplicate of the target's declaration, or an import that is now redundant:"
+    ]
+    lines += [
+        f"- {h['source_pr']} (commit `{h['commit'][:12]}`): {', '.join(f'`{p}`' for p in h['paths'])}" for h in hits
+    ]
+    return "\n".join(lines)
+
+
+def refuse_additive(clone: Path, batch_id: str, commit: str) -> None:
+    """Leave ``commit``'s conflict in any later run of batch ``batch_id`` to the agent: a verification
+    build found errors in a file its mechanical resolution wrote. Its stored resolutions are dropped
+    too, so a rerun does not reuse the mechanical one. Never fails."""
+    try:
+        git(clone, "update-ref", additive_refused_ref(batch_id, commit), commit)
+        listing = git(
+            clone, "for-each-ref", "--format=%(refname)", f"{RESOLUTION_PREFIX}/{batch_id}/{commit}-*", check=False
+        )
+        for ref in listing.split():
+            git(clone, "update-ref", "-d", ref, check=False)
+    except Exception as error:  # noqa: BLE001 - only costs a mechanical retry that the build catches again
+        log(f"batch {batch_id}: could not record the refused additive resolution of {commit[:12]}: {error}")
+
+
+def resolution_ref(batch_id: str, commit: str, prefix_tree: str) -> str:
+    return f"{RESOLUTION_PREFIX}/{batch_id}/{commit}-{prefix_tree}"
+
+
+def stored_resolution(clone: Path, batch_id: str, commit: str, prefix: str) -> str | None:
+    """The resolved commit an earlier run of a task of batch ``batch_id`` accepted for ``commit`` on a
+    clean prefix with ``prefix``'s tree (``store_resolution``), or None. Keyed by the tree because the
+    replay dates its commits when it runs: a rerun reaches the same prefix tree under another SHA."""
+    ref = resolution_ref(batch_id, commit, chain_tool.tree_of(clone, prefix))
+    sha = git(clone, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False).strip()
+    return sha or None
+
+
+def changed_paths(clone: Path, old: str, new: str) -> dict[str, str]:
+    """``git diff --raw`` from ``old`` to ``new``: each changed path's line, without rename detection."""
+    listing = git(clone, "diff", "--raw", "--no-renames", "-z", old, new, check=False).split("\0")
+    return dict(zip(listing[1::2], listing[0::2], strict=False))
+
+
+def applicable_resolution(clone: Path, batch_id: str, commit: str, prefix: str) -> str | None:
+    """A stored resolution of ``commit`` by any task of batch ``batch_id``, on any prefix, of the conflict
+    ``commit`` has on ``prefix``, or None. The key's commit fixes the conflicting change and its parent.
+    The prefix it was made on is the same as ``prefix`` in the conflicting paths and in every path the
+    resolution changes, and cherry-picking ``commit`` onto either conflicts in the same paths and
+    otherwise differs only as the two prefixes do (no change of ``commit`` lands elsewhere, as after a
+    directory rename), so the conflict it resolved is this one."""
+    stored = git(
+        clone, "for-each-ref", "--format=%(objectname)", f"{RESOLUTION_PREFIX}/{batch_id}/{commit}-*", check=False
+    ).split()
+    if not stored:
+        return None
+    here = chain_tool.merge_trees(clone, prefix, commit, merge_base=f"{commit}^")
+    conflicting = set(here.conflict_paths)
+    for sha in stored:
+        made_on = git(clone, "rev-parse", "--verify", "--quiet", f"{sha}^", check=False).strip()
+        if not made_on:
+            continue
+        there = chain_tool.merge_trees(clone, made_on, commit, merge_base=f"{commit}^")
+        differ = changed_paths(clone, made_on, prefix)
+        if (
+            set(there.conflict_paths) == conflicting
+            and not differ.keys() & (conflicting | changed_paths(clone, made_on, sha).keys())
+            and differ
+            == {p: line for p, line in changed_paths(clone, there.tree, here.tree).items() if p not in conflicting}
+        ):
+            return sha
+    return None
+
+
+def store_resolution(clone: Path, batch_id: str, commit: str, prefix: str, resolved: str) -> None:
+    """Record an accepted resolution in the shared clone, so a rerun of the task after a stop, or a later
+    task of the batch, resumes after it (``stored_resolution``, ``applicable_resolution``); the ref also
+    keeps its objects. Never fails the task."""
+    try:
+        git(clone, "update-ref", resolution_ref(batch_id, commit, chain_tool.tree_of(clone, prefix)), resolved)
+    except Exception as error:  # noqa: BLE001 - losing the record only costs the resume
+        log(f"batch {batch_id}: could not record the resolution of {commit[:12]}: {error}")
+
+
+def pre_rebased_chain(task: Task) -> dict | None:
+    """The ``pre_rebased_chain`` diagnostic of a head-time ``rebase_conflict`` task: the head's pre-rebase
+    ``base..tip`` (its earlier target, its resolved chain), which the seal could not use. None otherwise."""
+    if task.kind != "rebase_conflict" or not isinstance(task.diagnostics, list):
+        return None
+    for entry in task.diagnostics:
+        if (
+            isinstance(entry, dict)
+            and entry.get("kind") == "pre_rebased_chain"
+            and entry.get("base")
+            and entry.get("tip")
+        ):
+            return entry
+    return None
+
+
+def seed_pre_rebased(clone: Path, task: Task) -> dict | None:
+    """Store the resolutions in the head's unused pre-rebase as resolutions of this task's batch.
+
+    When the seal cannot use the head's pre-rebase (it does not replay onto `main`, or the members
+    inserted since do not replay onto it), the controller replays the head's own chain onto `main` and
+    names the pre-rebased chain in the task (``pre_rebased_chain``). Each member that chain resolved (a
+    commit whose message adds an explanation to the member's own) is recorded as that member's
+    resolution on the prefix it was made on (``store_resolution``). The replay then reuses it at once
+    where it reaches the same prefix (the pre-rebase was onto the `main` the head landed as), and
+    elsewhere where it is the same conflict (``applicable_resolution``), so only the remaining
+    conflicts go to an agent. A mechanical resolution the batch's verification refused is not
+    seeded. Each is stored in the form the worker commits a resolution, since the controller's carry
+    replays redate the commits they move. Returns ``{"seeded": [own commit SHAs], "exact": [...]}``:
+    ``exact`` are those the replay meets on the very prefix they were made on (the pre-rebase was onto
+    the task's ``onto``, and every member before them replays to the pre-rebased commit), or None
+    without such a diagnostic. Never fails the task."""
+    record = pre_rebased_chain(task)
+    if record is None:
+        return None
+    try:
+        own = {c.source_pr: c for c in chain_tool.chain_commits(clone, task.base, task.tip) if c.source_pr}
+        theirs = chain_tool.chain_commits(clone, record["base"], record["tip"])
+    except (chain_tool.ChainError, RuntimeError) as error:
+        log(f"task {task.task_id}: the pre-rebased chain {str(record['tip'])[:12]} is unreadable: {error}")
+        return {"seeded": [], "exact": [], "error": str(error)}
+    seeded: list[str] = []
+    exact: list[str] = []
+    same_prefixes = record["base"] == task.onto  # until a member's own replay leaves the pre-rebased chain
+    for commit in theirs:
+        original = own.get(commit.source_pr) if commit.source_pr else None
+        if original is None or len(commit.parents) != 1:
+            same_prefixes = False
+            continue
+        prefix = commit.parents[0]
+        replayed = chain_tool.merge_trees(clone, prefix, original.sha, merge_base=f"{original.sha}^")
+        if replayed.clean:
+            # The replay reproduces this commit only when the member applies to the same tree.
+            same_prefixes = same_prefixes and replayed.tree == commit.tree
+            continue
+        if commit.message == original.message or not commit.message.startswith(original.message.rstrip() + "\n"):
+            same_prefixes = False
+            continue  # not a resolution the worker made
+        if (
+            repair_additive.marked(commit.message)
+            and git(
+                clone,
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                additive_refused_ref(task.batch_id, original.sha),
+                check=False,
+            ).strip()
+        ):
+            same_prefixes = False
+            continue
+        # Stored as the worker commits a resolution (`repair.recommit_resolution` reuses only that form):
+        # the controller's carry and extension replays redate the commits they move.
+        resolution = chain_tool.commit_tree(
+            clone,
+            commit.tree,
+            prefix,
+            commit.message,
+            (original.author_name, original.author_email),
+            author_date=original.author_date,
+            committer_date=original.author_date,
+        )
+        store_resolution(clone, task.batch_id, original.sha, prefix, resolution)
+        seeded.append(original.sha)
+        if same_prefixes:
+            exact.append(original.sha)
+    log(
+        f"task {task.task_id}: seeded {len(seeded)} resolutions from the pre-rebased chain "
+        f"{str(record['tip'])[:12]} onto {str(record['base'])[:12]}, {len(exact)} on the replay's own prefixes"
+    )
+    return {"seeded": seeded, "exact": exact}
+
+
+def forget_resolutions(clone: Path, batch_id: str, only: str | None = None) -> None:
+    """Delete batch ``batch_id``'s stored resolutions (``only``: the entries naming that commit). Never
+    fails."""
+    try:
+        listing = git(
+            clone, "for-each-ref", "--format=%(refname) %(objectname)", f"{RESOLUTION_PREFIX}/{batch_id}/", check=False
+        )
+        for line in listing.splitlines():
+            ref, _, sha = line.partition(" ")
+            if only is None or sha == only:
+                git(clone, "update-ref", "-d", ref, sha, check=False)
+    except Exception as error:  # noqa: BLE001
+        log(f"batch {batch_id}: could not delete its stored resolutions: {error}")
+
+
+def conflict_findings(task: Task, entry: dict, prs: set) -> dict:
+    """The findings one conflict's prompt shows: the conflict, and a pre-rebase's predicted ripples from
+    the head that reference the members in ``prs`` (the clean prefix and the conflicting commit). The
+    batch-wide admission predictions and preparation errors, which name later members, are left out:
+    the agent resolves this one commit and never sees the commits after it."""
+    findings = repair.findings_from_diagnostics([entry])
+    findings["admission_predictions"] = None  # not taken from the task by `prompt_context` either
+    ripples = task_findings(task).get("cross_batch")
+    if ripples:
+        removed = []
+        for item in ripples.get("removed_used") or []:
+            references = [r for r in item.get("references") or [] if r.get("pr") in prs]
+            if references:
+                removed.append({**item, "references": references})
+        added = []
+        for item in ripples.get("added_by_both") or []:
+            ours = [n for n in item.get("next") or [] if n.get("pr") in prs]
+            if ours:
+                added.append({**item, "next": ours})
+        if removed or added:
+            findings["cross_batch"] = {**ripples, "removed_used": removed, "added_by_both": added}
+    return findings
+
+
+def absorbed_members(
+    clone: Path, prefix: str, commit: str, resolved: str, tip: str, rest: chain_tool.ChainResult
+) -> list[str]:
+    """Later members a resolution of ``commit`` took into itself, as problems.
+
+    A later member of the input chain ``commit..tip`` (replayed already in ``rest`` or still pending
+    behind a later conflict) is absorbed when it did not land on the base, its change applies onto
+    the clean ``prefix`` and changes it, the resolved commit already holds it (applying it there
+    changes nothing), and the conflicting commit did not carry it in the input chain. Taking a later
+    member's content is replaying it by hand, and would leave that member an empty commit. A member
+    that conflicts with the prefix is not judged; content moved in part is not detected mechanically.
+
+    Only a later member that changes a path the resolution changes on the prefix is judged: where the
+    prefix and the resolved commit agree on every path a member changes, applying it changes both
+    alike, so one cannot hold it while the other does not. (Git's rename detection could carry a
+    member's edit to a path the resolution added; like content moved in part, that is not judged.)
+    Merging every later member instead took about 20 s per conflict on a 1,014-member batch, about
+    half an hour over its 212 conflicts."""
+    prefix_tree = chain_tool.tree_of(clone, prefix)
+    resolved_tree = chain_tool.tree_of(clone, resolved)
+    if resolved_tree == prefix_tree:
+        return []  # the resolution leaves the prefix as it is, so applying a member changes both alike
+    original_tree = chain_tool.tree_of(clone, commit)
+    touched = set(chain_tool.git(clone, "diff", "--name-only", "--no-renames", "-z", prefix, resolved).split("\0"))
+    touched.discard("")
+    landed = {r.source_pr for r in rest.commits if r.landed_on_base}
+    later_commits = chain_tool.chain_commits(clone, commit, tip)
+    paths = chain_tool.commit_paths(clone, [c.sha for c in later_commits])
+    problems = []
+    for later in later_commits:
+        if later.source_pr in landed or paths[later.sha].isdisjoint(touched):
+            continue  # landed, empty, or applies alike onto the prefix and the resolution
+        parent = later.parents[0]
+        onto_prefix = chain_tool.merge_trees(clone, prefix, later.sha, merge_base=parent)
+        if not onto_prefix.clean or onto_prefix.tree == prefix_tree:
+            continue
+        onto_resolved = chain_tool.merge_trees(clone, resolved, later.sha, merge_base=parent)
+        if not onto_resolved.clean or onto_resolved.tree != resolved_tree:
+            continue
+        onto_original = chain_tool.merge_trees(clone, commit, later.sha, merge_base=parent)
+        if onto_original.clean and onto_original.tree == original_tree:
+            continue
+        problems.append(
+            f"absorbed-later-member: the resolution already contains {later.source_pr}'s change, which the worker "
+            "replays after it: keep only the conflicting commit's change"
+        )
+    return problems
 
 
 def _run_task(
@@ -2242,10 +3240,6 @@ def _run_task(
     """
     require_task_execution(cfg=cfg, task=task)
     state_dir = cfg.tasks_dir / task.task_id
-    staging_checks = functools.partial(repair_audit.staging_checks, task)
-    if task.extra.get("checks_owner") in ("worker", "staging") and cfg.publish.when == "before":
-        # Reuse the existing asynchronous publisher so staging setup overlaps the upload.
-        cfg = dataclasses.replace(cfg, publish=dataclasses.replace(cfg.publish, when="after"))
     logdir = state_dir / "logs"
     state = resume_state or TaskState(state_dir, task)
     pending_delivery = state.record.get("delivery") if state.state in IN_FLIGHT_STATES else None
@@ -2253,24 +3247,26 @@ def _run_task(
     cancel = threading.Event()
     if stop is not None:
         stop.attach(cancel)
-    lease = ClaimLease(
-        client,
-        task,
-        cancel,
-        retry_interval=cfg.lease_retry_interval,
-        check_settings=cfg.root
-        / "worktrees"
-        / f"task-{task.task_id}"
-        / repair.LISTINGS_DIR
-        / repair_audit.SETTINGS_FILE,
-    )
+    lease = ClaimLease(client, task, cancel, retry_interval=cfg.lease_retry_interval)
     lease.start()
     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
     outcome: dict = dict(state.record.get("outcome") or {}) if pending_delivery else {}
     outcome.update(task_id=task.task_id, status="running", worker=cfg.worker)
     state.progress_outcome = outcome
-    continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits else None
+    # Decision 153 (S1): a `pre_rebase` task resolves textual conflicts only, with no verification build
+    # and no repair rounds (not even from a checkpoint an older worker left); the head-time task
+    # verifies and repairs the batch on `main`.
+    conflicts_only = task.kind == "pre_rebase"
+    continuation = task.extra.get("repair_checkpoint") if cfg.worker_audits and not conflicts_only else None
     start_tip = continuation["tip"] if continuation else task.tip
+    # A rebase task's agent step is the worker's own replay, the agent resolving one conflict at a time
+    # (`resolve_conflicts`); a retained repair checkpoint is already on the target and is repaired as is.
+    rebasing = task.kind in repair.REBASE_KINDS and not continuation
+    # A rebased chain that fails verification is repaired like a repair task's (``rebasing`` turns
+    # off); ``rebased`` stays, and ``rebased_tip`` is that chain, submitted for CI if the repair fails.
+    rebased = rebasing
+    rebased_tip: str | None = None
+    rebased_report: dict = {}
     # A ``prepare`` task always streams: the streaming build is how it learns whether there is anything
     # to repair at all (the batch has not been tried, so the task carries no diagnostics).
     known_checks = bool(continuation) or known_check_failures(task)
@@ -2281,6 +3277,7 @@ def _run_task(
         outcome["pre_repair_discovery"] = "skipped: task already supplies located audit/lint findings"
     stream: repair_stream.StreamingBuild | None = None
     started = time.monotonic()
+    clean_check = False  # a parallel check whose build found nothing: verify the chain unchanged
 
     def discard(detail: str) -> dict:
         outcome.update(status="claim_lost", detail=detail)
@@ -2296,7 +3293,7 @@ def _run_task(
         """``TAUCETI_REPAIR_PUBLISH=after``: publish ``revision``'s outputs in the background now that the
         result is in; the publisher removes the worktree when done. Never fails the task. Under ``off``
         the record says so and nothing starts."""
-        if cfg.publish.when == "before" and not staging_checks():
+        if cfg.publish.when == "before":
             return
         early = repair_publish.early_record(logdir, revision, cfg.publish)
         if early:
@@ -2305,7 +3302,7 @@ def _run_task(
         record = repair_publish.start_background(
             worktree,
             revision,
-            settings=dataclasses.replace(cfg.publish, when="after") if cfg.publish.when == "before" else cfg.publish,
+            settings=cfg.publish,
             env=env_lake,
             logdir=logdir,
             task_id=task.task_id,
@@ -2313,6 +3310,8 @@ def _run_task(
             lake=cfg.lake,
             clone=cfg.clone,
             remove_worktree=not cfg.keep_worktree,
+            batch_id=task.batch_id,
+            park=parkable(cfg, task, outcome.get("artifacts") or state.record.get("artifacts")),
         )
         outcome["publish"] = record
         if record.get("launched"):
@@ -2355,10 +3354,38 @@ def _run_task(
                     cancel=cancel,
                 )
             except SourcesUnavailable:
-                if stopping() and not lease.lost.is_set():
-                    return cancelled("the worker stopped while the sources were fetched")
+                # A lost claim cancels the fetch too: that attempt is discarded as claim_lost, not
+                # released as unavailable sources under a claim the worker no longer holds.
+                if stopping() or lease.lost.is_set():
+                    return cancelled("the claim was lost or the worker stopped while the sources were fetched")
                 raise
+            from tauceti_queue import repair_cleanup
+
+            parked_at = repair_cleanup.adopt(cfg.clone, cfg.root, task.batch_id, worktree)
             outcome["sources"]["worktree_reused"] = checkout_worktree(cfg.clone, start_tip, worktree)
+            # The batch's tree from an earlier task on this worker: its `.lake` is the warm state, so
+            # nothing is fetched and Lake compiles only what changed since.
+            warm = warm_tree(worktree, task, parked_at, start_tip)
+            outcome["sources"]["batch_tree"] = "warm" if warm else "adopted" if parked_at else "new"
+            if parked_at is not None or outcome["sources"]["worktree_reused"]:
+                # A reused tree can hold outputs an interrupted write left truncated under a valid
+                # trace, which Lake would trust; compile those modules again instead.
+                from tauceti_queue import repair_outputs
+
+                checked = repair_outputs.discard_damaged(worktree, env_lake)
+                outcome["sources"]["output_check"] = checked
+                if checked.get("removed_modules"):
+                    log(
+                        f"task {task.task_id}: the reused tree had {checked['damaged_count']} damaged output(s); "
+                        f"rebuilding {checked['removed_modules']} module(s)"
+                    )
+                elif not checked.get("checked"):
+                    # The shared cache could restore the same bytes into a cleared tree, so the tree
+                    # is used as it is; freeze_outputs, which checks again, publishes nothing unchecked.
+                    log(
+                        f"task {task.task_id}: the reused tree's outputs could not be checked "
+                        f"({checked.get('reason')}); building in it, but publishing only checked outputs"
+                    )
             if cfg.seed_packages:
                 repair.link_shared_packages(worktree, cfg.seed_packages)
             state.write("sources_ready", worktree=str(worktree), sources=outcome["sources"])
@@ -2378,6 +3405,7 @@ def _run_task(
                     preferred=repair_publish.preferred(cfg.publish, task),
                     warm=repair_publish.warm(cfg.publish, task),
                     build=not streaming and not known_checks and task.kind not in repair.REBASE_KINDS,
+                    fetch=not warm,
                 )
             if artifacts.get("warm_attempts"):
                 warmed = artifacts.get("warmed_from") or []
@@ -2393,6 +3421,14 @@ def _run_task(
                     f"task {task.task_id}: warm artifacts from {describe_cache_revision(task, artifacts)}"
                     + (f"; skipped: {skipped}" if skipped else "")
                 )
+            if not artifacts["available"] and (
+                task.kind in repair.REBASE_KINDS
+                # A build-failure repair only: a preparation discovers its failures with the warm build
+                # (a repair works from the task's diagnostics, without the stream), and audit/lint
+                # findings are verified by the worker, which a cold tree cannot do.
+                or (task.kind == "repair" and not known_checks and toolchain_changed(worktree, revisions[0], start_tip))
+            ):
+                artifacts["cold"] = True
             outcome["artifacts"] = {k: v for k, v in artifacts.items() if k != "incremental_build"} | {
                 "incremental_build": {
                     k: v for k, v in (artifacts.get("incremental_build") or {}).items() if "load" not in k
@@ -2404,7 +3440,7 @@ def _run_task(
             if stopping() and not lease.lost.is_set():
                 return cancelled("the worker stopped while the artifacts were prepared")
             if not artifacts["available"]:
-                if task.kind not in repair.REBASE_KINDS:
+                if not artifacts.get("cold"):
                     return release_task(
                         cfg,
                         client,
@@ -2416,11 +3452,11 @@ def _run_task(
                         lease,
                     )
                 # The rebase itself needs no build; its validation build runs cold here or in the
-                # service's CI, so the agent is run rather than the task released.
-                outcome["artifacts"]["cold"] = True
+                # service's CI. A chain that changes `lean-toolchain` can never be warmed from main
+                # (`toolchain_changed`). Either way the agent is run rather than the task released.
                 log(
                     f"task {task.task_id}: no warm artifacts ({artifacts['unavailable_reason']}); "
-                    "running the rebase without them"
+                    f"running the {'rebase' if task.kind in repair.REBASE_KINDS else 'repair'} without them"
                 )
         elif not worktree.is_dir():
             return release_task(
@@ -2441,15 +3477,25 @@ def _run_task(
                 )
         chain_before = read_chain(cfg.clone, task.base, task.tip)
         prompt_chain = read_chain(cfg.clone, task.validation_base, start_tip) if continuation else chain_before
-        ownership = repair_context.compute(
-            cfg.clone,
-            chain_before,
-            task.validation_base,
-            worktree,
-            declaration_names={m.number: m.declaration_names for m in task.members},
-            edited_prs={m.number for m in task.members if m.provenance == "edited"},
-        )
-        outcome["repair_context"] = ownership.summary()
+        # The head's unused pre-rebase: its resolutions are reused, and only the rest is resolved.
+        seeded = seed_pre_rebased(cfg.clone, task) if rebasing else None
+        if seeded is not None:
+            outcome["pre_rebased"] = {k: (len(v) if isinstance(v, list) else v) for k, v in seeded.items()}
+
+        def compute_ownership(chain: list) -> repair_context.RepairContext:
+            return repair_context.compute(
+                cfg.clone,
+                chain,
+                task.validation_base,
+                worktree,
+                declaration_names={m.number: m.declaration_names for m in task.members},
+                edited_prs={m.number for m in task.members if m.provenance == "edited"},
+            )
+
+        # A rebase task computes the context of each conflict's own commits (`resolve_conflicts`).
+        ownership = None if rebasing else compute_ownership(chain_before)
+        if ownership is not None:
+            outcome["repair_context"] = ownership.summary()
         tools_root = cfg.root / repair_audit.TOOLS_DIR
         repair_publish.write_early_settings(
             worktree,
@@ -2466,7 +3512,7 @@ def _run_task(
                 tools_root=tools_root,
                 lake=tuple(cfg.lake),
                 logdir=logdir,
-                checks_owner="staging" if staging_checks() else "worker",
+                policy_commit=task.extra.get("policy_commit"),
             )
         if streaming and (outcome.get("artifacts") or {}).get("available"):
             stream = repair_stream.start_build(
@@ -2487,7 +3533,6 @@ def _run_task(
                     logdir=logdir,
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
-                    defer_when=staging_checks,
                 )
                 if cfg.worker_audits
                 else None,
@@ -2504,7 +3549,7 @@ def _run_task(
             ):
                 # The batch builds on its base as assembled: give the task back as prepared, without an
                 # agent, and publish the outputs for the head's later rounds.
-                if cfg.publish.when == "before" and not staging_checks():
+                if cfg.publish.when == "before":
                     outcome["publish"] = repair_publish.publish_outputs(
                         worktree,
                         task.tip,
@@ -2516,6 +3561,7 @@ def _run_task(
                     )
                 where = "the head's tip" if pre_rebased(task) is not None else "its base"
                 log(f"task {task.task_id}: the open batch builds on {where}; nothing to prepare")
+                attested = attestation(cfg.clone, task.tip, stream.audit_record, outcome.get("publish"))
                 released = release_task(
                     cfg,
                     client,
@@ -2525,9 +3571,19 @@ def _run_task(
                     f"the batch built on {where} without errors",
                     outcome,
                     lease,
+                    notes={"attestation": attested} if attested is not None else None,
                 )
                 publish_after(task.tip)
                 return released
+            clean_check = (
+                parallel_check_task(task)
+                and stream.finished.is_set()
+                and stream.rc == 0
+                and not stream.errors
+                and not stream.findings
+            )
+            if clean_check:
+                log(f"task {task.task_id}: the head's tip builds without errors; verifying it unchanged")
         findings = (
             repair.findings_from_diagnostics(continuation["diagnostics"]) if continuation else task_findings(task)
         )
@@ -2545,22 +3601,72 @@ def _run_task(
         resubmit = False
         agent_records: list[dict] = list(outcome.get("agent", []))
         agent = {"status": "ok"}
-        skip_agent = bool(pending_delivery)
+        if parallel_check_task(task) and not pending_delivery:
+            # The check exists to verify the tip; without the worker's own verification (no audits, or
+            # cold artifacts, which skip it) it would do nothing useful. Give it back: staging decides.
+            if not cfg.worker_audits or (outcome.get("artifacts") or {}).get("cold"):
+                return release_task(
+                    cfg,
+                    client,
+                    task,
+                    state,
+                    "artifacts_unavailable",
+                    "a parallel check needs the worker's own warm verification",
+                    outcome,
+                    lease,
+                )
+        # A parallel check with no streamed build goes straight to verification too; a failed
+        # verification then runs the agent on its findings like any repair round.
+        skip_agent = bool(pending_delivery) or clean_check or (parallel_check_task(task) and stream is None)
+        # Numeric projections are rewritten mechanically before an agent sees them: the first findings
+        # (the stream's too) and those of each failed verification (`rewrite_projections`).
+        projections_due = (
+            task.kind in ("repair", "prepare")
+            and not resuming
+            and not continuation
+            and not (outcome.get("artifacts") or {}).get("cold")
+        )
         while True:
             attempt += 1
             if cancel.is_set() or stopping():
                 return cancelled("cancelled before the agent started")
+            if projections_due:
+                projections_due = False
+                rewritten = rewrite_projections(
+                    cfg, task, worktree, findings, stream if attempt == 1 else None, logdir, cancel, env_lake
+                )
+                if cancel.is_set():
+                    return cancelled("cancelled while numeric projections were rewritten")
+                if rewritten is not None:
+                    findings, record = rewritten
+                    outcome.setdefault("numproj", []).append(record)
+                    chain_before = prompt_chain = read_chain(cfg.clone, task.validation_base, record["tip"])
+                    ownership = compute_ownership(chain_before)
+                    outcome["repair_context"] = ownership.summary()
+                    if feedback:  # a verification's: the findings it lists are superseded
+                        feedback = (
+                            "The worker's verification of the chain failed. The worker then rewrote the numeric "
+                            "projections in "
+                            + ", ".join(f"`{p}`" for p in record["paths"])
+                            + " with `tauceti-tools numproj`, in the members that wrote them, and rebuilt those files. "
+                            "What is left is listed as diagnostics and in "
+                            f"`{repair.LISTINGS_DIR}/{repair_audit.ERRORS_FILE}`."
+                        )
+                    if not findings_left(findings, worktree, stream is not None and attempt == 1):
+                        log(f"task {task.task_id}: nothing left for the agent after the numeric projection rewrite")
+                        skip_agent = True
             if (
                 attempt == 1
                 and not resuming
                 and not continuation
                 and task.kind in ("repair", "prepare")
                 and cfg.parallel_agents > 1
+                and not (outcome.get("artifacts") or {}).get("cold")
             ):
                 # Independent failing groups are repaired by concurrent agents first; what they leave
                 # (nothing, a group that failed, a build that still fails) goes to the usual agent below.
                 parallel, remaining = run_parallel_groups(
-                    cfg, task, worktree, chain_before, findings, ownership, logdir, cancel, state, env_lake, stream
+                    cfg, task, worktree, chain_before, findings, ownership, logdir, cancel, state, env_lake
                 )
                 outcome["parallel"] = {k: v for k, v in parallel.items() if k != "remaining"}
                 if parallel["status"] == "cancelled":
@@ -2582,6 +3688,40 @@ def _run_task(
                 resubmit = False  # the explanation turn already ran; check and submit its result
             elif skip_agent:
                 skip_agent = False  # every group folded and the verification build passed; check and submit
+            elif rebasing:
+                pending_delivery = None
+                state.record.pop("delivery", None)
+                outcome.pop("repair_checkpoint", None)
+                resolution = resolve_conflicts(
+                    cfg,
+                    task,
+                    worktree,
+                    logdir,
+                    cancel,
+                    state,
+                    env_lake,
+                    artifacts=outcome.get("artifacts") or state.record.get("artifacts"),
+                    agent_records=agent_records,
+                    seeded=seeded,
+                )
+                outcome["agent"] = agent_records
+                outcome["conflicts"] = resolution["resolved"]
+                additive = additive_summary(resolution["resolved"])
+                if additive is not None:
+                    outcome["additive"] = additive
+                    log(
+                        f"task {task.task_id}: {additive['count']} conflicts resolved by the additive pre-pass, "
+                        f"in {', '.join(additive['files'])}"
+                    )
+                else:
+                    outcome.pop("additive", None)
+                if resolution["status"] == "cancelled":
+                    return cancelled("the agent was cancelled")
+                if resolution["status"] != "ok":
+                    return release_task(
+                        cfg, client, task, state, resolution["status"], resolution.get("reason"), outcome, lease
+                    )
+                agent = resolution["agent"]
             else:
                 pending_delivery = None
                 state.record.pop("delivery", None)
@@ -2596,7 +3736,7 @@ def _run_task(
                     worker_verifies=cfg.worker_audits,
                 )
                 context.repair_context = ownership
-                if continuation:
+                if continuation or rebased:
                     context.kind = "repair"
                     context.check_findings_known = True
                 if context.worker_verifies:
@@ -2626,9 +3766,15 @@ def _run_task(
             tip = git(worktree, "rev-parse", "HEAD").strip()
             git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
             report = repair.chain_report(
-                cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                cfg.clone,
+                task.validation_base,
+                task.tip,
+                tip,
+                task.member_keys,
+                prior_base=task.base,
+                large_refactors=task.large_refactor_heads,
             )
-            if report["ok"] and report["unexplained"] and not cancel.is_set():
+            if report["ok"] and report["unexplained"] and not cancel.is_set() and not rebasing:
                 follow = run_repair_agent(
                     cfg,
                     task,
@@ -2656,17 +3802,25 @@ def _run_task(
                 tip = git(worktree, "rev-parse", "HEAD").strip()
                 git(cfg.clone, "update-ref", f"{RESULT_REF_PREFIX}/{task.task_id}/attempt-{attempt}", tip)
                 report = repair.chain_report(
-                    cfg.clone, task.validation_base, task.tip, tip, task.member_keys, prior_base=task.base
+                    cfg.clone,
+                    task.validation_base,
+                    task.tip,
+                    tip,
+                    task.member_keys,
+                    prior_base=task.base,
+                    large_refactors=task.large_refactor_heads,
                 )
             report["dirty"] = bool(git(worktree, "status", "--porcelain", "--untracked-files=no").strip())
             report["unchanged"] = tip == task.tip
             report["agent_failed"] = agent["status"] == "failed"
             state.write("validated", attempt=attempt, tip=tip, report=report)
-            proactive = bool((task_findings(task).get("admission_predictions") or {}).get("proactive"))
+            proactive = bool(
+                (task_findings(task).get("admission_predictions") or {}).get("proactive")
+            ) or parallel_check_task(task)
             acceptable = (
                 report["ok"]
                 and not report["dirty"]
-                and (not report["unchanged"] or proactive or scope_only_repair(task))
+                and (not report["unchanged"] or proactive or scope_only_repair(task) or driver_failure_only(task))
             )
             if not acceptable:
                 detail = format_report(report)
@@ -2674,7 +3828,7 @@ def _run_task(
                     detail = f"agent exceeded the worker's {cfg.agent_timeout:.0f}s cap\n{detail}"
                 elif agent["status"] == "failed":
                     detail = f"agent exited {agent.get('rc')}\n{detail}"
-                if attempt < cfg.agent_attempts:
+                if attempt < cfg.agent_attempts and not rebasing:
                     feedback = (
                         "Local validation of the previous attempt's chain:\n"
                         + detail
@@ -2683,16 +3837,31 @@ def _run_task(
                     )
                     log(f"attempt {attempt} not acceptable; retrying once with the report")
                     continue
-                return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+                if rebased_tip is not None:
+                    log(f"task {task.task_id}: the repair of the rebased chain failed; submitting that chain for CI")
+                    git(worktree, "checkout", "--quiet", "--force", "--detach", rebased_tip)
+                    tip, report = rebased_tip, rebased_report
+                else:
+                    if rebased and not cancel.is_set():
+                        # A rerun would rebuild this chain from the stored resolutions without the agent. A
+                        # worker that lost its claim leaves them to the claimant.
+                        forget_resolutions(cfg.clone, task.batch_id)
+                    return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
             parallel = outcome.get("parallel") or {}
             verified = (
-                parallel.get("verified_tip") == tip and (staging_checks() or "checks" in parallel)
-            ) or pending_delivery == delivery_identity(cfg, task, tip)
+                (parallel.get("verified_tip") == tip and "checks" in parallel)
+                or pending_delivery == delivery_identity(cfg, task, tip)
+                or tip == rebased_tip
+            )
             artifacts_cold = bool((outcome.get("artifacts") or state.record.get("artifacts") or {}).get("cold"))
-            if cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
+            if conflicts_only:
+                # Decision 153 (S1): a pre-rebase resolves the textual conflicts and stops. The head's tip
+                # it sits on may itself fail, and its findings are not this batch's to repair; the batch
+                # is verified and repaired once it is the head, on `main`.
+                outcome["verification_skipped"] = "pre_rebase: conflicts only"
+            elif cfg.worker_audits and (not artifacts_cold or continuation) and not verified:
                 outcome.pop("repair_checkpoint", None)
-                # Compile the final chain and capture its native output map. New tasks
-                # leave full checks to staging; older tasks retain their assigned checks.
+                # Compile the final chain, capture its native output map and run every check.
                 state.write("verifying", attempt=attempt, tip=tip)
                 verification = repair_audit.verify(
                     worktree,
@@ -2703,7 +3872,6 @@ def _run_task(
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
                     audits=True,
-                    defer_when=staging_checks,
                 )
                 outcome.setdefault("verification", []).append(
                     {k: v for k, v in verification.items() if k != "diagnostics"}
@@ -2729,9 +3897,31 @@ def _run_task(
                         verification["diagnostics"]
                     )
                     state.write("verification_failed", attempt=attempt, tip=tip, detail=detail)
+                    hits = additive_findings(outcome.get("additive"), verification["diagnostics"])
+                    if hits:
+                        # A mechanical resolution may be the cause: say so to the repair round, and leave
+                        # those conflicts to the agent in any later run of the batch.
+                        outcome["additive"].setdefault("verification_findings", []).append(
+                            {"tip": tip, "members": hits}
+                        )
+                        log(
+                            f"task {task.task_id}: verification findings in mechanically resolved files: "
+                            + "; ".join(f"{h['source_pr']} ({', '.join(h['paths'])})" for h in hits)
+                        )
+                        for hit in hits:
+                            refuse_additive(cfg.clone, task.batch_id, hit["commit"])
+                        detail += "\n\n" + additive_feedback(hits)
                     if verify_rounds < cfg.verify_retries:
+                        if rebasing:
+                            # The agent resolved conflicts and never saw the whole chain: repair the chain
+                            # on its target as a repair task would.
+                            log(f"task {task.task_id}: the rebased chain fails verification; repairing it")
+                            rebasing, rebased_tip, rebased_report = False, tip, report
+                            chain_before = prompt_chain = read_chain(cfg.clone, task.validation_base, tip)
+                            ownership = compute_ownership(chain_before)
                         verify_rounds += 1
                         findings = repair.findings_from_diagnostics(verification["diagnostics"])
+                        projections_due = not continuation
                         feedback = (
                             detail
                             + "\n\nThe findings are listed above as diagnostics and appended to "
@@ -2739,7 +3929,10 @@ def _run_task(
                         )
                         log(f"attempt {attempt}: verification failed; running the agent on its findings")
                         continue
-                    if not (
+                    elif rebased:
+                        # The retries are spent: the head's CI and repair tasks take the build from here.
+                        log(f"task {task.task_id}: the repaired chain still fails verification; submitting it for CI")
+                    elif not (
                         task.extra.get("can_checkpoint_repair")
                         and verification.get("build", {}).get("rc") == 0
                         and checks.get("status") == "failed"
@@ -2747,20 +3940,33 @@ def _run_task(
                         and all(d.get("kind") in ("audit", "lint") for d in verification["diagnostics"])
                     ):
                         return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-                    outcome["repair_checkpoint"] = {
-                        "tip": tip,
-                        "diagnostics": [
-                            {**finding, "message": finding["message"][:2000]}
-                            for finding in verification["diagnostics"][:20]
-                        ],
-                    }
+                    else:
+                        outcome["repair_checkpoint"] = {
+                            "tip": tip,
+                            "diagnostics": [
+                                {**finding, "message": finding["message"][:2000]}
+                                for finding in verification["diagnostics"][:20]
+                            ],
+                            "tools": checks.get("tools_commit") or checks.get("tools"),
+                            # The code that produced it, kept if a later process delivers it.
+                            "worker_revision": STARTUP_REVISION,
+                        }
+            if report["unchanged"] and driver_failure_only(task):
+                # Only a complete local pass makes an unchanged chain worth staging again, and only once.
+                if not verified_unchanged(tip, outcome):
+                    detail = "CI's check driver failed, but the worker could not verify the unchanged chain itself"
+                    return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+                if restaged_by_other_task(cfg.clone, task):
+                    detail = (
+                        "CI's check driver failed again on a chain already staged again unchanged after a driver "
+                        "failure; it needs an operator"
+                    )
+                    return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
+                git(cfg.clone, "update-ref", restaged_ref(task), tip)
+                log(f"task {task.task_id}: CI's check driver failed; submitting the verified unchanged chain once")
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
-            if (
-                cfg.publish.when == "before"
-                and not staging_checks()
-                and (outcome.get("publish") or {}).get("revision") != tip
-            ):
+            if cfg.publish.when == "before" and (outcome.get("publish") or {}).get("revision") != tip:
                 outcome["publish"] = repair_publish.publish_outputs(
                     worktree,
                     tip,
@@ -2790,36 +3996,17 @@ def _run_task(
                     a.get("estimated_cost_usd") or 0 for r in agent_records for a in r.get("attempts", [])
                 ),
             }
+            # Whether this exact tip passed the worker's own verification: the controller verifies and
+            # repairs the next batch only on a head tip with such a pass (decision 174).
+            notes["local_verification"] = {"tip": tip, "checks_passed": verified_unchanged(tip, outcome)}
+            attested = attestation(cfg.clone, tip, latest_checks(tip, outcome), outcome.get("publish"))
+            if attested is not None and verified_unchanged(tip, outcome):
+                notes["attestation"] = attested
             verification_note = admission_verification(
                 task, tip, outcome, stream.findings if stream is not None else []
             )
             if verification_note is not None:
                 notes["admission_verification"] = verification_note
-            if task.kind == "pre_rebase":
-                for result in reversed(outcome.get("verification", [])):
-                    checks = result.get("checks") or {}
-                    build_only = (
-                        staging_checks() and checks.get("status") != "passed" and result.get("build", {}).get("rc") == 0
-                    )
-                    if (
-                        result.get("tip") == tip
-                        and result.get("ok") is True
-                        and (build_only or checks.get("status") == "passed")
-                    ):
-                        tools = checks.get("tools")
-                        if build_only:
-                            try:
-                                repo, ref = repair_audit.tools_pin(worktree)
-                                tools = f"{repo}@{ref}"
-                            except repair_audit.Unavailable:
-                                break
-                        notes["pre_rebase_verification"] = {
-                            "tip": tip,
-                            "base": task.validation_base,
-                            "tools": tools,
-                            "scope": "build" if build_only else "full",
-                        }
-                        break
             if task.kind == "prepare":
                 notes["remaining_errors"] = prepare_remaining_errors(outcome.get("parallel"), findings, worktree)
             checkpoint = outcome.get("repair_checkpoint") or {}
@@ -2827,6 +4014,14 @@ def _run_task(
             submit_options = {"checkpoint": True} if saving_checkpoint else {}
             if saving_checkpoint:
                 notes["repair_checkpoint"] = checkpoint["diagnostics"]
+                # What the queue's stall detection reads (docs/queue/escalation.md, "Stalled repair"): the
+                # code that produced the checkpoint and the agent's own conclusion about it.
+                notes["worker_revision"] = checkpoint.get("worker_revision") or STARTUP_REVISION
+                if checkpoint.get("tools"):
+                    notes["tools_revision"] = checkpoint["tools"]
+                conclusion = last_agent_conclusion(agent_records)
+                if conclusion:
+                    notes["agent_conclusion"] = conclusion
             lease.submitting.set()
             try:
                 response = with_retries(
@@ -2844,6 +4039,10 @@ def _run_task(
             state.write("submitted", attempt=attempt, response=response)
             outcome["response"] = response
             reason = str(response.get("reason") or "")
+            if rebased and reason not in CLAIM_CODES:
+                # The service has the chain: the task is answered. A refused claim's successor may be
+                # using the batch's resolutions.
+                forget_resolutions(cfg.clone, task.batch_id)
             if reason == REPAIR_CHECKPOINT:
                 lease.stop()
                 outcome.update(status="released", reason=REPAIR_CHECKPOINT, tip=tip, pushed_ref=push["ref"])
@@ -2859,7 +4058,7 @@ def _run_task(
             if reason in CLAIM_CODES:
                 return discard(f"result rejected: {reason}")
             lease.submitting.clear()
-            if reason == "explanation-required" and explanation_resubmits < cfg.validation_retries:
+            if reason == "explanation-required" and explanation_resubmits < cfg.validation_retries and not rebasing:
                 # The controller asks the same claim to add the explanation and resubmit.
                 explanation_resubmits += 1
                 named = rejected_members(response) or report.get("edited") or task.member_keys
@@ -2889,7 +4088,11 @@ def _run_task(
                 feedback = None
                 resubmit = True
                 continue
-            if reason in ("invalid-chain", "no-repair-edited") and validation_retries < cfg.validation_retries:
+            if (
+                reason in ("invalid-chain", "no-repair-edited")
+                and validation_retries < cfg.validation_retries
+                and not rebasing
+            ):
                 validation_retries += 1
                 feedback = "The queue's validation of the previous attempt's chain:\n" + format_service_validation(
                     response
@@ -2928,10 +4131,12 @@ def _run_task(
         outcome["seconds"] = round(time.monotonic() - started, 1)
         outcome["lease"] = {"renewals": lease.renewals, "errors": lease.errors, "lost": lease.lost.is_set()}
         # A task awaiting delivery keeps its worktree for the retry. A background publication owns it
-        # from its start and removes it when done.
+        # from its start and parks or removes it when done.
         if not cfg.keep_worktree and outcome.get("status") not in ("error", "delivery_pending") and not background:
             with contextlib.suppress(Exception):
-                repair.remove_worktree(cfg.clone, worktree)
+                outcome["worktree"] = retire_worktree(
+                    cfg, task, outcome.get("artifacts") or state.record.get("artifacts")
+                )
         with contextlib.suppress(Exception):
             repair.write_record(state_dir / "outcome.json", outcome)
         state.write_progress(outcome)
@@ -3131,12 +4336,12 @@ def retry_deliveries(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None
                     outcomes.append(outcome)
                     if not cfg.keep_worktree:
                         with contextlib.suppress(Exception):
-                            repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
+                            retire_worktree(cfg, task, record.get("artifacts"))
                     continue
             state.write("claim_lost", detail=f"delivery retry: {error}")
             if not cfg.keep_worktree:
                 with contextlib.suppress(Exception):
-                    repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
+                    retire_worktree(cfg, task, record.get("artifacts"))
             log(f"task {task.task_id}: claim no longer ours; not delivered")
             continue
         except ServiceError as error:
@@ -3156,7 +4361,7 @@ def retry_deliveries(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None
             )
             if not cfg.keep_worktree:
                 with contextlib.suppress(Exception):
-                    repair.remove_worktree(cfg.clone, cfg.root / "worktrees" / f"task-{task.task_id}")
+                    retire_worktree(cfg, task, record.get("artifacts"))
             continue
         if record.get("next_retry_at", 0) > time.time():
             continue
@@ -3707,6 +4912,9 @@ def main(argv: list[str] | None = None) -> int:
     # The api provider's key, from the environment file; taken out of this process's environment so
     # only the api provider's agent ever sees it (and nothing logs it).
     api_key = (os.environ.pop("ANTHROPIC_API_KEY", "") or "").strip() or None
+    if args.seed_packages:
+        # The one tree every sandbox of this worker and its agents may bind through `.lake/packages`.
+        os.environ[repair_sandbox.READ_ONLY_VARIABLE] = str(args.seed_packages)
 
     clone = args.clone
     if clone is None:

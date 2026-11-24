@@ -191,8 +191,8 @@ class AgentTranscriptRenderer:
         self.rate_limit_status: str | None = None
 
     @property
-    def last_assistant(self) -> str | None:
-        """The text of the main agent's latest message; None for a provider with no structured events."""
+    def final_text(self) -> str | None:
+        """The agent's last top-level message (or its result text), as the transcript shows it."""
         return self._last_assistant
 
     def render_line(self, raw: str) -> str:

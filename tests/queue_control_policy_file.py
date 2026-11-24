@@ -275,5 +275,85 @@ class PolicyFile(unittest.TestCase):
         self.assertEqual(len(self.native.calls), before)
 
 
+@unittest.skipUnless(os.name == "posix", "systemd credentials require POSIX ownership checks")
+class SystemdCredential(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="queue-systemd-credentials-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve() / "credentials"
+        self.root.mkdir()
+        (self.root / "key").write_bytes(b"secret")
+        (self.root / "key").chmod(0o400)
+        self.root.chmod(0o500)
+        self.addCleanup(self.root.chmod, 0o700)
+        environment = patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": str(self.root)})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def test_credentials_directory_ancestors_are_not_walked(self):
+        def untrusted_ancestor(*_args, **_kwargs):
+            raise AssertionError("ancestor walk")
+
+        with patch.object(control_policy_file, "_parent", untrusted_ancestor):
+            self.assertEqual(control_policy_file.read_systemd_credential("key"), b"secret")
+
+    def test_directory_and_file_checks_still_apply(self):
+        for name in ("", ".", "..", "../key", "missing"):
+            with self.subTest(name=name), self.assertRaises(ControlPolicyError):
+                control_policy_file.read_systemd_credential(name)
+        self.root.chmod(0o750)
+        with self.assertRaisesRegex(ControlPolicyError, "private user-owned parent"):
+            control_policy_file.read_systemd_credential("key")
+        self.root.chmod(0o700)
+        (self.root / "key").chmod(0o640)
+        with self.assertRaisesRegex(ControlPolicyError, "bounded private"):
+            control_policy_file.read_systemd_credential("key")
+
+    def test_missing_or_relative_credentials_directory_is_refused(self):
+        for value in ("", "relative/credentials"):
+            with self.subTest(value=value), patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": value}):
+                with self.assertRaisesRegex(ControlPolicyError, "unavailable"):
+                    control_policy_file.read_systemd_credential("key")
+
+    def test_changed_read_keeps_no_private_bytes_in_traceback(self):
+        snapshots = iter([("before",), ("after",)])
+        with patch.object(control_policy_file, "_snapshot", side_effect=lambda _info: next(snapshots)):
+            with self.assertRaises(ControlPolicyError) as raised:
+                control_policy_file.read_systemd_credential("key")
+        frames = []
+        traceback = raised.exception.__traceback__
+        while traceback is not None:
+            frames.append(traceback.tb_frame.f_locals)
+            traceback = traceback.tb_next
+        self.assertFalse(any(b"secret" in repr(values).encode() for values in frames))
+
+    def test_execution_app_credentials_load_from_the_credentials_directory(self):
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+
+        from tauceti_queue import github_app
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048).private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        )
+        self.root.chmod(0o700)
+        for name, payload in (
+            ("github-app.json", json.dumps({"id": 1, "installation_id": 2, "slug": "app"}).encode()),
+            ("github-private-key.pem", key),
+        ):
+            (self.root / name).write_bytes(payload)
+            (self.root / name).chmod(0o400)
+        self.root.chmod(0o500)
+        with patch.object(control_policy_file, "_parent", side_effect=AssertionError("ancestor walk")):
+            credentials = github_app.load_execution_credentials(self.root, systemd_credentials=True)
+        self.assertEqual((credentials.app_id, credentials.installation_id, credentials.slug), (1, 2, "app"))
+
+    def test_symlinked_credentials_directory_is_refused(self):
+        link = self.root.parent / "link"
+        link.symlink_to(self.root)
+        with patch.dict(os.environ, {"CREDENTIALS_DIRECTORY": str(link)}), self.assertRaises(ControlPolicyError):
+            control_policy_file.read_systemd_credential("key")
+
+
 if __name__ == "__main__":
     unittest.main()

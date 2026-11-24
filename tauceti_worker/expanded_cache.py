@@ -333,6 +333,55 @@ def hydrate(
         os.utime(entry / "entry.json", None)
 
 
+REVISION = re.compile(r"[0-9a-f]{40}")
+
+
+def foreign_inputs(download, cwd):
+    """Input hashes that only revisions on another Lean toolchain list.
+
+    The main warm-up fetches base-branch outputs under the base branch's toolchain, whose leantar
+    may write a format this checkout's cannot read (0.1.20 rejects 0.1.21 archives: "unrecognized
+    LGZ version"). Their input hashes cannot match this checkout's modules, so they stay private
+    downloads; after a rebase, Lake restores them with the matching toolchain."""
+    try:
+        own = (Path(cwd) / "lean-toolchain").read_text().strip()
+    except OSError:
+        return set()
+    paths = [p for p in (download / "revisions/TauCeti").glob("*.jsonl") if REVISION.fullmatch(p.stem)]
+    if not own or not paths:
+        return set()
+    try:
+        # One batch lookup: a revision this checkout lacks reports "missing".
+        out = subprocess.run(
+            ["git", "cat-file", "--batch"],
+            cwd=cwd,
+            input="".join(f"{p.stem}:lean-toolchain\n" for p in paths).encode(),
+            capture_output=True,
+            check=True,
+            timeout=60,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    foreign, native = set(), set()
+    for path in paths:
+        header, _, out = out.partition(b"\n")
+        parts = header.split()
+        toolchain = None
+        if len(parts) == 3:
+            size = int(parts[2])
+            toolchain, out = out[:size].decode(errors="replace").strip(), out[size + 1 :]
+        if toolchain is None:
+            continue  # A revision this checkout lacks proves neither toolchain.
+        try:
+            lines = path.read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for line in lines:
+            with contextlib.suppress(ValueError, TypeError, IndexError):
+                (native if toolchain == own else foreign).add(json.loads(line)[0])
+    return foreign - native
+
+
 def expand(
     download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None, deadline=None, ci_outputs=None
 ):
@@ -342,8 +391,11 @@ def expand(
     entry this round needs, and a dead holder releases its lock. Only an explicit ``deadline``
     (tests) bounds the wait; the round's hard cap bounds it otherwise."""
     grouped = {}
+    foreign = foreign_inputs(download, cwd)
+    report["foreign_toolchain"] = len(foreign)
     for input_hash, archive in entries(download, manifest):
-        grouped.setdefault(archive, []).append(input_hash)
+        if input_hash not in foreign:
+            grouped.setdefault(archive, []).append(input_hash)
     pending = [(inputs, archive) for archive, inputs in grouped.items()]
     if not pending:
         return

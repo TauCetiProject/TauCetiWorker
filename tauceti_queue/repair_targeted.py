@@ -14,8 +14,8 @@ import shutil
 import time
 from pathlib import Path
 
+from tauceti_queue import diagnostics, repair_tools
 from tauceti_queue import repair_audit as audit
-from tauceti_queue import repair_tools
 
 FILE = "check-findings"
 SETTINGS = "findings.json"
@@ -26,6 +26,7 @@ def write(directory: Path, *, candidate: str, findings: dict) -> Path:
     from tauceti_queue import repair
 
     lint = (findings.get("lint") or {}).get("findings") or []
+    untargeted = (None, "lint", "environment_linter", *diagnostics.SOURCE_LINTERS)
     modules = {m.removesuffix(".lean").replace("/", ".") for m in findings.get("failed_modules") or []}
     for path in repair.finding_paths(findings):
         module = repair.path_to_module(path) or (path if path.startswith("TauCeti.") and NAME.fullmatch(path) else None)
@@ -42,11 +43,11 @@ def write(directory: Path, *, candidate: str, findings: dict) -> Path:
     settings = {
         "candidate": candidate,
         "modules": sorted(modules),
-        "linters": sorted({r["linter"] for r in lint if r.get("linter") not in (None, "lint", "environment_linter")}),
+        "linters": sorted({r["linter"] for r in lint if r.get("linter") not in untargeted}),
         "unchecked": bool(
             findings.get("other")
             or findings.get("import_collisions")
-            or any(r.get("linter") in (None, "lint", "environment_linter") for r in lint)
+            or any(r.get("linter") in untargeted for r in lint)
         ),
         "duplicates": bool(findings.get("duplicate_declarations")),
     }
@@ -191,17 +192,10 @@ def run(root: Path) -> int:
                     return 1
         if findings.get("unchecked"):
             record["status"] = "partial"
-            owner = "staging" if settings.get("checks_owner") == "staging" else "worker"
-            print(f"scoped compilation passed; some findings need {owner} verification", flush=True)
+            print("scoped compilation passed; some findings need worker verification", flush=True)
             return 2
         record["status"] = "passed"
-        if settings.get("checks_owner") == "staging":
-            print(
-                "targeted checks passed; return for final compilation and submission; full checks run in staging",
-                flush=True,
-            )
-        else:
-            print("targeted checks passed; return for the worker's full build, audits and lint", flush=True)
+        print("targeted checks passed; return for the worker's full build, audits and lint", flush=True)
         return 0
     except (audit.Unavailable, OSError, ValueError) as error:
         record.update(status="unavailable", reason=str(error))

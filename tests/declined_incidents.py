@@ -228,7 +228,7 @@ def test_round(root, tmp):
 
     def fake_fix(_w, _sv, c, _opts, _bubble):
         launched.append(c.pr)
-        agents._LAST_AGENT_RUN = {"last_message": f"#{c.pr} is covered.\nSubsumed-by: #41", "transcript": "/t.log"}
+        agents._LAST_AGENT_RUN = {"final_text": f"#{c.pr} is covered.\nSubsumed-by: #41", "transcript": "/t.log"}
         return 0
 
     def round_over(prs, *, dry_run=False, bump=False):
@@ -458,6 +458,7 @@ def test_multi_source_budgets(root):
         with (
             patch.object(multi_source, "collect", return_value=[("forgejo", worker, sv)]),
             patch.object(multi_source, "deduplicate"),
+            patch("tauceti_worker.account_pressure.read_other", return_value=0),
         ):
             try:
                 multi_source.run_round(worker, opts, use_fleet_focus=False)

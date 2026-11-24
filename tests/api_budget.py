@@ -455,6 +455,8 @@ if sys.argv[1:3] == ['auth', 'status']:
     print(json.dumps({'authMethod': 'api_key'}))
     sys.exit(0)
 print(json.dumps({'type': 'system', 'subtype': 'init', 'pid': os.getpid()}), flush=True)
+if os.environ.get('FAKE_STARTED'):
+    pathlib.Path(os.environ['FAKE_STARTED']).touch()
 time.sleep(float(os.environ.get('FAKE_DELAY', '0')))
 if os.environ.get('FAKE_CRASH'):
     sys.exit(1)
@@ -900,10 +902,21 @@ with ClaudeAPIContext("crash-fixture", "fix"):
             self.assertTrue(list(namespace.glob("*.json")))
 
     def test_finished_sessions_never_cut_off_on_balance_change(self):
-        os.environ["FAKE_DELAY"] = "0.6"
+        os.environ["FAKE_DELAY"] = "3"
         os.environ["FAKE_COST"] = "150"
+        started = self.root / "native-started"
+        os.environ["FAKE_STARTED"] = str(started)
+
+        def cut_funding_once_running():
+            # After admission, not after a fixed delay that a loaded runner can spend just starting
+            # the wrapper, which would test a denial instead.
+            deadline = time.monotonic() + 120
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.budget.configure(set_grant=0, rate=0)
+
         with ClaudeAPIContext("worker1", "fix"):
-            thread = threading.Thread(target=lambda: (time.sleep(0.3), self.budget.configure(set_grant=0, rate=0)))
+            thread = threading.Thread(target=cut_funding_once_running)
             thread.start()
             result = self.run_claude()
             thread.join()
@@ -992,7 +1005,7 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreaterEqual(count, 2, "exercise both a short ledger write and its failure")
         self.assertTrue(self.budget.ledger.read_bytes().startswith(good))
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 60
         while Decimal(self.budget.snapshot()["spent"]) < 20 and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 20)
@@ -1003,7 +1016,7 @@ with ClaudeAPIContext("crash-fixture", "fix"):
             result = self.run_claude()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.budget.ledger.write_bytes(good)
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 60
         while Decimal(self.budget.snapshot()["spent"]) < 30 and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 30)
@@ -1237,7 +1250,10 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         self.assertIn("cooldown", self.budget.admit("second", "second", "opus", "fix")["reason"])
 
     def test_denial_never_waits_inside_round_even_for_loop_worker(self):
-        with patch.dict(os.environ, {"TAUCETI_API_WAIT": "1", "FAKE_DELAY": "0.5"}):
+        # The holder keeps its reservation for 10 s. A denial that waited for it would return only
+        # after the holder exits; the bound is the holder still running, not a wall-clock limit that
+        # a loaded CI runner can exceed just starting the wrapper.
+        with patch.dict(os.environ, {"TAUCETI_API_WAIT": "1", "FAKE_DELAY": "10"}):
             with ClaudeAPIContext("worker1", "fix"):
                 proc = subprocess.Popen(
                     ["claude", "-p", "hello", "--model", "opus", "--output-format", "stream-json"],
@@ -1246,10 +1262,9 @@ with ClaudeAPIContext("crash-fixture", "fix"):
                     text=True,
                 )
                 self.assertIn('"init"', proc.stdout.readline())
-                started = time.monotonic()
                 denied = self.run_claude()
                 self.assertEqual(denied.returncode, 75, denied.stderr)
-                self.assertLess(time.monotonic() - started, 1)
+                self.assertIsNone(proc.poll(), "the denial waited for the holder's reservation")
                 proc.communicate()
                 self.assertEqual(proc.returncode, 0)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)

@@ -1,21 +1,22 @@
-"""Worker-owned whole-library verification using the candidate's pinned CI tools.
+"""Worker-owned whole-library verification using main's pinned CI tools and policy files.
 
-Repairs, preparations and rebases receive a final build followed by the native
-compiled audit and lint drivers. Without frozen GitHub lint-scope policy, use
-staging's conservative full-library fallback. Findings return to the existing
-repair loop; staging remains the authoritative landing verdict.
+Every repair, preparation and rebase verification runs the check set staging runs: the final
+build, then the compiled audit driver (import, duplicates, axioms), the module-system check, the
+environment lint, the style lint and the dot-notation lint, all at once. The environment lint
+first covers only the modules changed since the base, as an ordinary PR's preflight does; when
+that round finds nothing in any check, the whole-library lint runs before the checks pass, so a
+pass always includes it. Every finding of one round returns to the existing repair loop
+together; staging remains the authoritative landing verdict.
 
-Measure check phases and sampled process-tree RSS in existing task logs. A
-matching previous measurement and ample host/cgroup headroom permit two checks
-to overlap over read-only compiled outputs under the caller's build lock.
-Unmeasured or unsafe runs stay serial. Every check is joined before cleanup.
+Check phases and sampled process-tree RSS are measured in existing task logs. The compiled checks
+read the build outputs through read-only mounts while they run together under the caller's build
+lock. Every check is joined before cleanup.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-import functools
 import hashlib
 import json
 import os
@@ -32,6 +33,16 @@ from pathlib import Path
 from tauceti_queue import diagnostics, repair_sandbox, repair_tools
 
 WORK_DIR = Path(".lake") / "tauceti-repair-audit"
+# Under the TauCetiTools checkouts' root: the trusted pin and policy files read for each check.
+POLICY_DIR = "policy"
+# Under the same root, outside every candidate-writable directory (decision 200): each check's own
+# materialized scripts and scope files, and the compiled drivers, one directory per driver key. The
+# checks mount both read-only, so code the candidate runs can change neither the verifier nor its
+# inputs.
+VERIFIER_DIR = "verifier"
+# In a pristine driver root: which seed packages its drivers were built against (part of the driver key).
+SEED_FILE = "seed-packages"
+DRIVERS_DIR = "drivers"
 SETTINGS_FILE = "audit.json"  # in .tauceti-repair: what the agent's build script needs to run the checks
 ERRORS_FILE = "errors.jsonl"  # repair_stream's error list, in .tauceti-repair
 TOOLS_DIR = "tauceti-tools"  # under the worker's root: one TauCetiTools checkout per commit
@@ -39,12 +50,26 @@ URL_VARIABLE = "TAUCETI_QUEUE_TOOLS_URL"  # a ``{repo}`` template; tests point i
 DEFAULT_URL = "https://github.com/{repo}.git"
 ENABLE_VARIABLE = "TAUCETI_QUEUE_WORKER_AUDITS"
 AUDIT_TIMEOUT_SECONDS = 3000  # sandbox-build.sh's liveness budget for the audit driver
+# The most changed modules the first environment lint covers before the whole-library lint takes
+# its place. In changed-only mode ``lint-env.sh`` writes every selected module into one
+# ``#[`A, `B, ...]`` array literal in its docstring-scan driver, and Lean's code generator stops
+# with "maximum recursion depth reached" a little under 3,000 elements (v4.37.0-rc1, real
+# TauCeti module names). Half that keeps a margin for longer names and toolchain changes.
+CHANGED_LINT_MODULE_LIMIT = 1500
+DRIVER_FAILURE = "LINT-ENV: FAIL \u2014 driver failure"  # lint-env.sh's fail() line for its own drivers
+# Driver processes for the whole-library lint (lint-env.sh's LINT_SHARDS; scoped lints ignore it).
+# Each imports the whole library and lints every second declaration. On chungus2 two shards took
+# the linters phase from 514 s to 234 s, and four to 177 s. Up to three repair workers share
+# tauchonki2's 96 cores with a staging guest, so two shards of 16 threads keep three concurrent
+# full lints within the host. Only inside the sandbox, though: lint-env.sh starts each shard in its
+# own process group, and without bwrap's --unshare-pid --die-with-parent nothing would collect the
+# shards when ``_sandboxed`` kills its own group on a timeout.
+LINT_SHARDS = "2"
 MODULE_PATH = re.compile(r"^TauCeti(/[A-Za-z_][A-Za-z0-9_']*)+\.lean$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
 TAIL_LINES = 30
 TAIL_CHARS = 2000
-RSS_SAMPLING = "thread-children/v1"
 
 
 class Unavailable(RuntimeError):
@@ -54,11 +79,6 @@ class Unavailable(RuntimeError):
 def enabled(environ: dict | None = None) -> bool:
     value = (os.environ if environ is None else environ).get(ENABLE_VARIABLE, "1").strip().lower()
     return value not in ("0", "false", "no", "off")
-
-
-def staging_checks(task) -> bool:
-    """The controller assigns full checks to staging; older task records keep their policy."""
-    return task.extra.get("checks_owner") == "staging"
 
 
 # ----------------------------------------------------------------------------------------------
@@ -72,18 +92,19 @@ def write_settings(
     tools_root: Path,
     lake: tuple[str, ...] = ("lake",),
     logdir: Path | None = None,
-    checks_owner: str = "worker",
-    policy_file: Path | None = None,
+    policy_commit: str | None = None,
 ) -> Path:
     """``.tauceti-repair/audit.json``: the base the lint scope is taken against, where the TauCetiTools
-    checkouts live and the Lake command, for ``.tauceti-repair/build``."""
+    checkouts live and the Lake command, for ``.tauceti-repair/build``; and the ``policy_commit``
+    (the queue's canonical commit when the task was claimed) whose ``tauceti.toml`` and ``scripts/``
+    the checks take their TauCetiTools pin and policy files from, as staging takes them from ``main``."""
     path = worktree / repair_tools.TOOLS_DIR / SETTINGS_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
-    settings = {"base": base, "tools_root": str(tools_root), "lake": list(lake), "checks_owner": checks_owner}
+    settings = {"base": base, "tools_root": str(tools_root), "lake": list(lake)}
     if logdir is not None:
         settings["logdir"] = str(logdir)
-    if policy_file is not None:
-        settings["policy_file"] = str(policy_file)
+    if policy_commit and SHA.match(policy_commit):
+        settings["policy_commit"] = policy_commit
     path.write_text(json.dumps(settings))
     return path
 
@@ -95,40 +116,7 @@ def read_settings(worktree: Path) -> dict | None:
         return None
     if not isinstance(data, dict) or not data.get("base") or not data.get("tools_root"):
         return None
-    if data.get("policy_file"):
-        try:
-            policy = json.loads(Path(data["policy_file"]).read_text())
-            if isinstance(policy, dict) and policy.get("checks_owner") in ("worker", "staging"):
-                data["checks_owner"] = policy["checks_owner"]
-        except (OSError, ValueError, TypeError):
-            pass
     return data
-
-
-def update_checks_owner(path: Path, owner: str | None) -> None:
-    """Refresh the existing helper settings when claim renewal changes check priority."""
-    if owner not in ("worker", "staging"):
-        return
-    temporary = None
-    try:
-        settings = json.loads(path.read_text())
-        if settings.get("checks_owner") == owner:
-            return
-        settings["checks_owner"] = owner
-        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            json.dump(settings, stream)
-        os.replace(temporary, path)
-    except (OSError, ValueError, TypeError, AttributeError):
-        pass  # The next renewal retries; a settings write never loses the claim.
-    finally:
-        if temporary is not None:
-            with contextlib.suppress(OSError):
-                temporary.unlink(missing_ok=True)
-
-
-def checks_deferred(worktree: Path) -> bool:
-    return (read_settings(worktree) or {}).get("checks_owner") == "staging"
 
 
 # ----------------------------------------------------------------------------------------------
@@ -211,6 +199,50 @@ def tools_checkout(tools_root: Path, repo: str, ref: str) -> Path:
     return dest
 
 
+def policy_tree(worktree: Path, commit: str, tools_root: Path) -> Path:
+    """A fresh directory under ``tools_root/policy`` holding ``tauceti.toml`` and ``scripts/`` exactly as
+    ``commit`` has them, read from the worktree's object store (fetched from ``origin`` when missing),
+    never from the worktree's files: the trusted TauCetiTools pin and policy files a verification uses
+    (decision 200). It is made for each check at an unpredictable path outside every sandbox bind, so no
+    earlier candidate code can have planted anything in it or aimed a link at it; the caller removes it."""
+
+    def run(argv: list) -> subprocess.CompletedProcess:
+        try:
+            return _run(["git", "-C", worktree, *argv], timeout=300)
+        except subprocess.TimeoutExpired as error:
+            raise Unavailable(f"reading the policy commit {commit[:12]}: {error}") from error
+
+    if not SHA.match(commit):
+        raise Unavailable(f"policy commit {commit!r} is not a commit SHA")
+    if run(["cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
+        run(["fetch", "--quiet", "origin", commit])
+        if run(["cat-file", "-e", f"{commit}^{{commit}}"]).returncode != 0:
+            raise Unavailable(f"the policy commit {commit[:12]} is not in the clone")
+    parent = tools_root / POLICY_DIR
+    parent.mkdir(parents=True, exist_ok=True)
+    dest = Path(tempfile.mkdtemp(prefix=f"{commit[:12]}-", dir=parent))
+    try:
+        shown = run(["show", f"{commit}:tauceti.toml"])
+        if shown.returncode != 0:
+            raise Unavailable(f"the policy commit {commit[:12]} has no tauceti.toml")
+        (dest / "tauceti.toml").write_text(shown.stdout)
+        archive = dest / "scripts.tar"
+        listed = run(["archive", "--format=tar", "-o", str(archive), commit, "scripts"])
+        if listed.returncode != 0:
+            raise Unavailable(f"the policy commit {commit[:12]} has no scripts/: {_tail(listed.stderr)}")
+        try:
+            unpacked = _run(["tar", "-xf", archive, "-C", dest], timeout=300)
+        except subprocess.TimeoutExpired as error:
+            raise Unavailable(f"unpacking the policy commit's scripts/: {error}") from error
+        archive.unlink(missing_ok=True)
+        if unpacked.returncode != 0 or not (dest / "scripts").is_dir():
+            raise Unavailable(f"unpacking the policy commit's scripts/: {_tail(unpacked.stderr)}")
+    except BaseException:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+    return dest
+
+
 def materialize(checkout: Path, worktree: Path, dest: Path) -> Path:
     """The TauCetiTools setup action's ``materialize`` of the shared scripts, with the worktree's
     ``scripts/`` as the policy directory (baselines, allowlists)."""
@@ -237,25 +269,23 @@ def _sandboxed(
     timeout: float | None,
     *,
     read_only_build: bool = False,
-    defer_when=None,
+    ro_binds: tuple[Path, ...] = (),
+    rw_binds: tuple[Path, ...] = (),
 ) -> dict:
-    """``argv`` in the build sandbox with ``extra`` set inside it; output to ``log``."""
-    should_defer = defer_when or functools.partial(checks_deferred, worktree)
-    if read_only_build and should_defer():
-        now = time.time()
-        return {
-            "rc": 0,
-            "deferred": True,
-            "sampled_peak_rss_bytes": 0,
-            "seconds": 0.0,
-            "started_at": now,
-            "finished_at": now,
-            "log": str(log),
-            "output": "",
-        }
+    """``argv`` in the build sandbox with ``extra`` set inside it; output to ``log``. ``ro_binds`` and
+    ``rw_binds`` are host directories outside the worktree made visible inside it, read-only or writable,
+    at the same paths (the verifier's own directories)."""
     extra = {k: str(v) for k, v in (extra or {}).items()}
     run_env = {**env, **extra}
     wrapped = repair_sandbox.sandboxed_lake([str(a) for a in argv], worktree, run_env, extra_env=extra)
+    if (ro_binds or rw_binds) and "--remount-ro" in wrapped:
+        # Before the root becomes read-only: bwrap creates the mount points on it.
+        at = wrapped.index("--remount-ro")
+        binds = [
+            arg for path in ro_binds for arg in ("--ro-bind", str(Path(path).resolve()), str(Path(path).resolve()))
+        ]
+        binds += [arg for path in rw_binds for arg in ("--bind", str(Path(path).resolve()), str(Path(path).resolve()))]
+        wrapped[at:at] = binds
     if read_only_build and not repair_sandbox.disabled():
         boundary = wrapped.index("--")
         for build in [worktree / ".lake/build", *worktree.glob(".lake/packages/*/.lake/build")]:
@@ -265,7 +295,6 @@ def _sandboxed(
     started = time.monotonic()
     started_at = time.time()
     peak = 0
-    deferred = False
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as handle:
         handle.write(f"$ {' '.join(str(a) for a in argv)}\n".encode())
@@ -277,10 +306,6 @@ def _sandboxed(
             ) as proc:
                 try:
                     while True:
-                        if read_only_build and should_defer():
-                            deferred = True
-                            rc = 0
-                            break
                         peak = max(peak, process_tree_rss(proc.pid))
                         if timeout is not None and time.monotonic() - started >= timeout:
                             raise subprocess.TimeoutExpired(wrapped, timeout)
@@ -304,7 +329,6 @@ def _sandboxed(
         output = handle.read().decode("utf-8", errors="replace")
     return {
         "rc": rc,
-        "deferred": deferred,
         "sampled_peak_rss_bytes": peak,
         "seconds": round(time.monotonic() - started, 1),
         "started_at": started_at,
@@ -338,76 +362,160 @@ def process_tree_rss(pid: int) -> int:
     return total
 
 
-def available_memory() -> int:
-    """Host and capped ancestor headroom; unknown measurements disable overlap."""
-    try:
-        available = next(
-            int(line.split()[1]) * 1024
-            for line in Path("/proc/meminfo").read_text().splitlines()
-            if line.startswith("MemAvailable:")
-        )
-        relative = next(
-            line.split(":", 2)[2]
-            for line in Path("/proc/self/cgroup").read_text().splitlines()
-            if line.startswith("0::")
-        )
-        root = Path("/sys/fs/cgroup")
-        group = root / relative.lstrip("/")
-        for ancestor in (group, *group.parents):
-            if not ancestor.is_relative_to(root):
-                break
-            maximum = (ancestor / "memory.max").read_text().strip()
-            if maximum != "max":
-                available = min(available, int(maximum) - int((ancestor / "memory.current").read_text()))
-        return max(available, 0)
-    except (OSError, ValueError, StopIteration):
-        return 0
-
-
-def can_overlap(logdir: Path, key: str) -> bool:
-    if repair_sandbox.disabled():
-        return False  # output immutability requires the sandbox
-    try:
-        previous = json.loads((logdir / "checks-timing.json").read_text())
-        peaks = [previous[name]["sampled_peak_rss_bytes"] for name in ("audit", "lint")]
-        return (
-            previous.get("rss_sampling") == RSS_SAMPLING
-            and previous.get("driver_key") == key
-            and all(p > 0 for p in peaks)
-            and available_memory() > 2 * sum(peaks) + 8 * 1024**3
-        )
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
-
-
 def _driver_key(worktree: Path, ref: str) -> str:
     digest = hashlib.sha256(ref.encode())
-    for name in ("lean-toolchain", "lake-manifest.json"):
+    # A pristine driver root (`pristine_driver_root`) also names the seed packages it builds against.
+    for name in ("lean-toolchain", "lake-manifest.json", *((SEED_FILE,) if (worktree / SEED_FILE).is_file() else ())):
         path = worktree / name
         digest.update(path.read_bytes() if path.is_file() else b"-")
     return digest.hexdigest()
 
 
+DRIVER_SCRIPT = (
+    'bash "$1/build-lint-driver.sh" "$2" "$1/LintEnvDriver.lean" "$3" && bash "$1/build-audit-driver.sh" "$2" "$1" "$3"'
+)
+DRIVER_EXES = ("lint-env-driver", "audit-driver")
+
+
+def toolchain_executable(worktree: Path, env: dict, name: str) -> str | None:
+    """The absolute path of ``name`` in the toolchain the worktree's ``lean-toolchain`` names, under elan's
+    read-only toolchains, or None."""
+    try:
+        pin = (worktree / "lean-toolchain").read_text().strip()
+    except OSError:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+:[A-Za-z0-9_.+-]+", pin):
+        return None
+    directory = pin.replace("/", "--").replace(":", "---")
+    path = repair_sandbox._elan_home(env) / "toolchains" / directory / "bin" / name
+    return str(path) if path.is_file() and not path.is_symlink() else None
+
+
+def pristine_driver_root(worktree: Path, tools_root: Path, ref: str, env: dict) -> Path | None:
+    """A project root for the driver builds that candidate code has never written, or None: only the
+    toolchain pin (copied) and the worker's shared seed packages, under ``tools_root/drivers/root-<key>``.
+    The packages are the target the worker itself recorded when it linked the worktree's ``.lake/packages``
+    (``repair_sandbox.linked_packages``; the link itself is build state and never followed), and only one
+    inside a configured read-only tree, never another worktree's ``.lake``. Staging builds its drivers
+    before any candidate code runs; this is the worker's equivalent."""
+    recorded = repair_sandbox.linked_packages(worktree)
+    if len(recorded) != 1:
+        return None
+    shared = recorded[0]
+    if shared != shared.resolve() or not any(shared.is_relative_to(t) for t in repair_sandbox._read_only_trees(env)):
+        return None
+    if not (shared / "batteries" / "Batteries" / "Tactic" / "Lint.lean").is_file():
+        return None
+    try:
+        toolchain = (worktree / "lean-toolchain").read_text()
+        manifest = (
+            (worktree / "lake-manifest.json").read_text() if (worktree / "lake-manifest.json").is_file() else None
+        )
+        batteries = (
+            (shared / "batteries" / "lake-manifest.json").read_bytes()
+            if (shared / "batteries" / "lake-manifest.json").is_file()
+            else b""
+        )
+    except OSError:
+        return None
+    # The cached drivers are keyed by the pin, the toolchain, the dependency manifest and the seed itself
+    # (its path and Batteries' own manifest), so a changed seed never reuses an older driver.
+    seed = f"{shared}\n{hashlib.sha256(batteries).hexdigest()}\n"
+    root = (
+        tools_root
+        / DRIVERS_DIR
+        / f"root-{hashlib.sha256((_driver_key(worktree, ref) + seed).encode()).hexdigest()[:24]}"
+    )
+    lake_dir = root / ".lake"
+    lake_dir.mkdir(parents=True, exist_ok=True)
+    (root / "lean-toolchain").write_text(toolchain)
+    if manifest is not None:
+        (root / "lake-manifest.json").write_text(manifest)
+    (root / SEED_FILE).write_text(seed)
+    link = lake_dir / "packages"
+    if link.is_symlink() and link.resolve() != shared:
+        link.unlink()
+    if not link.is_symlink():
+        link.symlink_to(shared)
+    return root
+
+
 def build_drivers(
-    worktree: Path, scripts: Path, env: dict, ref: str, log: Path, timeout: float | None
+    worktree: Path,
+    scripts: Path,
+    env: dict,
+    ref: str,
+    log: Path,
+    timeout: float | None,
+    *,
+    tools_root: Path | None = None,
 ) -> tuple[Path, dict | None]:
     """Compile ``lint-env-driver`` and ``audit-driver`` with the pinned ``build-lint-driver.sh`` and
-    ``build-audit-driver.sh``, in the sandbox; reused while pin, toolchain and manifest are unchanged."""
-    drivers = worktree / WORK_DIR / "drivers"
-    stamp, key = drivers / "key", _driver_key(worktree, ref)
-    exes = (drivers / "lint-env-driver", drivers / "audit-driver")
-    if stamp.is_file() and stamp.read_text() == key and all(os.access(e, os.X_OK) for e in exes):
-        return drivers, None
-    shutil.rmtree(drivers, ignore_errors=True)
-    drivers.mkdir(parents=True)
-    script = 'bash "$1/build-lint-driver.sh" "$2" "$1/LintEnvDriver.lean" "$3" && bash "$1/build-audit-driver.sh" "$2" "$1" "$3"'
-    run = _sandboxed(
-        ["bash", "-c", script, "build-drivers", scripts, worktree, drivers], worktree, env, None, log, timeout
-    )
-    if run["rc"] != 0 or not all(os.access(e, os.X_OK) for e in exes):
-        raise Unavailable(f"building the audit and lint drivers exited {run['rc']}: {_tail(run['output'])}")
-    stamp.write_text(key)
-    return drivers, {k: v for k, v in run.items() if k != "output"}
+    ``build-audit-driver.sh``, in the sandbox; reused while pin, toolchain and manifest are unchanged.
+
+    With ``tools_root`` (the checks' verifier, decision 200) they live in ``tools_root/drivers/<key>``,
+    outside every candidate-writable directory: built in a scratch directory that is the build's only
+    writable bind besides the worktree's ``.lake``, with ``scripts`` read-only, then moved into place,
+    and never written again. Without it (the agent's advisory targeted lint) they stay in the worktree."""
+    key = _driver_key(worktree, ref)
+    if tools_root is None:
+        drivers = worktree / WORK_DIR / "drivers"
+        stamp = drivers / "key"
+        if stamp.is_file() and stamp.read_text() == key and all(os.access(drivers / e, os.X_OK) for e in DRIVER_EXES):
+            return drivers, None
+        shutil.rmtree(drivers, ignore_errors=True)
+        drivers.mkdir(parents=True)
+        # `check` materializes the scripts in its host-only verifier directory, outside the worktree:
+        # without the bind the sandbox cannot see them (bash exits 127). The targeted lint keeps them
+        # in the worktree, which the sandbox already shows.
+        outside = not scripts.resolve().is_relative_to(worktree.resolve())
+        run = _sandboxed(
+            ["bash", "-c", DRIVER_SCRIPT, "build-drivers", scripts, worktree, drivers],
+            worktree,
+            env,
+            None,
+            log,
+            timeout,
+            ro_binds=(scripts,) if outside else (),
+        )
+        if run["rc"] != 0 or not all(os.access(drivers / e, os.X_OK) for e in DRIVER_EXES):
+            raise Unavailable(f"building the audit and lint drivers exited {run['rc']}: {_tail(run['output'])}")
+        stamp.write_text(key)
+        return drivers, {k: v for k, v in run.items() if k != "output"}
+    dest = tools_root / DRIVERS_DIR / key
+
+    def regular(directory: Path) -> bool:
+        """Every driver is a regular executable file, not a link (which could lead into the worktree)."""
+        return all(
+            (directory / e).is_file() and not (directory / e).is_symlink() and os.access(directory / e, os.X_OK)
+            for e in DRIVER_EXES
+        )
+
+    if regular(dest):
+        return dest, None
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix=f".{key[:12]}-", dir=dest.parent))
+    try:
+        run = _sandboxed(
+            ["bash", "-c", DRIVER_SCRIPT, "build-drivers", scripts, worktree, scratch],
+            worktree,
+            env,
+            None,
+            log,
+            timeout,
+            ro_binds=(scripts,),
+            rw_binds=(scratch,),
+        )
+        if run["rc"] != 0 or not regular(scratch):
+            raise Unavailable(f"building the audit and lint drivers exited {run['rc']}: {_tail(run['output'])}")
+        try:
+            os.rename(scratch, dest)
+        except OSError:
+            if not regular(dest):  # another check's rename did not win either
+                raise
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return dest, {k: v for k, v in run.items() if k != "output"}
 
 
 # ----------------------------------------------------------------------------------------------
@@ -429,12 +537,23 @@ def changed_modules(worktree: Path, base: str) -> list[str]:
 
 
 def findings_of(kind: str, name: str, run: dict) -> list[dict]:
-    """The ``kind`` findings ``diagnostics.parse_log`` reads from a check's output; a nonzero exit with
-    none is one finding carrying the output's tail."""
-    found = [d for d in diagnostics.parse_log(run["output"].splitlines()) if d["kind"] == kind]
+    """The ``kind`` findings ``diagnostics.parse_log`` reads from a check's output (with the style lint's
+    header findings); a nonzero exit with none is one finding carrying the output's tail."""
+    lines = run["output"].splitlines()
+    found = [d for d in diagnostics.parse_log(lines) if d["kind"] == kind]
+    if name == "lint-style":
+        found += diagnostics.header_style_findings(lines)
     if run["rc"] != 0 and not found:
         found = [{"kind": kind, "module": "", "message": f"{name} exited {run['rc']}:\n{_tail(run['output'])}"}]
     return found
+
+
+def driver_failure(run: dict, findings: list[dict]) -> bool:
+    """Whether an environment-lint run ended in ``lint-env.sh``'s driver failure with no finding that
+    names a module (such as the docstring-scan driver failing to compile its module list)."""
+    if run["rc"] == 0 or any(f.get("module") for f in findings):
+        return False
+    return any(DRIVER_FAILURE in line for line in run["output"].splitlines())
 
 
 def check(
@@ -446,44 +565,100 @@ def check(
     logdir: Path,
     lake: tuple[str, ...] = ("lake",),
     timeout: float | None = None,
-    defer_when=None,
 ) -> dict:
-    """CI's audits and full environment lint, over the environment already built
-    in ``worktree``; the caller holds the build lock. ``status`` is ``passed``, ``failed`` (``diagnostics``
-    lists the findings in the controller's shape) or ``unavailable`` (``reason``)."""
+    """Staging's checks over the environment already built in ``worktree``, all at once; the caller
+    holds the build lock. These are the audit driver (import, duplicates, axioms), the module-system
+    check, the environment lint, the style lint and the dot-notation lint. The environment lint covers
+    the modules changed since ``base`` first and the whole library once nothing else is found, so
+    ``lint.scope`` is ``changed`` only on a failed round. ``status`` is ``passed``, ``failed``
+    (``diagnostics`` lists every check's findings in the controller's shape) or ``unavailable``
+    (``reason``)."""
+    verifier_root = tools_root / VERIFIER_DIR
+    verifier_root.mkdir(parents=True, exist_ok=True)
+    verifier = Path(tempfile.mkdtemp(prefix="check-", dir=verifier_root))
+    try:
+        return _check(
+            worktree,
+            env,
+            base=base,
+            tools_root=tools_root,
+            logdir=logdir,
+            lake=lake,
+            timeout=timeout,
+            verifier=verifier,
+        )
+    finally:
+        shutil.rmtree(verifier, ignore_errors=True)
+
+
+def _check(
+    worktree: Path,
+    env: dict,
+    *,
+    base: str,
+    tools_root: Path,
+    logdir: Path,
+    lake: tuple[str, ...],
+    timeout: float | None,
+    verifier: Path,
+) -> dict:
+    """`check`, with ``verifier`` the host-only directory for this check's scripts and scope files."""
     started = time.monotonic()
     record: dict = {"status": "passed", "diagnostics": []}
-    should_defer = defer_when or functools.partial(checks_deferred, worktree)
-    if should_defer():
-        return {"status": "deferred", "diagnostics": [], "seconds": 0.0}
-    from tauceti_queue import repair_publish
-
-    publication = repair_publish.start_early(worktree, env)
-    if publication is not None:
-        record["publication"] = publication
     work = worktree / WORK_DIR
+    # The phase markers (and, without shared packages, the drivers) stay under `.lake`, which candidate code
+    # can write. A link it left in place of the directory is removed rather than followed.
+    if work.is_symlink():
+        work.unlink()
+    work.mkdir(parents=True, exist_ok=True)
     setup_started = time.monotonic()
+    record["sandbox"] = not repair_sandbox.disabled(env)
     try:
-        repo, ref = tools_pin(worktree)
-        record["tools"] = f"{repo}@{ref}"
-        checkout = tools_checkout(tools_root, repo, ref)
-        ref = checkout.name  # the exact commit, which keys the compiled drivers
-        record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
-        if should_defer():
-            return dict(record, status="deferred", seconds=round(time.monotonic() - started, 1))
-        materialize_started = time.monotonic()
-        scripts = materialize(checkout, worktree, work / "scripts")
+        # The pin and policy files come from the task's policy commit (`main`), as staging takes them,
+        # when the controller named one; otherwise, and when it cannot be read, from the worktree.
+        source = worktree
+        policy_commit = (read_settings(worktree) or {}).get("policy_commit")
+        if policy_commit:
+            try:
+                source = policy_tree(worktree, policy_commit, tools_root)
+                record["policy_commit"] = policy_commit
+            except Unavailable as error:
+                record["policy_error"] = str(error)
+        try:
+            repo, ref = tools_pin(source)
+            record["tools"] = f"{repo}@{ref}"
+            checkout = tools_checkout(tools_root, repo, ref)
+            ref = checkout.name  # the exact commit, which keys the compiled drivers
+            record["tools_commit"] = f"{repo}@{ref}"
+            record["tools_seconds"] = round(time.monotonic() - setup_started, 3)
+            materialize_started = time.monotonic()
+            scripts = materialize(checkout, source, verifier / "scripts")
+        finally:
+            if source != worktree:
+                shutil.rmtree(source, ignore_errors=True)
         record["materialize_seconds"] = round(time.monotonic() - materialize_started, 3)
-        if should_defer():
-            return dict(record, status="deferred", seconds=round(time.monotonic() - started, 1))
         drivers_started = time.monotonic()
-        drivers, built = build_drivers(worktree, scripts, env, ref, logdir / "audit-drivers.log", timeout)
+        pristine = pristine_driver_root(worktree, tools_root, ref, env)
+        if pristine is None:
+            # The worktree has no shared read-only packages: build as before, and say the verifier is not isolated.
+            drivers, built = build_drivers(worktree, scripts, env, ref, logdir / "audit-drivers.log", timeout)
+            record["drivers_isolated"] = False
+        else:
+            drivers, built = build_drivers(
+                pristine, scripts, env, ref, logdir / "audit-drivers.log", timeout, tools_root=tools_root
+            )
+            record["drivers_isolated"] = True
         record["drivers_seconds"] = round(time.monotonic() - drivers_started, 3)
         if built:
             record["drivers"] = built
     except (Unavailable, repair_sandbox.SandboxUnavailable, OSError) as error:
         record.update(status="unavailable", reason=str(error), seconds=round(time.monotonic() - started, 1))
         return record
+    from tauceti_queue import repair_publish
+
+    publication = repair_publish.start_early(worktree, env)
+    if publication is not None:
+        record["publication"] = publication
     phases_path = work / "audit-phases.tsv"
     phase_record = logdir / ("audit-phases-" + str(time.time_ns()) + ".tsv")
     with contextlib.suppress(OSError):
@@ -494,64 +669,127 @@ def check(
         # markers in task logs even if the parent/helper is killed mid-audit.
         os.link(phase_record, phases_path)
     record["audit_phases_file"] = str(phase_record)
-    audit_argv = [*lake, "env", "timeout", "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s"]
-    audit_job = functools.partial(
-        _sandboxed,
-        [*audit_argv, drivers / "audit-driver"],
-        worktree,
-        env,
-        {"AUDIT_PHASES_FILE": phases_path},
-        logdir / "audit.log",
-        timeout,
-        read_only_build=True,
-        defer_when=should_defer,
+    # `lake env` puts the worktree's build directories first on PATH, which the candidate can write: name the
+    # trusted executables by absolute path, as staging's sandbox-build.sh does with `timeout`.
+    timeout_exe = shutil.which("timeout") or "timeout"
+    lean_exe = toolchain_executable(worktree, env, "lean")
+    # Inside the sandbox only the read-only system roots are where the host has them.
+    system = os.path.isabs(timeout_exe) and any(
+        Path(timeout_exe).is_relative_to(root) for root in repair_sandbox.SYSTEM_ROOTS
     )
-    # The task has no frozen GitHub label/branch policy that could justify scoped
-    # lint. Use staging's conservative full-library fallback, including unchanged
-    # declarations affected by new simp lemmas or other global environment changes.
-    extra = {
-        "TAUCETI_PROJECT_ROOT": worktree,
-        "TAUCETI_TRUSTED_SCRIPTS": scripts,
+    if not system or lean_exe is None:
+        record["verifier_isolated_reason"] = "the trusted timeout or lean executable could not be resolved"
+    audit_argv = [*lake, "env", timeout_exe, "--signal=TERM", "--kill-after=30", f"{AUDIT_TIMEOUT_SECONDS}s"]
+    project = {"TAUCETI_PROJECT_ROOT": worktree, "TAUCETI_TRUSTED_SCRIPTS": scripts, "LINT_CHANGED_ONLY": "0"}
+    full_lint_env = {
+        **project,
         "LINT_DRIVER_EXE": drivers / "lint-env-driver",
         "LINT_ONLY_MODULES": "",
-        "LINT_CHANGED_ONLY": "0",
+        "LINT_SHARDS": "1" if repair_sandbox.disabled() else LINT_SHARDS,
         "TAUCETI_LINT_PROFILE": env.get("TAUCETI_LINT_PROFILE", "0"),
     }
-    lint_job = functools.partial(
-        _sandboxed,
-        ["bash", scripts / "lint-env.sh"],
-        worktree,
-        env,
-        extra,
-        logdir / "lint-env.log",
-        timeout,
-        read_only_build=True,
-        defer_when=should_defer,
-    )
-    record["driver_key"] = _driver_key(worktree, ref)
-    record["rss_sampling"] = RSS_SAMPLING
-    record["overlap"] = can_overlap(logdir, record["driver_key"])
-    if record["overlap"]:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as checks:
-            audit_future, lint_future = checks.submit(audit_job), checks.submit(lint_job)
-            audit, lint = audit_future.result(), lint_future.result()
-    else:
-        audit, lint = audit_job(), lint_job()
-    record["audit_phases"] = audit_phases(phases_path, audit)
+    # The first lint covers the changed modules (staging's PR preflight scope). It misses findings
+    # in unchanged declarations, such as a new simp lemma breaking an old one's simp normal form,
+    # so a round that finds nothing ends with the whole-library lint below.
+    lint_env = full_lint_env
+    try:
+        modules = changed_modules(worktree, base)
+    except (Unavailable, OSError, subprocess.SubprocessError):
+        modules = None
+    if modules is not None and len(modules) > CHANGED_LINT_MODULE_LIMIT:
+        # Too many for the changed-only driver: the whole-library lint (CI's own scope) covers them.
+        record["changed_lint"] = {"skipped": "module_limit", "modules": len(modules)}
+        modules = None
+    if modules is not None:
+        scope_file = verifier / "lint-modules.txt"
+        scope_file.write_text("".join(m + "\n" for m in modules))
+        lint_env = {**full_lint_env, "LINT_ONLY_MODULES": scope_file, "LINT_CHANGED_ONLY": "1"}
+    dot_notation = [
+        "python3",
+        scripts / "lint-dot-notation.py",
+        "--baseline",
+        scripts / "lint-dot-notation-baseline.txt",
+    ]
+    dot_notation += ["--mathlib-root", ".lake/packages/mathlib/Mathlib", "--source-root", "TauCeti"]
+    # (record key, finding kind, argv, sandbox environment, log, build outputs read-only). The
+    # style lint may build Mathlib's lint-style executable, so its build outputs stay writable.
+    jobs = [
+        (
+            "audit",
+            "audit",
+            [*audit_argv, drivers / "audit-driver"],
+            {"AUDIT_PHASES_FILE": phases_path},
+            "audit.log",
+            True,
+        ),
+        ("lint", "lint", ["bash", scripts / "lint-env.sh"], lint_env, "lint-env.log", True),
+        (
+            "module_system",
+            "audit",
+            [*lake, "env", lean_exe or "lean", "--run", scripts / "ModuleSystem.lean"],
+            None,
+            "module-system.log",
+            True,
+        ),
+        ("style_lint", "lint", ["bash", scripts / "lint-style.sh"], project, "lint-style.log", False),
+        ("dot_notation", "lint", dot_notation, None, "lint-dot-notation.log", False),
+    ]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        futures = [
+            pool.submit(
+                _sandboxed,
+                argv,
+                worktree,
+                env,
+                extra,
+                logdir / log,
+                timeout,
+                read_only_build=read_only,
+                ro_binds=(verifier, drivers),
+            )
+            for _, _, argv, extra, log, read_only in jobs
+        ]
+        runs = {job[0]: future.result() for job, future in zip(jobs, futures, strict=True)}
+    # Read the markers through the host-only hard link in the log directory, never through the path under
+    # `.lake`: candidate code could have replaced that with a link to any host file meanwhile.
+    record["audit_phases"] = audit_phases(phase_record, runs["audit"])
     with contextlib.suppress(OSError):
-        if not os.path.samefile(phases_path, phase_record):
-            shutil.copyfile(phases_path, phase_record)
-    with contextlib.suppress(OSError):
-        shutil.copyfile(phases_path, logdir / "audit-phases.tsv")
-    found = [] if audit.get("deferred") else findings_of("audit", "audit-driver", audit)
-    record["audit"] = {k: v for k, v in audit.items() if k != "output"} | {"findings": len(found)}
-    record["diagnostics"] += found
-    found = [] if lint.get("deferred") else findings_of("lint", "lint-env.sh", lint)
-    record["lint"] = {k: v for k, v in lint.items() if k != "output"} | {"scope": "full", "findings": len(found)}
-    record["diagnostics"] += found
-    record["status"] = (
-        "deferred" if audit.get("deferred") or lint.get("deferred") else "failed" if record["diagnostics"] else "passed"
+        shutil.copyfile(phase_record, logdir / "audit-phases.tsv")
+    found = {name: findings_of(kind, log.removesuffix(".log"), runs[name]) for name, kind, _, _, log, _ in jobs}
+    scope = "full"
+    if modules is not None:
+        scope = "changed"
+        # A changed-only run that failed in its own driver, naming no module, gives the repair
+        # nothing to fix; the whole-library lint replaces it whatever the other checks found.
+        driver_failed = driver_failure(runs["lint"], found["lint"])
+        if driver_failed or not any(found.values()):
+            record["changed_lint"] = {k: v for k, v in runs["lint"].items() if k != "output"} | {
+                "modules": len(modules)
+            }
+            if driver_failed:
+                record["changed_lint"]["skipped"] = "driver_failure"
+            runs["lint"] = _sandboxed(
+                ["bash", scripts / "lint-env.sh"],
+                worktree,
+                env,
+                full_lint_env,
+                logdir / "lint-env.log",
+                timeout,
+                read_only_build=True,
+                ro_binds=(verifier, drivers),
+            )
+            found["lint"] = findings_of("lint", "lint-env", runs["lint"])
+            scope = "full"
+    for name, *_ in jobs:
+        record[name] = {k: v for k, v in runs[name].items() if k != "output"} | {"findings": len(found[name])}
+        record["diagnostics"] += found[name]
+    record["lint"]["scope"] = scope
+    # The scripts, scope files and drivers lived outside the worktree and were mounted read-only into
+    # every check (decision 200); without the sandbox nothing kept the candidate's code away from them.
+    record["verifier_isolated"] = (
+        record["sandbox"] and record.get("drivers_isolated") is True and "verifier_isolated_reason" not in record
     )
+    record["status"] = "failed" if record["diagnostics"] else "passed"
     record["seconds"] = round(time.monotonic() - started, 1)
     with contextlib.suppress(OSError):
         (logdir / "checks-timing.json").write_text(
@@ -585,7 +823,7 @@ def audit_phases(path: Path, run: dict) -> list[dict]:
             "name": name,
             "started_at": stamp,
             "seconds": round((events[index + 1][1] if index + 1 < len(events) else run["finished_at"]) - stamp, 3),
-            "complete": index + 1 < len(events) or run["rc"] == 0 and not run.get("deferred"),
+            "complete": index + 1 < len(events) or run["rc"] == 0,
         }
         for index, (name, stamp) in enumerate(events)
     ]
@@ -625,7 +863,6 @@ def verify(
     timeout: float | None = None,
     lock: Path | None = None,
     audits: bool = True,
-    defer_when=None,
 ) -> dict:
     """The worker's verification: hold the build lock, run the whole-library ``lake build --iofail`` in
     the sandbox and, when it is green and ``audits``, ``check``. ``ok`` is false when the build failed or a
@@ -661,7 +898,6 @@ def verify(
                 logdir=logdir,
                 lake=lake,
                 timeout=timeout,
-                defer_when=defer_when,
             )
             record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
             record["diagnostics"] = checks["diagnostics"]
@@ -685,15 +921,14 @@ def helper_checks(root: Path) -> int:
     if settings is None:
         print("audits: not configured in this worktree (.tauceti-repair/audit.json is missing); skipped", flush=True)
         return 0
-    if settings.get("checks_owner") == "staging":
-        print("audits: full checks run in staging; use check-findings for located findings", flush=True)
-        return 0
     logdir = (
         Path(settings["logdir"]) / ("helper-audit-" + str(time.time_ns()))
         if settings.get("logdir")
         else root / repair_tools.TOOLS_DIR / "audit"
     )
-    print("audits: running CI's audit driver and the changed-module environment lint", flush=True)
+    print(
+        "audits: running staging's audit, module-system check and environment, style and dot-notation lints", flush=True
+    )
     result = check(
         root,
         dict(os.environ),

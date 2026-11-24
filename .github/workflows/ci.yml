@@ -12,14 +12,17 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
-# CI uses GitHub-hosted runners.
+# Linux jobs run on the fleet's TauCetiInfra runners (native-disk slots on our own
+# machines) when the repository variable FLEET_INFRA_CI is 'true', and on GitHub-hosted
+# ubuntu-24.04 otherwise: unset or change that variable to fall back. Fork pull requests
+# always run hosted. docker (needs a Docker daemon) and macOS stay GitHub-hosted.
 jobs:
   # Classify the change so documentation-only pull requests skip the jobs that cannot observe them.
   # Only tests/run-all's DOCS_CONTRACT modules read README.md, docs/ or workers.toml.example, so a
   # change confined to docs/ and Markdown (outside prompts/ and tests/, which the suite and the
   # wheel bundle) runs just those; pushes and the schedule always run everything.
   changes:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     outputs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
     steps:
@@ -43,12 +46,14 @@ jobs:
           echo "docs_only=$docs_only" >>"$GITHUB_OUTPUT"
 
   # The suite is split by filesystem needs, not size: tests/run-all --group portable runs every
-  # module whose fixtures do not depend on native inode/device metadata, in parallel on GitHub-hosted Linux, while --group native runs the few that
-  # do on GitHub's ubuntu-24.04 image. The `test` job below folds both into the one required check.
+  # module whose fixtures do not depend on native inode/device metadata, in parallel, while --group native runs the few that
+  # do on the same Linux runner image. Branch protection requires `changes`, `test (portable)` and `test (native)`
+  # directly; `test (native)` is skipped, which satisfies it, only when `changes` succeeded and
+  # classified the change as documentation-only.
   test-portable:
     name: test (portable)
     needs: changes
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     env:
       # Test on the latest interpreter uv ships; macOS observations have their own native job.
       # requires-python >=3.11 is a declaration rather than a per-version matrix.
@@ -59,9 +64,16 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: test
+      # Test against the TauCetiTools commit pinned in pyproject.toml, not Tools main.
+      - name: Use the pinned TauCetiTools
+        run: .github/scripts/tools-pin.sh apply
       - name: Run the portable test modules
         if: needs.changes.outputs.docs_only != 'true'
-        run: ./tests/run-all -j "$(nproc)" --group portable
+        # Not $(nproc): the infra runners report 96 CPUs on a host they share with workers and PR
+        # CI. The longest module takes about 380 s, and 24 at a time finish the rest within it, while
+        # 96 at a time only divide the same share of the host more thinly between timing-sensitive
+        # modules.
+        run: ./tests/run-all -j 24 --group portable
       - name: Run the modules that assert on the documentation
         if: needs.changes.outputs.docs_only == 'true'
         run: ./tests/run-all -j "$(nproc)" --group docs
@@ -71,7 +83,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     # Storage fixtures require native, consistent inode/device metadata.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     env:
       UV_PYTHON: "3.14"
     steps:
@@ -80,44 +92,27 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: test
+      # Test against the TauCetiTools commit pinned in pyproject.toml, not Tools main.
+      - name: Use the pinned TauCetiTools
+        run: .github/scripts/tools-pin.sh apply
       - name: Run the native-filesystem test modules
         run: ./tests/run-all -j "$(nproc)" --group native
-
-  # Branch protection requires a check called `test`; this job is that check, and it is green only
-  # when the classification ran and every shard it called for succeeded.
-  test:
-    needs: [changes, test-portable, test-native]
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Require every test shard
-        env:
-          CHANGES: ${{ needs.changes.result }}
-          PORTABLE: ${{ needs.test-portable.result }}
-          NATIVE: ${{ needs.test-native.result }}
-          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
-        run: |
-          echo "changes=$CHANGES portable=$PORTABLE native=$NATIVE docs_only=$DOCS_ONLY"
-          test "$CHANGES" = success
-          test "$PORTABLE" = success
-          if [ "$DOCS_ONLY" = true ]; then
-            test "$NATIVE" = skipped
-          else
-            test "$NATIVE" = success
-          fi
 
   macos-live-use:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # Test against the TauCetiTools commit pinned in pyproject.toml, not Tools main.
+      - name: Use the pinned TauCetiTools
+        run: .github/scripts/tools-pin.sh apply
       - name: Check the source-checkout launcher environment
         run: ./tauceti --help
       - name: Check native macOS live-use observations
         run: uv run python tests/live_use.py
 
   prices:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check out the review engine's price table
@@ -138,7 +133,7 @@ jobs:
           fi
 
   lint:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -155,18 +150,21 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint services/queue/*.sh services/forgejo-mirror/*.sh tests/*.sh tests/run-all
+        run: shellcheck --severity=warning .github/scripts/tools-pin.sh scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint services/queue/*.sh services/forgejo-mirror/*.sh tests/*.sh tests/run-all
 
   build:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           enable-cache: true
           cache-suffix: build
+      # Test against the TauCetiTools commit pinned in pyproject.toml, not Tools main.
+      - name: Use the pinned TauCetiTools
+        run: .github/scripts/tools-pin.sh apply
       - name: Build the wheel
         run: uv build
       # uv build proves the artifact builds; this proves the force-include mapping (prompts/ and
@@ -189,6 +187,7 @@ jobs:
           print("bundled prompts/, scripts/ and prices.json present")
           PY
 
+  # The image installs the declared dependencies, TauCetiTools main, as production does.
   docker:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'

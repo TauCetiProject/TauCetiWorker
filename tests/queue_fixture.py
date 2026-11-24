@@ -6,6 +6,7 @@ a controllable clock and no inference. The tests are named after the acceptance 
 `docs/redesign/specs/ai-merge-queue.md`; the mapping is in `docs/queue/controller.md`.
 """
 
+import io
 import json
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import time
 import types
 import unittest
 import unittest.mock
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,12 +23,11 @@ sys.path.insert(0, str(REPO))
 
 from tauceti_queue import (  # noqa: E402
     admission_planning,
-    attribution,
     chain,
-    diagnostics,
     escalation,
     feeds,
     monitoring,
+    repair_stall,
     stuck_heads,
 )
 from tauceti_queue import runtime as rt  # noqa: E402
@@ -35,10 +36,10 @@ from tauceti_queue.controller import (  # noqa: E402
     CANDIDATE_BUILD_STEP,
     CANDIDATE_HANDOFF_STEP,
     CANDIDATE_PUBLICATION_JOB,
+    DEFAULT_SETTINGS,
     LOG_GRACE_SECONDS,
     MERGED_TITLE_PREFIX,
     MISSING_SOURCE_WATCH,
-    Controller,
     ControllerError,
     TaskError,
     publishing,
@@ -660,35 +661,7 @@ class StuckHeads(QueueFixture):
         self.assertIsNone(stuck_heads.summary(self.controller.status()["stuck_heads"]))
 
 
-class FailureFingerprints(unittest.TestCase):
-    def test_line_numbers_shas_and_urls_do_not_change_a_fingerprint(self):
-        first = [
-            {"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:12:3: error: boom at 0123abcd"}
-        ]
-        moved = [
-            {"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:40:7: error: boom at 99aa00ff"}
-        ]
-        other = [{"kind": "compiler", "module": "TauCeti/A.lean", "message": "TauCeti/A.lean:12:3: error: other"}]
-        identity = [
-            escalation.fingerprint("build", [], escalation.finding_lines(d))["fingerprint"]
-            for d in (first, moved, other)
-        ]
-        self.assertEqual(identity[0], identity[1])
-        self.assertNotEqual(identity[0], identity[2])
-        infrastructure = first + [{"kind": "infrastructure", "message": "runner lost"}]
-        self.assertEqual(escalation.finding_lines(first), escalation.finding_lines(infrastructure))
-
-    def test_verdict_class_names_the_classification_and_failed_contexts(self):
-        verdicts = {"build": {"state": "success"}, "scope": {"state": "failure"}, "bump-guard": {"state": "success"}}
-        self.assertEqual(
-            escalation.verdict_class("verified source CI: policy_failure", verdicts), "policy_failure:scope"
-        )
-        self.assertEqual(escalation.verdict_class("Build failed", {"build": {"state": "failure"}}), "build")
-        self.assertEqual(
-            escalation.named_members([{"kind": "status", "source_pr": "o/r#4"}, {"kind": "compiler", "pr": 7}]),
-            ["o/r#4", 7],
-        )
-
+class EscalationNotifier(unittest.TestCase):
     def test_zulip_notifier_reconciles_a_retry_by_its_marker(self):
         notifier = escalation.ZulipNotifier(
             {"site": "https://zulip.invalid", "email": "bot@x", "api_key": "k", "recipient_id": 5}
@@ -721,90 +694,71 @@ class FailureFingerprints(unittest.TestCase):
                 escalation.notifier_from_environment({escalation.ZULIP_CONFIG_ENV: str(path)})
 
 
-class FailureAttribution(unittest.TestCase):
-    """`attribution.attribute`: which members a failure's findings implicate, before any bisection."""
+class ProgressAlertNotifier(unittest.TestCase):
+    """The progress alert target reads TauCetiFleet's `fleet-alert --zulip-config` format."""
 
-    def error(self, module, kind="compiler"):
-        return {"kind": kind, "module": module, "path": module.replace(".", "/") + ".lean", "message": "boom"}
+    def test_a_stream_topic_target_posts_there_and_reconciles_in_that_topic(self):
+        calls = []
 
-    def attribute(self, findings, changes, imports=None, **kwargs):
-        graph = imports or {}
-        return attribution.attribute(findings, list(changes), changes, lambda p: graph.get(p, ()), **kwargs)
-
-    def test_a_module_one_member_changed_names_that_member(self):
-        found = self.attribute(
-            [self.error("TauCeti.B")], {"a": {"TauCeti/A.lean"}, "b": {"TauCeti/B.lean"}, "c": {"TauCeti/C.lean"}}
-        )
-        self.assertEqual(found.members, ["b"])
-        self.assertIn("changed TauCeti/B.lean", found.reasons["b"])
-
-    def test_an_untouched_module_names_the_nearest_imported_change(self):
-        imports = {
-            "TauCeti/User.lean": {"TauCeti/Mid.lean"},
-            "TauCeti/Mid.lean": {"TauCeti/Lib.lean", "TauCeti/Far.lean"},
-            "TauCeti/Lib.lean": {"TauCeti/Deep.lean"},
+        config = {
+            "site": "https://z.example",
+            "email": "bot@z",
+            "api_key": "k",
+            "stream": "ops",
+            "topic": "fleet health",
         }
-        changes = {"lib": {"TauCeti/Lib.lean"}, "deep": {"TauCeti/Deep.lean"}, "other": {"TauCeti/Other.lean"}}
-        found = self.attribute([self.error("TauCeti.User")], changes, imports)
-        self.assertEqual(found.members, ["lib"], "the nearer change, not the deeper one")
-        self.assertIn("which TauCeti/User.lean imports", found.reasons["lib"])
+        notifier = escalation.ZulipNotifier(config, streams=True)
 
-    def test_the_smallest_set_covering_every_finding(self):
-        changes = {"x": {"TauCeti/S.lean"}, "y": {"TauCeti/S.lean", "TauCeti/T.lean"}, "z": {"TauCeti/U.lean"}}
-        # S is ambiguous between x and y, T is y's alone: y explains both.
-        found = self.attribute([self.error("TauCeti.S"), self.error("TauCeti.T")], changes)
-        self.assertEqual(found.members, ["y"])
-        # S alone stays ambiguous: both plausible members are named.
-        found = self.attribute([self.error("TauCeti.S")], changes)
-        self.assertEqual(found.members, ["x", "y"])
-        self.assertIn("one of 2", found.reasons["x"])
+        class Opener:
+            def open(self, req, timeout):
+                calls.append((req.get_method(), req.full_url, req.data))
+                body = (
+                    {"result": "success", "messages": []}
+                    if req.get_method() == "GET"
+                    else {"result": "success", "id": 7}
+                )
+                return io.BytesIO(json.dumps(body).encode())
 
-    def test_unlocated_findings_are_not_attributed_and_too_many_members_are_refused(self):
-        changes = {f"m{i}": {f"TauCeti/M{i}.lean"} for i in range(5)}
-        found = self.attribute([{"kind": "status", "module": "", "message": "scope failed"}], changes)
-        self.assertEqual((found.members, len(found.unattributed)), ([], 1))
-        self.assertIn("no finding", found.summary())
-        many = [self.error(f"TauCeti.M{i}") for i in range(5)]
-        self.assertEqual(len(self.attribute(many, changes).members), 5)
-        refused = self.attribute(many, changes, max_members=4)
-        self.assertEqual(refused.members, [])
-        self.assertIn("attribution_max_members", refused.summary())
-
-    def test_a_build_configuration_change_explains_errors_in_untouched_modules(self):
-        changes = {"bump": {"lake-manifest.json"}, "other": {"TauCeti/Other.lean"}}
-        found = self.attribute([self.error("TauCeti.Untouched")], changes)
-        self.assertEqual(found.members, ["bump"])
-        self.assertIn("build configuration", found.reasons["bump"])
-
-    def test_policy_records_resolve_by_accepted_head_and_source_across_forges(self):
-        forgejo = {"forge": {"kind": "forgejo", "url": "https://forge.invalid"}, "name": "o/r", "id": 9}
-        github = {"forge": {"kind": "github", "url": "https://github.com"}, "name": "o/r", "id": 1}
-        members = [
-            {"id": 1, "number": 7, "accepted_head": "a" * 40, "source_identity": ""},
-            {
-                "id": 2,
-                "number": 7,
-                "accepted_head": "b" * 40,
-                "source_identity": json.dumps(forgejo, sort_keys=True, separators=(",", ":")),
-            },
-        ]
-        by_head = {"head": "b" * 40, "number": 7, "source": github}
-        self.assertEqual(Controller._policy_member(by_head, members)["id"], 2, "the accepted head decides")
+        calls = []
+        # Through the real transport: a stream target names no recipient and still passes its checks.
+        with patch("tauceti_worker.audit_alerts.urllib.request.build_opener", lambda *_: Opener()):
+            self.assertEqual(notifier.send("m1", "hello m1", reconcile=True), "zulip 7")
+        self.assertIn("ops", urllib.parse.unquote(calls[0][1]))
+        posted = urllib.parse.parse_qs(calls[1][2].decode())
         self.assertEqual(
-            Controller._policy_member({"head": "c" * 40, "number": 7, "source": forgejo}, members)["id"], 2
+            posted, {"type": ["stream"], "to": ["ops"], "topic": ["fleet health"], "content": ["hello m1"]}
         )
-        self.assertEqual(Controller._policy_member({"head": "c" * 40, "number": 7, "source": github}, members)["id"], 1)
-        self.assertIsNone(Controller._policy_member({"head": "c" * 40, "number": 7}, members))
-        self.assertEqual(
-            attribution.policy_references([{"kind": "policy", "member_head": "b" * 40, "source_pr": 7}]),
-            [{"head": "b" * 40, "number": 7, "source": None, "measured": "accepted-head"}],
+        from tauceti_worker import audit_alerts
+
+        with (
+            self.assertRaises(ValueError),
+            patch("tauceti_worker.audit_alerts.urllib.request.build_opener", lambda *_: Opener()),
+        ):
+            audit_alerts.request(config, "POST", {})  # audit direct messages still need a recipient
+        with self.assertRaises(ValueError):
+            escalation.ZulipNotifier({k: v for k, v in config.items() if k != "stream"}, streams=True)
+
+    def test_the_target_comes_from_its_own_variable_and_must_be_private(self):
+        self.assertIsNone(escalation.progress_notifier_from_environment({}))
+        self.assertIsNone(
+            escalation.progress_notifier_from_environment({escalation.ZULIP_CONFIG_ENV: "/nonexistent"}),
+            "the escalation direct messages' configuration is not a progress alert target",
         )
-        self.assertEqual(escalation.named_members([{"kind": "policy", "member_head": "b" * 40, "source_pr": 7}]), [])
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "fleet-alert-zulip.json"
+            path.write_text(json.dumps({"site": "https://z.example", "email": "e", "api_key": "k", "recipient_id": 5}))
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                escalation.progress_notifier_from_environment({escalation.PROGRESS_ALERT_CONFIG_ENV: str(path)})
+            path.chmod(0o600)
+            notifier = escalation.progress_notifier_from_environment({escalation.PROGRESS_ALERT_CONFIG_ENV: str(path)})
+            self.assertFalse(notifier.stream)
 
 
 class LoopTermination(QueueFixture):
-    """The queue never re-dispatches an unchanged candidate after the same failure: every failure is
-    followed by an adopted repair, a withdrawal, a split or an alert (docs/queue/escalation.md)."""
+    """A failing head is repaired by agents however often it fails: the queue never withdraws, bisects
+    or evicts a member on its own (docs/queue/escalation.md). Infrastructure failures back off
+    automatically and are told to the operator."""
 
     def setUp(self):
         super().setUp()
@@ -845,116 +799,28 @@ class LoopTermination(QueueFixture):
         adoption = agent.run(self.controller)
         self.assertTrue(adoption.accepted, adoption)
 
-    def test_a_recurring_failure_naming_a_member_withdraws_it_and_the_rest_lands(self):
+    def test_a_recurring_failure_goes_to_repair_every_time_and_withdraws_nobody(self):
         self.github.ci_policy = self.fails_on("Bad.lean", attributed=102)
         self.approve(101, {"A.lean": "a\n"})
         self.approve(102, {"Bad.lean": "bad\n"})
-        self.approve(103, {"C.lean": "c\n"})
-        self.tick()
-        head = self.head()
-        self.run_ci()
-        self.tick()
-        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
-        self.unhelpful_repair(101, "A.lean")
         self.tick()
         self.run_ci()
         self.tick()
-        # The same failure again: no second repair, the named member is withdrawn.
-        failures = self.controller.store.rows("failures", {"batch_id": head["id"]}, order="id")
-        self.assertEqual(len({f["fingerprint"] for f in failures}), 1)
-        self.assertEqual([f["action"] for f in failures], ["repair", "withdraw"])
-        self.assertEqual(json.loads(failures[0]["members"]), [f"{PROJECT}#102"])
-        row = self.controller.input_for(PROJECT, 102)
-        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
-        member = next(m for m in self.members(self.head()) if m["number"] == 102)
-        self.assertEqual(member["withdrawn"], 1)
-        self.assertTrue(self.controller._commit_empty(member["commit_sha"]))
-        self.assertIn("Withdrawn by the merge queue", member["explanation"])
-        status = self.controller.status()
-        self.assertTrue(any("escalation (withdraw)" in alert for alert in status["alerts"]), status["alerts"])
-        self.assertEqual(status["escalations"][-1]["action"], "withdraw")
-        self.tick()
-        self.assertEqual(len(self.notifier.messages), 1)
-        self.assertIn("withdraw on head batch", self.notifier.messages[0])
-        self.assertIn("withdrew #102", self.notifier.messages[0])
-        [comment] = self.github.comments_for(102)
-        self.assertIn("The merge queue withdrew this PR from batch", comment["body"])
-        self.assertIn("What to do next", comment["body"])
-        self.assertIn("boom", comment["body"])
-        self.run_ci()
-        self.tick(2)
-        self.assertIsNone(self.head())
-        self.assertEqual(self.repo.file_at("main", "C.lean"), "c\n")
-        self.assertIsNone(self.repo.file_at("main", "Bad.lean"))
-        self.assertNotIn(102, self.github.closed)
-        self.assertEqual(len(self.github.comments_for(102)), 1)
-        self.assertEqual(len(self.github.dispatches), 3)
-        self.assertEqual(len(self.notifier.messages), 1, "one message per escalation")
-
-    def test_an_unattributed_policy_failure_with_fruitless_repairs_is_bisected_until_isolated(self):
-        # The 2026-11-16 incident: a policy verdict names no member and no worker can submit a repair.
-        self.github.ci_policy = self.fails_on("Huge.lean", verdict="scope-fail")
-        for number in range(101, 107):
-            self.approve(number, {f"F{number}.lean": f"{number}\n", **({"Huge.lean": "x\n"} if number == 104 else {})})
-        self.tick()
-        head = self.head()
-        order = [m["number"] for m in self.members(head)]
-        self.assertEqual(sorted(order), list(range(101, 107)))
-        self.run_ci()
-        self.tick()
-        self.give_up(2)
-        self.tick()
-        self.assertEqual(self.controller.status()["head"]["stage"], "repair", "two fruitless claims are not enough")
-        self.give_up(1)
-        self.tick()
-        # Three fruitless claims: the head keeps its first half; the rest wait again at their age.
-        self.assertEqual([m["number"] for m in self.members(self.head())], order[:3])
-        self.assertEqual(self.controller.store.journal_entries("bisected")[0]["detail"]["moved"], order[3:])
-        self.assertTrue(all(self.controller.input_for(PROJECT, n)["state"] == "waiting" for n in order[3:]))
-        for _ in range(40):
+        for _ in range(4):
+            self.give_up(4)
+            self.unhelpful_repair(101, "A.lean")
             self.tick()
-            if all(self.controller.input_for(PROJECT, n)["state"] in ("landed", "cancelled") for n in range(101, 107)):
-                break
-            stage = self.controller.status()["head"]["stage"] if self.head() else None
-            if stage == "ci":
-                self.run_ci()
-            elif stage == "repair":
-                task = self.controller.status()["head"]["task"]
-                if self.controller._fruitless_claims({"id": task["task_id"]}) == 0:
-                    self.unhelpful_repair(self.members(self.head())[0]["number"], "Tweak.lean")
-                else:
-                    self.give_up(1)
-            self.clock.advance(60)
-        states = {n: self.controller.input_for(PROJECT, n) for n in range(101, 107)}
-        self.assertEqual(
-            {n: r["state"] for n, r in states.items() if n != 104}, {n: "landed" for n in (101, 102, 103, 105, 106)}
-        )
-        self.assertEqual((states[104]["state"], states[104]["reason"]), ("cancelled", "queue-withdrawn"))
-        self.assertIsNone(self.repo.file_at("main", "Huge.lean"))
-        actions = [e["action"] for e in self.controller.status()["escalations"]]
-        self.assertIn("bisect", actions)
-        visible = self.controller.status()["loop_termination"]
-        self.assertEqual(visible["bisections"], actions.count("bisect"))
-        self.assertEqual(visible["bisections_last_7_days"], actions.count("bisect"))
-        self.assertIn(
-            "attribution: no finding could be attributed", self.controller.status()["escalations"][0]["cause"]
-        )
-        self.assertEqual(actions[-1], "withdraw")
-        self.tick()
-        self.assertEqual(len(self.notifier.messages), len(actions))
-        [comment] = self.github.comments_for(104)
-        self.assertIn("withdrew this PR", comment["body"])
-        self.assertIn("verdict: `scope`", comment["body"])
-        self.assertIn("restricted paths changed", comment["body"])
-        self.assertIn("the only member left", comment["body"])
-        # No candidate was ever dispatched twice with the same content after the same failure.
-        trees = [
-            (d["client_payload"]["batch_id"], chain.tree_of(self.repo.origin, d["client_payload"]["head_sha"]))
-            for d in self.github.dispatches
-        ]
-        self.assertEqual(len(trees), len(set(trees)))
+            self.run_ci()
+            self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+        self.assertEqual(self.controller.store.count("tasks", {"kind": "repair"}), 5)
+        for number in (101, 102):
+            self.assertEqual(self.controller.input_for(PROJECT, number)["state"], "inserted")
+        self.assertEqual(self.controller.status()["escalations"], [])
+        self.assertEqual(self.notifier.messages, [])
+        self.assertEqual(self.controller.store.count("failures", {}), 0)
 
-    def test_a_repair_that_leaves_the_content_unchanged_is_not_dispatched(self):
+    def test_a_repair_that_leaves_the_content_unchanged_is_dispatched_again(self):
         self.github.ci_policy = self.fails_on("Bad.lean")
         self.approve(101, {"Bad.lean": "bad\n"})
         self.approve(102, {"B.lean": "b\n"})
@@ -965,314 +831,43 @@ class LoopTermination(QueueFixture):
         adoption = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
         self.assertTrue(adoption.accepted, adoption)
         self.tick()
-        self.assertEqual(len(self.github.dispatches), 1, "the unchanged content is not built again")
-        self.assertEqual(self.controller.status()["escalations"][-1]["action"], "bisect")
-        self.assertIn("unchanged", self.controller.status()["escalations"][-1]["cause"])
-
-    def test_a_policy_rejection_withdraws_the_named_member_at_its_first_failure(self):
-        # A record without `measured` (a TauCetiTools that measured only the accepted head).
-        heads = {}
-
-        def policy(head, _base, _members):
-            if self.repo.file_at(head, "Huge.lean") is None:
-                return "pass", []
-            record = {
-                "source_pr": 102,
-                "source": {"forge": {"kind": "github", "url": "https://github.com"}, "name": PROJECT, "id": 1},
-                "source_forge": "github",
-                "head": heads[102],
-                "reasons": ["+3400 added lines (cap 3000)"],
-                "additions": 3400,
-            }
-            return "fail", diagnostics.parse_log(["MEMBER-POLICY-REJECTED " + json.dumps(record)])
-
-        self.github.ci_policy = policy
-        self.approve(101, {"A.lean": "a\n"})
-        heads[102] = self.approve(102, {"Huge.lean": "x\n"})
-        self.approve(103, {"C.lean": "c\n"})
-        self.tick()
+        self.assertEqual(len(self.github.dispatches), 2)
         self.run_ci()
         self.tick()
-        # No repair task: no repair can change the accepted head the policy measured.
-        self.assertEqual(self.controller.store.count("tasks", {"kind": "repair"}), 0)
-        row = self.controller.input_for(PROJECT, 102)
-        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
-        [failure] = self.controller.store.rows("failures", {})
-        self.assertEqual((failure["action"], json.loads(failure["members"])), ("withdraw", [f"{PROJECT}#102"]))
-        self.assertIn("review-size policy", self.controller.status()["escalations"][-1]["cause"])
-        self.tick()
-        self.assertIn("+3400 added lines", self.github.comments_for(102)[0]["body"])
-        self.run_ci()
-        self.tick(2)
-        self.assertIsNone(self.head())
-        self.assertEqual((self.repo.file_at("main", "A.lean"), self.repo.file_at("main", "C.lean")), ("a\n", "c\n"))
-        self.assertEqual(self.controller.status()["loop_termination"]["bisections"], 0)
-
-    def batch_commit_policy(self, heads):
-        """CI whose member review-size policy rejects #102 while the candidate holds Huge.lean, measured on
-        #102's own commit in the batch chain (the record TauCetiTools writes since it measures the chain)."""
-
-        def policy(head, base, _members):
-            if self.repo.file_at(head, "Huge.lean") is None:
-                return "pass", []
-            [commit] = [c for c in self.first_parent_chain(base, head) if c.source_pr == f"{PROJECT}#102"]
-            record = {
-                "source_pr": 102,
-                "source": {"forge": {"kind": "github", "url": "https://github.com"}, "name": PROJECT, "id": 1},
-                "source_forge": "github",
-                "head": heads[102],
-                "measured": "batch-commit",
-                "batch_commit": commit.sha,
-                "parent": commit.parents[0],
-                "reasons": ["Huge.lean: new Lean files must be at most 1250 lines (found 1251)."],
-                "additions": 1251,
-            }
-            return "fail", diagnostics.parse_log(["MEMBER-POLICY-REJECTED " + json.dumps(record)])
-
-        return policy
-
-    def test_a_policy_rejection_measured_in_the_batch_goes_to_repair_and_a_split_lands(self):
-        heads = {}
-        self.github.ci_policy = self.batch_commit_policy(heads)
-        self.approve(101, {"A.lean": "a\n"})
-        heads[102] = self.approve(102, {"Huge.lean": "x\n"})
-        self.tick()
-        self.run_ci()
-        self.tick()
-        # The first failure is a repair task with the exact numbers, not a withdrawal.
-        self.assertEqual(self.controller.store.count("tasks", {"kind": "repair"}), 1)
-        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "inserted")
-        [failure] = self.controller.store.rows("failures", {})
-        self.assertEqual(failure["action"], "repair")
-        claimed = self.controller.claim_task("w", "admin-worker")
-        [finding] = [d for d in claimed.diagnostics if d.get("kind") == "policy"]
-        self.assertEqual((finding["measured"], finding["additions"]), ("batch-commit", 1251))
-        self.controller.release_task(claimed.task_id, claimed.claim_token, "agent_failed", "handing to the agent")
-        split = self.agent(
-            script=lambda task: {
-                f"{PROJECT}#102": Resolution(
-                    {"Huge.lean": None, "Huge/A.lean": "x\n", "Huge/B.lean": "y\n"}, explanation="Split Huge.lean."
-                )
-            }
-        )
-        self.assertTrue(split.run(self.controller).accepted)
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertIsNone(self.head())
-        self.assertEqual(self.controller.input_for(PROJECT, 102)["state"], "landed")
-        self.assertEqual(self.repo.file_at("main", "Huge/B.lean"), "y\n")
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
         self.assertEqual(self.controller.status()["escalations"], [])
 
-    def test_a_policy_rejection_measured_in_the_batch_withdraws_only_after_escalation(self):
-        heads = {}
-        self.github.ci_policy = self.batch_commit_policy(heads)
-        self.approve(101, {"A.lean": "a\n"})
-        heads[102] = self.approve(102, {"Huge.lean": "x\n"})
-        self.tick()
-        self.run_ci()
-        self.tick()
-        self.assertEqual(self.controller.store.count("tasks", {"kind": "repair"}), 1)
-        self.give_up(3)
-        self.tick()
-        escalated = self.controller.status()["escalations"][-1]
-        self.assertEqual(escalated["action"], "withdraw")
-        row = self.controller.input_for(PROJECT, 102)
-        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
-        self.tick()
-        self.assertIn("new Lean files must be at most 1250 lines", self.github.comments_for(102)[0]["body"])
-
-    def failing_module(self, path, content, module):
-        """CI that fails while `path` holds `content`, reporting the error in `module` and naming no member."""
-
-        def policy(head, _base, _members):
-            if self.repo.file_at(head, path) != content:
-                return "pass", []
-            location = module.replace(".", "/") + ".lean"
-            return "fail", [
-                {"kind": "compiler", "module": module, "path": location, "message": f"{location}:3:1: error: boom"}
-            ]
-
-        return policy
-
-    def test_a_recurring_error_is_attributed_to_the_member_that_changed_its_module(self):
-        self.github.ci_policy = self.failing_module("TauCeti/B.lean", "bad\n", "TauCeti.B")
-        self.approve(101, {"TauCeti/A.lean": "a\n"})
-        self.approve(102, {"TauCeti/B.lean": "bad\n"})
-        self.approve(103, {"TauCeti/C.lean": "c\n"})
-        self.approve(104, {"TauCeti/D.lean": "d\n"})
-        self.tick()
-        self.run_ci()
-        self.tick()
-        self.give_up(3)
-        self.tick()
-        escalated = self.controller.status()["escalations"][-1]
-        self.assertEqual(escalated["action"], "withdraw")
-        self.assertIn("attributed by #102: changed TauCeti/B.lean", escalated["cause"])
-        row = self.controller.input_for(PROJECT, 102)
-        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
-        self.assertEqual(len(self.members(self.head())), 4, "nobody else was sent back")
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertIsNone(self.head())
-        counters = self.controller.status()["counters"]
-        self.assertEqual((counters.get("bisections", 0), counters["attributed_withdrawals"]), (0, 1))
-        self.assertEqual(self.controller.status()["loop_termination"]["attributed_withdrawals"], 1)
-
-    def test_an_error_in_an_untouched_module_is_attributed_through_its_imports(self):
-        self.repo.advance_main(
-            {"TauCeti/Lib.lean": "def lib := 1\n", "TauCeti/User.lean": "import TauCeti.Lib\n\ndef user := lib\n"}
-        )
-        self.github.ci_policy = self.failing_module("TauCeti/Lib.lean", "broken\n", "TauCeti.User")
-        self.tick()
-        self.approve(101, {"TauCeti/Other.lean": "o\n"})
-        self.approve(102, {"TauCeti/Lib.lean": "broken\n"})
-        self.approve(103, {"TauCeti/Third.lean": "t\n"})
-        self.tick()
-        self.run_ci()
-        self.tick()
-        self.give_up(3)
-        self.tick()
-        escalated = self.controller.status()["escalations"][-1]
-        self.assertEqual(escalated["action"], "withdraw", escalated)
-        self.assertIn("which TauCeti/User.lean imports", escalated["cause"])
-        self.assertEqual(self.controller.input_for(PROJECT, 102)["reason"], "queue-withdrawn")
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
-
-    def broken_base(self, conclusion=None):
-        """An admin push breaks main in TauCeti/User.lean, which imports TauCeti/Lib.lean; `conclusion` is
-        main CI's for it. CI fails while User.lean is broken, naming no member."""
-        self.github.ci_policy = self.failing_module("TauCeti/User.lean", "import TauCeti.Lib\nbroken\n", "TauCeti.User")
-        base = self.repo.advance_main(
-            {"TauCeti/Lib.lean": "def lib := 1\n", "TauCeti/User.lean": "import TauCeti.Lib\nbroken\n"}
-        )
-        if conclusion is not None:
-            self.github.main_ci[base] = conclusion
-        self.tick()
-        return base
-
-    def escalate(self, *members):
-        for number, files in members:
-            self.approve(number, files)
-        self.tick()
-        self.run_ci()
-        self.tick()
-        self.give_up(3)
-        self.tick()
-        return self.controller.status()["escalations"][-1]
-
-    def test_a_base_the_queue_landed_is_healthy_without_reading_main_ci(self):
-        self.repo.advance_main({"TauCeti/Lib.lean": "def lib := 1\n", "TauCeti/User.lean": "import TauCeti.Lib\n"})
-        self.tick()
-        self.approve(100, {"TauCeti/First.lean": "f\n"})
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertEqual(self.controller.input_for(PROJECT, 100)["state"], "landed")
-        self.github.ci_policy = self.failing_module("TauCeti/Lib.lean", "broken\n", "TauCeti.User")
-        escalated = self.escalate((101, {"TauCeti/Lib.lean": "broken\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
-        self.assertEqual(escalated["action"], "withdraw", escalated)
-        self.assertNotIn("base health", escalated["cause"])
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
-        self.assertNotIn("main_ci_run", [name for name, _ in self.github.calls])
-
-    def test_a_broken_base_holds_instead_of_withdrawing_and_a_green_rerun_releases_it(self):
-        base = self.broken_base("failure")
-        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
-        self.assertEqual(escalated["action"], "hold", escalated)
-        self.assertIn(f"main is broken at {base[:12]}: main CI run", escalated["detail"])
-        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["inserted"] * 2)
-        self.assertEqual(self.controller.status()["counters"].get("bisections", 0), 0)
-        self.assertTrue(any("main is broken" in a for a in self.controller.status()["alerts"]))
-        self.tick()
-        self.assertEqual(len(self.notifier.messages), 1)
-        self.assertIn(f"main is broken at {base[:12]}", self.notifier.messages[0])
-        # Main CI re-run turns green: the next automatic retry attributes as before.
-        self.github.main_ci[base] = "success"
-        self.clock.advance(1800)
-        self.tick()
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
-        self.assertIsNone(self.controller.status()["loop_termination"]["escalation_hold"])
-
-    def test_a_fix_pushed_to_a_broken_main_ends_the_hold_without_a_withdrawal(self):
-        self.broken_base("failure")
-        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
-        self.assertEqual(escalated["action"], "hold", escalated)
-        self.repo.advance_main({"TauCeti/User.lean": "import TauCeti.Lib\n"})
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertIsNone(self.controller.status()["loop_termination"]["escalation_hold"])
-        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["landed"] * 2)
-
-    def test_a_fix_pushed_after_the_hold_expires_rebases_before_retrying(self):
-        self.broken_base("failure")
-        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
-        self.assertEqual(escalated["action"], "hold", escalated)
-        self.clock.advance(1800)
-        self.github.fail_next["main_ci_run"] = 1  # a retry on the old base would now attribute and withdraw #101
-        self.repo.advance_main({"TauCeti/User.lean": "import TauCeti.Lib\n"})
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertEqual([self.controller.input_for(PROJECT, n)["state"] for n in (101, 102)], ["landed"] * 2)
-
-    def unknown_base(self, reason):
-        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}), (102, {"TauCeti/Other.lean": "o\n"}))
-        self.assertEqual(escalated["action"], "withdraw", escalated)
-        self.assertIn(f"base health unknown ({reason}", escalated["cause"])
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
-        self.tick()
-        self.assertNotIn("base health", self.github.comments_for(101)[0]["body"])
-
-    def test_a_base_without_a_main_ci_run_keeps_attribution(self):
-        self.broken_base()
-        self.unknown_base("no main CI run")
-
-    def test_a_failed_main_ci_lookup_keeps_attribution(self):
-        self.broken_base()
-        self.github.fail_next["main_ci_run"] = 1
-        self.unknown_base("main CI lookup failed")
-
-    def test_a_broken_base_still_withdraws_a_member_ci_names(self):
-        self.broken_base("failure")
-        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
-        escalated = self.escalate((101, {"Bad.lean": "bad\n"}), (102, {"B.lean": "b\n"}))
-        self.assertEqual(escalated["action"], "withdraw", escalated)
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
-        self.assertNotIn("main_ci_run", [name for name, _ in self.github.calls])
-
-    def test_a_broken_base_holds_the_only_member_left(self):
-        self.broken_base("failure")
-        escalated = self.escalate((101, {"TauCeti/Lib.lean": "def lib := 2\n"}))
-        self.assertEqual(escalated["action"], "hold", escalated)
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
-
-    def test_a_head_with_no_active_member_left_is_dissolved(self):
-        self.github.ci_policy = lambda *_: ("scope-fail", [])
-        self.approve(101, {"A.lean": "a\n"})
+    def test_a_held_escalation_recorded_before_does_not_hold_the_head(self):
+        self.github.ci_policy = self.fails_on("Bad.lean")
+        self.approve(101, {"Bad.lean": "bad\n"})
         self.tick()
         head = self.head()
+        self.controller._set_state(
+            "escalation_hold",
+            {
+                "batch_id": head["id"],
+                "version": head["version"],
+                "detail": "escalation failed",
+                "at": self.clock(),
+                "retries": 3,
+                "retry_at": self.clock() + 86400,
+                "failure": {"id": None, "members": "[]", "lines": "[]"},
+                "cause": "an earlier escalation",
+            },
+        )
         self.run_ci()
         self.tick()
-        self.give_up(3)
-        self.tick()
-        self.assertEqual(self.controller.input_for(PROJECT, 101)["reason"], "queue-withdrawn")
-        # The same failure with nothing left to withdraw: the head is dissolved, not held for an operator.
-        self.tick()
-        self.run_ci()
-        self.tick()
-        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "removed")
-        self.assertEqual(self.controller.status()["escalations"][-1]["action"], "dissolve")
-        self.github.ci_policy = lambda *_: ("pass", [])
-        self.approve(102, {"B.lean": "b\n"})
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertEqual(self.repo.file_at("main", "B.lean"), "b\n")
-        self.assertIsNone(self.repo.file_at("main", "A.lean"))
+        status = self.controller.status()
+        self.assertEqual(status["head"]["stage"], "repair")
+        self.assertFalse(any("holds after escalation" in alert for alert in status["alerts"]), status["alerts"])
+        self.assertEqual(
+            status["loop_termination"],
+            {
+                "infrastructure_backoff": None,
+                "repair_stalls": [],
+                "head_progress": status["loop_termination"]["head_progress"],
+            },
+        )
 
     def test_repeated_infrastructure_failures_back_off_automatically_and_recover(self):
         self.controller.set_setting("infrastructure_failure_limit", 2, "test")
@@ -1340,38 +935,14 @@ class LoopTermination(QueueFixture):
         self.tick()
         self.assertEqual(len(self.notifier.messages), 1)
 
-    def test_a_rebase_conflict_nobody_resolves_withdraws_the_conflicting_member(self):
-        self.approve(101, {"Shared.lean": "one\ntwo by 101\nthree\n"})
-        self.tick()
-        self.approve(102, {"Shared.lean": "one\ntwo by 102\nthree\n"})
-        self.approve(103, {"C.lean": "c\n"})
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertEqual(self.controller.status()["head"]["stage"], "rebase_conflict")
-        self.give_up(3)
-        self.tick()
-        row = self.controller.input_for(PROJECT, 102)
-        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
-        self.tick()
-        self.run_ci()
-        self.tick(2)
-        self.assertIsNone(self.head())
-        self.assertEqual(self.repo.file_at("main", "C.lean"), "c\n")
-        self.assertEqual(self.repo.file_at("main", "Shared.lean"), "one\ntwo by 101\nthree\n")
-        self.assertIn("rebase conflict task", self.github.comments_for(102)[0]["body"])
-
     def test_notification_delivery_retries_without_a_second_message(self):
         self.notifier.lose = 1
-        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
-        self.approve(101, {"Bad.lean": "bad\n"})
-        self.approve(102, {"B.lean": "b\n"})
+        self.controller.set_setting("infrastructure_failure_limit", 1, "test")
+        self.github.ci_policy = lambda *_: ("infrastructure", [])
+        self.approve(101, {"A.lean": "a\n"})
         self.tick()
         self.run_ci()
-        self.tick()
-        self.give_up(3)
-        self.tick()
-        self.tick()
+        self.tick(2)
         self.assertEqual(len(self.notifier.messages), 1)
         self.clock.advance(self.controller.setting("outbox_retry_max_seconds"))
         self.tick()
@@ -1379,56 +950,447 @@ class LoopTermination(QueueFixture):
         self.assertEqual([reconcile for _, reconcile in self.notifier.calls], [False, True])
         self.assertEqual(self.controller.store.count("outbox", {"kind": "notify", "state": "done"}), 1)
 
-    def test_an_escalation_that_cannot_act_holds_the_head_with_an_alert(self):
-        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
-        self.approve(101, {"Bad.lean": "bad\n"})
-        self.approve(102, {"B.lean": "b\n"})
-        self.tick()
-        self.run_ci()
-        self.tick()
-        self.give_up(3)
-        with patch.object(chain, "replay", side_effect=chain.ChainError("object store unavailable")):
-            self.tick()
-        head = self.head()
-        self.assertEqual(self.controller.status()["escalations"][-1]["action"], "hold")
-        alerts = self.controller.status()["alerts"]
-        self.assertTrue(any("holds after escalation" in a and "object store unavailable" in a for a in alerts), alerts)
-        self.tick(3)
-        self.assertEqual(self.head()["version"], head["version"])
-        self.assertEqual(len(self.github.dispatches), 1)
-        self.assertEqual(len(self.notifier.messages), 1)
-        self.assertIn("hold on head batch", self.notifier.messages[0])
-        self.assertIn("retried automatically in 30 minutes", self.notifier.messages[0])
-        # It fails again on retry: the hold doubles, with no second message.
-        self.clock.advance(1800)
-        with patch.object(chain, "replay", side_effect=chain.ChainError("object store unavailable")):
-            self.tick()
-        hold = self.controller.status()["loop_termination"]["escalation_hold"]
-        self.assertEqual(hold["retries"], 1)
-        self.assertEqual(hold["retry_at"] - self.clock(), 3600)
-        self.tick()
-        self.assertEqual(len(self.notifier.messages), 1)
-        # Once the cause clears, the automatic retry withdraws the member without an operator.
-        self.clock.advance(3600)
-        self.tick()
-        row = self.controller.input_for(PROJECT, 101)
-        self.assertEqual((row["state"], row["reason"]), ("cancelled", "queue-withdrawn"))
-        self.assertIsNone(self.controller.status()["loop_termination"]["escalation_hold"])
-        self.assertGreater(self.head()["version"], head["version"])
-
     def test_without_a_notifier_the_alert_remains_and_the_outbox_settles(self):
         self.controller.notifier = None
-        self.github.ci_policy = self.fails_on("Bad.lean", attributed=101)
-        self.approve(101, {"Bad.lean": "bad\n"})
-        self.approve(102, {"B.lean": "b\n"})
+        self.controller.set_setting("infrastructure_failure_limit", 1, "test")
+        self.github.ci_policy = lambda *_: ("infrastructure", [])
+        self.approve(101, {"A.lean": "a\n"})
         self.tick()
         self.run_ci()
-        self.tick()
-        self.give_up(3)
         self.tick(2)
         entry = self.controller.store.row("outbox", {"kind": "notify"})
         self.assertEqual((entry["state"], entry["result"]), ("done", "notifier-unconfigured"))
-        self.assertTrue(any("escalation (withdraw)" in a for a in self.controller.status()["alerts"]))
+        alerts = self.controller.status()["alerts"]
+        self.assertTrue(any("escalation (infrastructure-backoff)" in a for a in alerts), alerts)
+
+
+# The agent's last message on batch 465's repair task 1415, one of the 109 that said a human was needed.
+TASK_1415_CONCLUSION = """I made no changes to the batch: HEAD is still `cc0e44e29450`, the same chain the queue already rejected. No content change in the PRs will fix this failure, so the queue will reject this chain again. The batch has to be split, or `lint-env.sh` fixed, which a human has to do because `scripts/` is human-owned.
+
+**Why it fails.** It is the same LINT-ENV failure as every earlier attempt on this task:
+- `tasks/1415/logs/lint-env.log` shows `DocScanDriver.lean:3436/3437:0: error: maximum recursion depth reached in the code generator`.
+
+**Focused checks:**
+- `python3 .tauceti-repair/check`: `ok` (linear on `b608709b45f2`, trailers and subjects intact, clean tree)."""
+
+DRIVER_FAILURE = {
+    "kind": "lint",
+    "message": "LINT-ENV: FAIL — driver failure: the docstring-scan driver did not elaborate cleanly — see output above",
+    "module": "",
+}
+
+
+class StallSignature(unittest.TestCase):
+    """The failure signature and the agent's conclusion (`tauceti_queue/repair_stall.py`)."""
+
+    def test_identical_failures_share_a_signature_whatever_varies_between_runs(self):
+        first = {
+            "kind": "lint",
+            "module": "TauCeti.A",
+            "message": "A.lean:3436:0: error at deadbeef1 after 31.2s in /tmp/x1/y",
+        }
+        again = {
+            "kind": "lint",
+            "module": "TauCeti.A",
+            "message": "A.lean:12:0:  error at cafe0042 after 30.9s in /tmp/z9/y",
+        }
+        other = {"kind": "audit", "module": "TauCeti.A", "message": first["message"]}
+        elsewhere = dict(first, module="TauCeti.B")
+        tip = "c" * 40
+        self.assertEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [again]))
+        self.assertEqual(
+            repair_stall.signature(tip, [first, DRIVER_FAILURE]), repair_stall.signature(tip, [DRIVER_FAILURE, again])
+        )
+        self.assertNotEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [other]), "another check")
+        self.assertNotEqual(repair_stall.signature(tip, [first]), repair_stall.signature(tip, [elsewhere]))
+        self.assertNotEqual(
+            repair_stall.signature(tip, [first]), repair_stall.signature("d" * 40, [first]), "a new tip"
+        )
+        self.assertNotEqual(
+            repair_stall.signature(tip, [first]),
+            repair_stall.signature(tip, [dict(first, message="unused variable `x`")]),
+            "another message",
+        )
+
+    def test_the_conclusion_keeps_why_the_agent_cannot_progress(self):
+        text = repair_stall.conclusion(TASK_1415_CONCLUSION)
+        self.assertIn("a human has to do", text)
+        self.assertIn("No content change in the PRs will fix this failure", text)
+        self.assertNotIn("Focused checks", text)
+        self.assertLessEqual(len(text), repair_stall.CONCLUSION_LIMIT)
+        self.assertEqual(repair_stall.conclusion("Fixed the import.\n\nAll checks pass."), "Fixed the import.")
+        self.assertEqual(repair_stall.conclusion(None), "")
+
+    def test_the_backoff_doubles_up_to_its_maximum(self):
+        self.assertEqual(
+            [repair_stall.retry_delay(n, 1800, 14400) for n in range(6)], [1800, 3600, 7200, 14400, 14400, 14400]
+        )
+
+
+class StalledRepair(QueueFixture):
+    """A head repair that keeps checkpointing the same tip with the same findings is stalled: one
+    journal-only progress alert quoting the agent, a backoff before the next claim, and a resume when
+    its inputs change (docs/queue/escalation.md, "Stalled repair")."""
+
+    REVISION = "a" * 40
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+        self.github.ci_policy = lambda head, _base, _members: (
+            ("fail", [DRIVER_FAILURE]) if self.repo.file_at(head, "Bad.lean") is not None else ("pass", [])
+        )
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+
+    def checkpoint(self, revision=REVISION, findings=(DRIVER_FAILURE,), conclusion=TASK_1415_CONCLUSION):
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision=revision)
+        self.assertIsNotNone(task, "the task is offered")
+        notes = {"repair_checkpoint": list(findings), "worker_revision": revision, "agent_conclusion": conclusion}
+        result = self.controller.submit_task(
+            task.task_id, task.claim_token, task.tip, json.dumps(notes), checkpoint=True
+        )
+        self.assertEqual(result.reason, "repair-checkpoint")
+        self.clock.advance(780)  # each of 1415's claims took about 13 minutes
+        return task
+
+    def escalated(self, action):
+        return [e for e in self.controller.store.journal_entries("escalated") if e["detail"]["action"] == action]
+
+    def test_three_identical_checkpoints_alert_once_journal_only_and_back_off(self):
+        task = self.checkpoint()
+        self.checkpoint()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.checkpoint()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.tick()
+        # Journal-only until decision 135 configures a target: nothing goes to the operator's direct messages.
+        self.assertEqual(self.notifier.messages, [])
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "notify"}), 0)
+        entry = self.controller.store.row("outbox", {"kind": "progress-alert"})
+        self.assertEqual((entry["state"], entry["result"]), ("done", "journal-only"))
+        content = json.loads(entry["payload"])["content"]
+        self.assertIn("repair-stalled", content)
+        self.assertIn("a human has to do", content)
+        self.assertIn("driver failure", content)
+        status = self.controller.status()
+        alerts = [a for a in status["alerts"] if a.startswith("repair stalled")]
+        self.assertEqual(len(alerts), 1, status["alerts"])
+        self.assertIn(f"task {task.task_id}", alerts[0])
+        self.assertIn("AEDT", alerts[0])
+        self.assertIn("agent: ", alerts[0])
+        self.assertFalse(any("unclaimed for" in a for a in status["alerts"]), "backed off on purpose")
+        self.assertEqual(status["head"]["repair_stall"]["checkpoints"], 3)
+        # Backed off: the same code is not offered the task for 30 minutes, then 60, ...
+        self.assertIsNone(self.controller.claim_task("repair-3", "admin-worker", worker_revision=self.REVISION))
+        self.clock.advance(1800 - 780 - 60)
+        self.tick()
+        self.assertIsNone(self.controller.claim_task("repair", "admin-worker", worker_revision=self.REVISION))
+        self.clock.advance(60)
+        self.checkpoint()
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual((stall["checkpoints"], stall["retries"]), (4, 1))
+        self.assertEqual(stall["retry_at"] - (self.clock() - 780), 3600)
+        self.assertEqual(len(self.escalated("repair-stalled")), 1, "one alert per stall")
+        self.assertEqual(len(self.controller.store.journal_entries("repair-stall-backoff")), 1)
+
+    def test_a_worker_on_new_code_is_offered_the_stalled_task_at_once(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.assertIsNone(self.controller.claim_task("repair-3", "admin-worker", worker_revision=self.REVISION))
+        self.assertIsNone(self.controller.claim_task("old", "admin-worker"), "an unknown revision waits too")
+        # The fix is installed on one unit: its revision has not tried the task.
+        self.checkpoint(revision="b" * 40)
+        claimed = self.controller.store.journal_entries("repair-stall-claimed")
+        self.assertEqual(claimed[-1]["detail"]["reason"], "new-worker-revision")
+        # Same failure on the new code: still stalled, and both revisions now wait for the backoff.
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(stall["revisions"], [self.REVISION, "b" * 40])
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40))
+
+    def test_other_findings_end_the_stall_with_one_recovery_message(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.checkpoint(revision="b" * 40, findings=({"kind": "lint", "module": "TauCeti.A", "message": "simpNF"},))
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.assertFalse(any(a.startswith("repair stalled") for a in self.controller.status()["alerts"]))
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+
+    def test_a_new_head_version_ends_the_stall(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.clock.advance(1800)
+        self.tick()
+        task = self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        resolution = Resolution({"Bad.lean": "good\n"}, explanation="Fixed.")
+        agent = self.agent(script=lambda _task: {f"{PROJECT}#101": resolution})
+        tip = agent.produce(task)
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, tip).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_disabled_stall_detection_keeps_offering_the_task(self):
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        for _ in range(5):
+            self.checkpoint()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+
+    def test_turning_detection_off_releases_a_stall_at_once(self):
+        for _ in range(3):
+            self.checkpoint()
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision=self.REVISION))
+        self.tick()
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+
+    def test_every_revision_in_the_identical_run_has_tried_the_task(self):
+        self.checkpoint(revision="b" * 40)
+        self.checkpoint()
+        self.checkpoint()
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(stall["revisions"], ["b" * 40, self.REVISION])
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40))
+        self.assertIsNotNone(self.controller.claim_task("w", "admin-worker", worker_revision="c" * 64))
+
+    def test_a_stall_that_recurs_is_told_again(self):
+        other = ({"kind": "lint", "module": "TauCeti.A", "message": "simpNF"},)
+        for findings in ((DRIVER_FAILURE,), other, (DRIVER_FAILURE,)):
+            for _ in range(3):
+                self.clock.advance(4 * 3600)
+                self.checkpoint(findings=findings)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stalled")), 3)
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "progress-alert"}), 5, "3 starts, 2 ends")
+
+    def test_a_configured_target_receives_the_progress_alert(self):
+        target = self.controller.progress_notifier = RecordingNotifier()
+        for _ in range(3):
+            self.checkpoint()
+        self.tick()
+        self.assertEqual(len(target.messages), 1)
+        self.assertIn("The agent's own conclusion", target.messages[0])
+        self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
+
+    def test_turning_the_head_alert_off_clears_an_active_one(self):
+        self.tick()
+        self.clock.advance(3 * 3600)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+        self.controller.set_setting("head_progress_alert_seconds", 0, "test")
+        self.tick()
+        self.assertFalse(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+        self.assertIsNone(self.controller.status()["loop_termination"]["head_progress"])
+
+    def test_revisions_from_a_long_identical_run_are_all_remembered(self):
+        for n in range(25):
+            self.clock.advance(4 * 3600)
+            self.checkpoint(revision=f"{n:040x}")
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual(len(stall["revisions"]), 25)
+        self.assertIsNone(self.controller.claim_task("w", "admin-worker", worker_revision=f"{0:040x}"))
+
+    def test_a_restart_starts_the_head_progress_period_again(self):
+        self.tick()
+        self.clock.advance(4 * 3600)  # the controller was down
+        self.controller._head_progress_anchored = False
+        self.tick()
+        self.assertEqual(self.escalated("head-no-progress"), [])
+        self.clock.advance(3 * 3600)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+
+    def test_a_head_without_progress_alerts_once_and_recovers(self):
+        self.controller.set_setting("repair_stall_checkpoints", 0, "test")
+        self.tick()
+        for _ in range(3 * 3600 // 780 + 1):
+            self.checkpoint()
+            self.tick()
+        self.assertEqual(len(self.escalated("head-no-progress")), 1)
+        self.assertTrue(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+        self.tick(3)
+        self.assertEqual(len(self.escalated("head-no-progress")), 1, "one alert per period")
+        task = self.controller.claim_task("w", "admin-worker")
+        self.github.ci_policy = lambda *_: ("pass", [])
+        agent = self.agent(
+            script=lambda _task: {f"{PROJECT}#101": Resolution({"Bad.lean": "ok\n"}, explanation="Fixed.")}
+        )
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task)).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("head-progress-resumed")), 1)
+        self.assertFalse(any(repair_stall.HEAD_ALERT_TEXT in a for a in self.controller.status()["alerts"]))
+
+
+class RepairReleaseStall(QueueFixture):
+    """A head repair whose claims keep ending as releases with the same error is stalled too: one
+    progress alert within a few claims, the task stays offered, and the stall ends when the error
+    changes or the task is settled (docs/queue/escalation.md, "Stalled repair"). Batch 506's repair
+    task 1521 was released 332 times in 7 hours with `KeyError: 'members'` and nobody was told."""
+
+    ERROR = "KeyError: 'members'"
+
+    def setUp(self):
+        super().setUp()
+        self.notifier = self.controller.notifier = RecordingNotifier()
+        self.github.ci_policy = lambda head, _base, _members: (
+            ("fail", [DRIVER_FAILURE]) if self.repo.file_at(head, "Bad.lean") is not None else ("pass", [])
+        )
+        self.approve(101, {"Bad.lean": "bad\n"})
+        self.approve(102, {"B.lean": "b\n"})
+        self.tick()
+        self.run_ci()
+        self.tick()
+        self.assertEqual(self.controller.status()["head"]["stage"], "repair")
+
+    def release(self, reason="artifacts_unavailable", error=ERROR, revision="a" * 40):
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision=revision)
+        self.assertIsNotNone(task, "the task stays offered")
+        self.controller.release_task(task.task_id, task.claim_token, reason, error)
+        self.clock.advance(120)  # task 1521's claims were given back every two minutes or so
+        return task
+
+    def escalated(self, action):
+        return [e for e in self.controller.store.journal_entries("escalated") if e["detail"]["action"] == action]
+
+    def test_identical_releases_alert_once_and_keep_the_task_offered(self):
+        task = None
+        for _ in range(3):
+            task = self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.tick()
+        entry = self.controller.store.row("outbox", {"kind": "progress-alert"})
+        self.assertEqual((entry["state"], entry["result"]), ("done", "journal-only"))
+        content = json.loads(entry["payload"])["content"]
+        self.assertIn("repair-stalled", content)
+        self.assertIn("KeyError: 'members'", content)
+        self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
+        alerts = [a for a in self.controller.status()["alerts"] if a.startswith("repair stalled")]
+        self.assertEqual(len(alerts), 1, alerts)
+        self.assertIn(f"task {task.task_id} given back 4 times", alerts[0])
+        self.assertIn("AEDT", alerts[0])
+        for _ in range(5):
+            self.release()  # no backoff: the same revision is offered the task at once
+        self.assertEqual(len(self.escalated("repair-stalled")), 1, "one alert per stall")
+        stall = self.controller.status()["loop_termination"]["repair_stalls"][0]
+        self.assertEqual((stall["source"], stall["releases"]), ("releases", 9))
+        self.assertEqual(self.controller.store.journal_entries("repair-stall-claimed"), [])
+
+    def test_volatile_detail_and_stops_do_not_break_the_run(self):
+        self.release(error="SourcesUnavailable: ref /tmp/abc123/x (after 13 attempt(s))")
+        self.release(reason="worker-stopped", error="stopped")
+        self.release(error="SourcesUnavailable: ref /tmp/def456/y (after 12 attempt(s))")
+        self.release(reason="inference_unavailable", error="429")
+        self.release(error="SourcesUnavailable: ref /tmp/0987/z (after 13 attempt(s))")
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release(error="SourcesUnavailable: ref /tmp/fff/w (after 2 attempt(s))")
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+
+    def test_another_error_breaks_the_run_and_ends_a_stall(self):
+        for _ in range(3):
+            self.release()
+        self.release(error="ValueError: something else")
+        self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [], "the run restarted")
+        for _ in range(3):
+            self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.release(reason="agent_failed", error="the agent exited 1")
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_a_submission_breaks_the_run(self):
+        for _ in range(3):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="a" * 40)
+        notes = {"repair_checkpoint": [DRIVER_FAILURE], "worker_revision": "a" * 40}
+        self.controller.submit_task(task.task_id, task.claim_token, task.tip, json.dumps(notes), checkpoint=True)
+        self.clock.advance(120)
+        for _ in range(3):
+            self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+
+    def test_a_rejected_submission_ends_the_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="b" * 40)
+        result = self.controller.submit_task(task.task_id, task.claim_token, "0" * 40, "{}")
+        self.assertFalse(result.accepted)
+        self.controller.release_task(task.task_id, task.claim_token, "worker-stopped", "stopped")
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_identical_releases_after_a_submission_are_a_new_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("repair-3", "admin-worker", worker_revision="b" * 40)
+        self.assertFalse(self.controller.submit_task(task.task_id, task.claim_token, "0" * 40, "{}").accepted)
+        self.controller.release_task(task.task_id, task.claim_token, "artifacts_unavailable", self.ERROR)
+        self.clock.advance(120)
+        for _ in range(2):
+            self.release()  # no loop pass in between
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 2)
+        self.tick()
+        self.assertEqual(len(self.controller.status()["loop_termination"]["repair_stalls"]), 1)
+
+    def test_many_ignored_releases_do_not_hide_the_run(self):
+        for _ in range(3):
+            self.release()
+        for _ in range(30):
+            self.release(reason="worker-stopped", error="stopped")
+        self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+
+    def test_settling_the_task_ends_the_stall(self):
+        for _ in range(4):
+            self.release()
+        task = self.controller.claim_task("w", "admin-worker", worker_revision="b" * 40)
+        self.github.ci_policy = lambda *_: ("pass", [])
+        agent = self.agent(
+            script=lambda _task: {f"{PROJECT}#101": Resolution({"Bad.lean": "ok\n"}, explanation="Fixed.")}
+        )
+        self.assertTrue(self.controller.submit_task(task.task_id, task.claim_token, agent.produce(task)).accepted)
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+        self.assertEqual(self.controller.status()["loop_termination"]["repair_stalls"], [])
+
+    def test_turning_release_detection_off(self):
+        self.controller.set_setting("repair_stall_releases", 0, "test")
+        for _ in range(6):
+            self.release()
+        self.assertEqual(self.escalated("repair-stalled"), [])
+        self.controller.set_setting("repair_stall_releases", 4, "test")
+        for _ in range(4):
+            self.release()
+        self.assertEqual(len(self.escalated("repair-stalled")), 1)
+        self.controller.set_setting("repair_stall_releases", 0, "test")
+        self.tick()
+        self.assertEqual(len(self.escalated("repair-stall-ended")), 1)
+
+    def test_the_head_alert_names_the_release_stall(self):
+        self.tick()
+        for _ in range(3 * 3600 // 120 + 2):
+            self.release()
+            self.tick()
+        entries = self.escalated("head-no-progress")
+        self.assertEqual(len(entries), 1)
+        self.assertIn("given back", entries[0]["detail"]["detail"])
 
 
 class WithdrawnAtAdoption(QueueFixture):
@@ -1474,6 +1436,9 @@ class WithdrawnAtAdoption(QueueFixture):
         self.assertIn(f"Accepted revision: `{row['head_sha']}`", body)
         self.assertIn("> Dropped F102.lean: it cannot compile against #101.", body)
         self.assertIn("What to do next: rebase onto `main`", body)
+        self.assertTrue(body.startswith(f"Merge-queue recovery for head `{row['head_sha'][:7]}`: "))
+        self.assertIn(f"<!--tauceti-rebase:v1 {row['head_sha']}-->", body.splitlines())
+        self.assertIn("needs-rebase", self.github.labels[102])
         self.assertNotIn("bors-staging", self.github.labels[102])
         self.assertEqual(self.controller.store.journal_entries("member-withdrawn-empty")[0]["detail"]["number"], 102)
         # The batch lands without it: no second comment, no close, not counted as landed or rejected.
@@ -1506,8 +1471,8 @@ class WithdrawnAtAdoption(QueueFixture):
     def test_comment_delivery_survives_a_lost_response_and_restart_without_duplicates(self):
         post = self.github.post_comment
 
-        def post_then_fail(*args):
-            post(*args)
+        def post_then_fail(*args, **kwargs):
+            post(*args, **kwargs)
             raise RuntimeError("lost comment response")
 
         with patch.object(self.github, "post_comment", side_effect=post_then_fail):
@@ -1519,7 +1484,7 @@ class WithdrawnAtAdoption(QueueFixture):
         restarted.recover()
         self.clock.advance(restarted.setting("outbox_retry_max_seconds"))
         restarted.tick()
-        self.assertEqual(restarted.store.count("outbox", {"key": "withdrawn-comment:2", "state": "done"}), 1)
+        self.assertEqual(restarted.store.count("outbox", {"key": "recovery-withdrawn:2", "state": "done"}), 1)
         self.assertEqual(len(self.github.comments_for(102)), 1)
 
     def test_a_withdrawn_member_merged_outside_the_queue_lands_with_its_batch(self):
@@ -1658,8 +1623,6 @@ class EmptyContributions(QueueFixture):
         self.assertEqual({o.state for o in outcomes}, {"canceled"})
 
     def test_a_later_repair_restoring_content_is_merged(self):
-        # The scripted failure repeats verbatim; allow it a second repair instead of escalating.
-        self.controller.set_setting("failure_repeat_limit", 3, "test")
         self.repaired_empty()
         self.github.ci_policy = verdicts("fail")
         self.tick()
@@ -2251,8 +2214,55 @@ class HeadOperations(QueueFixture):
         self.assertEqual(self.controller.inputs()[0]["state"], "cancelled")
         self.assertEqual(self.controller.inputs()[0]["reason"], "conflicts-with-main")
         self.tick()
-        self.assertIn("conflicts with `main`", self.github.comments_for(101)[0]["body"])
+        head = self.controller.inputs()[0]["head_sha"]
+        body = self.github.comments_for(101)[0]["body"]
+        self.assertIn("conflicts with `main`", body)
+        # A head-bound recovery request: workers rebase exactly this head, and the status labels stop
+        # calling it ready to merge.
+        self.assertTrue(body.startswith(f"Merge-queue recovery for head `{head[:7]}`: "))
+        self.assertIn(f"<!--tauceti-rebase:v1 {head}-->", body.splitlines())
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertNotIn("ready-to-merge", self.github.labels[101])
         self.assertIsNone(self.head())
+
+    def conflicting_approval(self):
+        self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
+        self.approve(
+            101, {"Shared.lean": "line one\nline two by 101\nline three\n"}, start=self.repo.rev_parse("main~1")
+        )
+
+    def test_a_failed_recovery_comment_leaves_the_labels_for_its_retry(self):
+        self.conflicting_approval()
+        with patch.object(self.github, "post_comment", side_effect=RuntimeError("comment refused")):
+            self.tick(2)
+        self.assertNotIn("needs-rebase", self.github.labels.get(101, set()), "labels never precede the comment")
+        self.clock.advance(self.controller.setting("outbox_retry_max_seconds"))
+        self.tick()
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertEqual(len(self.github.comments_for(101)), 1)
+
+    def test_a_recovery_request_for_a_head_already_replaced_is_dropped(self):
+        self.conflicting_approval()
+        self.tick(2)
+        entry = self.controller.store.row("outbox", {"kind": "recovery"})
+        payload = json.loads(entry["payload"])
+        self.github.labels[101] = {"ready-to-merge"}
+        self.github.prs[101]["head_sha"] = "f" * 40  # delivery delayed past a push
+        self.assertEqual(self.controller._perform("recovery", payload, self.clock()), "stale-head")
+        self.assertEqual(self.github.labels[101], {"ready-to-merge"}, "the new head's labels are not touched")
+        self.assertEqual(len(self.github.comments_for(101)), 1)
+
+    def test_a_conflict_request_removes_ready_to_merge_and_quotes_no_markers(self):
+        self.repo.advance_main({"Shared.lean": "line one\nline two by main\nline three\n"})
+        self.approve(
+            101, {"Shared.lean": "line one\nline two by 101\nline three\n"}, start=self.repo.rev_parse("main~1")
+        )
+        self.github.labels.setdefault(101, set()).add("ready-to-merge")
+        self.tick(2)
+        self.assertEqual(self.github.labels[101] & {"needs-rebase", "ready-to-merge"}, {"needs-rebase"})
+        [comment] = self.github.comments_for(101)
+        markers = [line for line in comment["body"].splitlines() if line.startswith("<!--tauceti-")]
+        self.assertEqual(markers, [f"<!--tauceti-rebase:v1 {self.controller.inputs()[0]['head_sha']}-->"])
 
 
 class MissingSource(QueueFixture):
@@ -2352,6 +2362,9 @@ class MissingSource(QueueFixture):
         self.controller.set_setting("prepare_quiet_seconds", 0, "t")
         self.approve(101, {"TauCeti/Provider.lean": None, "TauCeti/Importer.lean": None})
         self.tick()
+        # A claimed preparation on the head's tip holds the batch; it needs a known-good tip (decision 174).
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         self.approve(102, {"TauCeti/Unrelated.lean": "module\ndef unrelated := 1\n"})
         self.tick()
         claim = self.controller.claim_task("preparer", "admin-worker")
@@ -2433,6 +2446,35 @@ class MissingSource(QueueFixture):
             self.drive()
         self.assertEqual(self.states(101), ["landed"])
         self.assertEqual(len(self.github.comments_for(101)), 2, "the refusal and the landing")
+
+    def test_a_long_standing_refusal_is_handed_to_its_worker_and_still_rechecked(self):
+        self.approve(101, {"TauCeti/Consumer.lean": "module\nimport TauCeti.Later\n"})
+        self.tick(2)
+        self.assertTrue(self.refused(101))
+        head = next(r for r in self.controller.inputs() if r["number"] == 101)["head_sha"]
+        [refusal] = self.github.comments_for(101)
+        self.assertNotIn("<!--tauceti-rebase:v1", refusal["body"], "the recheck gets the first window")
+        self.assertNotIn("needs-rebase", self.github.labels.get(101, set()))
+        row = next(r for r in self.controller.inputs() if r["number"] == 101)
+        evidence = json.loads(row["evidence"])
+        # The grace period runs from the first refusal, which survives truncated selection history.
+        self.assertEqual(evidence["missing_source_first_refused"], evidence["merge_selection"][0]["at"])
+        evidence["merge_selection"] = [dict(evidence["merge_selection"][0], at=self.clock() + 10**6)]
+        self.controller.store.update("inputs", {"id": row["id"]}, evidence=json.dumps(evidence))
+        self.clock.advance(self.controller.setting("missing_source_handoff_seconds"))
+        self.tick(2)
+        handoffs = [c for c in self.github.comments_for(101) if c["body"].startswith("Merge-queue recovery for head")]
+        self.assertEqual(len(handoffs), 1)
+        self.assertIn(f"<!--tauceti-rebase:v1 {head}-->", handoffs[0]["body"].splitlines())
+        self.assertIn("imports `TauCeti.Later`, but no source provides it", handoffs[0]["body"])
+        self.assertIn("needs-rebase", self.github.labels[101])
+        self.assertEqual(self.controller.store.count("journal", {"kind": "missing-source-handoff"}), 1)
+        self.tick(2)
+        self.assertEqual(self.controller.store.count("journal", {"kind": "missing-source-handoff"}), 1, "once per head")
+        # The refusal is still watched: the provider landing re-admits the unchanged head.
+        self.repo.advance_main({"TauCeti/Later.lean": "module\ndef later := 1\n"})
+        self.tick()
+        self.assertEqual(self.states(101)[-1], "inserted")
 
     def test_removal_is_readmitted_once_main_drops_the_import(self):
         self.approve(101, {"TauCeti/Provider.lean": None})
@@ -2705,15 +2747,22 @@ class Preparation(QueueFixture):
 
         return policy
 
-    def scenario(self, prepare):
-        """A head in CI and an open batch with one broken member behind it; returns the batch and the agent."""
+    def scenario(self, prepare, pre_rebased=None, head_verified=True):
+        """A head in CI and an open batch with one broken member behind it; returns the batch and the agent.
+        The pre-rebased chain is prepared with `prepare` unless `pre_rebased` says otherwise, and only
+        on a head tip that passed its own verification (`head_verified`, decision 174)."""
         self.controller.set_setting("prepare_open_batches", prepare, "t")
+        if pre_rebased is not None:
+            self.controller.set_setting("prepare_pre_rebased", pre_rebased, "t")
         self.controller.set_setting("prepare_min_members", 3, "t")
         self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
         self.github.ci_policy = self.broken_content_policy()
         self.approve(101, {"TauCeti/Pr101.lean": "head\n"})
         self.tick()
         self.assertEqual(self.controller.status()["head"]["stage"], "ci")
+        if head_verified:
+            head = self.head()
+            self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         for number in (201, 202, 203):
             body = "BROKEN\n" if number == 202 else f"{number}\n"
             self.approve(number, {f"TauCeti/Pr{number}.lean": body})
@@ -2779,6 +2828,22 @@ class Preparation(QueueFixture):
         self.drive_until_landed(batch, [agent])
         self.assertEqual(self.source_failures(batch), 1)
         self.assertEqual([t.kind for t in agent.tasks], ["repair"])
+
+    def test_the_next_batch_is_not_verified_on_a_head_tip_without_its_own_verification(self):
+        """Decision 174: preparation of the pre-rebased chain is on by default, but only on a head tip that
+        passed its own local verification. On a head no worker verified, the next batch is pre-rebased
+        but neither built nor repaired there; it seals from that pre-rebase, its own CI round on `main`
+        finds the broken member, and the head's repair fixes it."""
+        self.assertTrue(DEFAULT_SETTINGS["prepare_pre_rebased"])
+        batch, agent = self.scenario(prepare=True, head_verified=False)
+        self.tick()
+        self.assertIsNone(agent.claim(self.controller), "nothing is verified on the head's tip")
+        self.assertEqual(self.controller.store.row("batches", {"id": batch["id"]})["pre_rebase_state"], "clean")
+        self.assertIn("has not passed its own verification", self.controller._pre_rebased_prepare_blocked(batch))
+        self.drive_until_landed(batch, [agent])
+        self.assertEqual(self.source_failures(batch), 1, "found by its own CI round, as the head")
+        self.assertEqual([t.kind for t in agent.tasks], ["repair"])
+        self.assertEqual(self.repo.file_at(self.repo.main_sha(), "TauCeti/Pr202.lean"), "202\n")
 
     def test_insertion_during_preparation_goes_to_the_next_batch_and_the_head_task_comes_first(self):
         batch, agent = self.scenario(prepare=True)
@@ -2846,6 +2911,115 @@ class Preparation(QueueFixture):
         self.drive_until_landed(batch, [repairer, preparer])
         self.assertEqual(self.source_failures(batch), 0, "prepared while the head was repaired")
         self.assertEqual([t.kind for t in preparer.tasks], ["prepare"])
+
+
+class OpenBatchRebaseOntoMain(QueueFixture):
+    """An open batch whose replay onto `main` conflicts gets a background `rebase_conflict` task onto
+    `main`; adopting it re-bases the batch, which is then prepared on `main`."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
+        self.controller.set_setting("prepare_min_members", 2, "t")
+        self.controller.set_setting("pre_rebase_enabled", False, "t")
+
+    def test_a_conflicting_open_batch_is_rebased_onto_main_by_a_worker_then_prepared_there(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        batch = self.open_batch()
+        main = self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"], task["base"]), ("rebase_conflict", main, batch["base"]))
+        self.tick()
+        self.assertEqual(
+            len(self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})), 1, "one task"
+        )
+
+        def resolve(claimed):
+            self.assertEqual(
+                (claimed.kind, claimed.batch_id, claimed.extra.get("background")),
+                ("rebase_conflict", batch["id"], True),
+            )
+            return {
+                f"{PROJECT}#202": Resolution(
+                    {"Shared.lean": "one\ntwo on main and by 202\nthree\n"}, explanation="Kept both line two edits."
+                )
+            }
+
+        resolver = self.agent("resolver", script=resolve)
+        self.assertTrue(resolver.run(self.controller).accepted)
+        rebased = self.open_batch()
+        self.assertEqual(rebased["id"], batch["id"])
+        self.assertEqual(rebased["base"], main)
+        self.assertGreater(rebased["version"], batch["version"])
+        self.assertIsNone(rebased["prepared_version"], "a rebase is not a preparation")
+        self.tick()
+        [prepare] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((prepare["kind"], prepare["base"]), ("prepare", main))
+
+    def prepared_batch(self):
+        """A head in CI and an open batch 202/203 prepared clean on its base."""
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        task = self.controller.claim_task("preparer", "admin-worker")
+        self.assertEqual(task.kind, "prepare")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        batch = self.open_batch()
+        self.assertEqual(batch["prepared_version"], batch["version"])
+        return batch
+
+    def test_a_prepared_batch_whose_replay_onto_main_conflicts_is_rebased_onto_main(self):
+        batch = self.prepared_batch()
+        main = self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.tick()
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"})
+        self.assertEqual((task["kind"], task["onto"]), ("rebase_conflict", main))
+
+    def test_a_prepared_batch_whose_replay_onto_main_is_clean_keeps_its_preparation(self):
+        batch = self.prepared_batch()
+        self.repo.advance_main({"Elsewhere.lean": "x\n"})
+        self.tick()
+        self.tick()
+        kept = self.open_batch()
+        self.assertEqual(
+            (kept["version"], kept["base"], kept["prepared_version"]),
+            (batch["version"], batch["base"], batch["version"]),
+        )
+        self.assertEqual(self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open"}), [])
+        rebase_claims = self.controller.store.rows("claims", {"batch_id": batch["id"], "operation": "rebase"})
+        self.assertEqual(len(rebase_claims), 1, "replayed once, then remembered")
+
+    def test_insertion_goes_around_an_open_batch_being_rebased(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(202, {"Shared.lean": "one\ntwo by 202\nthree\n"})
+        self.approve(203, {"TauCeti/P203.lean": "203\n"})
+        self.tick()
+        batch = self.open_batch()
+        self.repo.advance_main({"Shared.lean": "one\ntwo on main\nthree\n"})
+        self.tick()
+        self.clock.advance(self.controller.setting("prepare_quiet_seconds"))
+        self.tick()
+        claimed = self.agent("holder").claim(self.controller)
+        self.assertEqual((claimed.kind, claimed.batch_id), ("rebase_conflict", batch["id"]))
+        self.approve(204, {"TauCeti/P204.lean": "204\n"})
+        self.tick()
+        self.assertNotIn(
+            f"{PROJECT}#204",
+            [m["source_pr"] for m in self.members(self.controller.store.row("batches", {"id": batch["id"]}))],
+        )
 
 
 class SequencedBackgroundTasks(QueueFixture):
@@ -3052,6 +3226,99 @@ class RepairOrReject(QueueFixture):
         summary = self.controller.store.journal_entries("edit-summary")
         self.assertEqual([(e["detail"]["number"], e["detail"]["truncated"]) for e in summary], [(102, False)])
         self.assertEqual(self.controller.status()["counters"]["edit_summaries"], 1)
+
+    def test_landing_git_work_runs_without_the_locks_and_once_per_member(self):
+        controller = self.controller
+        diffs, git_reads = [], []
+        real_diff, real_fact = controller._landed_diff, controller._landing_fact
+
+        def landed_diff(member):
+            diffs.append((member["number"], controller._lock.owned(), controller.store._depth))
+            return real_diff(member)
+
+        def landing_fact(*args, **kwargs):
+            git_reads.append((args[1]["number"], controller._lock.owned()))
+            return real_fact(*args, **kwargs)
+
+        with (
+            patch.object(controller, "_landed_diff", landed_diff),
+            patch.object(controller, "_landing_fact", landing_fact),
+        ):
+            head = self.edited_landing()
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertEqual(diffs, [(102, False, 0)], "one diff, with neither the controller nor the store lock")
+        self.assertEqual(sorted(git_reads), [(101, False), (102, False)])
+        self.assertIn("-broken\n+fixed", self.github.comments_for(102)[0]["body"])
+        self.assertIn(f"repaired-label:{head['id']}:102", [e["key"] for e in controller.store.rows("outbox")])
+
+    def test_a_landing_recorded_while_the_lock_was_free_is_not_recorded_again(self):
+        controller = self.controller
+        real_facts = controller._landing_facts
+        raced = []
+
+        def landing_facts(batch, members, ranges, **kwargs):
+            facts = real_facts(batch, members, ranges, **kwargs)
+            if kwargs.get("partial") and not raced:
+                raced.append(batch["id"])
+                with controller._lock:  # another path lands the same head meanwhile
+                    controller._landed(controller.store.row("batches", {"id": batch["id"]}), "promoted", 0)
+            return facts
+
+        with patch.object(controller, "_landing_facts", landing_facts):
+            head = self.edited_landing()
+        self.assertEqual(raced, [head["id"]])
+        landed = [e for e in controller.store.journal_entries("landed") if e["batch_id"] == head["id"]]
+        self.assertEqual(len(landed), 1)
+        self.assertEqual(len(self.github.comments_for(102)), 1)
+
+    def test_a_revision_replaced_while_the_lock_was_free_is_not_recorded_as_landed(self):
+        controller = self.controller
+        real_facts = controller._landing_facts
+        replaced = []
+
+        def landing_facts(batch, members, ranges, **kwargs):
+            facts = real_facts(batch, members, ranges, **kwargs)
+            if kwargs.get("partial") and not replaced:
+                replaced.append(batch["id"])
+                # As a rebuild or repair submission would, meanwhile: a revision not on canonical.
+                tree = chain.tree_of(controller.clone, batch["base"])
+                ident = {
+                    f"GIT_{who}_{key}": value
+                    for who in ("AUTHOR", "COMMITTER")
+                    for key, value in (("NAME", "t"), ("EMAIL", "t@example.invalid"))
+                }
+                tip = chain.git(
+                    controller.clone, "commit-tree", tree, "-p", batch["base"], "-m", "rebuilt", env=ident
+                ).strip()
+                replaced.append(tip)
+                with controller._lock:
+                    controller.store.update("batches", {"id": batch["id"]}, version=batch["version"] + 1, tip=tip)
+            return facts
+
+        with patch.object(controller, "_landing_facts", landing_facts):
+            head = self.edited_landing()
+        (superseded,) = controller.store.journal_entries("landing-superseded")
+        self.assertEqual(superseded["batch_id"], head["id"])
+        self.assertEqual(superseded["detail"]["current_tip"], replaced[1])
+        landed = [e for e in controller.store.journal_entries("landed") if e["batch_id"] == head["id"]]
+        self.assertEqual(landed, [], "the replacement revision never reached canonical")
+        self.assertNotEqual(controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+
+    def test_a_member_changed_while_the_lock_was_free_is_read_again_under_it(self):
+        controller = self.controller
+        real_facts = controller._landing_facts
+
+        def landing_facts(batch, members, ranges, **kwargs):
+            facts = real_facts(batch, members, ranges, **kwargs)
+            if kwargs.get("partial"):
+                for fact in facts.values():
+                    fact["commit"] = "0" * 40  # as if each member's commit moved meanwhile
+            return facts
+
+        with patch.object(controller, "_landing_facts", landing_facts):
+            head = self.edited_landing()
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "landed")
+        self.assertIn("-broken\n+fixed", self.github.comments_for(102)[0]["body"])
 
     def test_edited_member_is_labelled_repaired_in_queue(self):
         head = self.edited_landing()

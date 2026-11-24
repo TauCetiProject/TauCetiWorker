@@ -148,6 +148,40 @@ for configured, provider, expected in (
     actual = argv[argv.index("--claude-model") + 1] if "--claude-model" in argv else None
     check(f"host: {provider} override {configured!r} -> {expected!r}", actual == expected)
 
+# Separate-usage launches require the compatible file-route CLI before any paid review.
+usage_var = "TAUCETI_CLAUDE_USAGE_CREDENTIALS"
+old_usage = os.environ.pop(usage_var, None)
+try:
+    for configured in (False, True):
+        if configured:
+            os.environ[usage_var] = str(tmp / "usage-login.json")
+        work_units.do_review(w, None, c, types.SimpleNamespace(work_model="claude"), False)
+        check(
+            f"host: usage={configured} file-route compatibility flag",
+            ("--require-claude-config-file" in host_commands[-1]) == configured,
+        )
+        agents._review_in_bubble(w, 470, "abc123", "claude", opts)
+        check(
+            f"bubble: usage={configured} file-route compatibility flag",
+            ("--require-claude-config-file" in captured["inner"]) == configured,
+        )
+    os.environ["TAUCETI_CLAUDE_BILLING"] = "api"
+    work_units.do_review(w, None, c, types.SimpleNamespace(work_model="claude"), False)
+    check(
+        "host: separate usage does not impose subscription file routing on API review",
+        "--require-claude-config-file" not in host_commands[-1],
+    )
+    agents._review_in_bubble(w, 470, "abc123", "claude", opts)
+    check(
+        "bubble: API review has no subscription file compatibility flag",
+        "--require-claude-config-file" not in captured["inner"],
+    )
+finally:
+    os.environ.pop("TAUCETI_CLAUDE_BILLING", None)
+    os.environ.pop(usage_var, None)
+    if old_usage is not None:
+        os.environ[usage_var] = old_usage
+
 os.environ.pop("TAUCETI_CLAUDE_MODEL", None)
 os.environ.pop("TAUCETI_AUTHORING_CLAUDE_MODEL", None)
 os.environ.pop("TAUCETI_REVIEW_ENGINE_DIR", None)
