@@ -378,10 +378,11 @@ tip, rather than onto `main` first and again as the head. While `pre_rebase_enab
   pre-rebase carries only the head's own conflicts.
 
 Preparing the pre-rebased chain (item 16 of "Five improvements from the first production repair" in
-the plan), off by default since decision 153 (`prepare_pre_rebased` false; S1 above): a clean replay produces a tip nobody has built, so `_prepare_pre_rebased` creates a
+the plan), on by default again since decision 174 (`prepare_pre_rebased` true; it was off from
+decision 153's S1 until then): a clean replay produces a tip nobody has built, so `_prepare_pre_rebased` creates a
 second kind of `prepare` task for the oldest open batch's usable pre-rebase (`clean`, or `adopted`
 from a `pre_rebase` task) once it is up to date (on the head's tip, covering the batch's tip),
-`_pre_rebase_blocked` allows the head, `prepare_pre_rebased` and `prepare_open_batches` are on, the
+`_pre_rebase_blocked` allows the head, the head's tip is known-good (below), `prepare_pre_rebased` and `prepare_open_batches` are on, the
 batch has `prepare_min_members` members and is prepared on its own base at its current version, no
 other background task of the batch is open, and the chain is neither prepared nor already prepared,
 released clean or failed for that tip. The task's `base` and `onto` are the head's tip, its `tip` the
@@ -403,6 +404,33 @@ preparation that becomes due waits while a worker holds this task and supersedes
 as the prepared tip's base seals with the prepared tip unchanged, so its CI round fetches the outputs
 the worker published for that exact tip; a later insertion extends the pre-rebase by replay, which
 leaves it unprepared until the next preparation.
+
+Known-good head tips (decision 174): the next batch is verified and repaired only on a head tip that
+has passed its own local verification, so it never acts on the head's own failures (task 1416), and
+no failure list passes between batches. `_head_tip_verified` holds when `batches.verified_tip` is the
+head's tip and CI has never failed that tip on the source (`_tip_failed`, any attempt of any batch,
+so a tip staged again unchanged after a failure stays not known-good). `verified_tip` is set when a task's adopted
+submission carries a `local_verification` note (`{tip, checks_passed}`, from the worker) with
+`checks_passed` true for exactly the submitted tip (the head's repair or `rebase_conflict`, an own-base
+preparation), and when the head seals from its pre-rebase unchanged (`onto` is `main`, no members
+replayed onto it) and that pre-rebase's tip is `batches.pre_rebase_verified`: a preparation of the
+pre-rebased chain released `prepared_clean`, or adopted with such a note. Any other new tip (a
+controller replay, a repair the worker could not verify) is not known-good, and a CI pass alone does
+not count: the head lands minutes later, and a preparation started then would only hold up the seal.
+On a head that is not known-good, the next batch's conflicts-only pre-rebase still runs, but
+`prepare_blocked` says `head N's tip <sha> has not passed its own verification`, and a claimed
+preparation is superseded (`head-unverified`) and its submission refused, a preserved one included
+once its `onto` has failed. When CI fails the tip a pre-rebase is on, or a repair round or rebase
+moves the head past it, `_discard_unverified_pre_rebase` clears an open batch's pre-rebase that
+carries a preparation's edits (journal `pre-rebase-discarded` with reason `head-failed`,
+`head-moved` or `head-unverified`, counter `pre_rebase_verification_discarded`) instead of carrying
+it to the next tip; `_pre_rebase` then replays the batch afresh, and it is prepared again once the
+new tip is known-good. One prepared clean, with no edits, keeps its chain and loses only
+`pre_rebase_prepared` and `pre_rebase_verified` (`chain_kept` true). A pre-rebase with only a
+`pre_rebase` task's conflict resolutions is carried as before. In `claim_task` the next
+batch's preparation of its pre-rebased chain ranks with its `pre_rebase`, ahead of every later batch's
+own-base preparation, and when the background slots are full it takes the newest such preparation's
+slot (`pre-rebase-first`), as the `pre_rebase` does.
 
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
@@ -852,7 +880,7 @@ prepares, `own_base` or `pre_rebased`) and `waiting` (null, or the other `kind` 
 `open_batch` carries the same preparation and `pre_rebase` fields; both forms include `sealed`
 and `sealed_at`, and retain the successor for compatibility); `sealed_successor` (null or the first sealed
 non-head batch summary; `open_batches` includes every sealed non-head batch); `head` (the same plus `sealed_at`,
-`expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
+`expected_parent`, `based_on_canonical`, `tip_verified` (whether the tip is known-good, `_head_tip_verified`), `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
 `repair`, `infrastructure`, `promote`, the open `task`, `base_cache_wait` (null, or the wait for a
 published base described in the CI section), and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,

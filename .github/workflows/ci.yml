@@ -69,7 +69,11 @@ jobs:
         run: .github/scripts/tools-pin.sh apply
       - name: Run the portable test modules
         if: needs.changes.outputs.docs_only != 'true'
-        run: ./tests/run-all -j "$(nproc)" --group portable
+        # Not $(nproc): the infra runners report 96 CPUs on a host they share with workers and PR
+        # CI. The longest module takes about 380 s, and 24 at a time finish the rest within it, while
+        # 96 at a time only divide the same share of the host more thinly between timing-sensitive
+        # modules.
+        run: ./tests/run-all -j 24 --group portable
       - name: Run the modules that assert on the documentation
         if: needs.changes.outputs.docs_only == 'true'
         run: ./tests/run-all -j "$(nproc)" --group docs

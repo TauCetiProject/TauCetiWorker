@@ -2040,6 +2040,9 @@ class PreRebase(ControllerCase):
             task.task_id, task.claim_token, tip, json.dumps({"pre_rebase_verification": evidence})
         )
         self.assertTrue(result.accepted, result)
+        # On a head tip that passed its own verification (decision 174), the mark stands.
+        head = self.controller._head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         self.controller.tick()
         self.assertEqual(self.open_batch()["pre_rebase_prepared"], tip)
         self.assertEqual(self.open_tasks(self.open_batch()), [])
@@ -3023,17 +3026,16 @@ class Preparation(ControllerCase):
         self.assertEqual(self.controller.claim_task("worker-1", "admin-worker").task_id, task.task_id)
 
 
-class PreRebasedPreparation(ControllerCase):
-    """A `prepare` task of the next batch's pre-rebased chain on the head's tip, so the head it seals as
-    reaches CI with published outputs for its exact tip."""
+class PreRebasedCase(ControllerCase):
+    """A head waiting on CI and an open batch pre-rebased onto its tip, with the helpers the preparation
+    of that pre-rebased chain is tested with."""
 
     def setUp(self):
         super().setUp()
         self.controller.set_setting("repair_concurrency", 2, "t")  # room for one background claim
         self.controller.set_setting("prepare_min_members", 2, "t")
         self.controller.set_setting("prepare_quiet_seconds", 0, "t")
-        # Off by default since decision 153 (S1); these tests cover the opt-in path.
-        self.controller.set_setting("prepare_pre_rebased", True, "t")
+        self.assertTrue(DEFAULT_SETTINGS["prepare_pre_rebased"], "on by default again (decision 174)")
 
     def open_batch(self):
         """A head waiting on CI and an open batch of 201 and 202, prepared on its own base and pre-rebased
@@ -3072,6 +3074,24 @@ class PreRebasedPreparation(ControllerCase):
             self.controller.handle_event("status", {"sha": self.github.runs[-1].head_sha, "context": context})
         self.controller.tick()  # observes the verdict and promotes
         self.controller.tick()  # seals the next head
+
+
+class PreRebasedPreparation(PreRebasedCase):
+    """A `prepare` task of the next batch's pre-rebased chain on the head's tip, so the head it seals as
+    reaches CI with published outputs for its exact tip."""
+
+    def setUp(self):
+        super().setUp()
+        # These cases are about the preparation itself: every head tip counts as having passed its own
+        # verification until CI fails it on the source. `KnownGoodHeadTip` covers that rule.
+        real = self.controller._head_tip_verified
+
+        def verified(head):
+            return real(dict(head, verified_tip=head["tip"]) if head is not None else None)
+
+        patcher = mock.patch.object(self.controller, "_head_tip_verified", side_effect=verified)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_the_pre_rebased_preparation_warms_from_the_heads_tips_then_the_batchs_own(self):
         batch = self.open_batch()
@@ -3304,6 +3324,259 @@ class PreRebasedPreparation(ControllerCase):
         self.assertEqual(self.repo.file_at(tip, "P202.lean"), "fixed on the head\n")
         self.assertEqual(self.controller.store.row("tasks", {"id": task.task_id})["resolution"], "adopted")
         self.assertEqual(self.github.runs[-1].head_sha, tip)
+
+
+class KnownGoodHeadTip(PreRebasedCase):
+    """Decision 174: the next batch is verified and repaired only on a head tip that has passed its own
+    verification, and that work is discarded, not carried, once the head fails CI or its tip moves."""
+
+    def row(self, batch):
+        return self.controller.store.row("batches", {"id": batch["id"]})
+
+    def verify_head(self):
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
+
+    def fail_head(self):
+        """The head's running CI round fails on the source."""
+        run = self.github.runs[-1]
+        self.assertEqual(run.head_sha, self.head()["tip"])
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "A.lean", "message": "boom"}]
+        self.github.complete_runs()
+        self.controller.handle_event("status", {"sha": run.head_sha, "context": "build"})
+        self.controller.tick()
+        self.assertEqual(self.controller._current_attempt(self.head())["outcome"], "source-failure")
+
+    def agent(self, name, member, content, *, verified=True):
+        return ScriptedAgent(
+            name,
+            "admin-worker",
+            self.repo,
+            self.root / name,
+            lambda _: {f"{PROJECT}#{member}": Resolution({f"{content[0]}": content[1]}, explanation="Fixed.")},
+            verified=verified,
+        )
+
+    def test_known_good_means_a_workers_pass_on_the_exact_tip_that_ci_has_not_failed(self):
+        self.open_batch()
+        head = self.head()
+        known_good = self.controller._head_tip_verified
+        self.assertFalse(known_good(None))
+        self.assertFalse(known_good(head), "dispatched, but no worker built this tip")
+        self.assertFalse(known_good(dict(head, verified_tip="0" * 40)), "a pass on another tip does not count")
+        self.assertTrue(known_good(dict(head, verified_tip=head["tip"])))
+        attempt = self.controller._current_attempt(head)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="source-failure")
+        self.assertFalse(known_good(dict(head, verified_tip=head["tip"])), "CI failed it since")
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass")
+        self.assertTrue(known_good(dict(head, verified_tip=head["tip"])))
+        self.assertFalse(known_good(head), "a CI pass alone does not qualify: the head is about to land")
+
+    def test_no_preparation_on_a_head_tip_without_its_own_verification(self):
+        batch = self.open_batch()
+        head = self.head()
+        self.assertEqual((batch["pre_rebase_state"], batch["pre_rebase_onto"]), ("clean", head["tip"]))
+        self.assertEqual(self.pre_rebased_tasks(), [], "the conflicts-only pre-rebase still runs, nothing more")
+        self.assertEqual(
+            self.preparation()["prepare_blocked"],
+            f"head {head['id']}'s tip {head['tip'][:12]} has not passed its own verification",
+        )
+        self.verify_head()
+        self.controller.tick()
+        [task] = self.pre_rebased_tasks()
+        self.assertEqual(task["onto"], head["tip"])
+
+    def test_a_head_repair_qualifies_its_tip_only_when_the_worker_verified_it(self):
+        batch = self.open_batch()
+        for attempt, verified in ((1, False), (2, True)):
+            self.fail_head()
+            repair = self.agent(f"repairer-{attempt}", 101, ("A.lean", f"fixed {attempt}\n"), verified=verified)
+            result = repair.run(self.controller)
+            self.assertEqual(repair.tasks[0].kind, "repair")
+            self.assertTrue(result.accepted, result)
+            self.controller.tick()
+            self.controller.tick()
+            head = self.head()
+            self.assertEqual(head["verified_tip"], head["tip"] if verified else None)
+            self.assertEqual(self.row(batch)["pre_rebase_onto"], head["tip"], "pre-rebased onto the new tip")
+            self.assertEqual(len(self.pre_rebased_tasks()), int(verified))
+
+    def test_a_head_that_fails_ci_discards_the_repairs_made_on_its_tip(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        failed_tip = self.head()["tip"]
+        preparer = self.agent("preparer", 202, ("P202.lean", "fixed on the head\n"))
+        result = preparer.run(self.controller)
+        self.assertIn("pre_rebased", preparer.tasks[0].extra)
+        self.assertTrue(result.accepted, result)
+        prepared = self.row(batch)
+        self.assertEqual(
+            (prepared["pre_rebase_state"], prepared["pre_rebase_prepared"], prepared["pre_rebase_verified"]),
+            ("adopted", result.tip, result.tip),
+        )
+        self.fail_head()
+        discarded = self.row(batch)
+        self.assertEqual((discarded["pre_rebase_state"], discarded["pre_rebase_tip"]), ("", None))
+        self.assertEqual(loads(discarded["pre_rebase_edits"], {}), {})
+        [entry] = self.controller.store.journal_entries("pre-rebase-discarded")
+        self.assertEqual((entry["detail"]["reason"], entry["detail"]["onto"]), ("head-failed", failed_tip))
+        # The head's repair moves its tip: the batch is replayed afresh, without the discarded edit, and
+        # prepared again once the new tip has passed its own verification.
+        repair = self.agent("repairer", 101, ("A.lean", "fixed\n"))
+        self.assertTrue(repair.run(self.controller).accepted)
+        self.controller.tick()
+        self.controller.tick()
+        head = self.head()
+        replayed = self.row(batch)
+        self.assertEqual((replayed["pre_rebase_state"], replayed["pre_rebase_onto"]), ("clean", head["tip"]))
+        self.assertEqual(chain.git(self.controller.clone, "show", f"{replayed['pre_rebase_tip']}:P202.lean"), "202\n")
+        [again] = self.pre_rebased_tasks()
+        self.assertEqual((again["onto"], again["tip"]), (head["tip"], replayed["pre_rebase_tip"]))
+
+    def test_a_conflicts_only_pre_rebase_is_kept_when_the_head_fails(self):
+        batch = self.open_batch()
+        before = self.row(batch)
+        self.fail_head()
+        self.assertEqual(self.row(batch)["pre_rebase_tip"], before["pre_rebase_tip"], "nothing verified to discard")
+        self.assertEqual(self.controller.store.journal_entries("pre-rebase-discarded"), [])
+
+    def test_a_claimed_preparation_is_taken_back_when_the_head_fails_ci(self):
+        self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertIn("pre_rebased", task.extra)
+        self.fail_head()
+        [superseded] = self.pre_rebased_tasks("superseded")
+        self.assertEqual((superseded["id"], superseded["resolution"]), (task.task_id, "head-unverified"))
+        result = self.controller.submit_task(task.task_id, task.claim_token, task.tip)
+        self.assertFalse(result.accepted, result)
+
+    def test_a_clean_preparation_loses_its_marks_when_the_head_fails_and_a_restaged_tip_stays_unverified(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], task.tip)
+        failed = self.head()
+        self.fail_head()
+        kept = self.row(batch)
+        self.assertEqual(
+            (kept["pre_rebase_tip"], kept["pre_rebase_prepared"], kept["pre_rebase_verified"]),
+            (task.tip, None, None),
+            "the chain is kept; it is no longer prepared or verified",
+        )
+        [entry] = self.controller.store.journal_entries("pre-rebase-discarded")
+        self.assertEqual((entry["detail"]["reason"], entry["detail"]["chain_kept"]), ("head-failed", True))
+        # The same tip staged again unchanged at a later version, with a fresh local pass, is still not
+        # known-good: CI failed it once.
+        version = failed["version"] + 1
+        self.controller._record_tip(failed["id"], version, failed["tip"], self.clock())
+        self.controller.store.update("batches", {"id": failed["id"]}, version=version, verified_tip=failed["tip"])
+        self.assertFalse(self.controller._head_tip_verified(self.head()))
+
+    def test_a_preserved_preparation_on_a_failed_tip_is_not_current(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        row = self.controller.store.row("tasks", {"id": task.task_id})
+        self.controller._set_state("emergency_preserved", {str(task.task_id): row["onto"]})
+        self.assertTrue(self.controller._pre_rebased_prepare_current(row, self.row(batch)))
+        attempt = self.controller._current_attempt(self.head())
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="source-failure")
+        self.assertFalse(self.controller._pre_rebased_prepare_current(row, self.row(batch)))
+
+    def test_sealing_from_a_verified_preparation_makes_the_new_head_known_good(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], task.tip)
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"], head["verified_tip"]), (batch["id"], task.tip, task.tip))
+        self.assertTrue(self.controller._head_tip_verified(head))
+        [rebased] = [e for e in self.controller.store.journal_entries("rebased") if e["batch_id"] == batch["id"]]
+        self.assertTrue(rebased["detail"]["verified"])
+
+    def test_sealing_from_an_unverified_preparation_leaves_the_new_head_unverified(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        preparer = self.agent("preparer", 202, ("P202.lean", "fixed on the head\n"), verified=False)
+        result = preparer.run(self.controller)
+        self.assertTrue(result.accepted, result)
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], None)
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"], head["verified_tip"]), (batch["id"], result.tip, None))
+
+
+class NextHeadPreparationPriority(ControllerCase):
+    """Decision 174: the next head's preparation on the head's tip is offered ahead of later batches'
+    own-base preparations, and takes the newest one's slot when the background slots are full."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in (
+            ("repair_concurrency", 3),
+            ("background_start_limit", 3),
+            ("open_batch_limit", 3),
+            ("prepare_open_batches", False),  # the tasks below are created by hand
+        ):
+            self.controller.set_setting(name, value, "kim")
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        for number in (102, 103, 104):  # each conflicts with the open batches before it, not with the head
+            self.approve(number, {"Shared.lean": f"line one\nline two by {number}\nline three\n"})
+            self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
+        self.successor, self.later, self.last = self.controller.store.rows("batches", {"state": "open"}, order="id")
+        self.assertEqual(self.successor["pre_rebase_state"], "clean")
+
+    def own_base(self, batch):
+        return self.controller._create_task(batch, "prepare", batch["base"], [], self.clock())
+
+    def next_heads(self):
+        batch = self.controller.store.row("batches", {"id": self.successor["id"]})
+        tip = batch["pre_rebase_tip"]
+        self.controller._retain(self.controller.pre_rebased_ref(batch["id"], tip), tip)
+        return self.controller._create_task(
+            batch, "prepare", batch["pre_rebase_onto"], [], self.clock(), pre_rebased=(tip, batch["tip"])
+        )
+
+    def test_it_is_offered_before_older_own_base_preparations(self):
+        self.own_base(self.later)
+        self.clock.advance(1)
+        self.own_base(self.last)
+        self.clock.advance(1)
+        self.next_heads()
+        first = self.controller.claim_task("w1", "admin-worker")
+        self.assertEqual(
+            (first.kind, first.batch_id, "pre_rebased" in first.extra), ("prepare", self.successor["id"], True)
+        )
+        second = self.controller.claim_task("w2", "admin-worker")
+        self.assertEqual((second.batch_id, "pre_rebased" in second.extra), (self.later["id"], False))
+
+    def test_it_takes_the_newest_later_preparations_slot(self):
+        self.own_base(self.later)
+        self.own_base(self.last)
+        first = self.controller.claim_task("w1", "admin-worker")
+        self.clock.advance(1)
+        second = self.controller.claim_task("w2", "admin-worker")
+        self.assertEqual({first.batch_id, second.batch_id}, {self.later["id"], self.last["id"]})
+        self.next_heads()
+        third = self.controller.claim_task("w3", "admin-worker")
+        self.assertEqual((third.batch_id, "pre_rebased" in third.extra), (self.successor["id"], True))
+        released = self.controller.store.row("tasks", {"id": second.task_id})
+        self.assertEqual((released["state"], released["resolution"]), ("superseded", "pre-rebase-first"))
+        self.assertEqual(self.controller.store.row("tasks", {"id": first.task_id})["state"], "open")
+        self.assertEqual(len(self.controller._active_task_claims()), 2, "the claims did not grow")
 
 
 class Holds(ControllerCase):
@@ -3797,7 +4070,7 @@ class StatusSnapshot(ControllerCase):
         def hold():
             with self.controller._lock:
                 held.set()
-                release.wait(10)
+                release.wait(60)
 
         thread = threading.Thread(target=hold)
         thread.start()
@@ -3812,7 +4085,8 @@ class StatusSnapshot(ControllerCase):
         release = self.hold_lock()
         started = time.monotonic()
         status = self.controller.status(wait=0.2)
-        self.assertLess(time.monotonic() - started, 1.5)
+        # The lock is held for a minute; the margin over the 0.2 s wait is for a loaded runner.
+        self.assertLess(time.monotonic() - started, 10)
         self.assertEqual((status["snapshot"], status["head"]["size"]), (True, 1), "the snapshot the tick took")
         self.assertGreaterEqual(status["stale_seconds"], 0)
         json.dumps(status)

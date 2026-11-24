@@ -972,7 +972,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `prepare_quiet_seconds` | `600` | integer, at least 0 |
 | `pre_rebase_enabled` | `true` | `true` or `false` |
 | `pre_rebase_takeover_seconds` | `1200` | non-negative integer |
-| `prepare_pre_rebased` | `false` | `true` or `false` |
+| `prepare_pre_rebased` | `true` | `true` or `false` |
 | `withdraw_emptied_at_adoption` | `true` | `true` or `false` ([reject-empty-commits.md](reject-empty-commits.md)) |
 | `infrastructure_failure_limit` | `5` | integer, at least 0; 0 disables the automatic backoff ([escalation.md](escalation.md)) |
 | `automatic_retry_seconds` | `1800` | integer, at least 0; below 60 counts as 60 |

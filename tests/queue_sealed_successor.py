@@ -316,7 +316,6 @@ class SealedSuccessor(ControllerCase):
         controller, github, repo, clock = make_controller(self.root / "pre-rebase")
         self.addCleanup(controller.store.close)
         github.admins.add("admin-worker")
-        controller.set_setting("prepare_pre_rebased", True, "test")  # off by default (decision 153, S1)
         controller.set_setting("sealed_successor_min_members", 3, "test")
         controller.set_setting("repair_concurrency", 2, "test")
         for number in (101, 201, 202, 203):
@@ -324,6 +323,9 @@ class SealedSuccessor(ControllerCase):
             controller.approve(PROJECT, number, head, "reviewer")
             if number == 101:
                 controller.tick()
+                # The head's tip passed its own verification: the successor may be prepared on it.
+                running = controller._head()
+                controller.store.update("batches", {"id": running["id"]}, verified_tip=running["tip"])
         controller.tick()
         successor = controller.status()["sealed_successor"]
         speculative = controller.claim_task("background-worker", "admin-worker")

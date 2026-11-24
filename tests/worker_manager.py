@@ -48,7 +48,8 @@ for current, wanted, expected in (("0", "500", "500"), ("700", "500", "700"), ("
     assert score.read_text().strip() == expected, (current, wanted, score.read_text())
 
 
-def wait_for(predicate, timeout=10):
+def wait_for(predicate, timeout=60):
+    # Generous: on a loaded CI runner a wrapper's startup or a manager poll can take many seconds.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = predicate()
@@ -56,6 +57,19 @@ def wait_for(predicate, timeout=10):
             return value
         time.sleep(0.05)
     raise AssertionError("condition did not become true")
+
+
+def keeps_wrapper(worker_id, pid):
+    """The worker still runs under wrapper ``pid``: it was not restarted.
+
+    A status read can fall back to the status file, which lags a wrapper whose first update lost
+    the file lock to its child, so the reported pid is awaited; the process itself must be alive."""
+    wait_for(lambda: wm.runner_status(worker_id).get("wrapper_pid") == pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def start_manager(config):
@@ -536,13 +550,13 @@ worker3 — backing off
     # An explicit restart replaces exactly one managed wrapper.
     assert wm.manager_request("restart", id="worker2")
     wait_for(lambda: wm.runner_status("worker2").get("wrapper_pid") not in (None, pids["worker2"]))
-    assert wm.runner_status("worker1").get("wrapper_pid") == pids["worker1"]
+    assert keeps_wrapper("worker1", pids["worker1"])
 
     # Disabling is persistent desired state and stops that worker without disturbing peers.
     wm.set_worker_enabled(config, "worker3", False)
     wait_for(lambda: not wm.runner_status("worker3").get("alive"))
     assert wm.load_worker_specs(config)[2].enabled is False
-    assert wm.runner_status("worker1").get("wrapper_pid") == pids["worker1"]
+    assert keeps_wrapper("worker1", pids["worker1"])
 
     # A changed definition restarts only the changed worker.
     current = wm.load_worker_specs(config)
@@ -561,7 +575,7 @@ worker3 — backing off
     malformed.write_text("version = 1\n[[workers]]\nid = 42\n")
     os.replace(malformed, config)
     time.sleep(0.3)
-    assert wm.runner_status("worker1").get("wrapper_pid") == worker1_pid
+    assert keeps_wrapper("worker1", worker1_pid)
     response = wm.manager_request("ping")
     assert response and response.get("error")
 
@@ -571,7 +585,7 @@ worker3 — backing off
     manager.wait(10)
     manager = start_manager(config)
     wait_for(lambda: (reply := wm.manager_request("ping")) and reply.get("error"))
-    assert {wid: wm.runner_status(wid).get("wrapper_pid") for wid in survivors} == survivors
+    assert all(keeps_wrapper(wid, pid) for wid, pid in survivors.items())
 
     # Shutdown against an initially malformed config stops surviving wrappers without iterating None.
     assert wm.manager_request("shutdown", stop_workers=True)
