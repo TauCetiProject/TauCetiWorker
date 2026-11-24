@@ -2742,7 +2742,9 @@ def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
 
             select("fix")
             report_runtime("running", phase="fix", target=f"PR #{c.pr}", detail=detail)
-            gh_run(["gh", "pr", "close", str(c.pr), "--repo", TAUCETI, "--comment", comment])
+            # The selected source's own repository: gh_run routes a Forgejo source's name to its forge.
+            repo = getattr(w.gh, "repo", "") or TAUCETI
+            gh_run(["gh", "pr", "close", str(c.pr), "--repo", repo, "--comment", comment])
             after = w.gh.pr_view(c.pr, ["state"])
             if not after or after.get("state") not in {"CLOSED", "MERGED"}:
                 raise NoProgress(f"fix #{c.pr}: automatic closure not confirmed; retrying without another model call")

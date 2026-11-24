@@ -336,6 +336,7 @@ class GlobalMaintenance(unittest.TestCase):
                 self.assertEqual(work._close_capped_pr(self.w, sv, c), 0)
             argv = mutation.call_args.args[0]
             self.assertEqual(argv[:4], ["gh", "pr", "close", "10"])
+            self.assertEqual(argv[argv.index("--repo") + 1], self.w.gh.repo, "the selected source's repository")
             self.assertIn(f"after {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds", argv[argv.index("--comment") + 1])
             self.assertEqual(peer_claims.fixed_heads(scope, 10), set(), "a reopened PR starts a fresh count")
             self.w.claims.release.assert_called_once()
