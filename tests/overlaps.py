@@ -742,11 +742,27 @@ class InterfaceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             event = threading.Event()
-            timer = threading.Timer(0.15, event.set)
+            ready = Path(tmp) / "agent-ready"
+
+            def lose_lease_once_running() -> None:
+                # Lose the lease only after the agent is running: a fixed delay can expire before
+                # the launch on a loaded CI runner, which tests the pre-launch check instead.
+                deadline = time.monotonic() + 60
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                event.set()
+
+            timer = threading.Thread(target=lose_lease_once_running, daemon=True)
             timer.start()
             try:
                 rc = agents.run_agent_proc(
-                    [sys.executable, "-u", "-c", "import time; print('ready', flush=True); time.sleep(30)"],
+                    [
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        "import pathlib, sys, time; pathlib.Path(sys.argv[1]).touch(); print('ready', flush=True); time.sleep(30)",
+                        str(ready),
+                    ],
                     env=dict(os.environ),
                     logdir=Path(tmp),
                     label="cancel",
@@ -754,7 +770,8 @@ class InterfaceTests(unittest.TestCase):
                     cancel_event=event,
                 )
             finally:
-                timer.cancel()
+                event.set()
+                timer.join()
             self.assertLess(rc, 0)
             telemetry = json.loads((Path(tmp) / "cancel-telemetry.json").read_text())
             self.assertEqual(telemetry["compactions"], 0)

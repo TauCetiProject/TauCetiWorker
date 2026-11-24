@@ -642,11 +642,16 @@ class CloneMaintenance(unittest.TestCase):
         env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid"}
         env.update(GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
         self.env = env
-        subprocess.run(["git", "init", "-q", str(self.clone)], check=True, env=env)
+        # A commit may start a detached automatic maintenance, which takes and then removes
+        # objects/maintenance.lock behind the test (and counts as a maintenance run) whenever it is
+        # slow to finish, as on a loaded CI runner. The fixture's own commits never start one.
+        quiet = {**env, "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "false"}
+        quiet.update(GIT_CONFIG_KEY_1="gc.auto", GIT_CONFIG_VALUE_1="0")
+        subprocess.run(["git", "init", "-q", str(self.clone)], check=True, env=quiet)
         for index in range(3):
             (self.clone / f"f{index}").write_text(f"{index}\n")
-            subprocess.run(["git", "-C", str(self.clone), "add", "-A"], check=True, env=env)
-            subprocess.run(["git", "-C", str(self.clone), "commit", "-qm", str(index)], check=True, env=env)
+            subprocess.run(["git", "-C", str(self.clone), "add", "-A"], check=True, env=quiet)
+            subprocess.run(["git", "-C", str(self.clone), "commit", "-qm", str(index)], check=True, env=quiet)
             subprocess.run(["git", "-C", str(self.clone), "update-ref", f"refs/x/{index}", "HEAD"], check=True)
         self.lock = self.clone / ".git/objects/maintenance.lock"
 

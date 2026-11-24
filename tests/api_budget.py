@@ -1237,7 +1237,10 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         self.assertIn("cooldown", self.budget.admit("second", "second", "opus", "fix")["reason"])
 
     def test_denial_never_waits_inside_round_even_for_loop_worker(self):
-        with patch.dict(os.environ, {"TAUCETI_API_WAIT": "1", "FAKE_DELAY": "0.5"}):
+        # The holder keeps its reservation for 10 s. A denial that waited for it would return only
+        # after the holder exits; the bound is the holder still running, not a wall-clock limit that
+        # a loaded CI runner can exceed just starting the wrapper.
+        with patch.dict(os.environ, {"TAUCETI_API_WAIT": "1", "FAKE_DELAY": "10"}):
             with ClaudeAPIContext("worker1", "fix"):
                 proc = subprocess.Popen(
                     ["claude", "-p", "hello", "--model", "opus", "--output-format", "stream-json"],
@@ -1246,10 +1249,9 @@ with ClaudeAPIContext("crash-fixture", "fix"):
                     text=True,
                 )
                 self.assertIn('"init"', proc.stdout.readline())
-                started = time.monotonic()
                 denied = self.run_claude()
                 self.assertEqual(denied.returncode, 75, denied.stderr)
-                self.assertLess(time.monotonic() - started, 1)
+                self.assertIsNone(proc.poll(), "the denial waited for the holder's reservation")
                 proc.communicate()
                 self.assertEqual(proc.returncode, 0)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 10)

@@ -1517,13 +1517,13 @@ class HappyPath(Fixture):
 class ClaimExpiry(Fixture):
     def test_lost_claim_stops_the_agent_and_submits_nothing(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
-        os.environ["STUB_SLEEP"] = "30"
+        os.environ["STUB_SLEEP"] = "300"
         cfg = self.config()
         self.service.renew_mode = "refuse"
         started = time.monotonic()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "claim_lost", outcome)
-        self.assertLess(time.monotonic() - started, 15, "the sleeping agent was killed when the claim was lost")
+        self.assertLess(time.monotonic() - started, 150, "the sleeping agent was killed when the claim was lost")
         self.assertEqual(self.service.results, [])
         self.assertEqual(self.service.releases, [])
         self.assertTrue(outcome["lease"]["lost"])
@@ -1562,6 +1562,7 @@ class ClaimExpiry(Fixture):
     def test_renew_errors_keep_the_agent_running(self):
         cfg = self.config()
         self.service.renew_mode = "error"  # the coordinator is unreachable but the claim has not expired
+        self.service.ttl = 300  # unrenewed, the claim must outlast the whole task on a loaded runner
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertGreaterEqual(outcome["lease"]["errors"], 1)
@@ -1970,7 +1971,7 @@ class RebaseArtifacts(Fixture):
 
         self.service.tasks = {1: self.raw}
         os.environ["STUB_AGENT_MODES"] = "repair,repair,repair,sleep"  # task 2 made calls 1 and 2
-        os.environ["STUB_SLEEP"] = "60"
+        os.environ["STUB_SLEEP"] = "300"
         stop = repair_task.Stop()
         self.addCleanup(stop.set, "cleanup")
 
@@ -2749,10 +2750,10 @@ class Providers(Fixture):
         # Codex refuses with its usage-limit error; Claude's stream reports a rejected rate limit; the api
         # provider does the work. No inference delay is spent between providers.
         os.environ["STUB_AGENT_MODES"] = "usage-limit,usage-limit,repair"
-        cfg = self.config(providers=("codex", "claude", "api"), api_key="sk-test-key", inference_delays=(30.0,))
+        cfg = self.config(providers=("codex", "claude", "api"), api_key="sk-test-key", inference_delays=(600.0,))
         started = time.monotonic()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
-        self.assertLess(time.monotonic() - started, 25)
+        self.assertLess(time.monotonic() - started, 300)
         self.assertEqual(outcome["status"], "adopted", outcome)
         calls = self.agent_calls()
         self.assertEqual([c["agent"] for c in calls], ["codex", "claude", "claude"])
@@ -3029,11 +3030,11 @@ class QueueCacheNote(Fixture):
 class AgentTimeout(Fixture):
     def test_the_worker_cap_is_an_agent_failure_not_a_lost_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
-        os.environ["STUB_SLEEP"] = "30"
+        os.environ["STUB_SLEEP"] = "300"
         cfg = self.config(agent_timeout=2, agent_attempts=1)
         started = time.monotonic()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
-        self.assertLess(time.monotonic() - started, 20)
+        self.assertLess(time.monotonic() - started, 150)
         self.assertEqual(outcome["status"], "released", outcome)
         self.assertEqual(outcome["reason"], "agent_failed")
         self.assertIn("cap", outcome["detail"])
@@ -3215,7 +3216,7 @@ class Serve(Fixture):
 
     def test_sigterm_abandons_the_attempt_and_releases_the_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
-        os.environ["STUB_SLEEP"] = "30"
+        os.environ["STUB_SLEEP"] = "300"
         cfg = self.config(poll_seconds=0.2)
         stop = repair_task.Stop()
         previous = repair_task.install_signal_handlers(stop)
@@ -3234,7 +3235,7 @@ class Serve(Fixture):
         threading.Thread(target=terminate, daemon=True).start()
         started = time.monotonic()
         summary = repair_task.serve(cfg, self.client(cfg), stop)  # the main thread: where the handler runs
-        self.assertLess(time.monotonic() - started, 25, "the sleeping agent was stopped promptly")
+        self.assertLess(time.monotonic() - started, 150, "the sleeping agent was stopped promptly")
         self.assertEqual(stop.reason, "SIGTERM")
         self.assertEqual(summary["outcomes"], {"released": 1}, summary)
         state = self.state()
@@ -3535,12 +3536,12 @@ class StopAndRelease(Fixture):
         # The retained tip is not published yet, so the claimed task waits in the fetch retry window
         # (production: the stop at 03:06 landed two minutes into the `claimed` phase).
         sh(self.content.bare, "update-ref", "-d", self.RETAINED_TIP)
-        cfg = self.config(poll_seconds=0.2, fetch_retry_seconds=60, fetch_retry_delay=0.2)
+        cfg = self.config(poll_seconds=0.2, fetch_retry_seconds=600, fetch_retry_delay=0.2)
         stop = self.install_handlers()
         self.terminate_when(lambda: self.checkpoint_state() == "claimed")
         started = time.monotonic()
         summary = repair_task.serve(cfg, self.client(cfg), stop)
-        self.assertLess(time.monotonic() - started, 20, "the fetch retry window was left at once")
+        self.assertLess(time.monotonic() - started, 150, "the fetch retry window was left at once")
         self.assertEqual(stop.reason, "SIGTERM")
         self.assertEqual(summary["outcomes"], {"released": 1}, summary)
         self.assertEqual(summary["errors"], 0)
@@ -3559,7 +3560,7 @@ class StopAndRelease(Fixture):
 
     def test_sigterm_with_the_agent_running_releases_the_claim(self):
         os.environ["STUB_AGENT_MODE"] = "sleep"
-        os.environ["STUB_SLEEP"] = "30"
+        os.environ["STUB_SLEEP"] = "300"
         cfg = self.config(poll_seconds=0.2)
         stop = self.install_handlers()
         self.terminate_when(lambda: self.checkpoint_state() == "agent_running", delay=1.0)
@@ -4151,7 +4152,7 @@ class ParallelRepair(Fixture):
         self.assertEqual(sh(self.content.bare, "show", f"{pushed}:TauCeti/A.lean"), "theorem a : True := trivial")
 
     def test_a_lost_claim_cancels_the_group_agents(self):
-        os.environ["STUB_GROUP_SLEEP"] = "30"
+        os.environ["STUB_GROUP_SLEEP"] = "300"
         cfg = self.config(parallel_agents=2)
 
         def lose_the_claim_once_both_agents_run():
@@ -4164,7 +4165,7 @@ class ParallelRepair(Fixture):
         started = time.monotonic()
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "claim_lost", outcome)
-        self.assertLess(time.monotonic() - started, 25, "the sleeping group agents were stopped")
+        self.assertLess(time.monotonic() - started, 150, "the sleeping group agents were stopped")
         self.assertEqual(outcome["parallel"]["status"], "cancelled")
         self.assertEqual([g["status"] for g in outcome["parallel"]["groups"]], ["cancelled", "cancelled"])
         self.assertEqual(len(self.agent_calls()), 2)

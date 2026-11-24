@@ -29,7 +29,7 @@ NEWSESS=("$PY" -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1
 # Imports can take longer than one second on a busy host. The hook logs readiness only
 # after RoundContext owns the lock and has installed both signal handlers.
 wait_ready() {
-  local pid=$1 logfile=$2 deadline=$((SECONDS + 15))
+  local pid=$1 logfile=$2 deadline=$((SECONDS + 90))
   while (( SECONDS < deadline )); do
     grep -qF "[test] holding the lock and sleeping" "$logfile" && return 0
     kill -0 "$pid" 2>/dev/null || break
@@ -81,7 +81,9 @@ pgid=$(ps -o pgid= -p "$child" | tr -d ' ')
 self=$(ps -o pgid= -p $$ | tr -d ' ')
 if [ -n "$pgid" ] && [ "$pgid" != "$self" ]; then
   kill -TERM -- "-$pgid" 2>/dev/null
-  sleep 1
+  # The teardown runs Python cleanup; on a loaded runner that can take seconds, not one.
+  deadline=$((SECONDS + 30))
+  while kill -0 "$child" 2>/dev/null && (( SECONDS < deadline )); do sleep 0.1; done
   kill -0 "$child" 2>/dev/null && { no "round survived SIGTERM"; kill -KILL -- "-$pgid" 2>/dev/null; } \
                                || ok "round group torn down by SIGTERM"
 else

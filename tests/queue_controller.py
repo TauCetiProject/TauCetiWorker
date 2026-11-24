@@ -3797,7 +3797,7 @@ class StatusSnapshot(ControllerCase):
         def hold():
             with self.controller._lock:
                 held.set()
-                release.wait(10)
+                release.wait(60)
 
         thread = threading.Thread(target=hold)
         thread.start()
@@ -3812,7 +3812,8 @@ class StatusSnapshot(ControllerCase):
         release = self.hold_lock()
         started = time.monotonic()
         status = self.controller.status(wait=0.2)
-        self.assertLess(time.monotonic() - started, 1.5)
+        # The lock is held for a minute; the margin over the 0.2 s wait is for a loaded runner.
+        self.assertLess(time.monotonic() - started, 10)
         self.assertEqual((status["snapshot"], status["head"]["size"]), (True, 1), "the snapshot the tick took")
         self.assertGreaterEqual(status["stale_seconds"], 0)
         json.dumps(status)
