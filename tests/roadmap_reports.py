@@ -140,8 +140,10 @@ class Reader(unittest.TestCase):
         deep = body(rr.PREFIX + "[" * 100000 + "]" * 100000 + "-->", marker())
         reports, errors = rr.read(deep)
         self.assertEqual(len(reports), 1)
-        self.assertIn("not one JSON object", errors[0])
-        self.assertIn("report marker 1: not one JSON object", rr.check(deep)[0])
+        # Whether the decoder raises RecursionError or returns the list depends on the interpreter;
+        # either way the marker is refused and nothing raises.
+        self.assertRegex(errors[0], "not (one|a) JSON object")
+        self.assertRegex(rr.check(deep)[0], "report marker 1: .*not (one|a) JSON object")
 
 
 class Checks(unittest.TestCase):
