@@ -2040,6 +2040,9 @@ class PreRebase(ControllerCase):
             task.task_id, task.claim_token, tip, json.dumps({"pre_rebase_verification": evidence})
         )
         self.assertTrue(result.accepted, result)
+        # On a head tip that passed its own verification (decision 174), the mark stands.
+        head = self.controller._head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
         self.controller.tick()
         self.assertEqual(self.open_batch()["pre_rebase_prepared"], tip)
         self.assertEqual(self.open_tasks(self.open_batch()), [])
