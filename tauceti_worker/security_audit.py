@@ -373,6 +373,15 @@ def image(repo: Path, commit: str, path: str) -> str | None:
         raise Die(f"security-audit: invalid UTF-8 at {commit}:{path}") from exc
 
 
+# Every diff shown to the reviewer is a full text diff. Attributes, including a `.gitattributes`
+# the audited commits add (`*.lean binary`, `-diff`, `diff=<driver>`), must not reduce it to
+# "Binary files ... differ": `attr.tree` names the empty tree, so no in-tree attributes are read,
+# and `--text` overrides any that remain (`$GIT_DIR/info/attributes`). The images themselves are
+# read with `cat-file`, and `image` rejects content that is not UTF-8 text.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+TEXT_DIFF = ("-c", f"attr.tree={EMPTY_TREE}", "diff", "--text", "--no-ext-diff", "--no-textconv", "--no-renames")
+
+
 def commit_input(repo: Path, sha: str) -> dict:
     parent = git(repo, "rev-parse", sha + "^1").decode().strip()
     names = git(repo, "diff", "--no-renames", "--name-only", "-z", parent, sha).split(b"\0")
@@ -391,7 +400,9 @@ def commit_input(repo: Path, sha: str) -> dict:
     files = []
     for path in paths:
         before, after = image(repo, parent, path), image(repo, sha, path)
-        diff = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", parent, sha, "--", path)
+        diff = git(repo, *TEXT_DIFF, parent, sha, "--", path)
+        if any(line.startswith((b"Binary files ", b"GIT binary patch")) for line in diff.splitlines()):
+            raise Die(f"security-audit: git elided the diff of {sha}:{path}; manual inspection required")
         files.append({"path": path, "before": before, "after": after, "diff": diff.decode("utf-8")})
     return {"sha": sha, "parent": parent, "files": files}
 
