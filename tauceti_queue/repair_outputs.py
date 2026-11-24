@@ -51,10 +51,17 @@ class Unavailable(RuntimeError):
 
 
 def _regular(path: Path) -> bool:
+    """Whether ``path`` is a regular file; absent is False, any other failure is Unavailable."""
     try:
         return stat.S_ISREG(path.lstat().st_mode)
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError as error:
+        raise Unavailable(f"cannot inspect {path}: {error}") from error
+
+
+def _raise_unavailable(error: OSError) -> None:
+    raise Unavailable(f"cannot list the build tree: {error}") from error
 
 
 def expected(worktree: Path) -> list[tuple[Path, object, list[tuple[Path, str]]]]:
@@ -63,7 +70,7 @@ def expected(worktree: Path) -> list[tuple[Path, object, list[tuple[Path, str]]]
     modules = []
     if not lib.is_dir():
         return modules
-    for directory, _, files in os.walk(lib):
+    for directory, _, files in os.walk(lib, onerror=_raise_unavailable):
         for file in files:
             if not file.endswith(".trace"):
                 continue
@@ -71,8 +78,10 @@ def expected(worktree: Path) -> list[tuple[Path, object, list[tuple[Path, str]]]
             stem = trace.relative_to(lib).with_suffix("")
             try:
                 value = json.loads(trace.read_text())
-            except (OSError, ValueError):
-                continue
+            except ValueError:
+                continue  # not a trace Lake would trust either
+            except OSError as error:
+                raise Unavailable(f"cannot read {trace}: {error}") from error
             outputs = value.get("outputs") if isinstance(value, dict) else None
             if not isinstance(outputs, dict):
                 continue
@@ -93,8 +102,10 @@ def published_archives(worktree: Path) -> list[tuple[str, str]]:
     """The (input hash, archive name) rows of the final build's native output map, if any."""
     try:
         lines = (worktree / ".lake/outputs.jsonl").read_text().splitlines()
-    except OSError:
+    except FileNotFoundError:
         return []
+    except OSError as error:
+        raise Unavailable(f"cannot read the output map: {error}") from error
     rows = []
     for line in lines[1:]:
         try:

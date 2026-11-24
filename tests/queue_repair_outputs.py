@@ -140,6 +140,18 @@ class Outputs(unittest.TestCase):
             with patch.object(repair_outputs, "native_hashes", side_effect=lambda w, e, paths: hasher(paths)):
                 self.assertEqual(len(repair_outputs.damaged(self.root, {})), 1)
 
+    def test_discovery_errors_stop_publication(self):
+        self.module("Basic", "4366fd23170e9e25", "a")
+        (self.root / ".lake/outputs.jsonl").mkdir()  # unreadable as a file
+        with self.assertRaises(repair_outputs.Unavailable):
+            repair_outputs.damaged(self.root, {}, hasher=hasher)
+        (self.root / ".lake/outputs.jsonl").rmdir()
+        # A trace that cannot be read.
+        with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
+            with self.assertRaises(repair_outputs.Unavailable):
+                repair_outputs.damaged(self.root, {}, hasher=hasher)
+            self.assertFalse(repair_outputs.discard_damaged(self.root, {}, hasher=hasher)["checked"])
+
     def test_an_unavailable_hasher_is_reported_not_raised(self):
         self.module("Basic", "4366fd23170e9e25", "a")
 
