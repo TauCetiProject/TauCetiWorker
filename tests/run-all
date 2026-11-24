@@ -176,6 +176,7 @@ RUN_STDLIB=(
   queue_chain.py
   queue_commands.py
   queue_github_adapter.py
+  queue_main_integration.py
   queue_feeds.py
   queue_landing_receipts.py
   queue_server.py
