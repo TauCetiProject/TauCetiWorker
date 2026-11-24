@@ -137,6 +137,8 @@ DELIVERY_STATES = ("delivery_pending", "pushed", "submitted")
 RELEASED_AGENT_STATUSES = ("inference_unavailable", "artifacts_unavailable", "agent_launch_failed")
 
 PROVIDERS = repair.PROVIDERS  # claude | codex | api, as the chain names them
+# ``api`` is the intended production provider; the subscriptions rank first only so they can be tested
+# when logged in, and their "skipped" lines while logged out are expected (docs/queue/repair-task.md).
 DEFAULT_PROVIDERS = ("claude", "codex", "api")
 SUBSCRIPTION_PROVIDERS = ("claude", "codex")  # paced by the fleet's quota reader; ``api`` is not
 # Checkpoint states before the agent has run: an error there is released as ``artifacts_unavailable``.

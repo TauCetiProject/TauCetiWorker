@@ -921,6 +921,15 @@ The agent's provider is chosen per task from a chain, `RunnerConfig.providers`
   an isolated config dir that holds no subscription credential. The worker takes the key out of its own
   environment at start; it is never logged or recorded.
 
+The production repair workers (`tauceti-queue-repair`, `@2` and `@3` on tauchonki2) are meant to run
+on `api`; that is the intended path (Kim, 2026-11-25). `claude` and `codex` rank above it in the
+default chain only so the subscriptions can be tested when they happen to be logged in; they are
+optional. While they are logged out or expired the journal shows skip lines such as `provider claude
+skipped: no claude accessToken` and `provider codex skipped: codex token expired; refresh left to the
+operator` (or another missing or expired credential reason: `no ~/.codex/auth.json`, `claude usage HTTP
+401 (access token expired or rejected; log in again)`). Those lines are expected and are not a problem:
+do not report, file or log in again over them unless Kim asks.
+
 At the start of each run (`select_providers`) a subscription provider is eligible only if the fleet
 pacer (`tauceti_worker.quota.Quota.claude` / `.codex`, the usage endpoints read with the host's
 credential, their session and weekly windows against the pacing curve) reports it under pace, with

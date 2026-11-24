@@ -729,6 +729,12 @@ task's outcome and `worker.json` (`providers` counts, `last_outcome.provider_att
 provider tried or skipped with its reason and seconds. `--providers` and `--rate` override the two
 settings on the command line.
 
+The intended production provider for the three repair workers is `api`; the subscriptions rank above it
+only for testing and may stay logged out. Their skip lines for a missing or expired credential (such as
+`provider claude skipped: no claude accessToken` or `provider codex skipped: codex token expired; refresh
+left to the operator`) are expected:
+do not report, file or log in again over them unless Kim asks ([Providers](repair-task.md#providers)).
+
 Codex through a ChatGPT account serves the default Sol profile (`gpt-6.1-sol`, with its probe and
 the `gpt-6-luna` fallback); no model pin is needed. A Codex CLI too old to know `gpt-6.1-sol` fails
 instead: it logs "Model metadata for `gpt-6.1-sol` not found" and the server answers `model_not_found`
