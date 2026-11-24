@@ -6262,7 +6262,18 @@ class WorkerAudits(Fixture):
             (repair_task.ATTESTATION_SCHEMA, outcome["tip"], policy, "full", True),
         )
         self.assertEqual(attested["tools_commit"], f"TauCetiProject/TauCetiTools@{TOOLS_REF}")
-        self.assertIs(attested["verifier_isolated"], False, "not yet: the controller counts none")
+        self.assertIs(attested["verifier_isolated"], True)
+        # The scripts and scope files lived in a host-only directory for the check, removed afterwards; the
+        # drivers are cached by key under the tools root; the checks mounted both read-only.
+        tools = cfg.root / repair_audit.TOOLS_DIR
+        self.assertEqual(list((tools / repair_audit.VERIFIER_DIR).iterdir()), [])
+        [drivers] = list((tools / repair_audit.DRIVERS_DIR).iterdir())
+        self.assertTrue(all((drivers / exe).is_file() for exe in repair_audit.DRIVER_EXES))
+        audits = [c["argv"] for c in self.bwrap_calls() if any(a.endswith("/audit-driver") for a in c["argv"])]
+        argv = audits[-1]
+        self.assertIn(str(drivers.resolve()), [argv[i + 1] for i, a in enumerate(argv) if a == "--ro-bind"])
+        self.assertLess(argv.index("--ro-bind", argv.index(str(drivers.resolve())) - 1), argv.index("--remount-ro"))
+        self.assertNotIn(str(drivers.resolve()), [argv[i + 1] for i, a in enumerate(argv) if a == "--bind"])
         self.assertEqual(
             attested["tree"], repair.git(self.content.clone, "rev-parse", f"{outcome['tip']}^{{tree}}").strip()
         )
@@ -6278,6 +6289,26 @@ class WorkerAudits(Fixture):
         self.assertIn("not in the clone", checks["policy_error"])
         attested = json.loads(self.service.results[0]["worker_notes"])["attestation"]
         self.assertIsNone(attested["policy_commit"], "the controller will not count it")
+
+    def test_a_link_left_in_place_of_the_audit_work_directory_is_not_followed(self):
+        """Candidate code can write `.lake`; a link it leaves where the phase markers go is removed, not
+        followed, and nothing is written through it."""
+        target = self.root / "elsewhere"
+        target.mkdir()
+        work = self.content.clone / repair_audit.WORK_DIR
+        shutil.rmtree(work, ignore_errors=True)
+        work.parent.mkdir(parents=True, exist_ok=True)
+        work.symlink_to(target)
+        checks = repair_audit.check(
+            self.content.clone,
+            repair.lake_env(self.config().root),
+            base=self.content.base,
+            tools_root=self.root / "tools",
+            logdir=self.root / "logs",
+        )
+        self.assertEqual(checks["status"], "passed")
+        self.assertFalse(work.is_symlink())
+        self.assertEqual(list(target.iterdir()), [])
 
     def test_a_failed_verification_is_not_attested(self):
         self.findings("audit-findings-always", DUPLICATE_LINE)

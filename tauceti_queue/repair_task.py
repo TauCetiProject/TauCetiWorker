@@ -1461,9 +1461,6 @@ def verified_unchanged(tip: str, outcome: dict) -> bool:
 
 
 ATTESTATION_SCHEMA = "tauceti-queue.attestation/v1"
-# Whether the checks' scripts, drivers and scope files are kept outside every candidate-writable
-# directory and mounted read-only. Not yet; until then the controller counts no attestation.
-VERIFIER_ISOLATED = False
 
 
 def latest_checks(tip: str, outcome: dict) -> dict | None:
@@ -1500,9 +1497,9 @@ def attestation(clone: Path, tip: str, checks: dict | None, publish: dict | None
         "sandbox": checks.get("sandbox") is True,
         "toolchain": toolchain,
         "outputs_published": bool(publish and publish.get("revision") == tip and publish.get("published")),
-        # The checks' scripts and compiled drivers still live under the worktree's `.lake`, which the
-        # sandboxed build can write, so the verifier itself is not yet out of the candidate's reach.
-        "verifier_isolated": VERIFIER_ISOLATED,
+        # Whether the checks' scripts, scope files and drivers were outside every candidate-writable
+        # directory and mounted read-only (`repair_audit.check`).
+        "verifier_isolated": checks.get("verifier_isolated") is True,
         "worker_revision": STARTUP_REVISION,
     }
 
