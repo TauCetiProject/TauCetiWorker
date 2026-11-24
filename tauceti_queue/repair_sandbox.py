@@ -77,6 +77,12 @@ CREDENTIAL_VARIABLES = (
     "TAUCETI_QUEUE_TOKEN_FILE",
     "TAUCETI_REPAIR_CACHE_KEY_FILE",
     "TAUCETI_QUEUE_CONFIG",
+    "TAUCETI_CLAUDE_USAGE_CREDENTIALS",
+    "TAUCETI_ANTHROPIC_KEY_FILE",
+    "TAUCETI_FORGEJO_TOKEN_FILE",
+    "TAUCETI_GITHUB_STATE_TOKEN_FILE",
+    "TAUCETI_SECURITY_AUDIT_ANTHROPIC_API_KEY_FILE",
+    "CREDENTIALS_DIRECTORY",
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
     "GH_CONFIG_DIR",
@@ -146,7 +152,8 @@ def credential_paths(env: dict | None = None) -> list[Path]:
     home = Path(env.get("HOME") or os.path.expanduser("~"))
     found: list[Path] = []
     for key in CREDENTIAL_VARIABLES:
-        if value := (env.get(key) or "").strip():
+        value = (env.get(key) or "").strip()
+        if value.startswith(("/", "~")):  # a path; anything else is never copied anywhere
             found.append(Path(value).parent if key == "TAUCETI_QUEUE_CONFIG" else Path(value))
     found += [Path(p) for p in (env.get(HIDDEN_VARIABLE) or "").split(os.pathsep) if p.strip()]
     found += [home / name for name in HOME_CREDENTIALS]
@@ -159,23 +166,44 @@ def credential_paths(env: dict | None = None) -> list[Path]:
     return result
 
 
-def _credential_masks(sources: list[str], env: dict) -> list[str]:
-    """Mount arguments covering each existing credential path inside a bound tree: an empty tmpfs on
-    a directory, ``/dev/null`` on a file. Raises :class:`SandboxUnavailable` when a bound tree lies
-    inside a credential directory (or is one), which no mask could repair."""
-    bound = [Path(source).resolve() for source in sources]
-    masks: list[str] = []
+def _binds(args: list[str]) -> list[tuple[str, str]]:
+    """The ``(source, destination)`` of every bind in sandbox arguments, ``/dev/null`` masks excluded."""
+    return [
+        (args[i + 1], args[i + 2])
+        for i, a in enumerate(args)
+        if a in ("--ro-bind", "--bind") and args[i + 1] != "/dev/null"
+    ]
+
+
+def exposures(binds: list[tuple[str, str]], env: dict) -> list[tuple[Path, Path]]:
+    """Where each credential path would appear inside the sandbox: ``(inside, host)`` for every bind
+    whose resolved source contains the credential's resolved path, the inside path being that bind's
+    destination joined with the remainder (a symlinked source shows its target's files under its own
+    name). Raises :class:`SandboxUnavailable` when a bound source lies inside a credential directory
+    (or is one), which no mask could repair."""
+    found: list[tuple[Path, Path]] = []
     for credential in credential_paths(env):
-        for source in bound:
-            if source == credential or source.is_relative_to(credential):
+        host = credential.resolve()
+        for source, destination in binds:
+            resolved = Path(source).resolve()
+            if resolved == host or resolved.is_relative_to(host):
                 raise SandboxUnavailable(f"the sandbox would bind {source}, inside the credential path {credential}")
-        if not os.path.lexists(credential) or not any(credential.is_relative_to(source) for source in bound):
-            continue
-        if credential.is_dir() and not credential.is_symlink():
-            masks += ["--tmpfs", str(credential)]
-        elif credential.is_file() and not credential.is_symlink():
-            masks += ["--ro-bind", "/dev/null", str(credential)]
-        # A symlink inside a bound tree resolves through it; its target is listed and checked itself.
+            if host.is_relative_to(resolved):
+                pair = (Path(destination) / host.relative_to(resolved), host)
+                if pair not in found:
+                    found.append(pair)
+    return found
+
+
+def _credential_masks(binds: list[tuple[str, str]], env: dict) -> list[str]:
+    """Mount arguments covering each existing credential path wherever a bind exposes it: an empty
+    tmpfs on a directory, ``/dev/null`` on a file."""
+    masks: list[str] = []
+    for inside, host in exposures(binds, env):
+        if host.is_dir():
+            masks += ["--tmpfs", str(inside)]
+        elif host.is_file():
+            masks += ["--ro-bind", "/dev/null", str(inside)]
     return masks
 
 
@@ -313,8 +341,7 @@ def sandbox_argv(
         shared = packages.resolve()
         if shared.is_dir():
             args += ["--ro-bind", str(shared), str(shared)]
-    sources = [args[i + 1] for i, a in enumerate(args) if a in ("--ro-bind", "--bind") and args[i + 1] != "/dev/null"]
-    args += _credential_masks(sources, env)
+    args += _credential_masks(_binds(args), env)
     args += ["--remount-ro", "/"]
     args += ["--setenv", "PATH", _inside_path(env, elan), "--setenv", "HOME", home]
     # The sandbox is always offline: Lake restores only from the local pool, never a remote cache.
@@ -383,10 +410,15 @@ def check(scratch: Path | None = None, env: dict | None = None) -> tuple[bool, s
     if scratch is not None:
         scratch.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ if env is None else env)
-    present = [str(p) for p in credential_paths(env) if p.is_file() or (p.is_dir() and any(p.iterdir()))]
+    present = [p for p in credential_paths(env) if p.is_file() or (p.is_dir() and any(p.iterdir()))]
     with tempfile.TemporaryDirectory(prefix="sandbox-check-", dir=scratch) as directory:
         try:
-            argv = sandbox_argv(["sh", "-c", _CREDENTIAL_PROBE, "sh", *present], Path(directory), env)
+            argv = sandbox_argv(["true"], Path(directory), env)
+            # Each credential's own path and every path a bind exposes it under.
+            held = {p.resolve() for p in present}
+            probed = [str(p) for p in present]
+            probed += [str(inside) for inside, host in exposures(_binds(argv), env) if host in held]
+            argv = sandbox_argv(["sh", "-c", _CREDENTIAL_PROBE, "sh", *dict.fromkeys(probed)], Path(directory), env)
         except SandboxUnavailable as error:
             return False, str(error)
         try:

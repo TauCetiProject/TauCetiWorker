@@ -438,7 +438,8 @@ has a time budget holds because the service re-exposes the task.
    toolchains, and every credential path the worker knows (`repair_sandbox.credential_paths`: the
    queue App's directory, the worker token file, the repair-cache write key, the provider and `gh`
    config directories, `~/.ssh` and the like) that lies inside a bound tree is covered by an empty
-   tmpfs or `/dev/null`. The preflight's "build sandbox" check fails when any of them that holds
+   tmpfs or `/dev/null`, at every path a bind exposes it under (a symlinked bind source shows its
+   target's files under its own name). The preflight's "build sandbox" check fails when any of them that holds
    something can be read from inside.
 
    **The agent's toolchain commands.** The batch's Lean can run code whenever it is elaborated, so the
@@ -452,7 +453,8 @@ has a time budget holds because the service re-exposes the task.
    `shell-guard.sh` is sourced by every bash the agent starts (`BASH_ENV` for Codex and scripts,
    Claude Code's `CLAUDE_ENV_FILE`): before each command it puts the shims back first on `PATH` and
    refuses a command line naming a toolchain executable by path (under the elan home, or the elan
-   proxy's resolved file). What the agent's unconfined shell leaves uncovered: a non-bash program that
+   proxy's resolved file) or giving a toolchain command a `PATH` of its own (a `PATH=` prefix not led
+   by the shims, `env -i`, `env -u PATH`, `command -p`). What the agent's unconfined shell leaves uncovered: a non-bash program that
    executes a toolchain binary by absolute path, a path assembled at run time, and deliberate evasion;
    closing those needs the agent itself confined, with builds requested from outside.
    The agent's scoped builds through `.tauceti-repair/build` import the same function from the

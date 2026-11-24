@@ -166,6 +166,24 @@ class ShellGuard(Fixture):
                 self.assertNotIn("survived", run.stdout)
                 self.assertIn("bypasses the build sandbox", run.stderr)
 
+    def test_a_path_that_skips_the_shims_is_refused(self):
+        for command in (
+            f'PATH="{self.bin}:$PATH" lake build',
+            f"PATH={self.bin} lean --version",
+            f"env PATH={self.bin} lake build",
+            "env -i lake build",
+            "env -u PATH lake build",
+            "command -p lean --version",
+            f"FOO=1 PATH='{self.bin}' elan show",
+        ):
+            with self.subTest(command=command):
+                run = self.run_agent(command, self.worktree)
+                self.assertNotIn("real", run.stdout)
+                self.assertIn("sets or resets PATH", run.stderr)
+        run = self.run_agent(f'PATH="{self.tools}:$PATH" lake build; grep -ci lean lakefile.toml', self.worktree)
+        self.assertEqual(run.stdout.split(), ["0"], run.stderr)
+        self.assertEqual(len(self.bwrap_calls()), 1)
+
     def test_ordinary_commands_and_named_tools_pass(self):
         run = self.run_agent(
             "echo TauCeti/Lean/Foo.lean; ls lakefile.toml; lake build; mkdir -p d/lean; echo ok", self.worktree
@@ -199,6 +217,29 @@ class Credentials(Fixture):
         self.assertIn(["--ro-bind", "/dev/null", str(key)], [tail[i : i + 3] for i in range(len(tail))])
         self.assertIn(["--tmpfs", str(pool / "app")], [tail[i : i + 2] for i in range(len(tail))])
         self.assertLess(argv.index(str(key)), argv.index("--remount-ro"))
+
+    def test_a_credential_under_a_symlinked_bind_is_masked_where_it_appears(self):
+        data = self.tmp / "data"
+        (data / "pool").mkdir(parents=True)
+        key = data / "pool" / "repair-cache-key"
+        key.write_text("secret")
+        (self.tmp / "pool").symlink_to(data / "pool")
+        usage = data / "pool" / "usage.json"
+        usage.write_text("secret")
+        env = {
+            **self.env,
+            "LAKE_CACHE_DIR": str(self.tmp / "pool"),
+            "TAUCETI_REPAIR_CACHE_KEY_FILE": str(key),
+            "TAUCETI_CLAUDE_USAGE_CREDENTIALS": str(usage),
+        }
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, env, bwrap=str(self.bin / "bwrap"))
+        triples = [argv[i : i + 3] for i in range(len(argv))]
+        for name in ("repair-cache-key", "usage.json"):
+            self.assertIn(["--ro-bind", "/dev/null", str(self.tmp / "pool" / name)], triples)
+
+    def test_a_credential_value_that_is_not_a_path_is_never_copied(self):
+        env = {**self.env, "TAUCETI_REPAIR_CACHE_KEY_FILE": "id:secret"}
+        self.assertNotIn("secret", " ".join(map(str, repair_sandbox.credential_paths(env))))
 
     def test_a_bound_tree_inside_a_credential_directory_is_refused(self):
         secrets = self.home / ".config" / "tauceti-queue"
@@ -246,6 +287,19 @@ class Credentials(Fixture):
         )
         self.assertEqual(run.stdout.strip(), "done", run.stderr)
         ok, detail = repair_sandbox.check(self.tmp / "scratch", env)
+        self.assertTrue(ok, detail)
+        # The same key exposed through a symlinked pool is masked, and probed, under the pool's name.
+        (self.tmp / "pool-link").symlink_to(pool)
+        linked = {**env, "LAKE_CACHE_DIR": str(self.tmp / "pool-link")}
+        run = subprocess.run(
+            repair_sandbox.sandbox_argv(
+                ["sh", "-c", f"cat {self.tmp}/pool-link/repair-cache-key; echo done"], self.worktree, linked
+            ),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(run.stdout.strip(), "done", run.stderr)
+        ok, detail = repair_sandbox.check(self.tmp / "scratch", linked)
         self.assertTrue(ok, detail)
         # A credential inside a bound tree that the masks did not cover is reported.
         with patch.object(repair_sandbox, "_credential_masks", return_value=[]):

@@ -20,7 +20,10 @@ worktree's ``.lake`` and the artifact pool writable, no credential readable.
   ``CLAUDE_ENV_FILE`` through ``repair.prepare_claude_shell_env``). Before each command it puts the
   shim directory back first on ``PATH`` (a login profile may reorder it) and refuses a command
   that names a toolchain executable by path (``~/.elan/toolchains/.../bin/lean``, the elan proxy's
-  resolved file), which would bypass the shims.
+  resolved file) or gives a toolchain command its own ``PATH`` (a ``PATH=`` prefix not led by the
+  shims, ``env -i``, ``env -u PATH``, ``command -p``), either of which would bypass the shims. A
+  refused command does not run; bash reports status 0 for it unless ``set -e`` is on, so the
+  refusal is the message on stderr.
 
 What this cannot cover while the agent's shell itself runs unsandboxed: a program other than bash
 (Python, Node, a compiled tool) that executes a toolchain binary by absolute path, a command line the
@@ -108,11 +111,32 @@ __tauceti_guard() {
     *) PATH="$__TAUCETI_TOOLS:$PATH" ;;
   esac
   local c=$BASH_COMMAND
-  case $c in */*) ;; *) return 0 ;; esac
   case $c in *lean*|*lake*|*elan*) ;; *) return 0 ;; esac
   local -a w
   local x r p
   read -r -a w <<<"$c" || true
+  # A command-local PATH, or env and command forms that reset it, would look a tool up past the shims.
+  local search=0 named=0 prev=
+  for x in "${w[@]}"; do
+    case $x in
+      PATH=*|\'PATH=*|\"PATH=*)
+        x=${x#[\'\"]}
+        case ${x#PATH=} in "$__TAUCETI_TOOLS"|"$__TAUCETI_TOOLS":*|[\'\"]"$__TAUCETI_TOOLS"*) ;; *) search=1 ;; esac ;;
+    esac
+    case $prev:$x in
+      env:-i|env:-|env:--ignore-environment|env:-uPATH|env:--unset=PATH|-u:PATH|--unset:PATH|command:-p*) search=1 ;;
+    esac
+    case $x in -u|--unset) ;; -*) [[ $prev == env || $prev == command ]] && x=$prev ;; esac
+    prev=${x##*/}
+    x=${x//\"/}
+    x=${x//\'/}
+    case ${x##*/} in lean*|lake*|elan*) named=1 ;; esac
+  done
+  if ((search && named)); then
+    printf 'tauceti repair: refused: this command sets or resets PATH for a Lean toolchain command, which would bypass the build sandbox. Run `lake`, `lean` or `elan` with the PATH you have; they run offline in the sandbox.\n' >&2
+    return 1
+  fi
+  case $c in */*) ;; *) return 0 ;; esac
   for x in "${w[@]}"; do
     x=${x//\"/}
     x=${x//\'/}
