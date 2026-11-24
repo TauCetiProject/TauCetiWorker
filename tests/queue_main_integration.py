@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """The main-integration backfill (decision 175 B): dispatch, results, confirmation, take-out before seal."""
 
+import dataclasses
+import json
 import subprocess
 import sys
 import tempfile
@@ -32,6 +34,7 @@ class Backfill(unittest.TestCase):
         }
         self.controller.set_setting("main_integration_interval_seconds", 0, "test")
         self.controller.set_setting("main_integration_enabled", True, "test")
+        self.runs = 0
 
     def approve(self, number, files):
         head = self.github.create_pr(number, files)
@@ -46,8 +49,17 @@ class Backfill(unittest.TestCase):
 
     def post(self, number, state, description="passed"):
         main = self.record(number)["main"]
+        self.runs += 1
         self.github.post_status(
-            self.heads[number], state, "77", f"B={main[:12]} T=0123456789ab {description}", context="main-integration"
+            self.heads[number],
+            state,
+            str(self.runs),
+            f"B={main[:12]} T=0123456789ab {description}",
+            context="main-integration",
+        )
+        key = (self.heads[number], "main-integration")
+        self.github.statuses[key] = dataclasses.replace(
+            self.github.statuses[key], target_url=f"https://github.com/run/{self.runs}"
         )
 
     def test_dispatches_unsealed_members_onto_main_and_records_green(self):
@@ -81,7 +93,9 @@ class Backfill(unittest.TestCase):
 
     def test_a_status_for_another_main_or_from_before_the_dispatch_is_not_an_answer(self):
         self.controller.tick()
-        self.github.post_status(self.heads[102], "failure", "1", "B=000000000000 T=x failed", context="main-integration")
+        self.github.post_status(
+            self.heads[102], "failure", "1", "B=000000000000 T=x failed", context="main-integration"
+        )
         self.clock.advance(60)
         self.controller.tick()
         self.assertEqual(self.record(102)["state"], "pending")
@@ -101,14 +115,29 @@ class Backfill(unittest.TestCase):
         self.assertEqual(self.record(103)["failures"], 1)
         self.assertEqual([r[0] for r in self.github.main_integration_requests].count(103), 2)
         self.assertEqual(self.batch()["version"], before["version"])
+        # The first run's status, read again while the confirmation is queued, is not a second verdict.
         self.clock.advance(60)
-        self.post(103, "failure", "failed again")
+        self.controller.tick()
+        self.assertEqual(self.record(103)["state"], "pending")
+        self.assertEqual(self.batch()["version"], before["version"])
+        self.clock.advance(60)
+        self.github.post_status(
+            self.heads[103],
+            "failure",
+            "78",
+            f"B={self.record(103)['main'][:12]} T=x failed again",
+            context="main-integration",
+        )
+        self.github.statuses[(self.heads[103], "main-integration")] = dataclasses.replace(
+            self.github.statuses[(self.heads[103], "main-integration")], target_url="https://github.com/run/78"
+        )
         self.clock.advance(60)
         self.controller.tick()
         batch = self.batch()
         self.assertEqual(batch["version"], before["version"] + 1)
         members = self.controller._members(batch["id"])
         self.assertEqual([m["number"] for m in members], [102, 104])
+        self.assertEqual([m["position"] for m in members], [0, 1])
         removed = self.controller.store.row("members", {"number": 103})
         self.assertEqual((removed["removed"], removed["removed_reason"]), (1, "main-integration-failed"))
         row = self.controller.store.row("inputs", {"number": 103})
@@ -117,7 +146,9 @@ class Backfill(unittest.TestCase):
         # The chain is exactly the remaining members, each commit where the member row says.
         commits = chain.chain_commits(self.controller.clone, batch["base"], batch["tip"])
         self.assertEqual([c.sha for c in commits], [m["commit_sha"] for m in members])
-        self.assertNotIn("TauCeti/F103.lean", chain.git(self.controller.clone, "ls-tree", "-r", "--name-only", batch["tip"]))
+        self.assertNotIn(
+            "TauCeti/F103.lean", chain.git(self.controller.clone, "ls-tree", "-r", "--name-only", batch["tip"])
+        )
         recovery = [o for o in self.controller.store.rows("outbox", {"kind": "recovery"}) if "103" in o["key"]]
         self.assertEqual(len(recovery), 1)
         self.assertIn("main-integration", loads(recovery[0]["payload"])["marker"])
@@ -142,6 +173,21 @@ class Backfill(unittest.TestCase):
         self.assertEqual(self.controller.store.row("members", {"number": 103})["removed"], 0)
         self.assertEqual(self.controller.store.row("inputs", {"number": 103})["state"], "inserted")
 
+    def test_a_member_an_adopted_pre_rebase_repaired_is_kept(self):
+        self.controller.tick()
+        batch = self.batch()
+        member = self.controller.store.row("members", {"number": 103})
+        self.controller.store.update(
+            "batches", {"id": batch["id"]}, pre_rebase_edits=json.dumps({member["source_pr"]: {"task_id": 5}})
+        )
+        for _ in range(2):
+            self.clock.advance(60)
+            self.post(103, "failure", "failed")
+            self.clock.advance(60)
+            self.controller.tick()
+        self.assertEqual(self.record(103)["acted"], "edited")
+        self.assertEqual(self.controller.store.row("members", {"number": 103})["removed"], 0)
+
     def test_off_by_default(self):
         self.controller.set_setting("main_integration_enabled", False, "test")
         self.controller.tick()
@@ -150,7 +196,9 @@ class Backfill(unittest.TestCase):
 
 class StaticCheck(unittest.TestCase):
     def git(self, *args):
-        return subprocess.run(["git", "-C", self.root, *args], check=True, capture_output=True, text=True).stdout.strip()
+        return subprocess.run(
+            ["git", "-C", self.root, *args], check=True, capture_output=True, text=True
+        ).stdout.strip()
 
     def commit(self, files, message):
         for path, text in files.items():
@@ -170,7 +218,9 @@ class StaticCheck(unittest.TestCase):
         self.root = self.tmp.name
         self.git("init", "-q", "-b", "main")
         self.base = self.commit(
-            {"TauCeti/Lp.lean": "import Mathlib.Tactic.Linarith\ntheorem MemLp.integrableOn_of_subset : True := trivial\n"},
+            {
+                "TauCeti/Lp.lean": "import Mathlib.Tactic.Linarith\ntheorem MemLp.integrableOn_of_subset : True := trivial\n"
+            },
             "base",
         )
 

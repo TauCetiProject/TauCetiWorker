@@ -155,6 +155,10 @@ def _answers(status: ports.Status | None, record: dict[str, Any]) -> bool:
         return False
     if not status.description.startswith(f"B={record.get('main', '')[:12]}"):
         return False
+    # A run already counted (the first red result, read again while its confirmation is queued)
+    # never answers a later request.
+    if status.target_url and status.target_url in record.get("runs", []):
+        return False
     posted = status.updated_at
     return posted is None or posted >= record.get("dispatched_at", 0) - 120
 
@@ -165,6 +169,8 @@ def _settle(ctl, row: dict[str, Any], record: dict[str, Any], status: ports.Stat
         state = DEFERRED
         record["retry_at"] = now + ctl.setting("main_integration_deferred_retry_seconds")
     record.update(state=state, description=status.description[:200], url=status.target_url, observed_at=now)
+    if status.target_url and state != DEFERRED:
+        record["runs"] = [*record.get("runs", []), status.target_url][-8:]
     if state == FAILURE:
         record["failures"] = record.get("failures", 0) + 1
     elif state == SUCCESS:
@@ -196,8 +202,9 @@ def _take_out(ctl, now: float) -> None:
         record = record_of(row)
         if record.get("state") != FAILURE or record.get("acted") or record.get("failures", 0) < CONFIRMATIONS:
             continue
-        if member["provenance"] != "clean":
-            # An agent already changed this member; its accepted head is no longer what lands.
+        if _edited(batch, member):
+            # An agent already changed this member (in the chain, or in an adopted pre-rebase that
+            # sealing will use); its accepted head is no longer what lands.
             record["acted"] = "edited"
             with ctl.store.transaction():
                 _save(ctl, row, record)
@@ -209,6 +216,11 @@ def _take_out(ctl, now: float) -> None:
             )
             continue
         _remove(ctl, batch, member, row, record, now)
+
+
+def _edited(batch: dict[str, Any], member: dict[str, Any]) -> bool:
+    edits = loads(batch.get("pre_rebase_edits"), {})
+    return member["provenance"] != "clean" or (isinstance(edits, dict) and member["source_pr"] in edits)
 
 
 def _remove(ctl, batch, member, row, record, now: float) -> None:
@@ -236,6 +248,7 @@ def _remove(ctl, batch, member, row, record, now: float) -> None:
         or current["sealed"]
         or current["state"] != "open"
         or ctl._active_claims(batch["id"])
+        or _edited(current, ctl.store.row("members", {"id": member["id"]}) or member)
     ):
         return  # the batch moved, sealed or was claimed meanwhile: the next pass decides again
     if error is not None or result is None or result.status != chain.CLEAN:
@@ -248,10 +261,13 @@ def _remove(ctl, batch, member, row, record, now: float) -> None:
     shas = {record_.source_pr: record_.sha for record_ in result.commits}
     version = batch["version"] + 1
     with ctl.store.transaction():
-        for other in ctl._members(batch["id"]):
-            if other["id"] != member["id"] and other["source_pr"] in shas:
-                ctl.store.update("members", {"id": other["id"]}, commit_sha=shas[other["source_pr"]])
         ctl.store.update("members", {"id": member["id"]}, removed=1, removed_reason=REASON)
+        # Positions stay dense, so the next insertion's `len(members)` position follows the chain.
+        for position, other in enumerate(ctl._members(batch["id"])):
+            changes = {"position": position}
+            if other["source_pr"] in shas:
+                changes["commit_sha"] = shas[other["source_pr"]]
+            ctl.store.update("members", {"id": other["id"]}, **changes)
         ctl.store.update("batches", {"id": batch["id"]}, version=version, tip=result.tip)
         ctl._record_tip(batch["id"], version, result.tip, now)
         ctl._retain(ctl.batch_ref(batch["id"], version), result.tip)
