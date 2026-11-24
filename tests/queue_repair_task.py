@@ -6327,6 +6327,35 @@ class WorkerAudits(Fixture):
         self.assertFalse(work.is_symlink())
         self.assertEqual(list(target.iterdir()), [])
 
+    def test_a_changed_seed_or_manifest_never_reuses_an_older_driver_root(self):
+        worktree = self.root / "state" / "worktrees" / "task-9"
+        worktree.mkdir(parents=True)
+        (worktree / "lean-toolchain").write_text("leanprover/lean4:v4.37.0-rc1\n")
+        (worktree / "lake-manifest.json").write_text('{"packages": []}\n')
+        seed = self.root / "seed"
+        (seed / "batteries" / "Batteries" / "Tactic").mkdir(parents=True)
+        (seed / "batteries" / "Batteries" / "Tactic" / "Lint.lean").write_text("")
+        (seed / "batteries" / "lake-manifest.json").write_text("one\n")
+        record = repair_sandbox.packages_record(worktree)
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(f"{seed}\n")
+        env = {"TAUCETI_QUEUE_SEED_PACKAGES": str(seed)}
+        tools = self.root / "tools"
+        first = repair_audit.pristine_driver_root(worktree, tools, "a" * 40, env)
+        self.assertIsNotNone(first)
+        self.assertEqual((first / "lake-manifest.json").read_text(), '{"packages": []}\n')
+        (seed / "batteries" / "lake-manifest.json").write_text("two\n")
+        second = repair_audit.pristine_driver_root(worktree, tools, "a" * 40, env)
+        (worktree / "lake-manifest.json").write_text('{"packages": [1]}\n')
+        third = repair_audit.pristine_driver_root(worktree, tools, "a" * 40, env)
+        self.assertEqual(len({first, second, third}), 3)
+        self.assertEqual(
+            len({repair_audit._driver_key(root, "a" * 40) for root in (first, second, third)}), 3, "nor its key"
+        )
+        self.assertIsNone(
+            repair_audit.pristine_driver_root(worktree, tools, "a" * 40, {}), "a seed outside read-only trees"
+        )
+
     def test_a_failed_verification_is_not_attested(self):
         self.findings("audit-findings-always", DUPLICATE_LINE)
         checks = repair_audit.check(

@@ -40,6 +40,8 @@ POLICY_DIR = "policy"
 # checks mount both read-only, so code the candidate runs can change neither the verifier nor its
 # inputs.
 VERIFIER_DIR = "verifier"
+# In a pristine driver root: which seed packages its drivers were built against (part of the driver key).
+SEED_FILE = "seed-packages"
 DRIVERS_DIR = "drivers"
 SETTINGS_FILE = "audit.json"  # in .tauceti-repair: what the agent's build script needs to run the checks
 ERRORS_FILE = "errors.jsonl"  # repair_stream's error list, in .tauceti-repair
@@ -362,7 +364,8 @@ def process_tree_rss(pid: int) -> int:
 
 def _driver_key(worktree: Path, ref: str) -> str:
     digest = hashlib.sha256(ref.encode())
-    for name in ("lean-toolchain", "lake-manifest.json"):
+    # A pristine driver root (`pristine_driver_root`) also names the seed packages it builds against.
+    for name in ("lean-toolchain", "lake-manifest.json", *((SEED_FILE,) if (worktree / SEED_FILE).is_file() else ())):
         path = worktree / name
         digest.update(path.read_bytes() if path.is_file() else b"-")
     return digest.hexdigest()
@@ -405,12 +408,30 @@ def pristine_driver_root(worktree: Path, tools_root: Path, ref: str, env: dict) 
         return None
     try:
         toolchain = (worktree / "lean-toolchain").read_text()
+        manifest = (
+            (worktree / "lake-manifest.json").read_text() if (worktree / "lake-manifest.json").is_file() else None
+        )
+        batteries = (
+            (shared / "batteries" / "lake-manifest.json").read_bytes()
+            if (shared / "batteries" / "lake-manifest.json").is_file()
+            else b""
+        )
     except OSError:
         return None
-    root = tools_root / DRIVERS_DIR / f"root-{_driver_key(worktree, ref)[:24]}"
+    # The cached drivers are keyed by the pin, the toolchain, the dependency manifest and the seed itself
+    # (its path and Batteries' own manifest), so a changed seed never reuses an older driver.
+    seed = f"{shared}\n{hashlib.sha256(batteries).hexdigest()}\n"
+    root = (
+        tools_root
+        / DRIVERS_DIR
+        / f"root-{hashlib.sha256((_driver_key(worktree, ref) + seed).encode()).hexdigest()[:24]}"
+    )
     lake_dir = root / ".lake"
     lake_dir.mkdir(parents=True, exist_ok=True)
     (root / "lean-toolchain").write_text(toolchain)
+    if manifest is not None:
+        (root / "lake-manifest.json").write_text(manifest)
+    (root / SEED_FILE).write_text(seed)
     link = lake_dir / "packages"
     if link.is_symlink() and link.resolve() != shared:
         link.unlink()
