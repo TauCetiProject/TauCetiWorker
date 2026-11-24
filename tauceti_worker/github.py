@@ -325,6 +325,20 @@ def can_push(repo: str) -> bool | None:
     return transport.shared_read(["permissions", repo], fetch, ttl=300)
 
 
+def maintainer_can_modify(repo: str, number: int) -> bool | None:
+    """Whether PR `number` of `repo` allows edits by maintainers: `true`/`false` from GitHub, or None
+    when we can't tell. Cached for an hour; the author rarely changes it."""
+
+    def fetch():
+        r = gh_run(["gh", "api", f"repos/{repo}/pulls/{number}", "--jq", ".maintainer_can_modify"])
+        if r.returncode != 0:
+            return None
+        out = (r.stdout or "").strip()
+        return True if out == "true" else False if out == "false" else None
+
+    return transport.shared_read(["maintainer_can_modify", repo, number], fetch, ttl=3600)
+
+
 def claims_repo() -> str:
     """Where this worker publishes its cooperative claim leases (`refs/tauceti-claims/<key>`).
 

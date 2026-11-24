@@ -49,7 +49,7 @@ from .constants import (
     TAUCETI,
     TAUCETI_OWNER,
 )
-from .github import GitHub, GitHubError, _parse_iso8601, can_push, me
+from .github import GitHub, GitHubError, _parse_iso8601, can_push, maintainer_can_modify, me
 from .github_state import StateQueryError
 from .review_state import Meta, ReviewState
 from .survey_facts import in_scope, roadmap_focuses, target_focuses
@@ -553,9 +553,9 @@ def owns_author(survey, author: dict | None) -> bool:
 def _adopted_github_authors(sv, nondraft, enabled, supports_external_repair):
     """Predicate for open PRs by TAUCETI_GITHUB_ADOPTED_AUTHORS that this identity can push to.
 
-    A fork branch accepts our push when the account can push to that fork, or through the author's
-    "allow edits by maintainers" when it can push to TauCeti. Without either, adoption stays off:
-    a round could not publish its repair. Close authority is unchanged (`owns` stays own-only).
+    A fork branch accepts our push when the account can push to that fork, or when it can push to
+    TauCeti and that PR allows edits by maintainers. Without either, the PR is skipped: a round could
+    not publish its repair. Close authority is unchanged (`owns` stays own-only).
     """
     from .source_identity import github_adopted_authors
 
@@ -569,13 +569,19 @@ def _adopted_github_authors(sv, nondraft, enabled, supports_external_repair):
     ]
     if not candidates:
         return lambda p: False
-    canonical = can_push(TAUCETI) is True
+    canonical = None
     writable = {}
+    adopted = set()
     for p in candidates:
         repo = f"{p.head_owner}/{p.head_repo}"
         if repo not in writable:
-            writable[repo] = canonical or can_push(repo) is True
-    adopted = {p.number for p in candidates if writable[f"{p.head_owner}/{p.head_repo}"]}
+            writable[repo] = can_push(repo) is True
+        if not writable[repo]:
+            if canonical is None:
+                canonical = can_push(TAUCETI) is True
+            if not canonical or maintainer_can_modify(TAUCETI, p.number) is not True:
+                continue
+        adopted.add(p.number)
     if adopted:
         log(f"adopted authors: tending {len(adopted)} open PR(s) by {', '.join(sorted(logins))}")
     if len(adopted) < len(candidates):

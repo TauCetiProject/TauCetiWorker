@@ -34,13 +34,14 @@ def raw(**changes):
     )
 
 
-def classify(record, stages, *, adopted="Mo271", push=None):
+def classify(record, stages, *, adopted="Mo271", push=None, edits=True):
     push = push or {}
     with (
         tempfile.TemporaryDirectory() as directory,
         patch.dict(os.environ, {ident.GITHUB_ADOPTED_AUTHORS_ENV: adopted}),
         patch.object(s, "me", return_value="me"),
         patch.object(s, "can_push", side_effect=lambda repo: push.get(repo, False)),
+        patch.object(s, "maintainer_can_modify", side_effect=lambda repo, number: edits),
     ):
         (Path(directory) / "ledger.json").write_text(
             json.dumps({"prs": {"7": {"rounds": [{"ts": datetime.now(UTC).isoformat()}]}}})
@@ -61,6 +62,10 @@ fork = {"mo271/TauCeti": True}
 for push in (canonical, fork):
     assert classify(raw(), ["rebase"], push=push).rebaseable.count == 1, push
     assert classify(raw(mergeable="MERGEABLE"), ["fix-ci"], push=push).red_ci.count == 1, push
+# Push access to TauCeti admits the push only while the PR allows edits by maintainers.
+assert classify(raw(), ["rebase"], push=canonical, edits=False).rebaseable.count == 0
+assert classify(raw(), ["rebase"], push=canonical, edits=None).rebaseable.count == 0
+assert classify(raw(), ["rebase"], push=fork, edits=False).rebaseable.count == 1
 # No push access, or not listed: nothing to do.
 assert classify(raw(), ["rebase"]).rebaseable.count == 0
 assert classify(raw(), ["rebase"], adopted="", push=canonical).rebaseable.count == 0
