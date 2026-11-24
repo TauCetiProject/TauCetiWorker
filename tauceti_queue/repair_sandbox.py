@@ -181,16 +181,16 @@ def _binds(args: list[str]) -> list[tuple[str, str]]:
     ]
 
 
-def linked_credentials(paths: list[Path], limit: int = 256) -> list[Path]:
+def linked_credentials(paths: list[Path]) -> list[Path]:
     """The targets of the symlinks directly inside each credential directory (a key file kept
-    elsewhere and linked in): masked wherever a bind exposes them, though never a reason to refuse."""
+    elsewhere and linked in), treated as credential paths themselves."""
     found: list[Path] = []
     for directory in paths:
         try:
             entries = list(os.scandir(directory)) if directory.is_dir() else []
         except OSError:
             continue
-        for entry in entries[:limit]:
+        for entry in entries:
             if entry.is_symlink():
                 target = Path(entry.path).resolve()
                 if target not in paths and target not in found:
@@ -210,7 +210,7 @@ def exposures(binds: list[tuple[str, str]], env: dict) -> list[tuple[Path, Path]
         host = credential.resolve()
         for source, destination in binds:
             resolved = Path(source).resolve()
-            if credential in named and (resolved == host or resolved.is_relative_to(host)):
+            if resolved == host or resolved.is_relative_to(host):
                 raise SandboxUnavailable(f"the sandbox would bind {source}, inside the credential path {credential}")
             if host.is_relative_to(resolved):
                 pair = (Path(destination) / host.relative_to(resolved), host)
@@ -229,6 +229,20 @@ def _credential_masks(binds: list[tuple[str, str]], env: dict) -> list[str]:
         elif host.is_file():
             masks += ["--ro-bind", "/dev/null", str(inside)]
     return masks
+
+
+# Where ``repair.link_shared_packages`` records the target it linked ``.lake/packages`` to: in the
+# worktree's tools directory, which a sandbox binds read-only, unlike ``.lake``.
+PACKAGES_RECORD = ".tauceti-repair/packages-link"
+
+
+def linked_packages(worktree: Path) -> list[Path]:
+    """The ``.lake/packages`` targets the worker itself linked in ``worktree`` (``PACKAGES_RECORD``)."""
+    try:
+        text = (worktree / PACKAGES_RECORD).read_text()
+    except OSError:
+        return []
+    return [Path(line).resolve() for line in text.splitlines() if line.startswith("/")]
 
 
 def _system_binds() -> list[str]:
@@ -370,7 +384,9 @@ def sandbox_argv(
         # The link is build state the batch's code can rewrite, so its target is bound only when it is
         # one of the configured read-only trees; any other target stays outside (the link dangles).
         shared = packages.resolve()
-        if shared.is_dir() and any(shared == tree or shared.is_relative_to(tree) for tree in read_only):
+        if shared.is_dir() and (
+            shared in linked_packages(worktree) or any(shared.is_relative_to(t) for t in read_only)
+        ):
             args += ["--ro-bind", str(shared), str(shared)]
     args += _credential_masks(_binds(args), env)
     args += ["--remount-ro", "/"]

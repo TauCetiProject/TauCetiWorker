@@ -148,6 +148,23 @@ class Shims(Fixture):
         self.assertEqual(run.returncode, 127)
         self.assertIn("which builds may only read", run.stderr)
 
+    def test_a_packages_link_the_worker_made_is_bound(self):
+        parent = self.tmp / "task" / ".lake" / "packages"
+        (parent / "mathlib").mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(self.worktree)], check=True)
+        repair.link_shared_packages(self.worktree, parent)
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
+        self.assertIn(["--ro-bind", str(parent), str(parent)], [argv[i : i + 3] for i in range(len(argv))])
+        excluded = subprocess.run(
+            ["git", "-C", str(self.worktree), "check-ignore", "-q", repair_sandbox.PACKAGES_RECORD], check=False
+        )
+        self.assertEqual(excluded.returncode, 0, "the record stays out of Git")
+        # The build rewrites the link: its new target is not the recorded one, so nothing is bound.
+        (self.worktree / ".lake" / "packages").unlink()
+        (self.worktree / ".lake" / "packages").symlink_to(self.home)
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
+        self.assertNotIn(str(self.home), [argv[i + 1] for i, a in enumerate(argv) if a == "--ro-bind"])
+
     def test_a_packages_link_the_build_rewrote_binds_nothing(self):
         (self.worktree / ".lake").mkdir()
         (self.worktree / ".lake" / "packages").symlink_to("/proc")
@@ -308,6 +325,16 @@ class Credentials(Fixture):
         self.assertIn(
             ["--ro-bind", "/dev/null", str(pool / "private-key.pem")], [argv[i : i + 3] for i in range(len(argv))]
         )
+
+    def test_a_bind_inside_a_linked_credential_directory_is_refused(self):
+        secrets = self.tmp / "secrets"
+        (secrets / "pool").mkdir(parents=True)
+        ssh = self.home / ".ssh"
+        ssh.mkdir()
+        (ssh / "keys").symlink_to(secrets)
+        env = {**self.env, "LAKE_CACHE_DIR": str(secrets / "pool")}
+        with self.assertRaisesRegex(repair_sandbox.SandboxUnavailable, "inside the credential path"):
+            repair_sandbox.sandbox_argv(["true"], self.worktree, env, bwrap=str(self.bin / "bwrap"))
 
     def test_a_credential_value_that_is_not_a_path_is_never_copied(self):
         env = {**self.env, "TAUCETI_REPAIR_CACHE_KEY_FILE": "id:secret"}
