@@ -129,15 +129,19 @@ I/O, below):
    `pre_rebase` owner keeps the batch open until adoption, release or claim expiry, so completed
    repairs enter the new head through ordinary validation. Unclaimed background offers are
    superseded (resolution `sealed`); the new head keeps what its preparations adopted.
-   The exception is a batch whose pre-rebase is a conflict (`_seal_clean_prefix`), with no claim
-   on it other than its `pre_rebase` task's: resolving the conflict takes hours, so the batch is
-   replayed onto the canonical commit and the members before the conflicting one move to a new
-   batch that becomes the head at once (`clean-prefix-sealed` in the journal). The conflicting
-   member and those after it stay in the batch, now based on the last moved member's own commit,
-   so they keep their approvals, their age and the batch's place as the next head; the batch's
-   `pre_rebase` tasks are superseded (resolution `clean-prefix`), their claims released, and the
-   next pre-rebase onto the new head creates a fresh task. A conflict at the first member leaves
-   the batch as before; a replay that is now clean seals the whole batch.
+   The exception is a batch whose pre-rebase is a conflict that no worker has claimed
+   (`_seal_clean_prefix`). A `pre_rebase` task still claimed at this point is current (made on the
+   tip that landed) or explicitly preserved (`_supersede_stale_pre_rebase` has dropped any other),
+   so it may still submit and the seal waits for it like any other owner; the next head reuses its
+   result when the carry onto the canonical commit, the extension and the membership checks of
+   `_seal_from_pre_rebase` succeed. Without an owner, resolving the conflict takes hours, so the
+   batch is replayed onto the canonical commit and the members before the conflicting one move to a
+   new batch that becomes the head at once (`clean-prefix-sealed` in the journal). The conflicting
+   member and those after it stay in the batch, now based on the last moved member's own commit, so
+   they keep their approvals, their age and the batch's place as the next head; the batch's
+   unclaimed `pre_rebase` task is superseded (resolution `clean-prefix`) and the next pre-rebase
+   onto the new head creates a fresh task. A conflict at the first member leaves the batch as
+   before; a replay that is now clean seals the whole batch.
    While fewer than two active batches are sealed (counting the head), seal the oldest unsealed batch once it has
    `sealed_successor_min_members` members (default 100; 0 disables new successor sealing). A larger
    later batch never overtakes a smaller first one. Successor sealing preserves active background
@@ -206,6 +210,24 @@ to waiting at its original age (journal `missing-source-readmitted`, counter
 gap remains. The refusal comment is keyed by head, so a repeated refusal posts nothing new.
 Closing, drafting, pushing to or withdrawing a refused PR drops its refusal from the recheck.
 
+Refusals that need a new head go back to the PR's worker as a head-bound recovery request: a
+comment beginning ``Merge-queue recovery for head `abc1234`: `` with a
+`<!--tauceti-rebase:v1 HEAD-->` line for the refused head, then `needs-rebase` on and
+`ready-to-merge` off. Both effects are one outbox entry (kind `recovery`), retried together and
+dropped (`stale-head`) once the PR is closed or no longer at the refused head. The source adapter appends that marker itself and escapes any quoted
+`<!--tauceti-` text, so only the request's own head is marked. A `conflicts-with-main` refusal and
+an `empty-commit` withdrawal at adoption post the request at once, in place of their old comments.
+A `missing-source` refusal keeps its ordinary comment and recheck, and gets the request only once it
+has stood `missing_source_handoff_seconds` (default six hours) since its first refusal
+(`evidence.missing_source_first_refused`; `_hand_off_missing_sources`, journal `missing-source-handoff`, once per head). The delay matters
+on Forgejo, where the queue's own recovery request holds the head in admission: the recheck gets
+the early window, when a provider is most likely to land, and the worker gets the PR when nothing
+has. On GitHub the queue is not a recovery-hold author, so the recheck can still re-admit the head
+afterwards. GitHub workers recognize `tauceti-queue[bot]` requests through TauCetiTools'
+`rebase_authors`, and GitHub's status labels report such a head as `awaiting-author`; Forgejo
+workers trust the user IDs in `TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS` (the queue's publisher).
+A push makes every request stale.
+
 A blocking label (`hold`, `wip` and the others `approve` refuses) added to a PR whose input is
 waiting or reserved is recorded in the input's `blocked_labels` (journal `blocked-label`), from the
 `labeled` delivery or, when that was missed, from admission's or eligibility's next read of the PR.
@@ -222,7 +244,14 @@ the head's tip) and its internal failures are repaired by an agent, so that it i
 seals. When `prepare_open_batches` is on, every open batch with at least `prepare_min_members`
 members, no insertion for `prepare_quiet_seconds`, a `prepared_version` other than its version, and
 no `prepare` task open or settled (adopted, clean or failed) at that version gets one `prepare`
-task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty. A sealed successor
+task: `base` and `tip` are the batch's, `onto` is `base`, diagnostics are empty. The batch lands on
+`main`, so one based elsewhere is first replayed onto the canonical commit: a clean replay re-bases
+it (a new version) and it is prepared there; a conflicting one is recorded per version and canonical
+commit and the batch gets no own-base preparation until it is pre-rebased. Two batches are not
+rebased onto `main` this way while `pre_rebase_enabled` is on (decision 153, "Rebase ordering"
+below): the next batch, unless the head has failed CI, and the batch behind it in the handoff
+window. An unclaimed own-base
+preparation on a base other than the canonical commit is neither offered nor kept (`base-behind`). A sealed successor
 bypasses both size and quiet gates; its preparation is preferred over other own-base preparations. This happens whether
 or not the head has a task of its own, since the long head repairs are when the batch would
 otherwise sit idle. `claim_task` offers it after every head task nobody holds, one claim per batch,
@@ -284,7 +313,13 @@ head's tip) with the conflict evidence of a `rebase_conflict` task and a `cross_
 `repair_context.cross_batch`: the names a head member removes or renames that a member of this batch
 uses (`removed_used`) and the names both batches add (`added_by_both`), text-derived and approximate,
 which the worker's prompt lists as predicted ripples. The worker handles it like a rebase conflict,
-told that the target is the next head's expected base rather than `main`. `claim_task` offers it
+told that the target is the next head's expected base rather than `main`, but resolves the textual
+conflicts only (decision 153, S1): it runs no verification build and so no repair rounds, and saves
+no repair checkpoint (`_can_checkpoint_repair` excludes `pre_rebase`). The head's tip it sits on may
+itself fail its checks, and a later batch must never act on the head's own failures (task 1416
+fixed 465's lint findings through 475's members). The batch is built, checked and repaired once it
+is the head, on `main`: by its own CI round and the head's repair tasks, or by the head-time
+`rebase_conflict` task's verification. `claim_task` offers it
 after the unheld head tasks and before `prepare`, one claim per batch; insertion goes on during the claim, and the submission
 is validated against the members the task covers and adopted as the batch's pre-rebase (`adopted`)
 with base, tip, version and members unchanged. A task whose `onto` is no longer the head's tip, or
@@ -293,19 +328,61 @@ except a claimed task whose `onto` is an earlier tip of the current head (a repa
 moved it, `_preserve_across_head_round`): resolving a conflict outlasts a head round, so the task is
 recorded in `state:emergency_preserved` (`pre-rebase-preserved` in the journal) like the claimed
 successor work of an emergency head (below), its owner submits onto that tip, and the next
-`_pre_rebase` carries the adopted result onto the head's tip by replay. A
+`_pre_rebase` carries the adopted result onto the head's tip by replay. Landing the head records
+the same preservation for claimed successor work made on any of its tips (`landing-preserved`), so a
+task stays open when `main` is already past the landed tip when the landing is observed. A
 rebuild of the head or a repair that empties a head member discards every pre-rebase. When the head
 lands and the canonical commit equals `pre_rebase_onto`, or the pre-rebase carries onto it by a clean
 replay (a preserved task that resolved onto an earlier tip of the landed head), the sealed head takes the pre-rebased chain
 directly (the `rebased` journal entry carries `pre_rebased`), recording the members edited in the
-task as edited; otherwise it is replayed as before. The stacked pair is never built by the
+task as edited; otherwise it is replayed as before, and a `pre-rebase-unused` journal entry says why
+the pre-rebase was left unused: `carry-conflict` (it does not replay onto `main`),
+`extension-conflict` (members inserted after its task do not replay onto it), `source-not-in-chain`
+or `members-mismatch`, with the conflicting member (`source_pr`) and `paths`. The stacked pair is never built by the
 controller and nothing about the pre-rebase is a verdict.
 
+When that replay of the head's own chain conflicts, the head-time `rebase_conflict` task starts from
+the unused pre-rebase (`_pre_rebased_chain`): while it is usable and its source is in the head's
+chain, the task's diagnostics carry `{kind: "pre_rebased_chain", base, tip, source}` (the
+pre-rebase's target, its chain and the batch tip it covered), the controller retains the chain as
+`refs/tauceti-queue/batches/<id>/pre-rebased/<tip>` (republished with the live batches' refs) and
+lists that ref in the claim's retained refs, and the `rebase-conflict` journal entry names the tip
+(`pre_rebased`). The worker
+(`repair_task.seed_pre_rebased`) records each member that chain resolved as that member's resolution
+on the prefix it was made on, so its replay reuses it at once where it meets the same prefix (the
+pre-rebase was onto the tip that landed, as for 484 and 490: no helper is started for those
+members) and wherever else it is the same conflict (`applicable_resolution`, tried before waiting
+for a helper, as for 479). Only the remaining conflicts go to an agent, then the chain is verified
+and repaired on `main` as for any head-time rebase. A mechanical resolution the batch's verification
+refused is not reused, and the additive pre-pass applies to the remaining conflicts as usual.
+
+Rebase ordering (decision 153): each handoff should rebase the next batch once, onto the head's
+tip, rather than onto `main` first and again as the head. While `pre_rebase_enabled` is on:
+
+- R1 (`_successor_rebase_held`): the next batch (the oldest open batch), when behind `main`, gets no
+  rebase onto `main` and so no own-base preparation unless the head has failed CI on the source:
+  with no head, before the head is dispatched, during the head's own rebase and while its CI runs.
+  After a source failure the head's repair may take hours, and a rebase onto `main` is useful then.
+  Once the head is dispatched the next batch gets no own-base preparation either, as before.
+- R2 (`_handoff_window`): in the handoff window (no head, or a head with no dispatched CI attempt at
+  any version) the batch behind the next batch, when behind `main`, gets no rebase onto `main`
+  either; the pass's reasons say `open batch N: no rebase onto main until the head is dispatched
+  (handoff window)`. It is about to become the next batch. This alone would have prevented the
+  rebases onto `main` that blocked 465, 477 and 484 (tasks 1401, 1446 and 1464).
+- R3 (`_take_over_rebase`): when the pre-rebase may start (`_pre_rebase_blocked` is None) and the
+  next batch has an open `rebase_conflict` task onto `main`, that task is superseded (resolution
+  `pre-rebase-first`, journal `rebase-taken-over` with `claimed` and `claim_age_seconds`, counter
+  `rebases_taken_over`) if it is unclaimed or its oldest live claim is younger than
+  `pre_rebase_takeover_seconds` (1200), whose claim is then released; the pre-rebase starts in the
+  same pass. An older claim runs to the end, as before: the batch is then on `main`, and its
+  pre-rebase carries only the head's own conflicts.
+
 Preparing the pre-rebased chain (item 16 of "Five improvements from the first production repair" in
-the plan): a clean replay produces a tip nobody has built, so `_prepare_pre_rebased` creates a
+the plan), on by default again since decision 174 (`prepare_pre_rebased` true; it was off from
+decision 153's S1 until then): a clean replay produces a tip nobody has built, so `_prepare_pre_rebased` creates a
 second kind of `prepare` task for the oldest open batch's usable pre-rebase (`clean`, or `adopted`
 from a `pre_rebase` task) once it is up to date (on the head's tip, covering the batch's tip),
-`_pre_rebase_blocked` allows the head, `prepare_pre_rebased` and `prepare_open_batches` are on, the
+`_pre_rebase_blocked` allows the head, the head's tip is known-good (below), `prepare_pre_rebased` and `prepare_open_batches` are on, the
 batch has `prepare_min_members` members and is prepared on its own base at its current version, no
 other background task of the batch is open, and the chain is neither prepared nor already prepared,
 released clean or failed for that tip. The task's `base` and `onto` are the head's tip, its `tip` the
@@ -328,6 +405,115 @@ as the prepared tip's base seals with the prepared tip unchanged, so its CI roun
 the worker published for that exact tip; a later insertion extends the pre-rebase by replay, which
 leaves it unprepared until the next preparation.
 
+Known-good head tips (decision 174): the next batch is verified and repaired only on a head tip that
+has passed its own local verification, so it never acts on the head's own failures (task 1416), and
+no failure list passes between batches. `_head_tip_verified` holds when `batches.verified_tip` is the
+head's tip and CI has never failed that tip on the source (`_tip_failed`, any attempt of any batch,
+so a tip staged again unchanged after a failure stays not known-good). `verified_tip` is set when a task's adopted
+submission carries a `local_verification` note (`{tip, checks_passed}`, from the worker) with
+`checks_passed` true for exactly the submitted tip (the head's repair or `rebase_conflict`, an own-base
+preparation), and when the head seals from its pre-rebase unchanged (`onto` is `main`, no members
+replayed onto it) and that pre-rebase's tip is `batches.pre_rebase_verified`: a preparation of the
+pre-rebased chain released `prepared_clean`, or adopted with such a note. Any other new tip (a
+controller replay, a repair the worker could not verify) is not known-good, and a CI pass alone does
+not count: the head lands minutes later, and a preparation started then would only hold up the seal.
+Every task offer names `extra.policy_commit`, the canonical commit at the claim, whose `tauceti.toml`
+and `scripts/` the worker's checks take their TauCetiTools pin and policy files from (decision 200).
+The worker's `attestation` of exactly the tip it verified (a submission's note, or a clean
+release's `notes`) is kept beside the verified mark: `batches.attestation` with `verified_tip`, and
+`pre_rebase_attestation` with `pre_rebase_verified`, carried to the head when it seals from that
+pre-rebase unchanged and discarded with the mark. `_attestation_problem` says why it would not stand
+in for staging's checks, or nothing when it would: it must name exactly the tip and its tree, the
+sandbox on, a verifier out of candidate code's reach (`verifier_isolated`), the whole-library lint, and a policy commit whose `tauceti.toml` and
+`scripts/` are `main`'s now, with the exact tools commit from the repository (and, for a SHA pin,
+the commit) `main` pins. Status
+shows it as `head.attestation_problem` and `pre_rebase.attestation_problem`.
+
+The attested landing (decision 200, setting `attested_landing_enabled`, default false) acts on it:
+a head's dispatch, and the next batch's early run (`_early_staging`), is sent with event
+`tauceti-bors-attested` instead of `tauceti-bors-staging` (`ci_attempts.dispatch_kind` `attested`,
+`_dispatch_kind`) when the batch's stored attestation of exactly that tip counts, the batch is
+GitHub-only, and no attested run of that tip and base has already failed. pr-build then builds
+nothing: it requires the observation feed to name the attestation of exactly that commit and tree
+(the feed adds `attestation` `{tip, tree, policy_commit}` to a running attested batch), restores every
+output with `lake build --no-build`, which fails if any module would need building, runs no audit or
+lint, and publishes and posts statuses as staging does (TauCetiTools `bors_attested.py`). An attested
+run that does not pass is an infrastructure failure (`attested-fallback: ...`, journal
+`attested-landing-fallback`), never a source failure, so the tip is not marked failed; the next
+dispatch of that tip and base is full staging. Status shows the attempt's `ci.kind` and `ci.early`.
+No preparation starts once the head's CI has passed (`prepare_blocked`: `head N passed CI and is landing`): it would be preserved across the landing and the seal would wait for it with staging idle. On a head that is not known-good, the next batch's conflicts-only pre-rebase still runs, but
+`prepare_blocked` says `head N's tip <sha> has not passed its own verification`, and a claimed
+preparation is superseded (`head-unverified`) and its submission refused, a preserved one included
+once its `onto` has failed. When CI fails the tip a pre-rebase is on, or a repair round or rebase
+moves the head past it, `_discard_unverified_pre_rebase` clears an open batch's pre-rebase that
+carries a preparation's edits (journal `pre-rebase-discarded` with reason `head-failed`,
+`head-moved` or `head-unverified`, counter `pre_rebase_verification_discarded`) instead of carrying
+it to the next tip; `_pre_rebase` then replays the batch afresh, and it is prepared again once the
+new tip is known-good. One prepared clean, with no edits, keeps its chain and loses only
+`pre_rebase_prepared` and `pre_rebase_verified` (`chain_kept` true). A pre-rebase with only a
+`pre_rebase` task's conflict resolutions is carried as before. In `claim_task` the next
+batch's preparation of its pre-rebased chain ranks with its `pre_rebase`, ahead of every later batch's
+own-base preparation, and when the background slots are full it takes the newest such preparation's
+slot (`pre-rebase-first`), as the `pre_rebase` does.
+
+Sealing only what was verified (decision 174, step 3; it replaces decision 172's B): the preparation
+of the next batch's pre-rebased chain is a frozen snapshot of that batch. Creating the task also seals
+the batch's membership (`sealed`, journal `successor-sealed` with reason `verification-snapshot`,
+counter `successors_sealed_for_verification`), so insertion sends later arrivals to the following
+batch and the run finishes on exactly the members the next head will have. When that preparation
+completes and passes, and the head lands as the tip it was made on with no replay needed, the batch
+seals from its pre-rebase unchanged, as exactly the verified tip, known-good, and its first staging
+run builds a tip a worker already built, checked and published. Otherwise (the preparation is
+superseded, fails or goes stale, or an emergency or lane landing forces a replay) promotion is as
+before and the head is not known-good; the batch stays sealed at its snapshot. A batch that gets no
+such preparation keeps taking members until the usual `sealed_successor_min_members` threshold. The
+cost: a batch can be frozen smaller than that threshold (from `prepare_min_members`, 20).
+
+The head's parallel check (decision 174, step 4; decision 172's A): when the head's attempt is
+dispatched and pending on a tip that is not known-good and that CI never failed,
+`_schedule_parallel_check` creates one speculative `repair` task per head version, whose only
+diagnostic is `{kind: parallel_check, proactive: true, attempt_id}` (journal
+`parallel-check-started`, counter `parallel_checks`; setting `parallel_check_enabled`, default false, turned on in production as a runtime setting).
+It runs alongside the staging run like a predicted repair (`_prediction_task`): it does not hold the
+next batch's pre-rebase back, a staging pass supersedes it (`prediction-ci-passed`) and promotes the
+head, and a source failure turns it into the head's ordinary repair task with CI's diagnostics (an
+unchanged submission is then refused). The worker builds warm and, when the streamed build is clean,
+verifies the chain unchanged without an agent; a clean unchanged submission with a passing
+`local_verification` records the tip as `verified_tip` (`parallel-check-clean`, journal
+`parallel-check-finished`), so the next batch is prepared on it. When the build or the checks fail,
+the worker repairs as for any repair task, and the repaired tip becomes the head's next version,
+whose dispatch cancels the running staging run (`_cancel_superseded_runs`) and stages the repaired
+tip. A released check is superseded (`parallel-check-released`) rather than offered again: staging
+remains the authority. A worker without its own warm verification (no audits, cold artifacts) gives
+the check back. When `main` advances while a check is claimed, the check is superseded
+(`head-rebasing`) so the head is rebased at once, and the rebased tip gets its own check; a
+speculative task never re-dispatches a head that is behind `main`.
+
+
+Early staging (decisions 199 B and 200; `_early_staging`, setting `early_staging_enabled`, default
+false): once the oldest open batch is sealed, its preparation on the head's tip has been adopted
+with a passing local verification of exactly the chain it seals as (`pre_rebase_verified` equal to
+`pre_rebase_tip`, `pre_rebase_source` equal to its tip), and the head is an ordinary batch based
+on `main` whose known-good tip is staging or has passed, the controller sends the trusted run of
+that prepared tip at once, based on the head's tip: a `ci_attempts` row with `early` 1 at the
+batch's current version, `generation` one more than it (the staging candidate branch's name, which
+pr-build's train identity needs positive and which the attempt keeps), and `dispatch_kind`
+`staging`. It is not held for the base's published cache (the base is the head's tip, published
+only at the end of its own run; the run is warm from the preparation's outputs). The observation
+feed reports the batch `running` with that tip and base while the attempt is pending, so pr-build's
+identity check and the finalizer's revalidation accept it, and stops as soon as it is cancelled.
+Each tick observes pending early attempts and cancels one (`_cancel_superseded_runs(only=...)`,
+journal `early-staging-cancelled`) once it no longer describes what the batch will seal as
+(`_early_invalid`): the batch changed, its pre-rebase changed (for example `_discard_unverified_pre_rebase`
+after the head failed), the head's tip moved or failed, `main` moved past the base, the setting was
+turned off, or, with one staging slot, the head needs a re-run while the early run is still queued
+(it is sent again behind the head's). When the head lands as the base, `_seal_from_pre_rebase`
+seals the batch as exactly that tip and adopts the attempt (`early` 2, `batch_version` the new
+version, journal `early-staging-adopted`): a pass is promoted in the same pass, a pending run is
+the head's run, and a source failure goes straight to the head's repair. Infrastructure failures
+of an early run are re-sent `early_staging_infrastructure_retries` (1) times; then the batch is
+staged as the head. Verdicts are journaled `early-staging-verdict`; the open batch's status carries
+`early_staging`.
 CI: the attempt for the head's current version is dispatched with `dispatch_candidate` (the
 `repository_dispatch` of `pr-build.yml`, event `tauceti-bors-staging`, payload `head_sha`,
 `base_sha`, `batch_id`, `members`, `base_ref`, `repair_outputs_revs`). Observation reads `find_candidate_run` when an event
@@ -666,6 +852,10 @@ and reported in status:
 | `prepare_quiet_seconds` | 600 | time since the last insertion before an open batch is prepared |
 | `pre_rebase_enabled` | true | replay the oldest open batch onto the head's tip once the head's chain is submitted |
 | `prepare_pre_rebased` | true | create a `prepare` task for the oldest open batch's usable pre-rebase on the head's tip (with `prepare_open_batches`, for the batches it applies to) |
+| `parallel_check_enabled` | false | verify a head dispatched on a tip no worker verified on a repair worker alongside its staging run, and repair what fails (`_schedule_parallel_check`) |
+| `early_staging_enabled` | false | send the next batch's verified prepared tip to its trusted run while the head is staging, and adopt that run when it seals as that tip (`_early_staging`) |
+| `early_staging_infrastructure_retries` | 1 | re-sends of an early run that failed on infrastructure before the batch waits to be staged as the head |
+| `attested_landing_enabled` | false | send a tip whose accepted worker attestation counts as an attested landing, which pr-build lands without rebuilding; a failed one falls back to full staging (`_dispatch_kind`) |
 | `base_cache_endpoint` | `https://cache.taucetiproject.org/revisions` | public Lake revision endpoint a head's base must be published at before staging is dispatched (CI section above); empty disables the requirement |
 | `base_cache_recheck_seconds` | 120 | how long a base found unpublished is remembered before it is probed again |
 | `base_cache_alert_seconds` | 7200 | a wait for a published base this long raises a status alert and one direct message; 0 never |
@@ -673,6 +863,45 @@ and reported in status:
 | `emergency_evict` | false | the emergency batch takes the head from a running ordinary head unless it is about to land or publishing its final oleans (`_evict`); off, it waits for the running head to land |
 | `control_lane_enabled` | false | with mixed sources admitted under GitHub primary, stage GitHub PRs whose own diff leaves the native path policy in the control-file lane batch, sealed next after the emergency batch and never repaired ([mixed-sources.md](mixed-sources.md), "The control-file lane"); off stages a live lane batch as an ordinary one |
 | `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
+| `main_integration_enabled` | false | the main-integration backfill (below): build queued members of unsealed batches on the current canonical commit while PR CI is idle |
+| `main_integration_take_out` | true | take a member whose main-integration build failed twice out of its unsealed batch; false only records results |
+| `main_integration_max_in_flight` | 8 | outstanding main-integration builds at most |
+| `main_integration_interval_seconds` | 120 | time between backfill passes |
+| `main_integration_fresh_seconds` | 21600 | a result younger than this is fresh evidence; older ones are asked again |
+| `main_integration_timeout_seconds` | 10800 | a build with no result after this long expires and is asked again (three times on the same head) |
+| `main_integration_deferred_retry_seconds` | 600 | after CI defers a build for lack of idle capacity, how long the backfill asks for nothing new (then it probes with one build) |
+| `main_integration_checks_per_pass` | 20 | static stale checks (`stale_check.py`) a pass runs to order candidates |
+
+## Main-integration backfill
+
+`tauceti_queue/main_integration.py` (decision 175 B), one step of the pass after insertion and
+before sealing, off until `main_integration_enabled`. Members of open batches are mostly heads no
+CI built on a recent main (Forgejo and self-tested PRs), approved on bases up to a day old. The
+backfill asks CI to build them merged onto the current canonical commit, without pushing anything,
+through `dispatch_main_integration` (a `repository_dispatch` of TauCeti's `main-integration.yml`;
+TauCetiTools `docs/main-integration.md`), and reads the `main-integration` commit status of every
+outstanding head in one GraphQL query per pass (`main_integration_statuses`).
+
+- **Candidates:** members of open, unsealed, non-emergency, non-lane batches that are not the head,
+  from GitHub (Forgejo members later), whose input has no result younger than
+  `main_integration_fresh_seconds`. Order: a red result awaiting confirmation first, then the next
+  batch to seal, then members the static check flags (or has not checked), then the oldest base.
+  CI runs a build only on idle Fleet PR capacity and otherwise reports it deferred. After a
+  deferral nothing new is asked for `main_integration_deferred_retry_seconds`; then one build at a
+  time probes until one runs, so a busy pool costs one short picker job per retry interval.
+- **Results** count only when the status names the main asked for and was posted after the
+  dispatch. Green is fresh evidence on the input (`inputs.main_integration`). A first red result is
+  asked again at once; a second takes the member out (below). An error (no verdict, a textual
+  conflict, deferral) is recorded and never acted on.
+- **Take-out before seal:** only while the batch is still unsealed, open and unclaimed, and only for
+  a member no agent has edited. The batch is replayed without the member's commit (the later
+  members are cherry-picked onto its parent, a new version), its open tasks are superseded and its
+  pre-rebase discarded; the member row is `removed` (`main-integration-failed`), the input cancelled
+  with that reason and its approval withdrawn, and the head goes back to its worker or author by a
+  head-bound recovery request naming the run (journal `main-integration-removed`). A batch sealed
+  meanwhile (decision 174's verification snapshot seals at the start of its preparation), an edited
+  member or a replay that conflicts keeps the member (journal `main-integration-kept`); the batch's
+  own verification and the head's repair deal with it as before.
 
 ## Ports
 
@@ -776,7 +1005,7 @@ prepares, `own_base` or `pre_rebased`) and `waiting` (null, or the other `kind` 
 `open_batch` carries the same preparation and `pre_rebase` fields; both forms include `sealed`
 and `sealed_at`, and retain the successor for compatibility); `sealed_successor` (null or the first sealed
 non-head batch summary; `open_batches` includes every sealed non-head batch); `head` (the same plus `sealed_at`,
-`expected_parent`, `based_on_canonical`, `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
+`expected_parent`, `based_on_canonical`, `tip_verified` (whether the tip is known-good, `_head_tip_verified`), `stage` in `rebase`, `rebase_conflict`, `dispatch`, `ci`,
 `repair`, `infrastructure`, `promote`, the open `task`, `base_cache_wait` (null, or the wait for a
 published base described in the CI section), and `ci` with dispatch id, run id and
 attempt, status, conclusion, timestamps, runner, labels, host, phases with timestamps, last progress,

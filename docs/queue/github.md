@@ -134,6 +134,9 @@ controller uses those alone for classification and hands the rest to the repair 
 finalizer exits nonzero after it posts a failed `build` status, so once that status is bound to the
 run the finalizer's own finding is ignored: a bound `build=failure` with no other infrastructure
 finding is a source failure, repaired from the parsed findings or, when none parse, from the status.
+The exception is the finalizer's `sandboxed merge-group build did not complete`, which it posts when the
+`sandboxed-build` job produced no build-state (its runner died, or the job was cancelled or skipped
+before its report step): that status is no verdict, so it is infrastructure and retried.
 
 ## Admission: how approvals arrive
 

@@ -88,6 +88,8 @@ def _roadmap_note(sv: Survey, esc=lambda s: s) -> tuple[str, str]:
     markup-interpreting Rich renderer; the Textual renderer passes them through unchanged."""
     skip_note = f"  (skip: {esc(', '.join(sv.roadmap_skip))})" if sv.roadmap_skip else ""
     only = esc(sv.roadmap_only)
+    if (umbrella := getattr(sv, "umbrella", None)) is not None:
+        only += f" (umbrella of {len(umbrella.scope)} areas)"
     if sv.roadmap_backpressure:
         return "⛔", f"backpressure: {sv.n_mine_open}/{sv.max_open_prs} open in scope  (only: {only}){skip_note}"
     return "∞", f"only: {only}{skip_note}"
@@ -101,12 +103,14 @@ def _expansion_rows(sv: Survey, name: str, titles: dict, areas: list | None) -> 
         if not areas:
             return [("    └ (areas unavailable)", "")]
         skip = set(sv.roadmap_skip)
+        umbrella = getattr(sv, "umbrella", None)
+        members = umbrella.scope if umbrella is not None else frozenset()
         rows = []
         # In "auto" mode no area is pinned (a random one is picked per round), so no row is marked
-        # "← only" — the intended display.
+        # "← only" — the intended display. An umbrella marks its members outside the skip list.
         for a in ["(all areas)"] + list(areas):
             active = a == sv.roadmap_only or (a == "(all areas)" and sv.roadmap_only in ("", "any"))
-            tag = "← only" if active else ("(skipped)" if a in skip else "")
+            tag = "← only" if active else ("← umbrella" if a in members else ("(skipped)" if a in skip else ""))
             rows.append((f"    └ {a}", tag))
         return rows
     wk = sv.kind(name)
@@ -812,8 +816,13 @@ def _dashboard_app(cfg, loader=None):
             os.environ["TAUCETI_ROADMAP_SKIP"] = ",".join(areas)
             self._skip_set_by_user = True
             if self.sv is not None:  # keep the roadmap row in step with the status bar immediately
+                before = self.sv.umbrella.scope if self.sv.umbrella is not None else frozenset()
                 self.sv.roadmap_skip = roadmap_skip()
                 self.sv.rescope_roadmap()
+                # A member taken off the umbrella's skip list had its pull requests left out of the
+                # last survey, so only a fresh one can count and list them.
+                if self.sv.umbrella is not None and self.sv.umbrella.scope - before:
+                    self._refresh()
             self._save_prefs()
             self._render()
 
@@ -932,7 +941,16 @@ def dashboard_survey(cfg, gh):
         from .multi_source import display_survey
 
         return display_survey(cfg, gh)
-    return survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True)
+    from types import SimpleNamespace
+
+    from .account_pressure import count_account
+    from .umbrellas import display_umbrella
+
+    sv = survey(cfg, gh, ReviewState(cfg, gh), Counters(cfg), deep=True, umbrella=display_umbrella(gh))
+    if not sv.github_failed and not sv.dependency_wait:
+        # Show the gate the worker enforces: the account's open PRs on every project forge.
+        count_account(SimpleNamespace(cfg=cfg, gh=gh), {"github": sv})
+    return sv
 
 
 def cmd_tui(args) -> int:

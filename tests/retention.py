@@ -234,12 +234,15 @@ class Retention(unittest.TestCase):
         cache = self.cache()
         private.parent.mkdir(parents=True, exist_ok=True)
         private.write_text("artifact")
+        # Timed from the clock: the payload just written carries the real time, which a loaded
+        # runner can carry seconds past self.clock, and the request must follow it.
+        later = max(self.clock, time.time())
         atomic_json(
             activity.root() / "cache-pressure.json",
-            dict(requested_at=self.clock + 1, until=self.clock + 200, workers=[]),
+            dict(requested_at=later + 1, until=later + 200, workers=[]),
         )
         with patch.object(retention.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(1000, 900, 100)):
-            retention.recycle(self.cfg, now=self.clock + 301)
+            retention.recycle(self.cfg, now=later + 301)
         self.assertFalse(private.exists())
         self.assertFalse(cache.exists())
         # Deferral released the round lock, and does not need an activity/paid round.

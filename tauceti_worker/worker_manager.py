@@ -53,6 +53,8 @@ _WORKER_KEYS = {
     "github",
     "forgejo",
     "new_pr_forge",
+    "prefer_forge",
+    "review_first",
     "enabled",
     "agent",
     "only",
@@ -330,6 +332,8 @@ class WorkerSpec:
     github: bool = True
     forgejo: bool = False
     new_pr_forge: str | None = None
+    prefer_forge: str | None = None  # offer this forge's PR work before the other's (multi_source)
+    review_first: bool = False  # offer re-reviews and first reviews before other PR work (multi_source)
     enabled: bool = True
     agent: str = "auto"
     only: tuple[str, ...] = ()
@@ -405,6 +409,8 @@ class WorkerSpec:
             github=_boolean(raw.get("github", True), f"workers[{index}].github"),
             forgejo=_boolean(raw.get("forgejo", False), f"workers[{index}].forgejo"),
             new_pr_forge=_string(raw.get("new_pr_forge"), f"workers[{index}].new_pr_forge", optional=True),
+            prefer_forge=_string(raw.get("prefer_forge"), f"workers[{index}].prefer_forge", optional=True),
+            review_first=_boolean(raw.get("review_first", False), f"workers[{index}].review_first"),
             only=only,
             sandbox=sandbox,
             ignore_quota=_boolean(raw.get("ignore_quota", False), f"workers[{index}].ignore_quota"),
@@ -438,10 +444,11 @@ class WorkerSpec:
             env=_env_pairs(raw.get("env", {}), f"workers[{index}].env"),
         )
         from .config import Die
-        from .worker_sources import resolve_selection
+        from .worker_sources import resolve_preference, resolve_selection
 
         try:
-            resolve_selection(spec.github, spec.forgejo, spec.new_pr_forge)
+            requested, _ = resolve_selection(spec.github, spec.forgejo, spec.new_pr_forge)
+            resolve_preference(requested, spec.prefer_forge)
         except Die as error:
             raise WorkersError(f"workers[{index}]: {error}") from None
         if spec.github_account is not None:
@@ -486,6 +493,10 @@ class WorkerSpec:
             value["forgejo"] = True
         if self.new_pr_forge is not None:
             value["new_pr_forge"] = self.new_pr_forge
+        if self.prefer_forge is not None:
+            value["prefer_forge"] = self.prefer_forge
+        if self.review_first:
+            value["review_first"] = True
         if self.max_open_prs != MAX_OPEN_PRS:
             value["max_open_prs"] = self.max_open_prs
         if self.agent != "auto":
@@ -555,6 +566,10 @@ class WorkerSpec:
             argv += ["--github" if self.github else "--no-github", "--forgejo" if self.forgejo else "--no-forgejo"]
         if self.new_pr_forge is not None:
             argv += ["--new-pr-forge", self.new_pr_forge]
+        if self.prefer_forge is not None:
+            argv += ["--prefer-forge", self.prefer_forge]
+        if self.review_first:
+            argv += ["--review-first"]
         if self.conf:
             argv += ["--conf", self.conf]
         argv += ["--max-open-prs", str(self.max_open_prs)]
@@ -1232,6 +1247,8 @@ def run_manager(config: Path, interval: float = DEFAULT_INTERVAL) -> int:
                     "error": last_error,
                     "self_tested": 1,
                     "source_selection": 1,
+                    "prefer_forge": 1,
+                    "review_first": 1,
                     "graceful_restart": 1,
                     "roadmap_targets": 1,
                     "targets_inspect": 1,
@@ -2529,7 +2546,7 @@ def add_workers_parser(subparsers) -> None:
     )
     add.add_argument("--self-tested", action="store_true", help="apply the self-tested label after local verification")
     add.add_argument("--full-quality", action="store_true", help="run all five quality-pass checks, not Q1, Q2, Q5")
-    add.add_argument("--roadmap-only", help="pin roadmap rounds to one area")
+    add.add_argument("--roadmap-only", help="pin roadmap rounds to one area or umbrella")
     add.add_argument("--roadmap-skip", default="", help="comma-separated roadmap areas to exclude")
     add.add_argument("--roadmap-targets", metavar="FILE", help="operator target list that roadmap rounds author from")
     add.add_argument("--extra-roadmap-prompt", help="extra guidance for roadmap rounds, appended to the agent's prompt")

@@ -19,6 +19,7 @@
 #             docs      only the modules that assert on README.md, docs/*.md and workers.toml.example,
 #                       which is all a documentation-only change can break (see DOCS_CONTRACT)
 set -uo pipefail
+INVOKED_FROM="$(pwd -P)"  # physical, as Git resolves a relative GIT_CONFIG_SYSTEM
 cd "$(dirname "$0")/.." || exit 1
 
 # Unit fixtures use their mocked transport, never the public production mirror.
@@ -51,9 +52,25 @@ case "$JOBS" in ''|*[!0-9]*|0) echo "run-all: -j wants a positive integer, got '
 RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/tauceti-test-run-XXXXXX")"
 trap 'rm -rf "$RUN_ROOT"' EXIT
 
+# Fixture commits must not start detached automatic `git maintenance`: on a loaded runner one
+# outlives its command, holds objects/maintenance.lock and keeps its cwd in the fixture's checkout,
+# which retention's and review recovery's process scans then see as a live user. The host's system
+# configuration still applies through the include; a module that opts out of system configuration
+# opts out of this too.
+# Git's own writer quotes the path. It is made absolute, so it does not resolve against $RUN_ROOT,
+# and normalized as Git normalizes GIT_CONFIG_SYSTEM: `..` collapsed lexically, symlinks kept.
+system_gitconfig="${GIT_CONFIG_SYSTEM:-/etc/gitconfig}"
+[[ "$system_gitconfig" == /* ]] || system_gitconfig="$INVOKED_FROM/$system_gitconfig"
+system_gitconfig="$(realpath -ms -- "$system_gitconfig")"
+git config --file "$RUN_ROOT/gitconfig" include.path "$system_gitconfig" || exit 1
+git config --file "$RUN_ROOT/gitconfig" maintenance.auto false || exit 1
+git config --file "$RUN_ROOT/gitconfig" gc.auto 0 || exit 1
+export GIT_CONFIG_SYSTEM="$RUN_ROOT/gitconfig"
+
 # stdlib-only python tests, run with the project interpreter
 RUN_STDLIB=(
   build_resources.py
+  excerpt.py
   build_cache_wait.py
   activity.py
   activity_git.py
@@ -69,10 +86,12 @@ RUN_STDLIB=(
   worker_sizing.py
   queue_repair_experiment.py
   queue_repair_task.py
+  queue_repair_additive.py
   queue_repair_locks.py
   queue_repair_cleanup.py
   queue_install_releases.py
   queue_repair_cache.py
+  queue_repair_outputs.py
   queue_claude_stdin.py
   expanded_cache.py
   canonical_store.py
@@ -80,6 +99,7 @@ RUN_STDLIB=(
   local_lint.py
   lean_pressure.py
   repair_pressure.py
+  repair_agent_tools.py
   repair_parallel_fold.py
   round_storage.py
   shared_mathlib.py
@@ -100,6 +120,7 @@ RUN_STDLIB=(
   bump_integration.py
   claude_config_dir.py
   claude_keychain.py
+  claude_usage_isolation.py
   claims_repo.py
   codex_account.py
   codex_fallback.py
@@ -165,6 +186,7 @@ RUN_STDLIB=(
   prompt_wrapper_paths.py
   provider_usage.py
   quota_auto_refresh.py
+  quota_usage_credentials.py
   quota_cache_fp.py
   quota_loop_refresh.py
   quota_wakeups.py
@@ -172,6 +194,7 @@ RUN_STDLIB=(
   queue_chain.py
   queue_commands.py
   queue_github_adapter.py
+  queue_main_integration.py
   queue_feeds.py
   queue_landing_receipts.py
   queue_server.py
@@ -184,6 +207,7 @@ RUN_STDLIB=(
   queue_execution.py
   queue_ci_requests.py
   queue_forgejo_git.py
+  queue_forgejo_team_sync.py
   queue_forgejo_source.py
   queue_ci_execution.py
   queue_workflow_token.py
@@ -235,6 +259,7 @@ RUN_STDLIB=(
   review_provider_down.py
   review_outcomes.py
   review_runtime.py
+  review_app.py
   review_unchanged_memo.py
   synchronous_state_repair.py
   source_mergeability.py
@@ -243,6 +268,7 @@ RUN_STDLIB=(
   review_throttles.py
   roadmap_backpressure.py
   roadmap_claims.py
+  roadmap_umbrella.py
   roadmap_claim_namespace.py
   round_crash_reasons.py
   round_file_changes.py
@@ -253,9 +279,7 @@ RUN_STDLIB=(
   safe_exists.py
   scoreboard_trust.py
   security_audit.py
-  security_audit_served.py
   security_audit_pool.py
-  security_audit_claude.py
   security_audit_watchdog.py
   security_audit_evidence.py
   shared_build_caches.py
@@ -280,6 +304,7 @@ RUN_STDLIB=(
   workflow_backstop.py
   live_use.py
   round_worktrees.py
+  checkout_without_pull_ref.py
 )
 # special-cased python tests (handled explicitly in run_one)
 RUN_SPECIAL=(parity_selectors.py dashboard.py)
@@ -297,7 +322,12 @@ NATIVE_FS=(queue_repair_cache.py cache_storage.py shared_mathlib.py retention.py
 # Modules that read README.md, docs/*.md or workers.toml.example and assert on their contents. A
 # change that touches only documentation can break these and nothing else, so CI runs just this
 # group for it. The guard below keeps the list honest.
-DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py target_list.py)
+DOCS_CONTRACT=(pr_targeting.py review_throttles.py forge_contracts.py target_list.py roadmap_umbrella.py)
+# Modules whose code under test scans every process of the user (/proc, pgrep) and fails closed
+# or holds back when another process is busy or uninspectable. Concurrent modules (their sandboxed
+# children, a detached `git gc`) can disturb that scan, so with -j above 1 these run one at a
+# time after the parallel batch.
+HOST_PROCESSES=(legacy_data_root.py queue_install_releases.py)
 
 pass=0; fail=0; failed=()
 
@@ -322,8 +352,8 @@ if ((${#unclassified[@]})); then
   printf '  - %s\n' "${unclassified[@]}" >&2
   exit 2
 fi
-for t in "${NATIVE_FS[@]}" "${DOCS_CONTRACT[@]}"; do
-  [[ "${known[*]}" == *" $t "* ]] || { echo "ERROR: $t is in NATIVE_FS/DOCS_CONTRACT but not a known test" >&2; exit 2; }
+for t in "${NATIVE_FS[@]}" "${DOCS_CONTRACT[@]}" "${HOST_PROCESSES[@]}"; do
+  [[ "${known[*]}" == *" $t "* ]] || { echo "ERROR: $t is in NATIVE_FS/DOCS_CONTRACT/HOST_PROCESSES but not a known test" >&2; exit 2; }
 done
 # A test that asserts on the repository's documentation must be in DOCS_CONTRACT, or a docs-only
 # change could break it without CI running it.
@@ -398,7 +428,12 @@ export RUN_ROOT FAIL_FAST
 
 # --- run ------------------------------------------------------------------------------------------
 echo "run-all: ${#selected[@]} modules, group $GROUP, $JOBS at a time, python $PY"
-printf '%s\n' "${selected[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+parallel=(); alone=()
+for t in "${selected[@]}"; do
+  if [ "$JOBS" -gt 1 ] && in_list "$t" "${HOST_PROCESSES[@]}"; then alone+=("$t"); else parallel+=("$t"); fi
+done
+((${#parallel[@]})) && printf '%s\n' "${parallel[@]}" | xargs -P "$JOBS" -I{} bash -c 'run_one "$1"' _ {}
+for t in "${alone[@]}"; do bash -c 'run_one "$1"' _ "$t"; done
 
 for t in "${selected[@]}"; do
   d="$RUN_ROOT/${t%.*}"

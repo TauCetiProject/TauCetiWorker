@@ -77,6 +77,7 @@ CALL_SITES = {
         RUBRICS="/opt/rubrics/rubrics.md",
         SOURCE_GUIDANCE="",
         EXTRA_ROADMAP_PROMPT="",
+        UMBRELLA="",
         TARGET_LIST="",
         BIN="/bin",
         **VERIFY,

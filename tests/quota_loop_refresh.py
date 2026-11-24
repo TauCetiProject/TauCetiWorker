@@ -580,7 +580,11 @@ finally:
 saved_loop_poll = tc.loop.POLL
 try:
     tc.loop.POLL = 1800
-    cool_checks["a headerless 429 waits for its bounded backoff"] = tc.loop._recheck_in(bare_first, wait_at) == 900
+    # The backoff is the 900 s cap less the time since the cooldown started, which a loaded runner
+    # can stretch past a second: bounded by the cap, and not the 1800 s poll.
+    cool_checks["a headerless 429 waits for its bounded backoff"] = (
+        840 <= tc.loop._recheck_in(bare_first, wait_at) <= 900
+    )
 finally:
     tc.loop.POLL = saved_loop_poll
 

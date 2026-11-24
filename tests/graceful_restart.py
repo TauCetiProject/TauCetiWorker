@@ -50,7 +50,12 @@ def driver(log: Path, runtime_file: Path, duration_file: Path, idle: str) -> int
     loop.github_budget = lambda: {}
     if idle == "idle":
         # Waiting for fleet capacity: the loop sleeps between rounds and never starts one.
-        loop.fleet_admission_reason = lambda _wid: "fixture capacity wait"
+        def capacity_wait(_wid):
+            # The loop installed its signal handlers before it first asks for capacity.
+            (log.parent / "idle-ready").touch()
+            return "fixture capacity wait"
+
+        loop.fleet_admission_reason = capacity_wait
     round_lifecycle.spawn_round = lambda _tail, **_kwargs: subprocess.Popen(
         [sys.executable, __file__, "round", str(log), runtime, duration],
         start_new_session=True,
@@ -126,7 +131,10 @@ try:
         [sys.executable, __file__, "driver", str(log), str(runtime_file), str(duration_file), "idle"],
         env={**os.environ, "TAUCETI_WORKER_ID": "idle"},
     )
-    time.sleep(1.5)  # the handler is installed and the loop is sleeping on fleet capacity
+    # Wait until the loop has installed its handler and is waiting on fleet capacity; under a
+    # fully parallel CI start the driver's imports alone can take several seconds.
+    wait_for(lambda: (root / "idle-ready").exists() or idle.poll() is not None, timeout=90, what="the idle loop")
+    assert idle.poll() is None, f"idle loop exited {idle.returncode} before the drain signal"
     began = time.monotonic()
     idle.send_signal(signal.SIGUSR1)
     rc = idle.wait(10)

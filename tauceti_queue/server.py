@@ -897,6 +897,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if SCHEMA in schemas:
                 kwargs["mixed_capable"] = True
+        revision = body.get("revision")
+        if isinstance(revision, str) and re.fullmatch(r"[0-9a-f]{7,64}", revision):
+            # The code the worker runs: a stalled repair is offered at once to a revision that has not tried it.
+            kwargs["worker_revision"] = revision
         self._call(lambda: self.server.controller.claim_task(self._worker_identity(body), login, **kwargs))
 
     def _task(self, task_id: str, action: str) -> None:
@@ -923,6 +927,8 @@ class Handler(BaseHTTPRequestHandler):
                     token,
                     str(body.get("reason") or "released"),
                     str(body.get("error") or ""),
+                    # A clean preparation's attestation (decision 200), passed only when sent.
+                    **({"notes": body["notes"]} if isinstance(body.get("notes"), dict) else {}),
                     **self._source_task_kwargs(),
                 )
             )

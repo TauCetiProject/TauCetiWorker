@@ -661,6 +661,15 @@ def construct_chain(clone: Path, failure: Failure, retained_sha: str) -> tuple[s
     return tip, chain, record
 
 
+def _share_seed(seed_packages: Path) -> None:
+    """Let every sandbox of this run, and its agent's, bind the shared seed packages read-only."""
+    from tauceti_queue import repair_sandbox
+
+    trees = [t for t in os.environ.get(repair_sandbox.READ_ONLY_VARIABLE, "").split(os.pathsep) if t]
+    if str(seed_packages) not in trees:
+        os.environ[repair_sandbox.READ_ONLY_VARIABLE] = os.pathsep.join([*trees, str(seed_packages)])
+
+
 def prepare_sources(clone: Path, failure: Failure, experiment_dir: Path, worktree: Path, seed_packages: Path) -> dict:
     """Retained commit, member heads, CI log, attributed chain and the detached worktree at its tip."""
     record: dict = {}
@@ -939,6 +948,7 @@ def run_experiment(
     record_path = experiment_dir / "result.json"
     worktree = root / "worktrees" / f"base-{failure.base_sha[:12]}"
     seed_packages = seed_packages or (root / "seed" / "packages")
+    _share_seed(seed_packages)
     record: dict = {
         "candidate": failure.to_json(),
         "status": "starting",
@@ -1019,6 +1029,7 @@ def remeasure(
     record = json.loads(record_path.read_text())
     worktree = root / "worktrees" / f"base-{failure.base_sha[:12]}"
     seed_packages = root / "seed" / "packages"
+    _share_seed(seed_packages)
     result_tip = git(clone, "rev-parse", "--verify", f"{REF_PREFIX}/result/{failure.ref}").strip()
     chain_before = read_chain(clone, failure.base_sha, record["sources"]["chain_tip"])
     env = lake_env(root)

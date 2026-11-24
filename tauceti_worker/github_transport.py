@@ -141,6 +141,10 @@ def note_cache_hit():
     _cache_hit.set(True)
 
 
+class LockWaitExpired(OSError):
+    """Another process held a shared lock for the whole wait."""
+
+
 @contextlib.contextmanager
 def locked(path: Path, *, timeout: float = 30):
     import fcntl
@@ -154,7 +158,7 @@ def locked(path: Path, *, timeout: float = 30):
                 break
             except BlockingIOError:
                 if time.monotonic() >= deadline:
-                    raise OSError("shared GitHub lock wait expired") from None
+                    raise LockWaitExpired("shared GitHub lock wait expired") from None
                 time.sleep(0.05)
         yield
 
@@ -334,6 +338,19 @@ def update_shared(key, mutate, *, identity, generation_scope, lock_timeout: floa
         return False
 
 
+def stored_shared(key, *, identity):
+    """The value last stored under `key`, whatever its age or generation, as the base of an
+    incremental refresh, never as an answer. None when there is none or this context bypasses
+    the shared cache."""
+    if not identity or _fresh.get() or os.environ.get("TAUCETI_GITHUB_CACHE_BYPASS") == "1":
+        return None
+    try:
+        cached = json.loads(_shared_path(key, identity).read_text())
+        return cached["value"] if cached.get("revision", "") == _revision.get() else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 def shared_read(
     key,
     fetch,
@@ -344,13 +361,17 @@ def shared_read(
     lock_timeout: float = 30,
     generation_scope=None,
     coalesce_failures: bool = False,
+    keep_base: bool = False,
 ):
     """Coalesce a complete logical read under a per-key lock. Never cache failures.
 
     Network/parser exceptions propagate; unavailable storage merely disables caching. Generation
     checks prevent an overlapping write from publishing a pre-write result after invalidation.
     Explicit generation scopes use invalidate_shared rather than unrelated GitHub writes.
-    Opt-in completion markers share unavailable reads only with existing waiters.
+    Opt-in completion markers share unavailable reads only with existing waiters, and a waiter
+    whose lock wait expires behind a running leader is unavailable rather than a second fetch.
+    With `keep_base`, a value that a write invalidated while it was fetched is still stored, under
+    the generation it began in, so it never answers a read but stays a base for stored_shared.
     The default invokes each caller's fetch after failures, preserving fetch side effects.
     """
     identity = identity or scope()
@@ -390,6 +411,12 @@ def shared_read(
     try:
         cm = locked(path.with_suffix(".lock"), timeout=lock_timeout)
         cm.__enter__()
+    except LockWaitExpired:
+        if coalesce_failures:
+            # The leader is still fetching. A second fetch would only compete with it (every
+            # waiter of a slow full listing would start its own), so this wait is unavailable.
+            return None
+        return fetch()
     except OSError:
         return fetch()
     try:
@@ -441,13 +468,13 @@ def shared_read(
                 value = fetch()
                 saved = False
                 generation_current = immutable or current_generation() == epoch
-                if value is not None and generation_current:
+                if value is not None and (generation_current or keep_base):
                     try:
                         atomic(
                             path,
                             {"time": time.time(), "generation": epoch, "revision": _revision.get(), "value": value},
                         )
-                        saved = True
+                        saved = generation_current
                     except OSError:
                         pass
                 if saved:
@@ -667,6 +694,24 @@ def content_write(args):
             and re.fullmatch(r"repos/[^/]+/[^/]+/(?:issues|pulls)", endpoint)
         )
     return len(args) > 1 and args[0] in ("pr", "issue") and args[1] in ("create", "comment", "review")
+
+
+def publication_backoff(env=None, *, identity=None) -> float:
+    """Seconds this host's pacer still refuses content writes for the account after a rejection.
+
+    A review admitted now would finish its model work and then sleep in the pacer holding its
+    worker slot, so selection offers other work first while this is positive. Read-only, unlocked.
+    `identity` names a pacing identity directly (the review App's), instead of `env`'s credential.
+    """
+    identity = identity or quota_scope(scope(env))
+    if not identity:
+        return 0.0
+    try:
+        state = json.loads((root() / "quota" / identity / "secondary.json").read_text())
+        until = max(float(state.get("until") or 0), float(state.get("mutation_until") or 0))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0.0
+    return max(0.0, until - time.time())
 
 
 def mutation_slot(env):
@@ -1026,6 +1071,11 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
 
                 sending(_intent)
                 sent_intent = True
+            if effective.get("_TAUCETI_REVIEW_APP_TOKEN") == "1":
+                from tauceti_worker import review_app
+
+                # A pacing wait can outlast the review App's token; send with a current one.
+                effective = {**review_app.refreshed(effective), "GH_DEBUG": "api"}
             p = subprocess.run(argv, env=effective, capture_output=True, text=True, **kwargs)
         except subprocess.TimeoutExpired as e:
             raw = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else e.stderr or ""
@@ -1033,6 +1083,12 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             raise
         p.stderr = parse_trace(p.stderr or "", identity=scope(effective), records=records)
         p.github_records = records
+        if effective.get("_TAUCETI_REVIEW_APP_TOKEN") == "1" and (
+            "HTTP 401" in p.stderr or any(r.get("status") == 401 for r in records if isinstance(r, dict))
+        ):
+            from tauceti_worker import review_app
+
+            review_app.invalidate(effective.get("GH_TOKEN", ""))  # The token this send used.
         if gql:
             traced = next((r["graphql_cost"] for r in reversed(records) if "graphql_cost" in r), None)
             try:
@@ -1382,6 +1438,15 @@ def migrated_history(args):
 def migrated_identity(args):
     if args not in (["api", "user", "--jq", ".login"], ["api", "/user", "--jq", ".login"]):
         return None
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from tauceti_worker import review_app
+
+    if review_app.publishing():
+        # A review publishing through the App edits only the comments the App's bot wrote.
+        bot = review_app.publishing_login()
+        if bot is None:
+            return subprocess.CompletedProcess(args, 1, "", "gh: review App login is not configured\n")
+        return subprocess.CompletedProcess(args, 0, bot + "\n", "")
     login = os.environ.get("_TAUCETI_PINNED_GITHUB_ACCOUNT")
     if (
         login
@@ -1485,12 +1550,15 @@ if __name__ == "__main__":
         if not readonly:
             invalidate(args)
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tauceti_worker import review_app
         from tauceti_worker.config import GitHubUnavailable
         from tauceti_worker.constants import EX_GITHUB_WAIT
         from tauceti_worker.github_outbox import NOT_POSTED
 
+        app_env = None
         try:
-            p = execute(["gh", *args], wait=os.environ.get("TAUCETI_GITHUB_EPHEMERAL") != "1")
+            app_env = review_app.request_environment(args)
+            p = execute(["gh", *args], env=app_env, wait=os.environ.get("TAUCETI_GITHUB_EPHEMERAL") != "1")
         except GitHubUnavailable as error:
             # The shell caller cannot catch Python exceptions. Preserve the
             # infrastructure wait marker for its owning worker's stage guard.

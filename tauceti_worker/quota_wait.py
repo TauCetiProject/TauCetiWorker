@@ -17,6 +17,7 @@ from .quota import (
     Quota,
     _cooldown_left,
     _finite_num,
+    claude_usage_credentials,
 )
 from .runtime_status import report_runtime
 
@@ -207,7 +208,8 @@ class QuotaWait:
             if self.context.get("directory") is not None:
                 quota._wait_cache_directory = self.context["directory"]
             # Cache-only macOS observations must not introduce Keychain polling.
-            if sys.platform == "darwin" and "claude" not in due and self.identities.get("claude"):
+            keychain = sys.platform == "darwin" and claude_usage_credentials() is None
+            if keychain and "claude" not in due and self.identities.get("claude"):
                 oauth = self.identities["claude"]
                 quota._claude_creds = lambda: (oauth, True)
                 quota._refresh_claude_credential = lambda **_kw: False

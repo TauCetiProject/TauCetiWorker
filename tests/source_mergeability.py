@@ -13,6 +13,8 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tauceti_tools.forge import ForgeError
+
 from tauceti_worker import source_mergeability as probe
 
 HEAD, BASE, OTHER = "a" * 40, "b" * 40, "c" * 40
@@ -64,6 +66,23 @@ class Mergeability(unittest.TestCase):
         self.git.mergeability.return_value = "MERGEABLE"
         self.assertEqual(self.resolve(), "MERGEABLE")
         self.assertEqual(self.git.fetch_refs.call_count, 2)
+
+    def test_missing_pull_ref_falls_back_to_the_exact_head_commit(self):
+        missing = ForgeError("source Git operation failed")
+        self.git.fetch_refs.side_effect = [missing, None]
+        self.assertEqual(self.resolve(), "CONFLICTING")
+        self.assertEqual(
+            self.git.fetch_refs.call_args_list[1].args,
+            ("owner/project", [HEAD, "+refs/heads/main:refs/mergeability/base"]),
+        )
+        self.git.mergeability.assert_called_once_with("owner/project", HEAD, BASE)
+
+    def test_unavailable_head_commit_after_missing_pull_ref_leaves_no_authority(self):
+        missing = ForgeError("source Git operation failed")
+        self.git.fetch_refs.side_effect = [missing, missing]
+        self.assertEqual(self.resolve(), "UNKNOWN")
+        self.git.mergeability.assert_not_called()
+        self.assertEqual(self.source._mergeability_cache, {})
 
     def test_ineligible_or_moved_head_never_fetches(self):
         for change in (

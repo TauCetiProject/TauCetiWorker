@@ -31,16 +31,17 @@ class StoreTests(unittest.TestCase):
             with self.store.transaction():
                 self.store.set_setting("snapshot-test", "pending")
                 writing.set()
-                release.wait(3)
+                release.wait(60)
 
         thread = threading.Thread(target=writer)
         thread.start()
         try:
-            self.assertTrue(writing.wait(2))
+            self.assertTrue(writing.wait(30))
             started = time.monotonic()
             with self.store.read_snapshot() as snapshot:
                 self.assertEqual(snapshot.get_setting("snapshot-test"), "committed")
-            self.assertLess(time.monotonic() - started, 1)
+            # The writer holds its transaction for a minute; a read that waited for it would take that.
+            self.assertLess(time.monotonic() - started, 10)
         finally:
             release.set()
             thread.join(5)
