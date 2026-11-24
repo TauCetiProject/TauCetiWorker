@@ -894,6 +894,8 @@ CREATE TABLE ci_attempts (
 
 # Columns declared on `ci_attempts` for runs the controller cancels.
 CANCEL_COLUMNS = ("cancelled_at", "cancelled_by", "cancel_reason", "cancel_result")
+# The early-staging columns (decisions 199 B and 200).
+EARLY_COLUMNS = ("early", "generation", "dispatch_kind")
 
 # Columns declared on `batches` and `tasks` after those tables existed.
 PRE_REBASED_CHAIN_COLUMNS = (("batches", "pre_rebase_prepared"), ("tasks", "pre_rebase_source"))
@@ -919,6 +921,7 @@ class OlderStore(ControllerCase):
             "dispatch_retryable",
             "dispatch_failures",
             *CANCEL_COLUMNS,
+            *EARLY_COLUMNS,
         ):
             columns.remove(column)
         listed = ", ".join(columns)
@@ -945,6 +948,7 @@ class OlderStore(ControllerCase):
             "dispatch_retryable",
             "dispatch_failures",
             *CANCEL_COLUMNS,
+            *EARLY_COLUMNS,
         ):
             self.assertIn(column, present)
         for table, column in PRE_REBASED_CHAIN_COLUMNS:
@@ -3603,6 +3607,299 @@ class VerificationSnapshot(PreRebasedCase):
         self.controller.tick()
         self.assertFalse(self.row(batch)["sealed"])
         self.assertEqual(self.controller.input_for(PROJECT, 203)["batch_id"], batch["id"])
+
+
+class EarlyStaging(PreRebasedCase):
+    """Decisions 199 B and 200: the next batch's verified preparation on the head's tip is staged at once,
+    based on the head's tip, and adopted when the head lands as that base."""
+
+    def setUp(self):
+        super().setUp()
+        self.controller.set_setting("early_staging_enabled", True, "t")
+
+    def prepared(self):
+        """A head staging a known-good tip, and the next batch prepared clean on it; one more tick."""
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertIn("pre_rebased", task.extra)
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.assertEqual(self.row(batch)["pre_rebase_verified"], task.tip)
+        self.controller.tick()
+        return self.row(batch), task.tip
+
+    def early(self, batch):
+        return [
+            a for a in self.controller.store.rows("ci_attempts", {"batch_id": batch["id"]}, order="id") if a["early"]
+        ]
+
+    def run_for(self, sha):
+        [run] = [r for r in self.github.runs if r.head_sha == sha]
+        return run
+
+    def finish(self, *runs):
+        """Complete exactly `runs` and deliver their status events."""
+        held = [(r, r.verdict) for r in self.github.runs if r not in runs and r.status != "completed"]
+        for run, _ in held:
+            run.verdict = "lost"
+        try:
+            self.github.complete_runs()
+        finally:
+            for run, verdict in held:
+                run.verdict = verdict
+        for run in runs:
+            for context in VERDICT_CONTEXTS:
+                self.controller.handle_event("status", {"sha": run.head_sha, "context": context})
+
+    def requested(self, batch):
+        return feeds.observation_feed(feeds.feed_source(self.controller), PROJECT, "main", batch["id"])[
+            "requested_batch"
+        ]
+
+    def test_off_by_default_and_nothing_is_sent_while_off(self):
+        self.assertFalse(DEFAULT_SETTINGS["early_staging_enabled"], "an operator turns it on")
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        batch, tip = self.prepared()
+        self.assertEqual(self.early(batch), [])
+        self.assertEqual([r.head_sha for r in self.github.runs], [self.head()["tip"]])
+
+    def test_the_prepared_tip_is_staged_on_the_heads_tip_and_reported_running(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        [attempt] = self.early(batch)
+        self.assertEqual(
+            (attempt["head_sha"], attempt["base_sha"], attempt["batch_version"], attempt["generation"]),
+            (tip, head["tip"], batch["version"], batch["version"] + 1),
+        )
+        self.assertEqual(
+            (attempt["early"], attempt["dispatch_kind"], attempt["dispatch_state"]), (1, "staging", "accepted")
+        )
+        run = self.run_for(tip)
+        self.assertEqual((run.base_sha, run.batch_id), (head["tip"], str(batch["id"])))
+        self.assertEqual(loads(attempt["repair_outputs_revs"], [])[0], head["tip"], "warm from the head's tip")
+        requested = self.requested(batch)
+        self.assertEqual(
+            (requested["state"], requested["head_sha"], requested["base_sha"]), ("running", tip, head["tip"])
+        )
+        branch = requested["train"]["staging_ref"]
+        self.assertEqual(branch, f"staging-candidate-{attempt['id']}-{batch['version'] + 1}")
+        self.assertIn(("update_ref", (f"refs/heads/{branch}", tip)), self.github.calls)
+        self.assertIsNone(self.row(batch)["first_dispatch_at"], "not yet the head's dispatch")
+        self.assertEqual(self.controller.status()["open_batches"][0]["early_staging"]["attempt_id"], attempt["id"])
+        self.controller.tick()
+        self.assertEqual(len(self.early(batch)), 1, "sent once")
+
+    def test_a_passed_early_run_lands_as_soon_as_the_head_has(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        self.finish(self.run_for(tip))
+        self.controller.tick()
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["outcome"], "pass")
+        self.assertEqual(self.requested(batch)["state"], "waiting", "no longer running once it finished")
+        runs = len(self.github.runs)
+        self.finish(self.run_for(head["tip"]))
+        self.controller.tick()  # the head lands
+        self.controller.tick()  # the next batch seals as the prepared tip, adopts its pass and promotes
+        self.controller.tick()
+        self.assertEqual(len(self.github.runs), runs, "no second run of the same tip")
+        landed = self.row(batch)
+        self.assertEqual((landed["state"], landed["tip"]), ("landed", tip))
+        self.assertEqual(self.repo.main_sha(), tip)
+        adopted = self.controller.store.row("ci_attempts", {"id": attempt["id"]})
+        self.assertEqual((adopted["early"], adopted["batch_version"]), (2, landed["version"]))
+        [entry] = self.controller.store.journal_entries("early-staging-adopted")
+        self.assertEqual((entry["batch_id"], entry["detail"]["outcome"]), (batch["id"], "pass"))
+
+    def test_a_running_early_run_becomes_the_heads_run(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        self.finish(self.run_for(head["tip"]))
+        self.controller.tick()
+        self.controller.tick()
+        sealed = self.head()
+        self.assertEqual((sealed["id"], sealed["tip"], sealed["base"]), (batch["id"], tip, head["tip"]))
+        [attempt] = self.early(batch)
+        self.assertEqual(self.controller._current_attempt(sealed)["id"], attempt["id"])
+        requested = self.requested(sealed)
+        self.assertEqual((requested["state"], requested["head_sha"]), ("running", tip))
+        self.assertEqual(
+            requested["train"]["staging_ref"], f"staging-candidate-{attempt['id']}-{attempt['generation']}"
+        )
+        self.assertIsNotNone(self.head()["first_dispatch_at"])
+        runs = len(self.github.runs)
+        self.finish(self.run_for(tip))
+        self.controller.tick()
+        self.controller.tick()
+        self.assertEqual(len(self.github.runs), runs)
+        self.assertEqual(self.row(batch)["state"], "landed")
+
+    def test_an_early_source_failure_goes_straight_to_the_heads_repair(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        run = self.run_for(tip)
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "P202.lean", "message": "boom"}]
+        self.finish(run)
+        self.controller.tick()
+        self.assertEqual(self.early(batch)[0]["outcome"], "source-failure")
+        self.finish(self.run_for(head["tip"]))
+        self.controller.tick()
+        self.controller.tick()
+        sealed = self.head()
+        self.assertEqual(sealed["id"], batch["id"])
+        self.assertFalse(self.controller._head_tip_verified(sealed), "CI failed the tip")
+        [task] = self.controller.store.rows("tasks", {"batch_id": batch["id"], "state": "open", "kind": "repair"})
+        [adopted] = self.early(batch)
+        self.assertEqual((task["ci_attempt_id"], adopted["early"]), (adopted["id"], 2), "the early run's own findings")
+        self.assertEqual(loads(task["diagnostics"], [])[0]["message"], "boom")
+
+    def test_the_early_run_is_cancelled_when_the_head_fails(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        run = self.run_for(head["tip"])
+        run.verdict, run.diagnostics = "fail", [{"kind": "compiler", "module": "A.lean", "message": "boom"}]
+        self.finish(run)
+        self.controller.tick()
+        self.controller.tick()
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["outcome"], "superseded")
+        self.assertIsNotNone(attempt["cancelled_at"])
+        self.assertEqual(self.run_for(tip).conclusion, "cancelled")
+        self.assertNotEqual(self.requested(batch)["state"], "running", "it can no longer post a verdict")
+        [entry] = self.controller.store.journal_entries("early-staging-cancelled")
+        # #999 discards the preparation made on the failed tip in the same pass.
+        self.assertIn(
+            entry["detail"]["reason"],
+            ("the batch's prepared tip changed", f"head {head['id']} failed CI on the source"),
+        )
+
+    def test_the_early_run_is_cancelled_when_the_heads_tip_moves(self):
+        batch, tip = self.prepared()
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, tip="1" * 40)
+        self.controller._early_staging(self.clock())
+        [attempt] = self.early(batch)
+        self.assertEqual((attempt["outcome"], self.run_for(tip).conclusion), ("superseded", "cancelled"))
+        [entry] = self.controller.store.journal_entries("early-staging-cancelled")
+        self.assertEqual(entry["detail"]["reason"], f"head {head['id']}'s tip moved")
+
+    def test_a_completed_run_awaiting_its_statuses_is_settled_when_invalid(self):
+        batch, tip = self.prepared()
+        run = self.run_for(tip)
+        run.status = "completed"  # GitHub reports it done; its statuses are not delivered yet
+        [attempt] = self.early(batch)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, run_status="completed")
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        self.controller._early_staging(self.clock())
+        [attempt] = self.early(batch)
+        self.assertEqual(attempt["outcome"], "superseded")
+        self.assertIsNotNone(attempt["cancelled_at"])
+        self.assertNotEqual(self.requested(batch)["state"], "running")
+
+    def test_an_early_pass_never_promotes_a_head_that_sealed_without_it(self):
+        batch, tip = self.prepared()
+        self.finish(self.run_for(tip))
+        self.controller.tick()
+        self.assertEqual(self.early(batch)[0]["outcome"], "pass")
+        # The batch becomes the head at the same version without adopting (the head ahead was removed).
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, state="removed")
+        self.controller.store.update("batches", {"id": batch["id"]}, state="head")
+        sealed = self.row(batch)
+        self.assertIsNone(self.controller._current_attempt(sealed), "the early pass is not the head's attempt")
+        self.controller._promote(sealed, self.early(batch)[0], self.clock())
+        self.assertIsNone(self.controller.store.row("outbox", {"kind": "promote"}), "another tip: not promoted")
+
+    def test_rejected_early_dispatches_do_not_use_the_retry(self):
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+        batch, tip = self.prepared()
+        [attempt] = self.early(batch)
+        for _ in range(3):
+            self.controller.store.insert(
+                "ci_attempts",
+                **{
+                    k: v
+                    for k, v in attempt.items()
+                    if k not in ("id", "run_id", "outcome", "dispatch_state", "cancelled_at")
+                },
+                outcome="infrastructure",
+                dispatch_state="rejected",
+            )
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="infrastructure")
+        self.assertIsNone(self.controller._early_staging_blocked(self.row(batch), self.head()))
+
+    def test_no_early_run_on_a_control_lane_head(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.store.update("batches", {"id": self.head()["id"]}, lane="control")
+        self.assertEqual(
+            self.controller._early_staging_blocked(dict(self.row(batch), sealed=1), self.head()),
+            f"head {self.head()['id']} is not an ordinary batch",
+        )
+
+    def test_turning_it_off_cancels_the_live_run(self):
+        batch, tip = self.prepared()
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        self.controller.tick()
+        [attempt] = self.early(batch)
+        self.assertEqual((attempt["outcome"], self.run_for(tip).conclusion), ("superseded", "cancelled"))
+        self.finish(self.run_for(self.head()["tip"]))
+        self.controller.tick()
+        self.controller.tick()
+        sealed = self.head()
+        self.assertEqual(sealed["id"], batch["id"])
+        self.assertNotEqual(self.controller._current_attempt(sealed)["id"], attempt["id"], "staged afresh")
+
+    def test_an_unverified_preparation_is_not_sent_early(self):
+        batch = self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        preparer = ScriptedAgent(
+            "preparer",
+            "admin-worker",
+            self.repo,
+            self.root / "preparer",
+            lambda _: {f"{PROJECT}#202": Resolution({"P202.lean": "fixed\n"}, explanation="Fixed.")},
+            verified=False,
+        )
+        self.assertTrue(preparer.run(self.controller).accepted)
+        self.controller.tick()
+        self.assertEqual(self.early(batch), [])
+
+    def test_a_queued_early_run_gives_way_to_the_heads_rerun(self):
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+        batch, tip = self.prepared()
+        head = self.head()
+        run = self.run_for(head["tip"])
+        run.verdict = "infrastructure"
+        self.finish(run)
+        self.controller.tick()
+        first = self.early(batch)[0]
+        self.assertEqual(first["outcome"], "superseded")
+        self.assertEqual(
+            [r for r in self.github.runs if r.head_sha == tip][0].conclusion, "cancelled", "it had not started"
+        )
+        self.controller.tick()
+        head_runs = [r for r in self.github.runs if r.head_sha == head["tip"]]
+        early_runs = [r for r in self.github.runs if r.head_sha == tip]
+        self.assertEqual((len(head_runs), len(early_runs)), (2, 2))
+        self.assertLess(self.github.runs.index(head_runs[1]), self.github.runs.index(early_runs[1]), "sent behind it")
+        self.assertEqual(self.early(batch)[-1]["outcome"], "pending")
+
+    def test_infrastructure_failures_of_the_early_run_are_retried_once(self):
+        self.controller.set_setting("infrastructure_retry_backoff_seconds", 0, "t")
+        batch, tip = self.prepared()
+        for _ in range(2):
+            run = [r for r in self.github.runs if r.head_sha == tip][-1]
+            run.verdict = "infrastructure"
+            self.finish(run)
+            self.controller.tick()
+            self.controller.tick()
+        self.assertEqual(len(self.early(batch)), 2, "the first run and one retry")
+        self.assertEqual(
+            [a["outcome"] for a in self.early(batch)], ["infrastructure", "infrastructure"], self.early(batch)
+        )
 
 
 class ParallelHeadCheck(PreRebasedCase):
