@@ -9,6 +9,10 @@ at most HINT_TTL_S, and the real lease stays authoritative for everything a roun
 The store lives under the explicitly configured shared read directory
 ($TAUCETI_GITHUB_SHARED_DIR, which the fleet's worker manager sets); without it no hint is
 recorded or read.
+
+A head that the review engine declined because its diff fails the PR-level guards (too large to
+review, oversized new files) is recorded here too, for GUARD_TTL_S. The engine's verdict depends
+only on the head and its merge base, so peers skip that head until a push gives the PR a new one.
 """
 
 from __future__ import annotations
@@ -25,6 +29,8 @@ HINT_TTL_S = 600
 # A selected PR whose source could not be fetched is skipped host-wide this long (the per-worker
 # retry deadline, github_state.MAX_RETRY_AFTER), so one fetch failure does not draw every peer to it.
 UNAVAILABLE_TTL_S = 300
+# A head failing the diff guards stays failing; the TTL only bounds how long a stale record lingers.
+GUARD_TTL_S = 7 * 86400
 
 
 def _root() -> Path | None:
@@ -89,3 +95,44 @@ def _prune(root: Path, now: float) -> None:
                 path.unlink()
         except OSError:
             pass
+
+
+def _guard_path(scope: str, pr: int, head: str) -> Path | None:
+    shared = os.environ.get("TAUCETI_GITHUB_SHARED_DIR")
+    if not shared or not pr or not head:
+        return None
+    return Path(shared) / "review-diff-guards" / (_key(scope, f"diff-guard/{pr}/{head}") + ".json")
+
+
+def note_diff_guard(scope: str, pr: int, head: str, *, now: float | None = None) -> None:
+    """Record that the review engine declined this exact head on the PR-level diff guards."""
+    path = _guard_path(scope, pr, head)
+    if path is None:
+        return
+    stamp = time.time() if now is None else now
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        temporary.write_text(json.dumps({"expires_at": stamp + GUARD_TTL_S}))
+        os.replace(temporary, path)
+        if random.random() < 0.02:
+            for old in path.parent.glob("*.json"):
+                try:
+                    if stamp - old.stat().st_mtime > GUARD_TTL_S:
+                        old.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass  # without the record, peers each pay one more declined review
+
+
+def diff_guarded(scope: str, pr: int, head: str, *, now: float | None = None) -> bool:
+    path = _guard_path(scope, pr, head)
+    if path is None:
+        return False
+    try:
+        expires = json.loads(path.read_text()).get("expires_at")
+    except (OSError, ValueError, AttributeError):
+        return False
+    stamp = time.time() if now is None else now
+    return isinstance(expires, (int, float)) and stamp < expires <= stamp + GUARD_TTL_S
