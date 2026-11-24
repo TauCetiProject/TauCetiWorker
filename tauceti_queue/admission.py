@@ -43,6 +43,9 @@ READMIT_REFUSED = frozenset({"closed", "draft", "review-unsafe"})
 CONTEXTS = ("build", "scope", "bump-guard")
 HUMAN_INFRASTRUCTURE_APPROVAL_VERSION = 1
 LARGE_REFACTOR_APPROVAL_VERSION = 1
+# Tools' self-tested eligibility is not part of the review policy's source, so bump this when its
+# rules change: every evaluated head is then evaluated again at startup. 2: any author's label counts.
+SELF_TESTED_POLICY_VERSION = 2
 
 
 # The Lake pins a Mathlib bump changes; a waived large refactor may change them only with a passing bump check.
@@ -151,6 +154,7 @@ class AdmissionPolicy:
                 "allow_files": self.allow_files,
                 "human_infrastructure_approval": HUMAN_INFRASTRUCTURE_APPROVAL_VERSION,
                 "large_refactor_approval": LARGE_REFACTOR_APPROVAL_VERSION,
+                "self_tested_policy": SELF_TESTED_POLICY_VERSION,
             }
         )
 
