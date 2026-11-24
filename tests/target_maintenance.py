@@ -94,10 +94,10 @@ class Ordering(unittest.TestCase):
     def test_forgejo_first_reviews_share_the_rereview_tier_in_review_order(self):
         sv = survey()
         sv.kind("review").actionable = [
-            Candidate(61, HEAD, native_first_review=True),
+            Candidate(61, HEAD, native_review=True),
             Candidate(60, HEAD, rereview=True),
             Candidate(50, HEAD),
-            Candidate(62, HEAD, native_first_review=True),
+            Candidate(62, HEAD, native_review=True),
             Candidate(63, HEAD, rereview=True),
         ]
         pairs = order(cascade(sv, AUTO_STAGES))

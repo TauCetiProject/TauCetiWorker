@@ -874,7 +874,7 @@ ci="one/project"
         observations = self.observations([], [])
         forgejo = observations[1][2]
         forgejo.needs_fix.actionable.append(Candidate(1, "a" * 40))
-        forgejo.reviewable.actionable.append(Candidate(2, "b" * 40, native_first_review=True))
+        forgejo.reviewable.actionable.append(Candidate(2, "b" * 40, native_review=True))
         for _, worker, _ in observations:
             worker.cfg = self.cfg
         options = RoundOpts(only=["fix", "review"], agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
