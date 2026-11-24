@@ -415,7 +415,8 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "check, then its default plan. `threshold`: no due check; the round runs `plan --strategy "
         "threshold`, which takes a roadmap on its own merged PRs and days since its last report, and "
         "waits for the time that plan names (at most $TAUCETI_PROGRESS_POLL seconds) when none "
-        "qualifies. Needs a TauCetiProgress revision that has the strategy ($TAUCETI_PROGRESS_REF). "
+        "qualifies. Needs a TauCetiProgress revision that has the strategy, as the default "
+        "$TAUCETI_PROGRESS_REF does. "
         "Overrides $TAUCETI_PROGRESS_STRATEGY for this run",
     )
     p.add_argument(

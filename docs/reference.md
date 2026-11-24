@@ -511,8 +511,9 @@ share a claim namespace take turns and do not write the same report twice.
 
 `--progress-skip` passes `--skip-area` to `plan` under either strategy.
 
-These settings need a TauCetiProgress revision whose `plan` has the flags; set
-`TAUCETI_PROGRESS_REF` (and `TAUCETI_PROGRESS_REPO` for a fork) accordingly. On a revision without
+These settings need a TauCetiProgress revision whose `plan` has the flags. The default
+`TAUCETI_PROGRESS_REF` has them; any other `TAUCETI_PROGRESS_REF`, or a fork named by
+`TAUCETI_PROGRESS_REPO`, must too. On a revision without
 them the first plan fails with a message naming the revision, and progress rounds stay suppressed
 with that reason until the pin changes, the settings are removed, or the named state file is
 deleted. With all three settings unset the progress phase runs exactly as before.
