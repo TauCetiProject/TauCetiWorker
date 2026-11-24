@@ -2534,6 +2534,29 @@ class DriverFailureRepair(Fixture):
         self.assertEqual(len(self.service.results), 1)
         self.assertEqual(json.loads(self.service.results[0]["worker_notes"])["edited"], [])
 
+    def test_the_same_chain_is_staged_again_only_once(self):
+        self.driver_failure()
+        cfg = self.config(agent_attempts=1)
+        claim = {"id": 0, "task_id": 1, "token": "t", "worker": "w", "expires_at": time.time() + 60}
+        task = repair_task.Task.from_json(self.service.task_record(1, claim))
+        repair.git(cfg.clone, "update-ref", repair_task.restaged_ref(task), self.content.tip)
+        with patch.object(repair_audit, "verify", return_value=self.verification("passed")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["reason"], "agent_failed", outcome)
+        self.assertIn("needs an operator", outcome["detail"])
+        self.assertEqual(self.service.results, [])
+
+    def test_an_earlier_pass_does_not_outvote_a_later_unavailable_check(self):
+        outcome = {
+            "verification": [
+                {"tip": "t", "ok": True, "checks": {"status": "passed"}},
+                {"tip": "t", "ok": True, "checks": {"status": "unavailable"}},
+            ]
+        }
+        self.assertFalse(repair_task.verified_unchanged("t", outcome))
+        outcome["verification"].reverse()
+        self.assertTrue(repair_task.verified_unchanged("t", outcome))
+
     def test_unchanged_chain_without_a_complete_local_pass_is_not_submitted(self):
         self.driver_failure()
         cfg = self.config(agent_attempts=1)
