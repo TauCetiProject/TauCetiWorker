@@ -88,8 +88,8 @@ A `declined` record adds:
 | --- | --- | --- |
 | `reason` | string | Why the survey offered the pull request, for example `conflicting` |
 | `summary` | string | The agent's final message, cut to 2000 characters. For an agent without a structured transcript, the last lines of its output |
-| `subsumed_by` | integer list | Pull requests named on the last `Subsumed-by:` line within the message's first 4000 characters, as the run record keeps it |
-| `mentions` | integer list | Other pull requests those characters refer to as `#N` |
+| `subsumed_by` | integer list | Pull requests named on the last `Subsumed-by:` line of that message |
+| `mentions` | integer list | Other pull requests the message refers to as `#N` |
 | `transcript` | string | The round's transcript file on the worker's host; its log directory for a streamed round |
 
 A `budget-spent` record adds `detail`, one line naming the survey's reason and

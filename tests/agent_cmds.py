@@ -206,8 +206,8 @@ try:
         run = tc.agents.take_last_agent_run()
         check(
             "the run record keeps the final message and the transcript file",
-            (run["final_text"], run["transcript"]),
-            ("working", str(next(parity_dir.glob("agent-claude-*.log")))),
+            (run["final_text"], run["last_message"], run["transcript"]),
+            ("working", "working", str(next(parity_dir.glob("agent-claude-*.log")))),
         )
         os.environ["TAUCETI_STREAM"] = "1"
         streamed = io.StringIO()

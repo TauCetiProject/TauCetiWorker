@@ -1169,7 +1169,7 @@ def _record_declined(stage: str, w: Worker, sv: Survey, c: Candidate) -> Path | 
         repository=repository,
         repository_id=repository_id,
         reason=c.reason,
-        message=run.get("final_text") or "\n".join(run.get("tail") or ()),
+        message=run.get("last_message") or "\n".join(run.get("tail") or ()),
         transcript=run.get("transcript") or str(w.cfg.logdir),
     )
 

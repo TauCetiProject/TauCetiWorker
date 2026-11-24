@@ -228,7 +228,10 @@ def test_round(root, tmp):
 
     def fake_fix(_w, _sv, c, _opts, _bubble):
         launched.append(c.pr)
-        agents._LAST_AGENT_RUN = {"final_text": f"#{c.pr} is covered.\nSubsumed-by: #41", "transcript": "/t.log"}
+        message = f"#{c.pr} is covered.\nSubsumed-by: #41"
+        if c.pr == 12:
+            message = f"#{c.pr} needs #43.\n" + "x" * 4100 + "\nSubsumed-by: #42"
+        agents._LAST_AGENT_RUN = {"final_text": message[:4000], "last_message": message, "transcript": "/t.log"}
         return 0
 
     def round_over(prs, *, dry_run=False, bump=False):
@@ -262,7 +265,7 @@ def test_round(root, tmp):
         return list(launched)
 
     with settings(), patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(tmp / "shared")}):
-        check("unset: the no-change round runs as before", round_over([11, 12]), [11, 12])
+        check("unset: the no-change round runs as before", sorted(round_over([11, 12])), [11, 12])
         check("unset: and leaves no directory", root.exists(), False)
 
     with settings(root), patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": str(tmp / "shared")}):
@@ -272,12 +275,18 @@ def test_round(root, tmp):
             (round_over([13], bump=True), (root / "declined-fix-13.json").exists()),
             ([13], False),
         )
-        check("set: both no-change rounds still run", round_over([11, 12]), [11, 12])
+        check("set: both no-change rounds still run", sorted(round_over([11, 12])), [11, 12])
         value = load(root / "declined-fix-11.json")
         check(
             "each leaves the agent's final message",
             (value["head"], value["reason"], value["summary"], value["subsumed_by"], value["transcript"]),
             ("head-11", "blocking review at head", "#11 is covered.\nSubsumed-by: #41", [41], "/t.log"),
+        )
+        long = load(root / "declined-fix-12.json")
+        check(
+            "a message longer than the run record's final_text still yields its closing Subsumed-by line",
+            (long["subsumed_by"], long["mentions"]),
+            ([42], [43]),
         )
         check("without the hold the head is taken again", round_over([11]), [11])
         check("…and the record counts it", load(root / "declined-fix-11.json")["count"], 2)
