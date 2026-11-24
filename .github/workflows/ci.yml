@@ -64,6 +64,9 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: test
+      # Test against the TauCetiTools commit pinned in pyproject.toml, not Tools main.
+      - name: Use the pinned TauCetiTools
+        run: .github/scripts/tools-pin.sh apply
       - name: Run the portable test modules
         if: needs.changes.outputs.docs_only != 'true'
         # Not $(nproc): the infra runners report 96 CPUs on a host they share with workers and PR
@@ -89,6 +92,9 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: test
+      # Test against the TauCetiTools commit pinned in pyproject.toml, not Tools main.
+      - name: Use the pinned TauCetiTools
+        run: .github/scripts/tools-pin.sh apply
       - name: Run the native-filesystem test modules
         run: ./tests/run-all -j "$(nproc)" --group native
 
@@ -97,6 +103,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      # Test against the TauCetiTools commit pinned in pyproject.toml, not Tools main.
+      - name: Use the pinned TauCetiTools
+        run: .github/scripts/tools-pin.sh apply
       - name: Check the source-checkout launcher environment
         run: ./tauceti --help
       - name: Check native macOS live-use observations
@@ -141,7 +150,7 @@ jobs:
       # --severity=warning: skip the info/style notes on the deliberate `A && B || C` test idiom
       # (where B, an echo, always succeeds), while still failing on real warnings and errors.
       - name: ShellCheck
-        run: shellcheck --severity=warning scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint services/queue/*.sh services/forgejo-mirror/*.sh tests/*.sh tests/run-all
+        run: shellcheck --severity=warning .github/scripts/tools-pin.sh scripts/claim.sh scripts/git-safe-push scripts/gh-safe-pr-create scripts/docker-entrypoint services/queue/*.sh services/forgejo-mirror/*.sh tests/*.sh tests/run-all
 
   build:
     needs: changes
@@ -153,6 +162,9 @@ jobs:
         with:
           enable-cache: true
           cache-suffix: build
+      # Test against the TauCetiTools commit pinned in pyproject.toml, not Tools main.
+      - name: Use the pinned TauCetiTools
+        run: .github/scripts/tools-pin.sh apply
       - name: Build the wheel
         run: uv build
       # uv build proves the artifact builds; this proves the force-include mapping (prompts/ and
@@ -175,6 +187,7 @@ jobs:
           print("bundled prompts/, scripts/ and prices.json present")
           PY
 
+  # The image installs the declared dependencies, TauCetiTools main, as production does.
   docker:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
