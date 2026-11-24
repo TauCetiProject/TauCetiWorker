@@ -2032,6 +2032,8 @@ def run_repair_agent(
             profile = provider_profile(cfg, provider)
             telemetry_provider = getattr(profile, "provider", "claude")
             changes = repair.isolation_env(cfg.root, env_lake, provider, api_key=cfg.api_key)
+            if cfg.seed_packages:
+                changes[repair_sandbox.READ_ONLY_VARIABLE] = str(cfg.seed_packages)
             changes["TAUCETI_ROUND_DEADLINE"] = str(time.time() + cfg.agent_timeout)
             changes["TAUCETI_SHELL_LIMIT_SECONDS"] = str(int(cfg.shell_limit))
             started = time.monotonic()

@@ -121,6 +121,27 @@ class Shims(Fixture):
         self.assertEqual(repair_agent_tools.project_root(self.worktree / "TauCeti"), self.worktree)
         self.assertIsNone(repair_agent_tools.project_root(self.tmp))
 
+    def test_a_symlinked_seed_package_keeps_its_worktree_and_stays_read_only(self):
+        seed = self.tmp / "seed"
+        (seed / "mathlib").mkdir(parents=True)
+        (seed / "mathlib" / "lakefile.lean").write_text("")
+        (self.worktree / ".lake").mkdir()
+        (self.worktree / ".lake" / "packages").symlink_to(seed)
+        logical = self.worktree / ".lake" / "packages" / "mathlib"
+        run = self.run_agent(f"cd {logical} && lake build", self.worktree)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        argv = self.bwrap_calls()[-1]["argv"]
+        self.assertEqual(argv[argv.index("--chdir") + 1], str(logical))
+        self.assertIn(
+            ["--bind", str(self.worktree / ".lake"), str(self.worktree / ".lake")],
+            [argv[i : i + 3] for i in range(len(argv))],
+        )
+        self.assertNotIn(str(seed / "mathlib" / ".lake"), argv)
+        # Reached by its physical path, the seed is refused as a worktree of its own.
+        run = self.run_agent("lake build", seed / "mathlib", **{repair_sandbox.READ_ONLY_VARIABLE: str(seed)})
+        self.assertEqual(run.returncode, 127)
+        self.assertIn("which builds may only read", run.stderr)
+
     def test_outside_a_lake_project_the_shims_refuse(self):
         run = self.run_agent("lean --version", self.tmp)
         self.assertEqual(run.returncode, 126)
@@ -162,6 +183,7 @@ class ShellGuard(Fixture):
             f"echo $({self.toolchain}/lean)",
             f"set -e; {self.toolchain}/lean; echo survived",
             f"PATH=/nonexistent; {self.toolchain}/lean --version",
+            f"IFS=$'\\n'; {self.toolchain}/lean --version",
         ):
             with self.subTest(command=command):
                 run = self.run_agent(command, self.worktree)
@@ -177,15 +199,22 @@ class ShellGuard(Fixture):
             "env -i lake build",
             "env -u PATH lake build",
             "command -p lean --version",
+            "env -u LANG -i lean --version",
+            "env -C . -i lean --version",
+            "env -vi lean --version",
+            "nice env --ignore-environment lake build",
             f"FOO=1 PATH='{self.bin}' elan show",
         ):
             with self.subTest(command=command):
                 run = self.run_agent(command, self.worktree)
                 self.assertNotIn("real", run.stdout)
                 self.assertIn("sets or resets PATH", run.stderr)
-        run = self.run_agent(f'PATH="{self.tools}:$PATH" lake build; grep -ci lean lakefile.toml', self.worktree)
-        self.assertEqual(run.stdout.split(), ["0"], run.stderr)
-        self.assertEqual(len(self.bwrap_calls()), 1)
+        run = self.run_agent(
+            f'PATH="{self.tools}:$PATH" lake build; grep -ci lean lakefile.toml; env -u FOO lean x; command -v lean',
+            self.worktree,
+        )
+        self.assertEqual(run.stdout.split(), ["0", str(self.tools / "lean")], run.stderr)
+        self.assertEqual(len(self.bwrap_calls()), 2)
 
     def test_ordinary_commands_and_named_tools_pass(self):
         run = self.run_agent(
@@ -239,6 +268,18 @@ class Credentials(Fixture):
         triples = [argv[i : i + 3] for i in range(len(argv))]
         for name in ("repair-cache-key", "usage.json"):
             self.assertIn(["--ro-bind", "/dev/null", str(self.tmp / "pool" / name)], triples)
+
+    def test_a_relative_credential_path_is_resolved_and_masked(self):
+        pool = self.tmp / "pool"
+        pool.mkdir()
+        (pool / "token").write_text("secret")
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, cwd)
+        env = {**self.env, "LAKE_CACHE_DIR": str(pool), "TAUCETI_QUEUE_TOKEN_FILE": "pool/token"}
+        self.assertIn(pool / "token", repair_sandbox.credential_paths(env))
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, env, bwrap=str(self.bin / "bwrap"))
+        self.assertIn(["--ro-bind", "/dev/null", str(pool / "token")], [argv[i : i + 3] for i in range(len(argv))])
 
     def test_a_credential_value_that_is_not_a_path_is_never_copied(self):
         env = {**self.env, "TAUCETI_REPAIR_CACHE_KEY_FILE": "id:secret"}

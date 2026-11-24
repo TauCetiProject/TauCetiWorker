@@ -113,21 +113,37 @@ __tauceti_guard() {
   local c=$BASH_COMMAND
   case $c in *lean*|*lake*|*elan*) ;; *) return 0 ;; esac
   local -a w
-  local x r p
+  local x r p IFS=$' \t\n'
   read -r -a w <<<"$c" || true
   # A command-local PATH, or env and command forms that reset it, would look a tool up past the shims.
-  local search=0 named=0 prev=
+  # `env` is parsed as GNU env takes its options: up to the command, with operands for -u, -C and -S.
+  local search=0 named=0 mode= operand=
   for x in "${w[@]}"; do
     case $x in
       PATH=*|\'PATH=*|\"PATH=*)
         x=${x#[\'\"]}
-        case ${x#PATH=} in "$__TAUCETI_TOOLS"|"$__TAUCETI_TOOLS":*|[\'\"]"$__TAUCETI_TOOLS"*) ;; *) search=1 ;; esac ;;
+        case ${x#PATH=} in "$__TAUCETI_TOOLS"|"$__TAUCETI_TOOLS":*|[\'\"]"$__TAUCETI_TOOLS"*) ;; *) search=1 ;; esac
+        continue ;;
     esac
-    case $prev:$x in
-      env:-i|env:-|env:--ignore-environment|env:-uPATH|env:--unset=PATH|-u:PATH|--unset:PATH|command:-p*) search=1 ;;
+    if [[ -n $operand ]]; then
+      [[ $operand == u && $x == PATH ]] && search=1
+      operand=
+      continue
+    fi
+    case $mode:$x in
+      env:-u|env:--unset|env:-C|env:--chdir|env:-S|env:--split-string) operand=${x#-}; operand=${operand#-}; operand=${operand:0:1}; continue ;;
+      env:-uPATH|env:--unset=PATH|env:-|env:--ignore-environment|env:--ignore-environment=*) search=1; continue ;;
+      env:--*) continue ;;
+      env:-*)
+        [[ $x == *i* ]] && search=1
+        case $x in -*u*PATH|-*u) [[ $x == *u ]] && operand=u; [[ $x == *uPATH ]] && search=1 ;; esac
+        case $x in -*C|-*S) operand=C ;; esac
+        continue ;;
+      command:-*) [[ $x == *p* ]] && search=1; continue ;;
     esac
-    case $x in -u|--unset) ;; -*) [[ $prev == env || $prev == command ]] && x=$prev ;; esac
-    prev=${x##*/}
+    case $x in [A-Za-z_]*=*) [[ $mode == env ]] && continue ;; esac
+    mode=
+    case ${x##*/} in env) mode=env ;; command) mode=command ;; esac
     x=${x//\"/}
     x=${x//\'/}
     case ${x##*/} in lean*|lake*|elan*) named=1 ;; esac
@@ -226,7 +242,7 @@ def agent_environment(root: Path, env: dict | None = None) -> dict:
 def project_root(directory: Path) -> Path | None:
     """The worktree a command run from ``directory`` belongs to: the nearest directory holding a
     ``PROJECT_MARKERS`` file, searched from above any ``.lake`` component."""
-    directory = directory.resolve()
+    directory = Path(os.path.abspath(directory))
     parts = directory.parts
     if ".lake" in parts:
         directory = Path(*parts[: parts.index(".lake")])
@@ -246,6 +262,10 @@ def shim_main(argv: list[str]) -> int:
     env.pop("BASH_ENV", None)
     try:
         cwd = Path.cwd()
+        # The shell's logical directory, so a symlinked `.lake/packages` still names its worktree.
+        logical = os.environ.get("PWD", "")
+        if logical.startswith("/") and os.path.samefile(logical, cwd):
+            cwd = Path(os.path.normpath(logical))
     except OSError as error:
         print(f"{name}: no current directory ({error})", file=sys.stderr)
         return 126

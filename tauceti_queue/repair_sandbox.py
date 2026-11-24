@@ -101,6 +101,10 @@ HOME_CREDENTIALS = (
     ".config/rclone",
 )
 HIDDEN_VARIABLE = "TAUCETI_SANDBOX_HIDDEN"
+# Trees a sandbox may bind only read-only (the shared ``--seed-packages`` Mathlib), as a path list;
+# ``TAUCETI_QUEUE_SEED_PACKAGES`` counts too. A worktree inside one is refused, since its ``.lake``
+# would be writable.
+READ_ONLY_VARIABLE = "TAUCETI_SANDBOX_READONLY"
 
 
 class SandboxUnavailable(RuntimeError):
@@ -153,7 +157,9 @@ def credential_paths(env: dict | None = None) -> list[Path]:
     found: list[Path] = []
     for key in CREDENTIAL_VARIABLES:
         value = (env.get(key) or "").strip()
-        if value.startswith(("/", "~")):  # a path; anything else is never copied anywhere
+        # A path, absolute or relative to this process's directory. A relative value names nothing
+        # unless it exists, so a misplaced secret value is never copied anywhere.
+        if value.startswith(("/", "~")) or (value and "\n" not in value and os.path.lexists(value)):
             found.append(Path(value).parent if key == "TAUCETI_QUEUE_CONFIG" else Path(value))
     found += [Path(p) for p in (env.get(HIDDEN_VARIABLE) or "").split(os.pathsep) if p.strip()]
     found += [home / name for name in HOME_CREDENTIALS]
@@ -311,9 +317,13 @@ def sandbox_argv(
     if not bwrap:
         raise SandboxUnavailable(f"bwrap is not on PATH; install bubblewrap or set {DISABLE_VARIABLE}=0")
     worktree = Path(worktree).resolve()
-    directory = worktree if cwd is None else Path(cwd).resolve()
-    if not directory.is_relative_to(worktree):
+    directory = worktree if cwd is None else Path(os.path.abspath(cwd))
+    if not (directory.is_relative_to(worktree) or directory.resolve().is_relative_to(worktree)):
         raise SandboxUnavailable(f"{directory} is outside the sandboxed worktree {worktree}")
+    shared = [*(env.get(READ_ONLY_VARIABLE) or "").split(os.pathsep), env.get("TAUCETI_QUEUE_SEED_PACKAGES") or ""]
+    for tree in (Path(t).resolve() for t in shared if t.strip()):
+        if worktree.is_relative_to(tree):
+            raise SandboxUnavailable(f"{worktree} is inside {tree}, which builds may only read")
     lake_dir = worktree / ".lake"
     lake_dir.mkdir(exist_ok=True)
     (lake_dir / "tmp").mkdir(exist_ok=True)
