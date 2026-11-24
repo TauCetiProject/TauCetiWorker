@@ -56,7 +56,7 @@ trap 'rm -rf "$RUN_ROOT"' EXIT
 # which retention's and review recovery's process scans then see as a live user. The host's system
 # configuration still applies through the include; a module that opts out of system configuration
 # opts out of this too.
-system_gitconfig="$(realpath -m -- "${GIT_CONFIG_SYSTEM:-/etc/gitconfig}")"
+system_gitconfig="$(realpath -ms -- "${GIT_CONFIG_SYSTEM:-/etc/gitconfig}")"
 # Git's own writer quotes the path; an absolute one does not resolve against $RUN_ROOT.
 git config --file "$RUN_ROOT/gitconfig" include.path "$system_gitconfig" || exit 1
 git config --file "$RUN_ROOT/gitconfig" maintenance.auto false || exit 1
