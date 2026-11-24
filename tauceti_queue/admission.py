@@ -43,9 +43,11 @@ READMIT_REFUSED = frozenset({"closed", "draft", "review-unsafe"})
 CONTEXTS = ("build", "scope", "bump-guard")
 HUMAN_INFRASTRUCTURE_APPROVAL_VERSION = 1
 LARGE_REFACTOR_APPROVAL_VERSION = 1
-# Tools' self-tested eligibility is not part of the review policy's source, so bump this when its
-# rules change: every evaluated head is then evaluated again at startup. 2: any author's label counts.
+# Tools' self-tested eligibility is not part of the review policy's source. Bump this when its rules
+# change: startup then evaluates again, once, each head last refused for its build, which the label
+# may now stand in for. 2: any author's label counts.
 SELF_TESTED_POLICY_VERSION = 2
+BUILD_REFUSAL = "build is not green on HEAD"
 
 
 # The Lake pins a Mathlib bump changes; a waived large refactor may change them only with a passing bump check.
@@ -154,7 +156,6 @@ class AdmissionPolicy:
                 "allow_files": self.allow_files,
                 "human_infrastructure_approval": HUMAN_INFRASTRUCTURE_APPROVAL_VERSION,
                 "large_refactor_approval": LARGE_REFACTOR_APPROVAL_VERSION,
-                "self_tested_policy": SELF_TESTED_POLICY_VERSION,
             }
         )
 
@@ -298,10 +299,18 @@ class AdmissionPoller:
             if not isinstance(row["number"], SourceNumber)
         ]
         waiting_numbers = {row["number"] for row in waiting}
+        # Unlike a policy change, a self-tested rule change re-reads only build refusals, not every PR.
+        retest = controller.store.get_setting("state:self_tested_policy") != SELF_TESTED_POLICY_VERSION
         for work in controller.store.rows("admission_work", {"repository": repo}):
-            previous_policy = loads(work["decision"], {}).get("evidence", {}).get("policy_digest")
-            if work["generation"] == work["evaluated_generation"] and previous_policy != self.policy.revision:
+            decision = loads(work["decision"], {})
+            previous_policy = decision.get("evidence", {}).get("policy_digest")
+            refused_build = retest and str(decision.get("reason", "")).startswith(BUILD_REFUSAL)
+            if work["generation"] == work["evaluated_generation"] and (
+                previous_policy != self.policy.revision or refused_build
+            ):
                 self.state.dirty(work["number"], head=work["head_sha"], urgent=work["number"] in waiting_numbers)
+        if retest:
+            controller.store.set_setting("state:self_tested_policy", SELF_TESTED_POLICY_VERSION)
         for row in waiting:
             if self.state.get(row["number"]) is None:
                 self.state.dirty(row["number"], head=row["head_sha"], urgent=True)

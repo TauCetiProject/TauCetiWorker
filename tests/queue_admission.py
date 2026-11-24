@@ -253,6 +253,25 @@ class AdmissionTests(unittest.TestCase):
         self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
 
+    def test_a_self_tested_rule_change_re_evaluates_only_build_refusals_once(self):
+        head = self.ready()
+        del self.github.statuses[(head, "build")]
+        self.github.labels[1].add("self-tested")
+        self.ready(2)
+        with mock.patch("tauceti_tools.self_tested.accepted", return_value=False):  # the old team rule
+            self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertTrue(json.loads(self.intake.state.get(1)["decision"])["reason"].startswith("build is not green"))
+        # A database from before the current self-tested rules.
+        self.controller.store.execute("DELETE FROM settings WHERE key = 'state:self_tested_policy'")
+        approved = self.intake.state.get(2)["generation"]
+        self.restart()
+        self.assertEqual(self.intake.state.get(2)["generation"], approved, "an admitted head is not re-read")
+        self.assertEqual(self.intake.run_once()["approved"], 1)
+        self.assertEqual({row["number"] for row in self.controller.inputs()}, {1, 2})
+        refused = self.intake.state.get(1)["generation"]
+        self.restart()
+        self.assertEqual(self.intake.state.get(1)["generation"], refused, "once per rule version")
+
     def test_primary_intake_uses_published_review_and_unchanged_inputs_cost_no_evaluation(self):
         self.ready()
         result = self.intake.run_once()
