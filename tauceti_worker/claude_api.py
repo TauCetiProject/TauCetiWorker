@@ -75,7 +75,18 @@ def configure_api(args, agent):
         raise BudgetError("--claude-billing api requires --agent claude")
     if getattr(args, "ignore_quota", False) and getattr(args, "cmd", None) != "_round":
         raise BudgetError("API mode does not use --ignore-quota")
-    if getattr(args, "quota_cmd", None) or getattr(args, "pace", None) or getattr(args, "auto_refresh", False):
+    # Flags override only their matching variables. Validate after that resolution,
+    # including inherited worker-manager env, before creating any API credentials.
+    paced = any(
+        str(value or "").strip()
+        for dest, variable in (
+            ("pace", "TAUCETI_PACE"),
+            ("pace_claude", "TAUCETI_PACE_CLAUDE"),
+            ("pace_codex", "TAUCETI_PACE_CODEX"),
+        )
+        for value in [getattr(args, dest, None) if getattr(args, dest, None) is not None else os.environ.get(variable)]
+    )
+    if getattr(args, "quota_cmd", None) or paced or getattr(args, "auto_refresh", False):
         raise BudgetError("API mode does not use subscription pacing or OAuth refresh")
     directory = budget_dir().resolve()
     os.environ["TAUCETI_BUDGET_DIR"] = str(directory)

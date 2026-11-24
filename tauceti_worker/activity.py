@@ -23,7 +23,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import activity_attribution, activity_ci, activity_costs, activity_git, activity_summary
+from . import activity_attribution, activity_ci, activity_costs, activity_forgejo, activity_git, activity_summary
 from .constants import WORK_TASKS
 from .runtime_status import atomic_json, read_json
 
@@ -490,6 +490,10 @@ def _refresh_prs(db, config, now, errors):
     batches = {}
     for repo, number, worker in due:
         key = (repo, number)
+        if activity_forgejo.is_forgejo(repo):
+            # activity_forgejo observes these from Forgejo, not the GitHub state service.
+            db.execute("UPDATE report_pr_refresh SET next_at=NULL WHERE repo=? AND number=?", key)
+            continue
         db.execute("INSERT OR IGNORE INTO pr_observations(repo,number) VALUES (?,?)", key)
         p = db.execute("SELECT * FROM prs WHERE repo=? AND number=?", key).fetchone()
         h = db.execute("SELECT * FROM pr_observations WHERE repo=? AND number=?", key).fetchone()
@@ -775,7 +779,10 @@ def _summary(db, now, column=None, identity=None):
     since = min((row[0] for row in (first_round, first_pr) if row is not None), default=None)
     native_since = minimum("rounds", "started")
     pr_windows = {
-        window: {key: int(values.get(key, 0)) for key in ("authored", "landed", "assisted", "reviews", "fixes")}
+        window: {
+            key: int(values.get(key, 0))
+            for key in ("authored", "authored_forgejo", "landed", "landed_forgejo", "assisted", "reviews", "fixes")
+        }
         for window, values in totals.items()
     }
     interrupted_where = f"{where} {'AND' if where else 'WHERE'} outcome='interrupted-unfinished'"
@@ -904,6 +911,11 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                     db.execute("INSERT OR REPLACE INTO meta VALUES ('activity_cost_error',?)", (type(error).__name__,))
                     errors.append("Conversation cost preparation failed; retaining last-known budget data")
                 _refresh_prs(db, config, now, errors)
+                from .worker_manager import load_worker_specs
+
+                forgejo = next((s for s in (load_worker_specs(config) if config else []) if s.forgejo), None)
+                if machine and forgejo:
+                    activity_forgejo.refresh(db, machine, now, errors, dict(forgejo.env))
                 _bors(db, errors)
                 try:
                     activity_attribution.prepare(db, now)

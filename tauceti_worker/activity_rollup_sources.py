@@ -177,8 +177,12 @@ def pr_events(db, key, now):
     if p["landed"] is not None and p["landed"] > now:
         db.execute("INSERT OR REPLACE INTO report_due VALUES('pr:prs',?,?)", (key, p["landed"]))
     cutoff = db.execute("SELECT CAST(value AS REAL) FROM meta WHERE key='history_cutoff'").fetchone()
+    forgejo = int(repo.startswith("forgejo:"))
     values = [
-        r.point(p["created"], {"authored": 1} if not cutoff or p["created"] >= cutoff[0] else {}),
+        r.point(
+            p["created"],
+            dict(authored=1, authored_forgejo=forgejo) if not cutoff or p["created"] >= cutoff[0] else {},
+        ),
         r.point(
             0,
             dict(
@@ -194,6 +198,7 @@ def pr_events(db, key, now):
                 p["landed"],
                 dict(
                     landed=1,
+                    landed_forgejo=forgejo,
                     landed_loc_added=loc[1] if measured else 0,
                     landed_prs=1,
                     missing_loc_prs=int(not measured),

@@ -7,8 +7,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from queue_github_adapter import BASE, HEAD, TAUCETI, Clock, FakeTransport, StaticTokens, client, pr_json
@@ -822,7 +824,6 @@ class SingleReadTests(unittest.TestCase):
 
         transport.add("POST", "https://api.github.com/graphql", 200, fence(raw))
         adapter = self.adapter(transport)
-        adapter.team_member_read = lambda path: {"state": "active"}
         with self.assertRaises(ga.GitHubError):
             adapter.admission_snapshot_single(TAUCETI, 42)
         # The same fence at the same update time passes.
@@ -830,7 +831,6 @@ class SingleReadTests(unittest.TestCase):
         transport.add("POST", "https://api.github.com/graphql", 200, self.single(labels=("self-tested",)))
         transport.add("POST", "https://api.github.com/graphql", 200, fence({**raw, "updated_at": self.TS}))
         adapter = self.adapter(transport)
-        adapter.team_member_read = lambda path: {"state": "active"}
         self.assertEqual(adapter.admission_snapshot_single(TAUCETI, 42).pull.head_sha, self.head)
 
     def test_live_self_tested_reads_are_fenced_again(self):
@@ -841,13 +841,12 @@ class SingleReadTests(unittest.TestCase):
         moved["data"]["repository"]["pullRequest"]["labels"] = connection([{"name": "self-tested"}, {"name": "wip"}])
         transport.add("POST", "https://api.github.com/graphql", 200, moved)
         adapter = self.adapter(transport)
-        adapter.team_member_read = lambda path: {"state": "active"}
         with self.assertRaises(ga.GitHubError):
             adapter.admission_snapshot_single(TAUCETI, 42)
 
 
 class BumpGuardFloorTests(unittest.TestCase):
-    """PR #43422: a self-tested Mathlib bump's guard needs 19 reads, and restarts from its first."""
+    """PR #43422: a self-tested Mathlib bump's guard needs 17 reads, and restarts from its first."""
 
     REPO = "TauCetiProject/TauCeti"
 
@@ -860,9 +859,8 @@ class BumpGuardFloorTests(unittest.TestCase):
         environment = mock.patch.dict("os.environ")
         environment.start()
         self.addCleanup(environment.stop)
-        for name in ("SELF_TESTED_TEAM_TOKEN", "TAUCETI_TEAM_TOKEN", "TAUCETI_SELF_TESTED_TEAM", "TAUCETI_BASE_BRANCH"):
+        for name in ("TAUCETI_SELF_TESTED_REPO", "TAUCETI_BASE_BRANCH"):
             os.environ.pop(name, None)
-        self_tested._MEMBERS.clear()
         guard = self_tested._bump_policy()
 
         def run_guard(api, command, directory, env):
@@ -883,11 +881,7 @@ class BumpGuardFloorTests(unittest.TestCase):
             state["remaining"] -= 1
             path = url.removeprefix("https://api.github.com/")
             state["calls"].append(path)
-            if "/issues/7/events" in path:
-                data = [{"id": 1, "event": "labeled", "label": {"name": "self-tested"}, "actor": {"login": "kim-em"}}]
-            elif "/teams/self-tested/memberships/" in path:
-                data = {"state": "active"}
-            elif path.endswith("/branches/main"):
+            if path.endswith("/branches/main"):
                 data = {"commit": {"sha": "b" * 40}}
             elif "/compare/" in path:
                 data = {"merge_base_commit": {"sha": "c" * 40}}
@@ -939,7 +933,7 @@ class BumpGuardFloorTests(unittest.TestCase):
         c = ga.GitHubClient(StaticTokens(), transport, clock=clock, sleep=clock.sleep)
         attempts, verdict = self.evaluate(c, clock)
         self.assertEqual((attempts, verdict), (1, True))
-        self.assertEqual(len(state["calls"]), 19)
+        self.assertEqual(len(state["calls"]), 17)
         self.assertEqual(clock.slept, [])
 
     def test_bump_guard_near_the_floor_defers_cleanly_and_completes_after_reset(self):
@@ -950,8 +944,8 @@ class BumpGuardFloorTests(unittest.TestCase):
         attempts, verdict = self.evaluate(c, clock)
         self.assertEqual((attempts, verdict), (2, True))
         # The first pass stopped at the floor, spending nothing below it. The restart after the
-        # reset ran the whole guard again; only the team membership came from the one-minute cache.
-        self.assertEqual(len(state["calls"]), 10 + 18)
+        # reset ran the whole guard again.
+        self.assertEqual(len(state["calls"]), 10 + 17)
         self.assertEqual(clock.now, reset + 1)
         self.assertEqual(clock.slept, [])
 
@@ -1049,6 +1043,98 @@ class LocalMergeBaseTests(unittest.TestCase):
             run_git(directory, "replace", "--graft", b)
             self.assertEqual(adapter._local_merge_base(a, b), root)
             self.assertEqual(transport.calls, [])
+
+
+class DiffVersionTests(unittest.TestCase):
+    """Discovery asks every open PR's merge base on every pass; git answers each pair once."""
+
+    def test_known_merge_bases_are_kept_and_unknown_ones_are_asked_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- a\n"}, "head", push_to="refs/pull/42/head")
+            adapter = ga.GitHubAdapter(client(FakeTransport())[0], repo=TAUCETI, clone_dir=repo.clone)
+            self.assertEqual(adapter._diff_version(base, head), "unknown:" + base, "the clone lacks the head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            adapter._refresh_git_caches()  # a discovery pass starts
+            calls = []
+            real = ga.chain._git
+
+            def counting(*args, **kwargs):
+                calls.append(args[1:])
+                return real(*args, **kwargs)
+
+            with mock.patch.object(ga.chain, "_git", counting):
+                self.assertEqual(adapter._diff_version(base, head), base)
+                self.assertEqual(len(calls), 1, "one merge-base, no existence checks")
+                self.assertEqual(adapter._diff_version(base, head), base)
+                self.assertEqual(len(calls), 1, "a known pair runs no git")
+                self.assertTrue(adapter._has_commit(base))
+                self.assertTrue(adapter._has_commit(base))
+                self.assertEqual(len(calls), 2)
+                self.assertFalse(adapter._has_commit("f" * 40))
+                self.assertFalse(adapter._has_commit("f" * 40), "absence is not remembered")
+                self.assertEqual(len(calls), 4)
+            adapter._refresh_git_caches()
+            self.assertEqual(adapter._present_commits, {}, "a pruned commit is asked again next pass")
+            self.assertEqual(adapter._diff_versions, {(base, head): base}, "unchanged ancestry keeps merge bases")
+
+    def test_merge_bases_are_not_kept_while_ancestry_can_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            head = repo.commit_branch({"TauCeti/A.lean": "-- a\n"}, "head", push_to="refs/pull/42/head")
+            run_git(repo.clone, "fetch", "-q", str(repo.origin), head)
+            adapter = ga.GitHubAdapter(client(FakeTransport())[0], repo=TAUCETI, clone_dir=repo.clone)
+            self.assertEqual(adapter._diff_version(base, head), base)
+            self.assertEqual(adapter._diff_versions, {}, "nothing is kept before a pass has checked the clone")
+            adapter._refresh_git_caches()
+            adapter._diff_version(base, head)
+            self.assertEqual(len(adapter._diff_versions), 1)
+            run_git(repo.clone, "replace", "--graft", head)
+            adapter._refresh_git_caches()
+            self.assertEqual(adapter._diff_versions, {}, "a replacement changes ancestry")
+            with self.assertRaises(ga.GitHubError, msg="the graft made the head a root"):
+                adapter._diff_version(base, head)
+            run_git(repo.clone, "replace", "-d", head)
+            shallow = Path(repo.clone) / ".git" / "shallow"
+            shallow.write_text(base + "\n")
+            adapter._refresh_git_caches()
+            adapter._diff_version(base, head)
+            self.assertEqual(adapter._diff_versions, {}, "a shallow clone may deepen")
+            shallow.unlink()
+            with mock.patch.dict(os.environ, {"GIT_SHALLOW_FILE": str(shallow)}):
+                adapter._refresh_git_caches()
+                self.assertNotEqual(adapter._ancestry, ga.PLAIN_ANCESTRY, "nor may a shallow file elsewhere")
+
+    def test_unrelated_histories_still_have_no_merge_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = FakeRepo(directory)
+            base = repo.main_sha()
+            tree = run_git(repo.clone, "write-tree")
+            orphan = run_git(repo.clone, "commit-tree", tree, "-m", "orphan")
+            adapter = ga.GitHubAdapter(client(FakeTransport())[0], repo=TAUCETI, clone_dir=repo.clone)
+            with self.assertRaises(ga.GitHubError):
+                adapter._diff_version(base, orphan)
+
+    def test_fetches_are_timed_per_thread(self):
+        adapter = ga.GitHubAdapter(
+            client(FakeTransport())[0], repo=TAUCETI, clone_dir=tempfile.gettempdir(), tokens=StaticTokens()
+        )
+        with mock.patch.object(adapter, "_git_with_token", lambda *args: time.sleep(0.02)):
+            adapter.fetch_refs(TAUCETI, ["f" * 40])
+            elsewhere = []
+            thread = threading.Thread(target=lambda: elsewhere.append(adapter.fetch_seconds()))
+            thread.start()
+            thread.join()
+        self.assertGreaterEqual(adapter.fetch_seconds(), 0.02)
+        self.assertEqual(elsewhere, [0.0])
+
+    def test_the_cache_is_bounded(self):
+        cache = {}
+        for key in range(5):
+            ga._remember(cache, key, key, 3)
+        self.assertEqual(list(cache), [2, 3, 4])
 
 
 if __name__ == "__main__":

@@ -31,9 +31,10 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
+from datetime import datetime
 from typing import Any
 
-from . import admission_planning, attribution, chain, declaration_names, escalation, stuck_heads
+from . import admission_planning, chain, declaration_names, escalation, main_integration, repair_stall, stuck_heads
 from .eligibility import KEEP as BLOCKING_LABELS
 from .mixed_identity import SourceNumber
 from .ports import (
@@ -62,10 +63,17 @@ BUILD_CONTEXT = "build"
 # and `scope` the merge-policy verdict (restricted paths, diff size, oversized new files). A head
 # lands only when all three are bound to its run and `success`.
 VERDICT_CONTEXTS = (BUILD_CONTEXT, "bump-guard", "scope")
+# The `build` description pr-build.yml's finalizer (`finalize_batch.py`) posts when the
+# `sandboxed-build` job produced no build-state: its runner died or the job was cancelled or skipped
+# before its report step ran. The report step always writes its own description, so this text is
+# never a verdict on the source; a bound failed status carrying it is infrastructure.
+INCOMPLETE_BUILD_DESCRIPTION = "sandboxed merge-group build did not complete"
 LOG_GRACE_SECONDS = 600  # publication grace for a completed run's bound verdicts and failed-build log
 # A source-candidate run's GitHub job and step phases are read at most this often while it runs, and
-# once more when it completes; observation itself stays on `polling_interval_seconds`.
-SOURCE_PHASES_INTERVAL_SECONDS = 300
+# once more when it completes; observation itself stays on `polling_interval_seconds`. Only the head's
+# run is observed, and one read is a single jobs listing (one REST call with the GitHub App's
+# installation token), so this costs at most one call a minute.
+SOURCE_PHASES_INTERVAL_SECONDS = 60
 DISPATCH_EVENT = "tauceti-bors-staging"
 # How many of a batch's previous tips a CI dispatch names in `repair_outputs_revs`.
 REPAIR_OUTPUTS_PREVIOUS_TIPS = 4
@@ -91,6 +99,19 @@ COMMENT_MARKER = "tauceti-queue"
 # Settings an operator can change at runtime (`set_setting`), with their initial values. The type of
 # the initial value is the type a new value must have.
 DEFAULT_SETTINGS: dict[str, Any] = {
+    # The main-integration backfill (`main_integration.py`, decision 175 B): while PR CI is idle, build
+    # queued members of unsealed batches merged onto the current canonical commit, and take a member
+    # whose build fails twice out of its batch before it seals. Off by default; the runtime switch.
+    "main_integration_enabled": False,
+    # False records results without taking anything out.
+    "main_integration_take_out": True,
+    "main_integration_max_in_flight": 8,
+    "main_integration_interval_seconds": 120,
+    # A result on a main younger than this is fresh evidence; older ones are asked again.
+    "main_integration_fresh_seconds": 6 * 3600,
+    "main_integration_timeout_seconds": 3 * 3600,
+    "main_integration_deferred_retry_seconds": 600,
+    "main_integration_checks_per_pass": 20,
     "insertion_age_window": 16,
     "open_batch_limit": 2,
     # Freeze oldest unsealed batches at this size until two active batches are sealed in total.
@@ -160,11 +181,42 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "prepare_quiet_seconds": 600,
     # Replay the oldest open batch onto the head's tip once the head's chain is submitted and waits
     # for its CI verdict, so the next head seals from the result without a replay (`_pre_rebase`).
+    # A `pre_rebase` task resolves textual conflicts only: the worker runs no verification build and
+    # no repair rounds on it (decision 153, S1), so a later batch never acts on the head's own
+    # failures. Verification and repair on the head's tip are `prepare_pre_rebased`'s, only once that
+    # tip is known-good; otherwise they happen once the batch is the head, on `main`. While this is
+    # on, the next batch is never rebased onto `main` unless the head has failed CI (`_successor_rebase_held`).
     "pre_rebase_enabled": True,
+    # A claimed `rebase_conflict` task onto `main` of the next batch younger than this is superseded
+    # when its pre-rebase onto the head's tip can start (`_take_over_rebase`); an unclaimed one always
+    # is. An older claim runs to the end. 0: only an unclaimed one is taken over.
+    "pre_rebase_takeover_seconds": 1200,
     # Build, repair and publish an open batch's usable pre-rebase on the head's tip (a `prepare` task
-    # of the pre-rebased chain, `_prepare_pre_rebased`), so the head it seals as reaches CI with
-    # published outputs for its exact tip. Applies to the batches own-base preparation applies to.
+    # of the pre-rebased chain, `_prepare_pre_rebased`), only while that tip has passed its own
+    # verification (`_head_tip_verified`), so a later batch never acts on the head's own failures
+    # (task 1416). Work done on a tip that then fails CI or moves is discarded, not carried
+    # (`_discard_unverified_pre_rebase`). Decision 174 restored it after S1 (decision 153) turned it off.
+    # Creating the task seals the batch's membership (step 3): the head seals only what was verified.
     "prepare_pre_rebased": True,
+    # When the head is dispatched to staging on a tip no worker has verified, verify it locally on a
+    # repair worker at the same time (a speculative `repair` task, `_schedule_parallel_check`): a clean
+    # check makes the tip known-good, so the next batch is prepared on it; errors are repaired at once
+    # and the repaired tip is staged in place of the running one (decision 172 A, 174 step 4). Off by
+    # default: production turns it on as a runtime setting, which is also its off switch.
+    "parallel_check_enabled": False,
+    # Decisions 199 B and 200: once the next batch's preparation on the head's tip is adopted with a
+    # passing local verification, send its trusted run for exactly that tip at once, based on the
+    # head's tip, and adopt that run when the batch seals as that tip (`_early_staging`). Off: the
+    # batch is dispatched when it becomes the head, as before; turning it off cancels live early runs.
+    "early_staging_enabled": False,
+    # How many early runs of one prepared tip may end as infrastructure failures before the batch
+    # waits to be staged as the head.
+    "early_staging_infrastructure_retries": 1,
+    # Decision 200, "the preparation counts": send a head (or the next batch's early run) whose tip the
+    # worker's accepted attestation covers (`_attestation_problem`) as an attested landing, which
+    # pr-build lands without rebuilding (`tauceti-bors-attested`). Any attested run that does not pass
+    # is an infrastructure failure, and the tip is then staged in full. Off: every run is full staging.
+    "attested_landing_enabled": False,
     # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
     # `problem-anticipated` (`_anticipate`).
@@ -174,36 +226,35 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # explanatory comment to its author (`_withdraw_member`). False defers the decision to landing,
     # where an empty final commit is rejected and its PR closed (`_enqueue_rejection_effects`).
     "withdraw_emptied_at_adoption": True,
-    # Loop termination (`docs/queue/escalation.md`). The queue never re-dispatches an unchanged
-    # candidate after the same failure: a head source failure goes to one repair; when the same
-    # failure fingerprint recurs on the batch this many times in all (2: the first repeat), or a repair
-    # task has had this many claims released without a submission, or the batch has failed this many
-    # times since its last escalation whatever the fingerprints, the controller escalates instead:
-    # it withdraws the members the failure names or that attribution finds (`attribution.py`), else
-    # bisects the head, else withdraws its last member. Every escalation raises a status alert and a
-    # Zulip direct message. 0 disables the check.
-    "failure_repeat_limit": 2,
-    "repair_fruitless_claim_limit": 3,
-    "source_failure_round_limit": 6,
-    # A member the source member review-size policy rejects by name, measured on its accepted head (a
-    # TauCetiTools before the batch-chain measure, or a member whose batch commit it could not identify),
-    # is withdrawn at its first failure: no repair can change that head. A rejection measured on the
-    # member's own commit in the batch chain is repairable and follows the ladder above.
-    "policy_rejection_withdraw": True,
-    # Attribution that implicates more members than this is not trusted (a systemic failure, such as a
-    # broken base, implicates many); the head is bisected instead. 0: no bound.
-    "attribution_max_members": 10,
+    # A `missing-source` refusal still standing at its head this long after the queue first refused it
+    # is handed to the PR's worker (`_hand_off_missing_sources`). Until then `_recheck_missing_sources`
+    # can re-admit it unchanged, and a recovery request would hold that head on Forgejo. 0: hand off at once.
+    "missing_source_handoff_seconds": 21600,
     # Infrastructure failures of one head version re-dispatch with short backoff
     # (`infrastructure_retry_backoff_seconds`) this many times; then the queue backs off automatically,
     # `automatic_retry_seconds` doubling up to `automatic_retry_max_seconds` between re-dispatches,
     # indefinitely, with one direct message when the backoff starts and one on recovery. 0: no backoff.
     "infrastructure_failure_limit": 5,
-    # The automatic retry delay of the infrastructure backoff and of an escalation that failed to act:
-    # this long at first, doubling at each further retry up to the maximum.
+    # The automatic retry delay of the infrastructure backoff: this long at first, doubling at each
+    # further retry up to the maximum.
     "automatic_retry_seconds": 1800,
     "automatic_retry_max_seconds": 14400,
-    # How long an escalation stays among the status page's alerts.
+    # How long an escalation (an infrastructure backoff's start) stays among the status page's alerts.
     "escalation_alert_seconds": 86400,
+    # Stalled repair (docs/queue/escalation.md): a repair task whose last this many checkpoints have the
+    # same tip and the same failure signature is stalled. The queue then alerts once and offers the task
+    # again only after `repair_stall_retry_seconds`, doubling at each further identical checkpoint up to
+    # `repair_stall_retry_max_seconds`, or at once to a worker on a revision that has not tried it. 0: off.
+    "repair_stall_checkpoints": 3,
+    "repair_stall_retry_seconds": 1800,
+    "repair_stall_retry_max_seconds": 14400,
+    # A repair task whose claims this many times in a row end as releases with the same reason and the
+    # same normalized error (and no submission in between) is stalled too: a worker failing the same way
+    # before it can submit. The queue alerts once and keeps offering the task. 0: off.
+    "repair_stall_releases": 4,
+    # A head whose version, tip, base, CI attempt and open task have all stayed the same this long has
+    # made no progress: one alert, and one message when it moves again. 0: off.
+    "head_progress_alert_seconds": 10800,
     # Staging is dispatched only on a base whose exact Lake revision map (or that of an ancestor with
     # the same build inputs) is published at this public endpoint, the one `pr-build.yml` reads
     # (`LAKE_CACHE_REVISION_ENDPOINT_PUBLIC`). Empty disables the requirement. A base found
@@ -244,6 +295,8 @@ MISSING_SOURCE_IN_FLIGHT = "missing-source-in-flight"  # an input waiting for a 
 # The evidence key of a `missing-source` refusal's dependency fingerprint: what `main` and the batches
 # introducing sources held for the refused gaps. The refused head is re-admitted when it changes.
 MISSING_SOURCE_WATCH = "missing_source_watch"
+# When the queue first refused this input's head as `missing-source` (`_hand_off_missing_sources`).
+MISSING_SOURCE_FIRST_REFUSED = "missing_source_first_refused"
 # The cancellation reason of a `missing-source` refusal whose dependencies changed: admission reads
 # the PR again and, if it would still admit the head, restores the input (`restore_missing_source`).
 MISSING_SOURCE_RECHECK = "missing-source-recheck"
@@ -253,19 +306,22 @@ PROBLEM_ANTICIPATED = "problem-anticipated"
 # The cancellation reason of a member whose final commit is empty: withdrawn when an adopted repair
 # empties it (`withdraw_emptied_at_adoption`), else rejected when its batch lands.
 EMPTY_COMMIT = "empty-commit"
-# The cancellation reason of a member the controller withdrew because a failure that names it kept
-# recurring, or because bisection isolated it (`_escalate`).
-QUEUE_WITHDRAWN = "queue-withdrawn"
-# Claim release reasons that are not a fruitless claim of a repair task: progress, or the queue's own
-# doing, or an inference outage (the inference hold answers for that).
-NOT_FRUITLESS_RELEASES = frozenset(
-    {"submitted", REPAIR_CHECKPOINT, "superseded", "landed", "inference_unavailable", "escalated"}
-)
+# The head-progress alert's wording, which the public observation recognises (`monitoring.py`).
+HEAD_NO_PROGRESS_TEXT = repair_stall.HEAD_ALERT_TEXT
+# Releases that say nothing about the task: the worker was stopped, or inference was unavailable (the
+# inference hold covers that). They neither count toward nor break a run of identical releases.
+STALL_IGNORED_RELEASES = ("worker-stopped", "inference_unavailable", "prepared_clean")
 # How many escalations the controller keeps for the status page.
 ESCALATIONS_KEPT = 50
 # The most CI findings a withdrawal or rejection comment quotes.
 COMMENT_FINDINGS = 8
 NEEDS_REBASE_LABEL = "needs-rebase"
+# Lifecycle label GitHub's PR-status reconciler sets when every per-PR prerequisite passes. A refused
+# head leaves it; the reconciler then reads the recovery request and reports `awaiting-author`.
+READY_TO_MERGE_LABEL = "ready-to-merge"
+# Head-bound recovery requests (TauCetiTools survey_facts.rebase_heads): this prefix, and the head in a
+# `<!--tauceti-rebase:v1 HEAD-->` line, which the source adapter appends for `recovery_head`.
+RECOVERY_PREFIX = "Merge-queue recovery for head `"
 # How `repaired_label` is created when the repository lacks it.
 REPAIRED_LABEL_COLOR = "d4c5f9"
 REPAIRED_LABEL_DESCRIPTION = "The merge queue modified this contribution while integrating it; see the landing comment"
@@ -289,6 +345,8 @@ TASK_SUPERSEDED = "superseded"
 TASK_REPAIR = "repair"
 TASK_REBASE_CONFLICT = "rebase_conflict"
 TASK_PREPARE = "prepare"
+# The diagnostic of the head's parallel local check (`_schedule_parallel_check`).
+PARALLEL_CHECK = "parallel_check"
 # `claim_task` hands out the lowest value first, then the oldest task: the head's own tasks always
 # come first, then the oldest open batch's pre-rebase onto the head, then the background preparation
 # of an open batch.
@@ -296,6 +354,8 @@ TASK_PRIORITY = {TASK_REBASE_CONFLICT: 0, TASK_REPAIR: 0, TASK_PRE_REBASE: 1, TA
 # The kinds of an open batch's background tasks: at most one of them is open or claimed per batch.
 BACKGROUND_TASKS = (TASK_PRE_REBASE, TASK_PREPARE)
 BACKGROUND_OPERATIONS = tuple(f"task:{kind}" for kind in BACKGROUND_TASKS)
+# Claims that rewrite a whole open batch, which insertion goes around.
+BATCH_TASK_OPERATIONS = (f"task:{TASK_PREPARE}", f"task:{TASK_REBASE_CONFLICT}")
 # How often a worker holding a `prepare` claim renews it (`Task.extra.renew_after`): a refused renewal
 # is how the worker learns that the controller took the batch back (it sealed, or the head needs the
 # worker), so the interval bounds how long a superseded preparation keeps running.
@@ -320,6 +380,17 @@ OUTCOME_PASS = "pass"
 OUTCOME_SOURCE_FAILURE = "source-failure"
 OUTCOME_INFRASTRUCTURE = "infrastructure"
 OUTCOME_SUPERSEDED = "superseded"
+# `ci_attempts.early`: 0 an ordinary head attempt; 1 the trusted run of an open batch's prepared tip,
+# sent before it is the head (`_early_staging`); 2 such a run the batch adopted when it sealed as that tip.
+EARLY_PENDING = 1
+EARLY_ADOPTED = 2
+# `ci_attempts.dispatch_kind`: the trusted workflow an attempt was sent as.
+DISPATCH_STAGING = "staging"
+DISPATCH_ATTESTED = "attested"
+# Decision 200: a worker's attestation of its passing verification (`tauceti_queue.repair_task.attestation`),
+# and what it must have taken from `main` to stand in for staging's checks (`_attestation_problem`).
+ATTESTATION_SCHEMA = "tauceti-queue.attestation/v1"
+ATTESTED_POLICY_PATHS = ("tauceti.toml", "scripts")
 # Run statuses GitHub reports for a run that has not finished: such a run is never re-dispatched over.
 LIVE_RUN_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
 # The detail of an in-progress run declared lost after a direct read confirmed it stale. Such a run is
@@ -374,6 +445,28 @@ def revision_map_published(url: str, *, timeout: float = 30.0) -> bool:
         raise
     parse_map(raw)
     return True
+
+
+LIVE_PROGRESS_SECONDS = 60
+LIVE_PROGRESS_SETTING = "live-progress"
+# A reporter clock further ahead than this is not believed at all.
+LIVE_PROGRESS_SKEW_SECONDS = 300
+
+
+def live_progress_at(report: dict[str, Any] | None, now: float) -> tuple[str | None, float | None]:
+    """A live build report's raw counter-change time and when it counts as progress: never after
+    the report itself or `now`. Counters come from candidate output: the stall report only."""
+    if not report or report.get("completed_tasks") is None:
+        return None, None
+    try:
+        raw = str(report["last_progress_at"])
+        observed = datetime.fromisoformat(str(report["observed_at"]).replace("Z", "+00:00")).timestamp()
+        advanced = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return None, None
+    if max(advanced, observed) > now + LIVE_PROGRESS_SKEW_SECONDS:
+        return None, None
+    return raw, min(advanced, observed, now)
 
 
 def current_step(phases: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -609,6 +702,7 @@ class Controller:
         logger: logging.Logger | None = None,
         notifier: escalation.Notifier | None = None,
         revision_map_probe: Callable[[str], bool] | None = None,
+        live_progress: Callable[[str, int], dict[str, Any] | None] | None = None,
     ) -> None:
         with store.transaction():
             if store.get_setting("queue:operating-mode") not in {None, "controller"}:
@@ -623,6 +717,15 @@ class Controller:
         self.mixed_ci = None
         self.execution = execution if execution is not None else github
         self.candidate_ci = candidate_ci
+        # The head run's public live build report (`build_progress.lookup`), read off the
+        # reconciliation thread at most every LIVE_PROGRESS_SECONDS. Observational only: its counts
+        # moving is progress for the stall report, never an input to a verdict.
+        self.live_progress = live_progress
+        # (run id, run attempt) -> {"checked_at", "raw", "progress_at"} for the head's run only.
+        self._live: dict[tuple[str, int], dict[str, Any]] = {}
+        self._live_reading = False
+        self._live_failure: str | None = None
+        self._live_lock = threading.Lock()
         # (attempt id, run id, run attempt) -> (time, run status) of the last phase read of a source run.
         self._source_phases_read: dict[tuple[Any, str, int], tuple[float, str]] = {}
         # The keys of `_source_phases_read` whose last read failed (`_eviction_observation` needs a fresh one).
@@ -716,6 +819,18 @@ class Controller:
                 self.notifier_error = f"{type(error).__name__}: {error}"[:300]
                 self.log.warning("escalation notifier unavailable: %s", self.notifier_error)
         self.notifier = notifier
+        # Where progress alerts (a stalled repair, a head without progress) are posted besides the
+        # journal and the status page: the Zulip target `TAUCETI_QUEUE_PROGRESS_ALERT_ZULIP_CONFIG`
+        # names, in the format of TauCetiFleet's `fleet-alert --zulip-config`. Unset, they stay
+        # journal-only, like the fleet alert without its configuration.
+        self.progress_notifier_error = ""
+        self._head_progress_anchored = False  # `_watch_head_progress` restarts its period once per process
+        self.progress_notifier: escalation.Notifier | None = None
+        try:
+            self.progress_notifier = escalation.progress_notifier_from_environment()
+        except (OSError, ValueError, TypeError) as error:
+            self.progress_notifier_error = f"{type(error).__name__}: {error}"[:300]
+            self.log.warning("progress alert notifier unavailable: %s", self.progress_notifier_error)
         # The service's public URL (configuration `public_url`), linked from notifications when set.
         self.public_url = ""
         # The CI recovery pass's stuck-head report (configuration `ci_recovery_report`), read for the
@@ -865,6 +980,14 @@ class Controller:
             wanted = [(self.batch_ref(batch["id"], batch["version"]), batch["tip"])]
             for member in self._members(batch["id"]):
                 wanted.append((self.input_ref(member["number"], member["accepted_head"]), member["accepted_head"]))
+            for task in self.store.rows(
+                "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_REBASE_CONFLICT}
+            ):
+                # The unused pre-rebase a head-time rebase names (`_pre_rebased_chain`), which its worker fetches.
+                for diagnostic in loads(task["diagnostics"], []):
+                    if isinstance(diagnostic, dict) and diagnostic.get("kind") == "pre_rebased_chain":
+                        tip = diagnostic["tip"]
+                        wanted.append((self.pre_rebased_ref(batch["id"], tip), tip))
             for ref, sha in wanted:
                 key = f"retain:{ref}:{sha}"
                 if self.store.row("outbox", {"key": key}) is not None or self._local_ref(ref) != sha:
@@ -1497,6 +1620,10 @@ class Controller:
             with self.store.transaction():
                 # Only the input is flagged: an ordinary batch never becomes an emergency batch.
                 self.store.update("inputs", {"id": current["id"]}, urgent=URGENT_EMERGENCY, evidence=dumps(evidence))
+                if self.admission is not None:
+                    # Its batch needs admission current at this head: evaluate it again now, ahead of
+                    # all other pending admission work (`AdmissionState.next_due`).
+                    self.admission.invalidate(number, head=current["head_sha"], urgent=True)
                 self.store.journal(
                     now,
                     "emergency-requested",
@@ -1747,6 +1874,12 @@ class Controller:
             or (payload.get("check_suite") or {}).get("head_sha")
             or (payload.get("workflow_run") or {}).get("head_sha")
         )
+        if sha:
+            # An early run (`_early_staging`) is observed as promptly as the head's own.
+            self.store.execute(
+                "UPDATE ci_attempts SET needs_observation=1 WHERE early=? AND outcome=? AND head_sha=?",
+                (EARLY_PENDING, OUTCOME_PENDING, sha),
+            )
         head = self._head()
         if head is None:
             return
@@ -1880,13 +2013,24 @@ class Controller:
         if self._pre_rebased_prepare(task):
             return self._pre_rebased_prepare_current(task, batch)
         return (
-            task["state"] == TASK_OPEN
-            and batch["version"] == task["batch_version"]
-            and batch["state"] == (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
-        ) or (task["kind"] != TASK_PREPARE and self._evicted_task_current(task, batch))
+            (
+                task["state"] == TASK_OPEN
+                and batch["version"] == task["batch_version"]
+                and batch["state"] == (BATCH_OPEN if task["kind"] == TASK_PREPARE else BATCH_HEAD)
+            )
+            or (task["kind"] != TASK_PREPARE and self._evicted_task_current(task, batch))
+            or self._open_rebase_current(task, batch)
+        )
 
     def claim_task(
-        self, worker_identity: str, github_login: str, *, source_access=None, expected_binding=None, mixed_capable=False
+        self,
+        worker_identity: str,
+        github_login: str,
+        *,
+        source_access=None,
+        expected_binding=None,
+        mixed_capable=False,
+        worker_revision: str | None = None,
     ) -> Task | None:
         """Hand an open task to an authorized worker under a renewable claim, within `repair_concurrency`.
 
@@ -1905,6 +2049,10 @@ class Controller:
 
         The admin check (a cached GitHub read) runs before the lock is taken, and the claim takes the
         lock's priority lane, so a claim answers while a tick is running.
+
+        A stalled repair task (`_observe_repair_stall`) is not offered until its backoff ends, except
+        to a worker whose `worker_revision` (the code it runs, as its claim reports it) has not
+        produced one of the stalled checkpoints.
         """
         if expected_binding is not None and self.candidate_ci is None:
             raise TaskError("not-authorized", "qualified task binding requires a native source controller")
@@ -1926,7 +2074,9 @@ class Controller:
                 self.store.journal(now, "claim-refused", worker=worker_identity, login=github_login, reason=reason)
                 return None
             concurrency = int(self.setting("repair_concurrency"))
-            claimable = self._claimable_tasks()
+            claimable = [
+                pair for pair in self._claimable_tasks() if not self._stall_holds(pair[0], now, worker_revision)
+            ]
             if not mixed_capable:
                 claimable = [
                     pair
@@ -1978,7 +2128,19 @@ class Controller:
                     task_kind=task["kind"],
                     worker=worker_identity,
                     claim_id=claim_id,
+                    **({"worker_revision": worker_revision} if worker_revision else {}),
                 )
+                stall = self._repair_stalls().get(str(task["id"]))
+                if stall is not None and stall.get("source") != "releases":  # a release stall never holds
+                    self.store.journal(
+                        now,
+                        "repair-stall-claimed",
+                        batch["id"],
+                        task_id=task["id"],
+                        claim_id=claim_id,
+                        reason="backoff-elapsed" if now >= stall["retry_at"] else "new-worker-revision",
+                        worker_revision=worker_revision,
+                    )
             return self._task_record(task, batch, claim_id, token, now + int(self.setting("claim_ttl_seconds")))
 
     def _choose_task(
@@ -1990,7 +2152,9 @@ class Controller:
         `repair_concurrency` 1 nothing runs in the background). The role is the batch's, not the
         task kind's: an evicted batch's retained repair is background work, ahead of the other kinds
         by priority. Selection and insertion of the claim share the controller lock; concurrent
-        requests cannot select the same batch.
+        requests cannot select the same batch. When the background slots are full, the next head's
+        unclaimed `pre_rebase`, or its unclaimed preparation of the pre-rebased chain, takes the slot of
+        the newest own-base preparation of a later batch.
         """
         active = self._active_task_claims()
         held_batches = {claim["batch_id"] for claim in active}
@@ -2005,7 +2169,46 @@ class Controller:
             for task, batch in unheld:
                 if batch["id"] != head_id:
                     return task, batch
-        return None
+            return None
+        # Pre-rebase first: the next head's pre-rebase (or the preparation of its pre-rebased chain) is
+        # on the way to staging, a later batch's own-base preparation is not. When the background slots are full, the newest such
+        # preparation gives its slot to the pre-rebase: the claims do not grow, so the capacity kept
+        # for head work stays available.
+        successor = self._open_batch()
+        if successor is None:
+            return None
+        pre_rebase = next(
+            (
+                pair
+                for pair in unheld
+                if pair[1]["id"] == successor["id"]
+                and (pair[0]["kind"] == TASK_PRE_REBASE or self._pre_rebased_prepare(pair[0]))
+            ),
+            None,
+        )
+        if pre_rebase is None:
+            return None
+        preparations = [
+            claim
+            for claim in background
+            if claim["operation"] == f"task:{TASK_PREPARE}"
+            and claim["batch_id"] != successor["id"]
+            and (self.store.row("tasks", {"id": claim["task_id"]}) or {}).get("pre_rebase_source") is None
+        ]
+        if not preparations:
+            return None
+        newest = max(preparations, key=lambda claim: (claim["created_at"], claim["id"]))
+        now = self.clock()
+        self._supersede_prepare(newest["batch_id"], "pre-rebase-first", now, own_base_only=True)
+        self.store.journal(
+            now,
+            "pre-rebase-first",
+            successor["id"],
+            task_id=pre_rebase[0]["id"],
+            superseded_batch=newest["batch_id"],
+            superseded_task=newest["task_id"],
+        )
+        return pre_rebase
 
     def _background_claims(self, batch_id: int) -> list[dict[str, Any]]:
         """The live claims on the batch's background tasks (`prepare`, `pre_rebase`)."""
@@ -2031,10 +2234,19 @@ class Controller:
                     found.append((task, batch))
                 continue
             if self._pre_rebased_prepare(task):
-                if self._pre_rebased_prepare_current(task, batch):
+                # An offer made while the head's CI ran is not newly claimed once it passed (`_head_landing`);
+                # an owner already holding it finishes.
+                if self._pre_rebased_prepare_current(task, batch) and not (
+                    task["onto"] == (self._head() or {}).get("tip") and self._head_landing(self._head())
+                ):
                     found.append((task, batch))
                 continue
+            if self._stale_prepare(task):
+                continue  # superseded on the next pass; never started on a base `main` has moved past
             if task["kind"] != TASK_PREPARE and self._evicted_task_current(task, batch):
+                found.append((task, batch))
+                continue
+            if self._open_rebase_current(task, batch):
                 found.append((task, batch))
                 continue
             if batch["version"] != task["batch_version"]:
@@ -2045,7 +2257,11 @@ class Controller:
             found.append((task, batch))
         found.sort(
             key=lambda pair: (
-                TASK_PRIORITY.get(pair[0]["kind"], 0),
+                # The next head's pre-rebased preparation ranks with its pre-rebase: both are on the way
+                # to staging, ahead of every later batch's own-base preparation (decision 174).
+                TASK_PRIORITY[TASK_PRE_REBASE]
+                if self._pre_rebased_prepare(pair[0])
+                else TASK_PRIORITY.get(pair[0]["kind"], 0),
                 not pair[1]["sealed"],
                 pair[0]["created_at"],
                 pair[0]["id"],
@@ -2102,60 +2318,16 @@ class Controller:
                     del self._renewal_waiters[claim_token]
                     self._renewing.pop(claim_token, None)
 
-    def _task_checks_owner(self, task: dict[str, Any]) -> str:
-        if task["kind"] == TASK_REPAIR and any(
-            diagnostic.get("kind")
-            in {"audit", "duplicate_declaration", "import_collision", "lint", "environment_linter"}
-            for diagnostic in loads(task["diagnostics"], [])
-        ):
-            # A diagnosed check failure is required repair verification, not optional
-            # background work to hand off for another serial staging round.
-            return "worker"
-        if task["kind"] not in BACKGROUND_TASKS:
-            return "staging"
-        head = self._head()
-        if head is not None:
-            if head["id"] == task["batch_id"]:
-                return "staging"
-            if task["kind"] == TASK_PREPARE and not self._pre_rebased_prepare(task):
-                first = self._open_batch()
-                if (
-                    first is not None
-                    and first["id"] == task["batch_id"]
-                    and not self._state("inference_hold")
-                    and self._pre_rebase_blocked(head) is None
-                ):
-                    # Finish useful source work, then release the old-base owner so
-                    # the successor can rebase. Its rebased worker may run full checks.
-                    return "staging"
-            return "worker"
-        first = self._open_batch()
-        ready = (
-            first is not None
-            and first["id"] == task["batch_id"]
-            and not self._state("inference_hold")
-            and not self._external_head_blocks_sealing()
-        )
-        return "staging" if ready else "worker"
-
-    def task_check_policy(self, task_id: int) -> dict:
-        """Refresh optional check priority over the existing authenticated claim renewal."""
-        with self._lock.priority():
-            task = self.store.row("tasks", {"id": task_id})
-            if task is None:
-                return {}
-            policy = {"checks_owner": self._task_checks_owner(task)}
-            if task["kind"] in BACKGROUND_TASKS:
-                policy["renew_after"] = HANDOFF_RENEW_SECONDS
-            return policy
-
-    def release_task(self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None) -> None:
+    def release_task(
+        self, task_id: int, claim_token: str, reason: str, error: str = "", *, source_access=None, notes=None
+    ) -> None:
         """A worker gives a task back. Reason `inference_unavailable` counts toward the inference hold.
 
         A `prepare` task released as `prepared_clean` (its batch built without an error, so there was
         nothing to repair) records the batch version as prepared; one released after the agent or the
         push failed is resolved as `failed` and not offered again at that version. Any other release
-        leaves the task open for the next claim, as for the head's tasks.
+        leaves the task open for the next claim, as for the head's tasks. `notes` may carry the worker's
+        `attestation` of a clean preparation (decision 200).
         """
         with self._lock.priority():
             now = self.clock()
@@ -2169,8 +2341,24 @@ class Controller:
                 self.store.journal(now, "released", claim["batch_id"], task_id=task_id, reason=reason, error=error)
                 if stale_policy and task["state"] == TASK_OPEN:
                     self._replace_stale_source_task(task, now)
+                elif task is not None and task["state"] == TASK_OPEN and self._proactive_check(task):
+                    # One try per head version: staging stays the authority, and a check that could not
+                    # finish is not offered again (decision 174, step 4).
+                    self.store.update(
+                        "tasks",
+                        {"id": task_id},
+                        state=TASK_SUPERSEDED,
+                        resolved_at=now,
+                        resolution="parallel-check-released",
+                    )
+                    self._count("parallel_checks_released")
+                    self.store.journal(
+                        now, "parallel-check-finished", claim["batch_id"], task_id=task_id, released=reason
+                    )
+                elif task is not None and task["kind"] != TASK_PREPARE and task["state"] == TASK_OPEN:
+                    self._observe_repair_release(task, claim["batch_id"], reason, error, now)
                 elif task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
-                    self._settle_prepare_release(task, reason, now)
+                    self._settle_prepare_release(task, reason, now, notes)
                     if reason == PREPARE_CLEAN_REASON:
                         settled = self.store.row("tasks", {"id": task_id}) or {}
                         knowledge = next(
@@ -2195,10 +2383,10 @@ class Controller:
                 self.report_inference(claim["worker"], False, error)
             self._wake.set()
 
-    def _settle_prepare_release(self, task: dict[str, Any], reason: str, now: float) -> None:
+    def _settle_prepare_release(self, task: dict[str, Any], reason: str, now: float, notes: Any = None) -> None:
         batch = self.store.row("batches", {"id": task["batch_id"]})
         if self._pre_rebased_prepare(task):
-            self._settle_pre_rebased_release(task, batch, reason, now)
+            self._settle_pre_rebased_release(task, batch, reason, now, notes)
             return
         current = batch is not None and batch["state"] == BATCH_OPEN and batch["version"] == task["batch_version"]
         if reason == PREPARE_CLEAN_REASON:
@@ -2437,9 +2625,12 @@ class Controller:
                 with self.store.transaction():
                     result = reject(REPAIR_CHECKPOINT)
                     self._release_claim(claim, REPAIR_CHECKPOINT, now)
+                    self._observe_repair_stall(task, batch, tip_sha, notes if isinstance(notes, dict) else {}, now)
                 self._wake.set()
                 return result
-            if tip_sha == task["tip"] and knowledge.get("was_proactive"):
+            if tip_sha == task["tip"] and (
+                knowledge.get("was_proactive") or (self._parallel_check(task) or {}).get("was_proactive")
+            ):
                 self._release_claim(claim, "source-failure-refresh", now)
                 return reject(
                     "claim-superseded",
@@ -2595,8 +2786,11 @@ class Controller:
             # An adopted preparation keeps its batch open: the repaired members are what it seals with.
             # So does a retained task of a batch the emergency batch took the head from (`_evict`):
             # its chain was validated as the head, and own-base preparation is not repeated.
+            # An open batch's own rebase onto `main` is not a preparation: one on `main` follows it.
             prepared = (
-                {"prepared_version": version} if task["kind"] == TASK_PREPARE or batch["state"] == BATCH_OPEN else {}
+                {"prepared_version": version}
+                if task["kind"] == TASK_PREPARE or self._eviction(batch) is not None
+                else {}
             )
             self.store.update(
                 "batches",
@@ -2604,6 +2798,8 @@ class Controller:
                 version=version,
                 base=task["onto"],
                 tip=tip_sha,
+                verified_tip=tip_sha if self._locally_verified(worker_notes, tip_sha) else None,
+                attestation=self._notes_attestation(worker_notes, tip_sha),
                 **prepared,
             )
             self._record_tip(batch["id"], version, tip_sha, now)
@@ -2909,14 +3105,18 @@ class Controller:
                     no_repair=bool(member["no_repair"] or member["withdrawn"]),
                     withdrawn=bool(member["withdrawn"]),
                     declaration_names=loads(input_row.get("declaration_names"), {}),
+                    large_refactor=self._large_refactor_member(member, input_row),
                 )
             )
         refs = [self.batch_ref(batch["id"], task["batch_version"])] + [m.retained_ref for m in members]
         extra: dict[str, Any] = {
             "canonical_branch": self.canonical_branch,
             "claim_id": claim_id,
-            "checks_owner": self._task_checks_owner(task),
         }
+        if self._canonical:
+            # Decision 200: the worker's checks take their TauCetiTools pin and policy files from this
+            # commit, as staging takes them from `main`, not from the candidate.
+            extra["policy_commit"] = self._canonical
         if loads(task.get("task_binding"), {}).get("schema") == "tauceti-queue.mixed-task/v1":
             if self.mixed is None:
                 raise TaskError("source-disabled", "mixed task requires its enrolled sources")
@@ -2936,8 +3136,9 @@ class Controller:
                 }
                 refs.append(checkpoint["retained_ref"])
                 warm_revs = list(dict.fromkeys([tip, *warm_revs]))
-        if task["kind"] in BACKGROUND_TASKS:
+        if task["kind"] in BACKGROUND_TASKS or batch["state"] == BATCH_OPEN:
             extra["renew_after"] = HANDOFF_RENEW_SECONDS
+            extra["background"] = True  # work for a later batch: its builds yield the CPU to the head's
         if self._pre_rebased_prepare(task):
             # The pre-rebased chain exists only in the controller's clone until `_prepare_pre_rebased`
             # retains it on GitHub; the worker builds on the head's tip and falls back to the public
@@ -2956,6 +3157,10 @@ class Controller:
             ahead = self._head()
             if ahead is not None and ahead["tip"] == task["onto"]:
                 refs.insert(1, self.batch_ref(ahead["id"], ahead["version"]))  # where `onto` is fetched from
+        if task["kind"] == TASK_REBASE_CONFLICT:
+            for diagnostic in loads(task["diagnostics"], []):
+                if isinstance(diagnostic, dict) and diagnostic.get("kind") == "pre_rebased_chain":
+                    refs.append(self.pre_rebased_ref(batch["id"], diagnostic["tip"]))  # its resolutions
         if self.candidate_ci is not None and getattr(self.source, "task_git_transport", None) == NATIVE_GIT_REFS:
             refs = [native_retained_ref(ref) for ref in refs]
             members = [
@@ -2985,7 +3190,8 @@ class Controller:
         )
 
     def _can_checkpoint_repair(self, task: dict[str, Any]) -> bool:
-        return self.candidate_ci is None and task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT, TASK_PRE_REBASE)
+        # Not a `pre_rebase`: it resolves conflicts only (decision 153, S1) and has nothing to checkpoint.
+        return self.candidate_ci is None and task["kind"] in (TASK_REPAIR, TASK_REBASE_CONFLICT)
 
     def _create_task(
         self,
@@ -3315,6 +3521,14 @@ class Controller:
     def _head(self) -> dict[str, Any] | None:
         return self.store.row("batches", {"repository": self.repository, "state": BATCH_HEAD}, order="id DESC")
 
+    @staticmethod
+    def _large_refactor_member(member: dict[str, Any], row: dict[str, Any]) -> bool:
+        """Admission found an admin's `large-refactor` label on this member's accepted head, so
+        repair's review-size checks skip the size caps for it, as staging does."""
+        if row.get("head_sha") != member["accepted_head"]:
+            return False
+        return loads(row.get("evidence"), {}).get("large_refactor") is True
+
     def _members(self, batch_id: int) -> list[dict[str, Any]]:
         return self.store.rows("members", {"batch_id": batch_id, "removed": 0}, order="position")
 
@@ -3384,9 +3598,9 @@ class Controller:
 
     def _current_attempt(self, head: dict[str, Any]) -> dict[str, Any] | None:
         rows = self.store.query(
-            "SELECT * FROM ci_attempts WHERE batch_id=? AND batch_version=? "
+            "SELECT * FROM ci_attempts WHERE batch_id=? AND batch_version=? AND early!=? "
             "AND NOT (dispatch_state='rejected' AND outcome='superseded') ORDER BY id DESC LIMIT 1",
-            (head["id"], head["version"]),
+            (head["id"], head["version"], EARLY_PENDING),
         )
         return rows[0] if rows else None
 
@@ -3643,6 +3857,11 @@ class Controller:
             try:
                 return self._tick()
             finally:
+                # Also after a failed pass: the build's own progress does not depend on GitHub.
+                try:
+                    self._read_live_progress(self.clock())
+                except Exception:  # noqa: BLE001 - observational; never disturbs reconciliation
+                    logging.getLogger(__name__).exception("live progress read not scheduled")
                 self._refresh_snapshot()
 
     def _tick(self) -> list[str]:
@@ -3656,6 +3875,8 @@ class Controller:
         self._expire_claims(now)
         # Before anything that can end the pass early: the message depends only on the report.
         self._notify_stuck_heads(now)
+        self._settle_repair_stalls(now)
+        self._watch_head_progress(now)
         if self.mixed is not None and self.mixed.mode == "admit" and self.setting("publication_enabled"):
             sync_key = f"mixed-sync:startup:{self.mixed.generation}:{self.revision}"
             self._enqueue("mixed-sync", sync_key, {})
@@ -3673,20 +3894,26 @@ class Controller:
             return list(self._reasons)
         self._follow_anticipated(now)
         self._recheck_missing_sources(now)
+        self._hand_off_missing_sources(now)
         hold = self._state("inference_hold")
         if hold:
             self._reasons.append(f"inference hold since {hold['since']:.0f}: {hold['last_error']}")
         offer()
         self._fetch_declaration_names(now)
         self._insertion_passes(now)
+        offer()
+        # Before sealing, so a member it takes out never reaches the next head (decision 175 B).
+        main_integration.run(self, now)
         for step in (
             self._supersede_stale_pre_rebase,
             self._emergency,
             self._seal,
             self._reconcile_head,
+            self._discard_unverified_pre_rebase,
             self._pre_rebase,
             self._prepare_open_batches,
             self._prepare_pre_rebased,
+            self._early_staging,
             self._republish_retained_refs,
         ):
             offer()
@@ -3695,6 +3922,107 @@ class Controller:
         self._drain_outbox(self.clock())
         self._set_state("last_tick_at", now)
         return list(self._reasons)
+
+    def _read_live_progress(self, now: float) -> None:
+        """Start a background read of the head run's live build report when one is due.
+
+        Runs on the reconciliation thread, which also persists the run's progress watermark (the
+        `live-progress` setting) so a restart does not report a stall the previous process had
+        seen progress against. The background thread only reads the public report."""
+        head = self._head()
+        attempt = self._current_attempt(head) if head is not None else None
+        if (
+            self.live_progress is None
+            or attempt is None
+            or attempt["outcome"] != OUTCOME_PENDING
+            or not attempt["run_id"]
+        ):
+            return
+        key = (str(attempt["run_id"]), int(attempt["run_attempt"] or 1))
+        saved = self.store.get_setting(LIVE_PROGRESS_SETTING)
+        with self._live_lock:
+            entry = self._live.get(key)
+            if entry is None and isinstance(saved, dict) and (saved.get("run_id"), saved.get("run_attempt")) == key:
+                entry = {"checked_at": 0, "raw": saved.get("raw"), "progress_at": saved.get("progress_at")}
+                self._live = {key: entry}
+            if (
+                entry is not None
+                and entry.get("progress_at") is not None
+                and (not isinstance(saved, dict) or saved.get("progress_at") != entry["progress_at"])
+            ):
+                persist = {
+                    "run_id": key[0],
+                    "run_attempt": key[1],
+                    "raw": entry.get("raw"),
+                    "progress_at": entry["progress_at"],
+                }
+            else:
+                persist = None
+            due = not self._live_reading and now - (entry or {}).get("checked_at", 0) >= LIVE_PROGRESS_SECONDS
+            if due:
+                self._live_reading = True
+        try:
+            if persist is not None:
+                self.store.set_setting(LIVE_PROGRESS_SETTING, persist)
+        except Exception:
+            # The read below still goes ahead; only a reserved reader that never starts would stop polling.
+            logging.getLogger(__name__).exception("live progress watermark not saved")
+        if not due:
+            return
+
+        def read() -> None:
+            try:
+                report = self.live_progress(*key)
+            except Exception as error:  # noqa: BLE001 - observational; a failed read leaves the step phases alone
+                report = None
+                failure = f"{type(error).__name__}: {str(error)[:200]}"
+            else:
+                failure = None if report is not None else "no live report for the run"
+            # One journal line when reads start failing and one when they recover, not one a minute.
+            if (failure is None) != (self._live_failure is None):
+                if failure is None:
+                    self.log.info("live build progress for run %s attempt %s readable again", *key)
+                else:
+                    self.log.warning(
+                        "live build progress for run %s attempt %s unavailable: %s", key[0], key[1], failure
+                    )
+                self._live_failure = failure
+            with self._live_lock:
+                try:
+                    current = self._live.get(key, {})
+                    raw, progress_at = live_progress_at(report, self.clock())
+                    if raw is not None and raw == current.get("raw"):
+                        # The same report again: its time was already capped when first seen.
+                        progress_at = current.get("progress_at")
+                    newest = max(
+                        filter(lambda value: value is not None, (current.get("progress_at"), progress_at)), default=None
+                    )
+                    # Only the head run's entry is kept, and its progress time never goes back.
+                    self._live = {
+                        key: {
+                            "checked_at": self.clock(),
+                            "raw": raw if progress_at is not None and progress_at == newest else current.get("raw"),
+                            "progress_at": newest,
+                        }
+                    }
+                finally:
+                    self._live_reading = False
+
+        try:
+            threading.Thread(target=read, name="live-progress", daemon=True).start()
+        except Exception:
+            with self._live_lock:
+                self._live_reading = False
+            raise
+
+    def _last_progress_at(self, attempt: dict[str, Any]) -> float:
+        """The attempt's last step-level progress, or its live build counts' last advance if later."""
+        last = attempt["last_progress_at"]
+        if attempt["run_id"]:
+            live = self._live.get((str(attempt["run_id"]), int(attempt["run_attempt"] or 1)), {}).get("progress_at")
+            if live is not None and live > last:
+                return live
+        return last
 
     def recover(self) -> dict[str, Any]:
         """Restart reconciliation: release in-process claims, return reservations, leave worker claims and the
@@ -3852,8 +4180,75 @@ class Controller:
 
     @staticmethod
     def _prediction_task(task: dict[str, Any]) -> bool:
+        """A speculative head task that runs alongside the head's own staging run: a predicted repair
+        (`admission_predictions`) or the head's parallel local check (`parallel_check`), while proactive."""
         return any(
-            d.get("proactive") for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"
+            d.get("proactive")
+            for d in loads(task["diagnostics"], [])
+            if d.get("kind") in ("admission_predictions", PARALLEL_CHECK)
+        )
+
+    @staticmethod
+    def _parallel_check(task: dict[str, Any]) -> dict[str, Any] | None:
+        return next((d for d in loads(task["diagnostics"], []) if d.get("kind") == PARALLEL_CHECK), None)
+
+    def _supersede_parallel_check(
+        self, head: dict[str, Any], task: dict[str, Any], resolution: str, now: float
+    ) -> None:
+        with self.store.transaction():
+            self.store.update(
+                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
+            )
+            for claim in self._active_claims(head["id"], task_id=task["id"]):
+                self._release_claim(claim, "superseded", now)
+            self.store.journal(now, "parallel-check-finished", head["id"], task_id=task["id"], superseded=resolution)
+        self._wake.set()
+
+    def _proactive_check(self, task: dict[str, Any]) -> bool:
+        """The head's parallel check before staging has failed the tip (it is then a repair task)."""
+        return bool((self._parallel_check(task) or {}).get("proactive"))
+
+    def _schedule_parallel_check(self, head: dict[str, Any], now: float) -> None:
+        """Verify the head's tip on a repair worker while staging runs it (decision 174, step 4).
+
+        Only for a dispatched, pending attempt on a tip that is not known-good (`_head_tip_verified`)
+        and that CI never failed (a tip staged again unchanged was verified by the worker already), at
+        most once per head version. The task is a `repair` of the head with a proactive
+        `parallel_check` diagnostic: the worker builds warm and runs every check; a clean result is
+        submitted unchanged and records the tip as verified (`_adopt_prediction_noop`), so the next
+        batch is prepared on it; errors are repaired, and the repaired tip becomes the head's next
+        version, whose dispatch cancels the running staging run (`_cancel_superseded_runs`). Staging
+        stays the authority: a pass promotes the head and supersedes the check
+        (`_finish_prediction_pass`), and a source failure turns it into the ordinary repair task with
+        CI's diagnostics (`_update_prediction_verdict`)."""
+        if not self.setting("parallel_check_enabled") or self._state("inference_hold"):
+            return
+        if self._open_task(head) is not None or head["urgent"] == URGENT_EMERGENCY:
+            return
+        attempt = self._current_attempt(head)
+        if (
+            attempt is None
+            or attempt["outcome"] != OUTCOME_PENDING
+            or attempt["head_sha"] != head["tip"]
+            or attempt["dispatch_state"] in {"prepared", "rejected"}
+        ):
+            return
+        if self._head_tip_verified(head) or self._tip_failed(head["tip"]):
+            return
+        key = f"parallel_check:{head['id']}:{head['version']}"
+        if self._state(key):
+            return
+        check = {
+            "kind": PARALLEL_CHECK,
+            "proactive": True,
+            "attempt_id": attempt["id"],
+            "message": "staging is running this tip; verify it locally and repair what fails",
+        }
+        task_id = self._create_task(head, TASK_REPAIR, head["base"], [check], now, ci_attempt_id=attempt["id"])
+        self._set_state(key, {"task_id": task_id, "at": now, "tip": head["tip"]})
+        self._count("parallel_checks")
+        self.store.journal(
+            now, "parallel-check-started", head["id"], task_id=task_id, attempt_id=attempt["id"], tip=head["tip"]
         )
 
     def _schedule_predicted_repair(self, head: dict[str, Any], now: float) -> None:
@@ -3927,16 +4322,29 @@ class Controller:
 
     def _adopt_prediction_noop(self, task, claim, batch, tip, retained, notes, now):
         # A conservative prediction may turn out to be harmless. Keep the existing candidate
-        # and its CI rather than create an identical version and force another build.
+        # and its CI rather than create an identical version and force another build. A parallel
+        # check that found nothing to repair records the tip as verified when the worker's checks
+        # all passed on it (decision 174, step 4).
+        check = self._parallel_check(task) is not None
+        verified = self._locally_verified(notes, tip) and tip == batch["tip"]
         with self.store.transaction():
             self.store.update(
                 "tasks",
                 {"id": task["id"]},
                 state=TASK_SUBMITTED,
                 resolved_at=now,
-                resolution="prediction-unchanged",
+                resolution="parallel-check-clean" if check else "prediction-unchanged",
                 submissions=task["submissions"] + 1,
             )
+            if verified:
+                self.store.update(
+                    "batches", {"id": batch["id"]}, verified_tip=tip, attestation=self._notes_attestation(notes, tip)
+                )
+            if check:
+                self._count("parallel_checks_clean" if verified else "parallel_checks_unverified")
+                self.store.journal(
+                    now, "parallel-check-finished", batch["id"], task_id=task["id"], tip=tip, verified=verified
+                )
             for active in self._active_claims(batch["id"], task_id=task["id"]):
                 self._release_claim(active, "submitted" if active["id"] == claim["id"] else "superseded", now)
             self.store.insert(
@@ -3978,13 +4386,15 @@ class Controller:
             knowledge = [
                 dict(d, proactive=False, was_proactive=True)
                 for d in loads(task["diagnostics"], [])
-                if d.get("kind") == "admission_predictions"
+                if d.get("kind") in ("admission_predictions", PARALLEL_CHECK)
             ]
             self.store.update(
                 "tasks", {"id": task["id"]}, diagnostics=dumps([*loads(attempt["diagnostics"], []), *knowledge])
             )
-        elif attempt["outcome"] in (OUTCOME_INFRASTRUCTURE, OUTCOME_SUPERSEDED):
-            self._ci(head, now)  # speculative work must not disable the controller's retry policy
+        elif attempt["outcome"] in (OUTCOME_INFRASTRUCTURE, OUTCOME_SUPERSEDED) and head["base"] == self._canonical:
+            # Speculative work must not disable the controller's retry policy; a head behind `main` is
+            # rebased first, never dispatched again on its old base.
+            self._ci(head, now)
 
     # --- insertion ---------------------------------------------------------------------------------
 
@@ -4038,9 +4448,9 @@ class Controller:
             target: dict[str, Any] | None = None
             eligible: list[dict[str, Any]] = []
             for batch in batches:
-                if any(c["operation"] == f"task:{TASK_PREPARE}" for c in self._active_claims(batch["id"])):
-                    # A `prepare` task holds this batch: insertion goes on to the next open batch
-                    # (created on the canonical commit when the limit allows) instead of waiting.
+                if any(c["operation"] in BATCH_TASK_OPERATIONS for c in self._active_claims(batch["id"])):
+                    # A `prepare` task, or the batch's rebase onto `main`, holds this batch: insertion goes
+                    # on to the next open batch (created on the canonical commit when the limit allows).
                     self._note_reason(f"open batch {batch['id']} is being prepared; insertion uses the next one")
                     continue
                 eligible = [
@@ -4238,7 +4648,7 @@ class Controller:
                 self._release_claim(claim, "placement-paused", now)
             return False
         current = self.store.row("batches", {"id": batch["id"]})
-        prepared = any(c["operation"] == f"task:{TASK_PREPARE}" for c in self._active_claims(batch["id"]))
+        prepared = any(c["operation"] in BATCH_TASK_OPERATIONS for c in self._active_claims(batch["id"]))
         if (
             current is None
             or current["version"] != batch["version"]
@@ -4391,6 +4801,19 @@ class Controller:
                     "at": now,
                 },
             ][-8:]
+            # The input is one approved head: its first refusal is the oldest recorded one (legacy
+            # rows keep their history), else this one.
+            evidence.setdefault(
+                MISSING_SOURCE_FIRST_REFUSED,
+                min(
+                    (
+                        e["at"]
+                        for e in evidence["merge_selection"]
+                        if e.get("kind") == "missing_source" and isinstance(e.get("at"), (int, float))
+                    ),
+                    default=now,
+                ),
+            )
             try:
                 evidence[MISSING_SOURCE_WATCH] = self._dependency_watch([(row, listed)])[0]
             except chain.ChainError:
@@ -4568,6 +4991,20 @@ class Controller:
             return set()
         return {path for path, _ in planner.changes.get(sha, [])}
 
+    @staticmethod
+    def _missing_source_text(gaps: list[dict[str, Any]]) -> str:
+        """The gaps of a `missing-source` refusal, as one sentence per gap."""
+        parts = []
+        for gap in gaps:
+            provider = gap["module"].replace(".", "/") + ".lean"
+            if gap.get("changed", True):
+                parts.append(f"`{gap['path']}` imports `{gap['module']}`, but no source provides it (`{provider}`).")
+            else:
+                parts.append(
+                    f"`{gap['path']}` still imports `{gap['module']}`, whose source `{provider}` this PR removes."
+                )
+        return " ".join(parts)
+
     def _missing_source_request(self, row: dict[str, Any], gaps: list[dict[str, Any]]) -> None:
         if not self.setting("publication_enabled"):
             return
@@ -4675,6 +5112,51 @@ class Controller:
 
     def _native_admission_open(self) -> bool:
         return bool(self.mixed is not None and self.mixed.mode == "admit" and self.setting("forgejo_admission_enabled"))
+
+    def _hand_off_missing_sources(self, now: float) -> None:
+        """Hand each `missing-source` refusal that has stood `missing_source_handoff_seconds` at its head
+        to the PR's worker, as a recovery request.
+
+        The refusal itself stays: `_recheck_missing_sources` keeps watching it, and on GitHub it can
+        still re-admit the head unchanged when the missing source appears. On Forgejo the queue's own
+        recovery request holds that head, so the request waits out the grace period first: the
+        recheck gets the early window, when a provider is most likely to land, and the worker gets
+        the PR when nothing has. Keyed by head, so each refused head is handed off once."""
+        if not self.setting("publication_enabled"):
+            return
+        grace = float(self.setting("missing_source_handoff_seconds"))
+        for row in self._current_refusals():
+            gaps = loads(row["last_probe"], None)
+            if not isinstance(gaps, list) or not gaps:
+                continue
+            if not all(isinstance(g, dict) and g.get("path") and g.get("module") for g in gaps):
+                continue
+            evidence = loads(row["evidence"], {})
+            first = evidence.get(MISSING_SOURCE_FIRST_REFUSED)
+            if not isinstance(first, (int, float)):
+                # Refusals recorded before the first-refusal time: the oldest history that remains.
+                refused = [
+                    e.get("at")
+                    for e in evidence.get("merge_selection", [])
+                    if e.get("kind") == "missing_source" and isinstance(e.get("at"), (int, float))
+                ]
+                first = min(refused) if refused else None
+            if first is None or now - first < grace:
+                continue
+            key = f"recovery-missing-source:{row['number']}:{row['head_sha']}"
+            if self.store.row("outbox", {"key": key}) is not None:
+                continue
+            with self.store.transaction():
+                self._recovery_request(
+                    key,
+                    row["number"],
+                    row["head_sha"],
+                    self._missing_source_text(gaps)
+                    + " The merge queue keeps watching for the missing source, but nothing has provided it "
+                    "since it refused this head; fix it on the branch and push.",
+                    f"<!-- {COMMENT_MARKER} missing-source-handoff:{row['head_sha']} -->",
+                )
+                self.store.journal(now, "missing-source-handoff", number=row["number"], head=row["head_sha"])
 
     def _recheck_missing_sources(self, now: float) -> None:
         """Re-admit `missing-source` refusals whose dependency fingerprint changed, at their original age.
@@ -4812,18 +5294,39 @@ class Controller:
         self._wake.set()
         return "readmitted"
 
+    def _recovery_request(self, key: str, number: Any, head: str, body: str, marker: str) -> None:
+        """Refuse `head` back to its author or worker: one outbox entry (kind `recovery`) that posts a
+        head-bound recovery request comment, then puts `needs-rebase` on and takes `ready-to-merge`
+        off. Workers treat the pair as an integration-repair handoff for exactly this head. One entry
+        keeps the two effects together across failures and restarts, and in order: the label change
+        that wakes GitHub's status reconciler always finds the comment. Delivered only while the PR
+        is open at `head` (`_perform`). Called with publication enabled."""
+        self._enqueue(
+            "recovery",
+            key,
+            {
+                "number": number,
+                "body": f"{RECOVERY_PREFIX}{head[:7]}`: {body}",
+                "marker": marker,
+                "recovery_head": head,
+            },
+        )
+
     def _conflict_request(self, row: dict[str, Any], paths: list[str], now: float) -> None:
         if not self.setting("publication_enabled"):
             return
         body = (
-            f"This PR conflicts with `{self.canonical_branch}` ("
+            f"this PR conflicts with `{self.canonical_branch}` ("
             + ", ".join(f"`{path}`" for path in paths[:20])
-            + "). Rebase it and approve it again."
+            + f"). Rebase it onto `{self.canonical_branch}`, resolve the conflicts and push; the new head "
+            "returns to ordinary CI and review, and needs approving again."
         )
-        self._enqueue(
-            "comment",
-            f"conflict:{row['number']}:{row['head_sha']}",
-            {"number": row["number"], "body": body, "marker": f"<!-- {COMMENT_MARKER} conflict:{row['head_sha']} -->"},
+        self._recovery_request(
+            f"recovery-conflict:{row['number']}:{row['head_sha']}",
+            row["number"],
+            row["head_sha"],
+            body,
+            f"<!-- {COMMENT_MARKER} conflict:{row['head_sha']} -->",
         )
 
     # --- the emergency lane ------------------------------------------------------------------------
@@ -5423,6 +5926,23 @@ class Controller:
             and batch["version"] == marker["version"] == task["batch_version"]
         )
 
+    def _open_rebase_current(self, task: dict[str, Any], batch: dict[str, Any]) -> bool:
+        """An open batch's own `rebase_conflict` task onto `main` (`_onto_canonical`), not an evicted
+        head's retained one: current, claimable and adoptable while the batch is open at its version."""
+        return (
+            task["kind"] == TASK_REBASE_CONFLICT
+            and task["state"] == TASK_OPEN
+            and batch["state"] == BATCH_OPEN
+            and batch["version"] == task["batch_version"]
+            and self._eviction(batch) is None
+        )
+
+    def _open_rebase_task(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        """The open batch's own open `rebase_conflict` task onto `main`, if any."""
+        if batch["state"] != BATCH_OPEN or self._eviction(batch) is not None:
+            return None
+        return self.store.row("tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_REBASE_CONFLICT})
+
     def _retained_tasks(self, batch: dict[str, Any]) -> list[dict[str, Any]]:
         """The evicted batch's open retained tasks: while there are any, nothing else is created for it."""
         if self._eviction(batch) is None:
@@ -5701,23 +6221,26 @@ class Controller:
             if result not in ("cancelled", "already-completed"):
                 self.log.warning("cancel intent %s: cancelling CI run %s %s", attempt_id, run_id, result)
 
-    # Claimed successor work across the emergency batch becoming the head.
+    # Claimed successor work across the emergency or lane batch becoming the head, or a landing.
 
-    def _preserve_successor_tasks(self, now: float) -> None:
+    def _preserve_successor_tasks(self, now: float, tips: set[str] | None = None) -> None:
         """Record `{task: onto}` for every claimed `pre_rebase` task and claimed pre-rebased `prepare`
-        task of an ordinary open batch, as the emergency batch becomes the head: their intended parent
-        (the previous head's tip) is no longer `_pre_rebase_target`, but their owner may still submit
-        onto it (`_preserved_onto`); the next `_pre_rebase` then carries the result onto the new head."""
+        task of an ordinary open batch (with `tips`, those whose `onto` is one of them): as the
+        emergency or lane batch becomes the head, or a head lands while `main` is already past its tip,
+        their intended parent is no longer `_pre_rebase_target`, but their owner may still submit onto
+        it (`_preserved_onto`); the next `_pre_rebase`, or the seal (`_seal_from_pre_rebase`), then
+        carries the result onto the new target by replay."""
         preserved = {}
         for batch in self._staging_batches():
             for claim in self._active_claims(batch["id"]):
                 task = self.store.row("tasks", {"id": claim["task_id"]}) if claim["task_id"] is not None else None
-                if task is not None and task["state"] == TASK_OPEN:
+                if task is not None and task["state"] == TASK_OPEN and (tips is None or task["onto"] in tips):
                     if task["kind"] == TASK_PRE_REBASE or self._pre_rebased_prepare(task):
                         preserved[str(task["id"])] = task["onto"]
-        self._set_state("emergency_preserved", preserved)
         if preserved:
-            self.store.journal(now, "emergency-preserved", tasks=sorted(int(task_id) for task_id in preserved))
+            self._set_state("emergency_preserved", {**(self._state("emergency_preserved") or {}), **preserved})
+            kind = "emergency-preserved" if tips is None else "landing-preserved"
+            self.store.journal(now, kind, tasks=sorted(int(task_id) for task_id in preserved))
 
     def _preserved_onto(self, task: dict[str, Any]) -> str | None:
         """The parent a preserved task may still submit onto, while it is open and claimed."""
@@ -5806,7 +6329,7 @@ class Controller:
         if batch is None or not self._members(batch["id"]):
             return
         blocked = self._seal_blocked(batch)
-        if (blocked is None or blocked[1]) and self._seal_clean_prefix(batch, now):
+        if blocked is None and self._seal_clean_prefix(batch, now):
             self._seal_successor(now)
             return
         if blocked is not None:
@@ -5834,15 +6357,17 @@ class Controller:
     def _seal_clean_prefix(self, batch: dict[str, Any], now: float) -> bool:
         """Seal the members of `batch` that replay cleanly onto `main`, when its pre-rebase is a conflict.
 
-        The slot is free, but resolving the conflict (a `pre_rebase` task, claimed or not) takes hours:
-        rather than wait for it, or seal everything and hand the head a `rebase_conflict` task, the
+        The slot is free and no worker owns the conflict (`_seal_blocked` waits for a claimed
+        `pre_rebase` task: it is current or preserved, so it may still submit, and
+        `_seal_from_pre_rebase` reuses its result when the carry and extension apply). Rather than wait
+        for a worker to start, or seal everything and hand the head a `rebase_conflict` task, the
         members before the conflict move to a new batch that becomes the head. The conflicting member
         and those after it stay in `batch`, now based on the last moved member's commit, so it keeps its
         place as the next batch and its members their approvals and age; a return to waiting would
-        instead cancel a member that conflicts with `main`. The batch's `pre_rebase` tasks are
-        superseded (resolution `clean-prefix`) and their claims released; the next pre-rebase onto the
-        new head creates a fresh task. False (nothing changed) for the emergency or control-file lane
-        batch, a claim that is not a `pre_rebase` task's, a conflict at the first member, or a replay error.
+        instead cancel a member that conflicts with `main`. The batch's unclaimed `pre_rebase` task is
+        superseded (resolution `clean-prefix`); the next pre-rebase onto the new head creates a fresh
+        task. False (nothing changed) for the emergency or control-file lane batch, a conflict at the
+        first member, or a replay error.
         """
         if (
             batch["pre_rebase_state"] != PRE_REBASE_CONFLICT
@@ -5851,10 +6376,6 @@ class Controller:
             or self._canonical is None
         ):
             return False
-        for claim in self._active_claims(batch["id"]):
-            task = self.store.row("tasks", {"id": claim["task_id"]}) if claim["task_id"] is not None else None
-            if task is None or task["kind"] != TASK_PRE_REBASE:
-                return False
         chain_id = f"clean-prefix-{batch['id']}-{secrets.token_hex(4)}"
         try:
             result = chain.replay(self.clone, batch["base"], batch["tip"], self._canonical, chain_id=chain_id)
@@ -5980,7 +6501,8 @@ class Controller:
             batch = batches[0]
             size = len(self._members(batch["id"]))
             if size < minimum or any(
-                c["operation"] not in BACKGROUND_OPERATIONS for c in self._active_claims(batch["id"])
+                c["operation"] not in (*BACKGROUND_OPERATIONS, f"task:{TASK_REBASE_CONFLICT}")
+                for c in self._active_claims(batch["id"])
             ):
                 return
             with self.store.transaction():
@@ -6011,6 +6533,12 @@ class Controller:
         assert canonical is not None
         task_claims = [c for c in self._active_claims(head["id"]) if c["task_id"] is not None]
         if task_claims:
+            active = self._open_task(head)
+            if head["base"] != canonical and active is not None and self._proactive_check(active):
+                # The head is about to be rebased, so its tip changes: a parallel check of the old tip
+                # would only hold the rebase up. Take it back; the rebased tip gets its own check.
+                self._supersede_parallel_check(head, active, "head-rebasing", now)
+                return
             if head["base"] != canonical:
                 self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase waits for worker")
             # A speculative repair runs alongside its own candidate CI, whose observation
@@ -6028,12 +6556,6 @@ class Controller:
                     self._update_prediction_verdict(head, active, attempt, now)
             self._reasons.append(f"head {head['id']} is claimed by {', '.join(c['worker'] for c in task_claims)}")
             return
-        # A moved base rebases first, which ends the hold, rather than retrying against the old base.
-        if head["base"] == canonical and self._retry_escalation(head, now):
-            return  # escalated again: the head changed, or holds longer
-        pending = self._open_task(head)
-        if pending is not None and self._fruitless_task(head, pending, now):
-            return  # escalated: the head changed, or holds
         if head["base"] != canonical:
             if not self._rebase_head(head, canonical, now):
                 self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase incomplete")
@@ -6058,6 +6580,9 @@ class Controller:
             return
         self._ci(head, now)
         self._schedule_predicted_repair(head, now)
+        head = self._head() or head
+        if head["state"] == BATCH_HEAD:
+            self._schedule_parallel_check(head, now)
 
     def _rebase_head(self, head: dict[str, Any], canonical: str, now: float) -> bool:
         """Replay the head onto the canonical commit; True when it is now based there."""
@@ -6114,20 +6639,13 @@ class Controller:
                 )
             return True
         conflict = result.conflict
-        diagnostics = [
-            {
-                "kind": "conflict",
-                "source_pr": conflict.source_pr if conflict else None,
-                "paths": list(conflict.conflict_paths) if conflict else [],
-                "onto": canonical,
-                "message": f"replaying the chain onto {canonical[:12]} conflicts at {conflict.source_pr if conflict else '?'}",
-                "pending": [r.source_pr for r in result.commits if r.status == chain.PENDING],
-                "clean_prefix_tip": result.tip,
-                # Members the new base already carries (landed outside the queue): empty commits in the
-                # clean prefix, or still pending; the agent keeps them empty rather than replaying them.
-                "landed_on_base": result.landed_on_base,
-            }
-        ]
+        diagnostics = self._conflict_diagnostics(result, canonical)
+        pre_rebased = self._pre_rebased_chain(head)
+        if pre_rebased is not None:
+            # Its pre-rebase did not carry onto `main` or take the members inserted since: the worker
+            # reuses its resolutions and resolves only what is left (`seed_pre_rebased`).
+            self._retain(self.pre_rebased_ref(head["id"], pre_rebased["tip"]), pre_rebased["tip"])
+            diagnostics.append(pre_rebased)
         with self.store.transaction():
             self._release_claim(claim, "conflict", now)
             self.store.journal(
@@ -6137,10 +6655,49 @@ class Controller:
                 onto=canonical,
                 source_pr=conflict.source_pr if conflict else None,
                 landed_on_base=result.landed_on_base,
+                pre_rebased=pre_rebased["tip"] if pre_rebased else None,
             )
         self._create_task(head, "rebase_conflict", canonical, diagnostics, now)
         self._reasons.append(f"head {head['id']} needs an agent to resolve the rebase conflict")
         return False
+
+    def _pre_rebased_chain(self, head: dict[str, Any]) -> dict[str, Any] | None:
+        """The `pre_rebased_chain` diagnostic of the head's head-time `rebase_conflict` task: its usable
+        pre-rebase, which `_seal_from_pre_rebase` could not use because it does not replay onto `main`
+        or the members inserted since do not replay onto it. Its chain `base..tip` holds the agent's
+        resolutions of the same members on the earlier target, which the worker reuses wherever they
+        still apply, resolving only the remaining conflicts. None when there is no such pre-rebase."""
+        tip, source = head["pre_rebase_tip"], head["pre_rebase_source"]
+        if (
+            head["pre_rebase_state"] not in PRE_REBASE_USABLE
+            or not tip
+            or not head["pre_rebase_onto"]
+            or not source
+            or not chain.is_ancestor(self.clone, source, head["tip"])
+        ):
+            return None
+        return {"kind": "pre_rebased_chain", "base": head["pre_rebase_onto"], "tip": tip, "source": source}
+
+    @staticmethod
+    def _conflict_diagnostics(result: chain.ChainResult, onto: str) -> list[dict[str, Any]]:
+        """A `rebase_conflict` task's diagnostics for a replay onto `onto` that conflicted."""
+        conflict = result.conflict
+        return [
+            {
+                "kind": "conflict",
+                "source_pr": conflict.source_pr if conflict else None,
+                # The input chain's conflicting commit, which the worker's own replay stops at.
+                "commit": conflict.replayed if conflict else None,
+                "paths": list(conflict.conflict_paths) if conflict else [],
+                "onto": onto,
+                "message": f"replaying the chain onto {onto[:12]} conflicts at {conflict.source_pr if conflict else '?'}",
+                "pending": [r.source_pr for r in result.commits if r.status == chain.PENDING],
+                "clean_prefix_tip": result.tip,
+                # Members the new base already carries (landed outside the queue): empty commits in the
+                # clean prefix, or still pending; the agent keeps them empty rather than replaying them.
+                "landed_on_base": result.landed_on_base,
+            }
+        ]
 
     # --- background preparation of open batches ----------------------------------------------------
 
@@ -6167,19 +6724,51 @@ class Controller:
                 self._supersede_prepare(task["batch_id"], closed, now)
             elif batch["version"] != task["batch_version"] and not self._pre_rebased_prepare(task):
                 self._supersede_prepare(task["batch_id"], "batch-changed", now, own_base_only=True)
+            elif self._stale_prepare(task) and not self._active_claims(batch["id"], task_id=task["id"]):
+                # Built on a base `main` has moved past: `_onto_canonical` replays the batch first.
+                self._supersede_prepare(task["batch_id"], "base-behind", now, own_base_only=True)
+        for task in self.store.rows(
+            "tasks", {"repository": self.repository, "state": TASK_OPEN, "kind": TASK_REBASE_CONFLICT}
+        ):
+            batch = self.store.row("batches", {"id": task["batch_id"]})
+            if (
+                batch is not None
+                and batch["state"] == BATCH_OPEN
+                and self._eviction(batch) is None
+                and batch["version"] != task["batch_version"]
+                and not self._active_claims(batch["id"], task_id=task["id"])
+            ):
+                # The batch changed under an unclaimed rebase onto `main`: `_onto_canonical` replays anew.
+                with self.store.transaction():
+                    self.store.update(
+                        "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="batch-changed"
+                    )
         if not self.setting("prepare_open_batches") or self._state("inference_hold"):
             return
         staging = self._staging_batches()
+        head = self._head()
         for index, batch in enumerate(staging):
             successor = self._open_batch()
-            if (
-                self.setting("prepare_pre_rebased")
-                and successor
-                and successor["id"] == batch["id"]
-                and self._pre_rebase_blocked(self._head()) is None
-            ):
-                # Prepare this successor on its intended parent. Starting another
-                # own-base pass would serialize two full builds and rewrite repairs.
+            behind = bool(self._canonical) and batch["base"] != self._canonical
+            if successor and successor["id"] == batch["id"]:
+                if self.setting("pre_rebase_enabled") and self._pre_rebase_blocked(head) is None:
+                    # Pre-rebased onto the head's tip instead. Starting another own-base pass would
+                    # serialize two full builds and rewrite the chain under the pre-rebase.
+                    continue
+                if behind and self._successor_rebase_held(head):
+                    # R1 (decision 153): a rebase onto `main` started now would block the pre-rebase
+                    # onto the head's tip until it finished, and go stale when the head lands.
+                    self._note_reason(
+                        f"open batch {batch['id']}: no rebase onto main; it is pre-rebased onto the head's tip"
+                    )
+                    continue
+            if index == 1 and behind and self.setting("pre_rebase_enabled") and self._handoff_window(head):
+                # R2 (decision 153): in the handoff window this batch is about to become the next batch,
+                # whose rebase onto `main` R1 holds; started now, it would block its pre-rebase (465, 477
+                # and 484 in November).
+                self._note_reason(
+                    f"open batch {batch['id']}: no rebase onto main until the head is dispatched (handoff window)"
+                )
                 continue
             if self._retained_tasks(batch):
                 continue  # its retained work as the evicted head owns the chain
@@ -6192,6 +6781,10 @@ class Controller:
                 # evicted batch returns; an own-base preparation would rewrite the chain under it.
                 continue
             if not self._prepare_due(batch, now):
+                if batch["prepared_version"] == batch["version"]:
+                    # Prepared on a base `main` has moved past: kept when its replay onto `main` is clean,
+                    # rebased onto `main` in the background (and then prepared again) when it conflicts.
+                    self._onto_canonical(batch, now, rebase_clean=False)
                 continue
             pre_rebase = self._open_pre_rebase_task(batch)
             if pre_rebase is not None and self._active_claims(batch["id"], task_id=pre_rebase["id"]):
@@ -6206,6 +6799,9 @@ class Controller:
                     f"chain (task {pre_rebased['id']})"
                 )
                 continue
+            if not self._onto_canonical(batch, now):
+                continue
+            batch = self.store.row("batches", {"id": batch["id"]})
             if pre_rebase is not None:
                 with self.store.transaction():
                     self._supersede_pre_rebase_tasks(batch["id"], "prepare", now)
@@ -6214,6 +6810,127 @@ class Controller:
                     )
             self._create_task(batch, TASK_PREPARE, batch["base"], [], now)
             self._note_reason(f"open batch {batch['id']} waits for a worker to prepare it")
+
+    def _successor_rebase_held(self, head: dict[str, Any] | None) -> bool:
+        """R1 (decision 153): whether the next batch, when behind `main`, gets no rebase onto `main` (and so
+        no own-base preparation), because it is to be pre-rebased onto the head's tip. That holds while
+        pre-rebase is on and the head has not failed CI on the source: before the head is dispatched,
+        during its own rebase, while its CI runs, and in the handoff window with no head. After a
+        source failure the head's repair may take hours, and a rebase onto `main` is useful meanwhile."""
+        if not self.setting("pre_rebase_enabled"):
+            return False
+        if head is None:
+            return True
+        attempt = self._current_attempt(head)
+        return attempt is None or attempt["outcome"] != OUTCOME_SOURCE_FAILURE
+
+    def _handoff_window(self, head: dict[str, Any] | None) -> bool:
+        """R2 (decision 153): the stretch from one head landing until the next head is first dispatched:
+        no head, or a head with no dispatched CI attempt at any version."""
+        if head is None:
+            return True
+        return not self.store.query(
+            "SELECT 1 FROM ci_attempts WHERE batch_id=? AND dispatch_state NOT IN ('prepared', 'rejected') LIMIT 1",
+            (head["id"],),
+        )
+
+    def _stale_prepare(self, task: dict[str, Any]) -> bool:
+        """An own-base `prepare` task on a base other than the canonical commit."""
+        return (
+            task["kind"] == TASK_PREPARE
+            and not self._pre_rebased_prepare(task)
+            and bool(self._canonical)
+            and task["base"] != self._canonical
+        )
+
+    def _onto_canonical(self, batch: dict[str, Any], now: float, *, rebase_clean: bool = True) -> bool:
+        """Whether the open batch is based on the canonical commit, replaying it there first when it is
+        not: it lands on top of `main`, so a preparation on an older base builds a tree that never
+        lands. The replay runs without the controller lock, under a `rebase` claim on the batch that
+        holds insertion off, and is applied only if neither the batch nor the canonical commit moved
+        meanwhile. A clean replay re-bases the batch (members' commits, base, tip, a new version). A
+        conflicting one creates the batch's `rebase_conflict` task onto `main`, which a worker
+        resolves in the background; while it is open the replay is not repeated and the batch gets no
+        own-base preparation. A batch with a pre-rebase is left as it is: its preparation is that of the
+        pre-rebased chain, which names its own chain. Without `rebase_clean` (a batch already prepared)
+        a clean replay leaves the batch and its preparation as they are, and is recorded per batch
+        version and canonical commit so it is not repeated."""
+        canonical = self._canonical
+        if not canonical or batch["base"] == canonical:
+            return True
+        if batch["pre_rebase_state"]:
+            return False
+        if self._open_rebase_task(batch) is not None:
+            self._note_reason(f"open batch {batch['id']} waits for a worker to resolve its rebase onto main")
+            return False
+        key = f"open_rebase_clean:{batch['id']}"
+        recorded = self._state(key) or {}
+        if recorded.get("version") == batch["version"] and recorded.get("onto") == canonical:
+            return True  # a clean replay of a prepared batch, left as it is
+        if self._active_claims(batch["id"]):
+            return False
+        with self.store.transaction():
+            claim = self._take_claim(batch, "rebase", now)
+        chain_id = f"open-rebase-{batch['id']}-{secrets.token_hex(4)}"
+        result: chain.ChainResult | None = None
+        try:
+            with self._lock.unlocked():
+                result = chain.replay(self.clone, batch["base"], batch["tip"], canonical, chain_id=chain_id)
+        except chain.ChainError as error:
+            self._note_reason(f"open batch {batch['id']}: replay onto {canonical[:12]} failed: {error}")
+        finally:
+            chain.delete_chain_ref(self.clone, chain_id)
+        current = self.store.row("batches", {"id": batch["id"]})
+        moved = (
+            result is None
+            or current is None
+            or current["version"] != batch["version"]
+            or current["state"] != BATCH_OPEN
+            or current["pre_rebase_state"]
+            or self._canonical != canonical
+            or [c for c in self._active_claims(batch["id"]) if c["id"] != claim["id"]]
+        )
+        if not moved and result.status == chain.CLEAN and not rebase_clean:
+            with self.store.transaction():
+                self._release_claim(claim, "clean", now)
+                self._set_state(key, {"version": batch["version"], "onto": canonical})
+            return True
+        if moved or result.status != chain.CLEAN:
+            with self.store.transaction():
+                self._release_claim(claim, "batch-moved" if moved else "conflict", now)
+                if not moved:
+                    source_pr = result.conflict.source_pr if result.conflict else None
+                    self.store.journal(now, "open-rebase-conflict", batch["id"], onto=canonical, source_pr=source_pr)
+            if not moved:
+                # A worker resolves the conflicts onto `main` in the background, as for the head; the
+                # open task is what keeps the replay from repeating. Adopting the result re-bases the
+                # batch, which is then prepared on `main`.
+                self._create_task(
+                    batch, TASK_REBASE_CONFLICT, canonical, self._conflict_diagnostics(result, canonical), now
+                )
+            return False
+        version = batch["version"] + 1
+        by_pr = {record.source_pr: record for record in result.commits}
+        with self.store.transaction():
+            for member in self._members(batch["id"]):
+                record = by_pr.get(member["source_pr"])
+                if record is not None:
+                    self.store.update("members", {"id": member["id"]}, commit_sha=record.sha)
+            self.store.update("batches", {"id": batch["id"]}, version=version, base=canonical, tip=result.tip)
+            self._record_tip(batch["id"], version, result.tip, now)
+            self._retain(self.batch_ref(batch["id"], version), result.tip)
+            self._release_claim(claim, "rebased", now)
+            self._count("open_batch_rebases")
+            self.store.journal(
+                now,
+                "open-rebased",
+                batch["id"],
+                version=version,
+                base=canonical,
+                tip=result.tip,
+                landed_on_base=result.landed_on_base,
+            )
+        return True
 
     def _pre_rebase_waits_for_prepare(self, batch: dict[str, Any]) -> str | None:
         """A live own-base owner finishes first; future work uses the intended parent."""
@@ -6364,6 +7081,166 @@ class Controller:
         head = self._head()
         return head["tip"] if head is not None else self._canonical
 
+    @staticmethod
+    def _locally_verified(worker_notes: str, tip: str) -> bool:
+        """The submission's `local_verification` note says the worker's own latest verification of
+        exactly `tip` (whole-library build, audits and lints) passed."""
+        try:
+            notes = loads(worker_notes, {})
+        except ValueError:
+            return False
+        note = notes.get("local_verification") if isinstance(notes, dict) else None
+        return isinstance(note, dict) and note.get("tip") == tip and note.get("checks_passed") is True
+
+    @staticmethod
+    def _notes_attestation(worker_notes: Any, tip: str) -> str | None:
+        """The submission's (or a clean release's) `attestation` of exactly `tip` as stored JSON, else None.
+        Whether it counts is `_attestation_problem`'s, at the time it is used."""
+        notes = worker_notes
+        if isinstance(notes, str):
+            try:
+                notes = loads(notes, {})
+            except ValueError:
+                return None
+        note = notes.get("attestation") if isinstance(notes, dict) else None
+        if not isinstance(note, dict) or note.get("tip") != tip or note.get("schema") != ATTESTATION_SCHEMA:
+            return None
+        return dumps(note)
+
+    def _attestation_problem(self, stored: str | None, tip: str) -> str | None:
+        """Why the stored attestation does not let the worker's verification of `tip` stand in for staging's
+        checks (decision 200); None when it does. It must be of exactly `tip` and its tree, have run every
+        check with the whole-library lint inside the build sandbox, and have taken its TauCetiTools pin and
+        policy files from a commit whose `tauceti.toml` and `scripts/` are `main`'s now."""
+        note = loads(stored, None) if stored else None
+        if not isinstance(note, dict) or note.get("schema") != ATTESTATION_SCHEMA:
+            return "no attestation"
+        if note.get("tip") != tip:
+            return "the attestation is of another tip"
+        tree = chain._git(self.clone, "rev-parse", f"{tip}^{{tree}}")
+        if tree.returncode != 0 or note.get("tree") != tree.stdout.strip():
+            return "the attestation names another tree"
+        if note.get("sandbox") is not True:
+            return "the verification ran outside the build sandbox"
+        if note.get("verifier_isolated") is not True:
+            return "the verification's scripts and drivers were writable by candidate code"
+        if note.get("lint_scope") != "full":
+            return "the verification did not run the whole-library lint"
+        policy = note.get("policy_commit")
+        if not isinstance(policy, str) or not policy or self._canonical is None:
+            return "the verification used the candidate's own tools and policy"
+        for path in ATTESTED_POLICY_PATHS:
+            ours = chain._git(self.clone, "rev-parse", f"{self._canonical}:{path}")
+            theirs = chain._git(self.clone, "rev-parse", f"{policy}:{path}")
+            if ours.returncode != 0 or theirs.returncode != 0 or ours.stdout != theirs.stdout:
+                return f"the verification's {path} is not {self.canonical_branch}'s"
+        from .repair_audit import Unavailable, parse_tools_pin
+
+        shown = chain._git(self.clone, "show", f"{self._canonical}:tauceti.toml")
+        try:
+            repo, ref = parse_tools_pin(shown.stdout if shown.returncode == 0 else "")
+        except Unavailable:
+            return f"{self.canonical_branch} names no TauCetiTools pin"
+        commit = str(note.get("tools_commit") or "")
+        # A `main` pin is resolved when the checks run, as staging's reusable workflow resolves it; either
+        # way the attestation names the exact commit.
+        exact = re.fullmatch(re.escape(repo) + r"@([0-9a-f]{40})", commit)
+        if exact is None or (ref != "main" and exact[1] != ref):
+            return "the verification used another TauCetiTools"
+        return None
+
+    def _head_tip_verified(self, head: dict[str, Any] | None) -> bool:
+        """The head's current tip has passed its own local verification, so a later batch may be
+        verified and repaired on it (decision 174): a worker verified exactly that tip clean
+        (`verified_tip`: the head's own task, or the preparation it sealed from unchanged), and CI has
+        not failed it on the source since. A tip no worker verified is not known-good. A CI pass alone
+        does not qualify: the head lands within minutes, and a preparation started then would only
+        hold up the seal. "Since" is durable (`_tip_failed`): a tip staged again unchanged after a
+        source failure, at a later version, stays not known-good."""
+        if head is None or not head["verified_tip"] or head["verified_tip"] != head["tip"]:
+            return False
+        return not self._tip_failed(head["tip"])
+
+    def _tip_failed(self, tip: str | None) -> bool:
+        """CI ever failed `tip` on the source, at any version of any batch."""
+        return (
+            bool(tip)
+            and self.store.row("ci_attempts", {"head_sha": tip, "outcome": OUTCOME_SOURCE_FAILURE}) is not None
+        )
+
+    def _head_landing(self, head: dict[str, Any] | None) -> bool:
+        """The head's current tip has passed CI: it lands within minutes. No preparation of the next batch
+        on that tip starts or is newly claimed then (`_pre_rebased_prepare_blocked`, `_claimable_tasks`)."""
+        if head is None:
+            return False
+        attempt = self._current_attempt(head)
+        return attempt is not None and attempt["head_sha"] == head["tip"] and attempt["outcome"] == OUTCOME_PASS
+
+    def _pre_rebase_target_verified(self) -> bool:
+        """`_head_tip_verified` for `_pre_rebase_target`: `main` once no head is left (it landed)."""
+        head = self._head()
+        return head is None or self._head_tip_verified(head)
+
+    def _pre_rebase_verification_work(self, batch: dict[str, Any]) -> bool:
+        """The batch's stored pre-rebase carries edits a preparation of the pre-rebased chain made
+        (`_adopt_prepared_pre_rebase`), not only a `pre_rebase` task's conflict resolutions."""
+        task_ids = {
+            edit.get("task_id")
+            for edit in loads(batch["pre_rebase_edits"], {}).values()
+            if isinstance(edit, dict) and edit.get("task_id")
+        }
+        return any((self.store.row("tasks", {"id": task_id}) or {}).get("kind") == TASK_PREPARE for task_id in task_ids)
+
+    def _discard_unverified_pre_rebase(self, now: float) -> None:
+        """Discard the verification and repair work an open batch's pre-rebase carries from a head tip
+        that is no longer known-good: CI failed that tip on the source (`_tip_failed`, durable, so it
+        holds for an evicted head and across a restaging of the same tip), or a repair round or rebase
+        moved the current head past it, or the current head's tip never passed its own verification
+        (decision 174). A pre-rebase with a preparation's edits is cleared, so the edits are never
+        carried to the next tip and a later batch never keeps changes made against the head's own
+        failures; `_pre_rebase` replays the batch afresh once the head allows it. One prepared clean
+        (no edits) keeps its chain and loses only its prepared and verified marks. A conflicts-only
+        pre-rebase is kept and carried as before."""
+        head = self._head()
+        for batch in self._open_batches():
+            onto = batch["pre_rebase_onto"]
+            if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not onto:
+                continue
+            edited = self._pre_rebase_verification_work(batch)
+            if not edited and not batch["pre_rebase_prepared"] and not batch["pre_rebase_verified"]:
+                continue
+            if self._tip_failed(onto):
+                reason = "head-failed"
+            elif head is None or self.store.row("batch_tips", {"batch_id": head["id"], "tip": onto}) is None:
+                continue  # landed, or another batch's tip (an emergency or lane head went ahead): kept
+            elif onto != head["tip"]:
+                reason = "head-moved"
+            elif not self._head_tip_verified(head):
+                reason = "head-unverified"
+            else:
+                continue
+            with self.store.transaction():
+                if edited:
+                    self._set_pre_rebase(batch, "", now)
+                else:
+                    self.store.update(
+                        "batches",
+                        {"id": batch["id"]},
+                        pre_rebase_prepared=None,
+                        pre_rebase_verified=None,
+                        pre_rebase_attestation=None,
+                    )
+                self._count("pre_rebase_verification_discarded")
+                self.store.journal(
+                    now,
+                    "pre-rebase-discarded",
+                    batch["id"],
+                    reason=reason,
+                    onto=onto,
+                    head_tip=head["tip"] if head is not None else None,
+                    chain_kept=not edited,
+                )
+
     def _open_pre_rebase_task(self, batch: dict[str, Any]) -> dict[str, Any] | None:
         return self.store.row(
             "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PRE_REBASE}, order="id DESC"
@@ -6390,14 +7267,21 @@ class Controller:
         source: str | None = None,
         edits: dict[str, Any] | None = None,
         prepared: bool = False,
+        verified: bool = False,
+        attestation: str | None = None,
     ) -> None:
         """Record (or with an empty `state`, clear) a batch's pre-rebase, keeping its chain under
         `pre_rebase_ref` in the clone and dropping the previous one. `pre_rebase_prepared` names the
         tip when `prepared` (a preparation of the chain was adopted) and is kept while the tip is the
-        one prepared; any other tip is unprepared."""
+        one prepared; any other tip is unprepared. `pre_rebase_verified` likewise names the tip when
+        `verified` (the worker's own verification of exactly that tip passed every check)."""
         current = self.store.row("batches", {"id": batch["id"]}) or batch
         kept = current.get("pre_rebase_prepared")
         prepared_tip = tip if prepared or (tip and kept == tip) else None
+        kept_verified = current.get("pre_rebase_verified")
+        verified_tip = tip if verified or (tip and kept_verified == tip) else None
+        # The attestation follows the verified mark: kept while the tip it names is the pre-rebase's.
+        attested = attestation if verified else (current.get("pre_rebase_attestation") if verified_tip else None)
         previous = (
             self.pre_rebase_ref(batch["id"], current["pre_rebase_onto"])
             if current.get("pre_rebase_tip") and current.get("pre_rebase_onto")
@@ -6418,6 +7302,8 @@ class Controller:
             pre_rebase_edits=dumps(edits or {}),
             pre_rebase_at=now if state else None,
             pre_rebase_prepared=prepared_tip if state else None,
+            pre_rebase_verified=verified_tip if state else None,
+            pre_rebase_attestation=attested if state and verified_tip else None,
         )
 
     def _supersede_pre_rebase_tasks(self, batch_id: int, resolution: str, now: float) -> int:
@@ -6506,7 +7392,12 @@ class Controller:
             self._note_reason(f"open batch {batch['id']} waits for its retained work as the evicted head")
             return
         head = self._head()
-        if self._pre_rebase_blocked(head) is not None:
+        blocked = self._pre_rebase_blocked(head)
+        rebase = self._open_rebase_task(batch)
+        if rebase is not None and (blocked is not None or not self._take_over_rebase(batch, rebase, now)):
+            self._note_reason(f"open batch {batch['id']} waits for its rebase onto main")
+            return
+        if blocked is not None:
             return
         assert head is not None
         onto = head["tip"]
@@ -6563,6 +7454,7 @@ class Controller:
             {
                 "kind": "conflict",
                 "source_pr": conflict.source_pr if conflict else None,
+                "commit": conflict.replayed if conflict else None,
                 "paths": list(conflict.conflict_paths) if conflict else [],
                 "onto": onto,
                 "message": (
@@ -6596,6 +7488,36 @@ class Controller:
             diagnostics.append(prepared)
         self._create_task(batch, TASK_PRE_REBASE, onto, diagnostics, now)
         self._reasons.append(f"open batch {batch['id']} needs an agent to resolve its pre-rebase onto the head")
+
+    def _take_over_rebase(self, batch: dict[str, Any], task: dict[str, Any], now: float) -> bool:
+        """R3 (decision 153): supersede the next batch's open `rebase_conflict` task onto `main` so its
+        pre-rebase onto the head's tip can start; True when it was superseded. An unclaimed task always
+        is (resolution `pre-rebase-first`); a claimed one only while its oldest live claim is younger
+        than `pre_rebase_takeover_seconds`, and the claim is released. Its conflict phase has barely
+        started, and its resolutions rarely carry to the new target (465's 1410 reused none of 1401's
+        212). An older claim runs to the end: the batch is then on `main`, and its pre-rebase carries
+        only the head's own conflicts."""
+        claims = self._active_claims(batch["id"], task_id=task["id"])
+        age = now - min(claim["created_at"] for claim in claims) if claims else None
+        if age is not None and age >= int(self.setting("pre_rebase_takeover_seconds")):
+            return False
+        with self.store.transaction():
+            self.store.update(
+                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="pre-rebase-first"
+            )
+            for claim in claims:
+                self._release_claim(claim, "superseded", now)
+            self._count("rebases_taken_over")
+            self.store.journal(
+                now,
+                "rebase-taken-over",
+                batch["id"],
+                task_id=task["id"],
+                onto=task["onto"],
+                claimed=bool(claims),
+                claim_age_seconds=round(age) if age is not None else None,
+            )
+        return True
 
     def _carry_pre_rebase(
         self, batch: dict[str, Any], onto: str, replay: Callable[[str, str, str], chain.ChainResult]
@@ -6644,7 +7566,8 @@ class Controller:
 
     def _pre_rebased_prepare_current(self, task: dict[str, Any], batch: dict[str, Any]) -> bool:
         """A `prepare` task of the pre-rebased chain still describes its batch: open, the batch open
-        with a usable pre-rebase on the task's `onto`, which is still the head's tip, and the task's
+        with a usable pre-rebase on the task's `onto`, which is still the head's tip and still
+        known-good (`_head_tip_verified`: a head that fails CI takes the task back), and the task's
         chain a prefix of that pre-rebase (insertion extends it by replay, which keeps the prefix)."""
         return (
             task["state"] == TASK_OPEN
@@ -6652,7 +7575,11 @@ class Controller:
             and batch["pre_rebase_state"] in PRE_REBASE_USABLE
             and bool(batch["pre_rebase_tip"])
             and batch["pre_rebase_onto"] == task["onto"]
-            and task["onto"] in (self._pre_rebase_target(), self._preserved_onto(task))
+            and not self._tip_failed(task["onto"])
+            and (
+                task["onto"] == self._preserved_onto(task)
+                or (task["onto"] == self._pre_rebase_target() and self._pre_rebase_target_verified())
+            )
             and chain.is_ancestor(self.clone, task["tip"], batch["pre_rebase_tip"])
         )
 
@@ -6667,7 +7594,8 @@ class Controller:
             if batch is None or batch["state"] != BATCH_OPEN or self._pre_rebased_prepare_current(task, batch):
                 continue
             moved = task["onto"] != self._pre_rebase_target()
-            resolution = "head-moved" if moved else "pre-rebase-changed"
+            unverified = self._tip_failed(task["onto"]) or (not moved and not self._pre_rebase_target_verified())
+            resolution = "head-unverified" if unverified else "head-moved" if moved else "pre-rebase-changed"
             with self.store.transaction():
                 self.store.update(
                     "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
@@ -6697,9 +7625,18 @@ class Controller:
             return "below prepare_min_members"
         if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not batch["pre_rebase_tip"]:
             return "no usable pre-rebase"
-        blocked = self._pre_rebase_blocked(self._head())
+        head = self._head()
+        blocked = self._pre_rebase_blocked(head)
         if blocked is not None:
             return blocked
+        if not self._head_tip_verified(head):
+            assert head is not None
+            return f"head {head['id']}'s tip {head['tip'][:12]} has not passed its own verification"
+        assert head is not None
+        if self._head_landing(head):
+            # The head is about to land: a preparation started now would be preserved across the landing
+            # and the seal would wait for it with staging idle (510's 1555 after 509, 24 Nov).
+            return f"head {head['id']} passed CI and is landing"
         if batch["pre_rebase_onto"] != self._pre_rebase_target() or batch["pre_rebase_source"] != batch["tip"]:
             return "the pre-rebase is not up to date"
         if batch["pre_rebase_prepared"] == batch["pre_rebase_tip"]:
@@ -6745,13 +7682,28 @@ class Controller:
         self._retain(self.pre_rebased_ref(batch["id"], tip), tip)
         head = self._head()
         diagnostics = [self._cross_batch(head, batch)] if head is not None else []
-        self._create_task(
-            batch, TASK_PREPARE, batch["pre_rebase_onto"], diagnostics, now, pre_rebased=(tip, batch["tip"])
-        )
+        with self.store.transaction():
+            self._create_task(
+                batch, TASK_PREPARE, batch["pre_rebase_onto"], diagnostics, now, pre_rebased=(tip, batch["tip"])
+            )
+            if not batch["sealed"]:
+                # Decision 174, step 3: the verification is a frozen snapshot of the batch. Sealing its
+                # membership now lets the run finish on exactly what the next head will be, and sends
+                # later arrivals to the following batch, so the head seals only what was verified.
+                self.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=now)
+                self._count("successors_sealed_for_verification")
+                self.store.journal(
+                    now,
+                    "successor-sealed",
+                    batch["id"],
+                    version=batch["version"],
+                    size=len(self._members(batch["id"])),
+                    reason="verification-snapshot",
+                )
         self._note_reason(f"open batch {batch['id']} waits for a worker to prepare its pre-rebased chain")
 
     def _settle_pre_rebased_release(
-        self, task: dict[str, Any], batch: dict[str, Any] | None, reason: str, now: float
+        self, task: dict[str, Any], batch: dict[str, Any] | None, reason: str, now: float, notes: Any = None
     ) -> None:
         """A released preparation of a pre-rebased chain: `prepared_clean` records the chain as
         prepared (when it is still the batch's pre-rebase), a failure settles the task for that chain."""
@@ -6762,7 +7714,15 @@ class Controller:
                 and batch["pre_rebase_tip"] == task["tip"]
                 and self._pre_rebased_prepare_current(task, batch)
             ):
-                self.store.update("batches", {"id": batch["id"]}, pre_rebase_prepared=task["tip"])
+                # Built with no error and no audit or lint finding: the worker's verification passed on
+                # exactly this tip, which `_seal_from_pre_rebase` carries to the head it seals.
+                self.store.update(
+                    "batches",
+                    {"id": batch["id"]},
+                    pre_rebase_prepared=task["tip"],
+                    pre_rebase_verified=task["tip"],
+                    pre_rebase_attestation=self._notes_attestation(notes, task["tip"]),
+                )
             self._count("pre_rebased_prepares_clean")
             self.store.journal(
                 now, "prepared", task["batch_id"], task_id=task["id"], tip=task["tip"], clean=True, pre_rebased=True
@@ -6812,6 +7772,8 @@ class Controller:
                 source=task["pre_rebase_source"],
                 edits=edits,
                 prepared=True,
+                verified=self._locally_verified(worker_notes, tip_sha),
+                attestation=self._notes_attestation(worker_notes, tip_sha),
             )
             self.store.update(
                 "tasks",
@@ -6882,6 +7844,38 @@ class Controller:
             ),
         }
 
+    def _pre_rebase_unused(
+        self,
+        head: dict[str, Any],
+        canonical: str,
+        reason: str,
+        now: float,
+        conflict: chain.CommitRecord | None = None,
+    ) -> None:
+        """Journal why the head's usable pre-rebase was not used at its seal (`pre-rebase-unused`), so
+        the head-time replay of its own chain that follows is explained: `carry-conflict` (the
+        pre-rebase does not replay onto `main`), `extension-conflict` (members inserted after its task
+        do not replay onto it), `source-not-in-chain` or `members-mismatch`. Written once per head
+        version, `main` and reason: a later pass that declines again for the same reason adds nothing."""
+        detail: dict[str, Any] = {
+            "reason": reason,
+            "version": head["version"],
+            "onto": canonical,
+            "pre_rebase_onto": head["pre_rebase_onto"],
+            "pre_rebase_tip": head["pre_rebase_tip"],
+            "pre_rebase_source": head["pre_rebase_source"],
+            "tip": head["tip"],
+            "source_pr": conflict.source_pr if conflict else None,
+            "paths": list(conflict.conflict_paths) if conflict else [],
+        }
+        key = (head["version"], canonical, reason)
+        with self.store.transaction():
+            for entry in self.store.journal_entries("pre-rebase-unused", head["id"]):
+                if (entry["detail"].get("version"), entry["detail"].get("onto"), entry["detail"].get("reason")) == key:
+                    return
+            self._count("pre_rebases_unused")
+            self.store.journal(now, "pre-rebase-unused", head["id"], **detail)
+
     def _seal_from_pre_rebase(self, head: dict[str, Any], canonical: str, now: float) -> bool:
         """Base a newly sealed head on `canonical` from its pre-rebase, without replaying it again.
 
@@ -6890,7 +7884,8 @@ class Controller:
         members inserted after the pre-rebase are replayed onto it first. The members take their
         commits from the pre-rebased chain, and those an agent edited in a `pre_rebase` task are
         recorded as edited with its explanation. False (nothing changed) when there is no such
-        pre-rebase, a carry or an extension conflicts, or the chain's members do not match.
+        pre-rebase, a carry or an extension conflicts, or the chain's members do not match. A usable
+        pre-rebase left unused is journaled (`pre-rebase-unused`, `_pre_rebase_unused`).
         """
         onto = head["pre_rebase_onto"]
         if head["pre_rebase_state"] not in PRE_REBASE_USABLE or not onto:
@@ -6898,7 +7893,10 @@ class Controller:
         tip = head["pre_rebase_tip"]
         source = head["pre_rebase_source"]
         if not tip or not source or not chain.is_ancestor(self.clone, source, head["tip"]):
+            self._pre_rebase_unused(head, canonical, "source-not-in-chain", now)
             return False
+        # The head seals as exactly the tip its preparation verified only when nothing is replayed.
+        verified = bool(tip) and head["pre_rebase_verified"] == tip and onto == canonical and source == head["tip"]
         if onto != canonical:
             # A batch landed after the pre-rebase was made (a lane or emergency head went ahead of
             # this one while its pre-rebase work was claimed), or the head landed at a later tip than
@@ -6914,6 +7912,7 @@ class Controller:
             finally:
                 chain.delete_chain_ref(self.clone, chain_id)
             if moved.status != chain.CLEAN:
+                self._pre_rebase_unused(head, canonical, "carry-conflict", now, moved.conflict)
                 return False
             tip = moved.tip
         landed_on_base: list[dict[str, str]] = []
@@ -6927,15 +7926,18 @@ class Controller:
             finally:
                 chain.delete_chain_ref(self.clone, chain_id)
             if extended.status != chain.CLEAN:
+                self._pre_rebase_unused(head, canonical, "extension-conflict", now, extended.conflict)
                 return False
             tip, landed_on_base = extended.tip, extended.landed_on_base
         try:
             commits = chain.chain_commits(self.clone, canonical, tip)
-        except chain.ChainError:
+        except chain.ChainError as error:
+            self.store.journal(now, "pre-rebase-error", head["id"], onto=canonical, error=str(error))
             return False
         by_pr = {commit.source_pr: commit for commit in commits}
         members = self._members(head["id"])
         if len(commits) != len(members) or set(by_pr) != {m["source_pr"] for m in members}:
+            self._pre_rebase_unused(head, canonical, "members-mismatch", now)
             return False
         edits = loads(head["pre_rebase_edits"], {})
         version = head["version"] + 1
@@ -6971,9 +7973,17 @@ class Controller:
                 ):
                     self._anticipate(head, dict(member, **values), edit.get("explanation", ""), now)
             self.store.update(
-                "batches", {"id": head["id"]}, version=version, base=canonical, tip=tip, expected_parent=None
+                "batches",
+                {"id": head["id"]},
+                version=version,
+                base=canonical,
+                tip=tip,
+                expected_parent=None,
+                verified_tip=tip if verified else None,
+                attestation=head["pre_rebase_attestation"] if verified else None,
             )
             self._record_tip(head["id"], version, tip, now)
+            early = self._adopt_early_attempt(head, version, tip, canonical, now) if verified else None
             self._set_pre_rebase(head, "", now)
             for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
                 self.store.update(
@@ -6991,8 +8001,321 @@ class Controller:
                 tip=tip,
                 landed_on_base=landed_on_base,
                 pre_rebased=True,
+                verified=verified,
+                early_attempt=early,
             )
         return True
+
+    # --- early staging (decisions 199 B and 200) ---------------------------------------------------
+
+    def _early_attempts(self, *, batch_id: int | None = None) -> list[dict[str, Any]]:
+        """Unadopted early attempts, oldest first: every batch's, or `batch_id`'s."""
+        sql = "SELECT * FROM ci_attempts WHERE early=?"
+        params: tuple[Any, ...] = (EARLY_PENDING,)
+        if batch_id is not None:
+            sql += " AND batch_id=?"
+            params += (batch_id,)
+        return self.store.query(sql + " ORDER BY id", params)
+
+    @staticmethod
+    def _early_view(batch: dict[str, Any], attempt: dict[str, Any]) -> dict[str, Any]:
+        """The batch as its early attempt sees it: the prepared tip on the head's tip. The CI code
+        reads a head's id, version, tip and base; an early run is observed and sent through it."""
+        return dict(batch, tip=attempt["head_sha"], base=attempt["base_sha"], version=attempt["batch_version"])
+
+    def _early_dispatch_kind(self, batch: dict[str, Any]) -> str:
+        """The trusted workflow an early attempt of `batch` is sent as."""
+        return self._dispatch_kind(
+            batch, batch["pre_rebase_tip"], batch["pre_rebase_onto"], batch["pre_rebase_attestation"]
+        )
+
+    def _dispatch_kind(self, batch: dict[str, Any], tip: str, base: str, stored: str | None) -> str:
+        """`attested` (decision 200) when `attested_landing_enabled` is on, the batch is GitHub-only, the
+        worker's stored attestation of exactly `tip` counts (`_attestation_problem`), and no attested run
+        of this tip and base has already failed; `staging` otherwise, which is also the fallback."""
+        if not self.setting("attested_landing_enabled") or self._candidate_coordinator(batch_id=batch["id"]):
+            return DISPATCH_STAGING
+        if self._attestation_problem(stored, tip) is not None:
+            return DISPATCH_STAGING
+        if not self._policy_unchanged(base):
+            # The base (the head's tip, for an early run) changes `tauceti.toml` or `scripts/`: once it lands
+            # the attestation, judged against `main` before it, no longer counts.
+            return DISPATCH_STAGING
+        if self._state(self._fallback_key(tip, base)):
+            return DISPATCH_STAGING
+        failed = self.store.query(
+            "SELECT id FROM ci_attempts WHERE head_sha=? AND base_sha=? AND dispatch_kind=? AND outcome IN (?, ?) LIMIT 1",
+            (tip, base, DISPATCH_ATTESTED, OUTCOME_INFRASTRUCTURE, OUTCOME_SOURCE_FAILURE),
+        )
+        return DISPATCH_STAGING if failed else DISPATCH_ATTESTED
+
+    @staticmethod
+    def _fallback_key(tip: str, base: str) -> str:
+        """Controller state naming a tip and base whose attested landing did not pass: staged in full from then on,
+        whatever later happens to that attempt's outcome (an operator's retry supersedes it)."""
+        return f"attested_fallback:{tip}:{base}"
+
+    def _policy_unchanged(self, commit: str) -> bool:
+        """`commit` has `main`'s `tauceti.toml` and `scripts/` (`ATTESTED_POLICY_PATHS`)."""
+        if self._canonical is None:
+            return False
+        if commit == self._canonical:
+            return True
+        for path in ATTESTED_POLICY_PATHS:
+            ours = chain._git(self.clone, "rev-parse", f"{self._canonical}:{path}")
+            theirs = chain._git(self.clone, "rev-parse", f"{commit}:{path}")
+            if ours.returncode != 0 or theirs.returncode != 0 or ours.stdout != theirs.stdout:
+                return False
+        return True
+
+    def _attested_still_counts(self, batch: dict[str, Any], attempt: dict[str, Any]) -> bool:
+        """An attested attempt may be adopted or promoted only while the attestation of its tip still counts
+        against `main` now (a landing in between can change the policy it was judged by)."""
+        if attempt.get("dispatch_kind") != DISPATCH_ATTESTED:
+            return True
+        stored = batch["pre_rebase_attestation"] if attempt.get("early") == EARLY_PENDING else batch["attestation"]
+        return self._attestation_problem(stored, attempt["head_sha"]) is None
+
+    def _early_staging(self, now: float) -> None:
+        """Send the trusted run of the next batch's prepared tip while the head is still staging.
+
+        When the oldest open batch's preparation on the head's tip has been adopted with a passing
+        local verification of exactly the chain the batch seals as (174 step 3 froze its members),
+        the run is dispatched for that tip, based on the head's tip, as an `early` attempt of the
+        batch at its current version. Pending early attempts are observed here, and cancelled once
+        they stop describing what the batch will seal as (`_early_invalid`). When the head lands as
+        that base, the batch seals as exactly that tip and adopts the attempt
+        (`_adopt_early_attempt`): a pass is promoted at once and a source failure goes straight to
+        the head's repair. Off (`early_staging_enabled`) nothing is sent and live runs are cancelled.
+        """
+        for attempt in self._early_attempts():
+            if attempt["outcome"] != OUTCOME_PENDING or attempt["cancelled_at"] is not None:
+                continue
+            batch = self.store.row("batches", {"id": attempt["batch_id"]})
+            reason = self._early_invalid(batch, attempt)
+            if reason is not None:
+                self._cancel_early(attempt, reason, now)
+                continue
+            assert batch is not None
+            self._advance_attempt(self._early_view(batch, attempt), attempt, now)
+            current = self.store.row("ci_attempts", {"id": attempt["id"]}) or attempt
+            if current["outcome"] != OUTCOME_PENDING:
+                with self.store.transaction():
+                    self.store.journal(
+                        now,
+                        "early-staging-verdict",
+                        batch["id"],
+                        attempt_id=attempt["id"],
+                        outcome=current["outcome"],
+                        tip=attempt["head_sha"],
+                        onto=attempt["base_sha"],
+                    )
+        if not self.setting("early_staging_enabled") or self._state("inference_hold"):
+            return
+        batch = self._open_batch()
+        if batch is None:
+            return
+        head = self._head()
+        if self._early_staging_blocked(batch, head) is not None:
+            return
+        assert head is not None
+        self._dispatch_early(batch, head, now)
+
+    def _early_staging_blocked(self, batch: dict[str, Any], head: dict[str, Any] | None) -> str | None:
+        """Why the open batch's prepared tip is not sent early now; None when it is."""
+        if not self.setting("publication_enabled"):
+            return "publication disabled"
+        if not batch["sealed"] or batch["urgent"] == URGENT_EMERGENCY or batch["lane"] == LANE_CONTROL:
+            return "not a sealed ordinary batch"
+        if self._candidate_coordinator(batch_id=batch["id"]) is not None or self._mixed_inert_batch(batch):
+            return "source-candidate CI"
+        if any(isinstance(m["number"], SourceNumber) for m in self._members(batch["id"])):
+            return "native members"
+        if head is None:
+            return "no head: the batch is staged when it seals"
+        if head["urgent"] == URGENT_EMERGENCY or head["lane"] == LANE_CONTROL:
+            # A lane head changes the trusted tooling a run sent before it lands would use; an
+            # emergency head is out of order.
+            return f"head {head['id']} is not an ordinary batch"
+        if head["base"] != self._canonical or not self._head_tip_verified(head):
+            return f"head {head['id']}'s tip is not known-good on {self.canonical_branch}"
+        attempt = self._current_attempt(head)
+        if (
+            attempt is None
+            or attempt["head_sha"] != head["tip"]
+            or attempt["dispatch_state"] in {"prepared", "rejected"}
+            or attempt["outcome"] not in (OUTCOME_PENDING, OUTCOME_PASS)
+        ):
+            return f"head {head['id']} is not staging its tip"
+        tip, onto = batch["pre_rebase_tip"], batch["pre_rebase_onto"]
+        if (
+            batch["pre_rebase_state"] not in PRE_REBASE_USABLE
+            or not tip
+            or onto != head["tip"]
+            or batch["pre_rebase_source"] != batch["tip"]
+            or batch["pre_rebase_verified"] != tip
+        ):
+            return "no verified preparation of the whole batch on the head's tip"
+        if self.store.row("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}) is not None:
+            return "the batch has an open task"
+        if self._active_claims(batch["id"]):
+            return "the batch is claimed"
+        failures = 0
+        for previous in self._early_attempts(batch_id=batch["id"]):
+            if (previous["head_sha"], previous["base_sha"]) != (tip, onto):
+                continue
+            if previous["outcome"] in (OUTCOME_PENDING, OUTCOME_PASS, OUTCOME_SOURCE_FAILURE):
+                return f"early attempt {previous['id']} already covers this tip"
+            if previous["outcome"] == OUTCOME_INFRASTRUCTURE:
+                # A proven non-send (`rejected`) cost no run: it backs off but uses no retry.
+                failures += previous["dispatch_state"] != "rejected"
+                due = (previous["last_observed_at"] or previous["dispatched_at"]) + int(
+                    self.setting("infrastructure_retry_backoff_seconds")
+                )
+                if self.clock() < due:
+                    return f"early attempt {previous['id']} failed on infrastructure; retry at {due:.0f}"
+        if failures > int(self.setting("early_staging_infrastructure_retries")):
+            return "early runs of this tip failed on infrastructure; it is staged as the head"
+        return None
+
+    def _early_invalid(self, batch: dict[str, Any] | None, attempt: dict[str, Any]) -> str | None:
+        """Why a pending early attempt no longer describes what its batch will seal as; None while it
+        does: the batch is open and sealed at the attempt's version with exactly this verified
+        pre-rebase, and the head is still staging the attempt's base (or has landed as it)."""
+        if not self.setting("early_staging_enabled"):
+            return "early staging turned off"
+        if batch is None or batch["state"] != BATCH_OPEN or not batch["sealed"]:
+            return "the batch is no longer the sealed next batch"
+        if batch["version"] != attempt["batch_version"]:
+            return "the batch changed"
+        tip, onto = attempt["head_sha"], attempt["base_sha"]
+        if (
+            batch["pre_rebase_tip"] != tip
+            or batch["pre_rebase_onto"] != onto
+            or batch["pre_rebase_verified"] != tip
+            or batch["pre_rebase_source"] != batch["tip"]
+        ):
+            return "the batch's prepared tip changed"
+        head = self._head()
+        if head is None:
+            return None if self._canonical == onto else f"{self.canonical_branch} moved past the base"
+        if head["tip"] != onto:
+            return f"head {head['id']}'s tip moved"
+        if head["base"] != self._canonical and self._canonical != onto:
+            return f"{self.canonical_branch} moved under head {head['id']}"
+        if self._tip_failed(onto):
+            return f"head {head['id']} failed CI on the source"
+        current = self._current_attempt(head)
+        if (
+            current is not None
+            and not attempt["run_started_at"]
+            and (current["outcome"] == OUTCOME_INFRASTRUCTURE or current["id"] > attempt["id"])
+        ):
+            # One staging slot: a queued early run would hold up the head's re-run. It is sent again
+            # behind it.
+            return f"head {head['id']} needs a re-run ahead of a queued early run"
+        return None
+
+    def _cancel_early(self, attempt: dict[str, Any], reason: str, now: float) -> None:
+        with self.store.transaction():
+            self._count("early_staging_cancelled")
+            self.store.journal(
+                now,
+                "early-staging-cancelled",
+                attempt["batch_id"],
+                attempt_id=attempt["id"],
+                tip=attempt["head_sha"],
+                onto=attempt["base_sha"],
+                reason=reason,
+            )
+        self._cancel_superseded_runs(attempt["batch_id"], now, reason=f"early run: {reason}", only=attempt["id"])
+        # Whatever GitHub's run is doing (a completed run still waiting for its statuses is not cancelled
+        # there), the attempt is settled here, so the feed stops reporting it and it is never adopted.
+        with self.store.transaction():
+            self.store.update(
+                "ci_attempts",
+                {"id": attempt["id"], "outcome": OUTCOME_PENDING},
+                outcome=OUTCOME_SUPERSEDED,
+                outcome_detail=f"ci-superseded: early run: {reason}",
+            )
+            self.store.update(
+                "ci_attempts",
+                {"id": attempt["id"], "cancelled_at": None},
+                cancelled_at=now,
+                cancel_reason=f"early run: {reason}",
+                cancel_result="settled-locally",
+            )
+
+    def _dispatch_early(self, batch: dict[str, Any], head: dict[str, Any], now: float) -> None:
+        tip, onto = batch["pre_rebase_tip"], batch["pre_rebase_onto"]
+        revs: list[str] = []
+        for sha in (onto, *self._previous_tips(head), head["base"], self._canonical):
+            if sha and sha != tip and sha not in revs:
+                revs.append(sha)
+        kind = self._early_dispatch_kind(batch)
+        self._retain(self.pre_rebased_ref(batch["id"], tip), tip)
+        with self.store.transaction():
+            attempt_id = self.store.insert(
+                "ci_attempts",
+                batch_id=batch["id"],
+                batch_version=batch["version"],
+                head_sha=tip,
+                base_sha=onto,
+                base_ref=self.canonical_branch,
+                dispatched_at=now,
+                last_progress_at=now,
+                repair_outputs_revs=dumps(revs),
+                request_id=secrets.token_hex(16),
+                dispatch_state="prepared",
+                early=EARLY_PENDING,
+                # Positive, as pr-build's train identity requires; also the version the batch seals at.
+                generation=batch["version"] + 1,
+                dispatch_kind=kind,
+            )
+            self._count("early_staging_dispatches")
+            self.store.journal(
+                now,
+                "early-staging-dispatched",
+                batch["id"],
+                attempt_id=attempt_id,
+                version=batch["version"],
+                tip=tip,
+                onto=onto,
+                head_id=head["id"],
+                dispatch_kind=kind,
+            )
+        attempt = self.store.row("ci_attempts", {"id": attempt_id})
+        assert attempt is not None
+        self._send_prepared(self._early_view(batch, attempt), attempt, now)
+
+    def _adopt_early_attempt(self, batch: dict[str, Any], version: int, tip: str, base: str, now: float) -> int | None:
+        """At the seal of `batch` as exactly the verified `tip` on `base` (`_seal_from_pre_rebase`, in its
+        transaction): make the early attempt for that tip and base the head's attempt at `version`.
+        Not one cancelled, being cancelled, superseded or failed on infrastructure. Returns its id."""
+        for attempt in reversed(self._early_attempts(batch_id=batch["id"])):
+            if (
+                (attempt["head_sha"], attempt["base_sha"]) != (tip, base)
+                or attempt["cancelled_at"] is not None
+                or self._cancelling(attempt)
+                or attempt["outcome"] not in (OUTCOME_PENDING, OUTCOME_PASS, OUTCOME_SOURCE_FAILURE)
+                or not self._attested_still_counts(batch, attempt)
+            ):
+                continue
+            self.store.update("ci_attempts", {"id": attempt["id"]}, batch_version=version, early=EARLY_ADOPTED)
+            if batch["first_dispatch_at"] is None and attempt["sent_at"] is not None:
+                self.store.update("batches", {"id": batch["id"]}, first_dispatch_at=attempt["sent_at"])
+            self._count("early_staging_adopted")
+            self.store.journal(
+                now,
+                "early-staging-adopted",
+                batch["id"],
+                attempt_id=attempt["id"],
+                version=version,
+                tip=tip,
+                outcome=attempt["outcome"],
+            )
+            return attempt["id"]
+        return None
 
     # --- CI ----------------------------------------------------------------------------------------
 
@@ -7010,8 +8333,6 @@ class Controller:
 
     def _ci(self, head: dict[str, Any], now: float) -> None:
         attempt = self._current_attempt(head)
-        if attempt is None and self._unchanged_after_failure(head, now):
-            return
         if attempt is None or attempt["outcome"] == OUTCOME_SUPERSEDED:
             self._dispatch(head, now, retry=0)
             return
@@ -7048,14 +8369,35 @@ class Controller:
             self._dispatch(head, now, retry=retries)
         elif attempt["outcome"] == OUTCOME_SOURCE_FAILURE:
             self._infrastructure_recovered(head, attempt, now)
-            hold = self._escalation_hold(head, now)
-            if hold is not None:
-                self._reasons.append(f"head {head['id']} holds after escalation: {hold['detail']}")
-                return
-            if self._open_task(head) is None and not self._source_failure(head, attempt, now):
-                return  # escalated: the head changed, or holds
+            if self._open_task(head) is None:
+                # The exact findings, unchanged: they carry any member attribution CI reported
+                # (`source_pr`). However often a failure recurs, the head goes to repair again; only the
+                # agent may withdraw a member, by reducing its contribution to an empty commit.
+                diagnostics = loads(attempt["diagnostics"], [])
+                self._create_task(head, TASK_REPAIR, head["base"], diagnostics, now, ci_attempt_id=attempt["id"])
             self._reasons.append(f"head {head['id']} waits for a worker to claim its repair task")
         elif attempt["outcome"] == OUTCOME_PASS:
+            if not self._attested_still_counts(head, attempt):
+                # Passed as an attested landing, but its attestation no longer counts: stage it in full.
+                with self.store.transaction():
+                    self._set_state(self._fallback_key(attempt["head_sha"], attempt["base_sha"]), True)
+                    self.store.update(
+                        "ci_attempts",
+                        {"id": attempt["id"], "outcome": OUTCOME_PASS},
+                        outcome=OUTCOME_SUPERSEDED,
+                        outcome_detail="attested-fallback: the attestation no longer counts against main",
+                    )
+                    self._count("attested_landing_fallbacks")
+                    self.store.journal(
+                        now,
+                        "attested-landing-fallback",
+                        head["id"],
+                        attempt_id=attempt["id"],
+                        tip=attempt["head_sha"],
+                        detail="the attestation no longer counts against main",
+                    )
+                self._dispatch(head, now, retry=0)
+                return
             self._infrastructure_recovered(head, attempt, now)
             self._promote(head, attempt, now)
 
@@ -7150,9 +8492,9 @@ class Controller:
         """Operator: break apart every live batch (the head and the open batches) that holds a Forgejo
         member or a GitHub PR named in `withdraw`, for when the Forgejo source cannot be used.
 
-        Each such batch is removed (the head as `_dissolve_head` does: tasks superseded, claims released,
-        pre-rebases discarded, runs cancelled) and all its members go back to waiting at their original
-        age with their approvals kept (`_return_members`), so a Forgejo PR re-enters a batch by itself once
+        Each such batch is removed (tasks superseded, claims released, pre-rebases discarded, runs
+        cancelled) and all its members go back to waiting at their original age with their approvals kept
+        (`_return_members`), so a Forgejo PR re-enters a batch by itself once
         `forgejo_placement_enabled` is true again. GitHub-only batches are kept. A PR in `withdraw` then
         has its input cancelled as `bors r-` would (a new approval brings it back). Refused while
         `forgejo_placement_enabled` is true, since the returned Forgejo inputs would be placed again."""
@@ -7373,7 +8715,7 @@ class Controller:
         return [
             a
             for a in self.store.rows("ci_attempts", {"batch_id": head["id"], "batch_version": head["version"]})
-            if a["head_sha"] == head["tip"] and a["base_sha"] == head["base"]
+            if a["head_sha"] == head["tip"] and a["base_sha"] == head["base"] and a["early"] != EARLY_PENDING
         ]
 
     def _source_head_current(self, head, attempt=None):
@@ -7542,7 +8884,9 @@ class Controller:
             if a["cancelled_at"] is not None and a["run_id"]
         }
 
-    def _cancel_superseded_runs(self, batch_id: int, now: float, *, reason: str, by: int | None = None) -> None:
+    def _cancel_superseded_runs(
+        self, batch_id: int, now: float, *, reason: str, by: int | None = None, only: int | None = None
+    ) -> None:
         """Cancel the run of every attempt of the batch other than `by` that is still live as last observed.
 
         Called after a new attempt `by` is dispatched, and after the batch lands, is removed or has its
@@ -7552,11 +8896,13 @@ class Controller:
         run lookup or cancel request leaves a durable cancel intent (`_write_cancel_intent`), retried
         with backoff until the run is settled (`_settle_cancel_intents`); it never holds anything back.
         The attempt is recorded as cancelled either way, so observation and the re-adoption of live
-        runs leave its run alone.
+        runs leave its run alone. `only` limits all this to that one attempt (an invalid early run).
         """
         adopted = self.store.row("ci_attempts", {"id": by}) if by is not None else None
         protected_run = adopted["run_id"] if adopted is not None else None
         for attempt in self.store.rows("ci_attempts", {"batch_id": batch_id}, order="id"):
+            if only is not None and attempt["id"] != only:
+                continue
             if (
                 self.candidate_ci is None
                 and self.mixed_ci is None
@@ -7815,6 +9161,9 @@ class Controller:
                     repair_outputs_revs=dumps(repair_outputs_revs),
                     request_id=request_id,
                     dispatch_state="prepared",
+                    dispatch_kind=DISPATCH_STAGING
+                    if candidate_ci is not None
+                    else self._dispatch_kind(head, head["tip"], head["base"], head["attestation"]),
                 )
                 if candidate_ci is not None:
                     candidate_ci.freeze(attempt_id, members, prepared=prepared)
@@ -7855,7 +9204,10 @@ class Controller:
             return
         repair_outputs_revs = loads(attempt["repair_outputs_revs"], [])
         members = [m["number"] for m in self._members(head["id"])]
-        branch = self.staging_candidate_ref(attempt_id, head["version"])
+        # An early attempt keeps the branch name it was sent under after its batch adopts it at a
+        # later version (`ci_attempts.generation`).
+        generation = attempt.get("generation")
+        branch = self.staging_candidate_ref(attempt_id, head["version"] if generation is None else generation)
         sending = False
         try:
             # The candidate exists only in the service's clone until it is retained on GitHub; CI checks it
@@ -7878,7 +9230,11 @@ class Controller:
                 if not self.setting("publication_enabled"):
                     return
             else:
-                retained_ref = self.batch_ref(head["id"], head["version"])
+                retained_ref = (
+                    self.pre_rebased_ref(head["id"], head["tip"])
+                    if attempt.get("early") == EARLY_PENDING
+                    else self.batch_ref(head["id"], head["version"])
+                )
                 retained = self.store.row("outbox", {"key": f"retain:{retained_ref}:{head['tip']}"})
                 if retained is None or retained["state"] != "done":
                     self.source.update_ref(self.repository, retained_ref, head["tip"])
@@ -7909,6 +9265,8 @@ class Controller:
                     batch_id=str(head["id"]),
                     members=members,
                     repair_outputs_revs=repair_outputs_revs,
+                    # Only an attested landing passes the flag, so older execution ports keep working.
+                    **({"attested": True} if attempt.get("dispatch_kind") == DISPATCH_ATTESTED else {}),
                 )
         except Exception as error:  # noqa: BLE001
             uncertain = sending and not isinstance(error, DispatchNotAccepted)
@@ -7991,7 +9349,7 @@ class Controller:
             )
             if not changed:
                 return
-            if head["first_dispatch_at"] is None:
+            if head["first_dispatch_at"] is None and current.get("early") != EARLY_PENDING:
                 self.store.update(
                     "batches",
                     {"id": head["id"], "first_dispatch_at": None},
@@ -8274,16 +9632,19 @@ class Controller:
                     outcome_detail="; ".join(f"{context}: {statuses[context].description}" for context in failed),
                     diagnostics=dumps(findings),
                 )
-                self._count("ci_source_failures")
-                self.store.journal(
-                    now,
-                    "ci-source-failure",
-                    head["id"],
-                    attempt_id=attempt["id"],
-                    run_id=run.run_id,
-                    findings=len(findings),
-                    contexts=failed,
-                )
+                if attempt.get("dispatch_kind") == DISPATCH_ATTESTED:
+                    self._attested_fallback(head, attempt, run, values, now)
+                else:
+                    self._count("ci_source_failures")
+                    self.store.journal(
+                        now,
+                        "ci-source-failure",
+                        head["id"],
+                        attempt_id=attempt["id"],
+                        run_id=run.run_id,
+                        findings=len(findings),
+                        contexts=failed,
+                    )
             else:
                 values.update(outcome=OUTCOME_PASS, outcome_detail=status.description)
                 self._count("ci_passes")
@@ -8309,7 +9670,11 @@ class Controller:
                 self._reasons.append(f"head {head['id']}: run {run.run_id} failed, waiting for its log")
                 self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
                 return
-            if status.description.lower().startswith("infrastructure") or (infrastructure and not source):
+            # The finalizer's "did not complete" status says the build produced no verdict at all.
+            no_verdict = status.description.lower().startswith("infrastructure") or (
+                status.description == INCOMPLETE_BUILD_DESCRIPTION
+            )
+            if no_verdict or (infrastructure and not source):
                 values.update(
                     outcome=OUTCOME_INFRASTRUCTURE, outcome_detail=f"infrastructure-failure: {status.description}"
                 )
@@ -8323,16 +9688,38 @@ class Controller:
                 values.update(
                     outcome=OUTCOME_SOURCE_FAILURE, outcome_detail=status.description, diagnostics=dumps(findings)
                 )
-                self._count("ci_source_failures")
-                self.store.journal(
-                    now,
-                    "ci-source-failure",
-                    head["id"],
-                    attempt_id=attempt["id"],
-                    run_id=run.run_id,
-                    findings=len(findings),
-                )
+                if attempt.get("dispatch_kind") == DISPATCH_ATTESTED:
+                    self._attested_fallback(head, attempt, run, values, now)
+                else:
+                    self._count("ci_source_failures")
+                    self.store.journal(
+                        now,
+                        "ci-source-failure",
+                        head["id"],
+                        attempt_id=attempt["id"],
+                        run_id=run.run_id,
+                        findings=len(findings),
+                    )
         self.store.update("ci_attempts", {"id": attempt["id"], "outcome": OUTCOME_PENDING}, **values)
+
+    def _attested_fallback(self, head, attempt, run, values: dict[str, Any], now: float) -> None:
+        """An attested landing that did not pass (decision 200) says nothing about the source: it built
+        nothing, so a missing output or a refused attestation fails it. It is an infrastructure failure,
+        never a source failure (the tip stays not failed, `_tip_failed`), and the next dispatch of this
+        tip and base is full staging (`_dispatch_kind`)."""
+        detail = f"attested-fallback: {values.get('outcome_detail') or 'the attested landing did not pass'}"
+        values.update(outcome=OUTCOME_INFRASTRUCTURE, outcome_detail=detail[:2000], diagnostics=dumps([]))
+        self._set_state(self._fallback_key(attempt["head_sha"], attempt["base_sha"]), True)
+        self._count("attested_landing_fallbacks")
+        self.store.journal(
+            now,
+            "attested-landing-fallback",
+            head["id"],
+            attempt_id=attempt["id"],
+            run_id=run.run_id,
+            tip=attempt["head_sha"],
+            detail=detail[:500],
+        )
 
     def _observe_source_attempt(self, head, attempt, now, *, strict=False):
         """Only the artifact verifier may decide a source candidate's pass or source failure.
@@ -8569,527 +9956,7 @@ class Controller:
             )
             return None
 
-    # --- loop termination: failure fingerprints and escalation ---------------------------------------
-
-    def _resolve_members(self, references: list[Any], members: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """The members of `members` that `references` name: a `Source-PR` value, a PR number when only
-        one member has it, or a policy record `{"head", "number", "source"}`, matched by accepted head and
-        number, else by number and source identity (`_policy_member`)."""
-        by_source = {m["source_pr"]: m for m in members}
-        by_number: dict[int, list[dict[str, Any]]] = {}
-        for member in members:
-            by_number.setdefault(int(member["number"]), []).append(member)
-        found: dict[int, dict[str, Any]] = {}
-        for reference in references:
-            if isinstance(reference, dict):
-                member = self._policy_member(reference, members)
-                if member is not None:
-                    found[member["id"]] = member
-                continue
-            if isinstance(reference, str) and reference in by_source:
-                found[by_source[reference]["id"]] = by_source[reference]
-                continue
-            text = str(reference).strip().lstrip("#")
-            if isinstance(reference, str) and "#" in text:
-                text = text.rsplit("#", 1)[1]
-            if text.isdigit() and len(by_number.get(int(text), [])) == 1:
-                member = by_number[int(text)][0]
-                found[member["id"]] = member
-        return [m for m in members if m["id"] in found]
-
-    @staticmethod
-    def _policy_member(reference: dict[str, Any], members: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """The one member a review-size policy record names. The accepted head identifies a member on
-        any forge; the number alone is ambiguous between a GitHub PR and a Forgejo pull, so without a
-        head match it must agree with the record's source identity too."""
-        number = reference.get("number")
-        number = number if type(number) is int else None
-        by_head = [
-            m
-            for m in members
-            if m["accepted_head"] == reference.get("head") and (number is None or int(m["number"]) == number)
-        ]
-        if len(by_head) == 1:
-            return by_head[0]
-        source = reference.get("source")
-        if number is None or not isinstance(source, dict):
-            return None
-        forge = source.get("forge")
-        github = isinstance(forge, dict) and forge.get("kind") == "github"
-        canonical = dumps(source)  # `mixed_identity.source_record`'s form
-        by_source = [
-            m
-            for m in members
-            if int(m["number"]) == number
-            and (m["source_identity"] == canonical or (github and not m["source_identity"]))
-        ]
-        return by_source[0] if len(by_source) == 1 else None
-
-    def _record_failure(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> dict[str, Any]:
-        """The `failures` row of a failed attempt, recorded once: its fingerprint over the verdict class,
-        the head members its findings name and its finding lines."""
-        existing = self.store.row("failures", {"attempt_id": attempt["id"]})
-        if existing is not None:
-            return existing
-        diagnostics = loads(attempt["diagnostics"], [])
-        named = self._resolve_members(
-            escalation.named_members(diagnostics) + attribution.policy_references(diagnostics),
-            self._members(head["id"]),
-        )
-        identity = escalation.fingerprint(
-            escalation.verdict_class(attempt["outcome_detail"] or "", loads(attempt["verdicts"], {})),
-            [m["source_pr"] for m in named],
-            escalation.finding_lines(diagnostics),
-        )
-        with self.store.transaction():
-            self.store.insert(
-                "failures",
-                batch_id=head["id"],
-                batch_version=attempt["batch_version"],
-                attempt_id=attempt["id"],
-                fingerprint=identity["fingerprint"],
-                verdict_class=identity["verdict_class"],
-                members=dumps(identity["members"]),
-                digest=identity["digest"],
-                lines=dumps(identity["lines"]),
-                at=now,
-            )
-        return self.store.row("failures", {"attempt_id": attempt["id"]}) or {}
-
-    def _last_escalation_at(self, batch_id: int) -> float:
-        rows = self.store.query(
-            "SELECT MAX(at) AS at FROM failures WHERE batch_id=? AND action IN ('withdraw', 'bisect', 'hold')",
-            (batch_id,),
-        )
-        return (rows[0]["at"] if rows else None) or 0.0
-
-    def _source_failure(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> bool:
-        """A head's CI source failure: a repair task with the exact findings, or, when the failure keeps
-        recurring, an escalation. True when a repair task was created."""
-        failure = self._record_failure(head, attempt, now)
-        same = self.store.count("failures", {"batch_id": head["id"], "fingerprint": failure["fingerprint"]})
-        since = self._last_escalation_at(head["id"])
-        rounds = len(
-            [
-                row
-                for row in self.store.rows("failures", {"batch_id": head["id"]})
-                if row["at"] > since or row["id"] == failure["id"]
-            ]
-        )
-        repeat_limit = int(self.setting("failure_repeat_limit"))
-        round_limit = int(self.setting("source_failure_round_limit"))
-        if self.setting("policy_rejection_withdraw"):
-            # Only a rejection measured on a member's accepted head is beyond repair. One measured on the
-            # member's own commit in the batch chain goes to repair like any other failure (a repair may
-            # split the change inside the batch), and the thresholds below withdraw it if that fails.
-            diagnostics = loads(attempt["diagnostics"], [])
-            active = [m for m in self._members(head["id"]) if not m["withdrawn"]]
-            unrepairable = [
-                reference
-                for reference in attribution.policy_references(diagnostics)
-                if reference["measured"] != "batch-commit"
-            ]
-            if self._resolve_members(unrepairable, active):
-                self._escalate(
-                    head,
-                    failure,
-                    "the member review-size policy rejected it, and the policy measured the accepted head, "
-                    "which no repair can change",
-                    now,
-                )
-                return False
-        if repeat_limit and same >= repeat_limit:
-            self._escalate(head, failure, f"the same failure occurred {same} times on batch {head['id']}", now)
-            return False
-        if round_limit and rounds >= round_limit:
-            self._escalate(
-                head, failure, f"{rounds} source failures on batch {head['id']} since its last escalation", now
-            )
-            return False
-        # The exact findings, unchanged: they carry any member attribution CI reported (`source_pr`).
-        # The agent instruction already lets an agent leave out a member it cannot repair.
-        diagnostics = loads(attempt["diagnostics"], [])
-        self._create_task(head, TASK_REPAIR, head["base"], diagnostics, now, ci_attempt_id=attempt["id"])
-        with self.store.transaction():
-            self.store.update("failures", {"id": failure["id"]}, action="repair")
-        return True
-
-    def _unchanged_after_failure(self, head: dict[str, Any], now: float) -> bool:
-        """Never dispatch content that already failed: when an adopted repair left the head's tree (on the
-        same base) as it was when CI failed, escalate that failure instead. True when it escalated."""
-        hold = self._escalation_hold(head, now)
-        if hold is not None:
-            self._reasons.append(f"head {head['id']} holds after escalation: {hold['detail']}")
-            return True
-        failures = self.store.rows("failures", {"batch_id": head["id"], "action": "repair"})
-        if not failures:
-            return False
-        # Only an adopted repair's version: an operator's `rebuild-head` or `retry-ci` may re-dispatch.
-        adopted = self.store.query(
-            "SELECT 1 FROM journal WHERE kind='adopted' AND batch_id=? AND json_extract(detail, '$.version')=? LIMIT 1",
-            (head["id"], head["version"]),
-        )
-        if not adopted:
-            return False
-        tree = chain.tree_of(self.clone, head["tip"])
-        for failure in failures:
-            attempt = self.store.row("ci_attempts", {"id": failure["attempt_id"]})
-            if (
-                attempt is not None
-                and attempt["base_sha"] == head["base"]
-                and chain.tree_of(self.clone, attempt["head_sha"]) == tree
-            ):
-                self._escalate(head, failure, "the adopted repair left the failed candidate's content unchanged", now)
-                return True
-        return False
-
-    def _fruitless_claims(self, task: dict[str, Any]) -> int:
-        """Claims of the task released (or expired) without an adopted submission."""
-        return sum(
-            1
-            for claim in self.store.rows("claims", {"task_id": task["id"]})
-            if claim["released_at"] is not None and claim["release_reason"] not in NOT_FRUITLESS_RELEASES
-        )
-
-    def _fruitless_task(self, head: dict[str, Any], task: dict[str, Any], now: float) -> bool:
-        """Escalate a head's repair or rebase-conflict task that workers keep giving back without a
-        result. True when it escalated (the head changed or holds)."""
-        limit = int(self.setting("repair_fruitless_claim_limit"))
-        if not limit or task["kind"] not in (TASK_REPAIR, TASK_REBASE_CONFLICT) or self._prediction_task(task):
-            return False
-        hold = self._escalation_hold(head, now)
-        if hold is not None:
-            self._reasons.append(f"head {head['id']} holds after escalation: {hold['detail']}")
-            return True
-        fruitless = self._fruitless_claims(task)
-        if fruitless < limit:
-            return False
-        cause = f"{task['kind'].replace('_', ' ')} task {task['id']} was claimed {fruitless} times without a result"
-        if task["kind"] == TASK_REPAIR and task["ci_attempt_id"] is not None:
-            attempt = self.store.row("ci_attempts", {"id": task["ci_attempt_id"]})
-            failure = self._record_failure(head, attempt, now) if attempt is not None else None
-        else:
-            failure = None
-        if failure is None:
-            # A rebase conflict names the member whose replay conflicts.
-            conflict = next((d for d in loads(task["diagnostics"], []) if d.get("kind") == "conflict"), {})
-            failure = {
-                "id": None,
-                "fingerprint": "",
-                "verdict_class": task["kind"],
-                "members": dumps([conflict["source_pr"]] if conflict.get("source_pr") else []),
-                "lines": dumps([conflict.get("message", "")] if conflict.get("message") else []),
-            }
-        with self.store.transaction():
-            self.store.update(
-                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="escalated"
-            )
-        self._escalate(head, failure, cause, now)
-        return True
-
-    def _escalation_hold(self, head: dict[str, Any], now: float | None = None) -> dict[str, Any] | None:
-        """The hold an escalation that failed to act put on this head version, while it lasts. A hold
-        expires at its `retry_at`: the next pass meets the same failure and escalates again."""
-        hold = self._state("escalation_hold")
-        if not hold or hold.get("batch_id") != head["id"] or hold.get("version") != head["version"]:
-            return None
-        if (self.clock() if now is None else now) >= hold.get("retry_at", float("inf")):
-            return None
-        return hold
-
-    def _retry_escalation(self, head: dict[str, Any], now: float) -> bool:
-        """Try a held escalation again once its hold expires (`_escalate`). A hold of an earlier head
-        version is dropped: the head changed, so the failure is met afresh. True when it retried."""
-        hold = self._state("escalation_hold")
-        if not hold:
-            return False
-        if hold.get("batch_id") != head["id"] or hold.get("version") != head["version"] or "failure" not in hold:
-            self._set_state("escalation_hold", None)
-            return False
-        if now < hold.get("retry_at", float("inf")):
-            return False
-        self.store.journal(now, "escalation-retry", head["id"], version=head["version"], retries=hold["retries"])
-        self._escalate(head, hold["failure"], hold["cause"], now)
-        return True
-
-    def _retry_delay(self, retries: int) -> float:
-        """The automatic retry delay after `retries` earlier retries: `automatic_retry_seconds`, doubling
-        each time, at most `automatic_retry_max_seconds`."""
-        initial = max(60, int(self.setting("automatic_retry_seconds")))  # never a retry every pass
-        return min(
-            initial * 2 ** min(20, max(0, retries)), max(initial, int(self.setting("automatic_retry_max_seconds")))
-        )
-
-    def _escalate(self, head: dict[str, Any], failure: dict[str, Any], cause: str, now: float) -> None:
-        """Act on a failure that repair did not resolve: withdraw the active members it names, else hold
-        while the base is known broken (`_base_health`), else withdraw the members attribution finds
-        (`_attribute`), else bisect the head, else withdraw its one active member, else (no active member
-        left) dissolve the head. A hold, or an escalation that raises, holds the head version and is
-        tried again after an automatic backoff. Every outcome is journaled, alerted on the
-        status page and sent to the operator."""
-        members = self._members(head["id"])
-        active = [m for m in members if not m["withdrawn"]]
-        named = self._resolve_members(loads(failure["members"], []), active)
-        lines = loads(failure["lines"], [])
-        original_cause = cause
-        health, evidence = "healthy", ""
-        try:
-            found = None
-            if not named and active:
-                health, evidence = self._base_health(head["base"])
-            if not named and len(active) > 1 and health != "broken":
-                try:
-                    found = self._attribute(head, failure, active)
-                except Exception as error:  # noqa: BLE001 - attribution is advisory; bisection still terminates
-                    self.log.exception("attribution on head %s failed", head["id"])
-                    found = attribution.Attribution(refused=f"attribution failed ({type(error).__name__})")
-                named = [m for m in active if m["source_pr"] in found.members]
-                if named:
-                    cause += "; attributed by " + found.summary(lambda key: self._member_label(key, active))
-                    self._count("attributed_withdrawals")
-            if health == "broken":
-                action = "hold"
-                detail = (
-                    f"main is broken at {head['base'][:12]}: {evidence}; not withdrawing or bisecting until main "
-                    "is fixed (fix main or re-run its CI; `rebuild-head` re-dispatches)"
-                )
-            elif named:
-                action, detail = "withdraw", self._withdraw_from_head(head, named, failure, cause, now)
-            elif len(active) > 1:
-                assert found is not None
-                cause += f"; attribution: {found.summary()}"
-                action, detail = "bisect", self._bisect(head, failure, cause, now)
-            elif active:
-                cause += "; this PR is the only member left on the batch, so the failure is its own"
-                action, detail = "withdraw", self._withdraw_from_head(head, active, failure, cause, now)
-            elif head["urgent"] == URGENT_EMERGENCY:
-                self._end_emergency(head, "dissolved", now)
-                action, detail = "dissolve", "no active member was left; the emergency batch ended"
-            else:
-                action, detail = "dissolve", self._dissolve_head(head, cause, now)
-        except Exception as error:  # noqa: BLE001 - a failed escalation must hold with an alert, not stall silently
-            self.log.exception("escalation of head %s failed", head["id"])
-            action, detail = "hold", f"escalation failed ({type(error).__name__}: {str(error)[:200]})"
-        if health == "unknown":
-            cause += f"; base health unknown ({evidence})"
-        retried = False
-        if action == "hold":
-            prior = self._state("escalation_hold") or {}
-            retried = prior.get("batch_id") == head["id"] and prior.get("version") == head["version"]
-            retries = int(prior.get("retries", -1)) + 1 if retried else 0
-            retry_at = now + self._retry_delay(retries)
-            detail += f"; retried automatically in {(retry_at - now) / 60:.0f} minutes"
-            self._set_state(
-                "escalation_hold",
-                {
-                    "batch_id": head["id"],
-                    "version": head["version"],
-                    "detail": detail,
-                    "at": prior.get("at", now) if retried else now,
-                    "retries": retries,
-                    "retry_at": retry_at,
-                    "failure": dict(failure),
-                    "cause": original_cause,
-                },
-            )
-        elif self._state("escalation_hold"):
-            self._set_state("escalation_hold", None)
-        if failure.get("id") is not None:
-            with self.store.transaction():
-                self.store.update("failures", {"id": failure["id"]}, action=action)
-        if retried:
-            # One alert and one message per held version; later retries are journaled only.
-            self.store.journal(now, "escalation-retry-failed", head["id"], version=head["version"], detail=detail)
-            return
-        self._record_escalation(
-            action,
-            head,
-            now,
-            cause=cause,
-            detail=detail,
-            fingerprint=failure.get("fingerprint", ""),
-            verdict_class=failure.get("verdict_class", ""),
-            lines=lines,
-        )
-
-    def _base_health(self, base: str) -> tuple[str, str]:
-        """Whether `base` builds, before a failure no finding names is blamed on a member: `healthy` when
-        it is the tip of a batch the queue promoted (it passed the same candidate CI; no API call), else
-        `healthy` or `broken` by the conclusion of main's `ci.yml` run for it, else `unknown` (no run,
-        not concluded, the lookup failed, or main is not on GitHub). Only `broken` changes the escalation;
-        `unknown` keeps today's attribution. The second value is the evidence, for the cause or detail."""
-        promoted = {"repository": self.repository, "state": BATCH_LANDED, "tip": base, "landed_how": "promoted"}
-        if self.store.row("batches", promoted) is not None:
-            return "healthy", "the queue landed it"
-        reader = getattr(self.execution, "main_ci_run", None)
-        if (
-            reader is None
-            or self.candidate_ci is not None
-            or self.native_source
-            or self.store.get_setting("mixed:primary", "github") != "github"
-        ):
-            return "unknown", "main CI is not read for this source"
-        try:
-            run = reader(self.repository, base)
-        except Exception as error:  # noqa: BLE001 - an unreadable base keeps today's attribution
-            self.log.warning("main CI lookup for %s failed: %s", base[:12], error)
-            return "unknown", f"main CI lookup failed ({type(error).__name__})"
-        if run is None:
-            return "unknown", f"no main CI run for {base[:12]}"
-        if run.status != "completed" or run.conclusion not in ("success", "failure"):
-            return "unknown", f"main CI run {run.html_url or run.run_id} is {run.conclusion or run.status}"
-        if run.conclusion == "success":
-            return "healthy", f"main CI run {run.html_url or run.run_id} passed"
-        return "broken", f"main CI run {run.html_url or run.run_id} failed"
-
-    @staticmethod
-    def _member_label(key: str, members: list[dict[str, Any]]) -> str:
-        member = next((m for m in members if m["source_pr"] == key), None)
-        return f"#{member['number']}" if member is not None else key
-
-    def _attribute(
-        self, head: dict[str, Any], failure: dict[str, Any], active: list[dict[str, Any]]
-    ) -> attribution.Attribution:
-        """Attribute a failure no finding names to the members whose changes it falls in or imports
-        (`attribution.attribute`), from the failed candidate's own chain: each commit's changed paths,
-        and the project imports of the candidate's tree. Members are keyed by `Source-PR`, so Forgejo
-        and GitHub members never collide."""
-        row = self.store.row("failures", {"id": failure["id"]}) if failure.get("id") is not None else None
-        attempt = self.store.row("ci_attempts", {"id": row["attempt_id"]}) if row is not None else None
-        if attempt is None:
-            return attribution.Attribution(refused="no CI attempt to attribute")
-        diagnostics = loads(attempt["diagnostics"], [])
-        try:
-            commits = chain.chain_commits(self.clone, attempt["base_sha"], attempt["head_sha"])
-        except (chain.ChainError, subprocess.SubprocessError) as error:
-            return attribution.Attribution(refused=f"the failed candidate's chain is unavailable: {error}"[:300])
-        planner = self._planner()
-        planner.load([c.sha for c in commits])
-        keys = {m["source_pr"] for m in active}
-        changes: dict[str, set[str]] = {}
-        for commit in commits:
-            if commit.source_pr in keys:
-                changes.setdefault(commit.source_pr, set()).update(p for p, _ in planner.changes.get(commit.sha, []))
-        graph: dict[str, set[str]] | None = None
-
-        def imports(path: str) -> set[str]:
-            nonlocal graph
-            if graph is None:
-                graph = {}
-                tree = chain.tree_of(self.clone, attempt["head_sha"])
-                for importer, module in admission_planning.grep_imports(planner, tree):
-                    graph.setdefault(importer, set()).add(module.replace(".", "/") + ".lean")
-            return graph.get(path, set())
-
-        order = [m["source_pr"] for m in active]
-        return attribution.attribute(
-            diagnostics, order, changes, imports, max_members=int(self.setting("attribution_max_members"))
-        )
-
-    def _dissolve_head(self, head: dict[str, Any], cause: str, now: float) -> str:
-        """Remove a head none of whose members is left to land: every one was withdrawn, so its content
-        is its base and there is nothing to promote. The next sealed batch takes its place."""
-        with self.store.transaction():
-            for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
-                self.store.update(
-                    "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="dissolved"
-                )
-            for claim in self._active_claims(head["id"]):
-                self._release_claim(claim, "escalated", now)
-            self._set_pre_rebase(head, "", now)
-            self._discard_pre_rebase("head-dissolved", now, head)
-            self.store.journal(now, "head-dissolved", head["id"], version=head["version"], cause=cause)
-        self._remove_batch(head, "dissolved", now)
-        self._wake.set()
-        return "no active member was left; the head was dissolved and the next batch takes its place"
-
-    def _withdrawal_note(self, failure: dict[str, Any], cause: str) -> str:
-        lines = loads(failure["lines"], [])
-        note = f"Withdrawn by the merge queue: {cause}"
-        if failure.get("verdict_class"):
-            note += f" ({failure['verdict_class']})"
-        if lines:
-            note += ". Finding: " + lines[0][:300]
-        return note + "."
-
-    def _withdraw_from_head(
-        self, head: dict[str, Any], named: list[dict[str, Any]], failure: dict[str, Any], cause: str, now: float
-    ) -> str:
-        """Replace the named members' commits with empty ones (their messages keep a note why) and withdraw
-        them (`_withdraw_member`, reason `queue-withdrawn`). A later member whose replay then conflicts goes
-        back to waiting with everything after it, as a bisection's second half does. Returns a summary."""
-        note = self._withdrawal_note(failure, cause)
-        empties = {m["source_pr"]: note for m in named}
-        chain_id = f"withdraw-{head['id']}-{secrets.token_hex(4)}"
-        try:
-            result = chain.replay(self.clone, head["base"], head["tip"], head["base"], chain_id=chain_id, empty=empties)
-        finally:
-            chain.delete_chain_ref(self.clone, chain_id)
-        by_pr = {record.source_pr: record for record in result.commits}
-        members = self._members(head["id"])
-        returned = [m for m in members if by_pr.get(m["source_pr"]) is None or by_pr[m["source_pr"]].sha is None]
-        with self.store.transaction():
-            for member in members:
-                record = by_pr.get(member["source_pr"])
-                if record is not None and record.sha is not None:
-                    self.store.update("members", {"id": member["id"]}, commit_sha=record.sha)
-            for member in named:
-                record = by_pr[member["source_pr"]]
-                explanation = (member["explanation"] + "\n\n" + note).strip()
-                self.store.update(
-                    "members",
-                    {"id": member["id"]},
-                    provenance="edited",
-                    explanation=explanation,
-                    edited_shas=dumps(loads(member["edited_shas"], []) + [record.sha]),
-                )
-                withdrawn = dict(member, commit_sha=record.sha, explanation=explanation)
-                self._withdraw_member(
-                    head,
-                    withdrawn,
-                    reason=QUEUE_WITHDRAWN,
-                    comment=self._queue_withdrawal_comment(head, withdrawn, failure, cause),
-                    journal_kind="queue-withdrawn",
-                    now=now,
-                    cause=cause,
-                    fingerprint=failure.get("fingerprint", ""),
-                )
-                self._count("queue_withdrawals")
-            self._return_members(head, returned, "withdrawal-conflict", now)
-            self._advance_head(head, result.tip, "escalated", now)
-        summary = "withdrew " + ", ".join(f"#{m['number']}" for m in named)
-        if returned:
-            summary += "; returned " + ", ".join(f"#{m['number']}" for m in returned) + " to waiting after a conflict"
-        return summary
-
-    def _bisect(self, head: dict[str, Any], failure: dict[str, Any], cause: str, now: float) -> str:
-        """Keep the first half of the head's active members; the rest go back to waiting at their original
-        age, to be inserted into the open batches again. Returns a summary."""
-        members = self._members(head["id"])
-        active = [m for m in members if not m["withdrawn"]]
-        keep = active[(len(active) + 1) // 2 - 1]
-        cut = next(index for index, member in enumerate(members) if member["id"] == keep["id"])
-        kept, moved = members[: cut + 1], members[cut + 1 :]
-        tip = kept[-1]["commit_sha"]
-        if len(chain.chain_commits(self.clone, head["base"], tip)) != len(kept):
-            raise ControllerError(
-                "chain-mismatch", f"head {head['id']} prefix at {tip} does not hold {len(kept)} members"
-            )
-        with self.store.transaction():
-            self._return_members(head, moved, "bisected", now)
-            self._advance_head(head, tip, "bisected", now)
-            self._count("bisections")
-            self.store.journal(
-                now,
-                "bisected",
-                head["id"],
-                kept=[m["number"] for m in kept if not m["withdrawn"]],
-                moved=[m["number"] for m in moved if not m["withdrawn"]],
-                cause=cause,
-                fingerprint=failure.get("fingerprint", ""),
-            )
-        kept_active = sum(1 for m in kept if not m["withdrawn"])
-        return f"kept {kept_active} of {len(active)} members; {len(active) - kept_active} returned to waiting"
+    # --- members leaving the head ----------------------------------------------------------------
 
     def _return_members(self, head: dict[str, Any], members: list[dict[str, Any]], reason: str, now: float) -> None:
         """Take members out of the head (`removed`); an input still inserted waits again at its original age.
@@ -9113,23 +9980,15 @@ class Controller:
                 )
             self.store.journal(now, "member-returned", head["id"], number=member["number"], reason=reason)
 
-    def _advance_head(self, head: dict[str, Any], tip: str, resolution: str, now: float) -> None:
-        """The head's next version at `tip` on the same base: open tasks superseded, pre-rebases onto the
-        old tip discarded, its live runs cancelled. Called inside the caller's transaction."""
-        version = head["version"] + 1
-        self.store.update("batches", {"id": head["id"]}, version=version, tip=tip, expected_parent=None)
-        self._record_tip(head["id"], version, tip, now)
-        self._retain(self.batch_ref(head["id"], version), tip)
-        for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
-            self.store.update(
-                "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
-            )
-        for claim in self._active_claims(head["id"]):
-            self._release_claim(claim, "escalated", now)
-        self._set_pre_rebase(head, "", now)
-        self._discard_pre_rebase("head-shrunk", now, head)
-        self._cancel_superseded_runs(head["id"], now, reason=f"head {resolution}")
-        self._wake.set()
+    # --- automatic retry backoff and operator notifications ----------------------------------------
+
+    def _retry_delay(self, retries: int) -> float:
+        """The automatic retry delay after `retries` earlier retries: `automatic_retry_seconds`, doubling
+        each time, at most `automatic_retry_max_seconds`."""
+        initial = max(60, int(self.setting("automatic_retry_seconds")))  # never a retry every pass
+        return min(
+            initial * 2 ** min(20, max(0, retries)), max(initial, int(self.setting("automatic_retry_max_seconds")))
+        )
 
     def _infrastructure_backoff(self, head: dict[str, Any], attempt: dict[str, Any], retries: int, now: float) -> bool:
         """Automatic backoff once a head's CI keeps failing on infrastructure: re-dispatch after
@@ -9195,14 +10054,16 @@ class Controller:
         *,
         cause: str,
         detail: str,
-        fingerprint: str = "",
-        verdict_class: str = "",
+        key: str,
         lines: list[str] | None = None,
-        key: str | None = None,
         counted: bool = True,
+        channel: str = "notify",
+        extra: dict[str, Any] | None = None,
     ) -> None:
         """Keep the escalation for the status page's alerts, journal it, and send it to the operator.
-        An uncounted record (a recovery) is journaled and sent but is neither an alert nor an escalation."""
+        An uncounted record (a recovery) is journaled and sent but is neither an alert nor an escalation.
+        `channel` `progress-alert` sends it where progress alerts go (`_progress_alert`) instead of the
+        operator's direct messages."""
         record = {
             "at": now,
             "action": action,
@@ -9210,9 +10071,8 @@ class Controller:
             "version": head["version"],
             "cause": cause,
             "detail": detail,
-            "fingerprint": fingerprint,
-            "verdict_class": verdict_class,
             "lines": (lines or [])[:5],
+            **(extra or {}),
         }
         with self.store.transaction():
             if counted:
@@ -9223,7 +10083,405 @@ class Controller:
             self.store.journal(
                 now, "escalated", head["id"], **{k: v for k, v in record.items() if k not in ("at", "batch_id")}
             )
-            self._notify(key or f"escalation:{head['id']}:{head['version']}:{action}:{fingerprint}", record)
+            if channel == "progress-alert":
+                self._progress_alert(key, record)
+            else:
+                self._notify(key, record)
+
+    # --- stalled repair and head progress (docs/queue/escalation.md, "Stalled repair") ------------
+
+    def _repair_stalls(self) -> dict[str, dict[str, Any]]:
+        """The stalled repair tasks by task id (`state:repair_stalls`)."""
+        return dict(self._state("repair_stalls", {}) or {})
+
+    def _observe_repair_stall(
+        self, task: dict[str, Any], batch: dict[str, Any], tip: str, notes: dict[str, Any], now: float
+    ) -> None:
+        """After a checkpoint: when the task's last `repair_stall_checkpoints` checkpoints share one
+        failure signature (`repair_stall.signature`: the tip and the normalized findings), the task is
+        stalled. The first time, journal it and raise one progress alert quoting the agent's own
+        conclusion; each further identical checkpoint lengthens the backoff before the next claim. A
+        checkpoint with another signature is progress and ends the stall."""
+        limit = int(self.setting("repair_stall_checkpoints"))
+        stalls = self._repair_stalls()
+        key = str(task["id"])
+        current = stalls.get(key)
+        rows = self.store.rows(
+            "submissions",
+            {"task_id": task["id"], "reason": REPAIR_CHECKPOINT},
+            order="id DESC",  # the whole history: every revision of the current identical run has tried the task
+        )
+        signatures = [repair_stall.checkpoint_signature(row["tip"], row["worker_notes"]) for row in rows]
+        latest = signatures[0] if signatures else None
+        run = 0
+        for value in signatures:
+            if value is None or value != latest:
+                break
+            run += 1
+        # Every revision that produced a checkpoint of this run has tried the task and failed the same way.
+        run_notes = [repair_stall.notes_of(row["worker_notes"]) for row in rows[:run]]
+        revisions = list(
+            dict.fromkeys(r for n in reversed(run_notes) if (r := repair_stall.revision(n.get("worker_revision"))))
+        )
+        tools_seen = list(
+            dict.fromkeys(str(n["tools_revision"])[:120] for n in reversed(run_notes) if n.get("tools_revision"))
+        )
+        conclusion = repair_stall.conclusion(notes.get("agent_conclusion"))
+        findings = notes.get("repair_checkpoint") or []
+        if current is not None and (current.get("signature") != latest or not limit):
+            self._end_repair_stall(task, batch, current, now, "a checkpoint with other findings or another tip")
+            stalls.pop(key, None)
+            self._set_state("repair_stalls", stalls)
+            current = None
+        if not limit or latest is None or run < limit:
+            return
+        if current is None:
+            delay = repair_stall.retry_delay(
+                0, self.setting("repair_stall_retry_seconds"), self.setting("repair_stall_retry_max_seconds")
+            )
+            current = {
+                "task_id": task["id"],
+                "batch_id": batch["id"],
+                "version": task["batch_version"],
+                "kind": task["kind"],
+                "since": now,
+                "signature": latest,
+                "tip": tip,
+                "checkpoints": run,
+                "retries": 0,
+                "retry_at": now + delay,
+                "revisions": revisions,
+                "tools": tools_seen[-20:],
+                "findings": repair_stall.describe_findings(findings),
+                "conclusion": conclusion,
+            }
+            stalls[key] = current
+            self._set_state("repair_stalls", stalls)
+            self._count("repair_stalls")
+            self._record_escalation(
+                "repair-stalled",
+                batch,
+                now,
+                cause=(
+                    f"{task['kind']} task {task['id']} retained tip {tip[:12]} with the same findings "
+                    f"{run} times in a row"
+                ),
+                detail=(
+                    f"next claim at {repair_stall.clock(now + delay)} at the earliest, then the wait doubles at each "
+                    f"identical checkpoint up to {repair_stall.duration(self.setting('repair_stall_retry_max_seconds'))}; "
+                    "a new tip, new members or a worker on a revision that has not tried it is offered the task at once"
+                ),
+                lines=current["findings"],
+                key=f"repair-stalled:{task['id']}:{latest}:{now}",
+                counted=False,
+                channel="progress-alert",
+                extra={"task_id": task["id"], "tip": tip, "signature": latest, "conclusion": conclusion},
+            )
+            return
+        current["checkpoints"] = run
+        current["retries"] = int(current.get("retries", 0)) + 1
+        delay = repair_stall.retry_delay(
+            current["retries"],
+            self.setting("repair_stall_retry_seconds"),
+            self.setting("repair_stall_retry_max_seconds"),
+        )
+        current["retry_at"] = now + delay
+        current["revisions"] = list(dict.fromkeys([*current.get("revisions", []), *revisions]))
+        current["tools"] = list(dict.fromkeys([*current.get("tools", []), *tools_seen]))[-20:]
+        if conclusion:
+            current["conclusion"] = conclusion
+        stalls[key] = current
+        self._set_state("repair_stalls", stalls)
+        self.store.journal(
+            now,
+            "repair-stall-backoff",
+            batch["id"],
+            task_id=task["id"],
+            tip=tip,
+            checkpoints=run,
+            retries=current["retries"],
+            retry_at=current["retry_at"],
+        )
+
+    def _observe_repair_release(self, task: dict[str, Any], batch_id: int, reason: str, error: str, now: float) -> None:
+        """After a claim of an open task is given back without a result: when its last
+        `repair_stall_releases` releases since its last submission share one reason and normalized
+        error (`repair_stall.release_signature`), the task is stalled. The run is kept per task in
+        `state:repair_release_runs`. The first time, journal it and raise one progress alert quoting
+        the error; the task stays offered (no backoff), because the worker already paces such releases
+        and a fix on any worker should be picked up at once. A release with another error or after a
+        submission ends a release stall; `_observe_repair_stall` and `_settle_repair_stalls` end it too."""
+        if reason in STALL_IGNORED_RELEASES:
+            return
+        limit = int(self.setting("repair_stall_releases"))
+        key = str(task["id"])
+        latest = repair_stall.release_signature(task["tip"], reason, error)
+        submitted = self.store.row("submissions", {"task_id": task["id"]}, order="id DESC")
+        boundary = submitted["id"] if submitted is not None else None
+        runs = dict(self._state("repair_release_runs", {}) or {})
+        run = runs.get(key)
+        if run is None or run.get("signature") != latest or run.get("after") != boundary:
+            run = {"signature": latest, "after": boundary, "count": 0}
+        run["count"] = int(run["count"]) + 1
+        runs[key] = run
+        self._set_state("repair_release_runs", runs)
+        stalls = self._repair_stalls()
+        current = stalls.get(key)
+        if current is not None and current.get("source") != "releases":
+            return  # a checkpoint stall: checkpoints decide it
+        if current is not None and (
+            current.get("signature") != latest or current.get("after") != boundary or not limit
+        ):
+            why = "a worker submitted a result" if current.get("after") != boundary else "a release with another error"
+            self._end_repair_stall(task, self.store.row("batches", {"id": batch_id}), current, now, why)
+            stalls.pop(key, None)
+            self._set_state("repair_stalls", stalls)
+            current = None
+        if not limit:
+            return
+        if current is not None:
+            current["releases"] = run["count"]
+            current["last_at"] = now
+            stalls[key] = current
+            self._set_state("repair_stalls", stalls)
+            return
+        if run["count"] < limit:
+            return
+        batch = self.store.row("batches", {"id": batch_id}) or {"id": batch_id, "version": task["batch_version"]}
+        message = " ".join(str(error or "no error given").split())[:240]
+        current = {
+            "task_id": task["id"],
+            "batch_id": batch_id,
+            "version": task["batch_version"],
+            "kind": task["kind"],
+            "source": "releases",
+            "since": now,
+            "last_at": now,
+            "signature": latest,
+            "after": boundary,
+            "tip": task["tip"],
+            "checkpoints": 0,
+            "releases": run["count"],
+            "reason": reason,
+            "retries": 0,
+            "retry_at": now,
+            "revisions": [],
+            "tools": [],
+            "findings": [f"{reason}: {message}"],
+            "conclusion": "",
+        }
+        stalls[key] = current
+        self._set_state("repair_stalls", stalls)
+        self._count("repair_stalls")
+        self._record_escalation(
+            "repair-stalled",
+            batch,
+            now,
+            cause=(
+                f"{task['kind']} task {task['id']} was given back {run['count']} times in a row as {reason} "
+                f"with the same error, without a submission"
+            ),
+            detail=(
+                "the task stays offered; the worker fails before it can submit, so a worker fix or an operator "
+                "is needed; one more message when the error changes or the task is settled"
+            ),
+            lines=current["findings"],
+            key=f"repair-stalled:{task['id']}:{latest}:{now}",
+            counted=False,
+            channel="progress-alert",
+            extra={"task_id": task["id"], "tip": task["tip"], "signature": latest, "release_reason": reason},
+        )
+
+    def _end_repair_stall(
+        self, task: dict[str, Any] | None, batch: dict[str, Any] | None, stall: dict[str, Any], now: float, why: str
+    ) -> None:
+        """Journal the end of a stall and send its one recovery message."""
+        head = batch or {"id": stall["batch_id"], "version": stall["version"]}
+        self._record_escalation(
+            "repair-stall-ended",
+            head,
+            now,
+            cause=f"task {stall['task_id']}: {why}",
+            detail=(
+                f"the stall that began at {repair_stall.clock(stall['since'])} ended after "
+                f"{repair_stall.duration(now - stall['since'])} and {stall.get('retries', 0)} backed-off claims"
+            ),
+            key=f"repair-stall-ended:{stall['task_id']}:{stall['signature']}:{stall['since']}",
+            counted=False,
+            channel="progress-alert",
+            extra={"task_id": stall["task_id"]},
+        )
+
+    def _settle_repair_stalls(self, now: float) -> None:
+        """End the stalls of tasks that are no longer open: adopted, superseded by a new batch version
+        (new members, a new base) or replaced by another task. Forget the release runs of such tasks."""
+        runs = dict(self._state("repair_release_runs", {}) or {})
+        if runs:
+            open_ids = {str(t["id"]) for t in self.store.rows("tasks", {"state": TASK_OPEN})}
+            if set(runs) - open_ids:
+                self._set_state("repair_release_runs", {k: v for k, v in runs.items() if k in open_ids})
+        stalls = self._repair_stalls()
+        if not stalls:
+            return
+        with self.store.transaction():
+            ended = False
+            for key, stall in list(stalls.items()):
+                setting = "repair_stall_releases" if stall.get("source") == "releases" else "repair_stall_checkpoints"
+                disabled = not int(self.setting(setting))
+                task = self.store.row("tasks", {"id": int(key)})
+                submitted = (
+                    stall.get("source") == "releases"
+                    and task is not None
+                    and (latest := self.store.row("submissions", {"task_id": task["id"]}, order="id DESC")) is not None
+                    and latest["id"] != stall.get("after")
+                )
+                if task is not None and task["state"] == TASK_OPEN and not disabled and not submitted:
+                    continue
+                batch = self.store.row("batches", {"id": stall["batch_id"]})
+                if disabled and task is not None and task["state"] == TASK_OPEN:
+                    why = "stalled-repair detection was turned off"
+                elif submitted and task["state"] == TASK_OPEN:
+                    why = "a worker submitted a result"
+                else:
+                    why = "the task was " + ((task["resolution"] or task["state"]) if task is not None else "removed")
+                self._end_repair_stall(task, batch, stall, now, why)
+                stalls.pop(key)
+                ended = True
+            if ended:
+                self._set_state("repair_stalls", stalls)
+
+    def _stall_holds(self, task: dict[str, Any], now: float, worker_revision: str | None) -> bool:
+        """Whether a stalled task waits out its backoff for this claim: a worker on a revision that has
+        not produced one of the stalled checkpoints is offered it at once."""
+        if not int(self.setting("repair_stall_checkpoints")):
+            return False
+        stall = self._repair_stalls().get(str(task["id"]))
+        if stall is None or stall.get("source") == "releases" or now >= stall.get("retry_at", 0):
+            return False
+        return not (worker_revision and worker_revision not in stall.get("revisions", []))
+
+    def _head_progress_fingerprint(self, head: dict[str, Any]) -> list[Any]:
+        attempt = self._current_attempt(head)
+        task = self._open_task(head)
+        return [
+            head["id"],
+            head["version"],
+            head["tip"],
+            head["base"],
+            attempt["id"] if attempt is not None else None,
+            attempt["outcome"] if attempt is not None else None,
+            task["id"] if task is not None else None,
+        ]
+
+    def _watch_head_progress(self, now: float) -> None:
+        """One alert once the head has made no progress for `head_progress_alert_seconds`: its version,
+        tip, base, current CI attempt and its outcome, and its open task all unchanged. Claims of the
+        same task are not progress. One message when it moves again (or another batch is head)."""
+        head = self._head()
+        state = self._state("head_progress")
+        if not self._head_progress_anchored:
+            # Time the controller did not observe proves nothing: a restart starts the period again.
+            self._head_progress_anchored = True
+            if state and not state.get("alerted_at"):
+                state = dict(state, since=max(state["since"], now))
+                self._set_state("head_progress", state)
+        if not int(self.setting("head_progress_alert_seconds")):
+            if state:  # turned off: no alert stays active, and a later re-enable starts a fresh period
+                self._set_state("head_progress", None)
+            return
+        fingerprint = self._head_progress_fingerprint(head) if head is not None else None
+        if state and state.get("fingerprint") == fingerprint:
+            limit = int(self.setting("head_progress_alert_seconds"))
+            if head is None or not limit or state.get("alerted_at") or now - state["since"] < limit:
+                return
+            stall = next((s for s in self._repair_stalls().values() if s.get("batch_id") == head["id"]), None)
+            stage = self._head_stage(head)
+            state["alerted_at"] = now
+            with self.store.transaction():
+                self._set_state("head_progress", state)
+                self._count("head_progress_alerts")
+                self._record_escalation(
+                    "head-no-progress",
+                    head,
+                    now,
+                    cause=(
+                        f"head batch {head['id']} {HEAD_NO_PROGRESS_TEXT} for {repair_stall.duration(now - state['since'])} "
+                        f"(since {repair_stall.clock(state['since'])}), at stage {stage}"
+                    ),
+                    detail=(
+                        f"repair task {stall['task_id']} is stalled: given back {stall['releases']} times in a row as "
+                        f"{stall['reason']} with the same error ({stall['findings'][0]})"
+                        if stall and stall.get("source") == "releases"
+                        else f"repair task {stall['task_id']} is stalled: {stall['checkpoints']} identical checkpoints at "
+                        f"{stall['tip'][:12]}; next claim at {repair_stall.clock(stall['retry_at'])}"
+                        if stall
+                        else "nothing was changed; one more message when the head moves again"
+                    ),
+                    lines=(stall or {}).get("findings") or [],
+                    key=f"head-no-progress:{head['id']}:{state['since']}",
+                    counted=False,
+                    channel="progress-alert",
+                    extra={"conclusion": (stall or {}).get("conclusion") or ""},
+                )
+            return
+        with self.store.transaction():
+            self._head_progress_moved(head, state, fingerprint, now)
+
+    def _head_progress_moved(self, head, state, fingerprint, now: float) -> None:
+        if state and state.get("alerted_at"):
+            previous = self.store.row("batches", {"id": state["fingerprint"][0]}) or {
+                "id": state["fingerprint"][0],
+                "version": state["fingerprint"][1],
+            }
+            self._record_escalation(
+                "head-progress-resumed",
+                previous,
+                now,
+                cause=f"head batch {previous['id']} moved after {repair_stall.duration(now - state['since'])} without progress",
+                detail="the head is progressing again",
+                key=f"head-progress-resumed:{previous['id']}:{state['since']}",
+                counted=False,
+                channel="progress-alert",
+            )
+        if state or head is not None:
+            self._set_state("head_progress", None if head is None else {"fingerprint": fingerprint, "since": now})
+
+    def _head_stage(self, head: dict[str, Any]) -> str:
+        task = self._open_task(head)
+        if task is not None:
+            return task["kind"]
+        attempt = self._current_attempt(head)
+        return "dispatch" if attempt is None else f"ci ({attempt['outcome']})"
+
+    def _progress_alerts(self, now: float) -> list[str]:
+        """The status alerts of stalled repairs and of a head without progress, with times in AEDT."""
+        alerts = []
+        for stall in self._repair_stalls().values():
+            if stall.get("source") == "releases":
+                alerts.append(
+                    f"{repair_stall.ALERT_TEXT}: batch {stall['batch_id']} {stall['kind']} task {stall['task_id']} "
+                    f"given back {stall['releases']} times in a row as {stall['reason']} with the same error since "
+                    f"{repair_stall.clock(stall['since'])}; {stall['findings'][0]}"
+                )
+                continue
+            line = (
+                f"{repair_stall.ALERT_TEXT}: batch {stall['batch_id']} {stall['kind']} task {stall['task_id']} "
+                f"retained tip {stall['tip'][:12]} with the same findings {stall['checkpoints']} times since "
+                f"{repair_stall.clock(stall['since'])}; next claim at {repair_stall.clock(stall['retry_at'])}"
+                if now < stall["retry_at"]
+                else f"{repair_stall.ALERT_TEXT}: batch {stall['batch_id']} {stall['kind']} task {stall['task_id']} "
+                f"retained tip {stall['tip'][:12]} with the same findings {stall['checkpoints']} times since "
+                f"{repair_stall.clock(stall['since'])}; claimable again"
+            )
+            if stall.get("conclusion"):
+                line += f"; agent: {stall['conclusion']}"
+            alerts.append(line)
+        state = self._state("head_progress")
+        if state and state.get("alerted_at"):
+            alerts.append(
+                f"head batch {state['fingerprint'][0]} {HEAD_NO_PROGRESS_TEXT} since {repair_stall.clock(state['since'])}"
+            )
+        return alerts
 
     def _notify_stuck_heads(self, now: float) -> None:
         """Queue the one direct message of the current stuck period of the CI recovery report, once due."""
@@ -9251,6 +10509,21 @@ class Controller:
     def _notify(self, key: str, record: dict[str, Any]) -> None:
         """Queue a direct message to the operator about `record` (outbox kind `notify`, sent once)."""
         marker = "tauceti-queue-" + hashlib.sha256(key.encode()).hexdigest()[:24]
+        self._enqueue("notify", f"notify:{key}", {"marker": marker, "content": self._notice_content(record, marker)})
+
+    def _progress_alert(self, key: str, record: dict[str, Any]) -> None:
+        """Queue a progress alert about `record` (outbox kind `progress-alert`, sent once): posted where
+        `TAUCETI_QUEUE_PROGRESS_ALERT_ZULIP_CONFIG` says once it is set, and until then written only to
+        the service's journal (`journalctl --user -u tauceti-queue`), like TauCetiFleet's fleet alert
+        before decision 135 chooses its target."""
+        marker = "tauceti-queue-" + hashlib.sha256(key.encode()).hexdigest()[:24]
+        self._enqueue(
+            "progress-alert",
+            f"progress-alert:{key}",
+            {"marker": marker, "content": self._notice_content(record, marker)},
+        )
+
+    def _notice_content(self, record: dict[str, Any], marker: str) -> str:
         lines = [
             f"**Tau Ceti merge queue: {record['action']} on head batch {record['batch_id']} "
             f"(version {record['version']})**",
@@ -9258,20 +10531,22 @@ class Controller:
             f"Why: {escalation.quote(record['cause'], 500)}",
             f"What the queue did: {escalation.quote(record['detail'], 1000)}",
         ]
-        if record.get("verdict_class"):
-            lines.append(
-                f"Failure: {escalation.quote(record['verdict_class'], 200)} (fingerprint {record['fingerprint']})"
-            )
         if record.get("lines"):
             lines += ["", "```text", *(escalation.quote(line, 300) for line in record["lines"]), "```"]
+        if record.get("conclusion"):
+            lines += ["", f"The agent's own conclusion: {escalation.quote(record['conclusion'], 1000)}"]
         if self.public_url:
             lines += ["", f"Status: {self.public_url.rstrip('/')}/status"]
         lines += ["", f"Alert ID: {marker}"]
-        self._enqueue("notify", f"notify:{key}", {"marker": marker, "content": "\n".join(lines)})
+        return "\n".join(lines)
 
     # --- promotion and landing ---------------------------------------------------------------------
 
     def _promote(self, head: dict[str, Any], attempt: dict[str, Any], now: float) -> None:
+        if (attempt["head_sha"], attempt["base_sha"]) != (head["tip"], head["base"]):
+            # A pass promotes exactly the tip and base it verified, nothing else.
+            self._reasons.append(f"head {head['id']}: attempt {attempt['id']} verified another tip; not promoted")
+            return
         candidate_ci = self._candidate_coordinator(attempt_id=attempt["id"])
         if self._mixed_inert_batch(head):
             self._reasons.append("Forgejo admission is disabled; retaining the mixed batch")
@@ -9318,6 +10593,28 @@ class Controller:
         batch = self.store.row("batches", {"id": batch["id"]}) or batch
         if batch["state"] == BATCH_LANDED:
             return
+        # Reading every member's landed commit, and diffing each edited one, takes about a second per
+        # member: minutes for a large batch. Commits do not change, so that git work runs without the
+        # controller lock and before the store transaction; only its use below needs them.
+        publish = bool(self.setting("publication_enabled"))
+        candidates = [m for m in self._members(batch["id"]) if not self._displaced(batch, m)]
+        landed_ranges: dict[str, dict[str, str]] = {}
+        if getattr(self.store, "_depth", 0):
+            facts = self._landing_facts(batch, candidates, landed_ranges, publish=publish, partial=True)
+        else:
+            with self._lock.unlocked():
+                facts = self._landing_facts(batch, candidates, landed_ranges, publish=publish, partial=True)
+            current = self.store.row("batches", {"id": batch["id"]}) or batch
+            if current["state"] == BATCH_LANDED:
+                return  # another path recorded this landing while the lock was free
+            if (current["version"], current["tip"]) != (batch["version"], batch["tip"]):
+                # A rebuild or repair replaced the revision the caller saw land: the batch's current
+                # revision has not landed, so nothing is recorded; the next canonical observation decides.
+                self.store.journal(
+                    now, "landing-superseded", batch["id"], tip=batch["tip"], current_tip=current["tip"], how=how
+                )
+                return
+            batch = current
         # A withdrawn member's empty commit lands with the head but the PR does not: it is not marked
         # landed, commented on or closed (`_anticipate` or `_withdraw_member` told its author why). The
         # one exception is a member withdrawn as emptied whose PR has meanwhile landed on `main` by other
@@ -9327,7 +10624,6 @@ class Controller:
         rejected = []
         members = []
         external_members: set[int] = set()
-        landed_ranges: dict[str, dict[str, str]] = {}
         for member in everyone:
             if self._displaced(batch, member):
                 continue  # its input is the emergency batch's, which lands or returns it
@@ -9336,14 +10632,12 @@ class Controller:
                 if source.get("reason") != EMPTY_COMMIT or source.get("state") != INPUT_CANCELLED:
                     withdrawn.append(member["number"])
                     continue
-            commit = chain.read_commit(self.clone, member["commit_sha"])
-            empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
-            external = empty and chain.carries_landed_note(commit.message)
-            if empty and not external:
-                since = chain.git(self.clone, "merge-base", member["accepted_head"], batch["base"]).strip()
-                if since not in landed_ranges:
-                    landed_ranges[since] = chain.landed_prs(self.clone, since, batch["base"])
-                external = chain.landed_commit(landed_ranges[since], member["source_pr"]) is not None
+            fact = facts.get(member["id"])
+            if fact is None or fact["commit"] != member["commit_sha"]:
+                # The member changed while the lock was free: read it now, under the lock.
+                fact = self._landing_facts(batch, [member], landed_ranges, publish=publish)[member["id"]]
+                facts[member["id"]] = fact
+            empty, external = fact["empty"], fact["external"]
             if external:
                 external_members.add(member["id"])
             if member["withdrawn"] and not external:
@@ -9356,6 +10650,9 @@ class Controller:
             # An emptied emergency member returns to its live displaced slot instead of being rejected.
             rejected = [member for member in rejected if not self._emergency_exit(batch, member, now)]
             self.store.update("batches", {"id": batch["id"]}, state=BATCH_LANDED, landed_at=now, landed_how=how)
+            self._preserve_successor_tasks(
+                now, {row["tip"] for row in self.store.rows("batch_tips", {"batch_id": batch["id"]})} | {batch["tip"]}
+            )
             if batch["urgent"] == URGENT_EMERGENCY:
                 self.store.journal(
                     now, "emergency-landed", batch["id"], tip=batch["tip"], members=[m["number"] for m in members]
@@ -9420,7 +10717,12 @@ class Controller:
             )
             if self.setting("publication_enabled"):
                 for member in members:
-                    self._enqueue_landing_effects(batch, member, landed_externally=member["id"] in external_members)
+                    fact = facts[member["id"]]
+                    if publish and fact["diff"] is None and member["provenance"] != "clean":
+                        fact.update(self._landing_facts(batch, [member], landed_ranges, publish=True)[member["id"]])
+                    self._enqueue_landing_effects(
+                        batch, member, landed_externally=member["id"] in external_members, fact=fact
+                    )
                 for member in rejected:
                     self._enqueue_rejection_effects(batch, member)
             self._interacting_landed({m["number"] for m in members}, now)
@@ -9433,6 +10735,50 @@ class Controller:
         else:
             self._cancel_superseded_runs(batch["id"], now, reason="batch landed")
         self._wake.set()
+
+    def _landing_facts(
+        self,
+        batch: dict[str, Any],
+        members: list[dict[str, Any]],
+        landed_ranges: dict[str, dict[str, str]],
+        *,
+        publish: bool,
+        partial: bool = False,
+    ) -> dict[int, dict[str, Any]]:
+        """What the clone says about each member's landed commit, keyed by member id: whether it is
+        `empty`, whether its PR landed `external`ly, and for an edited member, when its landing is
+        published, its `diff` against the accepted head and whether it `outside_queue` landed. Git
+        only, on commits that never change, so the caller may run it without the controller lock.
+        `partial`: leave out a member git cannot read (one that may turn out not to need reading), for
+        the caller to read again under the lock if it does."""
+        facts: dict[int, dict[str, Any]] = {}
+        for member in members:
+            try:
+                facts[member["id"]] = self._landing_fact(batch, member, landed_ranges, publish=publish)
+            except chain.ChainError:
+                if not partial:
+                    raise
+        return facts
+
+    def _landing_fact(
+        self, batch: dict[str, Any], member: dict[str, Any], landed_ranges: dict[str, dict[str, str]], *, publish: bool
+    ) -> dict[str, Any]:
+        commit = chain.read_commit(self.clone, member["commit_sha"])
+        empty = len(commit.parents) == 1 and commit.tree == chain.tree_of(self.clone, commit.parents[0])
+        external = empty and chain.carries_landed_note(commit.message)
+        if empty and not external:
+            since = chain.git(self.clone, "merge-base", member["accepted_head"], batch["base"]).strip()
+            if since not in landed_ranges:
+                landed_ranges[since] = chain.landed_prs(self.clone, since, batch["base"])
+            external = chain.landed_commit(landed_ranges[since], member["source_pr"]) is not None
+        edited = publish and member["provenance"] != "clean" and not member["withdrawn"]
+        return {
+            "commit": member["commit_sha"],
+            "empty": empty,
+            "external": external,
+            "diff": self._landed_diff(member) if edited else None,
+            "outside_queue": self._landed_outside_queue(member) if edited else None,
+        }
 
     def _enqueue_rejection_effects(self, batch: dict[str, Any], member: dict[str, Any]) -> None:
         number = member["number"]
@@ -9534,11 +10880,21 @@ class Controller:
             return
         number = member["number"]
         marker = f"<!-- {COMMENT_MARKER} withdrawn:{self._source_pr(number)}:{member['input_id']} -->"
-        self._enqueue(
-            "comment",
-            f"withdrawn-comment:{member['input_id']}",
-            {"number": number, "body": comment + "\n\n" + marker, "marker": marker},
-        )
+        if reason == EMPTY_COMMIT:
+            # The PR stays open at its accepted head: hand that head to its worker.
+            self._recovery_request(
+                f"recovery-withdrawn:{member['input_id']}",
+                number,
+                member["accepted_head"],
+                comment + "\n\n" + marker,
+                marker,
+            )
+        else:
+            self._enqueue(
+                "comment",
+                f"withdrawn-comment:{member['input_id']}",
+                {"number": number, "body": comment + "\n\n" + marker, "marker": marker},
+            )
         label = self.setting("membership_label")
         if label:
             self._enqueue(
@@ -9604,46 +10960,21 @@ class Controller:
         ]
         return "\n".join(lines)
 
-    def _queue_withdrawal_comment(
-        self, batch: dict[str, Any], member: dict[str, Any], failure: dict[str, Any], cause: str
-    ) -> str:
-        """The notice of a member the queue withdrew because a failure naming it kept recurring, or because
-        bisection isolated it as the one member left failing."""
-        lines = [
-            f"The merge queue withdrew this PR from batch {batch['id']}: {cause}, and repair did not resolve it. "
-            "The PR was not merged and stays open; its approval was withdrawn.",
-            "",
-            "What failed:",
-        ]
-        if failure.get("verdict_class"):
-            lines.append(f"- verdict: `{failure['verdict_class']}`")
-        recorded = loads(failure["lines"], [])
-        for line in recorded[:COMMENT_FINDINGS]:
-            lines.append(f"- {' '.join(line.replace('|', ' ').split())[:300]}")
-        if not recorded:
-            lines.append("- no findings were recorded")
-        attempt = self.store.row("failures", {"id": failure["id"]}) if failure.get("id") is not None else None
-        attempt = self.store.row("ci_attempts", {"id": attempt["attempt_id"]}) if attempt is not None else None
-        if attempt is not None and attempt["html_url"]:
-            lines.append(f"- CI run: {attempt['html_url']}")
-        lines += ["", f"Accepted revision: `{member['accepted_head']}`."]
-        if failure.get("fingerprint"):
-            lines.append(f"Failure fingerprint: `{failure['fingerprint']}`.")
-        lines += [
-            "",
-            f"What to do next: reproduce the failure on your branch rebased onto `{self.canonical_branch}` (the CI "
-            "of this PR applies the same checks), fix it, push, and approve the PR again. A new approval brings it "
-            "back into the queue.",
-        ]
-        return "\n".join(lines)
-
     def _enqueue_landing_effects(
-        self, batch: dict[str, Any], member: dict[str, Any], *, landed_externally: bool = False
+        self,
+        batch: dict[str, Any],
+        member: dict[str, Any],
+        *,
+        landed_externally: bool = False,
+        fact: dict[str, Any] | None = None,
     ) -> None:
+        """`fact`: the member's `_landing_facts`, so the git work behind them is not repeated here."""
         number = member["number"]
-        body = self.member_comment(batch, member)
-        if member["provenance"] != "clean":
+        diff = (fact or {}).get("diff")
+        if diff is None and member["provenance"] != "clean":
             diff = self._landed_diff(member)
+        body = self.member_comment(batch, member, diff=diff)
+        if member["provenance"] != "clean":
             self._count("edit_summaries")
             self.store.journal(
                 self.clock(),
@@ -9657,7 +10988,10 @@ class Controller:
                 error=diff["error"],
             )
             label = self.setting("repaired_label")
-            if label and not landed_externally and not self._landed_outside_queue(member):
+            outside = (fact or {}).get("outside_queue")
+            if outside is None:
+                outside = self._landed_outside_queue(member)
+            if label and not landed_externally and not outside:
                 self._enqueue(
                     "labels",
                     f"repaired-label:{batch['id']}:{number}",
@@ -9687,8 +11021,9 @@ class Controller:
         except chain.ChainError:
             return False
 
-    def member_comment(self, batch: dict[str, Any], member: dict[str, Any]) -> str:
-        """The one consolidated landing comment for a member: Bors's notice, plus the agent's explanation when edited."""
+    def member_comment(self, batch: dict[str, Any], member: dict[str, Any], *, diff: dict | None = None) -> str:
+        """The one consolidated landing comment for a member: Bors's notice, plus the agent's explanation when edited.
+        `diff` is the member's `_landed_diff` when the caller already has it."""
         attempt = self.store.row(
             "ci_attempts",
             {"batch_id": batch["id"], "batch_version": batch["version"], "outcome": OUTCOME_PASS},
@@ -9711,7 +11046,7 @@ class Controller:
                 "",
             ]
             lines += [f"> {line}" if line else ">" for line in member["explanation"].splitlines()]
-            lines += self._diff_lines(member, commit_url)
+            lines += self._diff_lines(member, commit_url, diff=diff)
             edited = [sha for sha in loads(member["edited_shas"], []) if sha and sha != member["commit_sha"]]
             if edited:
                 lines += [
@@ -9754,9 +11089,9 @@ class Controller:
             "error": None,
         }
 
-    def _diff_lines(self, member: dict[str, Any], commit_url: str) -> list[str]:
+    def _diff_lines(self, member: dict[str, Any], commit_url: str, *, diff: dict | None = None) -> list[str]:
         """The landing comment's diff of the landed commit against the accepted head, in a collapsed block."""
-        diff = self._landed_diff(member)
+        diff = self._landed_diff(member) if diff is None else diff
         if diff["error"] is not None:
             return [
                 "",
@@ -10181,7 +11516,7 @@ class Controller:
         try:
             with self._lock.unlocked():
                 payload = loads(current["payload"], {})
-                if current["kind"] == "notify":
+                if current["kind"] in ("notify", "progress-alert"):
                     payload["_retry"] = current["attempts"] > 0
                 result = self._perform(current["kind"], payload, now)
         except Exception as caught:  # noqa: BLE001 - every adapter failure is recorded and retried
@@ -10274,6 +11609,16 @@ class Controller:
             return "comment " + str(
                 self.source.post_comment(repo, payload["number"], payload["body"], payload["marker"])
             )
+        if kind == "recovery":
+            head = payload["recovery_head"]
+            pull = self.source.fetch_pr(repo, payload["number"])
+            if pull.state != "open" or pull.head_sha != head:
+                return "stale-head"  # a push or close already answered the refusal of this head
+            comment = self.source.post_comment(
+                repo, payload["number"], payload["body"], payload["marker"], recovery_head=head
+            )
+            self.source.set_labels(repo, payload["number"], [NEEDS_REBASE_LABEL], [READY_TO_MERGE_LABEL])
+            return f"recovery {comment}"
         if kind == "labels":
             if "admission_generation" in payload:
                 work = self.store.row("admission_work", {"repository": repo, "number": payload["number"]})
@@ -10313,6 +11658,14 @@ class Controller:
                 title = pull.title if pull.title.startswith(MERGED_TITLE_PREFIX) else MERGED_TITLE_PREFIX + pull.title
             self.source.close_pr(repo, payload["number"], title)
             return "closed"
+        if kind == "progress-alert":
+            if self.progress_notifier is None:
+                # Journal-only until a target is configured: the service log carries the whole alert.
+                self.log.warning("progress alert (journal only): %s", payload["content"])
+                return "journal-only" + (f": {self.progress_notifier_error}" if self.progress_notifier_error else "")
+            return self.progress_notifier.send(
+                payload["marker"], payload["content"], reconcile=bool(payload.get("_retry"))
+            )
         if kind == "notify":
             if self.notifier is None:
                 return "notifier-unconfigured" + (f": {self.notifier_error}" if self.notifier_error else "")
@@ -10607,30 +11960,25 @@ class Controller:
                         f"escalation ({record['action']}) on batch {record['batch_id']} v{record['version']}: "
                         f"{record['cause']}; {record['detail']}"
                     )
-            if head is not None and (held := self._escalation_hold(head, now)) is not None:
-                alerts.append(f"head {head['id']} holds after escalation: {held['detail']}")
             backoff = self._state("infrastructure_backoff")
             if backoff:
                 alerts.append(
                     f"CI infrastructure backoff since {backoff['since']:.0f}: {backoff['retries']} automatic retries"
                 )
-            week = self.store.query(
-                "SELECT COUNT(*) AS n, MAX(at) AS last FROM journal WHERE kind='bisected' AND at>=?", (now - 7 * 86400,)
-            )[0]
+            alerts.extend(self._progress_alerts(now))
             loop_termination = {
-                # Bisection is the last resort (docs/queue/escalation.md); its frequency is watched here.
-                "bisections": counters.get("bisections", 0),
-                "bisections_last_7_days": week["n"],
-                "last_bisection_at": week["last"],
-                "attributed_withdrawals": counters.get("attributed_withdrawals", 0),
-                "queue_withdrawals": counters.get("queue_withdrawals", 0),
                 "infrastructure_backoff": backoff or None,
-                "escalation_hold": self._state("escalation_hold") or None,
+                "repair_stalls": list(self._repair_stalls().values()),
+                "head_progress": self._state("head_progress"),
             }
             if self.notifier_error:
                 alerts.append(f"escalation notifier unavailable: {self.notifier_error}")
             if any(e["attempts"] and e["kind"] == "notify" for e in pending):
                 alerts.append("escalation notification delivery is failing; see outbox history")
+            if self.progress_notifier_error:
+                alerts.append(f"progress alert notifier unavailable: {self.progress_notifier_error}")
+            if any(e["attempts"] and e["kind"] == "progress-alert" for e in pending):
+                alerts.append("progress alert delivery is failing; see outbox history")
             stuck = stuck_heads.read(self.stuck_heads_report, now, self.repository)
             if (stuck_alert := stuck_heads.alert(stuck, now)) is not None:
                 alerts.append(stuck_alert)
@@ -10790,6 +12138,25 @@ class Controller:
             **self._preparation_status(batch, members, now),
             "pre_rebase": self._pre_rebase_status(batch),
             "background": self._background_status(batch, now),
+            "early_staging": self._early_status(batch),
+        }
+
+    def _early_status(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        """The batch's latest early attempt (`_early_staging`), or None."""
+        attempts = self._early_attempts(batch_id=batch["id"])
+        if not attempts:
+            return None
+        attempt = attempts[-1]
+        return {
+            "attempt_id": attempt["id"],
+            "kind": attempt["dispatch_kind"],
+            "tip": attempt["head_sha"],
+            "onto": attempt["base_sha"],
+            "run_id": attempt["run_id"],
+            "run_status": attempt["run_status"],
+            "outcome": attempt["outcome"],
+            "cancelled": attempt["cancelled_at"] is not None,
+            "html_url": attempt["html_url"],
         }
 
     def _background_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:
@@ -10873,6 +12240,13 @@ class Controller:
             "prepare_claimed": preparing is not None
             and bool(self._active_claims(batch["id"], task_id=preparing["id"])),
             "prepare_blocked": None if preparing is not None or prepared else self._pre_rebased_prepare_blocked(batch),
+            # Decision 200: why the worker's verification of the prepared tip would not stand in for
+            # staging's checks; None when it would. Only for a verified tip.
+            "attestation_problem": self._attestation_problem(
+                batch["pre_rebase_attestation"], batch["pre_rebase_verified"]
+            )
+            if batch["pre_rebase_verified"] and batch["pre_rebase_verified"] == batch["pre_rebase_tip"]
+            else None,
         }
 
     def _batch_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:
@@ -10936,6 +12310,13 @@ class Controller:
         info["expected_parent"] = head["expected_parent"]
         info["first_dispatch_at"] = head["first_dispatch_at"]
         info["based_on_canonical"] = head["base"] == self._canonical
+        # Decision 174: the next batch is verified and repaired on the head's tip only while this holds.
+        info["tip_verified"] = self._head_tip_verified(head)
+        # Decision 200: why the worker's verification of the head's tip would not stand in for staging's
+        # checks; None when it would (only for a verified tip).
+        info["attestation_problem"] = (
+            self._attestation_problem(head["attestation"], head["tip"]) if info["tip_verified"] else None
+        )
         task = self._open_task(head)
         info["task"] = None if task is None else self._task_status(task)
         attempt = self._current_attempt(head)
@@ -10973,6 +12354,10 @@ class Controller:
         if attempt is not None:
             ci = {
                 "attempt_id": attempt["id"],
+                # `staging`, or `attested` for an attested landing (decision 200); `early` when it was
+                # sent before the batch was the head (`_early_staging`).
+                "kind": attempt.get("dispatch_kind") or DISPATCH_STAGING,
+                "early": bool(attempt.get("early")),
                 "dispatch_id": attempt["dispatch_id"],
                 "request_id": attempt["request_id"],
                 "dispatch_state": attempt["dispatch_state"],
@@ -11038,10 +12423,11 @@ class Controller:
                 and attempt["last_progress_at"]
                 and attempt["dispatch_state"] != "prepared"
             ):
-                silence = now - attempt["last_progress_at"]
+                last_progress = self._last_progress_at(attempt)
+                silence = now - last_progress
                 interval = int(settings["stall_interval_seconds"])
                 if silence >= interval:
-                    since = attempt["last_progress_at"] + interval
+                    since = last_progress + interval
                     info["stall"] = {
                         "since": since,
                         "silence_seconds": silence,
@@ -11059,7 +12445,11 @@ class Controller:
                             alerts.append(
                                 f"head {head['id']} build stalled for {silence:.0f}s on {attempt['runner_name'] or 'unknown runner'} ({attempt['host'] or 'unknown host'})"
                             )
-        if task is not None and not info["task"]["active_claims"]:
+        stall = self._repair_stalls().get(str(task["id"])) if task is not None else None
+        info["repair_stall"] = stall
+        if stall is not None and now < stall["retry_at"]:
+            pass  # backed off on purpose: the stalled-repair alert says so
+        elif task is not None and not info["task"]["active_claims"]:
             unclaimed_at = task["created_at"]
             for claim in self.store.rows("claims", {"task_id": task["id"]}):
                 ended_at = claim["expires_at"]
@@ -11067,6 +12457,8 @@ class Controller:
                     ended_at = min(ended_at, claim["released_at"])
                 if ended_at <= now:
                     unclaimed_at = max(unclaimed_at, ended_at)
+            if stall is not None:
+                unclaimed_at = max(unclaimed_at, stall["retry_at"])  # unclaimed only once offered again
             silence = now - unclaimed_at
             interval = int(settings["stall_interval_seconds"])
             if silence >= interval:

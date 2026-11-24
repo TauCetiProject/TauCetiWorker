@@ -21,7 +21,9 @@ Tables:
   the expected parent recorded for promotion and, for a non-head batch, the version a `prepare` task
   last built (and repaired) on its own base and its pre-rebase onto the head's tip
   (`pre_rebase_state`, `_tip`, `_onto`, `_source`, `_edits`, `_at`, and `_prepared`, the pre-rebased
-  tip a `prepare` task last built and repaired on the head's tip).
+  tip a `prepare` task last built and repaired on the head's tip); and the worker's attestation
+  (decision 200) of its passing verification of the batch's tip (`attestation`) and of its
+  pre-rebased tip (`pre_rebase_attestation`), JSON, kept only for the tip it names.
 - `members`: per batch and position, the member's commit and provenance (`clean` or `edited`),
   the task that edited it, the explanation collected from its message, the `no_repair` opt-out and
   whether it was `withdrawn` (a member the queue sent back, an emptied `no_repair` member or one an
@@ -37,12 +39,15 @@ Tables:
   whose live run the controller cancelled because a newer dispatch, a landing, a removal or a
   rebuild superseded it records when (`cancelled_at`), the attempt that superseded it
   (`cancelled_by`, empty otherwise), why (`cancel_reason`) and GitHub's answer (`cancel_result`).
+  An `early` attempt (1) is the trusted run of an open batch's prepared tip on the head's tip,
+  dispatched before that batch is the head; 2 once the batch sealed as that tip and adopted it.
+  `generation` names its staging candidate branch (the batch version at dispatch, kept when the
+  attempt is adopted under a later version); `dispatch_kind` is the workflow it was sent as.
 - `outbox`: pending side effects (promotion, comments, closes, labels, ref retention) with an
   idempotency key and attempt history.
-- `failures`: one row per failed CI attempt of a head (`attempt_id` unique): its fingerprint
-  (`tauceti_queue/escalation.py`: verdict class, attributed members, digest of the finding lines),
-  the lines themselves, and what the controller did about it (`action`: `repair`, `withdraw`,
-  `bisect`, `dissolve`, `hold`), so the same failure on the same batch is recognised however often it recurs.
+- `failures`: history only, no longer written: one row per failed CI attempt of a head from when
+  a recurring failure could withdraw members or bisect the head, with its fingerprint, finding lines
+  and what the controller did about it (`action`: `repair`, `withdraw`, `bisect`, `dissolve`, `hold`).
 - `journal`: an append-only log of what the controller did, for status and tests.
 - `identity_cache`: answers GitHub gave about workers and operators, kept across restarts so a
   restart during a quota outage does not lock them out: per `namespace` (`bearer`, a token's
@@ -99,7 +104,8 @@ CREATE TABLE IF NOT EXISTS inputs (
     declaration_names TEXT NOT NULL DEFAULT '{}',
     declaration_fetch_attempts INTEGER NOT NULL DEFAULT 0,
     declaration_retry_at REAL NOT NULL DEFAULT 0,
-    blocked_labels TEXT NOT NULL DEFAULT '[]'
+    blocked_labels TEXT NOT NULL DEFAULT '[]',
+    main_integration TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS inputs_state ON inputs (repository, state);
 CREATE TABLE IF NOT EXISTS admission_work (
@@ -205,7 +211,11 @@ CREATE TABLE IF NOT EXISTS batches (
     pre_rebase_edits TEXT NOT NULL DEFAULT '{}',
     pre_rebase_at REAL,
     pre_rebase_prepared TEXT,
-    lane TEXT NOT NULL DEFAULT ''
+    lane TEXT NOT NULL DEFAULT '',
+    verified_tip TEXT,
+    pre_rebase_verified TEXT,
+    attestation TEXT,
+    pre_rebase_attestation TEXT
 );
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,
@@ -278,6 +288,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     worker_notes TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS submissions_task ON submissions (task_id, id);
 CREATE TABLE IF NOT EXISTS batch_tips (
     id INTEGER PRIMARY KEY,
     batch_id INTEGER NOT NULL,
@@ -327,9 +338,13 @@ CREATE TABLE IF NOT EXISTS ci_attempts (
     cancelled_at REAL,
     cancelled_by INTEGER,
     cancel_reason TEXT NOT NULL DEFAULT '',
-    cancel_result TEXT NOT NULL DEFAULT ''
+    cancel_result TEXT NOT NULL DEFAULT '',
+    early INTEGER NOT NULL DEFAULT 0,
+    generation INTEGER,
+    dispatch_kind TEXT NOT NULL DEFAULT 'staging'
 );
 CREATE INDEX IF NOT EXISTS ci_batch ON ci_attempts (batch_id, batch_version);
+CREATE INDEX IF NOT EXISTS ci_head_sha ON ci_attempts (head_sha);
 CREATE TABLE IF NOT EXISTS ci_requests (
     id INTEGER PRIMARY KEY,
     attempt_id INTEGER NOT NULL DEFAULT 0,

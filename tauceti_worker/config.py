@@ -99,6 +99,14 @@ def roadmap_skip() -> list[str]:
     return sorted({tok for tok in (t.strip() for t in raw.split(",")) if tok})
 
 
+def roadmap_targets() -> Path | None:
+    """The operator's target list for roadmap rounds (see docs/target-lists.md), read live from
+    TAUCETI_ROADMAP_TARGETS so --roadmap-targets is inherited by loop children. None when unset or
+    blank: roadmap rounds choose their own target. The file itself is read once per round."""
+    raw = os.environ.get("TAUCETI_ROADMAP_TARGETS", "").strip()
+    return Path(raw) if raw else None
+
+
 EXTRA_ROADMAP_PROMPT_MAX_CHARS = 4096
 
 
@@ -152,6 +160,8 @@ def _only_label(sv=None) -> str:
     v = sv.roadmap_only if (sv is not None and sv.roadmap_only) else roadmap_only()
     if v is None or v == "auto":
         return "auto (random each round)"
+    if getattr(sv, "umbrella", None) is not None:
+        return f"{v} (umbrella)"
     return "all areas" if v in ("", "any") else v
 
 
@@ -260,6 +270,9 @@ class Config:
     sbcache: Path  # scoreboard meta cache dir
     logdir: Path  # HERE/logs/<wid>
     quota_cache: Path  # raw provider usage responses
+    # A direct source's host-shared review-state index root (worker_sources.source_config sets it);
+    # None keeps the review state under this worker's own sbcache.
+    review_index: Path | None = None
 
     @property
     def store(self) -> Path:
@@ -446,6 +459,10 @@ class NoProgress(Exception):
 
 class ClaimCollision(NoProgress):
     """Available candidates were claimed by peers; reselect without failure backoff."""
+
+
+class ReviewSourceUnavailable(NoProgress):
+    """A selected review's source could not be prepared before inference; other PRs may still be workable."""
 
 
 class ProgressPreparationUnavailable(NoProgress):

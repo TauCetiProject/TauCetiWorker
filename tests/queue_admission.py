@@ -126,7 +126,6 @@ class AdmissionTests(unittest.TestCase):
         del self.github.statuses[(head, "build")]
         del self.github.statuses[(head, "scope")]
         self.github.labels[1].add("self-tested")
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         self.assertEqual(self.intake.run_once()["approved"], 1)
         self.controller.tick()
         self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
@@ -137,7 +136,6 @@ class AdmissionTests(unittest.TestCase):
         head = self.github.create_pr(1, files)
         self.review(1)
         self.github.labels[1].add("self-tested")
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         return head
 
     def test_self_tested_heads_must_pass_the_pr_level_diff_guards(self):
@@ -164,23 +162,120 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.intake.run_once()["approved"], 1)
         self.assertEqual(self.controller.store.rows("outbox", {"kind": "comment"}), [])
 
+    def test_an_admin_large_refactor_label_lifts_the_size_caps_at_admission(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as temp:
+            repo = Path(temp)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-C", temp, "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+
+            git("init", "--quiet")
+            (repo / "TauCeti").mkdir()
+            (repo / "TauCeti/A.lean").write_text("-- a\n")
+            git("add", "--all")
+            git("commit", "--quiet", "-m", "base")
+            base = git("rev-parse", "HEAD")
+            for index in range(diff_guard.ci_git.REVIEW_FILE_CAP + 1):
+                (repo / "TauCeti" / f"F{index}.lean").write_text(f"-- {index}\n")
+            git("add", "--all")
+            git("commit", "--quiet", "-m", "head")
+            head = git("rev-parse", "HEAD")
+            committed = int(git("show", "-s", "--format=%ct", head))
+            labelled = datetime.fromtimestamp(committed + 60, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            def read(path):
+                if "/events?" in path:
+                    return [
+                        {
+                            "id": 1,
+                            "event": "labeled",
+                            "label": {"name": "large-refactor"},
+                            "actor": {"login": "admin", "id": 7},
+                            "created_at": labelled,
+                        }
+                    ]
+                return {"role_name": "admin", "user": {"id": 7}}
+
+            self.assertIn("too large to review", diff_guard.violations(repo, base, head)[0])
+            self.assertFalse(diff_guard.large_refactor(repo, head, read, REPO, 1, ("self-tested",)))
+            exempt = diff_guard.large_refactor(repo, head, read, REPO, 1, ("self-tested", "large-refactor"))
+            self.assertTrue(exempt)
+            self.assertEqual(diff_guard.violations(repo, base, head, large_refactor=exempt), ())
+
+    def test_repair_reads_the_large_refactor_exemption_from_the_admitted_head(self):
+        from tauceti_queue.controller import Controller
+
+        member = {"accepted_head": "a" * 40}
+        exempt = {"head_sha": "a" * 40, "evidence": json.dumps({"large_refactor": True})}
+        self.assertTrue(Controller._large_refactor_member(member, exempt))
+        self.assertFalse(Controller._large_refactor_member(member, {**exempt, "head_sha": "b" * 40}))
+        self.assertFalse(Controller._large_refactor_member(member, {**exempt, "evidence": "{}"}))
+
+    def test_a_label_change_after_approval_updates_only_the_exemption_evidence(self):
+        from tauceti_queue.store import dumps
+
+        current = {"id": 9, "head_sha": "a" * 40, "evidence": json.dumps({"kind": "admission_policy"})}
+        with mock.patch.object(self.controller.store, "update") as update:
+            self.intake._sync_large_refactor(current, "b" * 40, True)
+            update.assert_not_called()
+            self.intake._sync_large_refactor(current, "a" * 40, False)
+            update.assert_not_called()
+            self.intake._sync_large_refactor(current, "a" * 40, True)
+        update.assert_called_once_with(
+            "inputs", {"id": 9}, evidence=dumps({"kind": "admission_policy", "large_refactor": True})
+        )
+        labelled = {**current, "evidence": json.dumps({"kind": "admission_policy", "large_refactor": True})}
+        with mock.patch.object(self.controller.store, "update") as update:
+            self.intake._sync_large_refactor(labelled, "a" * 40, False)
+        update.assert_called_once_with("inputs", {"id": 9}, evidence=dumps({"kind": "admission_policy"}))
+
     def test_ci_built_heads_rely_on_pr_ci_for_the_diff_guards(self):
         with mock.patch("tauceti_queue.diff_guard.violations") as measure:
             self.ready()
             self.assertEqual(self.intake.run_once()["approved"], 1)
         measure.assert_not_called()
 
-    def test_untrusted_label_and_label_removal_cannot_bypass_ci(self):
+    def test_any_authors_label_stands_in_for_ci_until_removed(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]
-        self.github.labels[1].add("self-tested")
         self.assertEqual(self.intake.run_once()["approved"], 0)
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
+        self.github.labels[1].add("self-tested")
         self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.run_once()["approved"], 1)
         generation = self.intake.state.get(1)["generation"]
         self.event("pull_request", {"number": 1, "action": "unlabeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.state.get(1)["generation"], generation + 1)
+
+    def test_a_self_tested_rule_change_re_evaluates_only_evidence_refusals_once(self):
+        for number, missing in ((1, "build"), (3, "scope")):
+            head = self.ready(number)
+            del self.github.statuses[(head, missing)]
+            self.github.labels[number].add("self-tested")
+        self.ready(2)
+        unlabelled = self.ready(4)
+        del self.github.statuses[(unlabelled, "build")]
+        with mock.patch("tauceti_tools.self_tested.accepted", return_value=False):  # the old team rule
+            self.assertEqual(self.intake.run_once()["approved"], 1)
+        reasons = {n: json.loads(self.intake.state.get(n)["decision"])["reason"] for n in (1, 3, 4)}
+        self.assertTrue(reasons[1].startswith("build is not green"), reasons)
+        self.assertTrue(reasons[3].startswith("trusted CI scope status is not green"), reasons)
+        # A database from before the current self-tested rules.
+        self.controller.store.execute("DELETE FROM settings WHERE key LIKE 'state:self_tested_policy:%'")
+        approved = self.intake.state.get(2)["generation"]
+        self.restart()
+        self.assertEqual(self.intake.state.get(2)["generation"], approved, "an admitted head is not re-read")
+        self.assertEqual(self.intake.run_once()["approved"], 2)
+        self.assertEqual({row["number"] for row in self.controller.inputs()}, {1, 2, 3})
+        refused = self.intake.state.get(4)["generation"]
+        self.restart()
+        self.assertEqual(self.intake.state.get(4)["generation"], refused, "once per rule version")
 
     def test_primary_intake_uses_published_review_and_unchanged_inputs_cost_no_evaluation(self):
         self.ready()
@@ -689,6 +784,86 @@ class AdmissionTests(unittest.TestCase):
                 self.intake.run_once()
                 self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
 
+    def large_refactor_approval(self, *, files=None, labelled=True, bump=True, admin=True):
+        """An admin's exact-head `bors r+` on a large refactor that also bumps the Lake pins."""
+        files = files or {"TauCeti/P1.lean": "-- renamed projections\n", "lean-toolchain": "v-next\n"}
+        head = self.human_approval(files=files, admin=admin)
+        if labelled:
+            self.github.large_refactor_heads = {head}
+            self.github.labels[1] = {"large-refactor"}
+        self.github.bump_verdicts = {head: bump}
+        return head
+
+    def test_admin_approved_large_refactor_is_kept_despite_a_negative_scoreboard(self):
+        head = self.large_refactor_approval()
+        self.review(state="red")
+        result = self.intake.run_once()
+        self.assertEqual(result["revoked"], 0)
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.assertTrue(self.intake.is_current(1, head))
+        decision = json.loads(self.intake.state.get(1)["decision"])
+        self.assertEqual(decision["reason"], "large refactor approved by repository admin")
+        waiver = decision["evidence"]["large_refactor_approval"]
+        self.assertEqual((waiver["actor_id"], waiver["head_sha"], waiver["bump_guard"]), (42, head, True))
+        self.assertIn(("bump_guard", (head,)), self.github.calls)
+        # Admin permission was established once, when the command was recorded; admission reads none.
+        self.assertNotIn("repository_admin", [name for name, _ in self.github.calls])
+        # The emergency lane sees a live approved input, so it no longer refuses `not-approved`.
+        self.controller.set_setting("emergency_enabled", True, "t")
+        request = self.controller.request_emergency(REPO, 1, "human", surface="test")
+        self.assertTrue(request["accepted"], request)
+        self.intake.run_once()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+
+    def test_library_only_large_refactor_needs_no_bump_check(self):
+        self.large_refactor_approval(files={"TauCeti/P1.lean": "-- renamed projections\n"}, bump=False)
+        self.intake.run_once()
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+        self.assertNotIn("bump_guard", [name for name, _ in self.github.calls])
+
+    def test_large_refactor_waiver_stays_narrow(self):
+        for case in (
+            "unlabelled",
+            "not-admin",
+            "stale-base",
+            "wrong-head",
+            "bump-fails",
+            "lakefile",
+            "root-file",
+            "new-file-cap",
+        ):
+            with self.subTest(case=case):
+                if self.controller.input_for(REPO, 1):
+                    self.controller.cancel(REPO, 1, "fixture")
+                self.github.review_comments.pop(1, None)
+                files = None
+                if case == "lakefile":
+                    files = {"TauCeti/P1.lean": "-- x\n", "lakefile.toml": "# changed\n"}
+                elif case == "root-file":
+                    files = {"TauCeti/P1.lean": "-- x\n", "TauCeti.lean": "import TauCeti.P1\n"}
+                elif case == "new-file-cap":
+                    lines = diff_guard.ci_git.NEW_FILE_LINE_CAP + 50  # the one cap the label never lifts
+                    files = {"TauCeti/Big.lean": "".join(f"-- {i}\n" for i in range(lines))}
+                self.large_refactor_approval(
+                    files=files, labelled=case != "unlabelled", bump=case != "bump-fails", admin=case != "not-admin"
+                )
+                if case in ("stale-base", "wrong-head"):
+                    current = self.controller.input_for(REPO, 1)
+                    evidence = json.loads(current["evidence"])
+                    evidence["merge_base_sha" if case == "stale-base" else "head_sha"] = "f" * 40
+                    self.controller.store.update("inputs", {"id": current["id"]}, evidence=json.dumps(evidence))
+                self.review(state="red")
+                self.intake.invalidate(1)
+                self.intake.run_once()
+                self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+
+    def test_unreadable_bump_check_defers_the_large_refactor_waiver(self):
+        head = self.large_refactor_approval(bump=None)
+        self.review(state="red")
+        self.assertTrue(self.intake.run_once()["errors"])
+        self.assertFalse(self.intake.is_current(1, head))
+        self.assertEqual(self.controller.input_for(REPO, 1)["state"], "waiting")
+
     def test_permission_read_failure_defers_human_approval_and_blocks_insertion(self):
         head = self.human_approval()
         original = self.github.repository_admin
@@ -890,6 +1065,83 @@ class AdmissionTests(unittest.TestCase):
         self.intake.run_once()
         self.assertLess(reads.index(1), reads.index(4), "new revocations must not wait for the old pass list")
         self.assertEqual(self.controller.input_for(REPO, 1)["state"], "cancelled")
+
+    def test_an_emergency_request_is_evaluated_again_ahead_of_every_urgent_backlog(self):
+        for number in (1, 2, 3, 4):
+            self.ready(number)
+        self.intake.run_once()
+        self.assertEqual(sorted(row["number"] for row in self.controller.inputs()), [1, 2, 3, 4])
+        # A canonical advance makes every PR urgent at once.
+        for number in (1, 2, 3, 4):
+            self.intake.invalidate(number)
+        current = self.intake.state.get(3)
+        self.controller.set_setting("emergency_enabled", True, "t")
+        request = self.controller.request_emergency(REPO, 3, "kim-em", surface="test")
+        self.assertTrue(request["accepted"], request)
+        work = self.intake.state.get(3)
+        self.assertGreater(work["generation"], current["generation"], "the request itself is fresh work")
+        self.assertEqual(work["head_sha"], self.github.prs[3]["head_sha"])
+        for kwargs in ({"prefer_urgent": True}, {"prefer_urgent": False}, {"urgent_only": True}):
+            self.assertEqual(self.intake.state.next_due(**kwargs)["number"], 3, kwargs)
+        reads = []
+        original = self.github.admission_snapshot
+
+        def observe(repo, number, **kwargs):
+            reads.append(number)
+            return original(repo, number, **kwargs)
+
+        self.github.admission_snapshot = observe
+        self.intake.run_once()
+        self.assertEqual(reads[0], 3)
+        self.assertTrue(self.intake.is_current(3, self.github.prs[3]["head_sha"]))
+
+    def test_an_already_current_emergency_request_still_gets_a_fresh_evaluation(self):
+        head = self.ready(1)
+        self.intake.run_once()
+        self.assertTrue(self.intake.is_current(1, head))
+        self.controller.set_setting("emergency_enabled", True, "t")
+        self.assertTrue(self.controller.request_emergency(REPO, 1, "kim-em", surface="test")["accepted"])
+        self.assertFalse(self.intake.is_current(1, head))
+        before = len(self.controller.store.journal_entries("admission-evaluated"))
+        self.intake.run_once()
+        self.assertEqual(len(self.controller.store.journal_entries("admission-evaluated")), before + 1)
+        self.assertTrue(self.intake.is_current(1, head))
+
+    def test_evaluations_and_discovery_passes_journal_where_their_time_went(self):
+        self.ready(1)
+        self.ready(2)
+        self.intake.run_once()
+        entries = self.controller.store.journal_entries("admission-evaluated")
+        self.assertEqual(len(entries), 2)
+        for entry in entries:
+            detail = entry["detail"]
+            for key in ("seconds", "read_seconds", "fetch_seconds", "lock_seconds"):
+                self.assertIsInstance(detail[key], float, key)
+                self.assertGreaterEqual(detail[key], 0, key)
+            self.assertLessEqual(detail["read_seconds"], detail["seconds"])
+        (discovered,) = self.controller.store.journal_entries("admission-discovered")
+        self.assertEqual(discovered["detail"]["prs"], 2)
+        self.assertGreaterEqual(discovered["detail"]["pages"], 1)
+        self.assertGreaterEqual(discovered["detail"]["seconds"], discovered["detail"]["evaluation_seconds"])
+
+    def test_a_discovery_pass_resumed_after_a_quota_wait_reports_all_its_pages(self):
+        self.ready(1)
+        original = self.github.list_open_pull_requests
+        calls = []
+
+        def paged(repo, **kwargs):
+            calls.append(1)
+            kwargs["on_page"]([])
+            if len(calls) == 1:
+                raise RequestDeferred("wait", retry_at=self.clock(), resource="graphql:background")
+            return original(repo, **kwargs)
+
+        self.github.list_open_pull_requests = paged
+        self.intake.run_once()
+        self.intake.run_once()
+        (discovered,) = self.controller.store.journal_entries("admission-discovered")
+        self.assertGreaterEqual(discovered["detail"]["pages"], 3, "both calls' pages")
+        self.assertIsNone(self.intake._discovery_timing)
 
     def test_pending_review_change_cannot_be_inserted_while_its_read_is_quota_blocked(self):
         self.ready()

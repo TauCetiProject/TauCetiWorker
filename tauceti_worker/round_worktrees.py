@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 from .config import log
+from .excerpt import ends
 
 # Every checkout this process prepared (worker and source checkouts), released at round end.
 PREPARED = []
@@ -317,7 +318,7 @@ def prepare(cfg, url) -> bool:
             _git("worktree", "add", "--quiet", "--detach", co, f"refs/remotes/origin/{base}")
     except (OSError, subprocess.SubprocessError) as error:
         detail = getattr(error, "stderr", "") or ""
-        log(f"worktrees: preparation failed: {error} {detail.strip()[-300:]}")
+        log(f"worktrees: preparation failed: {error} {ends(detail, 300)}")
         return False
     _unpark(cfg, co)
     PREPARED.append(cfg)

@@ -221,7 +221,7 @@ try:
         "tauceti-verify" in work_argv and "--stage build" in work_argv,
     )
     check("work disables background tasks", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1" in work_argv)
-    check("work allows foreground commands the round budget", "BASH_MAX_TIMEOUT_MS=7200000" in work_argv)
+    check("work bounds each foreground command to an hour", "BASH_MAX_TIMEOUT_MS=3600000" in work_argv)
     with (
         patch.dict(os.environ, TAUCETI_VERIFY_HELPER="1"),
         patch("tauceti_worker.verification.cache_root", side_effect=PermissionError("unavailable cache")),

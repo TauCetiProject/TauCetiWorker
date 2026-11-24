@@ -12,7 +12,7 @@ The script takes module names (``TauCeti.Foo.Bar``) or paths (``TauCeti/Foo/Bar.
 ``--dependents`` every module importing them transitively (from the library's ``import`` lines, one
 pass, cached in ``.tauceti-repair/imports.json``), and runs ``lake build --iofail`` on them in the
 foreground, exiting with Lake's status; no arguments builds the whole library and, when it is green, runs
-CI's audits and the changed-module lint (``repair_audit.helper_checks``, ``--no-audit`` skips them),
+staging's audits and lints (``repair_audit.helper_checks``, ``--no-audit`` skips them),
 exiting 1 on a finding. Lake runs in the offline
 ``bwrap`` sandbox of CI's required build (``repair_sandbox.sandboxed_lake``), as the worker's own builds do.
 """
@@ -105,8 +105,8 @@ BUILD_HEADER = '''#!/usr/bin/env python3
 """Build only the named modules, one lake build at a time. Written by the queue's repair worker.
 
 Usage: .tauceti-repair/build [--dependents] [--no-audit] [TauCeti.Foo.Bar | TauCeti/Foo/Bar.lean ...]; no
-arguments builds the whole library and, when it is green, runs CI's audits and the changed-module
-environment lint (tauceti_queue.repair_audit; --no-audit skips them), unless the worker owns full
+arguments builds the whole library and, when it is green, runs staging's audits and full-library
+lints (tauceti_queue.repair_audit; --no-audit skips them), unless the worker owns full
 verification: that mode requires named modules and uses check-findings for diagnostics. Findings go to
 .tauceti-repair/errors.jsonl. --dependents adds the modules importing the named ones (from the library's
 import lines, cached in .tauceti-repair/imports.json: delete it after changing imports). Builds wait for
