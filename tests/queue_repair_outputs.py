@@ -146,6 +146,16 @@ class Outputs(unittest.TestCase):
         with self.assertRaises(repair_outputs.Unavailable):
             repair_outputs.damaged(self.root, {}, hasher=hasher)
         (self.root / ".lake/outputs.jsonl").rmdir()
+        # A build root that cannot be inspected.
+        real_stat = Path.stat
+
+        def failing_stat(path, *args, **kwargs):
+            if path.name == "lean" and path.parent.name == "lib":
+                raise PermissionError("denied")
+            return real_stat(path, *args, **kwargs)
+
+        with patch.object(Path, "stat", failing_stat), self.assertRaises(repair_outputs.Unavailable):
+            repair_outputs.damaged(self.root, {}, hasher=hasher)
         # A trace that cannot be read.
         with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
             with self.assertRaises(repair_outputs.Unavailable):

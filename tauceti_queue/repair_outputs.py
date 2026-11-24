@@ -68,8 +68,13 @@ def expected(worktree: Path) -> list[tuple[Path, object, list[tuple[Path, str]]]
     """(module stem, depHash, [(output path, trace name)]) for every root-package module trace."""
     lib, ir = worktree / ".lake/build/lib/lean", worktree / ".lake/build/ir"
     modules = []
-    if not lib.is_dir():
+    try:
+        if not stat.S_ISDIR(lib.stat().st_mode):
+            return modules
+    except FileNotFoundError:
         return modules
+    except OSError as error:
+        raise Unavailable(f"cannot inspect {lib}: {error}") from error
     for directory, _, files in os.walk(lib, onerror=_raise_unavailable):
         for file in files:
             if not file.endswith(".trace"):
