@@ -328,7 +328,7 @@ def freeze_outputs(worktree: Path, revision: str, env: dict, logdir: Path, lake:
 
     try:
         damaged = repair_outputs.damaged(worktree, env)
-    except repair_outputs.Unavailable as error:
+    except (repair_outputs.Unavailable, OSError) as error:
         log(f"not publishing {revision[:12]}: its outputs could not be checked ({error})")
         return None
     if damaged:

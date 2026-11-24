@@ -130,6 +130,16 @@ class Outputs(unittest.TestCase):
         self.assertFalse((self.records / "2222222222222222.json").exists())
         self.assertFalse((self.lib / "Basic.trace").exists())
 
+    def test_only_the_fixture_variable_turns_the_check_off(self):
+        self.module("Basic", "4366fd23170e9e25", "a")
+        (self.lib / "Basic.ir.sig").write_bytes(b"")
+        with patch.dict(repair_outputs.os.environ, {repair_outputs.OFF_VARIABLE: "off"}):
+            with patch.object(repair_outputs, "native_hashes", side_effect=AssertionError("not called")):
+                self.assertEqual(repair_outputs.damaged(self.root, {}), [])
+        with patch.dict(repair_outputs.os.environ, {repair_outputs.OFF_VARIABLE: "0"}):
+            with patch.object(repair_outputs, "native_hashes", side_effect=lambda w, e, paths: hasher(paths)):
+                self.assertEqual(len(repair_outputs.damaged(self.root, {})), 1)
+
     def test_an_unavailable_hasher_is_reported_not_raised(self):
         self.module("Basic", "4366fd23170e9e25", "a")
 
@@ -137,7 +147,8 @@ class Outputs(unittest.TestCase):
             raise repair_outputs.Unavailable("no helper")
 
         self.assertEqual(
-            repair_outputs.discard_damaged(self.root, {}, hasher=failing), {"checked": False, "reason": "no helper"}
+            repair_outputs.discard_damaged(self.root, {}, hasher=failing),
+            {"checked": False, "reason": "Unavailable: no helper"},
         )
         self.assertTrue((self.lib / "Basic.trace").exists())
 

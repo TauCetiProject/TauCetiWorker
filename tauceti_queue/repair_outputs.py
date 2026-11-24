@@ -148,8 +148,13 @@ def cache_dir(worktree: Path, env: dict) -> Path:
     return Path(configured) if configured else worktree / ".lake/cache"
 
 
+OFF_VARIABLE = "TAUCETI_REPAIR_OUTPUT_CHECK"  # "off" only in test fixtures whose stub Lake writes fake outputs
+
+
 def damaged(worktree: Path, env: dict, *, hasher=None) -> list[dict]:
     """Every output (or same-named artifact cache file) whose bytes differ from its trace name."""
+    if hasher is None and os.environ.get(OFF_VARIABLE) == "off":
+        return []
     worktree = worktree.resolve()
     artifacts = cache_dir(worktree, env) / "artifacts"
     modules = expected(worktree)
@@ -172,6 +177,10 @@ def damaged(worktree: Path, env: dict, *, hasher=None) -> list[dict]:
         actual = hashes.get(str(path))
         if actual is not None and actual != name.split(".", 1)[0] and (path, name) not in seen:
             seen.add((path, name))
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:  # another worker discarded the same shared file meanwhile
+                continue
             found.append(
                 dict(
                     module=str(stem).replace(os.sep, ".") if stem is not None else None,
@@ -180,7 +189,7 @@ def damaged(worktree: Path, env: dict, *, hasher=None) -> list[dict]:
                     path=str(path),
                     expected=name,
                     actual=actual,
-                    size=path.stat().st_size,
+                    size=size,
                 )
             )
     return found
@@ -225,11 +234,12 @@ def discard_damaged(worktree: Path, env: dict, *, hasher=None) -> dict:
     """Check a reused tree before building in it; never raises. Returns what was found and removed."""
     try:
         found = damaged(worktree, env, hasher=hasher)
-    except Unavailable as error:
-        return {"checked": False, "reason": str(error)}
+        removed = discard(worktree, found, env) if found else 0
+    except (Unavailable, OSError) as error:
+        return {"checked": False, "reason": f"{type(error).__name__}: {error}"}
     return {
         "checked": True,
         "damaged_count": len(found),
         "damaged": [{k: item[k] for k in ("module", "path", "expected", "actual", "size")} for item in found[:20]],
-        "removed_modules": discard(worktree, found, env) if found else 0,
+        "removed_modules": removed,
     }
