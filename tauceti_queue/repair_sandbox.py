@@ -237,12 +237,14 @@ PACKAGES_RECORD = ".tauceti-repair/packages-link"
 
 
 def linked_packages(worktree: Path) -> list[Path]:
-    """The ``.lake/packages`` targets the worker itself linked in ``worktree`` (``PACKAGES_RECORD``)."""
+    """The ``.lake/packages`` targets the worker itself linked in ``worktree`` (``PACKAGES_RECORD``),
+    as recorded: canonical when written and never resolved again, since a target inside another
+    worktree's ``.lake`` is build state that could since have been replaced by a link elsewhere."""
     try:
         text = (worktree / PACKAGES_RECORD).read_text()
     except OSError:
         return []
-    return [Path(line).resolve() for line in text.splitlines() if line.startswith("/")]
+    return [Path(line) for line in text.splitlines() if line.startswith("/")]
 
 
 def _system_binds() -> list[str]:

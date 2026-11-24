@@ -159,6 +159,11 @@ class Shims(Fixture):
             ["git", "-C", str(self.worktree), "check-ignore", "-q", repair_sandbox.PACKAGES_RECORD], check=False
         )
         self.assertEqual(excluded.returncode, 0, "the record stays out of Git")
+        # The parent's build replaces the recorded directory by a link elsewhere: nothing is bound.
+        parent.rename(parent.with_name("moved"))
+        parent.symlink_to(self.home)
+        argv = repair_sandbox.sandbox_argv(["true"], self.worktree, self.env, bwrap=str(self.bin / "bwrap"))
+        self.assertNotIn(str(self.home), [argv[i + 1] for i, a in enumerate(argv) if a == "--ro-bind"])
         # The build rewrites the link: its new target is not the recorded one, so nothing is bound.
         (self.worktree / ".lake" / "packages").unlink()
         (self.worktree / ".lake" / "packages").symlink_to(self.home)
