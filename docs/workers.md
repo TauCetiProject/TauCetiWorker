@@ -112,10 +112,11 @@ private Forgejo token-file configuration. Source changes wait for the worker's
 current round to finish; other workers retain their running processes and settings.
 
 A both-source worker offers existing PR work by closeness to landing across both
-forges. A first review of the worker's own Forgejo PR (one its account authored,
-not an adopted author's) counts as close to landing as a re-review: both kinds are
-drawn together in one age-weighted random order, ahead of fixes, so neither starves
-the other. Set `prefer_forge = "github"` (or `"forgejo"`, or `--prefer-forge` for
+forges. Every review of a Forgejo PR, whoever authored it, counts as close to
+landing as a re-review, including a first review and a retry at a head whose
+review errored. All of them are drawn in one age-weighted random order, ahead of
+fixes, so neither kind starves the other. (Forgejo always has a fix left, so a
+Forgejo review offered after the fixes would never run.) Set `prefer_forge = "github"` (or `"forgejo"`, or `--prefer-forge` for
 `tauceti work`) to offer that forge's rebases, re-reviews, fixes and first reviews
 before any of the other forge's. Automatic bumps still come first and overlap work
 last on either forge, and the worker falls back to the other forge when its

@@ -353,9 +353,10 @@ class Candidate:
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
     rereview: bool = False  # a review of a PR already reviewed at an earlier head: closest to approval
-    # A first review of a PR this account authored on a native forge (Forgejo): offered with the
-    # re-reviews, since never-reviewed PRs of our own are the cheapest approvals on Forgejo.
-    own_first_review: bool = False
+    # Any other review on a native forge (Forgejo), whoever authored the PR: a first review, or a
+    # retry at a head whose review errored. Offered with the re-reviews: behind the fixes, which
+    # never run out on Forgejo, these PRs were never offered at all.
+    native_review: bool = False
     source_repository: RepositoryRef | None = None
     source_repository_id: int | None = None
     progress: dict | None = field(
@@ -1241,7 +1242,7 @@ def classify_survey(
                 ready_at=p.build_status_at,
                 preferred_reviewer=_scoreboard_reviewer(m),
                 rereview=str(m.data.get("head_sha") or p.head_oid) != p.head_oid,
-                own_first_review=hasattr(sv, "source_repository") and sv.authored(p) and not m.data.get("head_sha"),
+                native_review=hasattr(sv, "source_repository"),
             )
             if not p.automatic_bump and c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
@@ -1485,10 +1486,12 @@ def bump_prs(sv: Survey) -> set[int]:
 # Automatic Mathlib bumps and bump-stage repairs come first (tier 0, see cascade). Then conflict rebases (rare, and a
 # conflicting PR cannot land; reviewing or fixing it first would be redone after the rebase moves
 # its head) and re-reviews of PRs already reviewed at an earlier head or author contests: the next
-# verdict can approve them. First reviews of this account's own Forgejo PRs share that tier: they
-# approve more often than re-reviews do, and behind the fixes several hundred of them never came up.
-# Reviews within a tier are drawn in one age-weighted random order, so neither kind starves the
-# other. Then repairs of changes-requested or red PRs. Then other first reviews, then overlap work.
+# verdict can approve them. Every other Forgejo review (a first review, or a retry at a head whose
+# review errored) shares that tier, whoever authored the PR: a both-forge fleet always has a fix
+# left on Forgejo, so behind the fixes no such review was ever offered (several hundred of our own
+# first reviews, then every contributor's). Reviews within a tier are
+# drawn in one age-weighted random order, so neither kind starves the other. Then repairs of
+# changes-requested or red PRs. Then GitHub first reviews, then overlap work.
 LANDING_TIERS = {
     "bump": 0,
     "rebase": 1,
@@ -1505,7 +1508,7 @@ LANDING_TIERS = {
 def landing_tier(stage: str, candidate: Candidate, bumps=frozenset()) -> int:
     if candidate.pr in bumps:
         return 0
-    if stage == "review" and (candidate.rereview or candidate.contest or candidate.own_first_review):
+    if stage == "review" and (candidate.rereview or candidate.contest or candidate.native_review):
         return 1
     return LANDING_TIERS.get(stage, 7)
 

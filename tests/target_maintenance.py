@@ -91,18 +91,18 @@ class Ordering(unittest.TestCase):
         self.assertEqual(order(cascade(sv, AUTO_STAGES, tier=1))[-1], ("review", 60))
         self.assertNotIn("review", [stage for stage, _ in cascade(sv, AUTO_STAGES, tier=2)])
 
-    def test_own_first_reviews_share_the_rereview_tier_in_review_order(self):
+    def test_forgejo_first_reviews_share_the_rereview_tier_in_review_order(self):
         sv = survey()
         sv.kind("review").actionable = [
-            Candidate(61, HEAD, own_first_review=True),
+            Candidate(61, HEAD, native_review=True),
             Candidate(60, HEAD, rereview=True),
             Candidate(50, HEAD),
-            Candidate(62, HEAD, own_first_review=True),
+            Candidate(62, HEAD, native_review=True),
             Candidate(63, HEAD, rereview=True),
         ]
         pairs = order(cascade(sv, AUTO_STAGES))
-        # After the rebases, re-reviews and our own first reviews keep the review stage's (spread)
-        # order, so neither kind starves the other; then fixes; then other first reviews.
+        # After the rebases, re-reviews and Forgejo first reviews keep the review stage's (spread)
+        # order, so neither kind starves the other; then fixes; then GitHub first reviews.
         self.assertEqual(
             pairs[:8],
             [
