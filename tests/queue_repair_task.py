@@ -2539,7 +2539,13 @@ class DriverFailureRepair(Fixture):
         cfg = self.config(agent_attempts=1)
         claim = {"id": 0, "task_id": 1, "token": "t", "worker": "w", "expires_at": time.time() + 60}
         task = repair_task.Task.from_json(self.service.task_record(1, claim))
+        # The same task may deliver again (a failed push, a later claim of it).
         repair.git(cfg.clone, "update-ref", repair_task.restaged_ref(task), self.content.tip)
+        self.assertFalse(repair_task.restaged_by_other_task(cfg.clone, task))
+        # A later task on the same chain only exists after CI failed it again.
+        earlier = dataclasses.replace(task, task_id="0")
+        repair.git(cfg.clone, "update-ref", repair_task.restaged_ref(earlier), self.content.tip)
+        self.assertTrue(repair_task.restaged_by_other_task(cfg.clone, task))
         with patch.object(repair_audit, "verify", return_value=self.verification("passed")):
             outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["reason"], "agent_failed", outcome)

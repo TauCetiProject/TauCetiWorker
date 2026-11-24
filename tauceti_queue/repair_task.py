@@ -1451,14 +1451,22 @@ def verified_unchanged(tip: str, outcome: dict) -> bool:
 
 
 # One unchanged re-staging per batch and chain: a driver failure that CI reproduces every time
-# would otherwise alternate between staging and repair indefinitely. The ref lives in the clone the
-# repair workers share; once it exists the task is released `agent_failed` as before, which the
-# controller's stalled-repair detection reports.
+# would otherwise alternate between staging and repair indefinitely. Each task that submits one
+# records a ref under the chain's prefix in the clone the repair workers share. The same task may
+# deliver again (a failed push, a later claim of it); a later task on the same chain, which only a
+# second CI failure creates, is released `agent_failed` as before, which the controller's
+# stalled-repair detection reports.
 RESTAGED_REF_PREFIX = "refs/tauceti-queue/restaged"
 
 
 def restaged_ref(task: Task) -> str:
-    return f"{RESTAGED_REF_PREFIX}/{task.batch_id}/{task.tip}"
+    return f"{RESTAGED_REF_PREFIX}/{task.batch_id}/{task.tip}/{task.task_id}"
+
+
+def restaged_by_other_task(clone: Path, task: Task) -> bool:
+    prefix = f"{RESTAGED_REF_PREFIX}/{task.batch_id}/{task.tip}/"
+    refs = git(clone, "for-each-ref", "--format=%(refname)", prefix, check=False).split()
+    return any(ref != restaged_ref(task) for ref in refs)
 
 
 def admission_verification(task: Task, tip: str, outcome: dict, stream_findings: list) -> dict | None:
@@ -3839,14 +3847,13 @@ def _run_task(
                 if not verified_unchanged(tip, outcome):
                     detail = "CI's check driver failed, but the worker could not verify the unchanged chain itself"
                     return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-                marker = restaged_ref(task)
-                if git(cfg.clone, "rev-parse", "--verify", "--quiet", marker, check=False).strip():
+                if restaged_by_other_task(cfg.clone, task):
                     detail = (
                         "CI's check driver failed again on a chain already staged again unchanged after a driver "
                         "failure; it needs an operator"
                     )
                     return release_task(cfg, client, task, state, "agent_failed", detail, outcome, lease)
-                git(cfg.clone, "update-ref", marker, tip)
+                git(cfg.clone, "update-ref", restaged_ref(task), tip)
                 log(f"task {task.task_id}: CI's check driver failed; submitting the verified unchanged chain once")
             if lease.lost.is_set():
                 return discard(lease.lost_reason or "claim lost before the push")
