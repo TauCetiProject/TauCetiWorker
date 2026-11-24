@@ -321,6 +321,22 @@ def freeze_outputs(worktree: Path, revision: str, env: dict, logdir: Path, lake:
         return None
     if repair.git(worktree, "status", "--porcelain", "--untracked-files=no").strip():
         return None
+    # Lake trusts an output whose trace matches without reading it, so a truncated or empty output
+    # left by an interrupted write would be packed and published (batch 506, 24 Nov 2026). Publish
+    # nothing unless every output is the bytes its trace names.
+    from tauceti_queue import repair_outputs
+
+    try:
+        damaged = repair_outputs.damaged(worktree, env)
+    except repair_outputs.Unavailable as error:
+        log(f"not publishing {revision[:12]}: its outputs could not be checked ({error})")
+        return None
+    if damaged:
+        log(
+            f"not publishing {revision[:12]}: {len(damaged)} output(s) differ from their traces, "
+            + ", ".join(f"{d['module']} {Path(d['path']).name} ({d['size']} bytes)" for d in damaged[:5])
+        )
+        return None
     stage = worktree / ".lake/publication-stage"
     shutil.rmtree(stage, ignore_errors=True)
     argv = [*lake, "cache", "stage", ".lake/outputs.jsonl", ".lake/publication-stage"]
