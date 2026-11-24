@@ -58,9 +58,10 @@ trap 'rm -rf "$RUN_ROOT"' EXIT
 # configuration still applies through the include; a module that opts out of system configuration
 # opts out of this too.
 # Git's own writer quotes the path. It is made absolute, so it does not resolve against $RUN_ROOT,
-# but not normalized: Git reads the path as given, symlinks and `..` included.
+# and normalized as Git normalizes GIT_CONFIG_SYSTEM: `..` collapsed lexically, symlinks kept.
 system_gitconfig="${GIT_CONFIG_SYSTEM:-/etc/gitconfig}"
 [[ "$system_gitconfig" == /* ]] || system_gitconfig="$INVOKED_FROM/$system_gitconfig"
+system_gitconfig="$(realpath -ms -- "$system_gitconfig")"
 git config --file "$RUN_ROOT/gitconfig" include.path "$system_gitconfig" || exit 1
 git config --file "$RUN_ROOT/gitconfig" maintenance.auto false || exit 1
 git config --file "$RUN_ROOT/gitconfig" gc.auto 0 || exit 1
