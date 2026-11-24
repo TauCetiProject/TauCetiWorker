@@ -1406,6 +1406,15 @@ def scope_only_repair(task: Task) -> bool:
     return bool(findings) and all(d.get("kind") == "status" and d.get("context") == "scope" for d in findings)
 
 
+def parallel_check_task(task: Task) -> bool:
+    """The head's parallel local check while staging runs the same tip (decision 174, step 4): a
+    ``repair`` task whose ``parallel_check`` diagnostic is still proactive. The worker builds and runs
+    every check; when nothing fails it submits the chain unchanged, with its ``local_verification``,
+    and otherwise repairs what failed like any repair task."""
+    check = task_findings(task).get("parallel_check") if task.kind == "repair" else None
+    return isinstance(check, dict) and bool(check.get("proactive"))
+
+
 def driver_failure_only(task: Task) -> bool:
     """Every source finding is a check whose driver failed without naming a module or file.
 
@@ -3220,6 +3229,7 @@ def _run_task(
         outcome["pre_repair_discovery"] = "skipped: task already supplies located audit/lint findings"
     stream: repair_stream.StreamingBuild | None = None
     started = time.monotonic()
+    clean_check = False  # a parallel check whose build found nothing: verify the chain unchanged
 
     def discard(detail: str) -> dict:
         outcome.update(status="claim_lost", detail=detail)
@@ -3514,6 +3524,15 @@ def _run_task(
                 )
                 publish_after(task.tip)
                 return released
+            clean_check = (
+                parallel_check_task(task)
+                and stream.finished.is_set()
+                and stream.rc == 0
+                and not stream.errors
+                and not stream.findings
+            )
+            if clean_check:
+                log(f"task {task.task_id}: the head's tip builds without errors; verifying it unchanged")
         findings = (
             repair.findings_from_diagnostics(continuation["diagnostics"]) if continuation else task_findings(task)
         )
@@ -3531,7 +3550,23 @@ def _run_task(
         resubmit = False
         agent_records: list[dict] = list(outcome.get("agent", []))
         agent = {"status": "ok"}
-        skip_agent = bool(pending_delivery)
+        if parallel_check_task(task) and not pending_delivery:
+            # The check exists to verify the tip; without the worker's own verification (no audits, or
+            # cold artifacts, which skip it) it would do nothing useful. Give it back: staging decides.
+            if not cfg.worker_audits or (outcome.get("artifacts") or {}).get("cold"):
+                return release_task(
+                    cfg,
+                    client,
+                    task,
+                    state,
+                    "artifacts_unavailable",
+                    "a parallel check needs the worker's own warm verification",
+                    outcome,
+                    lease,
+                )
+        # A parallel check with no streamed build goes straight to verification too; a failed
+        # verification then runs the agent on its findings like any repair round.
+        skip_agent = bool(pending_delivery) or clean_check or (parallel_check_task(task) and stream is None)
         # Numeric projections are rewritten mechanically before an agent sees them: the first findings
         # (the stream's too) and those of each failed verification (`rewrite_projections`).
         projections_due = (
@@ -3728,7 +3763,9 @@ def _run_task(
             report["unchanged"] = tip == task.tip
             report["agent_failed"] = agent["status"] == "failed"
             state.write("validated", attempt=attempt, tip=tip, report=report)
-            proactive = bool((task_findings(task).get("admission_predictions") or {}).get("proactive"))
+            proactive = bool(
+                (task_findings(task).get("admission_predictions") or {}).get("proactive")
+            ) or parallel_check_task(task)
             acceptable = (
                 report["ok"]
                 and not report["dirty"]

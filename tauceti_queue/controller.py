@@ -198,6 +198,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # (`_discard_unverified_pre_rebase`). Decision 174 restored it after S1 (decision 153) turned it off.
     # Creating the task seals the batch's membership (step 3): the head seals only what was verified.
     "prepare_pre_rebased": True,
+    # When the head is dispatched to staging on a tip no worker has verified, verify it locally on a
+    # repair worker at the same time (a speculative `repair` task, `_schedule_parallel_check`): a clean
+    # check makes the tip known-good, so the next batch is prepared on it; errors are repaired at once
+    # and the repaired tip is staged in place of the running one (decision 172 A, 174 step 4). Off by
+    # default: production turns it on as a runtime setting, which is also its off switch.
+    "parallel_check_enabled": False,
     # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
     # `problem-anticipated` (`_anticipate`).
@@ -326,6 +332,8 @@ TASK_SUPERSEDED = "superseded"
 TASK_REPAIR = "repair"
 TASK_REBASE_CONFLICT = "rebase_conflict"
 TASK_PREPARE = "prepare"
+# The diagnostic of the head's parallel local check (`_schedule_parallel_check`).
+PARALLEL_CHECK = "parallel_check"
 # `claim_task` hands out the lowest value first, then the oldest task: the head's own tasks always
 # come first, then the oldest open batch's pre-rebase onto the head, then the background preparation
 # of an open batch.
@@ -2296,6 +2304,20 @@ class Controller:
                 self.store.journal(now, "released", claim["batch_id"], task_id=task_id, reason=reason, error=error)
                 if stale_policy and task["state"] == TASK_OPEN:
                     self._replace_stale_source_task(task, now)
+                elif task is not None and task["state"] == TASK_OPEN and self._proactive_check(task):
+                    # One try per head version: staging stays the authority, and a check that could not
+                    # finish is not offered again (decision 174, step 4).
+                    self.store.update(
+                        "tasks",
+                        {"id": task_id},
+                        state=TASK_SUPERSEDED,
+                        resolved_at=now,
+                        resolution="parallel-check-released",
+                    )
+                    self._count("parallel_checks_released")
+                    self.store.journal(
+                        now, "parallel-check-finished", claim["batch_id"], task_id=task_id, released=reason
+                    )
                 elif task is not None and task["kind"] != TASK_PREPARE and task["state"] == TASK_OPEN:
                     self._observe_repair_release(task, claim["batch_id"], reason, error, now)
                 elif task is not None and task["kind"] == TASK_PREPARE and task["state"] == TASK_OPEN:
@@ -2569,7 +2591,9 @@ class Controller:
                     self._observe_repair_stall(task, batch, tip_sha, notes if isinstance(notes, dict) else {}, now)
                 self._wake.set()
                 return result
-            if tip_sha == task["tip"] and knowledge.get("was_proactive"):
+            if tip_sha == task["tip"] and (
+                knowledge.get("was_proactive") or (self._parallel_check(task) or {}).get("was_proactive")
+            ):
                 self._release_claim(claim, "source-failure-refresh", now)
                 return reject(
                     "claim-superseded",
@@ -4113,8 +4137,75 @@ class Controller:
 
     @staticmethod
     def _prediction_task(task: dict[str, Any]) -> bool:
+        """A speculative head task that runs alongside the head's own staging run: a predicted repair
+        (`admission_predictions`) or the head's parallel local check (`parallel_check`), while proactive."""
         return any(
-            d.get("proactive") for d in loads(task["diagnostics"], []) if d.get("kind") == "admission_predictions"
+            d.get("proactive")
+            for d in loads(task["diagnostics"], [])
+            if d.get("kind") in ("admission_predictions", PARALLEL_CHECK)
+        )
+
+    @staticmethod
+    def _parallel_check(task: dict[str, Any]) -> dict[str, Any] | None:
+        return next((d for d in loads(task["diagnostics"], []) if d.get("kind") == PARALLEL_CHECK), None)
+
+    def _supersede_parallel_check(
+        self, head: dict[str, Any], task: dict[str, Any], resolution: str, now: float
+    ) -> None:
+        with self.store.transaction():
+            self.store.update(
+                "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
+            )
+            for claim in self._active_claims(head["id"], task_id=task["id"]):
+                self._release_claim(claim, "superseded", now)
+            self.store.journal(now, "parallel-check-finished", head["id"], task_id=task["id"], superseded=resolution)
+        self._wake.set()
+
+    def _proactive_check(self, task: dict[str, Any]) -> bool:
+        """The head's parallel check before staging has failed the tip (it is then a repair task)."""
+        return bool((self._parallel_check(task) or {}).get("proactive"))
+
+    def _schedule_parallel_check(self, head: dict[str, Any], now: float) -> None:
+        """Verify the head's tip on a repair worker while staging runs it (decision 174, step 4).
+
+        Only for a dispatched, pending attempt on a tip that is not known-good (`_head_tip_verified`)
+        and that CI never failed (a tip staged again unchanged was verified by the worker already), at
+        most once per head version. The task is a `repair` of the head with a proactive
+        `parallel_check` diagnostic: the worker builds warm and runs every check; a clean result is
+        submitted unchanged and records the tip as verified (`_adopt_prediction_noop`), so the next
+        batch is prepared on it; errors are repaired, and the repaired tip becomes the head's next
+        version, whose dispatch cancels the running staging run (`_cancel_superseded_runs`). Staging
+        stays the authority: a pass promotes the head and supersedes the check
+        (`_finish_prediction_pass`), and a source failure turns it into the ordinary repair task with
+        CI's diagnostics (`_update_prediction_verdict`)."""
+        if not self.setting("parallel_check_enabled") or self._state("inference_hold"):
+            return
+        if self._open_task(head) is not None or head["urgent"] == URGENT_EMERGENCY:
+            return
+        attempt = self._current_attempt(head)
+        if (
+            attempt is None
+            or attempt["outcome"] != OUTCOME_PENDING
+            or attempt["head_sha"] != head["tip"]
+            or attempt["dispatch_state"] in {"prepared", "rejected"}
+        ):
+            return
+        if self._head_tip_verified(head) or self._tip_failed(head["tip"]):
+            return
+        key = f"parallel_check:{head['id']}:{head['version']}"
+        if self._state(key):
+            return
+        check = {
+            "kind": PARALLEL_CHECK,
+            "proactive": True,
+            "attempt_id": attempt["id"],
+            "message": "staging is running this tip; verify it locally and repair what fails",
+        }
+        task_id = self._create_task(head, TASK_REPAIR, head["base"], [check], now, ci_attempt_id=attempt["id"])
+        self._set_state(key, {"task_id": task_id, "at": now, "tip": head["tip"]})
+        self._count("parallel_checks")
+        self.store.journal(
+            now, "parallel-check-started", head["id"], task_id=task_id, attempt_id=attempt["id"], tip=head["tip"]
         )
 
     def _schedule_predicted_repair(self, head: dict[str, Any], now: float) -> None:
@@ -4188,16 +4279,27 @@ class Controller:
 
     def _adopt_prediction_noop(self, task, claim, batch, tip, retained, notes, now):
         # A conservative prediction may turn out to be harmless. Keep the existing candidate
-        # and its CI rather than create an identical version and force another build.
+        # and its CI rather than create an identical version and force another build. A parallel
+        # check that found nothing to repair records the tip as verified when the worker's checks
+        # all passed on it (decision 174, step 4).
+        check = self._parallel_check(task) is not None
+        verified = self._locally_verified(notes, tip) and tip == batch["tip"]
         with self.store.transaction():
             self.store.update(
                 "tasks",
                 {"id": task["id"]},
                 state=TASK_SUBMITTED,
                 resolved_at=now,
-                resolution="prediction-unchanged",
+                resolution="parallel-check-clean" if check else "prediction-unchanged",
                 submissions=task["submissions"] + 1,
             )
+            if verified:
+                self.store.update("batches", {"id": batch["id"]}, verified_tip=tip)
+            if check:
+                self._count("parallel_checks_clean" if verified else "parallel_checks_unverified")
+                self.store.journal(
+                    now, "parallel-check-finished", batch["id"], task_id=task["id"], tip=tip, verified=verified
+                )
             for active in self._active_claims(batch["id"], task_id=task["id"]):
                 self._release_claim(active, "submitted" if active["id"] == claim["id"] else "superseded", now)
             self.store.insert(
@@ -4239,13 +4341,15 @@ class Controller:
             knowledge = [
                 dict(d, proactive=False, was_proactive=True)
                 for d in loads(task["diagnostics"], [])
-                if d.get("kind") == "admission_predictions"
+                if d.get("kind") in ("admission_predictions", PARALLEL_CHECK)
             ]
             self.store.update(
                 "tasks", {"id": task["id"]}, diagnostics=dumps([*loads(attempt["diagnostics"], []), *knowledge])
             )
-        elif attempt["outcome"] in (OUTCOME_INFRASTRUCTURE, OUTCOME_SUPERSEDED):
-            self._ci(head, now)  # speculative work must not disable the controller's retry policy
+        elif attempt["outcome"] in (OUTCOME_INFRASTRUCTURE, OUTCOME_SUPERSEDED) and head["base"] == self._canonical:
+            # Speculative work must not disable the controller's retry policy; a head behind `main` is
+            # rebased first, never dispatched again on its old base.
+            self._ci(head, now)
 
     # --- insertion ---------------------------------------------------------------------------------
 
@@ -6384,6 +6488,12 @@ class Controller:
         assert canonical is not None
         task_claims = [c for c in self._active_claims(head["id"]) if c["task_id"] is not None]
         if task_claims:
+            active = self._open_task(head)
+            if head["base"] != canonical and active is not None and self._proactive_check(active):
+                # The head is about to be rebased, so its tip changes: a parallel check of the old tip
+                # would only hold the rebase up. Take it back; the rebased tip gets its own check.
+                self._supersede_parallel_check(head, active, "head-rebasing", now)
+                return
             if head["base"] != canonical:
                 self._cancel_superseded_runs(head["id"], now, reason="canonical advanced; rebase waits for worker")
             # A speculative repair runs alongside its own candidate CI, whose observation
@@ -6425,6 +6535,9 @@ class Controller:
             return
         self._ci(head, now)
         self._schedule_predicted_repair(head, now)
+        head = self._head() or head
+        if head["state"] == BATCH_HEAD:
+            self._schedule_parallel_check(head, now)
 
     def _rebase_head(self, head: dict[str, Any], canonical: str, now: float) -> bool:
         """Replay the head onto the canonical commit; True when it is now based there."""

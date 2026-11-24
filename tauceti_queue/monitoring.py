@@ -861,6 +861,7 @@ def project(
                 "prepare_open_batches",
                 "pre_rebase_enabled",
                 "prepare_pre_rebased",
+                "parallel_check_enabled",
             )
             and (type(v) is bool or numeric(v) is not None)
         },

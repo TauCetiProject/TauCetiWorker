@@ -189,6 +189,9 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
         if kind == "prepare_errors":
             findings["prepare_errors"] = raw
             continue
+        if kind == "parallel_check":
+            findings["parallel_check"] = raw  # the head's parallel local check: no finding of its own
+            continue
         if kind == "pre_rebased_chain":
             continue  # the worker's input (`repair_task.seed_pre_rebased`), not a finding
         module = str(raw.get("module") or raw.get("path") or "")

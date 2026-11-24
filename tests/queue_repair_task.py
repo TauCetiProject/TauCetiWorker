@@ -5115,6 +5115,60 @@ exit 1
             repair_task.main(["--no-stream-repair", *common])
         self.assertEqual([cfg.stream_repair for cfg in seen], [True, False])
 
+    def parallel_check_task(self) -> dict:
+        """The head's parallel check: a ``repair`` task whose only diagnostic is a proactive check."""
+        raw = self.content.task(kind="repair")
+        raw["diagnostics"] = [{"kind": "parallel_check", "proactive": True, "attempt_id": 7, "message": "check"}]
+        raw["extra"] = {**raw["extra"], "renew_after": 0.2}
+        self.service.tasks = {1: raw}
+        return raw
+
+    def test_a_parallel_check_whose_build_is_clean_goes_to_verification_before_any_agent(self):
+        """The streamed build is clean, so the worker verifies the unchanged chain first; here the fixture's
+        full verification then fails, and only that failure reaches the agent."""
+        self.parallel_check_task()
+        self.script("✔ [1/3] Built TauCeti.One (0.1s)\n✔ [2/3] Built TauCeti.Two (0.1s)\nexit 0\n")
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertFalse(outcome["verification"][0]["ok"], "verified before any agent ran")
+        [call] = self.agent_calls()
+        self.assertIn("verification of the chain failed", call["prompt"])
+
+    def test_a_parallel_check_whose_verification_passes_is_submitted_unchanged(self):
+        raw = self.parallel_check_task()
+        self.script("✔ [1/3] Built TauCeti.One (0.1s)\n✔ [2/3] Built TauCeti.Two (0.1s)\nexit 0\n")
+        passed = {"ok": True, "checks": {"status": "passed"}, "build": {"rc": 0}, "diagnostics": []}
+        cfg = self.config()
+        with patch.object(repair_audit, "verify", return_value=passed):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(self.agent_calls(), [], "nothing failed: no agent")
+        [result] = self.service.results
+        self.assertEqual(result["tip_sha"], raw["tip"], "submitted unchanged")
+        local = json.loads(result["worker_notes"])["local_verification"]
+        self.assertEqual(local, {"tip": raw["tip"], "checks_passed": True})
+
+    def test_a_parallel_check_without_the_workers_own_verification_is_given_back(self):
+        self.parallel_check_task()
+        self.script("✔ [1/3] Built TauCeti.One (0.1s)\nexit 0\n")
+        cfg = self.config(worker_audits=False)
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual((outcome["status"], outcome["reason"]), ("released", "artifacts_unavailable"), outcome)
+        self.assertEqual(self.agent_calls(), [])
+        self.assertEqual(self.service.results, [])
+
+    def test_a_parallel_check_repairs_what_fails(self):
+        self.parallel_check_task()
+        self.script()
+        os.environ["STUB_AGENT_MODE"] = "stream"
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(len(self.agent_calls()), 1, "the streamed error goes to the agent")
+        [result] = self.service.results
+        self.assertNotEqual(result["tip_sha"], self.service.tasks[1]["tip"])
+
     def prepare_task(self) -> dict:
         """A ``prepare`` task: an open batch on its own base, not yet tried, so no diagnostics."""
         raw = self.content.task(kind="prepare")

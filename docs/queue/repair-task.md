@@ -332,7 +332,11 @@ a JSON string with the worker, the attempt number, the members whose provenance 
 seconds, the estimated inference cost (from the host agent's telemetry and `cost_model`), and
 `local_verification` (`{tip, checks_passed}`: whether the worker's latest verification of exactly
 the submitted tip ran every check and passed, `verified_unchanged`). The controller verifies and
-repairs the next batch only on a head tip with such a pass (decision 174). The
+repairs the next batch only on a head tip with such a pass (decision 174). A `repair` task whose
+`parallel_check` diagnostic is proactive (`parallel_check_task`, the head's parallel check while
+staging runs the same tip) skips the agent when the streamed build is clean, or when there is no
+streamed build, and goes straight to verification; it may submit the chain unchanged, and a failed
+verification runs the agent on its findings as usual. The
 response is recorded in the checkpoint and the outcome.
 
 ## Claims and the renewal heartbeat
