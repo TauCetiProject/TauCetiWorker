@@ -465,6 +465,10 @@ def build_drivers(
             return drivers, None
         shutil.rmtree(drivers, ignore_errors=True)
         drivers.mkdir(parents=True)
+        # `check` materializes the scripts in its host-only verifier directory, outside the worktree:
+        # without the bind the sandbox cannot see them (bash exits 127). The targeted lint keeps them
+        # in the worktree, which the sandbox already shows.
+        outside = not scripts.resolve().is_relative_to(worktree.resolve())
         run = _sandboxed(
             ["bash", "-c", DRIVER_SCRIPT, "build-drivers", scripts, worktree, drivers],
             worktree,
@@ -472,6 +476,7 @@ def build_drivers(
             None,
             log,
             timeout,
+            ro_binds=(scripts,) if outside else (),
         )
         if run["rc"] != 0 or not all(os.access(drivers / e, os.X_OK) for e in DRIVER_EXES):
             raise Unavailable(f"building the audit and lint drivers exited {run['rc']}: {_tail(run['output'])}")
