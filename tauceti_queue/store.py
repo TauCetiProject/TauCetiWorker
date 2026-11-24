@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS inputs (
     declaration_names TEXT NOT NULL DEFAULT '{}',
     declaration_fetch_attempts INTEGER NOT NULL DEFAULT 0,
     declaration_retry_at REAL NOT NULL DEFAULT 0,
-    blocked_labels TEXT NOT NULL DEFAULT '[]'
+    blocked_labels TEXT NOT NULL DEFAULT '[]',
+    main_integration TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS inputs_state ON inputs (repository, state);
 CREATE TABLE IF NOT EXISTS admission_work (

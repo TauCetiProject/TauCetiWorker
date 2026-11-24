@@ -234,6 +234,7 @@ class FakeGitHub:
         self.repository_labels: dict[str, tuple[str, str]] = {}
         self.closed: dict[int, str] = {}
         self.statuses: dict[tuple[str, str], Status] = {}
+        self.main_integration_requests: list[tuple[int, str, str]] = []
         self.declaration_records: dict[str, dict] = {}
         self.runs: list[FakeRun] = []
         # pr-build.yml's concurrency group with cancel-in-progress: a new dispatch for a candidate
@@ -595,6 +596,17 @@ class FakeGitHub:
         with self.lock:
             self._call("commit_status", sha, context)
             return self.statuses.get((sha, context))
+
+    def dispatch_main_integration(self, repo: str, *, pr: int, head_sha: str, main_sha: str) -> None:
+        """Records the request; a test posts the `main-integration` status itself (`post_status`)."""
+        with self.lock:
+            self._call("dispatch_main_integration", pr, head_sha, main_sha)
+            self.main_integration_requests.append((pr, head_sha, main_sha))
+
+    def main_integration_statuses(self, repo: str, heads) -> dict[str, Status | None]:
+        with self.lock:
+            self._call("main_integration_statuses", tuple(heads))
+            return {head: self.statuses.get((head, "main-integration")) for head in heads}
 
     def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         return self.fast_forward(repo, branch, expected_parent, tip)
