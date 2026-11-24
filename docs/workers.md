@@ -131,10 +131,12 @@ the queue while the rest of the pool works through long conflict rebases.
 
 Each host remembers which heads of a PR review sent back for a fix. Once review has
 sent back 6 earlier heads of a PR on a host and asks for changes again, the next worker
-there that confirms the fix on the live PR adds the `human` label instead of fixing, and
-the host's count for the PR starts again. Every worker treats `human` as a hold, so the
-whole fleet stops fixing and reviewing the PR until a person removes the label. On
-Forgejo the label must exist in the repository.
+there that confirms the fix on the live PR closes the PR instead of fixing it, if the
+fleet maintains it: the account's own PRs and adopted Forgejo authors' PRs. The closing
+comment says the branch is kept and that the `keep` label keeps the PR open. Any other
+PR the fleet fixes, such as a contributor's, stays open, and the host stops offering it
+fix rounds. The count is per host, so a PR fixed on several hosts can take more rounds
+before it closes.
 
 While GitHub is rejecting the account's comments and the host's publication pacer is
 backing off, a both-source worker offers GitHub reviews after all its other work,
