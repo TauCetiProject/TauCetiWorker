@@ -104,6 +104,32 @@ class Outputs(unittest.TestCase):
         self.assertFalse((pool / "outputs/TauCeti/4366fd23170e9e25.json").exists())
         self.assertFalse((self.lib / "Basic.trace").exists())
 
+    def test_archives_named_by_the_output_map_are_checked(self):
+        # A module's trace often has no "l" entry; `lake cache stage` copies the map's archives as is.
+        self.module("Basic", "4366fd23170e9e25", "a")
+        archive = fixture_hash(b"good archive") + ".ltar"
+        (self.artifacts / archive).write_bytes(b"truncated")
+        orphan = fixture_hash(b"orphan") + ".ltar"
+        (self.artifacts / orphan).write_bytes(b"truncated too")
+        (self.root / ".lake/outputs.jsonl").write_text(
+            '"2026-03-17"\n'
+            + json.dumps(["4366fd23170e9e25", archive])
+            + "\n"
+            + json.dumps(["2222222222222222", orphan])
+            + "\n"
+        )
+        (self.records / "2222222222222222.json").write_text("{}")
+        found = repair_outputs.damaged(self.root, {}, hasher=hasher)
+        self.assertEqual(
+            sorted((d["module"] or "", Path(d["path"]).name) for d in found),
+            sorted([("TauCeti.Flat.Basic", archive), ("", orphan)]),
+        )
+        self.assertEqual(repair_outputs.discard(self.root, found), 1)
+        for name in (archive, orphan):
+            self.assertFalse((self.artifacts / name).exists())
+        self.assertFalse((self.records / "2222222222222222.json").exists())
+        self.assertFalse((self.lib / "Basic.trace").exists())
+
     def test_an_unavailable_hasher_is_reported_not_raised(self):
         self.module("Basic", "4366fd23170e9e25", "a")
 

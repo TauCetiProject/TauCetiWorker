@@ -11,6 +11,8 @@ and the early publication uploaded them to the repair cache, from which staging 
 ``damaged`` hashes every root-package output (and the artifact cache's copy of the same name)
 with the toolchain's Lake hash, using the shared cache's native helper. ``discard`` removes each
 damaged module's build files and cache records, so the next build compiles it from source.
+Archives the final build's output map names are checked too. TauCeti does not use postponed
+compilation, whose IR outputs are not in the module trace, so those are not covered.
 """
 
 from __future__ import annotations
@@ -41,6 +43,7 @@ IR_EXTENSIONS = ("c", "bc", "ltar")
 MODULE_FILES = {"trace", "olean", "ilean", "ir", "c", "bc", "ltar", "setup", "log"}
 CHUNK = 2000  # files per helper call; the helper's own timeout is 45 s
 JOBS = 8
+DEADLINE = 900  # seconds for the whole check
 
 
 class Unavailable(RuntimeError):
@@ -86,6 +89,29 @@ def expected(worktree: Path) -> list[tuple[Path, object, list[tuple[Path, str]]]
     return modules
 
 
+def published_archives(worktree: Path) -> list[tuple[str, str]]:
+    """The (input hash, archive name) rows of the final build's native output map, if any."""
+    try:
+        lines = (worktree / ".lake/outputs.jsonl").read_text().splitlines()
+    except OSError:
+        return []
+    rows = []
+    for line in lines[1:]:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            isinstance(row, list)
+            and len(row) == 2
+            and all(isinstance(v, str) for v in row)
+            and NAME.fullmatch(row[0])
+            and re.fullmatch(NAME.pattern + r"\.ltar", row[1])
+        ):
+            rows.append((row[0], row[1]))
+    return rows
+
+
 def native_hashes(worktree: Path, env: dict, paths: list[Path]) -> dict[str, str]:
     """The Lake hash of each path from the shared cache's native helper, in parallel chunks."""
     if not paths:
@@ -97,12 +123,19 @@ def native_hashes(worktree: Path, env: dict, paths: list[Path]) -> dict[str, str
             directories = [Path(scratch) / str(index) for index in range(len(chunks))]
             for directory in directories:
                 directory.mkdir()
-            with concurrent.futures.ThreadPoolExecutor(JOBS) as pool:
-                results = pool.map(
-                    lambda pair: expanded_cache.hashes(program, *pair), zip(chunks, directories, strict=True)
-                )
-                hashes = {path: value for result in results for path, value in result.items()}
-    except (OSError, ValueError, TypeError, subprocess.SubprocessError) as error:
+            pool = concurrent.futures.ThreadPoolExecutor(JOBS)
+            try:
+                futures = [
+                    pool.submit(expanded_cache.hashes, program, chunk, directory)
+                    for chunk, directory in zip(chunks, directories, strict=True)
+                ]
+                hashes = {}
+                for future in concurrent.futures.as_completed(futures, timeout=DEADLINE):
+                    hashes.update(future.result())
+            finally:
+                # A failure cancels the chunks not yet started; running ones end within their 45 s.
+                pool.shutdown(wait=True, cancel_futures=True)
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError, concurrent.futures.TimeoutError) as error:
         raise Unavailable(f"{type(error).__name__}: {error}") from error
     if len(hashes) != len(paths):
         raise Unavailable("incomplete output hashes")
@@ -120,31 +153,36 @@ def damaged(worktree: Path, env: dict, *, hasher=None) -> list[dict]:
     worktree = worktree.resolve()
     artifacts = cache_dir(worktree, env) / "artifacts"
     modules = expected(worktree)
-    paths: list[Path] = []
-    for _, _, pairs in modules:
-        for path, name in pairs:
-            paths.append(path)
-            if _regular(artifacts / name):
-                paths.append(artifacts / name)
-    paths = list(dict.fromkeys(paths))
-    hashes = (hasher or (lambda items: native_hashes(worktree, env, items)))(paths)
-    found = []
+    stems = {dep_hash: stem for stem, dep_hash, _ in modules if isinstance(dep_hash, str)}
+    checks: list[tuple[Path | None, object, Path, str]] = []
     for stem, dep_hash, pairs in modules:
         for path, name in pairs:
-            for candidate in (path, artifacts / name):
-                actual = hashes.get(str(candidate))
-                if actual is not None and actual != name.split(".", 1)[0]:
-                    found.append(
-                        dict(
-                            module=str(stem).replace(os.sep, "."),
-                            stem=str(stem),
-                            dep_hash=dep_hash,
-                            path=str(candidate),
-                            expected=name,
-                            actual=actual,
-                            size=candidate.stat().st_size,
-                        )
-                    )
+            checks.append((stem, dep_hash, path, name))
+            if _regular(artifacts / name):
+                checks.append((stem, dep_hash, artifacts / name, name))
+    # `lake cache stage` copies the archives the output map names without reading them, and a
+    # module's trace often has no "l" entry for its archive.
+    for dep_hash, name in published_archives(worktree):
+        if _regular(artifacts / name):
+            checks.append((stems.get(dep_hash), dep_hash, artifacts / name, name))
+    paths = list(dict.fromkeys(path for _, _, path, _ in checks))
+    hashes = (hasher or (lambda items: native_hashes(worktree, env, items)))(paths)
+    found, seen = [], set()
+    for stem, dep_hash, path, name in checks:
+        actual = hashes.get(str(path))
+        if actual is not None and actual != name.split(".", 1)[0] and (path, name) not in seen:
+            seen.add((path, name))
+            found.append(
+                dict(
+                    module=str(stem).replace(os.sep, ".") if stem is not None else None,
+                    stem=str(stem) if stem is not None else None,
+                    dep_hash=dep_hash,
+                    path=str(path),
+                    expected=name,
+                    actual=actual,
+                    size=path.stat().st_size,
+                )
+            )
     return found
 
 
@@ -163,9 +201,13 @@ def discard(worktree: Path, found: list[dict], env: dict | None = None) -> int:
         path = Path(item["path"])
         if path.parent == artifacts:
             path.unlink(missing_ok=True)
-        stem = Path(item["stem"])
-        if item["stem"] in removed:
+        dep_hash = item.get("dep_hash")
+        if isinstance(dep_hash, str) and NAME.fullmatch(dep_hash) and records.is_dir():
+            for record in records.glob(f"*/{dep_hash}.json"):
+                record.unlink(missing_ok=True)
+        if item["stem"] is None or item["stem"] in removed:
             continue
+        stem = Path(item["stem"])
         removed.add(item["stem"])
         for root in (lib, ir):
             directory = (root / stem).parent
@@ -176,10 +218,6 @@ def discard(worktree: Path, found: list[dict], env: dict | None = None) -> int:
                 if entry.name.startswith(stem.name + ".") and not entry.is_dir():
                     if entry.name[len(stem.name) + 1 :].split(".", 1)[0] in MODULE_FILES:
                         entry.unlink(missing_ok=True)
-        dep_hash = item.get("dep_hash")
-        if isinstance(dep_hash, str) and NAME.fullmatch(dep_hash) and records.is_dir():
-            for record in records.glob(f"*/{dep_hash}.json"):
-                record.unlink(missing_ok=True)
     return len(removed)
 
 

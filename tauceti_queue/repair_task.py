@@ -3319,6 +3319,15 @@ def _run_task(
                         f"task {task.task_id}: the reused tree had {checked['damaged_count']} damaged output(s); "
                         f"rebuilding {checked['removed_modules']} module(s)"
                     )
+                elif not checked.get("checked"):
+                    # Unverified outputs are not reused: restore the root package's build afresh.
+                    log(
+                        f"task {task.task_id}: the reused tree's outputs could not be checked "
+                        f"({checked.get('reason')}); restoring its build afresh"
+                    )
+                    shutil.rmtree(worktree / ".lake/build", ignore_errors=True)
+                    warm = False
+                    outcome["sources"]["batch_tree"] = "adopted" if parked_at else "new"
             if cfg.seed_packages:
                 repair.link_shared_packages(worktree, cfg.seed_packages)
             state.write("sources_ready", worktree=str(worktree), sources=outcome["sources"])
