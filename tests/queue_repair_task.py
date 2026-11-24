@@ -533,7 +533,16 @@ env.update(extra)
 env["PATH"] = f"{here}:{env.get('PATH', '')}"
 if cwd:
     os.chdir(cwd)
-os.execvpe(args[split + 1], args[split + 1 :], env)
+command = args[split + 1 :]
+if command[:2] == ["sh", "-c"] and command[2].startswith("for p; do"):
+    # The preflight's credential probe: emulate the mounts, keeping only paths a bind would show.
+    pairs = [(a, args[i + 1], args[i + 2]) for i, a in enumerate(args[:split]) if a in ("--ro-bind", "--bind")]
+    masks = [args[i + 1] for i, a in enumerate(args[:split]) if a == "--tmpfs"]
+    masks += [target for flag, source, target in pairs if source == "/dev/null"]
+    under = lambda path, roots: any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+    shown = [target for _, source, target in pairs if source != "/dev/null"]
+    command = command[:4] + [p for p in command[4:] if under(p, shown) and not under(p, masks)]
+os.execvpe(command[0], command, env)
 '''.replace("PYTHON", sys.executable)
 
 LEAN = r"""#!/bin/sh
