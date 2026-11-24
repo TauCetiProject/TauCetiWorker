@@ -99,6 +99,7 @@ RUN_STDLIB=(
   local_lint.py
   lean_pressure.py
   repair_pressure.py
+  repair_agent_tools.py
   repair_parallel_fold.py
   round_storage.py
   shared_mathlib.py

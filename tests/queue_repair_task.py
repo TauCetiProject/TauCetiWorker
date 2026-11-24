@@ -4955,7 +4955,8 @@ class SandboxedBuilds(Fixture):
         by_name = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
         self.assertTrue(by_name["build sandbox"]["ok"], by_name["build sandbox"])
         self.assertIn(str(BIN / "bwrap"), by_name["build sandbox"]["detail"])
-        self.assertEqual(self.bwrap_calls()[-1]["argv"][-2:], ["--", "true"])
+        probe = self.bwrap_calls()[-1]["argv"]
+        self.assertEqual(probe[probe.index("--") + 1 :][:4], ["sh", "-c", repair_sandbox._CREDENTIAL_PROBE, "sh"])
         (BIN / "sandbox-env.json").write_text("{}")  # the stub now fails, as a broken bwrap would
         by_name = {c["check"]: c for c in repair_task.preflight(self.config(token=None), min_free_gib=0)}
         self.assertFalse(by_name["build sandbox"]["ok"])
