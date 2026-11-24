@@ -202,6 +202,29 @@ class GitHubPauseTests(unittest.TestCase):
             admit.assert_called_once()
             status.assert_called_once_with(publication_pending_count=1)
 
+    def test_publication_switches_are_set_before_recovery(self):
+        from tauceti_worker import github_outbox
+
+        seen = []
+        with (
+            patch.dict(os.environ),
+            patch.object(
+                github_outbox,
+                "drain",
+                side_effect=lambda: (
+                    seen.append((os.environ.get("TAUCETI_REACTIONS"), os.environ.get("TAUCETI_STUCK_ISSUES"))) or []
+                ),
+            ),
+            patch.object(cli, "configure_api", side_effect=NoProgress("reached admission")),
+            patch.object(cli, "report_runtime"),
+        ):
+            os.environ.pop("TAUCETI_REACTIONS", None)
+            os.environ.pop("TAUCETI_STUCK_ISSUES", None)
+            args = SimpleNamespace(dry_run=False, reactions=False, stuck_issues=False)
+            with self.assertRaises(NoProgress):
+                cli.cmd_work(args, only=["review"], agent="claude", one_round=True)
+        self.assertEqual(seen, [("0", "0")])
+
     def drive(self, codes, retry_at):
         args = cli.build_parser().parse_args(["work", "--agent", "claude", "--claude-billing", "api", "--loop"])
         waits, statuses = [], []
