@@ -731,17 +731,33 @@ class ControllerFeedSource:
         ):
             state = "running"
         sealed = bool(row["sealed"])
+        head_sha, base_sha = (row["tip"], row["base"]) if sealed else (None, None)
+        if (
+            row["state"] == "open"
+            and sealed
+            and latest is not None
+            and latest.get("early") == 1
+            and latest.get("outcome") == "pending"
+            and latest.get("cancelled_at") is None
+        ):
+            # Decisions 199 B and 200: the next batch's trusted run of its prepared tip on the head's
+            # tip, sent before it is the head. pr-build resolves and revalidates it here, so the batch
+            # is `running` with exactly that tip and base, and stops being so once it is cancelled.
+            state, head_sha, base_sha = "running", latest["head_sha"], latest["base_sha"]
+        generation = None
+        if latest is not None:
+            generation = int(latest["batch_version"] if latest.get("generation") is None else latest["generation"])
         return BatchView(
             id=int(row["id"]),
             base=self._branch(),
             state=state,
             sealed=sealed,
-            head_sha=row["tip"] if sealed else None,
-            base_sha=row["base"] if sealed else None,
+            head_sha=head_sha,
+            base_sha=base_sha,
             members=self._members(row["id"], inputs),
             candidate_id=int(latest["id"]) if latest else None,
-            generation=int(latest["batch_version"]) if latest else None,
-            staging_ref=self.controller.staging_candidate_ref(int(latest["id"]), int(latest["batch_version"]))
+            generation=generation,
+            staging_ref=self.controller.staging_candidate_ref(int(latest["id"]), generation)
             if latest and hasattr(self.controller, "staging_candidate_ref")
             else None,
             promotion_failures=int(row.get("promotion_failures") or 0),

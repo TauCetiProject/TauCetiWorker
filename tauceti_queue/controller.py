@@ -204,6 +204,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # and the repaired tip is staged in place of the running one (decision 172 A, 174 step 4). Off by
     # default: production turns it on as a runtime setting, which is also its off switch.
     "parallel_check_enabled": False,
+    # Decisions 199 B and 200: once the next batch's preparation on the head's tip is adopted with a
+    # passing local verification, send its trusted run for exactly that tip at once, based on the
+    # head's tip, and adopt that run when the batch seals as that tip (`_early_staging`). Off: the
+    # batch is dispatched when it becomes the head, as before; turning it off cancels live early runs.
+    "early_staging_enabled": False,
+    # How many early runs of one prepared tip may end as infrastructure failures before the batch
+    # waits to be staged as the head.
+    "early_staging_infrastructure_retries": 1,
     # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
     # `problem-anticipated` (`_anticipate`).
@@ -367,6 +375,12 @@ OUTCOME_PASS = "pass"
 OUTCOME_SOURCE_FAILURE = "source-failure"
 OUTCOME_INFRASTRUCTURE = "infrastructure"
 OUTCOME_SUPERSEDED = "superseded"
+# `ci_attempts.early`: 0 an ordinary head attempt; 1 the trusted run of an open batch's prepared tip,
+# sent before it is the head (`_early_staging`); 2 such a run the batch adopted when it sealed as that tip.
+EARLY_PENDING = 1
+EARLY_ADOPTED = 2
+# `ci_attempts.dispatch_kind`: the trusted workflow an attempt was sent as.
+DISPATCH_STAGING = "staging"
 # Run statuses GitHub reports for a run that has not finished: such a run is never re-dispatched over.
 LIVE_RUN_STATUSES = ("queued", "in_progress", "waiting", "requested", "pending")
 # The detail of an in-progress run declared lost after a direct read confirmed it stale. Such a run is
@@ -1850,6 +1864,12 @@ class Controller:
             or (payload.get("check_suite") or {}).get("head_sha")
             or (payload.get("workflow_run") or {}).get("head_sha")
         )
+        if sha:
+            # An early run (`_early_staging`) is observed as promptly as the head's own.
+            self.store.execute(
+                "UPDATE ci_attempts SET needs_observation=1 WHERE early=? AND outcome=? AND head_sha=?",
+                (EARLY_PENDING, OUTCOME_PENDING, sha),
+            )
         head = self._head()
         if head is None:
             return
@@ -3875,6 +3895,7 @@ class Controller:
             self._pre_rebase,
             self._prepare_open_batches,
             self._prepare_pre_rebased,
+            self._early_staging,
             self._republish_retained_refs,
         ):
             offer()
@@ -7871,6 +7892,7 @@ class Controller:
                 verified_tip=tip if verified else None,
             )
             self._record_tip(head["id"], version, tip, now)
+            early = self._adopt_early_attempt(head, version, tip, canonical, now) if verified else None
             self._set_pre_rebase(head, "", now)
             for stale in self.store.rows("tasks", {"batch_id": head["id"], "state": TASK_OPEN}):
                 self.store.update(
@@ -7889,8 +7911,251 @@ class Controller:
                 landed_on_base=landed_on_base,
                 pre_rebased=True,
                 verified=verified,
+                early_attempt=early,
             )
         return True
+
+    # --- early staging (decisions 199 B and 200) ---------------------------------------------------
+
+    def _early_attempts(self, *, batch_id: int | None = None) -> list[dict[str, Any]]:
+        """Unadopted early attempts, oldest first: every batch's, or `batch_id`'s."""
+        sql = "SELECT * FROM ci_attempts WHERE early=?"
+        params: tuple[Any, ...] = (EARLY_PENDING,)
+        if batch_id is not None:
+            sql += " AND batch_id=?"
+            params += (batch_id,)
+        return self.store.query(sql + " ORDER BY id", params)
+
+    @staticmethod
+    def _early_view(batch: dict[str, Any], attempt: dict[str, Any]) -> dict[str, Any]:
+        """The batch as its early attempt sees it: the prepared tip on the head's tip. The CI code
+        reads a head's id, version, tip and base; an early run is observed and sent through it."""
+        return dict(batch, tip=attempt["head_sha"], base=attempt["base_sha"], version=attempt["batch_version"])
+
+    def _early_dispatch_kind(self, batch: dict[str, Any]) -> str:
+        """The trusted workflow an early attempt of `batch` is sent as."""
+        return DISPATCH_STAGING
+
+    def _early_staging(self, now: float) -> None:
+        """Send the trusted run of the next batch's prepared tip while the head is still staging.
+
+        When the oldest open batch's preparation on the head's tip has been adopted with a passing
+        local verification of exactly the chain the batch seals as (174 step 3 froze its members),
+        the run is dispatched for that tip, based on the head's tip, as an `early` attempt of the
+        batch at its current version. Pending early attempts are observed here, and cancelled once
+        they stop describing what the batch will seal as (`_early_invalid`). When the head lands as
+        that base, the batch seals as exactly that tip and adopts the attempt
+        (`_adopt_early_attempt`): a pass is promoted at once and a source failure goes straight to
+        the head's repair. Off (`early_staging_enabled`) nothing is sent and live runs are cancelled.
+        """
+        for attempt in self._early_attempts():
+            if attempt["outcome"] != OUTCOME_PENDING or attempt["cancelled_at"] is not None:
+                continue
+            batch = self.store.row("batches", {"id": attempt["batch_id"]})
+            reason = self._early_invalid(batch, attempt)
+            if reason is not None:
+                self._cancel_early(attempt, reason, now)
+                continue
+            assert batch is not None
+            self._advance_attempt(self._early_view(batch, attempt), attempt, now)
+            current = self.store.row("ci_attempts", {"id": attempt["id"]}) or attempt
+            if current["outcome"] != OUTCOME_PENDING:
+                with self.store.transaction():
+                    self.store.journal(
+                        now,
+                        "early-staging-verdict",
+                        batch["id"],
+                        attempt_id=attempt["id"],
+                        outcome=current["outcome"],
+                        tip=attempt["head_sha"],
+                        onto=attempt["base_sha"],
+                    )
+        if not self.setting("early_staging_enabled") or self._state("inference_hold"):
+            return
+        batch = self._open_batch()
+        if batch is None:
+            return
+        head = self._head()
+        if self._early_staging_blocked(batch, head) is not None:
+            return
+        assert head is not None
+        self._dispatch_early(batch, head, now)
+
+    def _early_staging_blocked(self, batch: dict[str, Any], head: dict[str, Any] | None) -> str | None:
+        """Why the open batch's prepared tip is not sent early now; None when it is."""
+        if not self.setting("publication_enabled"):
+            return "publication disabled"
+        if not batch["sealed"] or batch["urgent"] == URGENT_EMERGENCY or batch["lane"] == LANE_CONTROL:
+            return "not a sealed ordinary batch"
+        if self._candidate_coordinator(batch_id=batch["id"]) is not None or self._mixed_inert_batch(batch):
+            return "source-candidate CI"
+        if any(isinstance(m["number"], SourceNumber) for m in self._members(batch["id"])):
+            return "native members"
+        if head is None:
+            return "no head: the batch is staged when it seals"
+        if head["urgent"] == URGENT_EMERGENCY or head["lane"] == LANE_CONTROL:
+            # A lane head changes the trusted tooling a run sent before it lands would use; an
+            # emergency head is out of order.
+            return f"head {head['id']} is not an ordinary batch"
+        if head["base"] != self._canonical or not self._head_tip_verified(head):
+            return f"head {head['id']}'s tip is not known-good on {self.canonical_branch}"
+        attempt = self._current_attempt(head)
+        if (
+            attempt is None
+            or attempt["head_sha"] != head["tip"]
+            or attempt["dispatch_state"] in {"prepared", "rejected"}
+            or attempt["outcome"] not in (OUTCOME_PENDING, OUTCOME_PASS)
+        ):
+            return f"head {head['id']} is not staging its tip"
+        tip, onto = batch["pre_rebase_tip"], batch["pre_rebase_onto"]
+        if (
+            batch["pre_rebase_state"] not in PRE_REBASE_USABLE
+            or not tip
+            or onto != head["tip"]
+            or batch["pre_rebase_source"] != batch["tip"]
+            or batch["pre_rebase_verified"] != tip
+        ):
+            return "no verified preparation of the whole batch on the head's tip"
+        if self.store.row("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}) is not None:
+            return "the batch has an open task"
+        if self._active_claims(batch["id"]):
+            return "the batch is claimed"
+        failures = 0
+        for previous in self._early_attempts(batch_id=batch["id"]):
+            if (previous["head_sha"], previous["base_sha"]) != (tip, onto):
+                continue
+            if previous["outcome"] in (OUTCOME_PENDING, OUTCOME_PASS, OUTCOME_SOURCE_FAILURE):
+                return f"early attempt {previous['id']} already covers this tip"
+            if previous["outcome"] == OUTCOME_INFRASTRUCTURE:
+                failures += 1
+                due = (previous["last_observed_at"] or previous["dispatched_at"]) + int(
+                    self.setting("infrastructure_retry_backoff_seconds")
+                )
+                if self.clock() < due:
+                    return f"early attempt {previous['id']} failed on infrastructure; retry at {due:.0f}"
+        if failures > int(self.setting("early_staging_infrastructure_retries")):
+            return "early runs of this tip failed on infrastructure; it is staged as the head"
+        return None
+
+    def _early_invalid(self, batch: dict[str, Any] | None, attempt: dict[str, Any]) -> str | None:
+        """Why a pending early attempt no longer describes what its batch will seal as; None while it
+        does: the batch is open and sealed at the attempt's version with exactly this verified
+        pre-rebase, and the head is still staging the attempt's base (or has landed as it)."""
+        if not self.setting("early_staging_enabled"):
+            return "early staging turned off"
+        if batch is None or batch["state"] != BATCH_OPEN or not batch["sealed"]:
+            return "the batch is no longer the sealed next batch"
+        if batch["version"] != attempt["batch_version"]:
+            return "the batch changed"
+        tip, onto = attempt["head_sha"], attempt["base_sha"]
+        if (
+            batch["pre_rebase_tip"] != tip
+            or batch["pre_rebase_onto"] != onto
+            or batch["pre_rebase_verified"] != tip
+            or batch["pre_rebase_source"] != batch["tip"]
+        ):
+            return "the batch's prepared tip changed"
+        head = self._head()
+        if head is None:
+            return None if self._canonical == onto else f"{self.canonical_branch} moved past the base"
+        if head["tip"] != onto:
+            return f"head {head['id']}'s tip moved"
+        if self._tip_failed(onto):
+            return f"head {head['id']} failed CI on the source"
+        current = self._current_attempt(head)
+        if (
+            current is not None
+            and not attempt["run_started_at"]
+            and (current["outcome"] == OUTCOME_INFRASTRUCTURE or current["id"] > attempt["id"])
+        ):
+            # One staging slot: a queued early run would hold up the head's re-run. It is sent again
+            # behind it.
+            return f"head {head['id']} needs a re-run ahead of a queued early run"
+        return None
+
+    def _cancel_early(self, attempt: dict[str, Any], reason: str, now: float) -> None:
+        with self.store.transaction():
+            self._count("early_staging_cancelled")
+            self.store.journal(
+                now,
+                "early-staging-cancelled",
+                attempt["batch_id"],
+                attempt_id=attempt["id"],
+                tip=attempt["head_sha"],
+                onto=attempt["base_sha"],
+                reason=reason,
+            )
+        self._cancel_superseded_runs(attempt["batch_id"], now, reason=f"early run: {reason}", only=attempt["id"])
+
+    def _dispatch_early(self, batch: dict[str, Any], head: dict[str, Any], now: float) -> None:
+        tip, onto = batch["pre_rebase_tip"], batch["pre_rebase_onto"]
+        revs: list[str] = []
+        for sha in (onto, *self._previous_tips(head), head["base"], self._canonical):
+            if sha and sha != tip and sha not in revs:
+                revs.append(sha)
+        kind = self._early_dispatch_kind(batch)
+        self._retain(self.pre_rebased_ref(batch["id"], tip), tip)
+        with self.store.transaction():
+            attempt_id = self.store.insert(
+                "ci_attempts",
+                batch_id=batch["id"],
+                batch_version=batch["version"],
+                head_sha=tip,
+                base_sha=onto,
+                base_ref=self.canonical_branch,
+                dispatched_at=now,
+                last_progress_at=now,
+                repair_outputs_revs=dumps(revs),
+                request_id=secrets.token_hex(16),
+                dispatch_state="prepared",
+                early=EARLY_PENDING,
+                # Positive, as pr-build's train identity requires; also the version the batch seals at.
+                generation=batch["version"] + 1,
+                dispatch_kind=kind,
+            )
+            self._count("early_staging_dispatches")
+            self.store.journal(
+                now,
+                "early-staging-dispatched",
+                batch["id"],
+                attempt_id=attempt_id,
+                version=batch["version"],
+                tip=tip,
+                onto=onto,
+                head_id=head["id"],
+                dispatch_kind=kind,
+            )
+        attempt = self.store.row("ci_attempts", {"id": attempt_id})
+        assert attempt is not None
+        self._send_prepared(self._early_view(batch, attempt), attempt, now)
+
+    def _adopt_early_attempt(self, batch: dict[str, Any], version: int, tip: str, base: str, now: float) -> int | None:
+        """At the seal of `batch` as exactly the verified `tip` on `base` (`_seal_from_pre_rebase`, in its
+        transaction): make the early attempt for that tip and base the head's attempt at `version`.
+        Not one cancelled, being cancelled, superseded or failed on infrastructure. Returns its id."""
+        for attempt in reversed(self._early_attempts(batch_id=batch["id"])):
+            if (
+                (attempt["head_sha"], attempt["base_sha"]) != (tip, base)
+                or attempt["cancelled_at"] is not None
+                or self._cancelling(attempt)
+                or attempt["outcome"] not in (OUTCOME_PENDING, OUTCOME_PASS, OUTCOME_SOURCE_FAILURE)
+            ):
+                continue
+            self.store.update("ci_attempts", {"id": attempt["id"]}, batch_version=version, early=EARLY_ADOPTED)
+            if batch["first_dispatch_at"] is None and attempt["sent_at"] is not None:
+                self.store.update("batches", {"id": batch["id"]}, first_dispatch_at=attempt["sent_at"])
+            self._count("early_staging_adopted")
+            self.store.journal(
+                now,
+                "early-staging-adopted",
+                batch["id"],
+                attempt_id=attempt["id"],
+                version=version,
+                tip=tip,
+                outcome=attempt["outcome"],
+            )
+            return attempt["id"]
+        return None
 
     # --- CI ----------------------------------------------------------------------------------------
 
@@ -8438,7 +8703,9 @@ class Controller:
             if a["cancelled_at"] is not None and a["run_id"]
         }
 
-    def _cancel_superseded_runs(self, batch_id: int, now: float, *, reason: str, by: int | None = None) -> None:
+    def _cancel_superseded_runs(
+        self, batch_id: int, now: float, *, reason: str, by: int | None = None, only: int | None = None
+    ) -> None:
         """Cancel the run of every attempt of the batch other than `by` that is still live as last observed.
 
         Called after a new attempt `by` is dispatched, and after the batch lands, is removed or has its
@@ -8448,11 +8715,13 @@ class Controller:
         run lookup or cancel request leaves a durable cancel intent (`_write_cancel_intent`), retried
         with backoff until the run is settled (`_settle_cancel_intents`); it never holds anything back.
         The attempt is recorded as cancelled either way, so observation and the re-adoption of live
-        runs leave its run alone.
+        runs leave its run alone. `only` limits all this to that one attempt (an invalid early run).
         """
         adopted = self.store.row("ci_attempts", {"id": by}) if by is not None else None
         protected_run = adopted["run_id"] if adopted is not None else None
         for attempt in self.store.rows("ci_attempts", {"batch_id": batch_id}, order="id"):
+            if only is not None and attempt["id"] != only:
+                continue
             if (
                 self.candidate_ci is None
                 and self.mixed_ci is None
@@ -8751,7 +9020,10 @@ class Controller:
             return
         repair_outputs_revs = loads(attempt["repair_outputs_revs"], [])
         members = [m["number"] for m in self._members(head["id"])]
-        branch = self.staging_candidate_ref(attempt_id, head["version"])
+        # An early attempt keeps the branch name it was sent under after its batch adopts it at a
+        # later version (`ci_attempts.generation`).
+        generation = attempt.get("generation")
+        branch = self.staging_candidate_ref(attempt_id, head["version"] if generation is None else generation)
         sending = False
         try:
             # The candidate exists only in the service's clone until it is retained on GitHub; CI checks it
@@ -8774,7 +9046,11 @@ class Controller:
                 if not self.setting("publication_enabled"):
                     return
             else:
-                retained_ref = self.batch_ref(head["id"], head["version"])
+                retained_ref = (
+                    self.pre_rebased_ref(head["id"], head["tip"])
+                    if attempt.get("early") == EARLY_PENDING
+                    else self.batch_ref(head["id"], head["version"])
+                )
                 retained = self.store.row("outbox", {"key": f"retain:{retained_ref}:{head['tip']}"})
                 if retained is None or retained["state"] != "done":
                     self.source.update_ref(self.repository, retained_ref, head["tip"])
@@ -8887,7 +9163,7 @@ class Controller:
             )
             if not changed:
                 return
-            if head["first_dispatch_at"] is None:
+            if head["first_dispatch_at"] is None and current.get("early") != EARLY_PENDING:
                 self.store.update(
                     "batches",
                     {"id": head["id"], "first_dispatch_at": None},
@@ -11647,6 +11923,25 @@ class Controller:
             **self._preparation_status(batch, members, now),
             "pre_rebase": self._pre_rebase_status(batch),
             "background": self._background_status(batch, now),
+            "early_staging": self._early_status(batch),
+        }
+
+    def _early_status(self, batch: dict[str, Any]) -> dict[str, Any] | None:
+        """The batch's latest early attempt (`_early_staging`), or None."""
+        attempts = self._early_attempts(batch_id=batch["id"])
+        if not attempts:
+            return None
+        attempt = attempts[-1]
+        return {
+            "attempt_id": attempt["id"],
+            "kind": attempt["dispatch_kind"],
+            "tip": attempt["head_sha"],
+            "onto": attempt["base_sha"],
+            "run_id": attempt["run_id"],
+            "run_status": attempt["run_status"],
+            "outcome": attempt["outcome"],
+            "cancelled": attempt["cancelled_at"] is not None,
+            "html_url": attempt["html_url"],
         }
 
     def _background_status(self, batch: dict[str, Any], now: float) -> dict[str, Any]:

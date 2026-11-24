@@ -862,6 +862,7 @@ def project(
                 "pre_rebase_enabled",
                 "prepare_pre_rebased",
                 "parallel_check_enabled",
+                "early_staging_enabled",
             )
             and (type(v) is bool or numeric(v) is not None)
         },
