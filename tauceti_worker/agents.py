@@ -898,11 +898,11 @@ def _finish_checkout(cfg: Config, co: Path) -> bool:
     return True
 
 
-def _fetch_shallow(url: str, dir: Path) -> bool:
-    """Clone or refresh a worker-owned shallow checkout and make its origin fetch-only."""
+def _fetch_shallow(url: str, dir: Path, *, ref: str = "HEAD") -> bool:
+    """Clone or refresh a worker-owned shallow checkout of `ref` and make its origin fetch-only."""
     if (dir / ".git").is_dir():
         ok = (
-            subprocess.run(["git", "-C", str(dir), "fetch", "-q", "--depth", "1", "origin", "HEAD"]).returncode == 0
+            subprocess.run(["git", "-C", str(dir), "fetch", "-q", "--depth", "1", "origin", ref]).returncode == 0
             and subprocess.run(["git", "-C", str(dir), "reset", "-q", "--hard", "FETCH_HEAD"]).returncode == 0
         )
         clean = subprocess.run(["git", "-C", str(dir), "clean", "-fdxq"]).returncode == 0
@@ -912,19 +912,21 @@ def _fetch_shallow(url: str, dir: Path) -> bool:
 
     shutil.rmtree(dir, ignore_errors=True)
     dir.parent.mkdir(parents=True, exist_ok=True)
-    cloned = subprocess.run(["git", "clone", "-q", "--depth", "1", "--", url, str(dir)]).returncode == 0
+    branch = [] if ref == "HEAD" else ["--branch", ref]
+    cloned = subprocess.run(["git", "clone", "-q", "--depth", "1", *branch, "--", url, str(dir)]).returncode == 0
     return (
         cloned and subprocess.run(["git", "-C", str(dir), "config", "remote.origin.pushurl", "no_push"]).returncode == 0
     )
 
 
-def fetch_ref(repo: str, dir: Path) -> bool:
-    """Worker-owned throwaway shallow mirror of repo's default branch (reset hard, clean)."""
+def fetch_ref(repo: str, dir: Path, *, ref: str = "HEAD") -> bool:
+    """Worker-owned throwaway shallow mirror of repo's default branch, or of branch `ref` (reset
+    hard, clean). `ref` is not used for the shared roadmap and review repositories."""
     if repo in (ROADMAP, REVIEW):
         from .shared_repositories import attach
 
         return attach(repo, dir, ttl=3600 if repo == ROADMAP else 900)
-    return _fetch_shallow(f"https://github.com/{repo}", dir)
+    return _fetch_shallow(f"https://github.com/{repo}", dir, ref=ref)
 
 
 def fetch_git_source(url: str, dir: Path) -> bool:
