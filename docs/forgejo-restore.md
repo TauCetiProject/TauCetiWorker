@@ -88,7 +88,7 @@ The plan contains:
   `tauceti-main-sync`;
 - every other ref in the mirror's base namespace: branches, tags, `refs/tauceti-claims/*`,
   `tauceti-ci/*`. It never includes `refs/pull/*`, which Forgejo regenerates when a PR branch is
-  pushed, or the mirror's `refs/forks/*` and staging refs;
+  pushed, `refs/tauceti-fork-heads/*` (below), or the mirror's `refs/forks/*` and staging refs;
 - for each open PR from the base repository whose branch the mirror lacks, the fleet's copies in
   its shared repositories (`refs/tauceti/published/push/<branch>`, `refs/remotes/prscan/<N>`,
   `refs/remotes/origin/<branch>`). When they disagree it takes the copy that descends from all the
@@ -137,8 +137,9 @@ python3 -I ~/.local/share/tauceti-forgejo-mirror/bin/forgejo_restore.py pull-ref
 
 `pull-refs` alone only reports. It fetches each head from its fork and publishes it only if the
 fork branch is still at the PR's head. Once the fork branch is pushed again, Forgejo writes the
-pull ref, and `pull-refs --prune` deletes fork-head refs that no open PR needs. The mirror copies
-`refs/tauceti-fork-heads/*` like any other base ref, so a later restore brings them back.
+pull ref, and `pull-refs --prune` deletes fork-head refs that no open PR needs. `restore` never
+pushes `refs/tauceti-fork-heads/*`, even though the mirror copies them: `pull-refs --publish`
+recreates them from the forks' current branches.
 
 If a fork lost refs too, `forgejo_restore.py --fork OWNER[/NAME] restore` restores it from the
 mirror's `refs/forks/OWNER/*`, with a token that can write to that fork (`--user`, `--token-file`).

@@ -456,9 +456,25 @@ class RestoreTests(unittest.TestCase):
         self.assertIn("by refs/tauceti-fork-heads/N 1", out)
         # A push to the fork branch rewrites the pull ref; the fork-head ref is then surplus.
         self.put(self.target, "refs/pull/5/head", self.alice_sha)
-        code, out = self.pull_refs("--prune")
+        outside = self.tmp / "not-a-repository"
+        outside.mkdir()
+        with contextlib.chdir(outside):
+            code, out = self.pull_refs("--prune")
         self.assertEqual(code, 0, out)
         self.assertIn("pruned 1 fork-head refs", out)
+        self.assertNotIn("refs/tauceti-fork-heads/5", refs(self.target))
+
+    def test_restore_leaves_fork_heads_to_pull_refs(self):
+        self.put(self.target, "refs/tauceti-fork-heads/5", self.alice_sha)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            mirror.main(
+                ["--repo", str(self.mirror), "fetch", "--base-url", str(self.forge), "--repository", "Org/TauCeti"]
+                + ["--no-fork-discovery", "--fork", "alice"]
+            )
+        git(self.target, "update-ref", "-d", "refs/tauceti-fork-heads/5")
+        code, out = self.run_restore("--execute")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("refs/tauceti-fork-heads/5", self.results())
         self.assertNotIn("refs/tauceti-fork-heads/5", refs(self.target))
 
     def test_pull_refs_never_publishes_a_fork_branch_that_moved(self):

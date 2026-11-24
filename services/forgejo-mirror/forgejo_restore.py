@@ -35,13 +35,14 @@ from pathlib import Path
 
 ZERO = "0" * 40
 DEFAULT_FLEET_GLOB = "~/.local/share/tauceti-fleet/worker-runtimes/*/lib/python3*/site-packages/tauceti_worker/host-repositories/TauCeti-*.git"
-# Never pushed: Forgejo derives refs/pull/* itself, the rest are the mirror's own namespaces.
-NEVER_PUSH = ("refs/pull/", "refs/forks/", "refs/tauceti-mirror/")
 # Forgejo writes a fork PR's refs/pull/N/head only when the PR is opened or its fork branch is
 # pushed, and refuses that ref from anyone else. After a restore the base repository therefore
 # lacks these heads' commits, so fetching them, inline review comments and the queue's merge base
 # fail. A plain ref here makes the exact head commit reachable again (pull-refs --publish).
 FORK_HEADS = "refs/tauceti-fork-heads/"
+# Never pushed: Forgejo derives refs/pull/* itself, pull-refs derives the fork heads from the
+# forks' current branches, and the rest are the mirror's own namespaces.
+NEVER_PUSH = ("refs/pull/", FORK_HEADS, "refs/forks/", "refs/tauceti-mirror/")
 TRANSIENT = (
     " 50",
     "HTTP 5",
@@ -673,17 +674,22 @@ def prune_fork_heads(args, target: Target, stale: list[str], remote: dict[str, s
     token_file = Path(args.token_file).expanduser()
     verify_identity(target, token_file, args.user)
     leases = [f"--force-with-lease={ref}:{remote[ref]}" for ref in stale]
-    proc = git(
-        None,
-        "push",
-        "--porcelain",
-        "--no-verify",
-        *leases,
-        target.url,
-        *(f":{ref}" for ref in stale),
-        env=git_env(target.base_url, args.user, token_file),
-        check=False,
-    )
+    # A deletion needs no objects, but git push still needs a repository to run in.
+    stage = make_staging(Path(args.mirror).expanduser(), [])
+    try:
+        proc = git(
+            stage,
+            "push",
+            "--porcelain",
+            "--no-verify",
+            *leases,
+            target.url,
+            *(f":{ref}" for ref in stale),
+            env=git_env(target.base_url, args.user, token_file),
+            check=False,
+        )
+    finally:
+        shutil.rmtree(stage.parent, ignore_errors=True)
     say(
         f"pruned {len(stale)} fork-head refs" if proc.returncode == 0 else f"prune failed: {proc.stderr.strip()[-300:]}"
     )
