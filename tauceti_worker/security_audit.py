@@ -260,6 +260,7 @@ def git_env(*, credential: bool = False) -> dict:
     env.update(
         GIT_CONFIG_NOSYSTEM="1",
         GIT_CONFIG_GLOBAL=os.devnull,
+        GIT_ATTR_NOSYSTEM="1",
         GIT_NO_REPLACE_OBJECTS="1",
         GIT_LITERAL_PATHSPECS="1",
         GIT_TERMINAL_PROMPT="0",
@@ -373,6 +374,19 @@ def image(repo: Path, commit: str, path: str) -> str | None:
         raise Die(f"security-audit: invalid UTF-8 at {commit}:{path}") from exc
 
 
+# Every diff shown to the reviewer is a full text diff. Attributes, including a `.gitattributes`
+# the audited commits add (`*.lean binary`, `-diff`, `diff=<driver>`), must not reduce it to
+# "Binary files ... differ": `attr.tree` names the empty tree, so no in-tree attributes are read,
+# `core.attributesFile` and `GIT_ATTR_NOSYSTEM` (`git_env`) drop the host's, and `--text` overrides any
+# that remain (`$GIT_DIR/info/attributes`). The images themselves are
+# read with `cat-file`, and `image` rejects content that is not UTF-8 text.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+TEXT_DIFF = (
+    *("-c", f"attr.tree={EMPTY_TREE}", "-c", f"core.attributesFile={os.devnull}"),
+    *("diff", "--text", "--no-ext-diff", "--no-textconv", "--no-renames", "--no-color", "--default-prefix"),
+)
+
+
 def commit_input(repo: Path, sha: str) -> dict:
     parent = git(repo, "rev-parse", sha + "^1").decode().strip()
     names = git(repo, "diff", "--no-renames", "--name-only", "-z", parent, sha).split(b"\0")
@@ -391,7 +405,10 @@ def commit_input(repo: Path, sha: str) -> dict:
     files = []
     for path in paths:
         before, after = image(repo, parent, path), image(repo, sha, path)
-        diff = git(repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames", parent, sha, "--", path)
+        diff = git(repo, *TEXT_DIFF, parent, sha, "--", path)
+        # Split on LF only: a CR inside a source line must not start a pseudo-line.
+        if any(line.startswith((b"Binary files ", b"GIT binary patch")) for line in diff.split(b"\n")):
+            raise Die(f"security-audit: git elided the diff of {sha}:{path}; manual inspection required")
         files.append({"path": path, "before": before, "after": after, "diff": diff.decode("utf-8")})
     return {"sha": sha, "parent": parent, "files": files}
 

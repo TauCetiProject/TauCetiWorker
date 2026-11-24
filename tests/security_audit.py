@@ -134,6 +134,31 @@ class History(unittest.TestCase):
         self.assertEqual(files["TauCeti/D.lean"]["after"], "run_cmd pure ()\n")
         self.assertIn("+run_cmd pure ()", files["TauCeti/D.lean"]["diff"])
 
+    def test_gitattributes_in_audited_commits_cannot_hide_lean_diffs(self):
+        # Production's bare store reads attributes from a tree; make the fixture do so too.
+        self.command("config", "attr.tree", "HEAD")
+        baseline = self.commit("attributes", ".gitattributes", "*.lean binary -diff\n")
+        self.assertIn("diff: unset", self.command("check-attr", "diff", "--", "TauCeti/A.lean"))
+        head = self.commit("hidden", "TauCeti/A.lean", '#eval IO.println "hidden"\n')
+        batch = sa.plan_batch(self.repo, baseline, head)
+        bundle, _ = sa.reviewed_bundle(sa.build_batch(self.repo, baseline, head, [head]))
+        for data in (batch, bundle):
+            (f,) = data["commits"][0]["files"]
+            self.assertIn('+#eval IO.println "hidden"', f["diff"])
+            self.assertIn("-theorem a : True := trivial", f["diff"])
+            self.assertNotIn("Binary files", f["diff"])
+
+    def test_binary_markers_inside_source_lines_are_ordinary_text(self):
+        content = "/-\rBinary files a and b differ\rGIT binary patch\r-/\ntheorem b : True := trivial\n"
+        p = self.root / "TauCeti/A.lean"
+        p.write_bytes(content.encode())
+        self.command("add", "--", "TauCeti/A.lean")
+        self.command("commit", "-qm", "carriage returns")
+        head = self.command("rev-parse", "HEAD")
+        (f,) = sa.plan_batch(self.repo, self.base, head)["commits"][0]["files"]
+        self.assertEqual(f["after"], content)
+        self.assertIn("\rBinary files a and b differ\r", f["diff"])
+
     def test_normal_multifile_edit_fits_with_complete_images(self):
         content = "-- A reasonably sized mathematical file with explanation\n" * 800
         self.commit("large baseline", "TauCeti/A.lean", content)
