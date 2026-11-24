@@ -422,7 +422,8 @@ class CanonicalSource(unittest.TestCase):
                 source = SimpleNamespace(repository=repository, identity=RepositoryIdentity(repository, native_id))
                 with patch("tauceti_worker.worker_sources.current", return_value=source):
                     self.assertEqual(enabled() == "", eligible)
-                    self.assertEqual(bool(self_tested_guidance("ordinary")), eligible)
+                    # Nothing on Forgejo reads the label, so no agent is asked to apply it.
+                    self.assertFalse(self_tested_guidance("ordinary"))
                     self.assertFalse(self_tested_guidance("full-lint"))
 
 
