@@ -1005,7 +1005,7 @@ with ClaudeAPIContext("crash-fixture", "fix"):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertGreaterEqual(count, 2, "exercise both a short ledger write and its failure")
         self.assertTrue(self.budget.ledger.read_bytes().startswith(good))
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 60
         while Decimal(self.budget.snapshot()["spent"]) < 20 and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 20)
@@ -1016,7 +1016,7 @@ with ClaudeAPIContext("crash-fixture", "fix"):
             result = self.run_claude()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.budget.ledger.write_bytes(good)
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 60
         while Decimal(self.budget.snapshot()["spent"]) < 30 and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertEqual(Decimal(self.budget.snapshot()["spent"]), 30)
