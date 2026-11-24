@@ -3058,6 +3058,14 @@ class PreRebasedCase(ControllerCase):
     def head(self):
         return self.controller.store.row("batches", {"state": "head"})
 
+    def row(self, batch):
+        return self.controller.store.row("batches", {"id": batch["id"]})
+
+    def verify_head(self):
+        """The head's tip passed its own verification."""
+        head = self.head()
+        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
+
     def pre_rebased_tasks(self, state="open"):
         return [
             t
@@ -3330,13 +3338,6 @@ class KnownGoodHeadTip(PreRebasedCase):
     """Decision 174: the next batch is verified and repaired only on a head tip that has passed its own
     verification, and that work is discarded, not carried, once the head fails CI or its tip moves."""
 
-    def row(self, batch):
-        return self.controller.store.row("batches", {"id": batch["id"]})
-
-    def verify_head(self):
-        head = self.head()
-        self.controller.store.update("batches", {"id": head["id"]}, verified_tip=head["tip"])
-
     def fail_head(self):
         """The head's running CI round fails on the source."""
         run = self.github.runs[-1]
@@ -3514,6 +3515,61 @@ class KnownGoodHeadTip(PreRebasedCase):
         self.land_head()
         head = self.head()
         self.assertEqual((head["id"], head["tip"], head["verified_tip"]), (batch["id"], result.tip, None))
+
+
+class VerificationSnapshot(PreRebasedCase):
+    """Decision 174, step 3: the next batch's verification on the head's tip is a frozen snapshot. Its
+    membership is sealed when the preparation is created, later arrivals go to the following batch,
+    and the next head seals as exactly the verified tip."""
+
+    def test_later_arrivals_go_to_the_following_batch_and_the_head_seals_as_the_verified_tip(self):
+        batch = self.open_batch()
+        self.assertFalse(batch["sealed"])
+        self.verify_head()
+        self.controller.tick()
+        [prepare] = self.pre_rebased_tasks()
+        frozen = self.row(batch)
+        self.assertTrue(frozen["sealed"], "sealed when its verification starts")
+        [entry] = [
+            e
+            for e in self.controller.store.journal_entries("successor-sealed")
+            if e["detail"].get("reason") == "verification-snapshot"
+        ]
+        self.assertEqual((entry["batch_id"], entry["detail"]["size"]), (batch["id"], 2))
+        self.approve(203, {"P203.lean": "203\n"})
+        self.controller.tick()
+        following = self.controller.input_for(PROJECT, 203)["batch_id"]
+        self.assertNotEqual(following, batch["id"], "a later arrival goes to the following batch")
+        self.assertEqual([m["number"] for m in self.controller._members(batch["id"])], [201, 202])
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual(task.task_id, prepare["id"])
+        self.controller.release_task(task.task_id, task.claim_token, "prepared_clean")
+        self.land_head()
+        head = self.head()
+        self.assertEqual((head["id"], head["tip"], head["verified_tip"]), (batch["id"], task.tip, task.tip))
+        self.assertEqual(self.github.runs[-1].head_sha, task.tip, "staging builds the exact verified tip")
+        self.assertEqual(self.controller.store.row("batches", {"id": following})["state"], "open")
+
+    def test_an_already_sealed_batch_is_not_sealed_again(self):
+        batch = self.open_batch()
+        self.controller.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=self.clock())
+        self.verify_head()
+        self.controller.tick()
+        self.assertEqual(len(self.pre_rebased_tasks()), 1)
+        snapshots = [
+            e
+            for e in self.controller.store.journal_entries("successor-sealed")
+            if e["detail"].get("reason") == "verification-snapshot"
+        ]
+        self.assertEqual(snapshots, [])
+
+    def test_without_a_verification_the_batch_keeps_taking_members(self):
+        batch = self.open_batch()
+        self.assertEqual(self.pre_rebased_tasks(), [], "the head is not known-good")
+        self.approve(203, {"P203.lean": "203\n"})
+        self.controller.tick()
+        self.assertFalse(self.row(batch)["sealed"])
+        self.assertEqual(self.controller.input_for(PROJECT, 203)["batch_id"], batch["id"])
 
 
 class NextHeadPreparationPriority(ControllerCase):

@@ -196,6 +196,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # verification (`_head_tip_verified`), so a later batch never acts on the head's own failures
     # (task 1416). Work done on a tip that then fails CI or moves is discarded, not carried
     # (`_discard_unverified_pre_rebase`). Decision 174 restored it after S1 (decision 153) turned it off.
+    # Creating the task seals the batch's membership (step 3): the head seals only what was verified.
     "prepare_pre_rebased": True,
     # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
@@ -7445,9 +7446,24 @@ class Controller:
         self._retain(self.pre_rebased_ref(batch["id"], tip), tip)
         head = self._head()
         diagnostics = [self._cross_batch(head, batch)] if head is not None else []
-        self._create_task(
-            batch, TASK_PREPARE, batch["pre_rebase_onto"], diagnostics, now, pre_rebased=(tip, batch["tip"])
-        )
+        with self.store.transaction():
+            self._create_task(
+                batch, TASK_PREPARE, batch["pre_rebase_onto"], diagnostics, now, pre_rebased=(tip, batch["tip"])
+            )
+            if not batch["sealed"]:
+                # Decision 174, step 3: the verification is a frozen snapshot of the batch. Sealing its
+                # membership now lets the run finish on exactly what the next head will be, and sends
+                # later arrivals to the following batch, so the head seals only what was verified.
+                self.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=now)
+                self._count("successors_sealed_for_verification")
+                self.store.journal(
+                    now,
+                    "successor-sealed",
+                    batch["id"],
+                    version=batch["version"],
+                    size=len(self._members(batch["id"])),
+                    reason="verification-snapshot",
+                )
         self._note_reason(f"open batch {batch['id']} waits for a worker to prepare its pre-rebased chain")
 
     def _settle_pre_rebased_release(
