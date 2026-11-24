@@ -300,6 +300,50 @@ class Cache(unittest.TestCase):
                 self.assertEqual((download / "artifacts" / good.name).read_bytes(), b"good")
                 self.assertFalse((download / "artifacts" / vanished.name).exists())
 
+    def test_seed_links_only_archives_that_history_maps_name(self):
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        git = dict(cwd=checkout, check=True, capture_output=True)
+        subprocess.run(["git", "init", "-q", "-b", "main"], **git)
+        identity = ["-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run(["git", *identity, "commit", "-q", "--allow-empty", "-m", "a"], **git)
+        old = subprocess.run(["git", "rev-parse", "HEAD"], text=True, **git).stdout.strip()
+        subprocess.run(["git", *identity, "commit", "-q", "--allow-empty", "-m", "b"], **git)
+        archives = self.pool / "archives"
+        archives.mkdir(exist_ok=True)
+        named, private_named, unnamed = ("a" * 16 + ".ltar", "b" * 16 + ".ltar", "c" * 16 + ".ltar")
+        for name in (named, unnamed):
+            (archives / name).write_bytes(name.encode())
+        private = self.root / "private"
+        (private / "artifacts").mkdir(parents=True)
+        (private / "artifacts" / private_named).write_bytes(b"private")
+        (private / "artifacts" / unnamed).write_bytes(b"private unnamed")
+        revisions = self.pool / "revisions/TauCeti"
+        revisions.mkdir(parents=True)
+        rows = [["d" * 16, named], ["e" * 16, private_named]]
+        (revisions / (old + ".jsonl")).write_text("\n".join(json.dumps(row) for row in ['"2026-03-17"', *rows]))
+        report = {}
+        env = dict(LAKE_CACHE_DIR=str(private), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        with patch.object(cache, "expand"), cache.preparation(checkout, env, report=report) as warm:
+            seeded = sorted(p.name for p in (Path(warm["LAKE_CACHE_DIR"]) / "artifacts").iterdir())
+        self.assertEqual(seeded, [named, private_named])
+        self.assertEqual(report["seed_selection"], "named")
+        self.assertEqual(report["seeded_artifacts"], 2)
+
+    def test_seed_falls_back_to_every_archive_without_history(self):
+        archives = self.pool / "archives"
+        archives.mkdir(exist_ok=True)
+        (archives / ("a" * 16 + ".ltar")).write_bytes(b"a")
+        revisions = self.pool / "revisions/TauCeti"
+        revisions.mkdir(parents=True)
+        (revisions / ("f" * 40 + ".jsonl")).write_text('"2026-03-17"\n["' + "d" * 16 + '","' + "b" * 16 + '.ltar"]')
+        report = {}
+        env = dict(LAKE_CACHE_DIR=str(self.root / "private"), TAUCETI_BUILD_CACHE_ROOT=str(self.pool))
+        with patch.object(cache, "expand"), cache.preparation(self.root, env, report=report):
+            pass
+        self.assertEqual(report["seed_selection"], "all")
+        self.assertEqual(report["seeded_artifacts"], 1)
+
     def test_preparation_lock_contention_fails_instead_of_private_fallback(self):
         from contextlib import contextmanager
 

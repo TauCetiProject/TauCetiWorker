@@ -472,7 +472,11 @@ Full-project verification and Lake's build-input invalidation remain enabled.
 Each preparation decodes the fresh download mappings once and reuses them through transfer
 and expansion. Private metadata is checked again on the next preparation; there is no
 persistent readiness marker. Hydration writes only changed mappings and missing artifacts.
-Archive seeding skips duplicates, and an archive removed concurrently by pool collection
+Archive seeding links only the archives named by a few pooled revision maps: the nearest
+two on each history walk the fetch makes (from `HEAD` and from the base branch) and the four
+newest. Without git history or any such map it links every pool archive, as before. Lake
+still selects the revision; an archive the hints miss is a download, never a wrong output.
+Seeding skips duplicates, and an archive removed concurrently by pool collection
 is an individual cache miss for Lake to fetch. Native fetch arguments and Mathlib snapshot
 keys/inventory checks are unchanged.
 
