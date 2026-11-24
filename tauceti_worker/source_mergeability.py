@@ -48,14 +48,16 @@ def observe(source, state, number, expected_head):
         # Retained local tips provide negotiation haves on the next fetch. The
         # base repository's pull ref also covers heads authored in forks.
         head_ref, base_ref = "refs/mergeability/head", "refs/mergeability/base"
-        git.fetch_refs(
-            source.repo,
-            [
-                f"+refs/pull/{number}/head:{head_ref}",
-                f"+refs/heads/{row['base']['ref']}:{base_ref}",
-            ],
-        )
-        if (git.local_ref_sha(head_ref), git.local_ref_sha(base_ref)) != key:
+        base_spec = f"+refs/heads/{row['base']['ref']}:{base_ref}"
+        try:
+            git.fetch_refs(source.repo, [f"+refs/pull/{number}/head:{head_ref}", base_spec])
+            fetched_head = git.local_ref_sha(head_ref)
+        except ForgeError:
+            # A fork PR can lack its pull ref (a restore drops them until the fork branch is
+            # pushed again) while the base repository still serves its exact head commit.
+            git.fetch_refs(source.repo, [head, base_spec])
+            fetched_head = head
+        if (fetched_head, git.local_ref_sha(base_ref)) != key:
             return "UNKNOWN"
         result = git.mergeability(source.repo, head, base)
     current = source.live_pull(number)
