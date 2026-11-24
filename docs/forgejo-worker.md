@@ -56,6 +56,13 @@ review responses, rebases and closing superseded work. Authoring pressure
 account opened. PRs from the previous account's fork are not adopted. A
 malformed value stops the worker at startup.
 
+Set `TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS` to the merge queue's Forgejo publisher ID
+(comma-separated for several) to act on its refusals. A PR labelled `needs-rebase` whose
+comment from such an author begins ``Merge-queue recovery for head `...`: `` and carries a
+`<!--tauceti-rebase:v1 HEAD-->` line for the current head then gets an integration-repair rebase
+round under the ordinary rebase budget, with the request as its brief, even when Forgejo reports
+no conflict. Unset, no Forgejo recovery request is trusted.
+
 The canonical instance defaults to those values. Other instances require
 explicit bindings. Token files must be private. A missing canonical credential
 allows public Forgejo discovery. Authenticated native work becomes available
@@ -65,6 +72,30 @@ Agents use familiar `gh pr` and `gh api` commands through a source-bound wrapper
 during native rounds. Explicit GitHub selections and shared-tool operations use
 the GitHub CLI. Native commands validate the server, native repository ID, and
 selected native account. Unsupported commands report their missing contract.
+
+### Claim access for contributor fleets
+
+Native claims are refs under `refs/tauceti-claims/` in the content repository itself, and a
+worker that cannot push them defers its native reviews and repairs (`SourceUnavailable`). So
+every fleet account needs code write on TauCetiProject/TauCeti. Our own accounts have it
+directly. Contributors get it from the `contributor-fleets` team, which grants code write on
+that repository only (issues and pull requests stay read-only). `main`, `tauceti-ci/**` and
+`migration/github/**` stay protected against it.
+
+Nobody edits that team by hand. On the queue host, `tauceti-queue-forgejo-team-sync.timer` runs
+`python -m tauceti_queue.forgejo_team_sync` every ten minutes, which makes the team's members
+exactly the Forgejo accounts whose GitHub sign-in belongs to a direct collaborator of
+`TauCetiProject/tauceti-claims`: the people TauCeti's `claims-access` workflow admitted to
+shared claims on GitHub (anyone with a landed PR), minus anyone a maintainer removed there. It
+matches on the GitHub user ID that Forgejo records for accounts created by signing in with
+GitHub; any other Forgejo account is skipped and listed in the log. Run it with `--dry-run` to
+see what it would change.
+
+`services/queue/install-monitoring.sh` installs the timer. It reads GitHub with
+`gh auth token --user tauceti-ai-for-science`, and Forgejo with
+`~/.config/tauceti-queue/forgejo-team-sync-token`, a token of the dedicated site-admin account
+`tauceti-team-sync` limited to the `read:admin` and `write:organization` scopes. See its log with
+`journalctl --user -u tauceti-queue-forgejo-team-sync`.
 
 ## Scheduling and recovery
 

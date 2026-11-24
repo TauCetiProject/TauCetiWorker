@@ -91,10 +91,13 @@ class GlobalMaintenance(unittest.TestCase):
         for item in (
             patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_URL": "https://state.test", "TAUCETI_ROADMAP_SKIP": ""}),
             patch.object(work, "roadmap_only", return_value=None),
+            # The roadmap repository defines no umbrella (tests/roadmap_umbrella.py covers them).
+            patch("tauceti_worker.umbrellas.read_umbrella", return_value=None),
             patch("tauceti_worker.survey.me", return_value="science"),
             patch.object(work, "mirror_creds"),
             patch.object(work, "_branch_claimed_elsewhere", return_value=False),
             patch.object(work, "spread_candidates", side_effect=lambda cs: sorted(cs, key=lambda c: c.pr)),
+            patch.object(work, "age_spread", side_effect=lambda cs: sorted(cs, key=lambda c: c.pr)),
         ):
             item.start()
             self.addCleanup(item.stop)
@@ -116,6 +119,294 @@ class GlobalMaintenance(unittest.TestCase):
         ):
             result = run_round(self.w, self.opts)
         return result, query, areas
+
+    def test_a_peer_claim_found_once_is_skipped_by_every_worker_before_fresh_reads(self):
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        self.w.claims.collisions = 0
+
+        def collide(stage, candidate):
+            if candidate.pr == 10:
+                self.w.claims.collisions += 1  # dispatch read the PR, then lost the lease
+                return None
+            return 0
+
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            self.run_round([row(10, "Other"), row(20, "Other")], collide)
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20)])
+            # The next round on any worker skips #10 without dispatching (no fresh PR reads).
+            self.run_round([row(10, "Other"), row(20, "Other")], collide)
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+        # Without the configured shared directory nothing is recorded or skipped.
+        self.run_round([row(10, "Other"), row(20, "Other")], collide)
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20)])
+
+    def test_an_unavailable_review_source_selects_other_work_and_spares_peers(self):
+        from tauceti_worker.config import ReviewSourceUnavailable
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        self.w.claims.collisions = 0
+
+        def unavailable(stage, candidate):
+            if candidate.pr == 10:
+                raise ReviewSourceUnavailable("review #10: source preparation unavailable before inference")
+            return 0
+
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            result, *_ = self.run_round([row(10, "Other"), row(20, "Other")], unavailable)
+            self.assertEqual(result, 0)
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20)])
+            # Any worker on the host now skips #10 at this head without dispatching it.
+            self.run_round([row(10, "Other"), row(20, "Other")], unavailable)
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+
+    def test_repeated_unavailable_sources_in_one_round_back_off(self):
+        from tauceti_worker.config import ReviewSourceUnavailable
+
+        def unavailable(stage, candidate):
+            raise ReviewSourceUnavailable(f"review #{candidate.pr}: source preparation unavailable")
+
+        rows = [row(n, "Other") for n in (10, 20, 30, 40)]
+        with self.assertRaises(ReviewSourceUnavailable):
+            self.run_round(rows, unavailable)
+        self.assertEqual([n for _, n, *_ in self.calls], [10, 20, 30])
+
+    def test_the_unavailable_source_cutoff_spans_prepared_tier_rounds(self):
+        import dataclasses
+
+        from tauceti_worker.config import ReviewSourceUnavailable
+        from tauceti_worker.survey import Candidate, Survey
+
+        def tier(numbers):
+            prepared = Survey(worker_id="test", roadmap_only="auto")
+            prepared._round_scope = (True, False)
+            prepared.needs_fix.actionable = [Candidate(n, HEAD) for n in numbers]
+            return prepared
+
+        def unavailable(stage, _w, _sv, candidate, _opts):
+            raise ReviewSourceUnavailable(f"review #{candidate.pr}: source preparation unavailable")
+
+        self.opts.only = ["fix"]
+        with patch.object(work, "dispatch", side_effect=unavailable):
+            first = dataclasses.replace(self.opts)
+            with self.assertRaises(ClaimCollision):
+                run_round(self.w, first, prepared_survey=tier([10, 20]))
+            second = dataclasses.replace(self.opts)
+            with self.assertRaises(ReviewSourceUnavailable):
+                run_round(self.w, second, prepared_survey=tier([30, 40]))
+        self.assertEqual([n for _, n in self.opts.unavailable_sources], [10, 20, 30])
+
+    def test_the_unfocused_fallback_keeps_the_rounds_unavailable_source_count(self):
+        from tauceti_worker.config import ReviewSourceUnavailable
+
+        def unavailable(stage, _w, _sv, candidate, _opts):
+            raise ReviewSourceUnavailable(f"review #{candidate.pr}: source preparation unavailable")
+
+        self.opts.unavailable_sources[:] = [("review", 1), ("review", 2)]
+        with (
+            patch(
+                "tauceti_worker.github_state.read_survey",
+                return_value=(True, SurveyRows([row(10, "Other"), row(20, "Other")], {"science": 3})),
+            ),
+            patch.object(work, "dispatch", side_effect=unavailable),
+            patch.object(work, "roadmap_areas", return_value=["NewArea"]),
+        ):
+            with self.assertRaises(ReviewSourceUnavailable):
+                run_round(self.w, self.opts, use_fleet_focus=False)
+        self.assertEqual([n for _, n in self.opts.unavailable_sources], [1, 2, 10])
+
+    def test_unavailable_source_hints_are_short_and_separate_from_claims(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            peer_claims.note("forgejo:one/project", "review", 7, HEAD, now=1000, unavailable=True)
+            self.assertTrue(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001, unavailable=True))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001))
+            self.assertFalse(
+                peer_claims.hinted("forgejo:one/project", "review", 7, "b" * 40, now=1001, unavailable=True)
+            )
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "fix", 7, HEAD, now=1001, unavailable=True))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1301, unavailable=True))
+
+    def test_diff_guard_records_are_per_head_and_outlast_claim_hints(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            self.assertFalse(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000))
+            peer_claims.note_diff_guard("forgejo:one/project", 7, HEAD, now=1000)
+            self.assertTrue(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000 + 3600))
+            self.assertFalse(peer_claims.diff_guarded("forgejo:one/project", 7, "b" * 40, now=1001), "a push")
+            self.assertFalse(peer_claims.diff_guarded("github:one/project", 7, HEAD, now=1001))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001))
+            self.assertFalse(
+                peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000 + peer_claims.GUARD_TTL_S + 1)
+            )
+        self.assertFalse(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD), "no shared directory")
+
+    def test_a_diff_guarded_review_head_is_skipped_as_no_work(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.survey import Candidate, Survey
+
+        prepared = Survey(worker_id="test", roadmap_only="auto")
+        prepared._round_scope = (True, False)
+        prepared.reviewable.actionable = [Candidate(10, HEAD)]
+        self.opts.only = ["review"]
+        with (
+            patch.object(peer_claims, "diff_guarded", return_value=True) as guarded,
+            patch.object(work, "dispatch") as dispatch,
+        ):
+            with self.assertRaises(work.NoEligibleWork):
+                run_round(self.w, self.opts, prepared_survey=prepared)
+        guarded.assert_called_once()
+        self.assertEqual(guarded.call_args.args[1:], (10, HEAD))
+        dispatch.assert_not_called()
+        # A green build at the same head lifts the engine's guards: the review is offered again.
+        prepared.open_prs = [
+            PRInfo(10, HEAD, "roadmap/work", "science", "TauCeti", False, "MERGEABLE", "science", True, False)
+        ]
+        prepared.reviewable.actionable = [Candidate(10, HEAD)]
+        with (
+            patch.object(peer_claims, "diff_guarded", return_value=True),
+            patch.object(work, "dispatch", return_value=0) as dispatch,
+        ):
+            run_round(self.w, self.opts, prepared_survey=prepared)
+        dispatch.assert_called_once()
+
+    def test_fixed_heads_are_recorded_per_pr_and_scope_and_expire(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), set())
+            peer_claims.note_fixed_head("forgejo:one/project", 7, HEAD)
+            peer_claims.note_fixed_head("forgejo:one/project", 7, HEAD)
+            peer_claims.note_fixed_head("forgejo:one/project", 7, "b" * 40)
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), {HEAD, "b" * 40})
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 8), set())
+            self.assertEqual(peer_claims.fixed_heads("github:one/project", 7), set())
+            later = os.path.getmtime(peer_claims._fixed_dir("forgejo:one/project", 7) / HEAD)
+            self.assertEqual(
+                peer_claims.fixed_heads("forgejo:one/project", 7, now=later + peer_claims.FIXED_HEAD_TTL_S + 1), set()
+            )
+        self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), set(), "no shared directory")
+
+    def test_the_fix_cap_counts_distinct_heads_per_pr(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+        from tauceti_worker.survey import Candidate
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            heads = [f"{n:040x}" for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL + 1)]
+            for head in heads[:-1]:
+                self.assertFalse(work._fix_cap_reached(self.w, Candidate(10, head)))
+                self.assertFalse(work._fix_cap_reached(self.w, Candidate(10, head)), "a retry at one head")
+            self.assertEqual(len(peer_claims.fixed_heads(scope, 10)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+            self.assertFalse(work._fix_cap_reached(self.w, Candidate(11, heads[-1])), "per PR")
+            self.assertFalse(work._fix_cap_spent(self.w, Candidate(10, heads[0])), "a recorded head is not counted")
+            self.assertTrue(work._fix_cap_spent(self.w, Candidate(10, heads[-1])))
+            self.assertTrue(work._fix_cap_reached(self.w, Candidate(10, heads[-1])))
+            self.assertNotIn(heads[-1], peer_claims.fixed_heads(scope, 10), "the capped head is not recorded")
+
+    def test_the_fix_cap_closes_a_maintained_pr(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        sv, c, live = self.spent_fixture()
+        self.counter_values.clear()  # the per-head attempt budget is not spent
+
+        def close(argv, **kwargs):
+            live["state"] = "CLOSED"
+            return SimpleNamespace(returncode=0)
+
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL):
+                peer_claims.note_fixed_head(scope, 10, f"{n:040x}")
+            with patch.object(work, "gh_run", side_effect=close) as mutation:
+                self.assertEqual(work._close_capped_pr(self.w, sv, c), 0)
+            argv = mutation.call_args.args[0]
+            self.assertEqual(argv[:4], ["gh", "pr", "close", "10"])
+            self.assertEqual(argv[argv.index("--repo") + 1], self.w.gh.repo, "the selected source's repository")
+            self.assertIn(f"after {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds", argv[argv.index("--comment") + 1])
+            self.assertEqual(peer_claims.fixed_heads(scope, 10), set(), "a reopened PR starts a fresh count")
+            self.w.claims.release.assert_called_once()
+
+    def test_the_fix_cap_never_closes_another_authors_pr_or_a_kept_one(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL):
+                peer_claims.note_fixed_head(scope, 10, f"{n:040x}")
+            for changes in ({"labels": [{"name": "keep"}]}, {"author": {"login": "peer"}}):
+                with self.subTest(changes=changes):
+                    sv, c, _ = self.spent_fixture(**changes)
+                    with patch.object(work, "gh_run") as mutation:
+                        self.assertIsNone(work._close_capped_pr(self.w, sv, c))
+                    mutation.assert_not_called()
+                    self.assertEqual(len(peer_claims.fixed_heads(scope, 10)), MAX_FIX_ROUNDS_WITHOUT_APPROVAL)
+            sv, c, _ = self.spent_fixture()
+            sv.me_login = "someone-else"  # a contributor's PR that the fleet fixes
+            self.w.claims.begin_branch_work = Mock(side_effect=AssertionError("no claim for a foreign PR"))
+            with patch.object(work, "gh_run") as mutation:
+                self.assertIsNone(work._close_capped_pr(self.w, sv, c))
+            mutation.assert_not_called()
+
+    def test_a_foreign_pr_at_the_fix_cap_is_skipped_before_any_read(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL):
+                peer_claims.note_fixed_head(scope, 10, f"{n:040x}")
+            # PR 10 stands for a contributor's PR that the fleet fixes but does not maintain.
+            with patch.object(work, "owns_pr", side_effect=lambda sv, p, **k: p.number != 10):
+                self.run_round([row(10, "Other"), row(20, "Other")])
+            self.assertEqual([call[:2] for call in self.calls], [("fix", 20)])
+            self.calls.clear()
+            self.run_round([row(10, "Other")])
+            self.assertEqual([call[:2] for call in self.calls], [("fix", 10)], "a maintained PR goes on to close")
+
+    def test_the_fix_cap_is_counted_only_after_the_live_recheck_confirms_the_fix(self):
+        import inspect
+
+        source = inspect.getsource(work.dispatch)
+        recheck = source.index("actionable = _still_actionable(stage, w, sv, c, explicit=explicit)")
+        cap = source.index("_fix_cap_reached(w, c)")
+        self.assertLess(recheck, cap)
+        guard = source[source.rindex('stage == "fix"', 0, cap) : cap]
+        for condition in ("actionable is True", "not c.partial_history", "c.pr not in bump_prs(sv)"):
+            self.assertIn(condition, guard)
+
+    def test_peer_claim_hints_expire_and_are_scoped(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            peer_claims.note("forgejo:one/project", "rebase", 7, HEAD, now=1000)
+            self.assertTrue(peer_claims.hinted("forgejo:one/project", "fix", 7, "b" * 40, now=1001))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001))
+            self.assertFalse(peer_claims.hinted("github:one/project", "rebase", 7, HEAD, now=1001))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "rebase", 7, HEAD, now=1000 + 601))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "rebase", 7, HEAD, now=0))
 
     def test_prepared_source_survey_keeps_global_peer_claim_checks(self):
         from tauceti_worker.survey import Candidate, Survey
@@ -570,9 +861,10 @@ class GlobalMaintenance(unittest.TestCase):
             row(15, "Geometry", contest={"id": 1, "rubric": "reuse"}),
         ]
         self.counter_values[f"fix-10-{HEAD[:12]}"] = 3
-        with patch.object(work, "spread_candidates", side_effect=lambda cs: sorted(cs, key=lambda c: -c.pr)):
-            _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr in (30, 20) else 0)
-        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 30), ("fix", 20), ("fix", 10)])
+        with patch.object(work, "age_spread", side_effect=lambda cs: sorted(cs, key=lambda c: -c.pr)):
+            _, query, areas = self.run_round(rows, lambda stage, c: None if c.pr in (15, 30, 20) else 0)
+        # The author contest is closest to landing (a re-review), so it is offered before the fixes.
+        self.assertEqual([(s, n) for s, n, *_ in self.calls], [("review", 15), ("fix", 30), ("fix", 20), ("fix", 10)])
         self.assertEqual(set(query.call_args.kwargs["stages"]), set(self.opts.only) - {"roadmap"})
         self.assertEqual(query.call_args.args[1], "auto")
         areas.assert_not_called()

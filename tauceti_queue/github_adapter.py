@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 
 from . import chain, declaration_names, diagnostics, diff_guard, github_app, ports
-from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
+from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status, recovery_body
 
 API = github_app.API
 API_VERSION = "2022-11-28"
@@ -61,6 +61,12 @@ API_VERSION = "2022-11-28"
 DEFAULT_BACKGROUND_FLOOR = 1000
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
+# Decision 200: a staging run of a candidate the queue's trusted worker verified, which pr-build lands
+# without rebuilding once the queue's observation attests it (TauCetiTools `bors_attested.py`).
+ATTESTED_EVENT = "tauceti-bors-attested"
+# The queue's idle-capacity test of an accepted head on current main (decision 175 B).
+MAIN_INTEGRATION_EVENT = "tauceti-main-integration"
+MAIN_INTEGRATION_CONTEXT = "main-integration"
 STAGING_WORKFLOW = "pr-build.yml"
 BUILD_JOB = "sandboxed-build"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -69,8 +75,6 @@ COMMENT_MARKER = "<!-- tauceti-queue {marker} -->"
 # Bors treats collaborators with push access as reviewers (`auto_reviewer_required_perm: :push`).
 REVIEWER_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 MAX_LOG_BYTES = 64 * 1024 * 1024
-# How long a self-tested evaluation waits when the App cannot read team membership.
-MEMBERS_PERMISSION_RETRY_SECONDS = 900
 
 Transport = github_app.Transport
 log = logging.getLogger(__name__)
@@ -937,14 +941,16 @@ class GitHubAdapter:
         batch_id,
         members: Sequence,
         repair_outputs_revs: Sequence[str] = (),
+        attested: bool = False,
     ) -> str:
         """`repository_dispatch` of pr-build.yml as Bors sends it; returns the run title.
 
         The payload adds `repair_outputs_revs`, the revisions whose published build outputs CI may
-        restore when none are published for `head_sha` (empty when the caller names none).
+        restore when none are published for `head_sha` (empty when the caller names none). `attested`
+        sends it as an attested landing (`ATTESTED_EVENT`); the run title is the same.
         """
         payload = {
-            "event_type": STAGING_EVENT,
+            "event_type": ATTESTED_EVENT if attested else STAGING_EVENT,
             "client_payload": {
                 "head_sha": head_sha,
                 "base_sha": base_sha,
@@ -965,6 +971,62 @@ class GitHubAdapter:
                 ) from error
             raise
         return dispatch_title(base_ref, _batch_id(batch_id), head_sha, base_sha)
+
+    def dispatch_main_integration(self, repo: str, *, pr: int, head_sha: str, main_sha: str) -> None:
+        """`repository_dispatch` of TauCeti's main-integration.yml: build `head_sha` merged onto
+        exactly `main_sha` on idle Fleet PR capacity, reported as the `main-integration` status on
+        the head (TauCetiTools docs/main-integration.md). One call; never retried here."""
+        for sha in (head_sha, main_sha):
+            if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+                raise ValueError("main-integration needs two commit SHAs")
+        payload = {
+            "event_type": MAIN_INTEGRATION_EVENT,
+            "client_payload": {"pr": int(pr), "head_sha": head_sha, "main_sha": main_sha},
+        }
+        try:
+            self.client.request("POST", f"repos/{repo}/dispatches", json_body=payload, ok=(204,), single_attempt=True)
+        except GitHubError as error:
+            if isinstance(error, RequestDeferred) or error.status in {400, 401, 403, 404, 405, 410, 415, 422, 429}:
+                raise ports.DispatchNotAccepted(
+                    str(error),
+                    retry_at=getattr(error, "retry_at", None),
+                    retryable=isinstance(error, RequestDeferred),
+                ) from error
+            raise
+
+    def main_integration_statuses(self, repo: str, heads: Sequence[str]) -> dict[str, ports.Status | None]:
+        """The latest `main-integration` status of each head, by GraphQL, 50 heads a query.
+
+        A head the repository does not have, or without the context, maps to None."""
+        owner, name = repo.split("/", 1)
+        result: dict[str, ports.Status | None] = {}
+        unique = [head for head in dict.fromkeys(heads) if re.fullmatch(r"[0-9a-f]{40}", head or "")]
+        for start in range(0, len(unique), 50):
+            chunk = unique[start : start + 50]
+            fields = " ".join(
+                f'h{index}: object(oid: "{head}") {{ ... on Commit {{ status {{ '
+                f'context(name: "{MAIN_INTEGRATION_CONTEXT}") {{ state description targetUrl createdAt }} }} }} }}'
+                for index, head in enumerate(chunk)
+            )
+            data = self.client.graphql(
+                f"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}",
+                {"owner": owner, "name": name},
+            )
+            repository = (data or {}).get("repository") or {}
+            for index, head in enumerate(chunk):
+                node = repository.get(f"h{index}") or {}
+                context = ((node.get("status") or {}).get("context")) if isinstance(node, dict) else None
+                if not isinstance(context, dict):
+                    result[head] = None
+                    continue
+                result[head] = ports.Status(
+                    state=str(context.get("state") or "").lower(),
+                    description=str(context.get("description") or ""),
+                    target_url=str(context.get("targetUrl") or ""),
+                    updated_at=_timestamp(context.get("createdAt")),
+                    run_id=run_id_from_url(context.get("targetUrl")),
+                )
+        return result
 
     def find_candidate_run(
         self,
@@ -1190,23 +1252,6 @@ class GitHubAdapter:
         record = declaration_names.parse_log(log, head_sha)
         return {**record, "run_id": run_id, "run_attempt": attempt, "job_id": job["id"]}
 
-    def team_member_read(self, path: str):
-        """A team-membership read for the self-tested route, made by the queue App itself.
-
-        It needs the App's organization `members: read` permission. Without it the read is
-        deferred with a clear reason instead of falling back to a user token or answering "not a
-        member": an unknown membership never grants admission and never withdraws one.
-        """
-        granted = getattr(self._tokens or self.client._tokens, "granted_permissions", None)
-        if granted is not None and "members" not in granted():
-            log.warning("self-tested team membership needs the queue App's organization Members: read permission")
-            raise RequestDeferred(
-                "self-tested team membership needs the queue App's organization Members: read permission",
-                retry_at=self.client._clock() + MEMBERS_PERMISSION_RETRY_SECONDS,
-                resource="members-permission",
-            )
-        return self.client.get_json(path)[1]
-
     def eligibility_checks(self, repo: str, head: str) -> list[dict]:
         """Every `merge eligibility` check run on `head`, any App (`filter=all`), as Bors lists them."""
         return self.client.paginate(
@@ -1333,7 +1378,7 @@ class GitHubAdapter:
         )
 
     def _self_tested(self, repo, number, pull, paths, merge_base):
-        """Inline self-tested eligibility (live membership and bump reads), whether an admin's
+        """Inline self-tested eligibility (live bump reads), whether an admin's
         `large-refactor` label lifts the size caps, and, for an eligible head, the PR-level diff
         guards PR CI would have run."""
         from tauceti_tools.self_tested import eligible, requested
@@ -1353,14 +1398,29 @@ class GitHubAdapter:
                 repo,
                 paths=paths,
                 read=lambda path: self.client.get_json(path)[1],
-                member_read=self.team_member_read,
             )
-        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
+        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here. A labelled
+        # large refactor is measured too: an admin's approval of one may stand in for PR CI and review
+        # (`AdmissionIntake._large_refactor_approval`), and the caps the label keeps still apply.
         exempt = diff_guard.large_refactor(
             self.clone_dir, pull.head_sha, lambda path: self.client.get_json(path)[1], repo, number, pull.labels
         )
-        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if local else ()
+        measured = local or exempt
+        guard = (
+            diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if measured else ()
+        )
         return local, guard, exempt
+
+    def bump_guard(self, repo: str, head: str) -> bool:
+        """The trusted Mathlib-bump check (`check-bump.sh` on main's tip, the merge base and `head`),
+        as self-tested bump eligibility runs it. Raises `GitHubUnavailable` when its inputs could not
+        be read, so the evaluation stays pending rather than deciding either way."""
+        from tauceti_tools.self_tested import _bump_policy, _ReadAPI
+
+        verdict, output = _bump_policy().check_bump(_ReadAPI(lambda path: self.client.get_json(path)[1]), repo, head)
+        if verdict is None:
+            raise ports.GitHubUnavailable(f"bump-guard for {head[:12]}: {output}"[:300])
+        return bool(verdict)
 
     def admission_snapshot_single(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """The same snapshot as `admission_snapshot`, from one GraphQL read (decision 38 step 4, slice 5).
@@ -1369,7 +1429,7 @@ class GitHubAdapter:
         separate fence is needed for them; the merge base and paths come from the clone. A PR whose
         read cannot be complete in one response (over 100 comments or labels), whose head commit
         does not match, or whose merge base the clone cannot vouch for, takes the full read. Live
-        self-tested reads (membership, bump guard) happen after the response, so a self-tested
+        self-tested reads (the bump guard) happen after the response, so a self-tested
         request is fenced again exactly as the full read fences.
         """
         owner, name = repo.split("/", 1)
@@ -1435,7 +1495,7 @@ class GitHubAdapter:
         from tauceti_tools.self_tested import requested
 
         if requested(pull.labels) or exempt:
-            # Membership and bump reads came after the response: fence them as the full read does.
+            # Bump-guard reads came after the response: fence them as the full read does.
             fresh, statuses = self._admission_fence(repo, number, pull)
             if (fresh.head_sha, fresh.base_sha, fresh.base_ref, fresh.state, fresh.draft, sorted(fresh.labels)) != (
                 pull.head_sha,
@@ -1856,8 +1916,11 @@ class GitHubAdapter:
 
     # -- comments and labels
 
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
+    def post_comment(self, repo: str, number: int, body: str, marker: str, *, recovery_head: str | None = None) -> str:
         """Post `body` once per `marker`: a comment already carrying the marker is edited instead."""
+        if recovery_head is not None:
+            # tauceti-queue[bot] is a trusted recovery author: only the request's own head is marked.
+            body = recovery_body(body, recovery_head)
         hidden = comment_marker(marker)
         existing = self.find_comment(repo, number, hidden)
         full = f"{body.rstrip()}\n\n{hidden}\n"

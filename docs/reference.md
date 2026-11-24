@@ -20,11 +20,11 @@ list is in `tauceti work -h`. For persistent workers, see
 | `--bubble` | Run code and review agents inside the Bubble sandbox instead of directly on the host. The outer survey and coordination, plus all progress-report rounds, remain on the host. |
 | `--host` | Deprecated no-op: the host is now the default. It only warns; pass `--bubble` for the sandbox. |
 | `--stream` | Stream the agent's log to the terminal instead of a file under `logs/`. |
-| `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas). |
-| `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap). |
-| `--roadmap-targets FILE` | Author only from an operator [target list](target-lists.md): each roadmap round takes one open item whose prerequisites have landed, claims it, and assigns it to the agent; with nothing eligible the round authors nothing. `--roadmap-only` and `--roadmap-skip` narrow the areas it draws from. Re-read every round; an empty value means no list. |
+| `--roadmap-only AREA` | The single roadmap area for roadmap rounds (empty = all areas), or an [umbrella](umbrellas.md): a set of areas named by `umbrellas/NAME.toml` in the roadmap repository. An umbrella round authors in one member area drawn by weight and maintains pull requests in every member; an area of the same name wins. |
+| `--roadmap-skip AREA[,AREA...]` | Roadmap areas to exclude from selection (`--roadmap-only` wins on overlap; an umbrella loses the skipped members). |
+| `--roadmap-targets FILE` | Author only from an operator [target list](target-lists.md): each roadmap round takes one open item whose prerequisites have landed, claims it, and assigns it to the agent; with nothing eligible the round authors nothing. `--roadmap-only` and `--roadmap-skip` narrow the areas it draws from (an umbrella to its members that are roadmap areas now). Re-read every round; an empty value means no list. |
 | `--extra-roadmap-prompt TEXT` | Operator guidance rendered into the roadmap prompt as its own section, steering the choice of target within the designated roadmap (and of area under `--roadmap-only ""`; an unpinned worker still draws its area at random first). It cannot override `--roadmap-skip`, others' claims, or the repository's rules; other phases ignore it. At most 4096 characters, not blank. |
-| `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA`; other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
+| `--source PATH_OR_URL` | Supplementary local Git repository directory or Git repository URL (checked-out/default `HEAD`) for authoring a PR. A shallow snapshot is stored in worker state, refreshed on later rounds, and mounted read-only in Bubble mode. Requires the roadmap phase to be enabled and one specific `--roadmap-only AREA` (an umbrella is refused); other enabled phases ignore it, and the roadmap and review quality remain authoritative. |
 | `--roadmap-extra-identities LOGIN[,LOGIN...]` | Extra GitHub logins, beyond your `gh auth` identity, whose claimed intentions the worker treats as its own (won't avoid). |
 | `--ignore-claims` | Don't avoid targets others have claimed on the intentions board (claim-respect is on by default). |
 | `--auto-refresh` | Renew this worker's Claude access token when it expires, instead of reporting Claude unavailable until a human runs `claude` again. Off by default, and only safe when nothing else uses the same credential file — the refresh token is single-use, so the rotation logs out an interactive `claude`, a second refresher, or a copy of the credential elsewhere. See [quota and pacing](quota.md). |
@@ -39,11 +39,22 @@ list is in `tauceti work -h`. For persistent workers, see
 ## Roadmap backpressure
 
 The open-PR backpressure limit follows the roadmap scope you select. A pinned
-area counts only your open PRs identified for that area; an all-areas or
+area counts only your open PRs identified for that area; an umbrella counts
+those of its member areas outside `--roadmap-skip` together; an all-areas or
 automatic run counts roadmap PRs in every non-skipped area. Drafts, non-roadmap
 PRs, and PRs for roadmaps outside the selected scope do not consume its authoring
 limit. An open roadmap PR whose area is temporarily unknown counts conservatively
 in every scope until its area label resolves.
+
+The limit is the account's across every forge the project uses, whichever forges
+the worker itself surveys. A Forgejo-only worker adds the account's open
+non-draft roadmap PRs on GitHub (the shared GitHub state's author counts, or the
+open-PR listing), and a GitHub-only worker with a Forgejo credential adds the
+account's Forgejo PRs (the host's shared Forgejo listing). That other-forge count
+covers every non-skipped area, so a focused round is at least as strict as its
+own scope. When the other forge's count is unavailable, authoring waits: an
+unknown count never reads as zero. A worker without a Forgejo credential has no
+Forgejo account to count and counts GitHub alone.
 
 ## The claim namespace
 
@@ -374,7 +385,7 @@ Most variables are tuning knobs with sane defaults.
 | `CODEX_HOME` | `~/.codex` | Codex config/credential source. Point it at a private directory to give TauCeti its own Codex account without disturbing the one your interactive `codex` uses. |
 | `TAUCETI_WORKER_ID` | _(unset)_ | Pin the id; when unset, `work` takes the lowest free `workerN`. |
 | `TAUCETI_FORK` | auto-created | Point at an existing fork instead of the one the worker creates. |
-| `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
+| `TAUCETI_ROADMAP_ONLY` | _(unset)_ | The single roadmap area or umbrella for `--roadmap-only`. Unset = a fresh random area each round (falls back to all areas if the list can't be fetched); `""` = all areas. |
 | `TAUCETI_ROADMAP_SKIP` | _(unset)_ | Comma-separated roadmap areas to exclude, for `--roadmap-skip`. |
 | `TAUCETI_ROADMAP_TARGETS` | _(unset)_ | Path of the operator target list, for `--roadmap-targets`; blank means no list. |
 | `TAUCETI_EXTRA_ROADMAP_PROMPT` | _(unset)_ | Operator guidance for roadmap rounds, for `--extra-roadmap-prompt`. |
@@ -383,6 +394,7 @@ Most variables are tuning knobs with sane defaults.
 | `TAUCETI_PR` | _(unset)_ | Comma-separated pull request numbers for `--pr`. |
 | `TAUCETI_QUOTA_CMD` | — | Default for `--quota-cmd`. |
 | `TAUCETI_AUTO_REFRESH` | _(unset)_ | `1` is the same as `--auto-refresh`. |
+| `TAUCETI_CLAUDE_USAGE_CREDENTIALS` | _(unset)_ | A second Claude login, as a config directory or a credentials file, that the pacer reads usage with. For workers whose agents run on a `claude setup-token` token; see [quota](quota.md#agents-on-a-setup-token-a-separate-usage-login). |
 | `TAUCETI_PACE` | _(unset)_ | Pacing curve for `--pace` (`time%:budget%` points); unset = `60:40`. |
 | `TAUCETI_PACE_CLAUDE`, `TAUCETI_PACE_CODEX` | _(unset)_ | Pacing curve for `--pace-claude` / `--pace-codex`; unset or empty = that provider follows `TAUCETI_PACE`. |
 | `TAUCETI_STREAM` | — | `1` is the same as `--stream`. |

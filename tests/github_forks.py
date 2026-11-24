@@ -208,7 +208,9 @@ with (
     with patch.object(outbox, "fork_read", return_value=stale):
         check = {**value, "fork_absent_since": time.time() - 301}
         assert outbox.reconcile(check, env) is None, "cached observations must be separated by the full grace period"
-    value.update(fork_absent_since=time.time() - 301, retry_at=0)
+    # The second observation is the fork read cached (for 60 s) by the drain above, so the grace
+    # period is counted from that observation, not from the clock, which a loaded runner advances.
+    value.update(fork_absent_since=value["fork_absent_since"] - 301, retry_at=0)
     tr.atomic(path, value)
     rejected = subprocess.CompletedProcess([], 1, "", "API rate limit exceeded")
     rejected.github_before_request = True

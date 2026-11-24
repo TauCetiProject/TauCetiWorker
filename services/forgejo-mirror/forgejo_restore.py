@@ -8,6 +8,9 @@
             fleet's shared repositories for open PR branches the mirror lacks. A ref that exists
             on the target is never changed. Without --execute nothing is pushed.
   verify    compare the target's refs and open PR heads with a saved plan
+  pull-refs report open PRs whose head the base repository does not serve (no matching
+            refs/pull/N/head); with --publish, push each fork PR's head to
+            refs/tauceti-fork-heads/N so the base repository serves it again
 
 Uses only the standard library and git. Run it where the mirror is (tauchonki).
 """
@@ -32,8 +35,14 @@ from pathlib import Path
 
 ZERO = "0" * 40
 DEFAULT_FLEET_GLOB = "~/.local/share/tauceti-fleet/worker-runtimes/*/lib/python3*/site-packages/tauceti_worker/host-repositories/TauCeti-*.git"
-# Never pushed: Forgejo derives refs/pull/* itself, the rest are the mirror's own namespaces.
-NEVER_PUSH = ("refs/pull/", "refs/forks/", "refs/tauceti-mirror/")
+# Forgejo writes a fork PR's refs/pull/N/head only when the PR is opened or its fork branch is
+# pushed, and refuses that ref from anyone else. After a restore the base repository therefore
+# lacks these heads' commits, so fetching them, inline review comments and the queue's merge base
+# fail. A plain ref here makes the exact head commit reachable again (pull-refs --publish).
+FORK_HEADS = "refs/tauceti-fork-heads/"
+# Never pushed: Forgejo derives refs/pull/* itself, pull-refs derives the fork heads from the
+# forks' current branches, and the rest are the mirror's own namespaces.
+NEVER_PUSH = ("refs/pull/", FORK_HEADS, "refs/forks/", "refs/tauceti-mirror/")
 TRANSIENT = (
     " 50",
     "HTTP 5",
@@ -578,8 +587,144 @@ def verify(args, target: Target, items: list[Item]) -> int:
             say(f"  {lagging} of them have no matching refs/pull/N/head yet; Forgejo rewrites it after a push")
         if unplanned:
             say(f"open PRs without a restored branch: {unplanned}")
-        problems += wrong + unplanned
+        forks = pull_ref_report(target, pulls, remote)["missing_fork"]
+        if forks:
+            say(
+                f"open fork PRs whose head the base repository does not serve: {len(forks)} "
+                f"(#{', #'.join(str(pull['number']) for pull in forks[:30])})"
+            )
+            say("  Forgejo rewrites their refs/pull/N/head only on a push to the fork branch; run pull-refs --publish")
+        problems += wrong + unplanned + len(forks)
     return 0 if problems == 0 else 1
+
+
+def pull_ref_report(target: Target, pulls: list[dict], remote: dict[str, str]) -> dict[str, list]:
+    """Sort open PRs by how the base repository serves their head commit.
+
+    `served`: refs/pull/N/head is the head. `fork_heads`: only refs/tauceti-fork-heads/N is.
+    `missing`: neither, split by whether the head is in a fork (publishable) or in the base
+    repository (Forgejo rewrites the pull ref on the next push of its branch). `stale`: fork-head
+    refs no longer needed, because their PR closed or its pull ref is back.
+    """
+    base_owner = target.repository.split("/", 1)[0].lower()
+    report = {"served": [], "fork_heads": [], "missing_fork": [], "missing_base": [], "stale": []}
+    numbers = set()
+    for pull in pulls:
+        number, head = pull["number"], pull.get("head") or {}
+        numbers.add(number)
+        sha = head.get("sha")
+        extra = remote.get(f"{FORK_HEADS}{number}")
+        if remote.get(f"refs/pull/{number}/head") == sha:
+            report["served"].append(pull)
+            if extra is not None:
+                report["stale"].append(f"{FORK_HEADS}{number}")
+            continue
+        if extra == sha:
+            report["fork_heads"].append(pull)
+            continue
+        owner = (((head.get("repo") or {}).get("owner") or {}).get("login") or "").lower()
+        report["missing_fork" if owner and owner != base_owner else "missing_base"].append(pull)
+    for name in sorted(remote):
+        suffix = name.removeprefix(FORK_HEADS)
+        if name.startswith(FORK_HEADS) and not (suffix.isdigit() and int(suffix) in numbers):
+            report["stale"].append(name)
+    return report
+
+
+def publish_fork_heads(args, target: Target, pulls: list[dict], remote: dict[str, str]) -> list[dict]:
+    """Push each fork PR's exact head to refs/tauceti-fork-heads/N; returns the PRs left unserved."""
+    token_file = Path(args.token_file).expanduser()
+    verify_identity(target, token_file, args.user)
+    env = git_env(target.base_url, args.user, token_file)
+    stage = make_staging(Path(args.mirror).expanduser(), [])
+    failed = []
+    try:
+        for pull in pulls:
+            number, head = pull["number"], pull["head"]
+            ref, sha = f"{FORK_HEADS}{number}", head["sha"]
+            source = f"{target.base_url}/{head['repo']['full_name']}.git"
+            fetched = git(stage, "fetch", "--no-tags", source, f"refs/heads/{head['ref']}", env=git_env(), check=False)
+            tip = git(stage, "rev-parse", "FETCH_HEAD", check=False).stdout.strip() if fetched.returncode == 0 else ""
+            if tip != sha:
+                say(f"  PR #{number}: {head['repo']['full_name']} {head['ref']} is at {tip or 'unreadable'}, not {sha}")
+                failed.append(pull)
+                continue
+            proc = git(
+                stage,
+                "push",
+                "--porcelain",
+                "--no-verify",
+                f"--force-with-lease={ref}:{remote.get(ref, '')}",
+                target.url,
+                f"{sha}:{ref}",
+                env=env,
+                check=False,
+            )
+            if proc.returncode:
+                say(f"  PR #{number}: push of {ref} failed: {proc.stderr.strip()[-300:]}")
+                failed.append(pull)
+            else:
+                say(f"  PR #{number}: published {sha} as {ref}")
+    finally:
+        shutil.rmtree(stage.parent, ignore_errors=True)
+    return failed
+
+
+def prune_fork_heads(args, target: Target, stale: list[str], remote: dict[str, str]) -> int:
+    token_file = Path(args.token_file).expanduser()
+    verify_identity(target, token_file, args.user)
+    leases = [f"--force-with-lease={ref}:{remote[ref]}" for ref in stale]
+    # A deletion needs no objects, but git push still needs a repository to run in.
+    stage = make_staging(Path(args.mirror).expanduser(), [])
+    try:
+        proc = git(
+            stage,
+            "push",
+            "--porcelain",
+            "--no-verify",
+            *leases,
+            target.url,
+            *(f":{ref}" for ref in stale),
+            env=git_env(target.base_url, args.user, token_file),
+            check=False,
+        )
+    finally:
+        shutil.rmtree(stage.parent, ignore_errors=True)
+    say(
+        f"pruned {len(stale)} fork-head refs" if proc.returncode == 0 else f"prune failed: {proc.stderr.strip()[-300:]}"
+    )
+    return proc.returncode
+
+
+def cmd_pull_refs(args) -> int:
+    target = target_from(args)
+    if target.owner:
+        raise RestoreError("pull-refs checks the base repository's open PRs; drop --fork")
+    pulls = open_pulls(target.base_url, target.repository, None)
+    remote = ls_remote(target.url, git_env(), "refs/pull/*", FORK_HEADS + "*")
+    report = pull_ref_report(target, pulls, remote)
+    say(
+        f"open PRs: {len(pulls)}; head served by refs/pull/N/head {len(report['served'])}, "
+        f"by {FORK_HEADS}N {len(report['fork_heads'])}, by neither {len(report['missing_fork']) + len(report['missing_base'])}"
+    )
+    for kind, pull in [("fork", p) for p in report["missing_fork"]] + [("base", p) for p in report["missing_base"]]:
+        number, head = pull["number"], pull.get("head") or {}
+        actual = remote.get(f"refs/pull/{number}/head", "missing")
+        say(
+            f"  PR #{number} ({kind} {(head.get('repo') or {}).get('full_name')}): head {head.get('sha')}, refs/pull/{number}/head {actual}"
+        )
+    unserved = report["missing_fork"] + report["missing_base"]
+    if report["missing_base"]:
+        say("  base-repository PRs get their pull ref back when their branch is next pushed")
+    if args.publish and report["missing_fork"]:
+        unserved = publish_fork_heads(args, target, report["missing_fork"], remote) + report["missing_base"]
+    elif report["missing_fork"]:
+        say(f"  rerun with --publish to push the fork heads to {FORK_HEADS}N")
+    if report["stale"]:
+        say(f"no longer needed: {len(report['stale'])} fork-head refs ({', '.join(report['stale'][:10])})")
+        if args.prune and prune_fork_heads(args, target, report["stale"], remote):
+            return 1
+    return 1 if unserved else 0
 
 
 def cmd_verify(args) -> int:
@@ -627,12 +772,20 @@ def parse(argv):
     restore.add_argument("--attempts", type=int, default=5)
     restore.add_argument("--push-timeout", type=float, default=1800)
     sub.add_parser("verify", help="compare the target with the saved plan (--results)")
+    pull_refs = sub.add_parser("pull-refs", help="report open PRs whose head the base repository does not serve")
+    pull_refs.add_argument("--publish", action="store_true", help=f"push missing fork PR heads to {FORK_HEADS}N")
+    pull_refs.add_argument("--prune", action="store_true", help="delete fork-head refs no open PR needs any more")
+    pull_refs.add_argument("--mirror", default="~/.local/share/tauceti-forgejo-mirror/TauCeti.git")
+    pull_refs.add_argument("--user", default="tauceti-ai-for-science")
+    pull_refs.add_argument("--token-file", default="~/.config/tauceti-forgejo/bot-token")
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse(argv)
-    handler = {"check": cmd_check, "restore": cmd_restore, "verify": cmd_verify}[args.command]
+    handler = {"check": cmd_check, "restore": cmd_restore, "verify": cmd_verify, "pull-refs": cmd_pull_refs}[
+        args.command
+    ]
     try:
         return handler(args)
     except (RestoreError, OSError, subprocess.SubprocessError, ValueError) as error:

@@ -43,7 +43,7 @@ class Meta:
     # "stale"       — a fetch failed and a prior value was served instead
     # "missing"     — a successful read found no scoreboard
     # "fetch_failed"— a fetch failed with nothing cached to fall back on
-    # "deferred"    — a budgeted survey had no cached observation and no detail read left: unknown
+    # "deferred"    — a cache-only pass had no current observation of this PR: unknown
     # Only `fresh` may authorize a mutation. `assumed` is deliberately NOT `fresh`: the `updatedAt`
     # rule cannot see a DELETED comment, so a board that was deleted or forged could be served under
     # it for up to the backstop. Triage tolerates that; spending money on it does not.
@@ -51,40 +51,28 @@ class Meta:
 
 
 class _Deferred(Exception):
-    """A budgeted survey may not spend a remote read on this PR."""
+    """A cache-only pass may not read this PR remotely."""
 
 
-class DetailBudget:
-    """The remote review-state reads one survey may spend, by PR.
+class CacheOnly:
+    """Mark a pass that answers from current observations only.
 
-    Reads are admitted in the order PRs are asked about, so the caller asks in rank order and then
-    closes the budget. A PR already admitted may finish its reads (scoreboard, then contest thread);
-    every other PR answers from a current cached observation or is deferred. Forced reads, which
-    dispatch uses before acting, are never budgeted.
+    The survey refreshes the host-shared index first (refresh_index), so classification needs no
+    remote read; a PR that refresh could not read is reported as `deferred`, never read here.
+    Forced reads, which dispatch uses before acting, are never cache-only.
     """
 
-    def __init__(self, limit: int):
-        self.limit = limit
-        self.read: set[int] = set()
+    def __init__(self):
         self.deferred: set[int] = set()
-        self.open = True
         self.meta: dict[int, tuple[str, Meta]] = {}
 
-    def allow(self, pr: int) -> bool:
-        if pr in self.read:
-            return True
-        if self.open and len(self.read) < self.limit:
-            self.read.add(pr)
-            return True
-        self.deferred.add(pr)
-        return False
 
-    @property
-    def exhausted(self) -> bool:
-        return not self.open or len(self.read) >= self.limit
+def shared_index_root() -> Path:
+    """The host's review-state index: one observation per PR and (updatedAt, head), shared by every
+    worker on the host that reads the same source with the same credential."""
+    from .github_transport import root
 
-    def close(self) -> None:
-        self.open = False
+    return root() / "review-index"
 
 
 class ReviewState:
@@ -98,16 +86,22 @@ class ReviewState:
             # boundaries. Recovered sidecars must remain in the source scope.
             if not re.fullmatch(r"[0-9a-f]{64}", gh.cache_namespace):
                 raise ValueError("direct source cache namespace must be a qualified identity digest")
-            self.sbcache = self.sbcache / "sources" / gh.cache_namespace
+            # One index per host and (source, credential): an observation any worker reads serves
+            # every worker, so each PR change costs the host one read rather than one per worker.
+            index = getattr(cfg, "review_index", None)
+            self.sbcache = (index if index is not None else self.sbcache / "sources") / gh.cache_namespace
         self._comments: dict[int, tuple[float, list[dict] | None, bool]] = {}
         self._observed: dict[int, str] = {}
         self._survey_facts: dict[int, dict] = {}
-        self._budget: DetailBudget | None = None
+        self._budget: CacheOnly | None = None
+        # PRs whose newest thread read failed; refresh_index counts these, not the absence of an
+        # indexed thread (a read the shared read cache answered is not re-indexed, by design).
+        self.thread_failures: set[int] = set()
 
     @contextlib.contextmanager
-    def detail_budget(self, limit: int):
-        """Bound this survey pass's remote per-PR reads; see DetailBudget."""
-        budget = DetailBudget(limit)
+    def cache_only(self):
+        """Answer this pass from current observations only; see CacheOnly."""
+        budget = CacheOnly()
         previous, self._budget = self._budget, budget
         try:
             yield budget
@@ -115,17 +109,38 @@ class ReviewState:
             self._budget = previous
 
     def _budgeted(self, pr: int, read, force: bool):
-        """Run `read` from cache only unless this PR may spend a remote read; _Deferred otherwise."""
+        """Run `read` normally, or from cache only in a cache-only pass (_Deferred on a miss)."""
         budget = None if force else self._budget
-        if budget is None or pr in budget.read:
+        if budget is None:
             return read()
         try:
             with read_context(cache_only=True):
                 return read()
         except CacheOnlyMiss:
-            if not budget.allow(pr):
-                raise _Deferred from None
-        return read()
+            budget.deferred.add(pr)
+            raise _Deferred from None
+
+    def current(self, pr: int, *, contest: bool = False) -> bool:
+        """Whether the index holds an observation entitled to answer for this PR's current state."""
+        sc = self._sidecar(self._contest_path(pr) if contest else self._key_path(pr), pr)
+        return sc is not None and ("contest" in sc if contest else sc.get("status") in ("present", "missing"))
+
+    @contextlib.contextmanager
+    def refresh_lock(self, timeout: float):
+        """Hold the host's refresh lock for this index, so one worker reads each changed PR while
+        the others wait and then reuse its observations. Yields False when the wait expired."""
+        from .github_transport import LockWaitExpired, locked
+
+        lock = locked(self.sbcache.parent / (self.sbcache.name + ".refresh.lock"), timeout=timeout)
+        try:
+            lock.__enter__()
+        except LockWaitExpired:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            lock.__exit__(None, None, None)
 
     def seed_survey(self, rows=()):
         """Facts last only for this pass. Force reads and post-write busts bypass them."""
@@ -234,10 +249,19 @@ class ReviewState:
         if self._direct_source:
             from .forgejo_reads import prune_state_cache
 
-            # Three small files per open PR; stay above the live set so a pass does not evict itself.
-            prune_state_cache(self.sbcache.parent, max_files=8192, max_bytes=64 * 1024 * 1024)
+            marker = self.sbcache.parent / ".pruned"
+            try:
+                if 0 <= time.time() - marker.stat().st_mtime < 300:
+                    return  # one bounded sweep per five minutes, not one per write
+            except OSError:
+                pass
+            # Three files per open PR for every PR on the host; stay well above the live set so a
+            # pass never evicts its own observations.
+            prune_state_cache(self.sbcache.parent, max_files=32768, max_bytes=512 * 1024 * 1024)
+            with contextlib.suppress(OSError):
+                marker.touch()
 
-    def _write_source_cache(self, path, value, *, prune=True, observed_at=None):
+    def _write_source_cache(self, path, value, *, prune=True, observed_at=None, wait=False):
         """Private atomic source cache writes, without following a target symlink."""
         self.sbcache.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory = os.open(self.sbcache, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -247,7 +271,8 @@ class ReviewState:
             os.fchmod(directory, 0o700)
             # Serialize only local atomic replacements. No network read holds
             # this lock; using the directory avoids persistent lock files.
-            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # A tombstone waits for the lock: it must land, or an older read could republish.
+            fcntl.flock(directory, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
             try:
                 if os.stat(path.name, dir_fd=directory, follow_symlinks=False).st_mtime > observed_at:
                     return  # An independently fetched later observation won.
@@ -428,8 +453,18 @@ class ReviewState:
         else:
             invalidate()
         self._cache_path(pr).unlink(missing_ok=True)
-        self._key_path(pr).unlink(missing_ok=True)
-        self._contest_path(pr).unlink(missing_ok=True)
+        if self._direct_source:
+            # The index is shared: a peer's read that started before this write could still land
+            # and republish the old state. A newer tombstone makes _write_source_cache refuse it.
+            now = time.time()
+            for path in (self._key_path(pr), self._contest_path(pr)):
+                try:
+                    self._write_source_cache(path, {"status": "invalidated"}, prune=False, observed_at=now, wait=True)
+                except (OSError, ValueError):
+                    path.unlink(missing_ok=True)
+        else:
+            self._key_path(pr).unlink(missing_ok=True)
+            self._contest_path(pr).unlink(missing_ok=True)
         self._comments.pop(pr, None)
         self._survey_facts.pop(pr, None)
         if self._budget is not None:
@@ -499,7 +534,9 @@ class ReviewState:
         except _Deferred:
             return None  # unread this survey; dispatch re-reads contests for the PR it selects
         if rcs is None:
+            self.thread_failures.add(pr)
             return None  # a fetch FAILURE answers nothing and must not be cached as "no contest"
+        self.thread_failures.discard(pr)
         best = self._newest_contest(rcs)
         if not (self._direct_source and reused):  # as for scoreboards: do not reset a reused observation's age
             self._write_sidecar(

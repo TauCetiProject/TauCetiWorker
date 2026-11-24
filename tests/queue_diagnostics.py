@@ -156,6 +156,30 @@ class ParseLog(unittest.TestCase):
         self.assertEqual(kinds(located), [("compiler", "TauCeti.A.B")])
         self.assertNotIn("located", located[0])
 
+    def test_lean_killed_by_signal_9_is_infrastructure(self):
+        module = "TauCeti.GroupTheory.SpecificGroups.Sporadic.Fischer.TwentyTwo.Presentation"
+        killed = (
+            "2026-11-20T08:40:07.7014941Z error: Lean process for /opt/actions-runner/_work/TauCeti/TauCeti/pr/"
+            + d.path_of(module)
+            + " was killed by signal 9 after 712s, likely out of memory"
+        )
+        targets = ["Some required targets logged failures:", "- " + module, "error: build failed"]
+        findings = d.parse_log([killed, "error: Lean exited with code 137", *targets])
+        self.assertEqual(kinds(findings), [("infrastructure", module)])
+        self.assertEqual(findings[0]["reason"], "lean_killed")
+        self.assertEqual(findings[0]["path"], d.path_of(module))
+        # Another failed target, or a located error elsewhere, is still a source finding.
+        other = d.parse_log([killed, *targets[:2], "- TauCeti.A.B", *targets[2:]])
+        self.assertEqual(kinds(other), [("compiler", "TauCeti.A.B"), ("infrastructure", module)])
+        located = d.parse_log(["TauCeti/A/B.lean:1:1: error: x", killed, *targets])
+        self.assertEqual(kinds(located), [("compiler", "TauCeti.A.B"), ("infrastructure", module)])
+        # A wall-clock timeout is the module's own failure.
+        timeout = killed.replace(
+            "was killed by signal 9 after 712s, likely out of memory",
+            "exceeded the 3000s wall-clock limit (TERM, then KILL after 30s)",
+        )
+        self.assertEqual(kinds(d.parse_log([timeout, *targets])), [("compiler", module)])
+
     def test_dedup_and_runner_loss(self):
         lines = ["TauCeti/A/B.lean:1:1: error: x"] * 3 + [
             "The runner has received a shutdown signal. This can happen when the runner service is stopped."

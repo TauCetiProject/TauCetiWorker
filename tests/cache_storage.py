@@ -114,10 +114,17 @@ class Storage(unittest.TestCase):
         with self.assertRaises(storage.InventoryDeferred):
             storage.inventory([self.pool], deadline=time.monotonic() - 1)
         result = storage.collect([], deadline=time.monotonic() - 1)  # a small pool, default interval
-        self.assertEqual(result["deferred"], ["shared-caches"])
+        self.assertEqual(result["deferred"], ["shared-cache-inventory", "shared-cache-deletion"])
         self.assertEqual(result["removed"], [])
         self.assertTrue(old.exists())
         self.assertFalse(storage.collect([], deadline=time.monotonic() + 600).get("deferred"))
+        self.assertFalse(old.exists())
+
+    def test_a_deferred_walk_still_deletes_expired_entries(self):
+        old = self.entry(age=4 * 86400)
+        with patch.object(storage, "inventory", side_effect=storage.InventoryDeferred("inventory deadline")):
+            result = storage.collect([], deadline=time.monotonic() + 600)
+        self.assertEqual(result["deferred"], ["shared-cache-inventory"])
         self.assertFalse(old.exists())
 
     def test_overlapping_roots_still_count_each_file_once(self):
