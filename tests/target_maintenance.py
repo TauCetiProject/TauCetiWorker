@@ -91,6 +91,41 @@ class Ordering(unittest.TestCase):
         self.assertEqual(order(cascade(sv, AUTO_STAGES, tier=1))[-1], ("review", 60))
         self.assertNotIn("review", [stage for stage, _ in cascade(sv, AUTO_STAGES, tier=2)])
 
+    def test_own_first_reviews_share_the_rereview_tier_in_review_order(self):
+        sv = survey()
+        sv.kind("review").actionable = [
+            Candidate(61, HEAD, own_first_review=True),
+            Candidate(60, HEAD, rereview=True),
+            Candidate(50, HEAD),
+            Candidate(62, HEAD, own_first_review=True),
+            Candidate(63, HEAD, rereview=True),
+        ]
+        pairs = order(cascade(sv, AUTO_STAGES))
+        # After the rebases, re-reviews and our own first reviews keep the review stage's (spread)
+        # order, so neither kind starves the other; then fixes; then other first reviews.
+        self.assertEqual(
+            pairs[:8],
+            [
+                ("rebase", 9),
+                ("rebase", 1),
+                ("rebase", 2),
+                ("review", 61),
+                ("review", 60),
+                ("review", 62),
+                ("review", 63),
+                ("lint-repair", 7),
+            ],
+        )
+        self.assertEqual(pairs[-1], ("review", 50))
+        self.assertEqual(
+            order(cascade(sv, AUTO_STAGES, tier=1)),
+            [("rebase", 1), ("rebase", 2), ("review", 61), ("review", 60), ("review", 62), ("review", 63)],
+        )
+        self.assertEqual(
+            order(cascade(sv, AUTO_STAGES, review_first=True))[1:5],
+            [("review", 61), ("review", 60), ("review", 62), ("review", 63)],
+        )
+
     def test_review_first_offers_rereviews_then_first_reviews_after_bumps(self):
         sv = survey()
         sv.kind("review").actionable.append(Candidate(60, HEAD, rereview=True))
