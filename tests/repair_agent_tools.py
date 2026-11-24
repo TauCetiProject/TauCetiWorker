@@ -55,11 +55,13 @@ class Fixture(unittest.TestCase):
         (self.worktree / "TauCeti" / "Sub").mkdir(parents=True)
         (self.worktree / "lakefile.toml").write_text('name = "probe"\n')
         self.root = self.tmp / "root"
-        self.env = {
-            "HOME": str(self.home),
-            "PATH": f"{self.bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
-            "LANG": "C.UTF-8",
-        }
+        # The host's tools the commands need, and nothing else: no real bwrap, elan or Lean.
+        system = self.tmp / "system"
+        system.mkdir()
+        for name in ("bash", "sh", "env", "readlink", "basename", "grep", "nice", "ls", "mkdir", "cat", "echo"):
+            if where := shutil.which(name):
+                (system / name).symlink_to(where)
+        self.env = {"HOME": str(self.home), "PATH": f"{self.bin}:{system}", "LANG": "C.UTF-8"}
         self.tools = repair_agent_tools.write_tools(self.root, self.env)
         self.agent_env = {
             **self.env,
@@ -159,6 +161,7 @@ class ShellGuard(Fixture):
             f"f() {{ {self.toolchain}/lean; }}; f",
             f"echo $({self.toolchain}/lean)",
             f"set -e; {self.toolchain}/lean; echo survived",
+            f"PATH=/nonexistent; {self.toolchain}/lean --version",
         ):
             with self.subTest(command=command):
                 run = self.run_agent(command, self.worktree)

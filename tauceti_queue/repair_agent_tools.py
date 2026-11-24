@@ -147,7 +147,7 @@ __tauceti_guard() {
     x=${x//\$\{ELAN_HOME\}/$__TAUCETI_ELAN}
     x=${x//\$ELAN_HOME/$__TAUCETI_ELAN}
     [[ -f $x && -x $x ]] || continue
-    r=$(readlink -f -- "$x" 2>/dev/null) || continue
+    r=$("$__TAUCETI_READLINK" -f -- "$x" 2>/dev/null) || r=$x
     for p in "${__TAUCETI_GUARDED[@]}"; do
       if [[ $r == "$p" || $r == "$p"/* ]]; then
         printf 'tauceti repair: refused `%s`: a toolchain executable named by path bypasses the build sandbox. Run `%s` by name instead; it runs offline in the sandbox, from this directory.\n' "$x" "${x##*/}" >&2
@@ -169,6 +169,8 @@ def guard_script(tools: Path, env: dict | None = None) -> str:
         "# executable named by path, which would run the batch's Lean outside the build sandbox.\n"
         f"__TAUCETI_TOOLS={shlex.quote(str(tools))}\n"
         f"__TAUCETI_ELAN={shlex.quote(str(elan_home(env)))}\n"
+        # Absolute, so a PATH the agent sets cannot make the guard's own lookup fail open.
+        f"__TAUCETI_READLINK={shlex.quote(shutil.which('readlink', path=(env or os.environ).get('PATH')) or 'readlink')}\n"
         f"__TAUCETI_GUARDED=({guarded})\n" + GUARD_BODY
     )
 
