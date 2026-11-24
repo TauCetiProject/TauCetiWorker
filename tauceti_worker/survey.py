@@ -1411,7 +1411,9 @@ def classify_survey(
     #    the lint-repair stage's, so fix-ci defers those; it picks up only other red PRs (ours, or
     #    any other bot-authored one).
     for p in tended if "fix-ci" in enabled else []:
-        if not p.needs_ci_repair or p.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX)):
+        if not p.needs_ci_repair or (
+            p.head_ref.startswith((BUMP_HEAD_PREFIX, LINT_REPAIR_HEAD_PREFIX)) and not adopts(p)
+        ):
             continue
         c = Candidate(p.number, p.head_oid, "build failed at head")
         per_head = counters.read(f"ci-{p.number}-{p.head_oid[:12]}")
