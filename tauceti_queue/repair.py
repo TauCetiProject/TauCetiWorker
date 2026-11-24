@@ -35,6 +35,7 @@ import datetime as dt
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -189,6 +190,11 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
         if kind == "prepare_errors":
             findings["prepare_errors"] = raw
             continue
+        if kind == "parallel_check":
+            findings["parallel_check"] = raw  # the head's parallel local check: no finding of its own
+            continue
+        if kind == "pre_rebased_chain":
+            continue  # the worker's input (`repair_task.seed_pre_rebased`), not a finding
         module = str(raw.get("module") or raw.get("path") or "")
         message = str(raw.get("message") or "")
         if kind == "conflict":
@@ -657,6 +663,71 @@ def commit_resolution(
     git(worktree, "checkout", "--quiet", "--force", "--detach", sha)
     if git(worktree, "rev-parse", "HEAD").strip() != sha:
         raise RuntimeError(f"the worktree could not be checked out at the resolved commit {sha[:12]}")
+    return sha, resolution_report(clone, prefix, sha, original, paths, large_refactors, explained=bool(explanation))
+
+
+def recommit_resolution(
+    clone: Path,
+    stored: str,
+    prefix: str,
+    commit: str,
+    paths: list[str],
+    large_refactors=frozenset(),
+    *,
+    made_on: str | None = None,
+) -> tuple[str, dict] | None:
+    """An earlier accepted resolution ``stored`` of ``commit``, committed again on the clean ``prefix``
+    as ``commit_resolution`` would commit the same files and explanation: its tree and message, the
+    conflicting commit's author and date. The worker's replay dates its commits when it runs, so a
+    rerun's prefix has the same tree under another SHA. None when ``stored`` is not a resolution of
+    ``commit`` on a prefix with ``prefix``'s tree (missing, foreign or otherwise mismatched); the report
+    is ``commit_resolution``'s. The worktree is not touched.
+
+    With ``made_on``, ``stored`` resolved ``commit`` on a commit with ``made_on``'s tree instead (the
+    rebase target, by the lookahead in ``repair_lookahead``): its change is merged onto ``prefix``, and
+    None when that merge conflicts."""
+    try:
+        resolved = chain_tool.read_commit(clone, stored)
+        original = chain_tool.read_commit(clone, commit)
+        parent_tree = chain_tool.tree_of(clone, resolved.parents[0]) if len(resolved.parents) == 1 else None
+    except chain_tool.ChainError:
+        return None
+    if parent_tree != chain_tool.tree_of(clone, made_on or prefix) or not resolved.message.startswith(
+        original.message.rstrip() + "\n"
+    ):
+        return None
+    tree = resolved.tree
+    if made_on is not None:
+        merged = chain_tool.merge_trees(clone, prefix, stored, merge_base=resolved.parents[0])
+        if not merged.clean:
+            return None
+        tree = merged.tree
+
+    def recommit(parent: str, tree: str) -> str:
+        return chain_tool.commit_tree(
+            clone,
+            tree,
+            parent,
+            resolved.message,
+            (original.author_name, original.author_email),
+            author_date=original.author_date,
+            committer_date=original.author_date,
+        )
+
+    # Only a commit made exactly as the worker makes one (author, committer and dates) is reused, not
+    # one an agent made with `git commit` and pointed a ref at.
+    if recommit(resolved.parents[0], resolved.tree) != stored:
+        return None
+    sha = recommit(prefix, tree)
+    explained = bool(chain_tool.appended_text(original.message, resolved.message).strip())
+    return sha, resolution_report(clone, prefix, sha, original, paths, large_refactors, explained=explained)
+
+
+def resolution_report(
+    clone: Path, prefix: str, sha: str, original, paths: list[str], large_refactors, *, explained: bool
+) -> dict:
+    """``commit_resolution``'s report on the resolved commit ``sha`` of ``original`` on ``prefix``."""
+    commit = original.sha
     problems = []
     for path in paths:
         blob = git(clone, "cat-file", "-p", f"{sha}:{path}", check=False)
@@ -666,13 +737,13 @@ def commit_resolution(
     for entry in review:
         problems += [f"review-size: the resolved commit against its parent: {v}" for v in entry["violations"]]
     source_pr = original.source_pr or commit
-    return sha, {
+    return {
         "base": prefix,
         "tip": sha,
         "resolved": commit,
         "review_size": review,
         "edited": [source_pr],
-        "unexplained": [] if explanation else [source_pr],
+        "unexplained": [] if explained else [source_pr],
         "problems": problems,
         "ok": not problems,
     }
@@ -748,6 +819,14 @@ def link_shared_packages(worktree: Path, seed_packages: Path) -> None:
         else:
             shutil.rmtree(target)
     target.symlink_to(seed_packages)
+    # The sandbox binds a packages link's target only when the worker recorded it, outside the
+    # checkout and every bind (repair_sandbox.linked_packages), and only a target that may be shared
+    # at all: a parent worktree's `.lake/packages` is build state the parent's build could have
+    # replaced by a link elsewhere before this call.
+    record = repair_sandbox.packages_record(worktree)
+    record.parent.mkdir(parents=True, exist_ok=True)
+    shared = Path(seed_packages)
+    record.write_text(f"{shared}\n" if repair_sandbox.shareable_packages(shared) else "")
 
 
 def lake_env(root: Path, base_env: dict | None = None, *, cache_root: Path | None = None) -> dict:
@@ -765,6 +844,8 @@ def lake_env(root: Path, base_env: dict | None = None, *, cache_root: Path | Non
     env["LAKE_CACHE_DIR"] = str((cache_root or root) / "lake-cache")
     env["LAKE_ARTIFACT_CACHE"] = "1"
     env["LAKE_RESTORE_ARTIFACTS"] = "1"
+    # The workers' own Mathlib cache: fetches run in the sandbox, which may write it (repair_sandbox).
+    env[repair_sandbox.MATHLIB_CACHE_VARIABLE] = str((cache_root or root) / "mathlib-cache")
     env.pop("TAUCETI_PR_CACHE_MISS", None)
     return env
 
@@ -935,7 +1016,13 @@ def _fetch_mapping(
     argv = [*lake, "cache", "get", "--service", service, "--repo", repository, f"--rev={revision}"]
     if mappings_only:
         argv.append("--mappings-only")
-    fetch = run_logged(argv, worktree, log, env=env, timeout=600 if mappings_only else 1800)
+    fetch = run_logged(
+        repair_sandbox.sandboxed_fetch(argv, worktree, env),
+        worktree,
+        log,
+        env=env,
+        timeout=600 if mappings_only else 1800,
+    )
     with log.open("rb") as handle:
         handle.seek(offset)
         text = handle.read().decode(errors="replace")
@@ -1019,6 +1106,7 @@ def prepare_artifacts(
     preferred: tuple[tuple[str, str], ...] = (),
     warm: tuple[tuple[str, str], ...] = (),
     build: bool = True,
+    fetch: bool = True,
 ) -> dict:
     """Warm artifacts the way the plan's default source does: main's cache at the base, then an
     incremental build of the batch's modules. Returns timings, module counts and ``available``.
@@ -1047,83 +1135,94 @@ def prepare_artifacts(
     first warmed revision). ``build=False`` fetches only, so ``available`` rests on the fetch alone:
     streaming callers build afterwards, known audit/lint repairs build during verification after
     the agent edits, and rebase tasks build the resulting chain after replay.
+
+    ``fetch=False`` is a batch tree a previous task built with the same toolchain and dependencies
+    (``repair_cleanup.adopt``): nothing is fetched, the tree's own ``.lake`` is the warm state and
+    Lake compiles what changed (``warm_tree``).
     """
     record: dict = {}
     seconds = 0.0
     reasons: list[str] = []
     from tauceti_queue.repair_cache import downloads
 
-    with downloads(env) as fetch_env:
-        if mathlib_cache:
-            deps = run_logged(
-                [*lake, "exe", "cache", "get"], worktree, logdir / "cache-get-mathlib.log", fetch_env, 1800
-            )
-            record["mathlib_cache"] = deps
-            seconds += deps["seconds"]
-            if deps["rc"] != 0:
-                reasons.append(f"lake exe cache get exited {deps['rc']}")
-        warm_attempts: list[dict] = []
-        for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
-            fetch = _fetch_mapping(
-                worktree,
-                revision,
-                fetch_env,
-                logdir,
-                repository=repository,
-                lake=lake,
-                mappings_only=False,
-                service=service,
-            )
-            fetch["distance"] = None
-            warm_attempts.append(fetch)
-            seconds += fetch["seconds"]
-        warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
-        record["warm_attempts"] = warm_attempts
-        record["warmed_from"] = [fetch["revision"] for fetch in warmed]
-        tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
-        attempts: list[dict] = []
-        candidates = [
-            (service, revision, None)
-            for service, revision in preferred
-            if revision and (service, revision) not in tried
-        ] + [
-            (CACHE_SERVICE, revision, distance)
-            for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
-        ]
-        for service, revision, distance in candidates:
-            fetch = _fetch_mapping(
-                worktree,
-                revision,
-                fetch_env,
-                logdir,
-                repository=repository,
-                lake=lake,
-                mappings_only=False,
-                service=service,
-            )
-            fetch["distance"] = distance
-            attempts.append(fetch)
-            seconds += fetch["seconds"]
-            if fetch["mapping_found"]:
-                break
-        found = attempts[-1] if attempts[-1]["mapping_found"] else None
-        record["base_cache"] = attempts[-1]
-        if found is None and warmed:
-            found = warmed[0]
-        record["cache_attempts"] = attempts
-        record["cache_revision"] = found["revision"] if found else None
-        record["cache_distance"] = found["distance"] if found else None
-        record["cache_service"] = found["service"] if found else None
-        record["cache_skipped"] = _skipped_summary(attempts, base)
-        if found is None:
-            reasons.append("; ".join(record["cache_skipped"]))
-        if candidate:
-            own = _fetch_mapping(
-                worktree, candidate, fetch_env, logdir, repository=repository, lake=lake, mappings_only=True
-            )
-            own["published"] = own["mapping_found"]
-            record["candidate_outputs_published"] = own
-            seconds += own["seconds"]
+    if not fetch:
+        record.update(warm_tree=True, cache_revision=None, cache_attempts=[], warm_attempts=[], warmed_from=[])
+    else:
+        with downloads(env) as fetch_env:
+            if mathlib_cache:
+                deps = run_logged(
+                    repair_sandbox.sandboxed_fetch([*lake, "exe", "cache", "get"], worktree, fetch_env),
+                    worktree,
+                    logdir / "cache-get-mathlib.log",
+                    fetch_env,
+                    1800,
+                )
+                record["mathlib_cache"] = deps
+                seconds += deps["seconds"]
+                if deps["rc"] != 0:
+                    reasons.append(f"lake exe cache get exited {deps['rc']}")
+            warm_attempts: list[dict] = []
+            for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
+                fetch = _fetch_mapping(
+                    worktree,
+                    revision,
+                    fetch_env,
+                    logdir,
+                    repository=repository,
+                    lake=lake,
+                    mappings_only=False,
+                    service=service,
+                )
+                fetch["distance"] = None
+                warm_attempts.append(fetch)
+                seconds += fetch["seconds"]
+            warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
+            record["warm_attempts"] = warm_attempts
+            record["warmed_from"] = [fetch["revision"] for fetch in warmed]
+            tried = {(fetch["service"], fetch["revision"]) for fetch in warm_attempts}
+            attempts: list[dict] = []
+            candidates = [
+                (service, revision, None)
+                for service, revision in preferred
+                if revision and (service, revision) not in tried
+            ] + [
+                (CACHE_SERVICE, revision, distance)
+                for revision, distance in _artifact_candidates(worktree, base, fallbacks, ancestors)
+            ]
+            for service, revision, distance in candidates:
+                fetch = _fetch_mapping(
+                    worktree,
+                    revision,
+                    fetch_env,
+                    logdir,
+                    repository=repository,
+                    lake=lake,
+                    mappings_only=False,
+                    service=service,
+                )
+                fetch["distance"] = distance
+                attempts.append(fetch)
+                seconds += fetch["seconds"]
+                if fetch["mapping_found"]:
+                    break
+            found = attempts[-1] if attempts[-1]["mapping_found"] else None
+            record["base_cache"] = attempts[-1]
+            if found is None and warmed:
+                found = warmed[0]
+            record["cache_attempts"] = attempts
+            record["cache_revision"] = found["revision"] if found else None
+            record["cache_distance"] = found["distance"] if found else None
+            record["cache_service"] = found["service"] if found else None
+            record["cache_skipped"] = _skipped_summary(attempts, base)
+            if found is None:
+                reasons.append("; ".join(record["cache_skipped"]))
+            if candidate:
+                own = _fetch_mapping(
+                    worktree, candidate, fetch_env, logdir, repository=repository, lake=lake, mappings_only=True
+                )
+                own["published"] = own["mapping_found"]
+                record["candidate_outputs_published"] = own
+                seconds += own["seconds"]
     if build and not reasons:
         built = run_logged(
             repair_sandbox.sandboxed_lake([*lake, "build", "--iofail"], worktree, env),
@@ -1155,7 +1254,7 @@ CHECK_FILE = "check"  # the agent's one validation command, written beside the l
 GUARDS_FILE = "ci_git.py"  # the shared PR-level diff guards the check script runs on each commit
 EXPLANATION_FILE = "explanation.md"  # a conflict resolution's explanation, appended to the commit by the worker
 BUILD_FILE = repair_tools.BUILD_FILE  # builds only the named modules, one Lake build at a time
-SHELL_LIMIT_SECONDS = 2 * 3600  # a repair agent's foreground shell limit (the fleet's rounds keep ten minutes)
+SHELL_LIMIT_SECONDS = 2 * 3600  # a repair agent's foreground shell limit (the fleet's rounds default to an hour)
 MEMBER_STATES = ("replayed", "conflicting", "pending")
 
 HARD_RULES = (
@@ -1188,6 +1287,7 @@ class PromptContext:
         None  # rebase_conflict, pre_rebase: {member, commit, paths, onto, previous_base, clean_prefix_tip}
     )
     feedback: str | None = None  # a validation report from a rejected attempt
+    prepass: str | None = None  # rebase conflicts: what the numproj pre-pass did (``repair_numproj``)
     members: list[dict] = dataclasses.field(
         default_factory=list
     )  # recorded members: source_pr, accepted_head, provenance, title
@@ -1584,7 +1684,10 @@ CACHE_SENTENCE = (
     "this batch and the revisions near it, then the public cache); do not run `lake exe cache get`, "
     "`lake cache get` or any other cache fetch yourself. When the task replays a batch onto a queue head, the "
     "public cache has nothing for the target commit, which is not on `main` yet: that miss is expected and is not "
-    "a reason to stop. Proceed to build incrementally."
+    "a reason to stop. Proceed to build incrementally. `lake`, `lean` and `elan` run offline in the build "
+    "sandbox, from your current directory in this worktree: only the worktree and the toolchains are visible "
+    "and only `.lake` is writable, so keep scratch files under `.lake/`. Run them by name, never by a "
+    "toolchain path."
 )
 
 # The one sentence the prompt says about the worker's checks (``repair_audit``): a fact, not a request.
@@ -1594,11 +1697,52 @@ AUDIT_SENTENCE = (
 )
 
 
+def _pre_rebase_verification(context: PromptContext, check_command: str | None) -> list[str]:
+    """A pre-rebase's "Verifying locally" (decision 153, S1): scoped checks of the resolution only. The
+    chain is not built, checked or repaired as a whole until the batch is the head, on `main`, and the
+    head's tip below it may fail its own checks."""
+    lines = []
+    if check_command:
+        lines += [
+            f"`{check_command}` checks the commit's form: trailers kept, the original message a prefix of the new "
+            "one, a clean working tree. It prints the first problem, or `ok`. Run it before you finish.",
+            "",
+        ]
+    if context.listings_path is not None:
+        lines += [
+            f"Check the files you resolved with `{LISTINGS_DIR}/{BUILD_FILE} <Module.Name>`: it builds only those "
+            "modules. That is all the checking this task needs.",
+            "",
+        ]
+    if context.artifacts_cold:
+        lines += [
+            "The build is cold: the worker found no warm artifacts"
+            + (f" ({context.artifacts_reason})" if context.artifacts_reason else "")
+            + ", so a scoped build may take long. Build only the modules you touched.",
+            "",
+        ]
+    lines += [
+        "Do not run a whole-library `lake build`, the audits or the environment lint, and do not fix anything "
+        "outside the conflict: the worker submits this resolution without a whole-library build, and the batch is "
+        "built, checked and repaired once it is the head, on `main`. A failure in the head's own commits below "
+        "the prefix is the head's to fix, not this batch's.",
+        "",
+        CACHE_SENTENCE,
+        f"Run scoped checks in the foreground: shell commands have a {_hours_text(context.shell_limit)} limit. "
+        "Do not use `--fail-fast`.",
+        "",
+        HARD_RULES,
+    ]
+    return lines
+
+
 def _verification_section(
     context: PromptContext, findings: dict, base_short: str, check_command: str | None
 ) -> list[str]:
     conflict = context.conflict if context.kind in REBASE_KINDS else None
     lines = ["", "## Verifying locally", ""]
+    if context.kind == "pre_rebase":
+        return lines + _pre_rebase_verification(context, check_command)
     if not context.worker_verifies and not resolving(context):
         lines += [
             "Fold fixups and finalize all commit-message explanations before the final whole-library build. "
@@ -1768,7 +1912,9 @@ def _rebase_sections(
         "commits your resolution and replays the rest of the batch itself; a later conflict is a separate request."
         + (
             f" The target is not `main`: `{base_short}` is what `main` becomes when the head lands, so this is the next "
-            "head's expected base, and the head's CI round may still change it."
+            "head's expected base, and the head's CI round may still change it. Resolve the textual conflict only: "
+            "the head's own commits below it are not yours to fix, and this batch is built and repaired once it is "
+            "the head, on `main`."
             if pre
             else ""
         )
@@ -1778,6 +1924,8 @@ def _rebase_sections(
         f"tree holds {commit_text} applied onto it, with git's conflict markers in the conflicting files. No "
         "rebase, cherry-pick or merge is in progress.",
     ]
+    if context.prepass:
+        happened += ["", context.prepass]
     evidence = [
         "",
         "## Conflict evidence",
@@ -2280,8 +2428,9 @@ def prepare_codex_home(root: Path) -> Path:
     return iso
 
 
-def prepare_claude_shell_env(config: Path) -> Path:
-    """Keep unattended Bash stdin at EOF, including commands with heredocs.
+def prepare_claude_shell_env(config: Path, guard: Path | None = None) -> Path:
+    """Keep unattended Bash stdin at EOF, including commands with heredocs, and source ``guard``
+    (``repair_agent_tools``' shell guard): Claude Code's Bash sources this file, not ``BASH_ENV``.
 
     Claude's native guard misses compound commands: anthropics/claude-code#84424.
     The CLI re-reads this file after cwd changes, so keep it in persistent config,
@@ -2292,6 +2441,8 @@ def prepare_claude_shell_env(config: Path) -> Path:
     try:
         with os.fdopen(fd, "w") as stream:
             stream.write("exec </dev/null\n")
+            if guard is not None:
+                stream.write(f". {shlex.quote(str(guard))}\n")
         os.replace(name, path)
     finally:
         Path(name).unlink(missing_ok=True)
@@ -2311,6 +2462,12 @@ def isolation_env(
     for key in LAKE_ENV_KEYS:
         if env_lake and key in env_lake:
             changes[key] = env_lake[key]
+    # The agent's lake, lean and elan run in the build sandbox (repair_agent_tools), which also hides
+    # the worker's credential paths named here; the agent's own environment loses their variables.
+    from tauceti_queue import repair_agent_tools, repair_sandbox
+
+    changes[repair_sandbox.HIDDEN_VARIABLE] = os.pathsep.join(str(p) for p in repair_sandbox.credential_paths())
+    changes.update(repair_agent_tools.agent_environment(root))
     changes["OPENAI_API_KEY"] = None
     if provider == "api":
         changes["CLAUDE_CONFIG_DIR"] = str(prepare_claude_config(root, credentials=False))
@@ -2326,7 +2483,9 @@ def isolation_env(
     if provider != "codex":
         # The host launcher supplies this through --settings, above project/user
         # settings and inherited CLAUDE_ENV_FILE; this private queue config owns it.
-        changes["TAUCETI_REPAIR_CLAUDE_ENV_FILE"] = str(prepare_claude_shell_env(Path(changes["CLAUDE_CONFIG_DIR"])))
+        changes["TAUCETI_REPAIR_CLAUDE_ENV_FILE"] = str(
+            prepare_claude_shell_env(Path(changes["CLAUDE_CONFIG_DIR"]), Path(changes["BASH_ENV"]))
+        )
     changes["GH_TOKEN"] = None
     changes["GITHUB_TOKEN"] = None
     changes["TAUCETI_QUEUE_TOKEN"] = None
@@ -2354,7 +2513,8 @@ def agent_environment(
     from tauceti_worker.agents import host_agent_launch
     from tauceti_worker.config import environment
 
-    with environment(**isolation_env(root, env_lake)):
+    # The prompt states SHELL_LIMIT_SECONDS; the launch must grant it rather than the default hour.
+    with environment(**isolation_env(root, env_lake), TAUCETI_SHELL_LIMIT_SECONDS=str(SHELL_LIMIT_SECONDS)):
         argv, env, stdin_text = host_agent_launch(prompt, claude_profile())
     return argv, env, stdin_text
 

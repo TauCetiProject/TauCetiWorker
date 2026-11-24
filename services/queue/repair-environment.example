@@ -84,6 +84,10 @@ TAUCETI_QUEUE_PROVIDERS=claude,codex,api
 # disjoint files, no imports between them), each in its own worktree of the tip; 0 or 1 keeps every
 # repair sequential. Builds are serialized by .tauceti-repair/build.lock in the task's worktree.
 #TAUCETI_QUEUE_PARALLEL_AGENTS=3
+# A rebase task's later conflicting members are resolved on its target by this many helper agents while
+# the replay works on the current one (tauceti_queue/repair_lookahead.py), half for background tasks;
+# 0 turns the lookahead off.
+#TAUCETI_QUEUE_LOOKAHEAD_HELPERS=16
 
 # Use the SAME root for every colocated repair worker. Task logs/worktrees remain separate.
 # Existing attempts keep their previous pool until completion; new tasks bind to this root.

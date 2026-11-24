@@ -125,6 +125,8 @@ def main():
             patch.object(tc.work_units, "mirror_creds"),
             patch.object(tc.work_units, "survey", return_value=survey),
             patch.object(tc.work_units, "spread_candidates", side_effect=lambda cs: cs),
+            # Fix candidates are otherwise an age-weighted random permutation.
+            patch.object(tc.work_units, "age_spread", side_effect=lambda cs: cs),
             patch.object(tc.work_units, "_still_actionable", return_value=True),
             patch.object(tc.work_units, "_host_agent_binary", return_value="python3"),
             patch.object(tc.work_units, "_progress_snapshot", return_value={}),
@@ -610,6 +612,63 @@ def main():
             check("no pre-head still works", run(repo, None) == "")
         except Exception as e:
             check(f"no pre-head does not raise (raised {e!r})", False)
+
+    # A roadmap round's PR is confirmed from the branch it published, without listing every open PR:
+    # that listing is many pages on a large source and fails whenever one page does.
+    marker = '<!--tauceti-target:v1 {"slug":"x"}-->'
+
+    def roadmap_gh(heads, bodies, listing=None):
+        def listed(*_args, **_kwargs):
+            if listing is None:
+                raise tc.work_units.ForgeError("listing page timed out")
+            return [{"number": n} for n in listing]
+
+        return types.SimpleNamespace(
+            pull_for_head=lambda owner, branch: heads.get((owner, branch)),
+            pr_view=lambda number, _fields: {"body": bodies[number]} if number in bodies else None,
+            pr_list=listed,
+        )
+
+    published = {"published_branches": {"roadmap/x": "c" * 40}, "published_owner": "team"}
+    roadmap = types.SimpleNamespace(pr=None, progress=None)
+    for name, gh, pre, progress, expected in (
+        (
+            "its published branch's new PR",
+            roadmap_gh({("team", "roadmap/x"): 9}, {9: marker}),
+            {"prs": {1}},
+            published,
+            True,
+        ),
+        (
+            "the same without a baseline",
+            roadmap_gh({("team", "roadmap/x"): 9}, {9: marker}),
+            None,
+            published,
+            True,
+        ),
+        (
+            "a PR without a target marker",
+            roadmap_gh({("team", "roadmap/x"): 9}, {9: "plain"}),
+            {"prs": {1}},
+            published,
+            None,
+        ),
+        (
+            "a PR open before the round",
+            roadmap_gh({("team", "roadmap/x"): 9}, {9: marker}),
+            {"prs": {9}},
+            published,
+            None,
+        ),
+        ("no published branch", roadmap_gh({}, {}), {"prs": {1}}, None, None),
+        ("no published branch, listing unchanged", roadmap_gh({}, {}, listing=[1]), {"prs": {1}}, None, False),
+        ("no baseline and no published branch", roadmap_gh({}, {}), None, None, None),
+    ):
+        roadmap.progress = None if progress is None else {**(pre or {}), **progress}
+        check(
+            "roadmap progress: " + name,
+            tc.work_units._progressed(types.SimpleNamespace(gh=gh), roadmap, pre) is expected,
+        )
 
     # The hook is wired only where an agent edits the host checkout.
     src = (REPO / "tauceti_worker" / "work_units.py").read_text()

@@ -151,6 +151,89 @@ round, a round resolving the model it will launch, and the launch stage. Reading
 commands stay reads: `tauceti status` and the dashboard report an expired token
 rather than rotating it behind you.
 
+## Agents on a setup-token: a separate usage login
+
+A `claude setup-token` token lasts a year and never rotates, which suits an
+unattended worker, but it carries the inference scope only: the usage endpoint
+refuses it with HTTP 403, so a worker whose only credential is that token has no
+usage reading and starts no Claude work.
+
+`TAUCETI_CLAUDE_USAGE_CREDENTIALS` names a second credential for the same
+account, from an ordinary `claude` sign-in: either a Claude config directory or
+the credentials file itself. With it set, the pacer, `tauceti status` and the
+dashboard read Claude usage with that login, and `tauceti doctor` shows it as
+`claude usage`. Agents never receive it. They keep launching from
+`$CLAUDE_CONFIG_DIR`, whose `.credentials.json` holds the setup-token as
+`claudeAiOauth.accessToken` (with its `expiresAt` and `scopes`, and no
+`refreshToken`), and off macOS that file is mirrored into isolated workers as
+before. On macOS the native host environment route keeps the existing Keychain
+behavior. Separate-usage file-only phases (Review, Bubble and security audit)
+remain unavailable until macOS file-route support (#682) is present; they do not
+fall back to the usage login or repeatedly charge a PR for missing support.
+
+```toml
+[[workers]]
+id = "worker1"
+agent = "claude"
+auto_refresh = true
+env = { CLAUDE_CONFIG_DIR = "/srv/claude/token", TAUCETI_CLAUDE_USAGE_CREDENTIALS = "/srv/claude/usage" }
+```
+
+Both values are paths, so the `env` table holds no secret. The usage path is
+expanded and made absolute before isolation changes `HOME`; a directory is pinned
+to its `.credentials.json` file. It must be a separate file from both the agents'
+credential and its original source: identical paths, symlinks and hardlinks are
+refused before usage reads or refreshes. Matching access or refresh tokens in
+the available agent files also reject a copied login. This cannot detect an
+export copied from a macOS Keychain: exclusive refresh ownership remains an
+operator assertion, and no new Keychain secret read is performed. Agents do not receive the usage-path
+environment variable.
+
+The two credentials must belong to the same account. When both files expose
+comparable local account IDs or email addresses, a mismatch is refused without
+printing their values. Opaque setup tokens usually have no comparable identity;
+in that case the operator asserts that both logins name the same account.
+`tauceti doctor` distinguishes that assertion from corroborating local fields.
+No provider identity probe is performed.
+
+The usage login's
+access token is short-lived. `--auto-refresh` renews it under the rules of the
+previous section and then rotates only this file, never the agents' credential;
+without the flag something else has to keep the login current. The login is a
+plain file on every platform: on macOS the Keychain is not consulted for it and
+`--auto-refresh` applies to it. It must not be a copy of a login that another
+`claude` also uses.
+
+Workers naming the same usage login share its observations, fetch lock and
+cooldowns under `<usage login directory>/.tauceti-quota/usage/`, exactly as
+workers sharing a credential source do. Model-limit refusals are recorded against
+the usage login too, so the two credentials must belong to one account.
+
+The variable must also be set in the environment running `status`, `doctor` or
+the dashboard; these commands do not load a worker's `env` table. Claude subscription Review phases
+pass `--require-claude-config-file` to the Review runtime, which validates the
+agent file and uses an access-only copy in a private reviewer home. An older
+explicitly pinned `TAUCETI_REVIEW_REF` or `TAUCETI_REVIEW_ENGINE_DIR` refuses the
+unknown flag before inference instead of silently choosing another login.
+
+Status and dashboard readings describe host credential inspection; they do not
+certify every possible agent phase. `work` chooses the strictest credential route
+for its selected phases and repeats the credential check when selecting work.
+The usage login says nothing about the agents' own token, so off macOS the
+worker also reads that file before Claude work starts, without a request: a
+missing file, or a token past its `expiresAt` with no refresh token, makes Claude
+unavailable whatever the usage login reports. With `CLAUDE_CODE_OAUTH_TOKEN` set
+the file is not checked: host agents inherit that variable and authenticate with
+it instead. The file is still checked when the worker's phases include one whose
+agent is given the file and not the variable: `review`, whose rubric reviewers
+run in a clean home seeded with the file; any Bubble-eligible phase under
+`--bubble` (`progress` and `overlap-scan` stay on the host); and
+`security-audit`, whose agent runs in a private home with a copy of the file
+stripped of its refresh token. These agents work on a copy, so a renewal they
+make is not kept: for them an expired token blocks even when the file holds a
+refresh token, and something other than the worker has to keep that login
+current, since `--auto-refresh` renews only the usage login.
+
 ## macOS and the login Keychain
 
 On macOS, Claude Code keeps its credentials in the login Keychain rather than in

@@ -10,16 +10,16 @@
 # layer weighs cgroups (BFQ, or io.cost configured for the device); on devices using the `none`
 # scheduler without io.cost, as on tauchonki2 in 2026-11, nothing here orders disk traffic.
 #
-# MemoryHigh is a reclaim threshold, meant to reduce how hard the repairs' memory, mostly file cache,
-# presses on the staging VM. On tauchonki2 (125 GiB) the staging VM has 64 GiB and the OS keeps
-# about 12 GiB, which leaves about 48 GiB, before the native PR runners (which reserve nothing);
-# repairs measured 36 GiB resident with two builds at once (2026-11-19). Above it the kernel reclaims
-# from the slice (file cache or, through swap, anonymous memory) and slows the slice's allocations.
-# Crossing it does not itself invoke the OOM killer (there is no MemoryMax), though host-wide
-# pressure still can. The repair builds' compiler wrapper ignores memory.high, so a working set above
-# it (compilers plus the .olean files they map) thrashes instead of waiting. If repairs slow down,
-# check the slice's memory.pressure, memory.events and swap activity, and raise the value or reduce
-# repair concurrency. systemctl --user daemon-reload applies a change to the running slice.
+# Memory: the staging VM has first claim, and repairs take what it leaves (decision 111). TauCetiFleet
+# puts one hard ceiling (MemoryMax) on the parent tauceti.slice, over the VMs and this slice together,
+# and its controller sets this slice's memory.high live to repair's use plus the free memory under
+# that ceiling, minus about 20 GiB of headroom. When the VMs are quiet that is far above what repairs
+# use; as the staging VM grows it falls, and the kernel reclaims, swaps and slows the repairs rather
+# than the VM, whose memory cannot be swapped. The repair builds' compiler wrapper measures the same
+# ceiling (it reads every capped ancestor), so it stops starting compilers as the ceiling nears. If it
+# still comes to an OOM kill, the repair units' OOMScoreAdjust=1000 makes a repair process the victim
+# (see tauceti-queue-repair.service for when that holds).
+# So this file sets no MemoryHigh or MemoryMax: either would fight TauCetiFleet's live value.
 #
 # install-repair.sh installs this file; never add a drop-in for it.
 
@@ -30,4 +30,3 @@ Documentation=https://github.com/TauCetiProject/TauCetiWorker/blob/main/docs/que
 [Slice]
 CPUWeight=10
 IOWeight=10
-MemoryHigh=48G

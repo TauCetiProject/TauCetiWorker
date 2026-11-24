@@ -50,8 +50,13 @@ def bare(path):
 
 
 def refs(repo):
+    """Every ref but refs/pull/*, which Forgejo writes and a restore never pushes."""
     out = git(repo, "for-each-ref", "--format=%(objectname) %(refname)")
-    return dict(reversed(line.split(" ", 1)) for line in out.splitlines())
+    return {
+        name: sha
+        for sha, name in (line.split(" ", 1) for line in out.splitlines())
+        if not name.startswith("refs/pull/")
+    }
 
 
 class RestoreTests(unittest.TestCase):
@@ -101,9 +106,10 @@ class RestoreTests(unittest.TestCase):
             self.pull(4, "roadmap/d", self.d_new),
             self.pull(5, "feature", self.alice_sha, owner="alice"),
         ]
-        # The incident: every ref gone.
+        # The incident: every ref gone, except (unlike November) the fork PR's pull ref.
         for ref in self.before:
             git(self.target, "update-ref", "-d", ref)
+        self.put(self.target, "refs/pull/5/head", self.alice_sha)
         self.tokens = {}
         for name in ("main", "worker"):
             path = self.tmp / f"{name}-token"
@@ -131,7 +137,8 @@ class RestoreTests(unittest.TestCase):
         git(self.work, "push", "-q", "--force", str(repo), f"{sha}:{ref}")
 
     def pull(self, number, branch, sha, owner="Org"):
-        return {"number": number, "head": {"ref": branch, "sha": sha, "repo": {"owner": {"login": owner}}}}
+        repo = {"owner": {"login": owner}, "full_name": f"{owner}/TauCeti"}
+        return {"number": number, "head": {"ref": branch, "sha": sha, "repo": repo}}
 
     def run_restore(self, *extra, command="restore", fork=None):
         argv = ["--base-url", str(self.forge), "--repository", "Org/TauCeti"]
@@ -412,6 +419,78 @@ class RestoreTests(unittest.TestCase):
         code, out = self.run_restore(command="verify")
         self.assertEqual(code, 1)
         self.assertIn("PR #2", out)
+
+    def test_verify_flags_a_fork_pr_without_its_pull_ref(self):
+        git(self.target, "update-ref", "-d", "refs/pull/5/head")
+        code, out = self.run_restore("--execute")
+        self.assertEqual(code, 1, out)
+        self.assertIn("open fork PRs whose head the base repository does not serve: 1 (#5)", out)
+        self.assertIn("pull-refs --publish", out)
+
+    def pull_refs(self, *extra):
+        return self.run_restore(
+            "--mirror",
+            str(self.mirror),
+            "--user",
+            "kim-em",
+            "--token-file",
+            str(self.tokens["worker"]),
+            *extra,
+            command="pull-refs",
+        )
+
+    def test_pull_refs_publishes_a_fork_head_and_prunes_it_once_forgejo_catches_up(self):
+        self.put(self.target, "refs/pull/2/head", self.before["refs/heads/roadmap/a"])
+        self.put(self.target, "refs/pull/4/head", self.d_new)
+        self.assertEqual(self.pull_refs()[0], 0)
+        git(self.target, "update-ref", "-d", "refs/pull/5/head")
+        code, out = self.pull_refs()
+        self.assertEqual(code, 1, out)
+        self.assertIn("PR #5 (fork alice/TauCeti)", out)
+        self.assertNotIn("refs/tauceti-fork-heads/5", refs(self.target))
+        code, out = self.pull_refs("--publish")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(refs(self.target)["refs/tauceti-fork-heads/5"], self.alice_sha)
+        code, out = self.pull_refs()
+        self.assertEqual(code, 0, out)
+        self.assertIn("by refs/tauceti-fork-heads/N 1", out)
+        # A push to the fork branch rewrites the pull ref; the fork-head ref is then surplus.
+        self.put(self.target, "refs/pull/5/head", self.alice_sha)
+        outside = self.tmp / "not-a-repository"
+        outside.mkdir()
+        with contextlib.chdir(outside):
+            code, out = self.pull_refs("--prune")
+        self.assertEqual(code, 0, out)
+        self.assertIn("pruned 1 fork-head refs", out)
+        self.assertNotIn("refs/tauceti-fork-heads/5", refs(self.target))
+
+    def test_restore_leaves_fork_heads_to_pull_refs(self):
+        self.put(self.target, "refs/tauceti-fork-heads/5", self.alice_sha)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            mirror.main(
+                ["--repo", str(self.mirror), "fetch", "--base-url", str(self.forge), "--repository", "Org/TauCeti"]
+                + ["--no-fork-discovery", "--fork", "alice"]
+            )
+        git(self.target, "update-ref", "-d", "refs/tauceti-fork-heads/5")
+        code, out = self.run_restore("--execute")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("refs/tauceti-fork-heads/5", self.results())
+        self.assertNotIn("refs/tauceti-fork-heads/5", refs(self.target))
+
+    def test_pull_refs_never_publishes_a_fork_branch_that_moved(self):
+        git(self.target, "update-ref", "-d", "refs/pull/5/head")
+        self.pulls[2]["head"]["sha"] = self.main
+        code, out = self.pull_refs("--publish")
+        self.assertEqual(code, 1, out)
+        self.assertIn(f"is at {self.alice_sha}, not {self.main}", out)
+        self.assertNotIn("refs/tauceti-fork-heads/5", refs(self.target))
+
+    def test_pull_refs_reports_base_prs_without_publishing_them(self):
+        code, out = self.pull_refs("--publish")
+        self.assertEqual(code, 1, out)
+        self.assertIn("PR #2 (base Org/TauCeti)", out)
+        self.assertIn("get their pull ref back when their branch is next pushed", out)
+        self.assertEqual([ref for ref in refs(self.target) if ref.startswith("refs/tauceti-fork-heads/")], [])
 
     def test_fleet_repositories_are_found_by_origin(self):
         pattern = str(self.tmp / "fleet/TauCeti-*.git")

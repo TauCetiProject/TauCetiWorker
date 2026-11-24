@@ -261,7 +261,7 @@ def admit(cfg):
 
 
 def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
-    from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, remove, workspace_idle
+    from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, past, remove, workspace_idle
 
     now = time.time() if now is None else now
     pool = expanded_cache.root()
@@ -292,14 +292,18 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
     # Pool copies are deleted only while no process holds them open (open fds add no link).
     guard = Guard(opened=opened or ())
     details, private_candidates = {}, {}
+    # The walk gets half the time, so deletion always has the rest.
+    walk = None if deadline is None else time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
     try:
         before = inventory(
-            paths, protected=protected, owners=owners, details=details, private=private_candidates, deadline=deadline
+            paths, protected=protected, owners=owners, details=details, private=private_candidates, deadline=walk
         )
     except InventoryDeferred:
-        # Nothing is deleted on a partial picture; the next run walks again from the start.
-        report.setdefault("deferred", []).append("shared-caches")
-        return report
+        # Without the full picture, still delete oldest-first: each candidate's own link counts and
+        # locks decide, and urgency comes from free space alone. Private reclamation waits for a
+        # complete walk.
+        report.setdefault("deferred", []).append("shared-cache-inventory")
+        before, details, private_candidates = {}, {}, {}
     for (device, _), (size, _, _, busy, labels) in details.items():
         if not busy and labels:
             for worker in labels:
@@ -328,6 +332,10 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
     ]
     pool_device = pool.stat().st_dev if owned else None
     urgent = str(pool_device) in pressured
+    if owned and "shared-cache-inventory" in report.get("deferred", []):
+        # The pool's size is unknown: free space alone decides, up to the usual target.
+        usage = shutil.disk_usage(pool)
+        urgent = urgent or usage.free < headroom(usage.total, TARGET)
     # Oldest reuse first. These are disposable entries, not source or accounting records.
     candidates = []
     for entry in (pool / "entries").glob("*") if owned else ():
@@ -366,7 +374,15 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
         except FileNotFoundError:
             return 0
 
+    def out_of_time():
+        if past(deadline):
+            report.setdefault("deferred", []).append("shared-cache-deletion")
+            return True
+        return False
+
     for clock, entry, key in sorted(candidates, key=stamp):
+        if out_of_time():
+            break
         usage, cap = limits(pool)
         if not urgent and now - stamp((clock, entry, key)) < LIFETIME:
             continue
@@ -432,6 +448,8 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
     # so a canonical file with one remaining link is safely unreferenced.
     for directory in ("artifacts", "archives"):
         for path in (pool / directory).glob("*") if owned else ():
+            if out_of_time():
+                break
             try:
                 info = path.lstat()
                 if path.is_symlink() or info.st_nlink != 1:
@@ -455,7 +473,15 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
 
         # Canonical objects (and their adopted pool alias) go once no checkout or store links them.
         freed = sweep(
-            pool, report, dry=dry, urgent=urgent, now=now, lifetime=LIFETIME, remove=remove, opened=opened or ()
+            pool,
+            report,
+            dry=dry,
+            urgent=urgent,
+            now=now,
+            lifetime=LIFETIME,
+            remove=remove,
+            opened=opened or (),
+            deadline=deadline,
         )
         if not dry:
             removed_bytes[pool_device] = removed_bytes.get(pool_device, 0) + freed

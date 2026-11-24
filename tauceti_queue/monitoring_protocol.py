@@ -20,27 +20,31 @@ MAX_FRAME_BYTES = 256_000
 MAX_SNAPSHOT_BYTES = 15_000_000
 
 
+REJECTION_CODES = (
+    "source_changed",
+    "superseded",
+    "missing_batch",
+    "invalid_frame",
+    "invalid_snapshot",
+    "staging_budget",
+    "scope_mismatch",
+    "authentication",
+    "rate_limit",
+    "receiver_unavailable",
+    "storage_full",
+    "server_error",
+)
+
+
 class PublicationRejected(ValueError):
     def __init__(self, status, code):
         self.status = status
-        self.code = (
-            code
-            if isinstance(code, str)
-            and code
-            in (
-                "source_changed",
-                "superseded",
-                "missing_batch",
-                "invalid_frame",
-                "invalid_snapshot",
-                "staging_budget",
-                "scope_mismatch",
-                "authentication",
-                "rate_limit",
-                "receiver_unavailable",
-            )
-            else "invalid_snapshot"
-        )
+        if isinstance(code, str) and code in REJECTION_CODES:
+            self.code = code
+        else:
+            # An unrecognised or missing code says nothing about the snapshot.
+            # A receiver fault must not read as a rejected snapshot.
+            self.code = "server_error" if isinstance(status, int) and status >= 500 else "invalid_snapshot"
         super().__init__(f"HTTP {status} {self.code}")
 
 

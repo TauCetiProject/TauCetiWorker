@@ -801,6 +801,8 @@ class Wiring(Tmp):
                 patch.object(multi_source, "log"),
                 patch.object(multi_source, "collect", return_value=observations),
                 patch.object(multi_source, "deduplicate"),
+                patch("tauceti_worker.account_pressure.count_account"),
+                patch("tauceti_worker.account_pressure.report"),
                 patch.object(multi_source, "activate", return_value=contextlib.nullcontext()) as activated,
                 patch.object(work, "run_round", side_effect=outcomes) as execute,
             ):

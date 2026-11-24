@@ -469,6 +469,22 @@ class Canonical(unittest.TestCase):
         sweep(set())
         self.assertFalse((objects / name).exists())
 
+    def test_sweep_stops_at_its_deadline(self):
+        from tauceti_worker import retention
+
+        checkout = self.checkout("w", "TauCeti.A")
+        self.relink(checkout)
+        objects = canonical.store(self.pool) / "objects"
+        name = paths(checkout)[0][1]
+        shutil.rmtree(checkout)
+        for lease in (canonical.store(self.pool) / "uses").glob("*"):
+            lease.unlink()
+        report = retention.fresh_report(time.time())
+        freed = canonical.sweep(self.pool, report, lifetime=1, remove=retention.remove, deadline=time.monotonic() - 1)
+        self.assertEqual(freed, 0)
+        self.assertEqual(report["deferred"], ["canonical-objects"])
+        self.assertTrue((objects / name).exists())
+
     def test_hashing_that_outlasts_the_grace_still_makes_progress(self):
         modules = [f"TauCeti.M{i}" for i in range(8)]
         checkout = self.checkout("w", *modules)

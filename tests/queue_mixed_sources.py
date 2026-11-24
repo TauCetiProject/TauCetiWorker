@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from tauceti_tools import ci_candidate as cc
-from tauceti_tools.forge import GITHUB, Forge, RepositoryRef
+from tauceti_tools.forge import GITHUB, Forge, ForgeError, RepositoryRef
 
 from tauceti_queue.config import Config, load, validate
 from tauceti_queue.fakes import FakeGitHub, make_controller
@@ -117,6 +117,21 @@ class Mixed(MixedFixture, unittest.TestCase):
             service.build_controller()
         self.assertIsNone(service.forgejo_poller)
         self.assertIsNone(service.controller.mixed)
+
+    def test_head_fetch_without_a_pull_ref_falls_back_to_the_exact_commit(self):
+        registry = self.registry()
+        number, head = registry.number(7), "d" * 40
+        calls = []
+
+        def fetch(repo, specs):
+            calls.append(list(specs))
+            if specs[0].startswith("+refs/pull/"):
+                raise ForgeError("source Git operation failed")
+
+        self.native.fetch_refs = fetch
+        with patch("tauceti_queue.mixed_sources.chain.object_exists", side_effect=[False, False, True]):
+            self.assertTrue(registry.fetch_head(number, head))
+        self.assertEqual(calls, [["+refs/pull/7/head:refs/tauceti-queue/pulls/" + number.ref_key], [head]])
 
     def test_number_identity_survives_database_json_copy_and_recreation(self):
         number = SourceNumber(1, self.native_id)

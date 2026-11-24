@@ -107,11 +107,20 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return self._read("live_pull", [pr], lambda: self.api.pull(self.repository, pr), fresh=True, number=pr)
 
     def pr_list(self, fields, *, author=None, state="open"):
-        rows = self._read(
-            "pr_list",
-            [fields, author, state],
-            lambda: self.reader.pulls(self.repository, fields, state=state, author=author),
-        )
+        def fetch():
+            if list(fields) != ["number"] or author is not None or state != "open":
+                return self.reader.pulls(self.repository, fields, state=state, author=author)
+            # A roadmap round's baseline needs only numbers: the issue index lists them without
+            # the per-PR git work (head, base, diff stat) of a pull listing.
+            numbers = []
+            for batch in self.api.pages(f"repos/{self.repository.name}/issues?type=pulls&state=open"):
+                for row in batch:
+                    if not isinstance(row, dict) or type(row.get("number")) is not int or not row.get("pull_request"):
+                        raise Incomplete("issue index did not identify a PR")
+                    numbers.append(row["number"])
+            return [{"number": number} for number in dict.fromkeys(numbers)]
+
+        rows = self._read("pr_list", [fields, author, state], fetch)
         if rows is None:
             raise Incomplete("Forgejo PR listing is unavailable")
         return rows
@@ -292,9 +301,33 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return ""
 
     def rebase_requested(self, pr, head):
-        return False
+        return bool(self._recovery_request(pr, head))
 
     def rebase_request_body(self, pr, head):
+        body = self._recovery_request(pr, head)
+        # Do not silently truncate a diagnosis; the prompt can fetch the original request.
+        return body if len(body) <= 32768 else ""
+
+    def _recovery_request(self, pr, head):
+        """The newest trusted merge-queue recovery request for exactly this head, or ""."""
+        import re
+
+        from .source_identity import recovery_author_ids
+
+        trusted = recovery_author_ids()
+        if not trusted or not re.fullmatch(r"[0-9a-f]{40}", head or ""):
+            return ""
+        marker = f"<!--tauceti-rebase:v1 {head}-->"
+        for row in reversed(self.issue_comments(pr) or []):
+            author = (row.get("user") or {}).get("id")
+            body = row.get("body") or ""
+            if (
+                type(author) is int
+                and author in trusted
+                and body.startswith("Merge-queue recovery for head `")
+                and marker in body.splitlines()
+            ):
+                return body
         return ""
 
     def bump_repair_requested(self, pr, head):

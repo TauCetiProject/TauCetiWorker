@@ -456,6 +456,94 @@ async def test_skip_dashboard():
             os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
 
 
+def umbrella_survey():
+    """A dashboard survey of an umbrella over both test areas. Like survey(), it holds only the pull
+    requests of members outside the skip list in force when it was taken: one of ours per area."""
+    from tauceti_worker.umbrellas import Member, Umbrella, UmbrellaRound
+
+    skip = tc.roadmap_skip()
+    umbrella = Umbrella("GRH", "", (Member("algebra"), Member("topology")))
+    sv = tc.Survey(worker_id="tester", roadmap_only="GRH", roadmap_skip=skip)
+    sv._umbrella = UmbrellaRound(umbrella, frozenset(m.area for m in umbrella.members if m.area not in skip))
+    sv.max_open_prs = 2
+    sv._mine_open_prs = [
+        tc.PRInfo(
+            number=300 + n,
+            head_oid="x",
+            head_ref="roadmap/x",
+            head_owner="o",
+            head_repo="r",
+            is_draft=False,
+            mergeable="MERGEABLE",
+            author="me",
+            build_success=True,
+            build_failed=False,
+            labels=(f"roadmap/{area}",),
+        )
+        for n, area in enumerate(("algebra", "topology"))
+        if area not in skip
+    ]
+    sv.rescope_roadmap()
+    return sv
+
+
+async def test_umbrella_skip_dial():
+    """The [x] dial on an umbrella: skipping a member rescopes the count and the area rows at once;
+    bringing it back also takes a fresh survey, since the last one never read that member's PRs."""
+    cfgdir = tempfile.mkdtemp(prefix="tauceti-prefs-umbrella-")
+    old_xdg = os.environ.get("XDG_CONFIG_HOME")
+    old_only = os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+    old_skip = os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+    os.environ["XDG_CONFIG_HOME"] = cfgdir
+    os.environ["TAUCETI_ROADMAP_ONLY"] = "GRH"
+    loads = []
+
+    def counting_loader():
+        loads.append(tc.roadmap_skip())
+        return umbrella_survey(), {}, ["algebra", "topology"]
+
+    def rows(app):
+        return dict(tc._expansion_rows(app.sv, "roadmap", {}, app.areas))
+
+    try:
+        cfg = SimpleNamespace(logdir=Path("/tmp/x"), home=Path(cfgdir), state=Path(cfgdir) / "state")
+        app = tc._dashboard_app(cfg, loader=counting_loader)
+        async with app.run_test() as pilot:
+            await await_survey(app, pilot)
+            check(
+                "umbrella: both members count, authoring blocked",
+                (app.sv.n_mine_open, app.sv.roadmap_backpressure) == (2, True),
+            )
+            app._apply_skip("topology")
+            await pilot.pause(0.05)
+            check(
+                "umbrella: skipping a member drops its PR at once",
+                (app.sv.n_mine_open, app.sv.roadmap_backpressure) == (1, False),
+            )
+            check("umbrella: the skipped member is shown skipped", rows(app)["    └ topology"] == "(skipped)")
+            check("umbrella: the other member is still marked", rows(app)["    └ algebra"] == "← umbrella")
+            check("umbrella: narrowing needs no fresh survey", loads == [[]])
+            app._apply_skip("")
+            for _ in range(40):
+                if len(loads) == 2 and app.sv.n_mine_open == 2:
+                    break
+                await pilot.pause(0.05)
+            check("umbrella: bringing a member back takes a fresh survey", loads == [[], []])
+            check(
+                "umbrella: the fresh survey counts its PR again",
+                (app.sv.n_mine_open, app.sv.roadmap_backpressure) == (2, True),
+            )
+            check("umbrella: the member is marked again", rows(app)["    └ topology"] == "← umbrella")
+    finally:
+        os.environ.pop("TAUCETI_ROADMAP_ONLY", None)
+        os.environ.pop("TAUCETI_ROADMAP_SKIP", None)
+        os.environ["XDG_CONFIG_HOME"] = _CFGDIR if old_xdg is None else old_xdg
+        if old_only is not None:
+            os.environ["TAUCETI_ROADMAP_ONLY"] = old_only
+        if old_skip is not None:
+            os.environ["TAUCETI_ROADMAP_SKIP"] = old_skip
+
+
 async def test_persistent_workers_view():
     """The dashboard's loop action writes desired state, and the Workers view monitors and edits it."""
     config = tc.default_workers_config()
@@ -529,6 +617,7 @@ async def run_all():
     test_dashboard_uses_saved_pref()
     test_dashboard_migrates_host_pref()
     await test_skip_dashboard()
+    await test_umbrella_skip_dial()
     await test_persistent_workers_view()
 
 

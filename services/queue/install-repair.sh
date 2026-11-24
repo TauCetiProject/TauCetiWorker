@@ -18,7 +18,8 @@
 # it comes back (SIGTERM handling in tauceti_queue/repair_task.py). Unused release directories are
 # then removed (services/queue/release.sh).
 #
-# Usage: services/queue/install-repair.sh [--revision REF | --release DIR] [--checkout DIR] [--instance NAME] [--no-restart] [--wait SECONDS]
+# Usage: services/queue/install-repair.sh [--revision REF | --release DIR] [--checkout DIR] [--instance NAME]
+#                                          [--no-restart | --when-idle [--idle-timeout SECONDS]] [--wait SECONDS]
 #
 #   --revision REF   commit, branch or tag to install (default: origin/main). A revision that does
 #                    not descend from the one the worker runs now fails rather than being forced.
@@ -27,6 +28,13 @@
 #   --instance NAME  another worker, using repair-environment-NAME and its own task root.
 #   --no-restart     install files and the unit but leave a running worker alone (the next
 #                    restart picks up the new release).
+#   --when-idle      restart only once the queue shows the running worker holding no claim: no row
+#                    in the controller's claims table (~/TauCetiQueue-data/queue.sqlite3, read-only)
+#                    for the TAUCETI_QUEUE_WORKER the unit's process runs as with released_at unset
+#                    (an expired claim counts until the controller releases it, since a renewal
+#                    waiting for its lock keeps it). It checks every 60s before installing
+#                    anything, and again right before the restart.
+#   --idle-timeout SECONDS  give up waiting after SECONDS (default: wait for as long as it takes).
 #   --wait SECONDS   how long to wait for the restarted worker to report serving (default: 60).
 #
 # WARNING: repair workers run origin/main HEAD, each install in its own ~/TauCetiQueue-releases
@@ -38,7 +46,7 @@
 #
 # Exit status: 0 when the worker is active and serving; 1 on a setup or host-check failure;
 # 2 when the unit is not active, does not run from the release, or does not report serving within
-# --wait.
+# --wait; 3 when --idle-timeout passed with the worker still holding a claim (it was not restarted).
 set -euo pipefail
 
 REPO_URL="https://github.com/TauCetiProject/TauCetiWorker.git"
@@ -48,6 +56,10 @@ RELEASE_ARG=""
 RESTART=1
 WAIT=60
 INSTANCE=""
+WHEN_IDLE=0
+IDLE_TIMEOUT=""
+IDLE_POLL=60
+QUEUE_DB="$HOME/TauCetiQueue-data/queue.sqlite3"
 UNIT="tauceti-queue-repair.service"
 UNIT_SOURCE="tauceti-queue-repair.service"
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -63,7 +75,9 @@ while [ $# -gt 0 ]; do
     --instance) INSTANCE="$2"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     --wait) WAIT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
+    --when-idle) WHEN_IDLE=1; shift ;;
+    --idle-timeout) IDLE_TIMEOUT="$2"; shift 2 ;;
+    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
     *) echo "install-repair.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
@@ -80,6 +94,71 @@ if [ -n "$INSTANCE" ]; then
   UNIT_SOURCE="tauceti-queue-repair@.service"
   ENV_FILE="$CONFIG_DIR/repair-environment-$INSTANCE"
 fi
+
+if [ -n "$IDLE_TIMEOUT" ]; then
+  [[ "$IDLE_TIMEOUT" =~ ^(0|[1-9][0-9]*)$ ]] || die "--idle-timeout takes a number of seconds"
+  [ "$WHEN_IDLE" = 1 ] || die "--idle-timeout needs --when-idle"
+fi
+if [ "$WHEN_IDLE" = 1 ]; then
+  [ "$RESTART" = 1 ] || die "--when-idle and --no-restart are exclusive"
+  [ -f "$QUEUE_DB" ] || die "--when-idle reads the queue's claims from $QUEUE_DB, which does not exist on this host"
+fi
+
+# --when-idle: the unreleased claims, in the queue, of the worker the unit runs now. Its identity is read
+# from the running process's own environment, as the worker computes it (default_worker_identity
+# in tauceti_queue/repair_task.py), so an edited environment file cannot misname it. Prints
+# nothing when the unit has no running process; fails, and so counts as busy, when it cannot tell.
+live_claims() {
+  local pid
+  # Called as a condition, where errexit is off: a failed lookup must not read as "no process".
+  pid="$(systemctl --user show -p MainPID --value "$UNIT")" && [ -n "$pid" ] || return 1
+  python3 - "$QUEUE_DB" "$pid" <<'PY'
+import pathlib, socket, sqlite3, sys, time
+if sys.argv[2] == "0":
+    sys.exit(0)
+env = dict(
+    entry.split("=", 1)
+    for entry in pathlib.Path(f"/proc/{sys.argv[2]}/environ").read_text().split("\0")
+    if "=" in entry
+)
+worker = env.get("TAUCETI_QUEUE_WORKER") or f"{env.get('TAUCETI_WORKER_ID', 'default')}@{socket.gethostname()}"
+db = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+now = time.time()
+rows = db.execute(
+    "SELECT id, task_id, operation, expires_at FROM claims WHERE worker = ? AND released_at IS NULL ORDER BY id",
+    (worker,),
+).fetchall()
+if rows:
+    print(f"{worker} holds " + "; ".join(f"claim {i} (task {t}, {op}, expires_at {e - now:+.0f}s)" for i, t, op, e in rows))
+PY
+}
+# wait_until_idle: return once the queue shows no unreleased claim for the running worker. Never returns
+# early on anything it cannot read; exits 3 after --idle-timeout.
+wait_until_idle() {
+  local claims deadline="" left
+  [ -z "$IDLE_TIMEOUT" ] || deadline=$(( $(date +%s) + IDLE_TIMEOUT ))
+  while :; do
+    if claims="$(live_claims)"; then
+      if [ -z "$claims" ]; then
+        log "$UNIT holds no claim in $QUEUE_DB"
+        return 0
+      fi
+      log "waiting before restarting $UNIT: $claims"
+    else
+      log "cannot read $UNIT's claims from $QUEUE_DB; treating it as busy"
+    fi
+    if [ -n "$deadline" ]; then
+      left=$(( deadline - $(date +%s) ))
+      if [ "$left" -le 0 ]; then
+        log "$UNIT still holds a claim after ${IDLE_TIMEOUT}s; it was not restarted"
+        exit 3
+      fi
+      sleep $(( left < IDLE_POLL ? left : IDLE_POLL ))
+    else
+      sleep "$IDLE_POLL"
+    fi
+  done
+}
 
 override_warning() {
   log "WARNING: $1. Running a repair worker at anything other than origin/main HEAD requires explicit"
@@ -109,6 +188,8 @@ if [ -z "${TAUCETI_QUEUE_RELEASE:-}" ]; then
   command -v git >/dev/null || die "git is required"
   command -v uv >/dev/null || die "uv is required (https://docs.astral.sh/uv/)"
   command -v systemctl >/dev/null || die "systemd user services are required"
+  # Wait before choosing the revision, so a long wait installs origin/main as it is when it ends.
+  if [ "$WHEN_IDLE" = 1 ]; then wait_until_idle; fi
   RELEASE_UNIT="$UNIT" release_handoff "$CHECKOUT" "$REVISION" "$RELEASE_ARG" "$0" "${ARGS[@]}"
 fi
 release_enter "$0"
@@ -176,6 +257,14 @@ fragment="$(systemctl --user show -p FragmentPath --value "$UNIT")"
 systemctl --user reenable --quiet "$UNIT"
 
 if [ "$RESTART" = 1 ]; then
+  # The wait above ended before the build and the host checks; check again with nothing left
+  # between the check and the restart. (The worker has no switch to stop claiming meanwhile.) The
+  # unit file names the release now, so the release lock is not needed to keep it from collection,
+  # and is given up so that a long wait does not hold up other installs' collection.
+  if [ "$WHEN_IDLE" = 1 ]; then
+    flock -u 9 2>/dev/null || true
+    wait_until_idle
+  fi
   log "restarting $UNIT"
   systemctl --user restart "$UNIT"
 else

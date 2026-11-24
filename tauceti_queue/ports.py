@@ -9,6 +9,7 @@ Timestamps are Unix seconds; None means unknown or not yet.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -85,7 +86,7 @@ class AdmissionSnapshot:
     statuses: dict[str, str]
     diff_version: str = ""
     discovery_version: str = ""
-    self_tested: bool = False  # Inline trusted-author/scope eligibility, never a workflow receipt.
+    self_tested: bool = False  # Inline scope eligibility (any author), never a workflow receipt.
     # Failed PR-level diff guards (diff_guard.violations) for heads admission measured; empty passes.
     diff_guard: tuple[str, ...] = ()
     # An admin's `large-refactor` label on this head (`ci_git.large_refactor_approved`): the
@@ -196,8 +197,9 @@ class SourcePort(Protocol):
         `update_ref` for each when the batched push fails, or when a port lacks this method."""
         ...
 
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
-        """Post (or update) the comment carrying `marker`; returns the comment id."""
+    def post_comment(self, repo: str, number: int, body: str, marker: str, *, recovery_head: str | None = None) -> str:
+        """Post (or update) the comment carrying `marker`; returns the comment id. With `recovery_head`
+        the comment is a head-bound recovery request: see `recovery_body`."""
         ...
 
     def set_labels(self, repo: str, number: int, add: Sequence[str], remove: Sequence[str]) -> None: ...
@@ -256,11 +258,13 @@ class ExecutionPort(Protocol):
         batch_id: str,
         members: Sequence[int],
         repair_outputs_revs: Sequence[str] = (),
+        attested: bool = False,
     ) -> str:
         """`repository_dispatch` of `pr-build.yml` with event `tauceti-bors-staging`; returns a dispatch id.
 
         `repair_outputs_revs` names the revisions whose published build outputs CI may restore when
-        none are published for `head_sha`, in the order to try them.
+        none are published for `head_sha`, in the order to try them. `attested` sends event
+        `tauceti-bors-attested` instead (decision 200): the attested landing, which builds nothing.
         """
         ...
 
@@ -451,3 +455,17 @@ AGENT_INSTRUCTION = (
     "concise explanation of what changed and why to its existing message. If a contribution cannot be made to "
     "pass, reduce it to the part that does, down to an empty commit, and say so in its message."
 )
+
+
+RECOVERY_HEAD = re.compile(r"[0-9a-f]{40}")
+
+
+def recovery_body(body: str, recovery_head: str | None) -> str:
+    """`body` as the queue publishes it. Quoted text (agent explanations, CI findings) never adds a
+    `<!--tauceti-...-->` marker; a recovery request then gets the one rebase marker for its head."""
+    body = body.replace("<!--tauceti-", "&lt;!--tauceti-").rstrip()
+    if recovery_head is None:
+        return body
+    if not RECOVERY_HEAD.fullmatch(recovery_head):
+        raise ValueError("a recovery request needs a full commit id")
+    return f"{body}\n\n<!--tauceti-rebase:v1 {recovery_head}-->"
