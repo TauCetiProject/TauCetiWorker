@@ -86,7 +86,7 @@ class AdmissionSnapshot:
     statuses: dict[str, str]
     diff_version: str = ""
     discovery_version: str = ""
-    self_tested: bool = False  # Inline trusted-author/scope eligibility, never a workflow receipt.
+    self_tested: bool = False  # Inline scope eligibility (any author), never a workflow receipt.
     # Failed PR-level diff guards (diff_guard.violations) for heads admission measured; empty passes.
     diff_guard: tuple[str, ...] = ()
     # An admin's `large-refactor` label on this head (`ci_git.large_refactor_approved`): the
