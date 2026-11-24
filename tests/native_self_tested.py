@@ -5,7 +5,6 @@ import contextlib
 import json
 import multiprocessing
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -357,68 +356,30 @@ class NativeSelfTested(unittest.TestCase):
             discovery_inventory(self.source)
             self.assertEqual(prune.call_count, 2)
 
-    def test_native_roadmap_receipt_through_persistent_label(self):
+    def test_a_verified_native_push_makes_no_label_edit(self):
+        # Regression: a contributor fleet's account has no write on Forgejo's pull-requests unit, so
+        # every verified round logged "self-tested labelling failed (Forgejo POST returned HTTP 403)"
+        # for a label nothing on Forgejo reads. The worker no longer reads or edits PRs to label them.
         from types import SimpleNamespace
 
-        from tauceti_worker import self_tested_label, verification
+        from tauceti_worker import self_tested_label
 
-        root, state = self.fixture.clone / "content", self.fixture.clone / "verification-state"
-        (root / "TauCeti").mkdir(parents=True)
-
-        def git(*args):
-            return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
-
-        git("init", "-q", "-b", "main")
-        git("config", "user.name", "test")
-        git("config", "user.email", "test@example.com")
-        (root / "TauCeti/A.lean").write_text("-- base\n")
-        git("add", ".")
-        git("commit", "-q", "-m", "base")
-        base = git("rev-parse", "HEAD")
-        git("remote", "add", "origin", self.source.repository.clone_url)
-        git("update-ref", "refs/remotes/origin/main", base)
-        (root / "TauCeti/A.lean").write_text("-- verified change\n")
-        git("commit", "-q", "-am", "change")
-        head = git("rev-parse", "HEAD")
-        self.live["head"].update(sha=head, ref="roadmap/x")
-        self.source.reader.pulls = Mock(
-            return_value=[dict(number=1, headRefName="roadmap/x", headRepositoryOwner=dict(login="team"))]
+        self.source.add_label.side_effect = AssertionError("no Forgejo label edit")
+        self.source.live_pull = Mock(side_effect=AssertionError("no Forgejo PR read"))
+        self.source.pull_for_head = Mock(side_effect=AssertionError("no Forgejo PR lookup"))
+        worker = SimpleNamespace(
+            gh=self.source, cfg=SimpleNamespace(checkout=self.fixture.clone, state=self.fixture.clone)
         )
-        project = self.fixture.clone / "project.toml"
-        self.source.write_cli_configuration(project)
-        inputs = dict(base=base, sources=verification.inventory(root, base))
-        fingerprint = verification.digest(inputs)
-        inputs_path = state / "inputs.json"
-        inputs_path.parent.mkdir()
-        inputs_path.write_text(json.dumps(inputs))
-        receipt = state / "verification" / "run" / "receipt.json"
-        receipt.parent.mkdir(parents=True)
-        receipt.write_text(
-            json.dumps(
-                dict(
-                    schema=verification.SCHEMA,
-                    status="success",
-                    requested_phases=list(verification.STAGES),
-                    phases={name: dict(status="success") for name in verification.STAGES},
-                    scope=dict(policy="ordinary"),
-                    inputs=dict(path=str(inputs_path), sha256=fingerprint),
-                    fingerprint=fingerprint,
-                )
-            )
-        )
-        worker = SimpleNamespace(gh=self.source, cfg=SimpleNamespace(checkout=root, state=state))
-        candidate = SimpleNamespace(
-            pr=None, progress=dict(published_branches={"roadmap/x": head}, published_owner="team")
-        )
-        with (
-            patch.dict(os.environ, TAUCETI_SELF_TESTED="1", TAUCETI_SOURCE_GH_CONF=str(project)),
-            patch("tauceti_worker.worker_sources.canonical_mathematics_source", return_value=True),
+        for candidate in (
+            SimpleNamespace(pr=1, progress=dict(published="a" * 40)),
+            SimpleNamespace(pr=None, progress=dict(published_branches={"roadmap/x": "a" * 40}, published_owner="team")),
         ):
-            os.environ.pop("TAUCETI_CONF", None)
-            result = self_tested_label.label_round_pushes(worker, candidate, "roadmap", time.time() - 5)
-            self.assertNotIn("TAUCETI_CONF", os.environ)
-        self.assertEqual(result, [(1, f"labelled {head[:12]}: persistent self-tested label applied")])
-        self.source.add_label.assert_called_once_with(1, "self-tested")
+            with (
+                patch.dict(os.environ, TAUCETI_SELF_TESTED="1"),
+                patch("tauceti_worker.worker_sources.canonical_mathematics_source", return_value=True),
+            ):
+                self.assertEqual(self_tested_label.label_round_pushes(worker, candidate, "roadmap", time.time()), [])
+        self.source.add_label.assert_not_called()
 
     def test_native_checkout_separates_local_branch_from_remote_pr_branch(self):
         from tauceti_worker.source_cli import checkout
