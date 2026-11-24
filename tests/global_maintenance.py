@@ -230,6 +230,59 @@ class GlobalMaintenance(unittest.TestCase):
             self.assertFalse(peer_claims.hinted("forgejo:one/project", "fix", 7, HEAD, now=1001, unavailable=True))
             self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1301, unavailable=True))
 
+    def test_fixed_heads_are_recorded_per_pr_and_scope_and_expire(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), set())
+            peer_claims.note_fixed_head("forgejo:one/project", 7, HEAD)
+            peer_claims.note_fixed_head("forgejo:one/project", 7, HEAD)
+            peer_claims.note_fixed_head("forgejo:one/project", 7, "b" * 40)
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), {HEAD, "b" * 40})
+            self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 8), set())
+            self.assertEqual(peer_claims.fixed_heads("github:one/project", 7), set())
+            later = os.path.getmtime(peer_claims._fixed_dir("forgejo:one/project", 7) / HEAD)
+            self.assertEqual(
+                peer_claims.fixed_heads("forgejo:one/project", 7, now=later + peer_claims.FIXED_HEAD_TTL_S + 1), set()
+            )
+        self.assertEqual(peer_claims.fixed_heads("forgejo:one/project", 7), set(), "no shared directory")
+
+    def test_fix_rounds_stop_and_label_after_the_cap_of_fixed_heads(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.constants import MAX_FIX_ROUNDS_WITHOUT_APPROVAL, NEEDS_HUMAN_LABEL
+        from tauceti_worker.survey import Candidate, Survey
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        labels = []
+        self.w.gh.add_label = lambda pr, name: labels.append((pr, name)) or True
+        self.opts.only = ["fix"]
+
+        def attempt():
+            prepared = Survey(worker_id="test", roadmap_only="auto")
+            prepared._round_scope = (True, False)
+            prepared.needs_fix.actionable = [Candidate(10, HEAD)]
+            with patch.object(work, "dispatch", return_value=0) as dispatch:
+                try:
+                    run_round(self.w, self.opts, prepared_survey=prepared)
+                except work.NoEligibleWork:
+                    pass
+            return dispatch.called
+
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            scope = work._claim_scope(self.w)
+            for n in range(MAX_FIX_ROUNDS_WITHOUT_APPROVAL - 1):
+                peer_claims.note_fixed_head(scope, 10, f"{n:040x}")
+            self.assertTrue(attempt(), "under the cap the fix runs")
+            self.assertIn(HEAD, peer_claims.fixed_heads(scope, 10), "a performed fix records its head")
+            self.assertTrue(attempt(), "the same head again does not count twice")
+            self.assertEqual(labels, [])
+            peer_claims.note_fixed_head(scope, 10, "f" * 40)
+            self.assertFalse(attempt(), "at the cap the fix is not offered")
+            self.assertEqual(labels, [(10, NEEDS_HUMAN_LABEL)])
+
     def test_peer_claim_hints_expire_and_are_scoped(self):
         from tauceti_worker import peer_claims
 

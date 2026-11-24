@@ -76,7 +76,9 @@ from .constants import (
     EX_CLAIM_COLLISION,
     EX_NOPROGRESS,
     MAX_FIX_ATTEMPTS,
+    MAX_FIX_ROUNDS_WITHOUT_APPROVAL,
     MAX_INFRA_REFUNDS,
+    NEEDS_HUMAN_LABEL,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -189,6 +191,24 @@ def _claim_scope(w) -> str:
     repository = getattr(gh, "repository", None)
     key = getattr(repository, "key", None)
     return key if isinstance(key, str) else str(getattr(gh, "repo", ""))
+
+
+def _fix_loop_escalated(w, c: Candidate) -> bool:
+    """Whether this host already fixed MAX_FIX_ROUNDS_WITHOUT_APPROVAL other heads of the PR. If so,
+    label the PR for a person (the label pauses fix and review fleet-wide) instead of fixing again."""
+    fixed = peer_claims.fixed_heads(_claim_scope(w), c.pr) - {c.head}
+    if len(fixed) < MAX_FIX_ROUNDS_WITHOUT_APPROVAL:
+        return False
+    try:
+        labelled = w.gh.add_label(c.pr, NEEDS_HUMAN_LABEL) is not False
+    except Exception as error:  # the cap holds on this host whether or not the label lands
+        log(f"  fix #{c.pr}: could not add the {NEEDS_HUMAN_LABEL!r} label ({type(error).__name__})")
+        labelled = False
+    log(
+        f"Global PR work: fix #{c.pr} skipped: {len(fixed)} earlier heads fixed on this host without an "
+        f"approval; {'labelled' if labelled else 'not labelled'} {NEEDS_HUMAN_LABEL!r} for a person"
+    )
+    return True
 
 
 def _review_claimed_elsewhere(w, candidate: Candidate) -> bool:
@@ -872,6 +892,9 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             claim_collision = True
             declined.append((stage, c.pr))
             continue
+        if stage == "fix" and not opts.dry_run and c.pr and c.pr not in bump_prs(sv) and _fix_loop_escalated(w, c):
+            declined.append((stage, c.pr))
+            continue
         if global_pick and c.pr:
             p = next((p for p in sv.open_prs if p.number == c.pr), None)
             areas = [label[8:] for label in p.labels if label.startswith("roadmap/")] if p else []
@@ -896,6 +919,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             # Spare every other worker on the host the fresh reads that found this collision.
             peer_claims.note(_claim_scope(w), stage, c.pr, c.head)
         claim_collision |= collided
+        if rc is not None and stage == "fix" and not opts.dry_run and c.pr:
+            peer_claims.note_fixed_head(_claim_scope(w), c.pr, c.head)
         if rc is not None:
             return rc  # performed (or dry-run); else (None) claimed-elsewhere → try next candidate
         declined.append((stage, c.pr))

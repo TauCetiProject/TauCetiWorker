@@ -126,6 +126,12 @@ inside each step, and the worker falls back to the normal landing order (rebases
 rest) when no review is claimable. A few review-first workers keep approvals flowing into
 the queue while the rest of the pool works through long conflict rebases.
 
+Each host remembers which heads of a PR its fix rounds repaired. When fix rounds on a
+host have repaired 6 heads of a PR and review still asks for changes, the next worker to
+select that PR for a fix adds the `human` label instead. Every worker treats `human` as a
+hold, so the whole fleet stops fixing and reviewing the PR until a person removes the
+label. On Forgejo the label must exist in the repository.
+
 While GitHub is rejecting the account's comments and the host's publication pacer is
 backing off, a both-source worker offers GitHub reviews after all its other work,
 including review-first workers. A review started then would finish its model work and
