@@ -502,7 +502,8 @@ def check(scratch: Path | None = None, env: dict | None = None) -> tuple[bool, s
     if scratch is not None:
         scratch.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ if env is None else env)
-    present = [p for p in credential_paths(env) if p.is_file() or (p.is_dir() and any(p.iterdir()))]
+    named = credential_paths(env)
+    present = [p for p in [*named, *linked_credentials(named)] if p.is_file() or (p.is_dir() and any(p.iterdir()))]
     with tempfile.TemporaryDirectory(prefix="sandbox-check-", dir=scratch) as directory:
         try:
             argv = sandbox_argv(["true"], Path(directory), env)

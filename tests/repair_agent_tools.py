@@ -406,6 +406,17 @@ class Credentials(Fixture):
         self.assertEqual(run.stdout.strip(), "done", run.stderr)
         ok, detail = repair_sandbox.check(self.tmp / "scratch", env)
         self.assertTrue(ok, detail)
+        # A key linked into the App directory from the pool is probed where the pool exposes it.
+        app = self.tmp / "app"
+        app.mkdir()
+        (pool / "app-key.pem").write_text("secret")
+        (app / "github-private-key.pem").symlink_to(pool / "app-key.pem")
+        linked = {**env, "TAUCETI_QUEUE_GITHUB_APP": str(app)}
+        with patch.object(repair_sandbox, "_credential_masks", return_value=[]):
+            ok, detail = repair_sandbox.check(self.tmp / "scratch", linked)
+        self.assertFalse(ok)
+        self.assertTrue(ok or "pool" in detail, detail)
+        self.assertTrue(repair_sandbox.check(self.tmp / "scratch", linked)[0])
         # The same key exposed through a symlinked pool is masked, and probed, under the pool's name.
         (self.tmp / "pool-link").symlink_to(pool)
         linked = {**env, "LAKE_CACHE_DIR": str(self.tmp / "pool-link")}
