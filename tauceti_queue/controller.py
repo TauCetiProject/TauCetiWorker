@@ -7514,6 +7514,12 @@ class Controller:
         if not self._head_tip_verified(head):
             assert head is not None
             return f"head {head['id']}'s tip {head['tip'][:12]} has not passed its own verification"
+        assert head is not None
+        attempt = self._current_attempt(head)
+        if attempt is not None and attempt["head_sha"] == head["tip"] and attempt["outcome"] == OUTCOME_PASS:
+            # The head is about to land: a preparation started now would be preserved across the landing
+            # and the seal would wait for it with staging idle (510's 1555 after 509, 24 Nov).
+            return f"head {head['id']} passed CI and is landing"
         if batch["pre_rebase_onto"] != self._pre_rebase_target() or batch["pre_rebase_source"] != batch["tip"]:
             return "the pre-rebase is not up to date"
         if batch["pre_rebase_prepared"] == batch["pre_rebase_tip"]:

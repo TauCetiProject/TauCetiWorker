@@ -3387,6 +3387,23 @@ class KnownGoodHeadTip(PreRebasedCase):
         [task] = self.pre_rebased_tasks()
         self.assertEqual(task["onto"], head["tip"])
 
+    def test_no_preparation_starts_once_the_heads_ci_has_passed(self):
+        """A preparation started in the landing window would be preserved across the landing, and the seal
+        would wait for it with staging idle: once the head's CI has passed, none starts."""
+        batch = self.open_batch()
+        self.verify_head()
+        head = self.head()
+        attempt = self.controller._current_attempt(head)
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass")
+        self.assertEqual(
+            self.controller._pre_rebased_prepare_blocked(self.row(batch)), f"head {head['id']} passed CI and is landing"
+        )
+        self.controller._prepare_pre_rebased(self.clock())
+        self.assertEqual(self.pre_rebased_tasks(), [])
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pending")
+        self.controller.tick()
+        self.assertEqual(len(self.pre_rebased_tasks()), 1, "while CI runs, the known-good tip is prepared on")
+
     def test_a_head_repair_qualifies_its_tip_only_when_the_worker_verified_it(self):
         batch = self.open_batch()
         for attempt, verified in ((1, False), (2, True)):

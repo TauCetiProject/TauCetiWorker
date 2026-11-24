@@ -417,7 +417,7 @@ replayed onto it) and that pre-rebase's tip is `batches.pre_rebase_verified`: a 
 pre-rebased chain released `prepared_clean`, or adopted with such a note. Any other new tip (a
 controller replay, a repair the worker could not verify) is not known-good, and a CI pass alone does
 not count: the head lands minutes later, and a preparation started then would only hold up the seal.
-On a head that is not known-good, the next batch's conflicts-only pre-rebase still runs, but
+No preparation starts once the head's CI has passed (`prepare_blocked`: `head N passed CI and is landing`): it would be preserved across the landing and the seal would wait for it with staging idle. On a head that is not known-good, the next batch's conflicts-only pre-rebase still runs, but
 `prepare_blocked` says `head N's tip <sha> has not passed its own verification`, and a claimed
 preparation is superseded (`head-unverified`) and its submission refused, a preserved one included
 once its `onto` has failed. When CI fails the tip a pre-rebase is on, or a repair round or rebase
