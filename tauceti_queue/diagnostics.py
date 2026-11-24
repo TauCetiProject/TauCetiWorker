@@ -13,15 +13,19 @@ defining module path):
 | `audit-driver: import TauCeti.X failed, environment already contains '...' from M` | `audit` (duplicate declaration) on `TauCeti.X`, and on `M` when it is a project module |
 | `duplicate-declarations: name is declared in both M and N` | `audit` on the project modules |
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON findings) | `lint` on the defining path, `unknown` kept when the linter could not locate it |
+| `TauCeti/A/B.lean:12:0: error: dot-notation namespace lint: D puts ...` | `lint` (`dot-notation`) on `TauCeti.A.B`, declaration `D` |
+| `error: TauCeti/A/B.lean:12: ...` (the style lint's text linters, which give no column) | `lint` (`style`) on `TauCeti.A.B` |
 | `Some required targets logged failures:` followed by `- TauCeti.A.B` lines | `compiler` on each target, only when no located finding exists |
 | `TauCeti/A.lean: missing project import ...` and other located import-header findings | `compiler` on the importing module |
 | `MEMBER-POLICY-REJECTED {...}` (the source member review-size policy's JSON record of one member) | `policy` naming that member by its accepted head and source identity |
 
 Infrastructure findings come from the run and jobs rather than the log: a cancelled, timed out or
-startup-failed run, a lost runner (the job log says so), and a failed finalizer, which may not have
-published the `build` status (it also exits nonzero after posting a failed one, so the controller
-ignores this finding once the run's own `build` status is bound). Logs are untrusted text: they are
-matched, never executed, and the read is bounded.
+startup-failed run, a lost runner (the job log says so), a Lean process the watchdog reports killed
+by signal 9 before its deadline (`reason` `lean_killed` on that module, whose failed-target entry is
+then dropped; located findings elsewhere still make the run a source failure), and a failed
+finalizer, which may not have published the `build` status (it also exits nonzero after posting a
+failed one, so the controller ignores this finding once the run's own `build` status is bound). Logs
+are untrusted text: they are matched, never executed, and the read is bounded.
 """
 
 from __future__ import annotations
@@ -36,6 +40,14 @@ PATH = r"TauCeti(?:/[A-Za-z0-9_\-]+)+\.lean"
 MODULE = r"TauCeti(?:\.[A-Za-z0-9_]+)+"
 SOURCE = re.compile(r"^(?:error: )?(" + PATH + r"):(\d+):(\d+):\s*(?:error:|error\b)")
 LAKE = re.compile(r"^error: (" + PATH + r"):(\d+):(\d+):")
+# The lint scripts print located findings in the compiler's shape; these are lint findings.
+DOT_NOTATION = re.compile(r"^(" + PATH + r"):(\d+):\d+: error: dot-notation namespace lint: (\S{1,1024}) ")
+STYLE = re.compile(r"^error: (?:\./)?(" + PATH + r"):(\d+): (.+)$")
+# Their `linter` names; the environment lint driver cannot check these.
+SOURCE_LINTERS = ("dot-notation", "style")
+# The style lint's header check (TauCetiTools `HeaderStyle.lean`) prints `path: message`. Other
+# scripts use that shape too (`check-imports.py`), so only the style lint's own output is read for it.
+HEADER_STYLE = re.compile(r"^(" + PATH + r"): (.+)$")
 ANY_MODULE = r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*"
 # The second module is the earlier definition: a project module, or a dependency's (a Mathlib bump can
 # add a declaration a project module already defines). Findings name only the project modules.
@@ -68,6 +80,12 @@ IMPORT_HEADER = re.compile(
 )
 FAILED_TARGETS_HEADER = "Some required targets logged failures:"
 FAILED_TARGET = re.compile(r"- (TauCeti(?:\.[A-Za-z_][A-Za-z0-9_']*)+)")
+# TauCetiTools' Lean watchdog reports a Lean process SIGKILLed before its wall-clock deadline, almost
+# always by the kernel's out-of-memory killer: a fault of the runner, not of the source. Its path is
+# absolute (the checkout's), so the project path is its last `TauCeti/...` suffix.
+LEAN_KILLED = re.compile(
+    r"^error: Lean process for (?:\S*/)?(" + PATH + r") was killed by signal 9 after \d+s, likely out of memory$"
+)
 RUNNER_LOST = re.compile(
     r"The runner has received a shutdown signal|lost communication with the server|"
     r"The hosted runner .* lost communication|runner has stopped responding|No space left on device",
@@ -95,6 +113,7 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
     fallback: dict[tuple, dict] = {}
     in_targets = False
     runner_lost: dict | None = None
+    killed: dict[str, dict] = {}
     for raw in lines:
         if len(located) >= MAX_FINDINGS:
             break
@@ -132,6 +151,36 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
                         _finding("audit", module, line, path=path_of(module), declaration=dup.group(1)),
                     )
             continue
+        if (dot := DOT_NOTATION.match(line)) and len(dot.group(1)) <= 512:
+            path = dot.group(1)
+            located.setdefault(
+                ("lint", path, dot.group(3)),
+                _finding(
+                    "lint",
+                    module_of(path),
+                    line,
+                    path=path,
+                    linter="dot-notation",
+                    declaration=dot.group(3),
+                    line_number=int(dot.group(2)),
+                ),
+            )
+            continue
+        if (style := STYLE.match(line)) and len(style.group(1)) <= 512:
+            path = style.group(1)
+            located.setdefault(
+                ("lint", path, style.group(2), style.group(3)[:MAX_MESSAGE]),
+                _finding(
+                    "lint",
+                    module_of(path),
+                    line,
+                    path=path,
+                    linter="style",
+                    declaration=style.group(3),
+                    line_number=int(style.group(2)),
+                ),
+            )
+            continue
         source = SOURCE.match(line) or LAKE.match(line)
         if source and len(source.group(1)) <= 512:
             path = source.group(1)
@@ -147,6 +196,10 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
                     column=int(source.group(3)),
                 ),
             )
+            continue
+        if (oom := LEAN_KILLED.match(line)) and len(oom.group(1)) <= 512:
+            module = module_of(oom.group(1))
+            killed.setdefault(module, _finding("infrastructure", module, line, path=oom.group(1), reason="lean_killed"))
             continue
         if line.startswith("LINT-ENV: FAIL"):
             fallback.setdefault(("lint", line[:MAX_MESSAGE]), _finding("lint", "", line))
@@ -165,9 +218,23 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
             in_targets = False
         if runner_lost is None and RUNNER_LOST.search(line):
             runner_lost = _finding("infrastructure", "", line, reason="runner_lost")
-    findings = list(located.values()) or list(fallback.values())
+    # Lake lists a killed module among its failed targets too; that entry is no source finding.
+    findings = list(located.values()) or [f for f in fallback.values() if f["module"] not in killed]
+    findings.extend(killed.values())
     if runner_lost is not None:
         findings.append(runner_lost)
+    return findings
+
+
+def header_style_findings(lines: Iterable[str]) -> list[dict]:
+    """The style lint's located copyright-header findings, from that script's output only."""
+    findings = []
+    for line in lines:
+        if (header := HEADER_STYLE.match(line.rstrip("\r\n"))) and len(header.group(1)) <= 512:
+            path = header.group(1)
+            findings.append(
+                _finding("lint", module_of(path), line, path=path, linter="style", declaration=header.group(2))
+            )
     return findings
 
 

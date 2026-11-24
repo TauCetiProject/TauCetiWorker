@@ -97,7 +97,7 @@ def main():
     check(peer_counts["awaiting-CI"] == (1, 0), "peer view: awaiting-CI 1 total, 0 mine")
 
     backlog = Survey(worker_id=ME)
-    backlog.n_mine_open = 7
+    backlog._own_open, backlog.n_mine_open = 7, 12
     backlog._mine_open_prs = [
         prinfo(1, ME, ["awaiting-author", "roadmap/PDE"]),
         prinfo(2, ME, ["ci-failed"]),
@@ -107,7 +107,7 @@ def main():
     backlog.open_prs = list(backlog._mine_open_prs)
     check(
         backlog.backlog_counts() == {"mine_open": 7, "mine_awaiting_author": 2, "mine_needs_fix": 3},
-        "backlog: authoring count passed through; awaiting-author plus ci-failed is one PR to fix",
+        "backlog: this forge's share of the authoring count; awaiting-author plus ci-failed is one PR to fix",
     )
 
     print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} assertion failure(s)")

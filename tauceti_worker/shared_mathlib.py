@@ -41,6 +41,7 @@ import time
 import uuid
 from pathlib import Path
 
+from .excerpt import ends
 from .paths import HERE
 from .processes import run as run_process
 from .runtime_status import atomic_json, read_json
@@ -202,7 +203,7 @@ def overlay_preload():
                 )
                 if result.returncode:
                     raise Unavailable(
-                        "cannot compile cache overlay helper: " + result.stderr.decode(errors="replace")[-400:]
+                        "cannot compile cache overlay helper: " + ends(result.stderr.decode(errors="replace"), 400)
                     )
                 os.replace(built, target)
     return target
@@ -285,7 +286,7 @@ def capability(directory=None):
                 return (
                     False,
                     "rootless OverlayFS probe failed: "
-                    + p.stderr.decode(errors="replace")[-400:].strip()
+                    + ends(p.stderr.decode(errors="replace"), 400)
                     + "; administrator may need to allow unprivileged user namespaces or provide an OverlayFS-capable filesystem",
                 )
         return True, "rootless OverlayFS works; immutable lower with private copy-on-write builds"
@@ -299,7 +300,7 @@ def capability(directory=None):
 def git(path, *args):
     p = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30)
     if p.returncode:
-        raise Unavailable("cannot identify clean dependency sources: " + p.stderr.strip()[-200:])
+        raise Unavailable("cannot identify clean dependency sources: " + ends(p.stderr, 200))
     return p.stdout.strip()
 
 
@@ -833,7 +834,7 @@ def _fetch_package(destination, name, revision, url, seeds, env):
 
     for args in (["init", "-q"], ["remote", "add", "origin", url]):
         if (result := run(*args)).returncode:
-            raise Unavailable(f"cannot prepare the shared {name} source: {result.stderr.strip()[-200:]}")
+            raise Unavailable(f"cannot prepare the shared {name} source: {ends(result.stderr, 200)}")
     failures = []
     for seed in [*seeds, url]:
         try:
@@ -845,12 +846,14 @@ def _fetch_package(destination, name, revision, url, seeds, env):
             continue
         if fetched.returncode == 0 and optional_git(destination, "rev-parse", "FETCH_HEAD^{commit}") == revision:
             break
-        failures.append(f"{seed}: {fetched.stderr.strip()[-200:]}")
+        failures.append(f"{seed}: {ends(fetched.stderr, 200)}")
     else:
-        raise Unavailable(f"cannot fetch {name} {revision[:12]} for the shared source: " + "; ".join(failures)[-400:])
+        raise Unavailable(
+            f"cannot fetch {name} {revision[:12]} for the shared source: " + ends("; ".join(failures), 400)
+        )
     result = run("-c", "advice.detachedHead=false", "checkout", "--quiet", "--detach", revision, timeout=300)
     if result.returncode:
-        raise Unavailable(f"cannot check out the shared {name} source: {result.stderr.strip()[-200:]}")
+        raise Unavailable(f"cannot check out the shared {name} source: {ends(result.stderr, 200)}")
     (destination / ".lake/build").mkdir(parents=True)
 
 
@@ -1046,9 +1049,7 @@ def signature(cwd, env, closure):
         ["lake", "env", "lean", "--version"], cwd=cwd, env=env, capture_output=True, text=True, timeout=120
     )
     if lean.returncode:
-        raise Unavailable(
-            "Lean toolchain is unavailable; run lake env lean --version: " + (lean.stderr or "").strip()[-300:]
-        )
+        raise Unavailable("Lean toolchain is unavailable; run lake env lean --version: " + ends(lean.stderr, 300))
     prefix = run_process(
         ["lake", "env", "lean", "--print-prefix"], cwd=cwd, env=env, capture_output=True, text=True, timeout=120
     )
@@ -1848,7 +1849,9 @@ def view(cwd, env, logdir, fetch):
             if probe.returncode == 42:
                 raise IntegrityFailure("verified lower missing through fresh overlay; stop sharing and investigate")
             if probe.returncode:
-                raise Unavailable("shared Mathlib view unavailable: " + probe.stderr.decode(errors="replace")[-300:])
+                raise Unavailable(
+                    "shared Mathlib view unavailable: " + ends(probe.stderr.decode(errors="replace"), 300)
+                )
             lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
             prefix = candidate
             env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = ",".join(str(fd) for fd in fds)

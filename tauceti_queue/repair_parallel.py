@@ -260,7 +260,7 @@ def plan_groups(
 def read_errors(directory: Path) -> list[dict] | None:
     """The compiler errors of the streaming build's ``errors.jsonl`` in ``directory`` (the worktree's
     ``.tauceti-repair``), with the audit and lint findings the worker appended (``kind`` ``audit`` or
-    ``lint``), without its event lines; None when there is no such file."""
+    ``lint``), without its event lines and ``rerun`` entries; None when there is no such file."""
     path = directory / repair_stream.ERRORS_FILE
     if not path.exists():
         return None
@@ -270,8 +270,8 @@ def read_errors(directory: Path) -> list[dict] | None:
             entry = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(entry, dict) or entry.get("event"):
-            continue
+        if not isinstance(entry, dict) or entry.get("event") or entry.get("kind") == repair_stream.RERUN:
+            continue  # a rerun entry is a module edited during the build, not an error of it
         if entry.get("file") or entry.get("kind") in CHECK_KINDS:
             errors.append(entry)
     return errors
@@ -378,7 +378,7 @@ def group_prompt(context: PromptContext, group: Group, chain: list[ChainCommit],
             )
         lines.append("")
     if findings["lint"]["findings"]:
-        lines += ["Environment lint findings (new violations against the grandfathered baseline):", ""]
+        lines += ["Lint findings (new violations against the grandfathered baselines):", ""]
         for finding in findings["lint"]["findings"]:
             where = f" in `{finding['path']}`" if finding.get("path") else ""
             lines.append(f"- linter `{finding.get('linter')}`: `{finding.get('declaration')}`{where}")
@@ -550,6 +550,38 @@ def run_group_job(job_path: Path) -> int:
     tmp.write_text(json.dumps(result, default=str))
     os.replace(tmp, result_path)
     return 0
+
+
+def run_child(module_args: list[str], log_path: Path, env: dict, stopping) -> tuple[bool, int | None]:
+    """Run ``python -m <module_args>`` as an owned child of the worker (``owned_process``: it and its
+    descendants end with the worker), its output appended to ``log_path``. ``stopping()`` is polled,
+    waiting briefly; once it is true the child is terminated. Returns whether it was stopped, and its
+    exit status."""
+    from tauceti_worker.processes import owned_process
+
+    stopped = False
+    with (
+        log_path.open("ab") as log,
+        owned_process(
+            [sys.executable, "-m", *module_args],
+            cwd=REPO_ROOT,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        ) as proc,
+    ):
+        while proc.poll() is None:
+            if stopping():
+                stopped = True
+                proc.terminate()
+                try:
+                    proc.wait(60)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                break
+    return stopped, proc.returncode
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -762,8 +794,7 @@ def repair_groups(
             base=base,
             tools_root=cfg.root / repair_audit.TOOLS_DIR,
             lake=tuple(cfg.lake),
-            checks_owner="staging" if repair_audit.staging_checks(task) else "worker",
-            policy_file=worktree / repair_tools.TOOLS_DIR / repair_audit.SETTINGS_FILE,
+            policy_commit=task.extra.get("policy_commit"),
         )
         group.worktree = str(path)
         return path
@@ -795,32 +826,18 @@ def repair_groups(
         env = dict(os.environ)
         if cfg.api_key:
             env[API_KEY_ENV] = cfg.api_key
-        cancelled = False
-        with (group_logdir / "runner.log").open("ab") as log:
-            proc = subprocess.Popen(
-                [sys.executable, "-m", "tauceti_queue.repair_parallel", "run-group", str(job_path)],
-                cwd=REPO_ROOT,
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-            )
-            while proc.poll() is None:
-                if group_cancels[group.name].wait(0.2):
-                    cancelled = True
-                    proc.terminate()
-                    try:
-                        proc.wait(60)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                    break
+        cancelled, returncode = run_child(
+            ["tauceti_queue.repair_parallel", "run-group", str(job_path)],
+            group_logdir / "runner.log",
+            env,
+            lambda: group_cancels[group.name].wait(0.2),
+        )
         if result_path.exists():
             group.agent = json.loads(result_path.read_text())
         elif cancelled:
             group.agent = {"status": "cancelled", "attempts": []}
         else:
-            group.agent = {"status": "failed", "reason": f"the group runner exited {proc.returncode}", "attempts": []}
+            group.agent = {"status": "failed", "reason": f"the group runner exited {returncode}", "attempts": []}
         status = group.agent["status"]
         if status == "ok":
             group.fixups, problem = collect_fixups(path, tip, group)
@@ -862,24 +879,34 @@ def repair_groups(
         record["seconds"] = round(time.monotonic() - started, 1)
         _cleanup(worktree, groups, cfg.keep_worktree)
         return record
-    record["fold"] = fold_fixups(worktree, base, tip, groups)
-    record["groups"] = [group.summary() for group in groups]
-    folded_tip = record["fold"].get("tip")
-    failed_modules: list[str] = []
-    check_findings: list[dict] = []
-    if folded_tip:
-        report = repair.chain_report(cfg.clone, base, tip, folded_tip, task.member_keys, prior_base=task.base)
-        record["report"] = report
-        if not report["ok"]:
-            git(worktree, "checkout", "--quiet", "--force", "--detach", tip)
-            for group in groups:
-                if group.status == "folded":
-                    group.status, group.detail = "fixups_not_applied", "the folded chain did not validate"
-            record["groups"] = [group.summary() for group in groups]
-        elif not cancel.is_set():
-            lock_wait = time.monotonic()
-            with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
-                record["lock_wait_seconds"] = round(time.monotonic() - lock_wait, 1)
+    lock_wait = time.monotonic()
+    # The fold rewrites the task worktree, so it waits for any build there, the streaming one included,
+    # and holds the lock through the verification build.
+    with repair_tools.build_lock(worktree, log=lambda *a, **k: None):
+        record["lock_wait_seconds"] = round(time.monotonic() - lock_wait, 1)
+        record["fold"] = fold_fixups(worktree, base, tip, groups)
+        record["groups"] = [group.summary() for group in groups]
+        folded_tip = record["fold"].get("tip")
+        failed_modules: list[str] = []
+        check_findings: list[dict] = []
+        if folded_tip:
+            report = repair.chain_report(
+                cfg.clone,
+                base,
+                tip,
+                folded_tip,
+                task.member_keys,
+                prior_base=task.base,
+                large_refactors=task.large_refactor_heads,
+            )
+            record["report"] = report
+            if not report["ok"]:
+                git(worktree, "checkout", "--quiet", "--force", "--detach", tip)
+                for group in groups:
+                    if group.status == "folded":
+                        group.status, group.detail = "fixups_not_applied", "the folded chain did not validate"
+                record["groups"] = [group.summary() for group in groups]
+            elif not cancel.is_set():
                 # CI's offline bwrap sandbox, as every build the worker runs (``repair_sandbox``).
                 build = repair.run_logged(
                     repair_sandbox.sandboxed_lake(
@@ -890,13 +917,8 @@ def repair_groups(
                     env_lake,
                     cfg.build_timeout,
                 )
-                if (
-                    build["rc"] == 0
-                    and getattr(cfg, "worker_audits", False)
-                    and task.kind == "repair"
-                    and not repair_audit.staging_checks(task)
-                ):
-                    # CI's audits and changed-module lint over the green build, still under the lock.
+                if build["rc"] == 0 and getattr(cfg, "worker_audits", False) and task.kind == "repair":
+                    # Staging's audits and lints over the green build, still under the lock.
                     checks = repair_audit.check(
                         worktree,
                         env_lake,
@@ -905,16 +927,15 @@ def repair_groups(
                         logdir=logdir,
                         lake=tuple(cfg.lake),
                         timeout=cfg.build_timeout,
-                        defer_when=lambda: repair_audit.staging_checks(task),
                     )
                     record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
                     check_findings = checks["diagnostics"]
                     repair_audit.append_errors(worktree / repair_tools.TOOLS_DIR, check_findings)
-            build.update(repair.parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
-            record["build"] = {k: v for k, v in build.items() if "load" not in k}
-            failed_modules = list(build["failed_modules"])
-            if build["rc"] != 0 and not failed_modules:
-                failed_modules = [path for group in groups if group.status == "folded" for path in group.paths]
+                build.update(repair.parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
+                record["build"] = {k: v for k, v in build.items() if "load" not in k}
+                failed_modules = list(build["failed_modules"])
+                if build["rc"] != 0 and not failed_modules:
+                    failed_modules = [path for group in groups if group.status == "folded" for path in group.paths]
     _cleanup(worktree, groups, cfg.keep_worktree)
     if cancel.is_set():
         record["status"] = "cancelled"
@@ -926,7 +947,7 @@ def repair_groups(
     ):
         record["status"] = "ok"
         record["tip"] = folded_tip
-        if "checks" in record or repair_audit.staging_checks(task):
+        if "checks" in record:
             record["verified_tip"] = folded_tip  # the task's assigned worker verification completed
     else:
         record["status"] = "partial"

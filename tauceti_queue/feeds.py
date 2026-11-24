@@ -274,6 +274,9 @@ class BatchView:
     promotion_retry_at: int = 0
     recovery_failures: int = 0
     recovery_after: int = 0
+    # Decision 200: for a running attested landing, the worker's attestation of exactly `head_sha`
+    # that the queue accepted (`tip`, `tree`, `policy_commit`); pr-build's `bors_attested.py` requires it.
+    attestation: dict | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -373,6 +376,7 @@ def batch_detail(batch: BatchView) -> dict:
         "recovery_failures": batch.recovery_failures,
         "train": train,
         "members": [{"pr": m.pr, "head_sha": m.head_sha} for m in batch.members],
+        **({"attestation": batch.attestation} if batch.attestation is not None else {}),
     }
 
 
@@ -720,6 +724,8 @@ class ControllerFeedSource:
             for a in self._attempts(row["id"])
             if a["batch_version"] == row["version"]
             and a.get("dispatch_state", "legacy") not in {"prepared", "rejected"}
+            # An unadopted early attempt describes the open batch's prepared tip, never a head's.
+            and (row["state"] == "open" or a.get("early") != 1)
         ]
         latest = attempts[-1] if attempts else None
         state = BATCH_STATES.get(row["state"], row["state"])
@@ -731,19 +737,44 @@ class ControllerFeedSource:
         ):
             state = "running"
         sealed = bool(row["sealed"])
+        head_sha, base_sha = (row["tip"], row["base"]) if sealed else (None, None)
+        if (
+            row["state"] == "open"
+            and sealed
+            and latest is not None
+            and latest.get("early") == 1
+            and latest.get("outcome") == "pending"
+            and latest.get("cancelled_at") is None
+        ):
+            # Decisions 199 B and 200: the next batch's trusted run of its prepared tip on the head's
+            # tip, sent before it is the head. pr-build resolves and revalidates it here, so the batch
+            # is `running` with exactly that tip and base, and stops being so once it is cancelled.
+            state, head_sha, base_sha = "running", latest["head_sha"], latest["base_sha"]
+        attestation = None
+        if state == "running" and latest is not None and latest.get("dispatch_kind") == "attested":
+            stored = row.get("pre_rebase_attestation") if latest.get("early") == 1 else row.get("attestation")
+            note = _loads(stored, {})
+            problem = getattr(self.controller, "_attestation_problem", None)
+            counts = problem is None or problem(stored, head_sha) is None
+            if counts and isinstance(note, dict) and note.get("tip") == head_sha and note.get("tree"):
+                attestation = {"tip": note["tip"], "tree": note["tree"], "policy_commit": note.get("policy_commit")}
+        generation = None
+        if latest is not None:
+            generation = int(latest["batch_version"] if latest.get("generation") is None else latest["generation"])
         return BatchView(
             id=int(row["id"]),
             base=self._branch(),
             state=state,
             sealed=sealed,
-            head_sha=row["tip"] if sealed else None,
-            base_sha=row["base"] if sealed else None,
+            head_sha=head_sha,
+            base_sha=base_sha,
             members=self._members(row["id"], inputs),
             candidate_id=int(latest["id"]) if latest else None,
-            generation=int(latest["batch_version"]) if latest else None,
-            staging_ref=self.controller.staging_candidate_ref(int(latest["id"]), int(latest["batch_version"]))
+            generation=generation,
+            staging_ref=self.controller.staging_candidate_ref(int(latest["id"]), generation)
             if latest and hasattr(self.controller, "staging_candidate_ref")
             else None,
+            attestation=attestation,
             promotion_failures=int(row.get("promotion_failures") or 0),
         )
 

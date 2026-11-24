@@ -254,10 +254,21 @@ class _ProjectionAPI:
             raise Incomplete("PR projection lifecycle is unavailable or inconsistent")
         return row
 
-    def pulls(self, repository, **filters):
+    def pulls(self, repository, *, page=None, sort=None, **filters):
+        from urllib.parse import urlencode
+
         from tauceti_tools.forge import Incomplete, RepositoryRef
 
-        rows = self.api.pulls(repository, **filters)
+        if page is None and sort is None:
+            rows = self.api.pulls(repository, **filters)
+        else:
+            # One native page of open PRs, for incremental discovery.
+            if type(page) is not int or page < 1 or filters != {"state": "open"}:
+                raise ValueError("a single listing page reads one positive page of open PRs")
+            query = {"state": "open", **({"sort": sort} if sort else {}), "limit": 50, "page": page}
+            rows = self.api.request("GET", f"repos/{repository.name}/pulls?{urlencode(query)}")
+            if not isinstance(rows, list):
+                raise Incomplete("source listing page is not an array")
         for row in rows:
             number = row.get("number") if isinstance(row, dict) else None
             if type(number) is not int or number < 1:
@@ -287,6 +298,34 @@ class _ProjectionAPI:
 
 
 LISTING_PAGE_ATTEMPTS = 3
+# Updates committed while a listing pages, and the issue index's lag behind the database.
+RECENT_MARGIN_SECONDS = 120
+
+
+def _timestamp(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _unavailable_server(failure):
+    return failure.kind == "ForgeError" and (failure.status in (0, 408, 429) or failure.status >= 500)
+
+
+def _updated(row):
+    """A listed PR's update time in seconds; 0 when it has none."""
+    try:
+        return datetime.fromisoformat(row["updatedAt"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+
+
+def _resume(rows, since, started):
+    """Where the next incremental refresh starts: the newest update listed, less the margin and the
+    time this refresh took. None, forcing a full listing next time, when nothing says."""
+    newest = max(map(_updated, rows), default=0.0)
+    if not newest:
+        return since
+    resume = newest - RECENT_MARGIN_SECONDS - (time.time() - started)
+    return resume if since is None else max(since, resume)
 
 
 def _page_retrying(api, *, attempts=LISTING_PAGE_ATTEMPTS, sleep=time.sleep):
@@ -533,7 +572,8 @@ class ForgejoReadSource:
         from .source_identity import discovery_scope
         from .source_survey import discovery_key
 
-        def mutate(rows):
+        def mutate(value):
+            rows = value["rows"]
             if not isinstance(rows, list):
                 raise ValueError("cached listing is not a list")
             kept = [item for item in rows if not (isinstance(item, dict) and item.get("number") == number)]
@@ -541,11 +581,18 @@ class ForgejoReadSource:
                 # Native listings are creation-descending, which PR numbers follow.
                 index = next((i for i, item in enumerate(kept) if item.get("number", 0) < number), len(kept))
                 kept.insert(index, row)
-            return kept
+            return {**value, "rows": kept}
 
         return transport.update_shared(
             discovery_key(self), mutate, identity=self.cache_namespace, generation_scope=discovery_scope(self)
         )
+
+    def _listing_reader(self, api):
+        if api is self.api:
+            return self.reader
+        from tauceti_tools.forge_read import ForgejoReader
+
+        return ForgejoReader(_ProjectionAPI(api))
 
     def open_prs(self, *, fresh=False):
         """Complete bounded open inventory, excluding unverified CI observations.
@@ -557,15 +604,94 @@ class ForgejoReadSource:
         fields = list(self.inventory_fields)
 
         def fetch():
-            reader = self.reader
-            retrying = _page_retrying(self.api)
-            if retrying is not self.api:
-                from tauceti_tools.forge_read import ForgejoReader
-
-                reader = ForgejoReader(_ProjectionAPI(retrying))
-            return reader.pulls(self.repository, fields, state="open")
+            return self._listing_reader(_page_retrying(self.api)).pulls(self.repository, fields, state="open")
 
         return self._read("open_prs", [], fetch, fresh=fresh)
+
+    def inventory(self, previous=None):
+        """The open inventory as {"rows", "since", "sweep"}, brought up to date from `previous`.
+
+        Forgejo renders every listed PR with git work (head, base and a diff stat), so listing all
+        of about 1,300 open PRs costs the server minutes. Without a usable `previous` this is
+        open_prs. Otherwise it reads PRs closed since `previous` from the issue index, which does no
+        git work; the update-ordered listing until it reaches PRs older than that; and one page of
+        the creation-ordered listing, a different page each time, so a change that moves no update
+        time (mergeability after the base branch moves) is seen once the pages come round. When
+        they do, open PRs missing from the issue index are dropped too. A refresh that fails for
+        any reason but an unavailable server lists in full instead. None when unavailable.
+        """
+        started = time.time()
+
+        def full():
+            rows = self.open_prs(fresh=True)
+            return None if rows is None else {"rows": rows, "since": _resume(rows, None, started), "sweep": 1}
+
+        try:
+            since, sweep, rows = previous["since"], previous["sweep"], previous["rows"]
+            usable = (
+                _timestamp(since)
+                and type(sweep) is int
+                and sweep >= 1
+                and isinstance(rows, list)
+                and all(isinstance(row, dict) and type(row.get("number")) is int for row in rows)
+            )
+        except (TypeError, KeyError):
+            usable = False
+        if not usable:
+            return full()
+        fields = list(self.inventory_fields)
+
+        def fetch():
+            from urllib.parse import urlencode
+
+            from tauceti_tools.forge import Incomplete
+
+            api = _page_retrying(self.api)
+            reader = self._listing_reader(api)
+
+            def issue_numbers(state, **query):
+                path = f"repos/{self.repository.name}/issues?" + urlencode({"type": "pulls", "state": state, **query})
+                numbers = set()
+                for batch in api.pages(path):
+                    for row in batch:
+                        if (
+                            not isinstance(row, dict)
+                            or type(row.get("number")) is not int
+                            or not row.get("pull_request")
+                        ):
+                            raise Incomplete("issue index did not identify a PR")
+                        numbers.add(row["number"])
+                return numbers
+
+            current = {row["number"]: row for row in rows}
+            stamp = datetime.fromtimestamp(since, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+            for number in issue_numbers("closed", since=stamp):
+                current.pop(number, None)
+            changed, page = [], 1
+            while True:
+                batch = reader.pulls(self.repository, fields, state="open", sort="recentupdate", page=page)
+                changed += batch
+                if not batch or _updated(batch[-1]) < since:
+                    break
+                page += 1
+            swept = reader.pulls(self.repository, fields, state="open", page=sweep)
+            for row in changed + swept:
+                current[row["number"]] = row
+            if not swept:
+                listed = issue_numbers("open")
+                current = {n: row for n, row in current.items() if n in listed or _updated(row) >= since}
+            return {
+                "rows": sorted(current.values(), key=lambda row: row["number"], reverse=True),
+                "since": _resume(changed, since, started),
+                "sweep": sweep + 1 if swept else 1,
+            }
+
+        value = self._read("open_inventory", [], fetch, fresh=True, cacheable=False)
+        failure = self.last_failure
+        if value is None and failure is not None and not _unavailable_server(failure):
+            # A malformed base or a rejected query would fail every later refresh too.
+            return full()
+        return value
 
     def authenticated_actor(self):
         """Fresh native actor identity; never infer it from a login or GitHub."""

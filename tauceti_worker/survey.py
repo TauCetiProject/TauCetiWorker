@@ -300,7 +300,6 @@ class PRInfo:
 
         local = d.get("baseRefName", "main") == "main" and accepted(
             d.get("labels"),
-            member=True,
             branch=d.get("headRefName", ""),
         )
         build_states = [c.get("state") for c in rollup if c.get("context") == "build"]
@@ -353,6 +352,10 @@ class Candidate:
     bump_pending: bool = False  # an automatic bump taken before its build finished
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
+    rereview: bool = False  # a review of a PR already reviewed at an earlier head: closest to approval
+    # A first review of a PR this account authored on a native forge (Forgejo): offered with the
+    # re-reviews, since never-reviewed PRs of our own are the cheapest approvals on Forgejo.
+    own_first_review: bool = False
     source_repository: RepositoryRef | None = None
     source_repository_id: int | None = None
     progress: dict | None = field(
@@ -409,8 +412,8 @@ class Survey:
     dependency_wait: dict | None = None
     discovery_gaps: int = 0  # diagnostic only; partial history never stops work selection
     discovery_gap_prs: list[int] = field(default_factory=list)
-    # A native source survey's per-PR review-history reads (at most SURVEY_DETAIL_READS), and the PRs
-    # it left unclassified because no cached observation describes their current state. Diagnostic.
+    # A native source survey's review-index refresh reads, and the PRs it could not refresh (lock wait
+    # expired or the source failed), which this survey leaves unclassified. Diagnostic.
     detail_reads: int = 0
     detail_deferred: int = 0
     errors: list[str] = field(default_factory=list)
@@ -436,10 +439,37 @@ class Survey:
         # a `--pr` round can explain a target the throttles took, instead of reporting the survey found
         # it no work.
         self._review_throttled: dict[int, str] = {}
+        # The umbrella round (docs/umbrellas.md) when roadmap_only names an umbrella; not a field, so
+        # `status --json` keeps its shape. Read it through `umbrella`.
+        self._umbrella = None
+        # The account's open roadmap PRs on the project's other forges (account_pressure), added to
+        # this survey's own count; None for a forge whose count is unknown, which blocks authoring.
+        self._account_others: dict[str, int | None] = {}
+        self._own_open = 0
+
+    @property
+    def umbrella(self):
+        """The umbrella round this survey's roadmap_only names, or None. A dashboard dial that moves
+        roadmap_only elsewhere drops it until the next survey."""
+        umbrella = self._umbrella
+        return umbrella if umbrella is not None and umbrella.umbrella.name == self.roadmap_only else None
+
+    def covers(self, pr: PRInfo) -> bool:
+        """Whether a PR is in this survey's roadmap scope. An umbrella covers a PR in any of its member
+        areas outside --roadmap-skip; PRs with no roadmap area stay in every scope, as in_scope keeps them."""
+        umbrella = self.umbrella
+        if umbrella is None:
+            return in_scope(pr.labels, pr.target_focuses, pr.head_ref, self.roadmap_only, self.roadmap_skip)
+        areas = roadmap_focuses(pr.labels, pr.target_focuses, pr.head_ref)
+        return not areas or bool(areas & umbrella.scope)
 
     def owns(self, pr: PRInfo) -> bool:
         # Qualified source records cannot fall back to a GitHub display login.
         return not hasattr(pr, "source_repository") and pr.author == self.me_login
+
+    def authored(self, pr: PRInfo) -> bool:
+        """PRs this identity opened itself: authoring pressure and "mine" counts use these."""
+        return self.owns(pr)
 
     def kind(self, name: str) -> WorkKind:
         return {
@@ -457,17 +487,40 @@ class Survey:
     def rescope_roadmap(self) -> None:
         """Recompute authoring pressure after roadmap-only/skip changes, including live TUI dials."""
         automatic = getattr(self, "_automatic_open_count", None)
-        self.n_mine_open = (
+        umbrella = self.umbrella
+        if umbrella is not None:
+            # The skip dial may have taken members out of the umbrella or brought them back.
+            self._umbrella = umbrella = umbrella.rescoped(self.roadmap_skip)
+        self._own_open = (
             automatic
             if automatic is not None
-            else roadmap_open_count(self._mine_open_prs, self.roadmap_only, self.roadmap_skip)
+            else roadmap_open_count(
+                self._mine_open_prs,
+                self.roadmap_only,
+                self.roadmap_skip,
+                within=None if umbrella is None else umbrella.scope,
+            )
         )
-        self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs
+        others = self._account_others.values()
+        self.n_mine_open = self._own_open + sum(count for count in others if count is not None)
+        # An unknown count on another forge fails closed: the account may already be at its limit.
+        self.roadmap_backpressure = self.n_mine_open >= self.max_open_prs or None in others
         self.next_auto_stage = _next_auto_stage(self)
 
+    @property
+    def own_open(self) -> int:
+        """This survey's own forge's share of n_mine_open."""
+        return self._own_open
+
+    def count_account(self, others: dict[str, int | None]) -> None:
+        """Judge authoring against the account's open PRs on every forge: `others` maps each other
+        project forge to its count there, or None when that count is unavailable."""
+        self._account_others = dict(others)
+        self.rescope_roadmap()
+
     def backlog_counts(self) -> dict[str, int]:
-        """This identity's backlog as the runtime status publishes it: the open-PR count the authoring
-        limit is compared with, how many of its surveyed non-draft PRs carry `awaiting-author`, and how
+        """This identity's backlog on this survey's forge as the runtime status publishes it: its own
+        share of the open-PR count the authoring limit is compared with, how many of its surveyed non-draft PRs carry `awaiting-author`, and how
         many carry that or `ci-failed` (a PR with both counts once). Only PRs in the surveyed scope
         count: a source survey keeps its unscoped list of owned PRs for the authoring limit."""
         scoped = {(p.number, p.head_oid) for p in self.open_prs}
@@ -477,7 +530,7 @@ class Survey:
             if (p.number, p.head_oid) in scoped
         ]
         return {
-            "mine_open": self.n_mine_open,
+            "mine_open": self.own_open,
             "mine_awaiting_author": sum("awaiting-author" in labels for labels in waiting),
             "mine_needs_fix": sum(map(bool, waiting)),
         }
@@ -539,7 +592,7 @@ def bucket_status_labels(nondraft: list[PRInfo], me_login: str, *, owns=None) ->
     return buckets, unlabeled
 
 
-def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str]) -> int:
+def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str], within=None) -> int:
     """Count open roadmap PRs in the current authoring scope.
 
     ``only`` is the survey's normalized value: a concrete area, ``auto`` (a random eligible area
@@ -548,11 +601,16 @@ def roadmap_open_count(prs: list[PRInfo], only: str, skip: list[str]) -> int:
     labels are authoritative when present; a concrete synchronous target-marker focus
     is the fallback during label lag. ``roadmap/none`` is not roadmap work, while an Unknown label
     or an unresolved ``roadmap/`` branch counts in every scope so the safety limit cannot fail open.
-    A PR is counted once.
+    A PR is counted once. ``within``, for an umbrella (docs/umbrellas.md), is its member areas
+    outside the skip list: a PR in any of them counts, and ``only`` (the umbrella's name) does not.
     """
 
     def focuses(p: PRInfo):
         return roadmap_focuses(p.labels, p.target_focuses, p.head_ref)
+
+    if within is not None:
+        within = set(within) - set(skip)
+        return sum((areas := focuses(p)) is None or bool(areas & within) for p in prs)
 
     if only not in ("", "any", "auto"):
         return sum((areas := focuses(p)) is None or only in areas for p in prs)
@@ -810,6 +868,31 @@ def bust_progress_cache(cfg: Config) -> None:
         pass
 
 
+def _umbrella_reader(read_survey, umbrella):
+    """A github_state.read_survey for an umbrella (docs/umbrellas.md): one scoped read per member area
+    in scope, merged by PR. The service is asked exactly what one worker pinned to each member asks,
+    so an umbrella creates no history demand outside its areas. Unavailable if any read is, or when
+    --roadmap-skip leaves no member, so the survey keeps its direct-inventory fallback."""
+
+    def read(repo, _roadmap, skip, **kwargs):
+        from .github_state import SurveyRows
+
+        if not umbrella.scope:
+            return False, None
+        rows, counts, cached = {}, None, False
+        for area in sorted(umbrella.scope):
+            available, part = read_survey(repo, area, skip, **kwargs)
+            if not available:
+                return False, None
+            for row in part:
+                rows.setdefault(row["pr"]["number"], row)
+            counts = getattr(part, "author_counts", None) if counts is None else counts
+            cached = cached or getattr(part, "cached", False)
+        return True, SurveyRows(list(rows.values()), counts, cached=cached)
+
+    return read
+
+
 def survey(
     cfg: Config,
     gh: GitHub,
@@ -822,13 +905,15 @@ def survey(
     numbers=(),
     count_all_roadmaps=False,
     cached_only=False,
+    umbrella=None,
 ) -> Survey:
     """Classify relevant open PRs per enabled work-kind, without writes or model work.
 
     Local cache and verified rebase-progress checkpoints may be updated.
 
     `deep=False` skips the per-PR scoreboard reads (faster, coarse) for a quick glance; the picker
-    always uses deep=True.
+    always uses deep=True. `umbrella` is the umbrella round (docs/umbrellas.md) the selected roadmap
+    names, whose member areas form the scope.
     """
     began = time.monotonic()
     _f = selected_roadmap if selected_roadmap is not None else roadmap_only()
@@ -840,6 +925,7 @@ def survey(
         roadmap_only=("auto" if _f is None else (_f or "any")),
         roadmap_skip=roadmap_skip(),
     )
+    sv._umbrella = umbrella
     if getattr(gh, "direct_source", False) is True:
         from .source_survey import inventory_survey, worker_survey
 
@@ -854,6 +940,7 @@ def survey(
             stages=enabled,
             numbers=numbers,
             count_all_roadmaps=count_all_roadmaps,
+            umbrella=umbrella,
             **runtime,
         )
     compact = []
@@ -862,6 +949,9 @@ def survey(
     try:
         from .github_state import read_survey
 
+        if sv.umbrella is not None:
+            # The service scopes by one area: read each member as a worker pinned there would.
+            read_survey = _umbrella_reader(read_survey, sv.umbrella)
         available, compact = (
             read_survey(
                 gh.repo,
@@ -918,15 +1008,7 @@ def survey(
             )
         )
     if deep:
-        prs = [
-            p
-            for p in prs
-            if (
-                p.number in numbers
-                if numbers
-                else in_scope(p.labels, p.target_focuses, p.head_ref, sv.roadmap_only, sv.roadmap_skip)
-            )
-        ]
+        prs = [p for p in prs if (p.number in numbers if numbers else sv.covers(p))]
     sv.open_prs = prs
     # Hand ReviewState this pass's clocks BEFORE any per-PR read below: they are what let it skip the
     # comment fetch for a PR that has not moved since the last round looked at it. A shallow survey
@@ -1004,7 +1086,7 @@ def classify_survey(
     ]
     me_login = sv.me_login or me()
     sv.me_login = me_login
-    mine = [p for p in nondraft if sv.owns(p)]
+    mine = [p for p in nondraft if sv.authored(p)]
     # Tend our own PRs, plus bot PRs hosted on canonical when this identity can push there. Only query
     # that permission while such a bot PR is open; an unknown result skips optional bot work this round.
     bot_on_canonical = bool(enabled & {"rebase", "fix", "fix-ci", "bump", "lint-repair"}) and any(
@@ -1036,7 +1118,7 @@ def classify_survey(
     sv.rescope_roadmap()
     # Bucket open non-draft PRs by the STATUS_LABELS pipeline (fixed order), pairing each label's
     # total with the subset this identity authored, for the per-round "open PRs" line.
-    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.owns)
+    sv.status_labels, sv.n_status_unlabeled = bucket_status_labels(nondraft, me_login, owns=sv.authored)
 
     # 1) rebase: tended (ours or bot-authored), conflicting or a sweep handoff for
     #    this exact head, under the per-PR budget since last verified progress.
@@ -1162,7 +1244,7 @@ def classify_survey(
             continue
         m = rs.gh_meta(p.number)
         if m.provenance == "deferred":
-            continue  # unread this survey (detail budget spent); a later survey reads it
+            continue  # the index could not be refreshed for it this survey; a later survey reads it
         if m.provenance in {"stale", "fetch_failed"}:
             gaps.add(p.number)
             continue
@@ -1176,6 +1258,8 @@ def classify_survey(
                 budget=MAX_REVIEW_ERRORS,
                 ready_at=p.build_status_at,
                 preferred_reviewer=_scoreboard_reviewer(m),
+                rereview=str(m.data.get("head_sha") or p.head_oid) != p.head_oid,
+                own_first_review=hasattr(sv, "source_repository") and sv.authored(p) and not m.data.get("head_sha"),
             )
             if not p.automatic_bump and c.attempts >= c.budget:
                 sv.reviewable.suppressed.append(c)
@@ -1256,7 +1340,7 @@ def classify_survey(
                 continue
             meta = rs.gh_meta(p.number)
             if meta.provenance == "deferred":
-                sv.fix_waiting.append((p.number, "review state not read this survey"))
+                sv.fix_waiting.append((p.number, "review index not refreshed this survey"))
                 continue
             blocking = rs.ledger_blocking(p.number, p.head_oid)
             per_head = counters.read(f"fix-{p.number}-{p.head_oid[:12]}")
@@ -1414,17 +1498,98 @@ def bump_prs(sv: Survey) -> set[int]:
     return {p.number for p in sv.open_prs if p.automatic_bump}
 
 
-def cascade(sv: Survey, stages) -> list[tuple[str, Candidate]]:
+# Landing tiers: work is offered by how close it brings a PR to landing, not by a strict stage
+# cascade (which let several hundred visible fixes starve every review, and so every approval).
+# Automatic Mathlib bumps and bump-stage repairs come first (tier 0, see cascade). Then conflict rebases (rare, and a
+# conflicting PR cannot land; reviewing or fixing it first would be redone after the rebase moves
+# its head) and re-reviews of PRs already reviewed at an earlier head or author contests: the next
+# verdict can approve them. First reviews of this account's own Forgejo PRs share that tier: they
+# approve more often than re-reviews do, and behind the fixes several hundred of them never came up.
+# Reviews within a tier are drawn in one age-weighted random order, so neither kind starves the
+# other. Then repairs of changes-requested or red PRs. Then other first reviews, then overlap work.
+LANDING_TIERS = {
+    "bump": 0,
+    "rebase": 1,
+    "lint-repair": 2,
+    "progress": 2,
+    "fix-ci": 2,
+    "fix": 2,
+    "review": 3,
+    "overlap-fix": 5,
+    "overlap-scan": 6,
+}
+
+
+def landing_tier(stage: str, candidate: Candidate, bumps=frozenset()) -> int:
+    if candidate.pr in bumps:
+        return 0
+    if stage == "review" and (candidate.rereview or candidate.contest or candidate.own_first_review):
+        return 1
+    return LANDING_TIERS.get(stage, 7)
+
+
+def age_spread(candidates: list, rng=random) -> list:
+    """An oldest-first weighted random permutation (older PRs up to four times as likely to come
+    first), so concurrent workers spread over the queue while old work still drains first. Age is
+    the PR number's rank: numbers are assigned in creation order."""
+    if len(candidates) < 2:
+        return list(candidates)
+    ranked = sorted(candidates, key=lambda c: c.pr)
+    keyed = []
+    for index, candidate in enumerate(ranked):
+        weight = 1.0 + 3.0 * (len(ranked) - 1 - index) / (len(ranked) - 1)
+        draw = max(float(rng.random()), 1e-300)
+        keyed.append((-math.log(draw) / weight, candidate))
+    keyed.sort(key=lambda item: item[0])
+    return [candidate for _, candidate in keyed]
+
+
+def review_first_rank(stage: str, rank: int) -> bool:
+    """False for the reviews a review-first worker offers ahead of the landing order: re-reviews
+    and first reviews, though not an automatic bump's review (bumps lead anyway) or overlap work."""
+    return not (stage == "review" and 0 < rank < LANDING_TIERS["overlap-fix"])
+
+
+def cascade(sv: Survey, stages, listed=frozenset(), *, tier=None, review_first=False) -> list[tuple[str, Candidate]]:
     """Actionable (stage, candidate) pairs in the order a round offers them.
 
     Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
     red build, review findings and pending reviews. Main moves faster than an ordinary queue
     position allows a bump round to start, so a bump that waits behind unrelated work goes stale
-    again before it can be admitted. Everything else follows in the usual stage order.
+    again before it can be admitted. Everything else follows in landing-tier order (LANDING_TIERS),
+    in stage order within a tier and the stage's own order within a stage. `tier` keeps one tier.
+    `review_first` moves re-reviews, then first reviews, ahead of every other tier but the bumps.
+
+    Within each maintenance/review stage, prefer this account's listed PRs among its own
+    non-bump positions. Other authors and automatic bumps keep their positions; no candidate
+    moves across stages, so target priority cannot overtake lint repair or progress reports.
     """
     bumps = bump_prs(sv)
     pairs = [(stage, c) for stage in stages for c in sv.kind(stage).actionable]
-    return [pair for pair in pairs if pair[1].pr in bumps] + [pair for pair in pairs if pair[1].pr not in bumps]
+
+    def rank(pair):
+        tier_rank = landing_tier(*pair, bumps)
+        return review_first and tier_rank > 0 and review_first_rank(pair[0], tier_rank), tier_rank
+
+    pairs.sort(key=rank)  # stable: stage order within a tier
+    if tier is not None:
+        pairs = [pair for pair in pairs if landing_tier(*pair, bumps) == tier]
+    if not listed:
+        return pairs
+    own = {p.number for p in sv.open_prs if sv.owns(p)} - bumps
+    for stage, rank in {(kind, landing_tier(kind, c, bumps)) for kind, c in pairs}:
+        if stage not in ("rebase", "fix-ci", "fix", "review"):
+            continue
+        # Listed PRs move ahead only within their own stage and landing tier.
+        slots = [
+            i
+            for i, (kind, c) in enumerate(pairs)
+            if kind == stage and c.pr in own and landing_tier(kind, c, bumps) == rank
+        ]
+        ranked = sorted((pairs[i] for i in slots), key=lambda pair: pair[1].pr not in listed)
+        for i, pair in zip(slots, ranked, strict=True):
+            pairs[i] = pair
+    return pairs
 
 
 def _next_auto_stage(sv: Survey) -> str | None:

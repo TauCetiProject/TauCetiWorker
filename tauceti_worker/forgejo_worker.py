@@ -55,7 +55,15 @@ class ForgejoWorkerSource(ForgejoReadSource):
         row = self.live_pull(candidate.pr)
         if row is None:
             return None
-        return actor is not None and row["user"]["id"] == int(actor.principal.native_id)
+        from .source_identity import maintains_author
+
+        if actor is not None and row["user"]["id"] == int(actor.principal.native_id):
+            return True
+        # An adopted author's PR is maintained only on a branch in this repository.
+        head = (row.get("head") or {}).get("repo") or {}
+        return head.get("id") == self.identity.native_id and maintains_author(
+            actor, self.repository.forge, row["user"]["id"]
+        )
 
     def writable_repository(self):
         """Use an explicit writable fork, or authorized same-repository branches."""
@@ -99,14 +107,152 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return self._read("live_pull", [pr], lambda: self.api.pull(self.repository, pr), fresh=True, number=pr)
 
     def pr_list(self, fields, *, author=None, state="open"):
-        rows = self._read(
-            "pr_list",
-            [fields, author, state],
-            lambda: self.reader.pulls(self.repository, fields, state=state, author=author),
-        )
+        def fetch():
+            if list(fields) != ["number"] or author is not None or state != "open":
+                return self.reader.pulls(self.repository, fields, state=state, author=author)
+            # A roadmap round's baseline needs only numbers: the issue index lists them without
+            # the per-PR git work (head, base, diff stat) of a pull listing.
+            numbers = []
+            for batch in self.api.pages(f"repos/{self.repository.name}/issues?type=pulls&state=open"):
+                for row in batch:
+                    if not isinstance(row, dict) or type(row.get("number")) is not int or not row.get("pull_request"):
+                        raise Incomplete("issue index did not identify a PR")
+                    numbers.append(row["number"])
+            return [{"number": number} for number in dict.fromkeys(numbers)]
+
+        rows = self._read("pr_list", [fields, author, state], fetch)
         if rows is None:
             raise Incomplete("Forgejo PR listing is unavailable")
         return rows
+
+    def merged_prs(self, search, *, limit=200):
+        """`GitHub.merged_prs` on this source: number, title, body, URL and base branch of the `limit` most recently
+        created pull requests merged into `content_base()` whose body matches the GitHub-style `search`
+        (`body_matches`; its qualifiers are not native and are ignored), among the closed pull requests the client's
+        page bound reaches. One item's search (`landed_pr`) goes to the native keyword search for
+        its slug, which reaches a pull request of any age. Raises SourceUnavailable when it fails."""
+        import urllib.parse
+
+        from .config import SourceUnavailable
+        from .github import BORS_MERGED_PREFIX
+        from .targets import MARKER_TAG, MergedPRs, body_matches, content_base, search_id, search_phrases
+
+        phrases = search_phrases(search)
+        keyword = search_id(phrases) or next((p for p in phrases if p != MARKER_TAG), None)
+        if keyword is None:
+            path = f"repos/{self.repository.name}/pulls?state=closed"
+        else:
+            query = urllib.parse.urlencode({"type": "pulls", "state": "closed", "q": keyword})
+            path = f"repos/{self.repository.name}/issues?{query}"
+
+        def merged(row):
+            # A pull listing row says `merged`; an issue search row says it under `pull_request`. The
+            # queue lands a pull request by squash and closes it, unmerged, under BORS_MERGED_PREFIX.
+            if (row if keyword is None else row.get("pull_request") or {}).get("merged") is True:
+                return True
+            return row.get("state") == "closed" and str(row.get("title") or "").startswith(BORS_MERGED_PREFIX)
+
+        def base(row):
+            if keyword is not None:  # an issue search row names no base branch
+                row = self.api.pull(self.repository, row["number"])
+            return (row.get("base") or {}).get("ref") or ""
+
+        def on_base(row):
+            row["baseRefName"] = base(row)
+            return row["baseRefName"] == content_base()
+
+        def fetch():
+            rows = []
+            complete = True
+            # Stop at the client's page bound, where `pages` would raise, rather than fail the read.
+            for n, batch in enumerate(self.api.pages(path), 1):
+                # The base is checked before counting, so landings on other branches never fill `limit`.
+                rows += [r for r in batch if merged(r) and body_matches(r.get("body") or "", phrases) and on_base(r)]
+                if len(rows) >= limit or n >= self.api.max_pages:
+                    complete = False
+                    break
+            found = [
+                {
+                    "number": r["number"],
+                    "title": r.get("title") or "",
+                    "body": r.get("body") or "",
+                    "url": self.repository.pull_url(r["number"]),
+                    "baseRefName": r["baseRefName"],
+                    "state": "MERGED"
+                    if (r if keyword is None else r.get("pull_request") or {}).get("merged") is True
+                    else "CLOSED",
+                }
+                for r in rows[:limit]
+            ]
+            return {"rows": found, "complete": complete}
+
+        result = self._read("merged_prs", ["candidates-v3", search, limit], fetch)
+        if result is None:
+            raise SourceUnavailable("Forgejo merged pull request listing is unavailable")
+        return MergedPRs(result["rows"], complete=result["complete"])
+
+    def target_queue_landed(self, number, branch):
+        from .target_landings import queue_landed
+
+        def fetch():
+            failures = []
+
+            def read_json(path):
+                try:
+                    if "/git/commits/" in path:
+                        from tauceti_tools.forge_api import execute, plan
+                        from tauceti_tools.forge_command import parse_command
+
+                        # Forgejo's raw commit JSON nests the message and tree; the Tools
+                        # adapter normalizes it and verifies the actual Git tree object.
+                        output, _, _ = execute(plan(parse_command(["api", path])), self.api)
+                        return json.loads(output)
+                    return self.api.request("GET", path)
+                except ForgeError as error:
+                    suffix = path.split("/", 3)[-1]
+                    candidate_read = suffix.startswith(("compare/", "git/commits/"))
+                    oversized_compare = (
+                        suffix.startswith("compare/")
+                        and isinstance(error, Incomplete)
+                        and str(error) == "Forgejo response exceeded the configured byte limit"
+                    )
+                    if (error.status in (404, 422) and candidate_read) or oversized_compare:
+                        return None  # Invalid or unprovably large candidates cannot complete an item.
+                    failures.append(error)
+                    raise
+                except (OSError, ValueError) as error:
+                    failures.append(error)
+                    raise
+
+            def comments():
+                rows = self.issue_comments(number)
+                if rows is None:
+                    error = Incomplete("native target landing comments are unavailable")
+                    failures.append(error)
+                    raise error
+                return rows
+
+            subject = f"{self.repository.forge.key}/{self.repository.name}@{self.identity.native_id}#{number}"
+            verified = queue_landed(
+                self.repository.name,
+                number,
+                branch,
+                read_json=read_json,
+                read_comments=comments,
+                native=True,
+                subject=subject,
+                alternate_subjects=(f"{self.repository.key}#{number}",),
+            )
+            if failures:
+                raise failures[0]
+            return verified
+
+        result = self._read("target_queue_landed", [number, branch], fetch)
+        if result is None:
+            from .config import SourceUnavailable
+
+            raise SourceUnavailable("native target landing evidence is unavailable")
+        return result
 
     def issue_list(self, repository, **options):
         from .github import GitHub
@@ -155,9 +301,33 @@ class ForgejoWorkerSource(ForgejoReadSource):
         return ""
 
     def rebase_requested(self, pr, head):
-        return False
+        return bool(self._recovery_request(pr, head))
 
     def rebase_request_body(self, pr, head):
+        body = self._recovery_request(pr, head)
+        # Do not silently truncate a diagnosis; the prompt can fetch the original request.
+        return body if len(body) <= 32768 else ""
+
+    def _recovery_request(self, pr, head):
+        """The newest trusted merge-queue recovery request for exactly this head, or ""."""
+        import re
+
+        from .source_identity import recovery_author_ids
+
+        trusted = recovery_author_ids()
+        if not trusted or not re.fullmatch(r"[0-9a-f]{40}", head or ""):
+            return ""
+        marker = f"<!--tauceti-rebase:v1 {head}-->"
+        for row in reversed(self.issue_comments(pr) or []):
+            author = (row.get("user") or {}).get("id")
+            body = row.get("body") or ""
+            if (
+                type(author) is int
+                and author in trusted
+                and body.startswith("Merge-queue recovery for head `")
+                and marker in body.splitlines()
+            ):
+                return body
         return ""
 
     def bump_repair_requested(self, pr, head):

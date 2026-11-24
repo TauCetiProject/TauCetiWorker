@@ -47,7 +47,7 @@ log = logging.getLogger(__name__)
 
 MODES = ("off", "shadow", "events")
 CONTEXTS = ("build", "scope", "bump-guard")
-ADMISSION_LABELS = frozenset({"needs-rebase", "self-tested", "full-lint", "lint-repair"})
+ADMISSION_LABELS = frozenset({"needs-rebase", "self-tested", "full-lint", "lint-repair", "large-refactor"})
 MISMATCH_LIMIT = 20
 GIT_TIMEOUT_SECONDS = 30
 # A status delivery for a (sha, context) a full read seeded carries no comparable status id; within

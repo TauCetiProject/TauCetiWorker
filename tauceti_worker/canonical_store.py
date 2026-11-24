@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import secrets
+import socket
 import stat
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from pathlib import Path
 
 from . import expanded_cache
 from .config import log
+from .excerpt import ends
 from .runtime_status import read_json
 
 NAMESPACE = "canonical-v1"
@@ -290,12 +292,14 @@ def writers(checkout):
 def open_for_writing():
     """Every `(dev, ino)` some process of this user holds open for writing (Linux `/proc` only).
 
-    One scan per relink pass. An fd whose flags cannot be read counts as writable.
+    One scan per relink pass. An fd whose flags cannot be read counts as writable. Where `fdinfo`
+    names the inode, a writable file is `(None, ino)`, busy on any device (see `_descriptor`).
     """
     if not os.path.isdir("/proc/self/fd"):
         return set()
     found = set()
     uid = os.getuid()
+    scan = _Scan()
     for entry in os.scandir("/proc"):
         if not entry.name.isdigit():
             continue
@@ -306,23 +310,134 @@ def open_for_writing():
         except OSError:
             continue
         for descriptor in descriptors:
-            try:
-                info = os.stat(descriptor.path)
-            except OSError:
-                continue
-            if not stat.S_ISREG(info.st_mode):
-                continue
-            key = info.st_dev, info.st_ino
-            if key in found:
-                continue
-            try:
-                text = Path(entry.path, "fdinfo", descriptor.name).read_text()
-                flags = int(next(line.split()[1] for line in text.splitlines() if line.startswith("flags:")), 8)
-            except (OSError, StopIteration, ValueError):
-                found.add(key)
-                continue
-            if flags & (os.O_WRONLY | os.O_RDWR):
-                found.add(key)
+            found |= _descriptor(entry.path, descriptor.name, scan)
+    return found
+
+
+class _Scan:
+    """What one `/proc` scan learns once from descriptors of our own."""
+
+    def __init__(self):
+        # Pipes, sockets and anonymous inodes live on kernel-internal mounts that no path reaches,
+        # so no canonical object or checkout output is ever on one. Learn their ids from our own.
+        self.internal = set()
+        self.inodes = False  # Whether fdinfo names the inode and mount (Linux 5.14 and later).
+        opened = []
+        with contextlib.suppress(OSError, AttributeError):
+            opened.extend(os.pipe())
+            pair = socket.socketpair()
+            opened.extend(p.detach() for p in pair)
+            opened.append(os.eventfd(0))
+        for fd in opened:
+            fields = _fdinfo("/proc/self", str(fd)) or {}
+            if fields.get("mnt_id", "").isdigit():
+                self.internal.add(fields["mnt_id"])
+                self.inodes = self.inodes or fields.get("ino", "").isdigit()
+            os.close(fd)
+
+
+def _fdinfo(process, fd):
+    """`fd`'s `fdinfo` fields, `None` if the fd is closed, `{}` if they cannot be read."""
+    try:
+        text = Path(process, "fdinfo", fd).read_text()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {}
+    fields = {}
+    for line in text.splitlines():
+        field, _, value = line.partition(":")
+        fields.setdefault(field.strip(), value.strip())
+    return fields
+
+
+def _legacy(path, fdinfo):
+    """Stat, then flags: what kernels whose fdinfo names no inode allow (and main always did).
+
+    An fd closed or reused between the two looks counts the file stat'ed as writable.
+    """
+    try:
+        info = os.stat(path)
+    except OSError:
+        return set()
+    if not stat.S_ISREG(info.st_mode):
+        return set()
+    try:
+        flags = int(_fdinfo(*fdinfo)["flags"], 8)
+    except (TypeError, KeyError, ValueError):
+        return {(info.st_dev, info.st_ino)}
+    return {(info.st_dev, info.st_ino)} if flags & (os.O_WRONLY | os.O_RDWR) else set()
+
+
+def _pin(path):
+    """`(mnt_id, kernel ino, stat)` of the file `path` names now, through a descriptor of our own.
+
+    Nothing else can reuse our `O_PATH` descriptor, so its `fdinfo` and `fstat` describe one file.
+    If we cannot open one (out of descriptors, say), a plain stat with an unknown identity
+    `(None, None, stat)`, which proves nothing either way; None once the fd is closed.
+    """
+    try:
+        ours = os.open(path, os.O_PATH | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None  # Closed: a stat now would name whatever reused the fd.
+    except OSError:
+        ours = None
+    if ours is not None:
+        try:
+            fields = _fdinfo("/proc/self", str(ours)) or {}
+            return fields.get("mnt_id"), fields.get("ino"), os.fstat(ours)
+        except OSError:
+            pass
+        finally:
+            os.close(ours)
+    try:
+        return None, None, os.stat(path)
+    except OSError:
+        return None
+
+
+def _descriptor(process, fd, scan):
+    """The `(dev, ino)` keys that `process`'s `fd` holds open for writing.
+
+    The process keeps opening, closing and `dup2`ing descriptors while it is scanned, so two
+    lookups of `fd` may describe different files: stat-then-flags once charged a lock file's
+    writable flags to the read-only output it replaced, deferring a relink that nothing blocked.
+    The verdict rests on one `fdinfo` read, which describes one open file: its flags, mount and
+    kernel inode. A read-only fd, or one on a kernel-internal mount (pipe, socket, eventfd), is
+    never a file a relink could share. A writable fd is pinned before and after that read (see
+    `_pin`); each pin is kept unless its known `(mnt_id, ino)` differs from the read's, which
+    proves it another file. A match is not proof of the same file (multi-layer overlayfs
+    without `xino` repeats kernel inodes in one mount), so every other pin counts. `(None, ino)`
+    counts too, which `Guard.busy` matches on any device, for a writer that left this fd
+    unpinned. Pins give the `(st_dev, st_ino)` the guard compares, which NFS and overlayfs may
+    report differently from the kernel inode. Every unproven outcome errs toward busy. An
+    unreadable `fdinfo` counts the file pinned before it, and kernels whose `fdinfo` names no
+    inode (before 5.14) get main's stat-first judgement. Like any snapshot, a writer moved to an
+    already-scanned fd before this fd's `fdinfo` is read is not seen.
+    """
+    path = os.path.join(process, "fd", fd)
+    if not scan.inodes:
+        return _legacy(path, (process, fd))
+    before = _pin(path)
+    fields = _fdinfo(process, fd)
+    if fields is None:
+        return set()  # Closed: nothing open here to judge.
+    ino, mount = fields.get("ino", ""), fields.get("mnt_id", "")
+    try:
+        flags = int(fields["flags"], 8)
+    except (KeyError, ValueError):
+        flags = None
+    if flags is None or not (ino.isdigit() and mount.isdigit()):
+        pins = [before]  # Unreadable: judged as main did, by the file seen just before.
+    elif not flags & (os.O_WRONLY | os.O_RDWR) or mount in scan.internal:
+        return set()
+    else:
+        # Only a pin whose identity is known and differs is proven to be another file.
+        pins = [pin for pin in (before, _pin(path)) if pin is not None and pin[:2] in ((mount, ino), (None, None))]
+    found = {(None, int(ino))} if ino.isdigit() and flags is not None else set()
+    for pin in pins:
+        if pin is not None and stat.S_ISREG(pin[2].st_mode):
+            found.add((pin[2].st_dev, pin[2].st_ino))
     return found
 
 
@@ -374,7 +489,7 @@ def probe(checkout, private_store, directory, *, prefix=(), env=None):
         middle.unlink(missing_ok=True)
         final.unlink(missing_ok=True)
     if result.returncode:
-        detail = (result.stdout + result.stderr).strip()[-400:]
+        detail = ends(result.stdout + result.stderr, 400)
         raise Unavailable(f"hard links unavailable in the agent namespace: {detail}")
 
 
@@ -407,7 +522,7 @@ class Guard:
 
     def busy(self, info):
         key = info.st_dev, info.st_ino
-        return key in self.opened or key in self.writable
+        return key in self.opened or key in self.writable or (None, info.st_ino) in self.writable
 
     def idle(self, *pairs, recent_ok=False):
         """True if every `(path, inspected_info)` is quiescent right now."""
@@ -664,7 +779,7 @@ class Pass:
             except FileNotFoundError:
                 canonical_info = None
             if canonical_info is not None:
-                if (canonical_info.st_dev, canonical_info.st_ino) in self.writable:
+                if self.guard.busy(canonical_info):
                     self.count("deferred_busy")  # Neither trusted nor re-recorded while writable.
                     return
                 sha, size, intact = expected(self.directory, name, self.deadline)
@@ -1132,13 +1247,15 @@ def boundary(checkout, env, *, phase, prefix=()):
     return report
 
 
-def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60, opened=()):
+def sweep(
+    pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, reconcile_budget=60, opened=(), deadline=None
+):
     """Evict canonical objects only their own pool names link to, under the exclusive object lock.
 
     Link counts are evidence, not a refcount: a checkout or private store that links an object
     keeps it alive. Names a checkout recorded at a recent relink are kept unless under pressure.
     """
-    from .retention import note
+    from .retention import note, past
 
     now = time.time() if now is None else now
     directory = store(pool)
@@ -1152,10 +1269,16 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
     refused = rejected(pool)
     reconciling_until = time.monotonic() + reconcile_budget
     for lease in (directory / "uses").glob("*.list"):
+        if past(deadline):
+            break
         with contextlib.suppress(FileNotFoundError):
             if now - lease.stat().st_mtime > lifetime:
                 remove(lease, pool, report, dry=dry, check_users=False, mounts=[])
-    for path in objects.iterdir():
+    for entry in os.scandir(objects):  # Lazily: the store can hold millions of objects.
+        path = Path(entry.path)
+        if past(deadline):
+            report.setdefault("deferred", []).append("canonical-objects")
+            break
         name = path.name
         try:
             info = path.lstat()
@@ -1168,6 +1291,7 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
                     old.lstat().st_ino != info.st_ino
                     and not dry
                     and time.monotonic() < reconciling_until
+                    and not past(deadline)
                     # Busy shards wait for the next sweep.
                     and reconcile(pool, name, old, blocking=False, guard=guard, refused=refused)
                 ):
@@ -1180,8 +1304,12 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
                 if leased is None:
                     leased = set()
                     for lease in (directory / "uses").glob("*.list"):
+                        if past(deadline):
+                            break
                         with contextlib.suppress(FileNotFoundError):
                             leased.update(lease.read_text().split())
+                if past(deadline):
+                    continue  # A partial lease set protects nothing; the loop stops at its next check.
                 if name in leased:
                     continue
             with object_lock(directory, name, exclusive=True, blocking=False):
@@ -1205,6 +1333,8 @@ def sweep(pool, report, *, dry=False, urgent=False, now=None, lifetime, remove, 
         except OSError as error:
             note(report, "errors", f"{path}: {error}")
     for meta in (directory / "meta").glob("*/*.json"):
+        if past(deadline):
+            break
         with contextlib.suppress(FileNotFoundError):
             if not (objects / meta.name[: -len(".json")]).exists() and now - meta.stat().st_mtime > 3600:
                 if not dry:

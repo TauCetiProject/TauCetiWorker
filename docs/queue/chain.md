@@ -80,8 +80,9 @@ unknown base or head, or an unsafe `chain_id` raise `ChainError`.
 **`replay(repo, base, tip, onto, chain_id=None, committer=...) -> ChainResult`** rebases the chain
 `base..tip` onto `onto`, one commit per commit, with the message, author and author date copied
 verbatim (a cherry-pick of each commit onto the new tip, with the commit's own parent as merge base).
-Conflicts are reported as in `build`. A mechanical replay changes every hash; `compare` still reports
-it as clean.
+Conflicts are reported as in `build`, and the conflicting record's `replayed` names the commit of
+the input chain that conflicted. A mechanical replay changes every hash; `compare` still reports it
+as clean.
 
 **`validate(repo, base, tip, members) -> ValidationReport`** lists every violation rather than
 stopping at the first. `members` may be `Member` records or `owner/repo#N` strings. Checks and their

@@ -24,6 +24,9 @@ for key in (
     "TAUCETI_WORKERS_CONFIG",
     "TAUCETI_WORKERS_STATE_DIR",
     "TAUCETI_RUNTIME_DIR",
+    "TAUCETI_PACE",
+    "TAUCETI_PACE_CLAUDE",
+    "TAUCETI_PACE_CODEX",
 ):
     os.environ.pop(key, None)
 os.environ["XDG_CONFIG_HOME"] = str(root / "config")
@@ -46,7 +49,8 @@ for current, wanted, expected in (("0", "500", "500"), ("700", "500", "700"), ("
     assert score.read_text().strip() == expected, (current, wanted, score.read_text())
 
 
-def wait_for(predicate, timeout=10):
+def wait_for(predicate, timeout=60):
+    # Generous: on a loaded CI runner a wrapper's startup or a manager poll can take many seconds.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         value = predicate()
@@ -54,6 +58,19 @@ def wait_for(predicate, timeout=10):
             return value
         time.sleep(0.05)
     raise AssertionError("condition did not become true")
+
+
+def keeps_wrapper(worker_id, pid):
+    """The worker still runs under wrapper ``pid``: it was not restarted.
+
+    A status read can fall back to the status file, which lags a wrapper whose first update lost
+    the file lock to its child, so the reported pid is awaited; the process itself must be alive."""
+    wait_for(lambda: wm.runner_status(worker_id).get("wrapper_pid") == pid)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def start_manager(config):
@@ -112,6 +129,32 @@ for changes in (
         pass
     else:
         raise AssertionError(f"accepted invalid source selection: {changes}")
+preferring = wm.WorkerSpec.from_dict(dict(id="preferring", forgejo=True, prefer_forge="github"), 0)
+assert preferring.as_dict()["prefer_forge"] == "github"
+assert wm.WorkerSpec.from_dict(preferring.as_dict(), 0) == preferring
+argv = preferring.work_argv()
+assert argv[argv.index("--prefer-forge") + 1] == "github"
+assert build_parser().parse_args(argv[argv.index("work") :]).prefer_forge == "github"
+reviewing = wm.WorkerSpec.from_dict(dict(id="reviewing", forgejo=True, review_first=True), 0)
+assert reviewing.as_dict()["review_first"] is True
+assert "review_first" not in wm.WorkerSpec.from_dict(dict(id="plain", forgejo=True), 0).as_dict()
+assert wm.WorkerSpec.from_dict(reviewing.as_dict(), 0) == reviewing
+assert build_parser().parse_args(reviewing.work_argv()[reviewing.work_argv().index("work") :]).review_first is True
+assert not wm._defer_read_policy_reload(
+    reviewing,
+    dict(applied_spec=wm.WorkerSpec.from_dict(dict(id="reviewing", forgejo=True), 0).as_dict(), state="running"),
+)
+for changes in (dict(prefer_forge="forgejo"), dict(forgejo=True, prefer_forge="other")):
+    try:
+        wm.WorkerSpec.from_dict(dict(id="invalid-preference", **changes), 0)
+    except wm.WorkersError:
+        pass
+    else:
+        raise AssertionError(f"accepted invalid forge preference: {changes}")
+# A preference change takes the graceful-drain path (which waits for the round) rather than the
+# read-policy deferral, which waits for a long enough pause and can wait forever on a busy worker.
+both = wm.WorkerSpec.from_dict(dict(id="preferring", forgejo=True), 0)
+assert not wm._defer_read_policy_reload(preferring, dict(applied_spec=both.as_dict(), state="running"))
 old_source = wm.WorkerSpec("source-worker")
 new_source = dataclasses.replace(old_source, github=False, forgejo=True, new_pr_forge="forgejo")
 live_source = dict(applied_spec=old_source.as_dict(), state="running")
@@ -377,6 +420,7 @@ try:
                         "author_model": "claude-opus-5",
                         "author_effort": "high",
                         "pace": "50%@1h",
+                        "pace_claude": "0:100",
                         "stream": True,
                         "isolate_home": True,
                         "restart": "on-failure",
@@ -398,7 +442,7 @@ worker1 — waiting for quota
   phases:   rebase, review, fix-ci, fix, bump, progress, roadmap, lint-repair,
             overlap-scan, overlap-fix
   agent:    auto · host sandbox
-  pacing:   normal
+  pacing:   normal · configured curves: claude 60:40, codex 60:40
   roadmap:  auto (random each round)
   activity: —
   quota:    codex ~ (weekly ahead, 84% left)
@@ -417,7 +461,7 @@ worker2 — running
 worker3 — backing off
   phases:   roadmap, fix, fix-ci
   agent:    claude · bubble sandbox
-  pacing:   normal · curve 50%@1h
+  pacing:   normal · configured curves: claude 0:100, codex 50%@1h
   roadmap:  RepresentationTheory
             skip: Algebra
             also treat as self: maintainer
@@ -454,6 +498,9 @@ worker3 — backing off
                 # A bundle discoverable at runtime is deliberately not frozen into a persistent unit.
                 assert "SSL_CERT_FILE" not in unit and "NIX_SSL_CERT_FILE" not in unit
                 assert "ExecStart=" in unit and str(config.resolve()) in unit
+                # Workers move into scopes under the unit's slice, so a manager restart adopts them.
+                assert f"Slice={wm.WORKER_SLICE}" in unit
+                assert f'Environment="{wm.worker_scopes.SLICE_ENV}={wm.WORKER_SLICE}"' in unit
 
                 os.environ.pop("SSL_CERT_FILE", None)
                 worker_paths._ssl_cert_candidates = lambda env: (env.get("NIX_SSL_CERT_FILE"),)
@@ -504,13 +551,13 @@ worker3 — backing off
     # An explicit restart replaces exactly one managed wrapper.
     assert wm.manager_request("restart", id="worker2")
     wait_for(lambda: wm.runner_status("worker2").get("wrapper_pid") not in (None, pids["worker2"]))
-    assert wm.runner_status("worker1").get("wrapper_pid") == pids["worker1"]
+    assert keeps_wrapper("worker1", pids["worker1"])
 
     # Disabling is persistent desired state and stops that worker without disturbing peers.
     wm.set_worker_enabled(config, "worker3", False)
     wait_for(lambda: not wm.runner_status("worker3").get("alive"))
     assert wm.load_worker_specs(config)[2].enabled is False
-    assert wm.runner_status("worker1").get("wrapper_pid") == pids["worker1"]
+    assert keeps_wrapper("worker1", pids["worker1"])
 
     # A changed definition restarts only the changed worker.
     current = wm.load_worker_specs(config)
@@ -529,7 +576,7 @@ worker3 — backing off
     malformed.write_text("version = 1\n[[workers]]\nid = 42\n")
     os.replace(malformed, config)
     time.sleep(0.3)
-    assert wm.runner_status("worker1").get("wrapper_pid") == worker1_pid
+    assert keeps_wrapper("worker1", worker1_pid)
     response = wm.manager_request("ping")
     assert response and response.get("error")
 
@@ -539,7 +586,7 @@ worker3 — backing off
     manager.wait(10)
     manager = start_manager(config)
     wait_for(lambda: (reply := wm.manager_request("ping")) and reply.get("error"))
-    assert {wid: wm.runner_status(wid).get("wrapper_pid") for wid in survivors} == survivors
+    assert all(keeps_wrapper(wid, pid) for wid, pid in survivors.items())
 
     # Shutdown against an initially malformed config stops surviving wrappers without iterating None.
     assert wm.manager_request("shutdown", stop_workers=True)

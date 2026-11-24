@@ -48,6 +48,21 @@ StandardError=journal
 SyslogIdentifier=tauceti-queue-repair
 LimitNOFILE=65536
 UMask=0077
+# Repairs yield to CI and staging builds on the same host (tauceti-repair.slice). Every thread and
+# child inherits the niceness and IO class from the exec, and the slice's weights cover any process
+# in the unit's cgroup, including bwrap sandboxes and the agent's. Background publications join the
+# slice too (tauceti_queue/repair_publish.py). Neither CPUWeight=idle nor the idle IO class: the
+# claim lease, which renews from a thread of this process and touches the task root, must keep
+# renewing under a full staging build, so the lowest best-effort IO priority instead.
+Slice=tauceti-repair.slice
+# The staging VM has first claim on the host's memory (decision 111): the kernel scores a process by
+# its memory plus adjustment/1000 of the OOM domain's RAM and swap, so at 1000 a repair process outscores
+# a VM at 200 unless that VM holds over 80% of it (139 GiB under tauchonki2's 112 GiB ceiling and
+# 62 GiB swap, more than the ceiling). OOMPolicy=kill then restarts this worker.
+OOMScoreAdjust=1000
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 
 [Install]
 WantedBy=default.target
