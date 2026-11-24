@@ -215,8 +215,15 @@ with agents._review_mathlib_staging(Path(sys.argv[1])) as (source, fd):
                         if time.monotonic() >= deadline:
                             raise AssertionError("downloader lease did not release") from None
                         time.sleep(0.01)
+            # As above: retried, because the prune also defers to any process still referencing it.
+            from tauceti_worker import live_use
+
+            deadline = time.monotonic() + 30
             agents._prune_review_mathlib_staging(base)
-            assert not source.exists()
+            while source.exists() and time.monotonic() < deadline:
+                time.sleep(0.2)
+                agents._prune_review_mathlib_staging(base)
+            assert not source.exists(), live_use.referenced_users(source.parent, live_use.process_references())
         finally:
             if producer.poll() is None:
                 producer.kill()
