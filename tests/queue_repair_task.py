@@ -6304,6 +6304,13 @@ class WorkerAudits(Fixture):
         self.assertIn("not in the clone", checks["policy_error"])
         self.assertIs(checks["drivers_isolated"], False, "no shared read-only packages: drivers built in the worktree")
         self.assertIs(checks["verifier_isolated"], False)
+        # The scripts were materialized in the host-only verifier directory, outside the worktree: the
+        # driver build must bind them, or the sandbox cannot run build-lint-driver.sh.
+        [build] = [c["argv"] for c in self.bwrap_calls() if "build-drivers" in c["argv"]]
+        [scripts] = [a for a in build[build.index("--") + 1 :] if a.endswith("/scripts")]
+        self.assertIn(f"/{repair_audit.VERIFIER_DIR}/check-", scripts)
+        self.assertIn(str(Path(scripts).resolve()), [build[i + 1] for i, a in enumerate(build) if a == "--ro-bind"])
+        self.assertLess(build.index(str(Path(scripts).resolve())), build.index("--remount-ro"))
         attested = json.loads(self.service.results[0]["worker_notes"])["attestation"]
         self.assertIsNone(attested["policy_commit"], "the controller will not count it")
 
