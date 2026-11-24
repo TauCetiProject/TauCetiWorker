@@ -863,6 +863,32 @@ ci="one/project"
         tiers = [(call.args[1].only, call.args[1].landing_tier) for call in execute.call_args_list]
         self.assertEqual(tiers, [(["review"], 1), (["fix"], 2), (["review"], 3)])
 
+    def test_a_contributors_forgejo_first_review_comes_before_forgejo_fixes(self):
+        # Regression: a Forgejo first review of another author's PR was offered only after every
+        # Forgejo fix. The fleet always has a fix left, so contributors' PRs were never reviewed.
+        import contextlib
+
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        observations = self.observations([], [])
+        forgejo = observations[1][2]
+        forgejo.needs_fix.actionable.append(Candidate(1, "a" * 40))
+        forgejo.reviewable.actionable.append(Candidate(2, "b" * 40, native_first_review=True))
+        for _, worker, _ in observations:
+            worker.cfg = self.cfg
+        options = RoundOpts(only=["fix", "review"], agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
+        with (
+            patch.dict(os.environ, {"TAUCETI_PREFER_FORGE": "forgejo"}),
+            patch("tauceti_worker.multi_source.collect", return_value=observations),
+            patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+            patch("tauceti_worker.work_units.run_round", return_value=0) as execute,
+        ):
+            self.assertEqual(run_round(None, options), 0)
+        selected = execute.call_args.args[1]
+        self.assertIs(execute.call_args.args[0], observations[1][1])
+        self.assertEqual((selected.only, selected.landing_tier), (["review"], 1))
+
     def test_a_forge_preference_walks_that_forges_landing_tiers_first(self):
         import contextlib
 
