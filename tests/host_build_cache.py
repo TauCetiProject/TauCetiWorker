@@ -595,6 +595,10 @@ with tempfile.TemporaryDirectory() as tmp:
             assert "nothing to fetch" in done.stderr, done
         # Without the marker (the worker could not fetch for this workspace) the fetch runs.
         assert lake(*fetch, view=view).stdout.strip() == "real-lake " + " ".join(fetch)
+        # Help is help, and a `get` after `--` is not the subcommand.
+        for args in (("cache", "get", "--help"), ("-h", "cache", "get"), ("cache", "--", "get")):
+            shown = lake(*args, view=view, installed=True)
+            assert shown.stdout.strip() == "real-lake " + " ".join(args), (args, shown)
         # Only Lake's own `cache get`: other cache subcommands and builds run as before.
         assert lake("cache", "put", "x", view=view, installed=True).stdout.strip() == "real-lake cache put x"
         assert lake("build", "Foo", view=view, installed=True).stdout.strip() == "real-lake build Foo"
@@ -644,3 +648,18 @@ with tempfile.TemporaryDirectory() as tmp:
         looped = lake("build", path=f"{alias}:{real}", view=False, cwd=wrapper.parent if alias == "scripts" else None)
         assert looped.stdout.strip() == "real-lake build", (alias, looped)
 print("[OK] the agent's lake wrapper refuses Mathlib cache fetches inside a shared view")
+
+# The worker's own fetches (a corrupt-archive refetch runs after the marker is set) never see it,
+# so the wrapper on PATH cannot answer them without fetching.
+with tempfile.TemporaryDirectory() as tmp:
+    out = Path(tmp) / "out"
+    with out.open("wb") as output:
+        rc = agents._cache_fetch(
+            ["sh", "-c", 'echo "marker=${TAUCETI_PR_CACHE_INSTALLED:-unset}"'],
+            Path(tmp),
+            {**os.environ, agents.PR_CACHE_INSTALLED: "1"},
+            output,
+            30,
+        )
+    assert rc == 0 and out.read_text().strip() == "marker=unset", out.read_text()
+print("[OK] the worker's own cache fetches never carry the agent's installed marker")

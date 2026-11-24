@@ -1156,6 +1156,7 @@ def run_agent_host(
         from .build_resources import defaults
 
         defaults(env)
+        env.pop(PR_CACHE_INSTALLED, None)  # nothing was installed for this round's agent
         caches = contextlib.nullcontext(None)
     with caches as prefix:
         if not cache_note:
@@ -1677,6 +1678,7 @@ def host_build_cache_context(cwd: Path, env: dict, logdir: Path, *, cache_wait: 
     from .build_resources import defaults
 
     defaults(env)
+    env.pop(PR_CACHE_INSTALLED, None)  # set again only by this round's own successful fetch
     if not any((cwd / name).is_file() for name in ("lakefile.toml", "lakefile.lean")):
         yield
         return
@@ -1730,7 +1732,6 @@ def _host_build_cache_context(cwd: Path, env: dict, logdir: Path, mathlib_view):
         )
         env["LAKE_CONFIG"] = str(config)
         env.pop("TAUCETI_PR_CACHE_MISS", None)
-        env.pop(PR_CACHE_INSTALLED, None)
         env.setdefault("LAKE_ARTIFACT_CACHE", "1")
         env.setdefault("LAKE_RESTORE_ARTIFACTS", "1")
         from . import expanded_cache, shared_mathlib
@@ -1835,9 +1836,13 @@ def _cache_fetch(command: list[str], cwd: Path, env: dict, output, timeout: floa
 
     The pipe guardian retains the snapshot lease and kills its process group if
     the worker disappears. Ordinary timeout/interruption also tears down the group.
+
+    The worker's own fetches always run: with `scripts` on PATH, the installed marker would make
+    the agent's `lake` wrapper answer them (a corrupt-archive refetch, say) without fetching.
     """
     from .shared_mathlib import lease_fds
 
+    env = {key: value for key, value in env.items() if key != PR_CACHE_INSTALLED}
     reader, writer = os.pipe()
     try:
         proc = subprocess.Popen(

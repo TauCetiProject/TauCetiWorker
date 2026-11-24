@@ -308,7 +308,7 @@ launch = {
 }
 started = time.time()
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "TAUCETI_QUEUE_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "TAUCETI_QUEUE_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS", "TAUCETI_PR_CACHE_INSTALLED")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
 fcntl.flock(call_lock, fcntl.LOCK_UN)
 call_lock.close()
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
@@ -3161,7 +3161,8 @@ class QueueCacheNote(Fixture):
             patch.object(agents, "TAUCETI_CACHE_SERVICE", "tauceti-public"),
             patch.object(agents, "host_build_cache_context", host_preparation),
             patch.object(agents, "relink_build_outputs", host_preparation),
-            patch.dict(os.environ, {"TAUCETI_PR_CACHE_MISS": "1"}),
+            # An inherited marker would make the agent's `lake` skip a fetch nothing performed.
+            patch.dict(os.environ, {"TAUCETI_PR_CACHE_MISS": "1", "TAUCETI_PR_CACHE_INSTALLED": "1"}),
         ):
             outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
@@ -3172,6 +3173,7 @@ class QueueCacheNote(Fixture):
         self.assertNotIn("report the cache miss and stop", call["prompt"])
         self.assertNotIn("(the worker already tried)", call["prompt"])
         self.assertIsNone(call["env"]["TAUCETI_PR_CACHE_MISS"])
+        self.assertIsNone(call["env"]["TAUCETI_PR_CACHE_INSTALLED"])
         self.assertIn(repair.CACHE_SENTENCE, call["prompt"])
         self.assertIn("that miss is expected and is not a reason to stop", call["prompt"])
         # The fleet's own runs keep the appendix.

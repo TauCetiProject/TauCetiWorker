@@ -89,6 +89,12 @@ def pin_matches(workspace):
     return found is not None and found[0] == found[1]
 
 
+def fetch(args, words):
+    """Is this Lake's own `cache get`, as its first two words, both before any `--`?"""
+    end = args.index("--") if "--" in args else len(args)
+    return len(words) >= 2 and words[1] < end and [args[i] for i in words[:2]] == ["cache", "get"]
+
+
 def shared_view():
     return os.environ.get("TAUCETI_SHARED_MATHLIB_VIEW", "") not in ("", "[]")
 
@@ -129,7 +135,11 @@ def main(real, wrapper, args):
             file=sys.stderr,
         )
         return 1
-    if command[:2] == ["cache", "get"] and os.environ.get("TAUCETI_PR_CACHE_INSTALLED") == "1":
+    if (
+        os.environ.get("TAUCETI_PR_CACHE_INSTALLED") == "1"
+        and fetch(args, words)
+        and not ({"--help", "-h"} & set(args[: args.index("--")] if "--" in args else args))
+    ):
         print(
             "lake cache get: the worker already installed TauCeti's published outputs for this checkout"
             " and for current main from this host's shared cache; nothing to fetch. Build directly: a"
