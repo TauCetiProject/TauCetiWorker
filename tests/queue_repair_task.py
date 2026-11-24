@@ -2507,6 +2507,91 @@ class ScopeOnlyRepair(Fixture):
         self.assertFalse(repair_task.scope_only_repair(task))
 
 
+class DriverFailureRepair(Fixture):
+    BROKEN = ()
+
+    def driver_failure(self):
+        self.service.tasks[1]["diagnostics"] = [
+            {
+                "kind": "lint",
+                "module": "",
+                "message": "LINT-ENV: FAIL \u2014 driver failure: the docstring-scan driver did not elaborate cleanly",
+            },
+            {"kind": "infrastructure", "module": "", "reason": "finalizer_failed", "message": "finalizer failed"},
+        ]
+        os.environ["STUB_AGENT_MODE"] = "noop"
+
+    def verification(self, status):
+        return {"ok": True, "diagnostics": [], "build": {"rc": 0}, "checks": {"status": status}}
+
+    def test_unchanged_chain_passing_every_check_is_submitted_for_fresh_ci(self):
+        self.driver_failure()
+        cfg = self.config(agent_attempts=1)
+        with patch.object(repair_audit, "verify", return_value=self.verification("passed")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        self.assertEqual(outcome["tip"], self.content.tip)
+        self.assertEqual(len(self.service.results), 1)
+        self.assertEqual(json.loads(self.service.results[0]["worker_notes"])["edited"], [])
+
+    def test_the_same_chain_is_staged_again_only_once(self):
+        self.driver_failure()
+        cfg = self.config(agent_attempts=1)
+        claim = {"id": 0, "task_id": 1, "token": "t", "worker": "w", "expires_at": time.time() + 60}
+        task = repair_task.Task.from_json(self.service.task_record(1, claim))
+        # The same task may deliver again (a failed push, a later claim of it).
+        repair.git(cfg.clone, "update-ref", repair_task.restaged_ref(task), self.content.tip)
+        self.assertFalse(repair_task.restaged_by_other_task(cfg.clone, task))
+        # A later task on the same chain only exists after CI failed it again.
+        earlier = dataclasses.replace(task, task_id="0")
+        repair.git(cfg.clone, "update-ref", repair_task.restaged_ref(earlier), self.content.tip)
+        self.assertTrue(repair_task.restaged_by_other_task(cfg.clone, task))
+        with patch.object(repair_audit, "verify", return_value=self.verification("passed")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["reason"], "agent_failed", outcome)
+        self.assertIn("needs an operator", outcome["detail"])
+        self.assertEqual(self.service.results, [])
+
+    def test_an_earlier_pass_does_not_outvote_a_later_unavailable_check(self):
+        outcome = {
+            "verification": [
+                {"tip": "t", "ok": True, "checks": {"status": "passed"}},
+                {"tip": "t", "ok": True, "checks": {"status": "unavailable"}},
+            ]
+        }
+        self.assertFalse(repair_task.verified_unchanged("t", outcome))
+        outcome["verification"].reverse()
+        self.assertTrue(repair_task.verified_unchanged("t", outcome))
+
+    def test_unchanged_chain_without_a_complete_local_pass_is_not_submitted(self):
+        self.driver_failure()
+        cfg = self.config(agent_attempts=1)
+        with patch.object(repair_audit, "verify", return_value=self.verification("unavailable")):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["reason"], "agent_failed", outcome)
+        self.assertEqual(self.service.results, [])
+
+    def test_a_finding_that_names_a_module_keeps_the_changed_result_rule(self):
+        self.driver_failure()
+        record = self.service.task_record(1, self.service.preclaim(1, "token", "worker"))
+        task = repair_task.Task.from_json(record)
+        self.assertTrue(repair_task.driver_failure_only(task))
+        for finding in [
+            {"kind": "lint", "module": "TauCeti.A", "message": "driver failure"},
+            {"kind": "lint", "path": "TauCeti/A.lean", "message": "driver failure"},
+            {"kind": "lint", "message": "simpNF: a finding"},
+            {"kind": "compiler", "message": "driver failure"},
+            None,
+            {"kind": "admission_predictions", "was_proactive": True},
+        ]:
+            original = list(task.diagnostics)
+            task.diagnostics.append(finding)
+            self.assertFalse(repair_task.driver_failure_only(task), finding)
+            task.diagnostics[:] = original
+        task.diagnostics[:] = [{"kind": "infrastructure", "message": "driver failure"}]
+        self.assertFalse(repair_task.driver_failure_only(task))
+
+
 class PredictedRepair(Fixture):
     BROKEN = ()
 

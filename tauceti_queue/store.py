@@ -277,6 +277,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     worker_notes TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL
 );
+CREATE INDEX IF NOT EXISTS submissions_task ON submissions (task_id, id);
 CREATE TABLE IF NOT EXISTS batch_tips (
     id INTEGER PRIMARY KEY,
     batch_id INTEGER NOT NULL,
