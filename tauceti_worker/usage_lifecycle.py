@@ -156,6 +156,9 @@ def alive(owner):
         return True  # Unreadable birth evidence is not proof of termination.
 
 
+PERMIT_WAIT_SECONDS = 120
+
+
 def exec_gate(bridge, invocation, command):
     """Runs inside the paid process boundary; exec keeps the registered identity."""
     bridge = Path(bridge)
@@ -167,7 +170,8 @@ def exec_gate(bridge, invocation, command):
         durable(bridge / "inbox" / (invocation + ".no-exec"), dict(id=invocation, native=birth, reason=reason))
         return 75
 
-    deadline = time.monotonic() + 30
+    # A loaded host's supervisor can lag; a late permit costs only time, a missed one a whole session.
+    deadline = time.monotonic() + PERMIT_WAIT_SECONDS
     while not permit.exists():
         if time.monotonic() >= deadline:
             return no_exec("permit-timeout")

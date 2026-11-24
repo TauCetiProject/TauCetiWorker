@@ -259,6 +259,55 @@ class SupervisorTests(unittest.TestCase):
         tick(self.budget)
         self.assertFalse((self.bridge / "outbox" / (self.id + ".permit")).exists())
 
+    def admitted_invocation(self):
+        """A second admitted invocation with its own bridge, shim and usage journal."""
+        bridge = self.root / "bridges" / uuid.uuid4().hex
+        (bridge / "inbox").mkdir(parents=True)
+        (bridge / "outbox").mkdir()
+        invocation = uuid.uuid4().hex
+        lifecycle = registration(
+            invocation,
+            uuid.uuid4().hex,
+            bridge,
+            identity(self.sleeper().pid),
+            enabled=True,
+            owner=self.owner,
+            parent=identity(),
+        )
+        self.budget.admit(
+            invocation, "fixture-2", MODEL, "fix", bridge=str(bridge), owner=self.owner, lifecycle=lifecycle
+        )
+        register(self.root, lifecycle)
+        UsageJournal(self.root / "usage" / bridge.name, invocation, model=MODEL)
+        return bridge, invocation
+
+    def test_waiting_gate_is_permitted_before_recovery_work(self):
+        permit = self.bridge / "outbox" / (self.id + ".permit")
+        native = self.sleeper()
+        durable(self.bridge / "inbox" / (self.id + ".launch"), dict(id=self.id, native=identity(native.pid)))
+        seen = []
+        with patch("tauceti_worker.usage_supervisor.recover_invocation", lambda *a, **k: seen.append(permit.exists())):
+            tick(self.budget)
+        self.assertEqual(seen, [True])
+
+    def test_gate_that_starts_waiting_during_slow_recovery_is_served_before_the_next_item(self):
+        bridge, invocation = self.admitted_invocation()
+        permit = bridge / "outbox" / (invocation + ".permit")
+        native = self.sleeper()
+        seen = []
+
+        def slow_recovery(*args, **kwargs):
+            if not seen:
+                durable(bridge / "inbox" / (invocation + ".launch"), dict(id=invocation, native=identity(native.pid)))
+            seen.append(permit.exists())
+
+        with (
+            patch("tauceti_worker.usage_supervisor.LAUNCH_PASS_SECONDS", 0),
+            patch("tauceti_worker.usage_supervisor.recover_invocation", slow_recovery),
+        ):
+            tick(self.budget)
+        self.assertEqual(seen, [False, True])
+
     def test_missing_journal_never_gets_launch_permit(self):
         self.journal.path.unlink()
         self.journal.log.unlink()

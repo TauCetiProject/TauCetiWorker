@@ -22,6 +22,9 @@ from .claude_api import safe_message
 from .usage_accounting import session_usage, usage_path
 from .usage_lifecycle import alive, durable, identity, resolve
 
+# How often a supervisor pass interrupts recovery work to serve newly waiting exec gates.
+LAUNCH_PASS_SECONDS = 1.0
+
 
 def lifecycle_path(directory, invocation):
     return Path(directory) / "lifecycles" / (invocation + ".json")
@@ -320,9 +323,17 @@ def tick(budget, cache=None, stop=None):
     errors = cache.setdefault("errors", {})
     paths = list((budget.directory / "lifecycles").glob("*.json"))
     paths.sort(key=lambda path: cache["sessions"].get(path.stem, {}).get("status") != "active")
+    # Recovering stopped invocations appends to the ledger and fsyncs, which can take seconds per
+    # item on a loaded host. Waiting exec gates give up, so serve them first and between items.
+    granted = set()
+    grant_launches(budget, granted)
+    last_grant = time.monotonic()
     for path in paths:
         if stop is not None and stop.is_set():
             return
+        if time.monotonic() - last_grant >= LAUNCH_PASS_SECONDS:
+            grant_launches(budget, granted)
+            last_grant = time.monotonic()
         if budget.clock() < cache.get("stopped_next_poll", {}).get(path.stem, 0):
             continue
         try:
@@ -448,11 +459,89 @@ def delivery_finished(directory, value):
         return False
 
 
+def grant_launch(budget, path, value, event):
+    """Authorize a waiting exec gate; True when the gate identity changed in memory.
+
+    Gates give up after a deadline, so tick() runs this ahead of slower recovery work too."""
+    invocation = value["id"]
+    inbox, outbox = Path(value["bridge"]) / "inbox", Path(value["bridge"]) / "outbox"
+    changed = False
+    launch = inbox / (invocation + ".launch")
+    if value["phase"] == "admitted" and launch.exists():
+        message = safe_message(launch)
+        if message.get("id") != invocation:
+            raise ValueError("native launch invocation mismatch")
+        if value.get("gate") != message.get("native"):
+            value["gate"] = message["native"]
+            changed = True
+    permit = outbox / (invocation + ".permit")
+    # A permit is a second durable copy of the native identity. Rebuilding an
+    # admission sidecar must never erase evidence that inference was authorized.
+    if value["phase"] == "admitted" and permit.exists():
+        permission = safe_message(permit)
+        if permission.get("id") != invocation:
+            raise ValueError("native permit invocation mismatch")
+        value.update(phase="permitted", native=permission.get("native", {"unsupported": True}), gate=permission["gate"])
+        event("launch-permitted")
+    if (
+        value["phase"] == "admitted"
+        and launch.exists()
+        and alive(value["shim"])
+        and session_usage(budget.directory, value)
+    ):
+        message = safe_message(launch)
+        if message.get("id") != invocation:
+            raise ValueError("native launch invocation mismatch")
+        native = dict(remote=message["native"]) if value.get("external") else resolve(message.get("native"))
+        if native is not None and alive(native):
+            value.update(phase="permitted", native=native, gate=message["native"])
+            event("launch-permitted")
+            durable(path, value)  # Identity must survive before the gate can exec.
+    if value["phase"] == "permitted" and alive(value["shim"]) and alive(value["native"]):
+        permit = outbox / (invocation + ".permit")
+        if not permit.exists():
+            durable(permit, dict(id=invocation, gate=value["gate"], native=value["native"]))
+    return changed
+
+
+def grant_launches(budget, handled):
+    """Serve every admitted host gate that is waiting for its permit; errors are left to recovery.
+
+    External (VM) invocations keep their liveness bookkeeping in recover_invocation's ordered pass."""
+    try:
+        recovery_mode(budget.directory)
+    except ValueError:
+        return  # An invalid policy never permits inference; recover_invocation reports it.
+    for path in (budget.directory / "lifecycles").glob("*.json"):
+        if path.stem in handled:
+            continue
+        try:
+            value = read_lifecycle(budget.directory, path.stem)
+            if not value or value["phase"] != "admitted" or value.get("external"):
+                continue
+            if not (Path(value["bridge"]) / "inbox" / (value["id"] + ".launch")).exists():
+                continue
+            changed = False
+
+            def event(kind, value=value, **fields):
+                nonlocal changed
+                if not any(e["kind"] == kind for e in value["events"]):
+                    value["events"].append(dict(kind=kind, at=time.time(), **fields))
+                    changed = True
+
+            if grant_launch(budget, path, value, event) or changed:
+                durable(path, value)
+            if value["phase"] == "permitted":
+                handled.add(path.stem)
+        except Exception:
+            continue  # recover_invocation reports the same lifecycle's error on its own pass
+
+
 def recover_invocation(budget, path, *, cache=None, session=None):
     mode = recovery_mode(budget.directory)
     value = read_lifecycle(budget.directory, path.stem)
     bridge, invocation = Path(value["bridge"]), value["id"]
-    inbox, outbox = bridge / "inbox", bridge / "outbox"
+    inbox = bridge / "inbox"
     stamp = evidence_stamp(budget.directory, value)
     sealed_estimate = (
         mode == "auto"
@@ -498,41 +587,9 @@ def recover_invocation(budget, path, *, cache=None, session=None):
             value["events"].append(dict(kind=kind, at=time.time(), **fields))
             changed = True
 
+    if grant_launch(budget, path, value, event):
+        changed = True
     launch = inbox / (invocation + ".launch")
-    if value["phase"] == "admitted" and launch.exists():
-        message = safe_message(launch)
-        if message.get("id") != invocation:
-            raise ValueError("native launch invocation mismatch")
-        if value.get("gate") != message.get("native"):
-            value["gate"] = message["native"]
-            changed = True
-    permit = outbox / (invocation + ".permit")
-    # A permit is a second durable copy of the native identity. Rebuilding an
-    # admission sidecar must never erase evidence that inference was authorized.
-    if value["phase"] == "admitted" and permit.exists():
-        permission = safe_message(permit)
-        if permission.get("id") != invocation:
-            raise ValueError("native permit invocation mismatch")
-        value.update(phase="permitted", native=permission.get("native", {"unsupported": True}), gate=permission["gate"])
-        event("launch-permitted")
-    if (
-        value["phase"] == "admitted"
-        and launch.exists()
-        and alive(value["shim"])
-        and session_usage(budget.directory, value)
-    ):
-        message = safe_message(launch)
-        if message.get("id") != invocation:
-            raise ValueError("native launch invocation mismatch")
-        native = dict(remote=message["native"]) if value.get("external") else resolve(message.get("native"))
-        if native is not None and alive(native):
-            value.update(phase="permitted", native=native, gate=message["native"])
-            event("launch-permitted")
-            durable(path, value)  # Identity must survive before the gate can exec.
-    if value["phase"] == "permitted" and alive(value["shim"]) and alive(value["native"]):
-        permit = outbox / (invocation + ".permit")
-        if not permit.exists():
-            durable(permit, dict(id=invocation, gate=value["gate"], native=value["native"]))
     round_end = budget.directory / "round-exits" / round_key(value.get("owner"))
     if value.get("owner") and round_end.exists():
         ending = safe_message(round_end)
