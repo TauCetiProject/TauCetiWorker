@@ -170,7 +170,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # for its CI verdict, so the next head seals from the result without a replay (`_pre_rebase`).
     # A `pre_rebase` task resolves textual conflicts only: the worker runs no verification build and
     # no repair rounds on it (decision 153, S1), so a later batch never acts on the head's own
-    # failures. Verification and repair happen once the batch is the head, on `main`. While this is
+    # failures. Verification and repair on the head's tip are `prepare_pre_rebased`'s, only once that
+    # tip is known-good; otherwise they happen once the batch is the head, on `main`. While this is
     # on, the next batch is never rebased onto `main` unless the head has failed CI (`_successor_rebase_held`).
     "pre_rebase_enabled": True,
     # A claimed `rebase_conflict` task onto `main` of the next batch younger than this is superseded
@@ -178,9 +179,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # is. An older claim runs to the end. 0: only an unclaimed one is taken over.
     "pre_rebase_takeover_seconds": 1200,
     # Build, repair and publish an open batch's usable pre-rebase on the head's tip (a `prepare` task
-    # of the pre-rebased chain, `_prepare_pre_rebased`). Off since decision 153 (S1): verifying and
-    # repairing a later batch on the head's tip makes it act on the head's own failures (task 1416).
-    "prepare_pre_rebased": False,
+    # of the pre-rebased chain, `_prepare_pre_rebased`), only while that tip has passed its own
+    # verification (`_head_tip_verified`), so a later batch never acts on the head's own failures
+    # (task 1416). Work done on a tip that then fails CI or moves is discarded, not carried
+    # (`_discard_unverified_pre_rebase`). Decision 174 restored it after S1 (decision 153) turned it off.
+    "prepare_pre_rebased": True,
     # Labels by which an author opts a PR out of agent repair (case-insensitive): such a member is never
     # edited; when it would need an edit the agent empties it and the queue withdraws it as
     # `problem-anticipated` (`_anticipate`).
@@ -2098,7 +2101,8 @@ class Controller:
         task kind's: an evicted batch's retained repair is background work, ahead of the other kinds
         by priority. Selection and insertion of the claim share the controller lock; concurrent
         requests cannot select the same batch. When the background slots are full, the next head's
-        unclaimed `pre_rebase` takes the slot of the newest own-base preparation of a later batch.
+        unclaimed `pre_rebase`, or its unclaimed preparation of the pre-rebased chain, takes the slot of
+        the newest own-base preparation of a later batch.
         """
         active = self._active_task_claims()
         held_batches = {claim["batch_id"] for claim in active}
@@ -2114,15 +2118,20 @@ class Controller:
                 if batch["id"] != head_id:
                     return task, batch
             return None
-        # Pre-rebase first: the next head's pre-rebase is on the way to staging, a later batch's
-        # own-base preparation is not. When the background slots are full, the newest such
+        # Pre-rebase first: the next head's pre-rebase (or the preparation of its pre-rebased chain) is
+        # on the way to staging, a later batch's own-base preparation is not. When the background slots are full, the newest such
         # preparation gives its slot to the pre-rebase: the claims do not grow, so the capacity kept
         # for head work stays available.
         successor = self._open_batch()
         if successor is None:
             return None
         pre_rebase = next(
-            (pair for pair in unheld if pair[1]["id"] == successor["id"] and pair[0]["kind"] == TASK_PRE_REBASE),
+            (
+                pair
+                for pair in unheld
+                if pair[1]["id"] == successor["id"]
+                and (pair[0]["kind"] == TASK_PRE_REBASE or self._pre_rebased_prepare(pair[0]))
+            ),
             None,
         )
         if pre_rebase is None:
@@ -2192,7 +2201,11 @@ class Controller:
             found.append((task, batch))
         found.sort(
             key=lambda pair: (
-                TASK_PRIORITY.get(pair[0]["kind"], 0),
+                # The next head's pre-rebased preparation ranks with its pre-rebase: both are on the way
+                # to staging, ahead of every later batch's own-base preparation (decision 174).
+                TASK_PRIORITY[TASK_PRE_REBASE]
+                if self._pre_rebased_prepare(pair[0])
+                else TASK_PRIORITY.get(pair[0]["kind"], 0),
                 not pair[1]["sealed"],
                 pair[0]["created_at"],
                 pair[0]["id"],
@@ -2710,6 +2723,7 @@ class Controller:
                 version=version,
                 base=task["onto"],
                 tip=tip_sha,
+                verified_tip=tip_sha if self._locally_verified(worker_notes, tip_sha) else None,
                 **prepared,
             )
             self._record_tip(batch["id"], version, tip_sha, now)
@@ -3812,6 +3826,7 @@ class Controller:
             self._emergency,
             self._seal,
             self._reconcile_head,
+            self._discard_unverified_pre_rebase,
             self._pre_rebase,
             self._prepare_open_batches,
             self._prepare_pre_rebased,
@@ -6891,6 +6906,97 @@ class Controller:
         head = self._head()
         return head["tip"] if head is not None else self._canonical
 
+    @staticmethod
+    def _locally_verified(worker_notes: str, tip: str) -> bool:
+        """The submission's `local_verification` note says the worker's own latest verification of
+        exactly `tip` (whole-library build, audits and lints) passed."""
+        try:
+            notes = loads(worker_notes, {})
+        except ValueError:
+            return False
+        note = notes.get("local_verification") if isinstance(notes, dict) else None
+        return isinstance(note, dict) and note.get("tip") == tip and note.get("checks_passed") is True
+
+    def _head_tip_verified(self, head: dict[str, Any] | None) -> bool:
+        """The head's current tip has passed its own local verification, so a later batch may be
+        verified and repaired on it (decision 174): a worker verified exactly that tip clean
+        (`verified_tip`: the head's own task, or the preparation it sealed from unchanged), and CI has
+        not failed it on the source since. A tip no worker verified is not known-good. A CI pass alone
+        does not qualify: the head lands within minutes, and a preparation started then would only
+        hold up the seal. "Since" is durable (`_tip_failed`): a tip staged again unchanged after a
+        source failure, at a later version, stays not known-good."""
+        if head is None or not head["verified_tip"] or head["verified_tip"] != head["tip"]:
+            return False
+        return not self._tip_failed(head["tip"])
+
+    def _tip_failed(self, tip: str | None) -> bool:
+        """CI ever failed `tip` on the source, at any version of any batch."""
+        return (
+            bool(tip)
+            and self.store.row("ci_attempts", {"head_sha": tip, "outcome": OUTCOME_SOURCE_FAILURE}) is not None
+        )
+
+    def _pre_rebase_target_verified(self) -> bool:
+        """`_head_tip_verified` for `_pre_rebase_target`: `main` once no head is left (it landed)."""
+        head = self._head()
+        return head is None or self._head_tip_verified(head)
+
+    def _pre_rebase_verification_work(self, batch: dict[str, Any]) -> bool:
+        """The batch's stored pre-rebase carries edits a preparation of the pre-rebased chain made
+        (`_adopt_prepared_pre_rebase`), not only a `pre_rebase` task's conflict resolutions."""
+        task_ids = {
+            edit.get("task_id")
+            for edit in loads(batch["pre_rebase_edits"], {}).values()
+            if isinstance(edit, dict) and edit.get("task_id")
+        }
+        return any((self.store.row("tasks", {"id": task_id}) or {}).get("kind") == TASK_PREPARE for task_id in task_ids)
+
+    def _discard_unverified_pre_rebase(self, now: float) -> None:
+        """Discard the verification and repair work an open batch's pre-rebase carries from a head tip
+        that is no longer known-good: CI failed that tip on the source (`_tip_failed`, durable, so it
+        holds for an evicted head and across a restaging of the same tip), or a repair round or rebase
+        moved the current head past it, or the current head's tip never passed its own verification
+        (decision 174). A pre-rebase with a preparation's edits is cleared, so the edits are never
+        carried to the next tip and a later batch never keeps changes made against the head's own
+        failures; `_pre_rebase` replays the batch afresh once the head allows it. One prepared clean
+        (no edits) keeps its chain and loses only its prepared and verified marks. A conflicts-only
+        pre-rebase is kept and carried as before."""
+        head = self._head()
+        for batch in self._open_batches():
+            onto = batch["pre_rebase_onto"]
+            if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not onto:
+                continue
+            edited = self._pre_rebase_verification_work(batch)
+            if not edited and not batch["pre_rebase_prepared"] and not batch["pre_rebase_verified"]:
+                continue
+            if self._tip_failed(onto):
+                reason = "head-failed"
+            elif head is None or self.store.row("batch_tips", {"batch_id": head["id"], "tip": onto}) is None:
+                continue  # landed, or another batch's tip (an emergency or lane head went ahead): kept
+            elif onto != head["tip"]:
+                reason = "head-moved"
+            elif not self._head_tip_verified(head):
+                reason = "head-unverified"
+            else:
+                continue
+            with self.store.transaction():
+                if edited:
+                    self._set_pre_rebase(batch, "", now)
+                else:
+                    self.store.update(
+                        "batches", {"id": batch["id"]}, pre_rebase_prepared=None, pre_rebase_verified=None
+                    )
+                self._count("pre_rebase_verification_discarded")
+                self.store.journal(
+                    now,
+                    "pre-rebase-discarded",
+                    batch["id"],
+                    reason=reason,
+                    onto=onto,
+                    head_tip=head["tip"] if head is not None else None,
+                    chain_kept=not edited,
+                )
+
     def _open_pre_rebase_task(self, batch: dict[str, Any]) -> dict[str, Any] | None:
         return self.store.row(
             "tasks", {"batch_id": batch["id"], "state": TASK_OPEN, "kind": TASK_PRE_REBASE}, order="id DESC"
@@ -6917,14 +7023,18 @@ class Controller:
         source: str | None = None,
         edits: dict[str, Any] | None = None,
         prepared: bool = False,
+        verified: bool = False,
     ) -> None:
         """Record (or with an empty `state`, clear) a batch's pre-rebase, keeping its chain under
         `pre_rebase_ref` in the clone and dropping the previous one. `pre_rebase_prepared` names the
         tip when `prepared` (a preparation of the chain was adopted) and is kept while the tip is the
-        one prepared; any other tip is unprepared."""
+        one prepared; any other tip is unprepared. `pre_rebase_verified` likewise names the tip when
+        `verified` (the worker's own verification of exactly that tip passed every check)."""
         current = self.store.row("batches", {"id": batch["id"]}) or batch
         kept = current.get("pre_rebase_prepared")
         prepared_tip = tip if prepared or (tip and kept == tip) else None
+        kept_verified = current.get("pre_rebase_verified")
+        verified_tip = tip if verified or (tip and kept_verified == tip) else None
         previous = (
             self.pre_rebase_ref(batch["id"], current["pre_rebase_onto"])
             if current.get("pre_rebase_tip") and current.get("pre_rebase_onto")
@@ -6945,6 +7055,7 @@ class Controller:
             pre_rebase_edits=dumps(edits or {}),
             pre_rebase_at=now if state else None,
             pre_rebase_prepared=prepared_tip if state else None,
+            pre_rebase_verified=verified_tip if state else None,
         )
 
     def _supersede_pre_rebase_tasks(self, batch_id: int, resolution: str, now: float) -> int:
@@ -7207,7 +7318,8 @@ class Controller:
 
     def _pre_rebased_prepare_current(self, task: dict[str, Any], batch: dict[str, Any]) -> bool:
         """A `prepare` task of the pre-rebased chain still describes its batch: open, the batch open
-        with a usable pre-rebase on the task's `onto`, which is still the head's tip, and the task's
+        with a usable pre-rebase on the task's `onto`, which is still the head's tip and still
+        known-good (`_head_tip_verified`: a head that fails CI takes the task back), and the task's
         chain a prefix of that pre-rebase (insertion extends it by replay, which keeps the prefix)."""
         return (
             task["state"] == TASK_OPEN
@@ -7215,7 +7327,11 @@ class Controller:
             and batch["pre_rebase_state"] in PRE_REBASE_USABLE
             and bool(batch["pre_rebase_tip"])
             and batch["pre_rebase_onto"] == task["onto"]
-            and task["onto"] in (self._pre_rebase_target(), self._preserved_onto(task))
+            and not self._tip_failed(task["onto"])
+            and (
+                task["onto"] == self._preserved_onto(task)
+                or (task["onto"] == self._pre_rebase_target() and self._pre_rebase_target_verified())
+            )
             and chain.is_ancestor(self.clone, task["tip"], batch["pre_rebase_tip"])
         )
 
@@ -7230,7 +7346,8 @@ class Controller:
             if batch is None or batch["state"] != BATCH_OPEN or self._pre_rebased_prepare_current(task, batch):
                 continue
             moved = task["onto"] != self._pre_rebase_target()
-            resolution = "head-moved" if moved else "pre-rebase-changed"
+            unverified = self._tip_failed(task["onto"]) or (not moved and not self._pre_rebase_target_verified())
+            resolution = "head-unverified" if unverified else "head-moved" if moved else "pre-rebase-changed"
             with self.store.transaction():
                 self.store.update(
                     "tasks", {"id": task["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=resolution
@@ -7260,9 +7377,13 @@ class Controller:
             return "below prepare_min_members"
         if batch["pre_rebase_state"] not in PRE_REBASE_USABLE or not batch["pre_rebase_tip"]:
             return "no usable pre-rebase"
-        blocked = self._pre_rebase_blocked(self._head())
+        head = self._head()
+        blocked = self._pre_rebase_blocked(head)
         if blocked is not None:
             return blocked
+        if not self._head_tip_verified(head):
+            assert head is not None
+            return f"head {head['id']}'s tip {head['tip'][:12]} has not passed its own verification"
         if batch["pre_rebase_onto"] != self._pre_rebase_target() or batch["pre_rebase_source"] != batch["tip"]:
             return "the pre-rebase is not up to date"
         if batch["pre_rebase_prepared"] == batch["pre_rebase_tip"]:
@@ -7325,7 +7446,11 @@ class Controller:
                 and batch["pre_rebase_tip"] == task["tip"]
                 and self._pre_rebased_prepare_current(task, batch)
             ):
-                self.store.update("batches", {"id": batch["id"]}, pre_rebase_prepared=task["tip"])
+                # Built with no error and no audit or lint finding: the worker's verification passed on
+                # exactly this tip, which `_seal_from_pre_rebase` carries to the head it seals.
+                self.store.update(
+                    "batches", {"id": batch["id"]}, pre_rebase_prepared=task["tip"], pre_rebase_verified=task["tip"]
+                )
             self._count("pre_rebased_prepares_clean")
             self.store.journal(
                 now, "prepared", task["batch_id"], task_id=task["id"], tip=task["tip"], clean=True, pre_rebased=True
@@ -7375,6 +7500,7 @@ class Controller:
                 source=task["pre_rebase_source"],
                 edits=edits,
                 prepared=True,
+                verified=self._locally_verified(worker_notes, tip_sha),
             )
             self.store.update(
                 "tasks",
@@ -7496,6 +7622,8 @@ class Controller:
         if not tip or not source or not chain.is_ancestor(self.clone, source, head["tip"]):
             self._pre_rebase_unused(head, canonical, "source-not-in-chain", now)
             return False
+        # The head seals as exactly the tip its preparation verified only when nothing is replayed.
+        verified = bool(tip) and head["pre_rebase_verified"] == tip and onto == canonical and source == head["tip"]
         if onto != canonical:
             # A batch landed after the pre-rebase was made (a lane or emergency head went ahead of
             # this one while its pre-rebase work was claimed), or the head landed at a later tip than
@@ -7572,7 +7700,13 @@ class Controller:
                 ):
                     self._anticipate(head, dict(member, **values), edit.get("explanation", ""), now)
             self.store.update(
-                "batches", {"id": head["id"]}, version=version, base=canonical, tip=tip, expected_parent=None
+                "batches",
+                {"id": head["id"]},
+                version=version,
+                base=canonical,
+                tip=tip,
+                expected_parent=None,
+                verified_tip=tip if verified else None,
             )
             self._record_tip(head["id"], version, tip, now)
             self._set_pre_rebase(head, "", now)
@@ -7592,6 +7726,7 @@ class Controller:
                 tip=tip,
                 landed_on_base=landed_on_base,
                 pre_rebased=True,
+                verified=verified,
             )
         return True
 
@@ -11496,6 +11631,8 @@ class Controller:
         info["expected_parent"] = head["expected_parent"]
         info["first_dispatch_at"] = head["first_dispatch_at"]
         info["based_on_canonical"] = head["base"] == self._canonical
+        # Decision 174: the next batch is verified and repaired on the head's tip only while this holds.
+        info["tip_verified"] = self._head_tip_verified(head)
         task = self._open_task(head)
         info["task"] = None if task is None else self._task_status(task)
         attempt = self._current_attempt(head)
