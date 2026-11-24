@@ -26,21 +26,11 @@ uv run python scripts/tauceti_queue_github_app.py url
 Open the printed URL as an organization owner, set a webhook secret in the form (GitHub does not
 accept one through the URL), and create the App. The URL requests exactly these repository
 permissions: contents write, pull requests write, issues write, checks read, statuses write,
-actions write, workflows write, metadata read, and the organization permission members read; and subscribes to these events: pull request,
+actions write, workflows write and metadata read; and subscribes to these events: pull request,
 pull request review, issue comment, status, check run, check suite, push, workflow run. Pass
 `--webhook-url https://<host>/webhook/github` once the service host exists. Without it GitHub creates
 the App with no webhook and discards the event subscription, so both are added on the App's settings
 page later (Public endpoint, step 7); the API can edit an App webhook but not create one.
-
-Admission checks the `self-tested` route's team membership
-(`orgs/TauCetiProject/teams/self-tested/memberships/<login>`) with the App's own installation token,
-which needs **Organization permissions > Members: Read-only**. The App registered on 2026-11-04 lacks
-it: add it under
-[Permissions & events](https://github.com/organizations/TauCetiProject/settings/apps/tauceti-queue/permissions),
-then an organization owner accepts the changed permissions on the installation. Until then a
-self-tested PR's evaluation is deferred (15 minutes at a time) with that reason; it is neither
-admitted nor withdrawn, and no personal token is used instead. `SELF_TESTED_TEAM_TOKEN` in the
-service environment names an explicit token for this read instead of the App.
 
 For the deployed **primary intake**, narrow the App subscriptions in
 [Permissions & events](https://github.com/organizations/TauCetiProject/settings/apps/tauceti-queue/permissions):
@@ -1086,7 +1076,7 @@ admission_evidence_mode shadow`.
 `events` (slice 5) keeps the shadow and changes two things. Each evaluation reads the PR, its
 labels, every comment and the head's statuses with one GraphQL call
 (`GitHubAdapter.admission_snapshot_single`), takes the merge base and paths from the clone, and
-runs the same policy; self-tested membership and bump-guard reads stay live and are fenced again
+runs the same policy; self-tested bump-guard reads stay live and are fenced again
 afterwards. A PR whose read one response cannot complete (over 100 comments or labels), whose
 head commit does not match, or whose merge base the clone cannot vouch for takes the full read as
 before; `status.admission.snapshot_sources` counts both paths. And a commit status delivery
