@@ -61,6 +61,9 @@ API_VERSION = "2022-11-28"
 DEFAULT_BACKGROUND_FLOOR = 1000
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
+# The queue's idle-capacity test of an accepted head on current main (decision 175 B).
+MAIN_INTEGRATION_EVENT = "tauceti-main-integration"
+MAIN_INTEGRATION_CONTEXT = "main-integration"
 STAGING_WORKFLOW = "pr-build.yml"
 BUILD_JOB = "sandboxed-build"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -963,6 +966,62 @@ class GitHubAdapter:
                 ) from error
             raise
         return dispatch_title(base_ref, _batch_id(batch_id), head_sha, base_sha)
+
+    def dispatch_main_integration(self, repo: str, *, pr: int, head_sha: str, main_sha: str) -> None:
+        """`repository_dispatch` of TauCeti's main-integration.yml: build `head_sha` merged onto
+        exactly `main_sha` on idle Fleet PR capacity, reported as the `main-integration` status on
+        the head (TauCetiTools docs/main-integration.md). One call; never retried here."""
+        for sha in (head_sha, main_sha):
+            if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+                raise ValueError("main-integration needs two commit SHAs")
+        payload = {
+            "event_type": MAIN_INTEGRATION_EVENT,
+            "client_payload": {"pr": int(pr), "head_sha": head_sha, "main_sha": main_sha},
+        }
+        try:
+            self.client.request("POST", f"repos/{repo}/dispatches", json_body=payload, ok=(204,), single_attempt=True)
+        except GitHubError as error:
+            if isinstance(error, RequestDeferred) or error.status in {400, 401, 403, 404, 405, 410, 415, 422, 429}:
+                raise ports.DispatchNotAccepted(
+                    str(error),
+                    retry_at=getattr(error, "retry_at", None),
+                    retryable=isinstance(error, RequestDeferred),
+                ) from error
+            raise
+
+    def main_integration_statuses(self, repo: str, heads: Sequence[str]) -> dict[str, ports.Status | None]:
+        """The latest `main-integration` status of each head, by GraphQL, 50 heads a query.
+
+        A head the repository does not have, or without the context, maps to None."""
+        owner, name = repo.split("/", 1)
+        result: dict[str, ports.Status | None] = {}
+        unique = [head for head in dict.fromkeys(heads) if re.fullmatch(r"[0-9a-f]{40}", head or "")]
+        for start in range(0, len(unique), 50):
+            chunk = unique[start : start + 50]
+            fields = " ".join(
+                f'h{index}: object(oid: "{head}") {{ ... on Commit {{ status {{ '
+                f'context(name: "{MAIN_INTEGRATION_CONTEXT}") {{ state description targetUrl createdAt }} }} }} }}'
+                for index, head in enumerate(chunk)
+            )
+            data = self.client.graphql(
+                f"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}",
+                {"owner": owner, "name": name},
+            )
+            repository = (data or {}).get("repository") or {}
+            for index, head in enumerate(chunk):
+                node = repository.get(f"h{index}") or {}
+                context = ((node.get("status") or {}).get("context")) if isinstance(node, dict) else None
+                if not isinstance(context, dict):
+                    result[head] = None
+                    continue
+                result[head] = ports.Status(
+                    state=str(context.get("state") or "").lower(),
+                    description=str(context.get("description") or ""),
+                    target_url=str(context.get("targetUrl") or ""),
+                    updated_at=_timestamp(context.get("createdAt")),
+                    run_id=run_id_from_url(context.get("targetUrl")),
+                )
+        return result
 
     def find_candidate_run(
         self,

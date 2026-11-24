@@ -91,6 +91,7 @@ RUN_STDLIB=(
   queue_repair_cleanup.py
   queue_install_releases.py
   queue_repair_cache.py
+  queue_repair_outputs.py
   queue_claude_stdin.py
   expanded_cache.py
   canonical_store.py
@@ -192,6 +193,7 @@ RUN_STDLIB=(
   queue_chain.py
   queue_commands.py
   queue_github_adapter.py
+  queue_main_integration.py
   queue_feeds.py
   queue_landing_receipts.py
   queue_server.py
@@ -256,6 +258,7 @@ RUN_STDLIB=(
   review_provider_down.py
   review_outcomes.py
   review_runtime.py
+  review_app.py
   review_unchanged_memo.py
   synchronous_state_repair.py
   source_mergeability.py

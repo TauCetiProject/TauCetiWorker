@@ -17,6 +17,15 @@ dependencies = [
     "anthropic>=2.12,<3",
 ]
 
+# The TauCetiTools commit Worker CI tests against. CI runs `.github/scripts/tools-pin.sh apply`,
+# which points the dependency above at it, so a TauCetiTools merge cannot change Worker CI's
+# verdict; `.github/scripts/tools-pin.sh bump` opens the pull request that moves it to Tools main.
+# Production installs (services/queue/install*.sh, TauCetiFleet's worker runtimes and the Docker
+# image) deliberately keep following TauCetiTools main: the shared CI harness and TauCeti's
+# workflows run Tools main, and the queue's admission and result checks must agree with them.
+[tool.tauceti-ci]
+tools-rev = "e4648aa6e6325cfd08a1dbc191d0a610f4124a69"
+
 [project.scripts]
 tauceti = "tauceti_worker.cli:cli_main"
 tauceti-workflow-backstop = "tauceti_worker.workflow_backstop:main"

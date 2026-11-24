@@ -166,6 +166,9 @@ def run_round(w, opts, *, use_fleet_focus=True):
     from .work_units import NoEligibleWork, want
     from .work_units import run_round as ordinary_round
 
+    if use_fleet_focus and isinstance(getattr(opts, "unavailable_sources", None), list):
+        # One outage cutoff across every source and landing tier; the unfocused fallback keeps it.
+        opts.unavailable_sources.clear()
     observations = collect(w, opts, use_fleet_focus=use_fleet_focus)
     deduplicate(observations)
     for name, _, result in observations:

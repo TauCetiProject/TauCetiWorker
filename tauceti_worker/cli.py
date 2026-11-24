@@ -1400,9 +1400,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             raise Die(problem)
         require_admin()  # Before quota/model selection, including on the loop-driver path.
     if one_round and not getattr(args, "dry_run", False):
+        from . import review_app
         from .github_outbox import drain
 
         pending = drain()
+        # The review App's retained writes live in its own outbox and replay under its own token.
+        pending += review_app.drain()
         if pending:
             log(f"GitHub publications awaiting retry or reconciliation: {len(pending)}; retaining completed work")
             reason = f"{len(pending)} retained GitHub publications awaiting retry or reconciliation"

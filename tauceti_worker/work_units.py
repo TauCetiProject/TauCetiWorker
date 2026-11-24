@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from pathlib import Path
 
 from tauceti_tools.forge import ForgeError
@@ -53,6 +54,7 @@ from .config import (
     Die,
     GitHubUnavailable,
     NoProgress,
+    ReviewSourceUnavailable,
     SharedStateUnavailable,
     environment,
     extra_roadmap_prompt,
@@ -264,6 +266,9 @@ class RoundOpts:
     # Offer only this landing tier's work (survey.LANDING_TIERS); multi_source walks tiers across
     # sources. None offers every tier in order.
     landing_tier: int | None = None
+    # Review sources found unavailable this round, shared by the per-tier copies multi_source makes
+    # (dataclasses.replace keeps this list), so the outage cutoff spans the whole round.
+    unavailable_sources: list = dataclass_field(default_factory=list)
 
     @property
     def agent_name(self) -> str:
@@ -821,6 +826,13 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
     # still runs.
     declined: list[tuple[str, int]] = []
     claim_collision = False
+    unavailable_sources = getattr(opts, "unavailable_sources", None)
+    if unavailable_sources is None:
+        unavailable_sources = []  # option objects without the field count for this call only
+    elif prepared_survey is None and use_fleet_focus:
+        # The outer round. multi_source clears it once for all of its tiers, and the unfocused
+        # fallback keeps the focused attempt's count.
+        unavailable_sources.clear()
     from .state_repair import retry_key
 
     stages = [stage for stage in round_stages(opts) if want(opts.only, stage)]
@@ -832,6 +844,10 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         review_first=os.environ.get("TAUCETI_REVIEW_FIRST") == "1",
     ):
         if not opts.dry_run and c.pr and w.counters.read(retry_key(c.pr, c.head)) > time.time():
+            w.selection_changed = True
+            continue
+        if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head, unavailable=True):
+            log(f"Global PR work: {stage} #{c.pr} source recently unavailable on this host — selecting other work")
             w.selection_changed = True
             continue
         if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head):
@@ -862,7 +878,19 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             log(f"Global PR work: trying {stage} #{c.pr} ({', '.join(areas) or 'shared maintenance'})")
         collisions_before = getattr(getattr(w, "claims", None), "collisions", 0)
         w.review_claimed_by_peer = False
-        rc = dispatch(stage, w, sv, c, opts)
+        try:
+            rc = dispatch(stage, w, sv, c, opts)
+        except ReviewSourceUnavailable as error:
+            # One PR's source failing to fetch says nothing about the rest: spare peers the same
+            # attempt and move on. Repeated failures in one round look like an outage; back off.
+            peer_claims.note(_claim_scope(w), stage, c.pr, c.head, unavailable=True)
+            unavailable_sources.append((stage, c.pr))
+            if len(unavailable_sources) >= MAX_UNAVAILABLE_SOURCES:
+                raise
+            log(f"{error}; selecting other work")
+            w.selection_changed = True
+            declined.append((stage, c.pr))
+            continue
         collided = getattr(getattr(w, "claims", None), "collisions", 0) > collisions_before
         if rc is None and not opts.dry_run and (collided or w.review_claimed_by_peer):
             # Spare every other worker on the host the fresh reads that found this collision.
@@ -943,6 +971,8 @@ FILE_CHANGE_STAGES = {"rebase", "fix", "fix-ci", "bump", "lint-repair", "roadmap
 # Stages whose pushes the worker labels `self-tested` itself; automatic bumps use bump_attestation.
 SELF_TESTED_STAGES = {"rebase", "fix", "fix-ci", "lint-repair", "roadmap"}
 _MAX_CHANGED_FILES = 25
+# Source-preparation failures one round absorbs before backing off as a probable outage.
+MAX_UNAVAILABLE_SOURCES = 3
 
 
 def _checkout_head(cfg: Config) -> str | None:
@@ -1885,8 +1915,10 @@ def do_overlap_fix(w, sv, c, opts, bubble):
 
 
 def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool) -> int | None:
+    from . import review_app
     from .github_transport import blocked_since
 
+    app_env = None
     github_started = time.time()
     pr, head = c.pr, c.head
     reviewers = opts.work_model
@@ -1928,13 +1960,20 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             km = _kiro_review_model(reviewers)
             from .retention import review_workspace
 
+            # A share of GitHub reviews publishes as the review App, a second GitHub identity with
+            # its own comment limit; the engine otherwise runs as the account. The scoreboard keeps
+            # the account as its submitter, so reviewer affinity still matches.
+            repository = getattr(w.gh, "review_repository", w.gh.repo)
+            if review_app.routes(repository, pr):
+                app_env = review_app.engine_overrides()
+                log(f"  review #{pr}: publishing as {app_env[review_app.LOGIN_ENV]}")
             with review_workspace(w.cfg) as scratch:
                 rc = run_to_logfile(
                     [
                         *runtime.command(),
                         str(pr),
                         "--repo",
-                        getattr(w.gh, "review_repository", w.gh.repo),
+                        repository,
                         "--workdir",
                         str(scratch),
                         "--store",
@@ -1950,9 +1989,11 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                         *(["--claude-model", claude_model] if claude_model else []),
                         *(["--codex-model", cm] if cm else []),
                         *(["--kiro-model", km] if km else []),
+                        *(["--submitted-by", review_publisher()] if app_env else []),
                     ],
                     logf,
                     f"review #{pr}",
+                    **({"env_overrides": app_env} if app_env else {}),
                 )
         log(f"  review #{pr}: engine rc={rc}")
         from .claude_api import check_result
@@ -1990,7 +2031,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
 
             w.counters.write(retry_key(pr, head), int(time.time() + MAX_RETRY_AFTER) + 1)
             w.rs.bust(pr)
-            raise NoProgress(f"review #{pr}: source preparation unavailable before inference — not charged to the PR")
+            raise ReviewSourceUnavailable(
+                f"review #{pr}: source preparation unavailable before inference — not charged to the PR"
+            )
         if rc == 0:
             # Both changed and unchanged success prove the review is published.
             w.counters.write(errkey, 0)
@@ -2038,7 +2081,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
             w.rs.bust(pr)
-        elif blocked_since(github_started):
+        elif blocked_since(github_started) or (app_env and review_app.blocked_since(github_started)):
             raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")
         elif rc == 2 and strict_file_flags:
             raise NoProgress(

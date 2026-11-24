@@ -1529,7 +1529,7 @@ def run_agent_proc(
     return rc
 
 
-def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
+def run_to_logfile(argv: list[str], logf: Path, label: str, *, env_overrides: dict | None = None) -> int:
     """Run a subprocess with stdout+stderr redirected to logf, keeping the worker's MAIN log clean. Used
     for the review engine, which prints a lot (git clones, the full scoreboard dump, per-rubric lines) —
     detail that belongs in a subsidiary per-review log, not the orchestration stream. TAUCETI_STREAM=1
@@ -1556,7 +1556,14 @@ def run_to_logfile(argv: list[str], logf: Path, label: str) -> int:
 
             if current() is None:
                 api_env.update(CLAIM_REPO=claims_repo(), TAUCETI_CLAIM_SH=CLAIM_SH)
-    env_kwargs = {"env": _without_usage_credentials(dict(os.environ) if api_env is None else api_env)}
+    environment = dict(os.environ) if api_env is None else dict(api_env)
+    # A value of None removes the variable (for example GITHUB_TOKEN beside an App's GH_TOKEN).
+    for name, value in (env_overrides or {}).items():
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = value
+    env_kwargs = {"env": _without_usage_credentials(environment)}
     if os.environ.get("TAUCETI_STREAM"):
         return run_process(argv, **env_kwargs).returncode
     logf.parent.mkdir(parents=True, exist_ok=True)

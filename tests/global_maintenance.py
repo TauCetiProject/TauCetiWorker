@@ -140,6 +140,96 @@ class GlobalMaintenance(unittest.TestCase):
         self.run_round([row(10, "Other"), row(20, "Other")], collide)
         self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20)])
 
+    def test_an_unavailable_review_source_selects_other_work_and_spares_peers(self):
+        from tauceti_worker.config import ReviewSourceUnavailable
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        self.w.claims.collisions = 0
+
+        def unavailable(stage, candidate):
+            if candidate.pr == 10:
+                raise ReviewSourceUnavailable("review #10: source preparation unavailable before inference")
+            return 0
+
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            result, *_ = self.run_round([row(10, "Other"), row(20, "Other")], unavailable)
+            self.assertEqual(result, 0)
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 10), ("fix", 20)])
+            # Any worker on the host now skips #10 at this head without dispatching it.
+            self.run_round([row(10, "Other"), row(20, "Other")], unavailable)
+            self.assertEqual([(s, n) for s, n, *_ in self.calls], [("fix", 20)])
+
+    def test_repeated_unavailable_sources_in_one_round_back_off(self):
+        from tauceti_worker.config import ReviewSourceUnavailable
+
+        def unavailable(stage, candidate):
+            raise ReviewSourceUnavailable(f"review #{candidate.pr}: source preparation unavailable")
+
+        rows = [row(n, "Other") for n in (10, 20, 30, 40)]
+        with self.assertRaises(ReviewSourceUnavailable):
+            self.run_round(rows, unavailable)
+        self.assertEqual([n for _, n, *_ in self.calls], [10, 20, 30])
+
+    def test_the_unavailable_source_cutoff_spans_prepared_tier_rounds(self):
+        import dataclasses
+
+        from tauceti_worker.config import ReviewSourceUnavailable
+        from tauceti_worker.survey import Candidate, Survey
+
+        def tier(numbers):
+            prepared = Survey(worker_id="test", roadmap_only="auto")
+            prepared._round_scope = (True, False)
+            prepared.needs_fix.actionable = [Candidate(n, HEAD) for n in numbers]
+            return prepared
+
+        def unavailable(stage, _w, _sv, candidate, _opts):
+            raise ReviewSourceUnavailable(f"review #{candidate.pr}: source preparation unavailable")
+
+        self.opts.only = ["fix"]
+        with patch.object(work, "dispatch", side_effect=unavailable):
+            first = dataclasses.replace(self.opts)
+            with self.assertRaises(ClaimCollision):
+                run_round(self.w, first, prepared_survey=tier([10, 20]))
+            second = dataclasses.replace(self.opts)
+            with self.assertRaises(ReviewSourceUnavailable):
+                run_round(self.w, second, prepared_survey=tier([30, 40]))
+        self.assertEqual([n for _, n in self.opts.unavailable_sources], [10, 20, 30])
+
+    def test_the_unfocused_fallback_keeps_the_rounds_unavailable_source_count(self):
+        from tauceti_worker.config import ReviewSourceUnavailable
+
+        def unavailable(stage, _w, _sv, candidate, _opts):
+            raise ReviewSourceUnavailable(f"review #{candidate.pr}: source preparation unavailable")
+
+        self.opts.unavailable_sources[:] = [("review", 1), ("review", 2)]
+        with (
+            patch(
+                "tauceti_worker.github_state.read_survey",
+                return_value=(True, SurveyRows([row(10, "Other"), row(20, "Other")], {"science": 3})),
+            ),
+            patch.object(work, "dispatch", side_effect=unavailable),
+            patch.object(work, "roadmap_areas", return_value=["NewArea"]),
+        ):
+            with self.assertRaises(ReviewSourceUnavailable):
+                run_round(self.w, self.opts, use_fleet_focus=False)
+        self.assertEqual([n for _, n in self.opts.unavailable_sources], [1, 2, 10])
+
+    def test_unavailable_source_hints_are_short_and_separate_from_claims(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            peer_claims.note("forgejo:one/project", "review", 7, HEAD, now=1000, unavailable=True)
+            self.assertTrue(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001, unavailable=True))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001))
+            self.assertFalse(
+                peer_claims.hinted("forgejo:one/project", "review", 7, "b" * 40, now=1001, unavailable=True)
+            )
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "fix", 7, HEAD, now=1001, unavailable=True))
+            self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1301, unavailable=True))
+
     def test_peer_claim_hints_expire_and_are_scoped(self):
         from tauceti_worker import peer_claims
 

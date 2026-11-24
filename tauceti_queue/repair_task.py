@@ -3319,6 +3319,25 @@ def _run_task(
             # nothing is fetched and Lake compiles only what changed since.
             warm = warm_tree(worktree, task, parked_at, start_tip)
             outcome["sources"]["batch_tree"] = "warm" if warm else "adopted" if parked_at else "new"
+            if parked_at is not None or outcome["sources"]["worktree_reused"]:
+                # A reused tree can hold outputs an interrupted write left truncated under a valid
+                # trace, which Lake would trust; compile those modules again instead.
+                from tauceti_queue import repair_outputs
+
+                checked = repair_outputs.discard_damaged(worktree, env_lake)
+                outcome["sources"]["output_check"] = checked
+                if checked.get("removed_modules"):
+                    log(
+                        f"task {task.task_id}: the reused tree had {checked['damaged_count']} damaged output(s); "
+                        f"rebuilding {checked['removed_modules']} module(s)"
+                    )
+                elif not checked.get("checked"):
+                    # The shared cache could restore the same bytes into a cleared tree, so the tree
+                    # is used as it is; freeze_outputs, which checks again, publishes nothing unchecked.
+                    log(
+                        f"task {task.task_id}: the reused tree's outputs could not be checked "
+                        f"({checked.get('reason')}); building in it, but publishing only checked outputs"
+                    )
             if cfg.seed_packages:
                 repair.link_shared_packages(worktree, cfg.seed_packages)
             state.write("sources_ready", worktree=str(worktree), sources=outcome["sources"])

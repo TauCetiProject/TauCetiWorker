@@ -22,6 +22,9 @@ import uuid
 from pathlib import Path
 
 HINT_TTL_S = 600
+# A selected PR whose source could not be fetched is skipped host-wide this long (the per-worker
+# retry deadline, github_state.MAX_RETRY_AFTER), so one fetch failure does not draw every peer to it.
+UNAVAILABLE_TTL_S = 300
 
 
 def _root() -> Path | None:
@@ -33,22 +36,29 @@ def _key(scope: str, stage_key: str) -> str:
     return hashlib.sha256(json.dumps([scope, stage_key]).encode()).hexdigest()
 
 
-def resource(stage: str, pr: int, head: str) -> str:
+def resource(stage: str, pr: int, head: str, *, unavailable: bool = False) -> str:
     """The lease a candidate needs: one branch lease per PR for branch-writing work, one review
-    lease per PR head."""
+    lease per PR head. An unavailable source is noted per stage and exact head instead."""
+    if unavailable:
+        return f"unavailable/{stage}/{pr}/{head}"
     return f"review/{pr}/{head}" if stage == "review" else f"branch/{pr}"
 
 
-def note(scope: str, stage: str, pr: int, head: str, *, now: float | None = None) -> None:
+def _ttl(unavailable: bool) -> int:
+    return UNAVAILABLE_TTL_S if unavailable else HINT_TTL_S
+
+
+def note(scope: str, stage: str, pr: int, head: str, *, now: float | None = None, unavailable: bool = False) -> None:
+    """Record a peer's claim, or with `unavailable` that this exact head's source could not be prepared."""
     root = _root()
     if root is None or not pr:
         return
     stamp = time.time() if now is None else now
     try:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        path = root / (_key(scope, resource(stage, pr, head)) + ".json")
+        path = root / (_key(scope, resource(stage, pr, head, unavailable=unavailable)) + ".json")
         temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-        temporary.write_text(json.dumps({"expires_at": stamp + HINT_TTL_S}))
+        temporary.write_text(json.dumps({"expires_at": stamp + _ttl(unavailable)}))
         os.replace(temporary, path)
         if random.random() < 0.02:
             _prune(root, stamp)
@@ -56,16 +66,18 @@ def note(scope: str, stage: str, pr: int, head: str, *, now: float | None = None
         pass  # a hint we cannot write costs one more collision, nothing else
 
 
-def hinted(scope: str, stage: str, pr: int, head: str, *, now: float | None = None) -> bool:
+def hinted(scope: str, stage: str, pr: int, head: str, *, now: float | None = None, unavailable: bool = False) -> bool:
     root = _root()
     if root is None or not pr:
         return False
     try:
-        value = json.loads((root / (_key(scope, resource(stage, pr, head)) + ".json")).read_text())
+        value = json.loads(
+            (root / (_key(scope, resource(stage, pr, head, unavailable=unavailable)) + ".json")).read_text()
+        )
         expires = value.get("expires_at")
         stamp = time.time() if now is None else now
         # A hint dated beyond its TTL (a clock we cannot place) is ignored rather than trusted.
-        return isinstance(expires, (int, float)) and stamp < expires <= stamp + HINT_TTL_S
+        return isinstance(expires, (int, float)) and stamp < expires <= stamp + _ttl(unavailable)
     except (OSError, ValueError, AttributeError):
         return False
 

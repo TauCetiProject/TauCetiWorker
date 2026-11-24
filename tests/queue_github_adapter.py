@@ -531,6 +531,47 @@ class Adapter(unittest.TestCase):
         with self.assertRaises(ga.GitHubError):
             a.cancel_run(TAUCETI, "3")
 
+    def test_main_integration_dispatch_and_graphql_status_read(self):
+        transport = FakeTransport()
+        transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/dispatches", 204)
+        a = adapter(transport)
+        a.dispatch_main_integration(TAUCETI, pr=7, head_sha=HEAD, main_sha=BASE)
+        self.assertEqual(
+            json.loads(transport.calls[0][3]),
+            {"event_type": "tauceti-main-integration", "client_payload": {"pr": 7, "head_sha": HEAD, "main_sha": BASE}},
+        )
+        with self.assertRaises(ValueError):
+            a.dispatch_main_integration(TAUCETI, pr=7, head_sha="main", main_sha=BASE)
+        url = f"https://github.com/{TAUCETI}/actions/runs/99"
+        transport.add(
+            "POST",
+            "https://api.github.com/graphql",
+            200,
+            {
+                "data": {
+                    "repository": {
+                        "h0": {
+                            "status": {
+                                "context": {
+                                    "state": "FAILURE",
+                                    "description": "B=abc failed",
+                                    "targetUrl": url,
+                                    "createdAt": "2026-11-24T04:00:00Z",
+                                }
+                            }
+                        },
+                        "h1": None,
+                    }
+                }
+            },
+        )
+        statuses = a.main_integration_statuses(TAUCETI, [HEAD, TIP, HEAD])
+        query = json.loads(transport.calls[-1][3])["query"]
+        self.assertIn('context(name: "main-integration")', query)
+        self.assertEqual(query.count("object(oid:"), 2)
+        self.assertEqual((statuses[HEAD].state, statuses[HEAD].run_id), ("failure", "99"))
+        self.assertIsNone(statuses[TIP])
+
     def test_dispatch_candidate_sends_the_bors_payload(self):
         transport = FakeTransport()
         transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/dispatches", 204)

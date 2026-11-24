@@ -34,7 +34,7 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from typing import Any
 
-from . import admission_planning, chain, declaration_names, escalation, repair_stall, stuck_heads
+from . import admission_planning, chain, declaration_names, escalation, main_integration, repair_stall, stuck_heads
 from .eligibility import KEEP as BLOCKING_LABELS
 from .mixed_identity import SourceNumber
 from .ports import (
@@ -99,6 +99,19 @@ COMMENT_MARKER = "tauceti-queue"
 # Settings an operator can change at runtime (`set_setting`), with their initial values. The type of
 # the initial value is the type a new value must have.
 DEFAULT_SETTINGS: dict[str, Any] = {
+    # The main-integration backfill (`main_integration.py`, decision 175 B): while PR CI is idle, build
+    # queued members of unsealed batches merged onto the current canonical commit, and take a member
+    # whose build fails twice out of its batch before it seals. Off by default; the runtime switch.
+    "main_integration_enabled": False,
+    # False records results without taking anything out.
+    "main_integration_take_out": True,
+    "main_integration_max_in_flight": 8,
+    "main_integration_interval_seconds": 120,
+    # A result on a main younger than this is fresh evidence; older ones are asked again.
+    "main_integration_fresh_seconds": 6 * 3600,
+    "main_integration_timeout_seconds": 3 * 3600,
+    "main_integration_deferred_retry_seconds": 600,
+    "main_integration_checks_per_pass": 20,
     "insertion_age_window": 16,
     "open_batch_limit": 2,
     # Freeze oldest unsealed batches at this size until two active batches are sealed in total.
@@ -3846,6 +3859,9 @@ class Controller:
         offer()
         self._fetch_declaration_names(now)
         self._insertion_passes(now)
+        offer()
+        # Before sealing, so a member it takes out never reaches the next head (decision 175 B).
+        main_integration.run(self, now)
         for step in (
             self._supersede_stale_pre_rebase,
             self._emergency,
