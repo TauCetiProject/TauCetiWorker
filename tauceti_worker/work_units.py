@@ -1759,7 +1759,15 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     actionable = _still_actionable(stage, w, sv, c, explicit=explicit)
     if actionable is False:
         return None
-    if stage == "fix" and actionable is True and c.pr not in bump_prs(sv) and _fix_loop_escalated(w, c):
+    # Count only a fix confirmed against the live scoreboard: a partial-history candidate is let
+    # through to investigate without one, so it says nothing about whether review sent this head back.
+    if (
+        stage == "fix"
+        and actionable is True
+        and not c.partial_history
+        and c.pr not in bump_prs(sv)
+        and _fix_loop_escalated(w, c)
+    ):
         return None
     from .claude_api import admission_failure
     from .fleet_capacity import admission_reason

@@ -288,7 +288,9 @@ class GlobalMaintenance(unittest.TestCase):
         recheck = source.index("actionable = _still_actionable(stage, w, sv, c, explicit=explicit)")
         cap = source.index("_fix_loop_escalated(w, c)")
         self.assertLess(recheck, cap)
-        self.assertIn('stage == "fix" and actionable is True and c.pr not in bump_prs(sv)', source)
+        guard = source[source.rindex('stage == "fix"', 0, cap) : cap]
+        for condition in ("actionable is True", "not c.partial_history", "c.pr not in bump_prs(sv)"):
+            self.assertIn(condition, guard)
 
     def test_peer_claim_hints_expire_and_are_scoped(self):
         from tauceti_worker import peer_claims
