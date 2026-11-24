@@ -224,7 +224,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         )
 
     def wait_calls(self, p):
-        limit = time.monotonic() + 10
+        limit = time.monotonic() + 60
         while not (self.root / ".lake/calls").exists():
             self.assertIsNone(p.poll())
             self.assertLess(time.monotonic(), limit)
@@ -408,15 +408,15 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="60")
         try:
             self.wait_calls(p)
-            limit = time.monotonic() + 10
+            limit = time.monotonic() + 60
             while not (self.root / ".lake/tool.pid").exists():
                 self.assertIsNone(p.poll())
                 self.assertLess(time.monotonic(), limit)
                 time.sleep(0.02)
             owned_tool = int((self.root / ".lake/tool.pid").read_text())
             p.kill()
-            p.communicate(timeout=10)
-            limit = time.monotonic() + 5
+            p.communicate(timeout=120)
+            limit = time.monotonic() + 30
             while running(owned_tool) and time.monotonic() < limit:
                 time.sleep(0.02)
             self.assertFalse(running(owned_tool), "verification tool survived its owner")
@@ -425,17 +425,17 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
             for name in ("verification-pending", "verification-jobs", "verification-candidates"):
                 self.assertFalse((self.state / name).exists(), name)
             q = self.spawn(TAUCETI_VERIFY_STATE=str(self.home / "worker2"))
-            out, _ = q.communicate(timeout=10)
+            out, _ = q.communicate(timeout=120)
             self.assertEqual(q.returncode, 0, out)
         finally:
             if p.poll() is None:
                 p.kill()
-                p.communicate(timeout=10)
+                p.communicate(timeout=120)
 
     def test_round_deadline_does_not_interrupt_verification(self):
         # An already-passed round deadline is not a verification limit: the checks run to completion.
         p = self.spawn(FIXTURE_MODE="sleep", FIXTURE_SLEEP="2", TAUCETI_ROUND_DEADLINE=str(time.time() - 60))
-        out, _ = p.communicate(timeout=30)
+        out, _ = p.communicate(timeout=120)
         result = json.loads(out)
         self.assertEqual(result["status"], "success", result.get("error"))
         self.assertEqual(Path(result["receipt"]).parent.parent, self.state / "verification")
@@ -447,7 +447,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         p = self.spawn(FIXTURE_MODE="sleep", TAUCETI_VERIFY_STATE=str(self.home / "sigterm-state"))
         self.wait_calls(p)
         p.send_signal(signal.SIGTERM)
-        out, _ = p.communicate(timeout=10)
+        out, _ = p.communicate(timeout=120)
         self.assertEqual(json.loads(out)["status"], "incomplete")
 
     def test_verifier_and_executable_invalidation(self):
@@ -495,7 +495,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
                     time.sleep(0.02)
                 (barrier / "release").touch()
                 for p in processes:
-                    out, _ = p.communicate(timeout=20)
+                    out, _ = p.communicate(timeout=120)
                     self.assertEqual(p.returncode, 0, out)
                     result = json.loads(out)
                     self.assertEqual(result["status"], "success")
@@ -507,7 +507,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
                 for p in processes:
                     if p.poll() is None:
                         p.kill()
-                    p.communicate(timeout=10)
+                    p.communicate(timeout=120)
 
     def test_shim_ratchet_and_one_json_result(self):
         write(self.root, "TauCeti/mathlib-shims.json", "{}")

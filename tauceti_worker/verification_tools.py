@@ -9,6 +9,8 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
+from .excerpt import ends
+
 
 class Unavailable(RuntimeError):
     def __init__(self, message, *, reason="tool-missing"):
@@ -107,7 +109,7 @@ def check(checkout, *, env=None, required=False):
     except (OSError, subprocess.TimeoutExpired) as error:
         raise Unavailable(f"verification Python tooling probe deferred: {error}", reason="verification-busy") from error
     if result.returncode:
-        detail = (result.stderr or result.stdout).strip()[-2000:]
+        detail = ends(result.stderr or result.stdout, 2000)
         raise Unavailable(
             f"verification Python tooling unavailable with {sys.executable}: {detail}",
             reason="verification-busy" if result.returncode < 0 else "tool-missing",

@@ -28,7 +28,7 @@ from contextlib import ExitStack, closing
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import stuck_heads, task_progress
+from . import repair_stall, stuck_heads, task_progress
 from .monitoring_protocol import PublicationRejected, PublisherIdentity, ResyncRequired, SnapshotPublisher, encode
 
 SCHEMA = "tauceti.operations.queue/v1"
@@ -765,6 +765,24 @@ def project(
         )
     if hold:
         conditions.append({"kind": "inference_hold", "since": iso(hold.get("since"))})
+    # Stalled repair and a head without progress (docs/queue/escalation.md, "Stalled repair"): their
+    # start time and batch only; the findings and the agent's conclusion stay private.
+    loop = status.get("loop_termination") or {}
+    for stall in (loop.get("repair_stalls") or [])[:5]:
+        if isinstance(stall, dict) and numeric(stall.get("since")) is not None and stall.get("batch_id") in batch_map:
+            conditions.append(
+                {
+                    "kind": "repair_stalled",
+                    "since": iso(stall["since"]),
+                    "batch_id": str(stall.get("batch_id")),
+                }
+            )
+    progress = loop.get("head_progress") or {}
+    fingerprint = (progress.get("fingerprint") or [None]) if isinstance(progress, dict) else [None]
+    if progress.get("alerted_at") and numeric(progress.get("since")) is not None and fingerprint[0] in batch_map:
+        conditions.append(
+            {"kind": "head_no_progress", "since": iso(progress["since"]), "batch_id": str(fingerprint[0])}
+        )
     for alert in status.get("alerts") or []:
         kind = (
             "promotion_failed"
@@ -774,7 +792,15 @@ def project(
             else "source_condition"
         )
         if kind != "source_condition" or not any(
-            x in str(alert) for x in ("build stalled", "inference hold", " unclaimed for ", stuck_heads.ALERT_TEXT)
+            x in str(alert)
+            for x in (
+                "build stalled",
+                "inference hold",
+                " unclaimed for ",
+                stuck_heads.ALERT_TEXT,
+                repair_stall.ALERT_TEXT,
+                repair_stall.HEAD_ALERT_TEXT,
+            )
         ):
             conditions.append({"kind": kind})
     # The CI recovery pass's stuck heads: one condition per listed head (since its last push), so the
@@ -835,6 +861,9 @@ def project(
                 "prepare_open_batches",
                 "pre_rebase_enabled",
                 "prepare_pre_rebased",
+                "parallel_check_enabled",
+                "early_staging_enabled",
+                "attested_landing_enabled",
             )
             and (type(v) is bool or numeric(v) is not None)
         },
@@ -1098,7 +1127,8 @@ def run(args, stop, facts, opener, publisher):
                             result = json.loads(error.read(65536))
                         except (OSError, ValueError):
                             result = {}
-                        if error.code == 409 and result.get("code") == "resync":
+                        code = result.get("code") if isinstance(result, dict) else None
+                        if error.code == 409 and code == "resync":
                             raise ResyncRequired("receiver requires full state") from None
                         codes = {
                             401: "authentication",
@@ -1106,9 +1136,7 @@ def run(args, stop, facts, opener, publisher):
                             429: "rate_limit",
                             503: "receiver_unavailable",
                         }
-                        raise PublicationRejected(
-                            error.code, result.get("code") or codes.get(error.code, "invalid_snapshot")
-                        ) from None
+                        raise PublicationRejected(error.code, code or codes.get(error.code)) from None
 
                 publisher.publish(observation, send)
                 retry_seconds = args.interval

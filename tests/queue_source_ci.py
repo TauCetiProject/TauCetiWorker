@@ -262,8 +262,9 @@ class SourceController(unittest.TestCase):
         self.assertIn("step 2/3 Build exact candidate under bwrap (build / Build), running", rt.summarize(status))
         # Observation continues every polling interval; the jobs listing is read only every
         # SOURCE_PHASES_INTERVAL_SECONDS while the run is in progress.
+        self.store.set_setting("polling_interval_seconds", SOURCE_PHASES_INTERVAL_SECONDS // 2)
         observations = self.execution.observations
-        self.clock.advance(60)
+        self.clock.advance(SOURCE_PHASES_INTERVAL_SECONDS // 2)
         self.controller.tick()
         self.assertGreater(self.execution.observations, observations)
         self.assertEqual(reads, ["101"])

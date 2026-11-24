@@ -401,7 +401,7 @@ def prompt_lines(context: dict | None, *, with_file: bool = False) -> list[str]:
         return []
     lines = ["Admission-time knowledge (predictions and navigation; scripted audits remain authoritative):", ""]
     for record in context.get("records", [])[:40]:
-        kind = record["kind"]
+        kind = record.get("kind", "unknown")
         if kind == "declaration_collision":
             owners = ", ".join(f"#{s['pr']} in {s['module']}" for s in record["sources"])
             lines.append(f"- Compiled accepted inputs both add `{record['name']}`: {owners}.")
@@ -417,10 +417,14 @@ def prompt_lines(context: dict | None, *, with_file: bool = False) -> list[str]:
                 + caveat
                 + "."
             )
-        else:
+        elif kind == "import_component" and record.get("members"):
             lines.append(
                 "- Connected import/shared-path component: " + ", ".join(f"#{p}" for p in record["members"]) + "."
             )
+        else:
+            # Other record kinds (for example selection notes without members) are navigation only;
+            # an unfamiliar shape must never stop a repair from composing its prompt.
+            lines.append(f"- Admission note ({kind}); see the retained admission context.")
     if not context.get("complete", True):
         lines.append("This context is incomplete; missing evidence is unknown.")
     if with_file:

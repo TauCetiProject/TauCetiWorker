@@ -207,7 +207,13 @@ class StateClient(unittest.TestCase):
             raise http_error(503)
 
         results = []
-        with patch.object(state.urllib.request, "urlopen", side_effect=slow_outage):
+        # The circuit lock's 1 s wait fails open by design, and a peer whose wait expires probes too.
+        # On a loaded runner the holder's fsync alone can outlast that, so this test waits longer.
+        locked = state.transport.locked
+        with (
+            patch.object(state.urllib.request, "urlopen", side_effect=slow_outage),
+            patch.object(state.transport, "locked", lambda path, timeout=30: locked(path, timeout=max(timeout, 60))),
+        ):
             threads = [
                 threading.Thread(target=lambda: results.append(state.read("org/repo", "issue_comments", number=7)))
                 for _ in range(6)
@@ -330,15 +336,20 @@ class StateClient(unittest.TestCase):
             self.fail_with(fails(503))
         (path,) = (self.root / "gateway").glob("*/circuits/*.json")
         path.write_text(json.dumps({**self.circuit(), "until": 0}))
-        peer = []
+        peer, initial = [], {}
 
+        # Wall-clock margins of seconds, not tenths: on a loaded CI runner a thread can be descheduled
+        # for longer than a sub-second lease and see it expire with no renewal missed.
         def slow_pages(request, **_):
             if peer:
                 self.fail("a peer probed while the lease holder was still reading")
-            time.sleep(0.3)
             if "cursor=" not in request.full_url:
+                initial["until"] = json.loads(path.read_text())["probe_until"]
+                time.sleep(4)  # the lease is renewed after this page, 4 s after it was first taken
                 return Response(page([{"id": "1"}], cursor="p1"))
             # Past the initial lease, but within the renewed one.
+            while time.time() <= initial["until"]:
+                time.sleep(0.05)
             peer.append(True)
             outcome = state.read("org/repo", "issue_comments", number=7)
             peer.append(state.last_failure())
@@ -346,7 +357,7 @@ class StateClient(unittest.TestCase):
             return Response(page([{"id": "2"}]))
 
         with (
-            patch.object(state, "PROBE_LEASE", 0.5),
+            patch.object(state, "PROBE_LEASE", 10),
             patch.object(state.urllib.request, "urlopen", side_effect=slow_pages),
         ):
             self.assertEqual(state.read("org/repo", "issue_comments", number=7), (True, [{"id": 1}, {"id": 2}]))

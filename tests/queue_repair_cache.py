@@ -181,6 +181,15 @@ class Retention(unittest.TestCase):
         self.store.commit()
         self.assertEqual(self.collect()["state"], "collected")
 
+    def test_parked_batch_tree_does_not_block_pruning(self):
+        path = self.artifact(1)
+        (self.root / "worktrees/batch-7/.lake").mkdir(parents=True)
+        self.assertEqual(self.collect()["state"], "collected")
+        self.assertFalse(path.exists())
+        self.assertTrue((self.root / "worktrees/batch-7/.lake").is_dir())
+        (self.root / "worktrees/batch-x").mkdir()
+        self.assertEqual(self.collect()["state"], "busy", "an unrecognized tree still counts as a user")
+
     def test_handoff_blocks_collection_until_publisher_can_acquire_lease(self):
         path = self.artifact(1)
         self.write("tasks/1/logs/publish.json", json.dumps({"state": "running", "started_at": self.now}))

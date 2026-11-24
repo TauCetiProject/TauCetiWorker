@@ -9,6 +9,7 @@ import contextlib
 import http.server
 import json
 import os
+import shlex
 import shutil
 import sys
 import tempfile
@@ -151,7 +152,9 @@ class ShellEnvironment(unittest.TestCase):
                             argv, _ = agents.host_agent_argv("test", "claude")
                         startup = Path(json.loads(argv[argv.index("--settings") + 1])["env"]["CLAUDE_ENV_FILE"])
                         self.assertEqual(startup.parent, config)
-                        self.assertEqual(startup.read_text(), "exec </dev/null\n")
+                        self.assertEqual(
+                            startup.read_text(), f"exec </dev/null\n. {shlex.quote(changes['BASH_ENV'])}\n"
+                        )
                         self.assertEqual((config / "settings.json").read_bytes(), settings)
                         self.assertFalse(list(config.glob(".bash-env-*")))
                 changes = repair.isolation_env(root / "state", provider="codex")

@@ -77,6 +77,25 @@ class ParseLog(unittest.TestCase):
         self.assertNotIn("\x1b", findings[0]["message"])
         self.assertFalse(findings[0]["message"].startswith("2026-"))
 
+    def test_lint_script_lines_in_the_compiler_shape_are_lint(self):
+        lines = [
+            "2026-11-19T04:20:00.1Z TauCeti/Topology/Covering/Quotient.lean:186:0: error: dot-notation namespace lint: "
+            "TauCeti.IsQuotientCoveringMap.foo puts a Mathlib type's namespace inside `namespace TauCeti`",
+            "2026-11-19T04:20:01.1Z error: TauCeti/Algebra/Basic.lean:12: Line has more than 100 characters",
+            "2026-11-19T04:20:02.1Z TauCeti/Algebra/Basic.lean:14:3: error: unknown identifier",
+        ]
+        findings = d.parse_log(lines)
+        self.assertEqual(
+            [(f["kind"], f["module"], f.get("linter")) for f in findings],
+            [
+                ("lint", "TauCeti.Topology.Covering.Quotient", "dot-notation"),
+                ("lint", "TauCeti.Algebra.Basic", "style"),
+                ("compiler", "TauCeti.Algebra.Basic", None),
+            ],
+        )
+        self.assertEqual(findings[0]["declaration"], "TauCeti.IsQuotientCoveringMap.foo")
+        self.assertEqual((findings[1]["path"], findings[1]["line_number"]), ("TauCeti/Algebra/Basic.lean", 12))
+
     def test_audits(self):
         lines = [
             "audit-driver: import TauCeti.A.B failed, environment already contains 'Foo.bar' from TauCeti.C.D",
@@ -136,6 +155,30 @@ class ParseLog(unittest.TestCase):
         located = d.parse_log(["TauCeti/A/B.lean:1:1: error: x", *targets])
         self.assertEqual(kinds(located), [("compiler", "TauCeti.A.B")])
         self.assertNotIn("located", located[0])
+
+    def test_lean_killed_by_signal_9_is_infrastructure(self):
+        module = "TauCeti.GroupTheory.SpecificGroups.Sporadic.Fischer.TwentyTwo.Presentation"
+        killed = (
+            "2026-11-20T08:40:07.7014941Z error: Lean process for /opt/actions-runner/_work/TauCeti/TauCeti/pr/"
+            + d.path_of(module)
+            + " was killed by signal 9 after 712s, likely out of memory"
+        )
+        targets = ["Some required targets logged failures:", "- " + module, "error: build failed"]
+        findings = d.parse_log([killed, "error: Lean exited with code 137", *targets])
+        self.assertEqual(kinds(findings), [("infrastructure", module)])
+        self.assertEqual(findings[0]["reason"], "lean_killed")
+        self.assertEqual(findings[0]["path"], d.path_of(module))
+        # Another failed target, or a located error elsewhere, is still a source finding.
+        other = d.parse_log([killed, *targets[:2], "- TauCeti.A.B", *targets[2:]])
+        self.assertEqual(kinds(other), [("compiler", "TauCeti.A.B"), ("infrastructure", module)])
+        located = d.parse_log(["TauCeti/A/B.lean:1:1: error: x", killed, *targets])
+        self.assertEqual(kinds(located), [("compiler", "TauCeti.A.B"), ("infrastructure", module)])
+        # A wall-clock timeout is the module's own failure.
+        timeout = killed.replace(
+            "was killed by signal 9 after 712s, likely out of memory",
+            "exceeded the 3000s wall-clock limit (TERM, then KILL after 30s)",
+        )
+        self.assertEqual(kinds(d.parse_log([timeout, *targets])), [("compiler", module)])
 
     def test_dedup_and_runner_loss(self):
         lines = ["TauCeti/A/B.lean:1:1: error: x"] * 3 + [

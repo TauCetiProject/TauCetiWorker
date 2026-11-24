@@ -66,6 +66,7 @@ from .config import (
     log,
     one_line,
     roadmap_only,
+    roadmap_targets,
     sanitize_wid,
     security_audit_problem,
     set_log_file,
@@ -93,7 +94,22 @@ from .cost_model import format_report as format_cost_report
 from .github import GitHub, pin_github_account, shared_claims_granted
 from .loop import cmd_loop, resolve_work_model
 from .paths import HERE, ensure_ssl_cert_file, legacy_data_root
-from .quota import Quota, _claude_keychain_creds, _safe_exists, claude_dir, codex_dir, parse_pace_curve
+from .quota import (
+    PACE_PROVIDERS,
+    Quota,
+    _claude_keychain_creds,
+    _safe_exists,
+    claude_agent_credential_route,
+    claude_dir,
+    claude_usage_configuration_problem,
+    claude_usage_credentials,
+    claude_usage_identity_verified,
+    codex_dir,
+    effective_pace_specs,
+    normalize_claude_usage_credentials,
+    pace_env,
+    parse_pace_curve,
+)
 from .review_state import ReviewState
 from .round import Claims, RoundContext, cmd_heartbeat
 from .runtime_status import report_failure, report_runtime
@@ -133,6 +149,7 @@ examples:
   tauceti work --pr 412                 whatever the cascade wants to do to PR #412
   tauceti work --pr 412,415 --only review,fix   only those two PRs, only those two units
   tauceti work --only roadmap --roadmap-only ReductiveGroups
+  tauceti work --loop --full-quality --roadmap-only GRH   an umbrella: every area one goal needs
   tauceti work --loop --roadmap-skip OneParameterSemigroups   leave that area to other workers
   tauceti work --only roadmap --extra-roadmap-prompt "Work on the material relevant to Higher Topos Theory"
   tauceti work --only review --agent claude --bubble
@@ -144,20 +161,23 @@ multiple workers (share a host and coordinate through GitHub; a distinct id name
   tauceti work --loop --worker-id alice --only review
   tauceti work --loop --worker-id bob   --only roadmap
 
-environment (flags win; full reference linked below):
+environment (each flag overrides its matching variable; full reference linked below):
   TAUCETI_AGENT          default for --agent
   TAUCETI_WORKER_ID      pins the worker id (else `work` auto-assigns worker1, worker2, ...)
-  TAUCETI_ROADMAP_ONLY   single roadmap area (unset = a fresh random area each round; "" = all areas)
+  TAUCETI_ROADMAP_ONLY   single roadmap area or umbrella (unset = a fresh random area each round; "" = all areas)
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_EXTRA_ROADMAP_PROMPT   extra guidance for roadmap rounds; default for --extra-roadmap-prompt
+  TAUCETI_ROADMAP_TARGETS        operator target list for roadmap rounds; default for --roadmap-targets
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
+  TAUCETI_PACE_CLAUDE / _CODEX   pacing curve for one provider's windows (default = TAUCETI_PACE)
   TAUCETI_AUTHORING_CODEX_MODEL / _EFFORT   exact Codex authoring profile
   TAUCETI_AUTHORING_CLAUDE_MODEL / _EFFORT exact Claude authoring profile
   TAUCETI_STREAM=1       same as --stream
   TAUCETI_AUTO_REFRESH=1 same as --auto-refresh (renew an expired Claude or Codex token; see --auto-refresh)
   TAUCETI_CODEX_REFRESH_PLANS  comma-separated Codex plans to renew beyond the built-in list (see docs/quota.md)
+  TAUCETI_CLAUDE_USAGE_CREDENTIALS  a second Claude login read for usage only (agents on a setup-token)
   TAUCETI_FULL_QUALITY=1 same as --full-quality
   TAUCETI_ACCOUNT        default for --account (require a specific Codex account)
   TAUCETI_GITHUB_ACCOUNT default for --github-account (select the GitHub login)
@@ -214,6 +234,18 @@ def add_source_flags(parser):
         choices=("github", "forgejo"),
         default=argparse.SUPPRESS,
         help="destination for new PRs (default: github)",
+    )
+    parser.add_argument(
+        "--prefer-forge",
+        choices=("github", "forgejo"),
+        default=argparse.SUPPRESS,
+        help="within each landing tier, offer this forge's PR work first (default: no preference)",
+    )
+    parser.add_argument(
+        "--review-first",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="offer re-reviews and first reviews before any other PR work (default: landing order)",
     )
 
 
@@ -341,6 +373,9 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         help="for roadmap rounds, the single roadmap area to steer toward: a subdirectory of "
         "the TauCetiRoadmap repo. List them by opening the dashboard (bare `tauceti`) and "
         "expanding the roadmap row, or browse github.com/TauCetiProject/TauCetiRoadmap. "
+        "Or an umbrella, a named set of areas defined by umbrellas/NAME.toml in that repo "
+        "(docs/umbrellas.md): each round then authors in one member area drawn by weight and "
+        "maintains PRs in all of them; an area of the same name wins. "
         "Empty string = all areas; omit entirely (and leave $TAUCETI_ROADMAP_ONLY "
         "unset) to pick a fresh random area each round. Overrides "
         "$TAUCETI_ROADMAP_ONLY for this run",
@@ -364,6 +399,17 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "--roadmap-skip OneParameterSemigroups. Excludes them from the auto-random pick and the "
         "all-areas case; --roadmap-only takes precedence if it names a skipped area. Overrides "
         "$TAUCETI_ROADMAP_SKIP for this run",
+    )
+    p.add_argument(
+        "--roadmap-targets",
+        dest="roadmap_targets",
+        default=None,
+        metavar="FILE",
+        help="for roadmap rounds, an operator target list (docs/target-lists.md): milestones grouped "
+        "by roadmap area, each with the items it needs first. Every round the worker takes one open "
+        "item whose needs have landed, claims it, and hands it to the agent; with nothing eligible it "
+        "authors nothing. --roadmap-only and --roadmap-skip narrow the areas it draws from. The file "
+        "is re-read each round. Empty string = no list. Overrides $TAUCETI_ROADMAP_TARGETS for this run",
     )
     p.add_argument(
         "--self-tested",
@@ -459,6 +505,16 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "by the reset; `0:0,100:100` restores the plain used%% < elapsed%% rule. Overrides "
         "$TAUCETI_PACE for this run (inherited by loop children)",
     )
+    for provider in PACE_PROVIDERS:
+        p.add_argument(
+            f"--pace-{provider}",
+            dest=f"pace_{provider}",
+            default=None,
+            metavar="T:B[,T:B...]",
+            help=f"pacing curve for {provider}'s windows only, in the form --pace takes; a provider "
+            f"without one of its own follows --pace. Overrides ${pace_env(provider)} for this run "
+            "(inherited by loop children)",
+        )
     p.add_argument(
         "--worker-id",
         dest="worker_id",
@@ -910,6 +966,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_workers_parser(sub)
     add_budget_parser(sub)
     sub.add_parser("_fleet-protocol", help=argparse.SUPPRESS)
+    target_info = sub.add_parser("_targets-inspect", help=argparse.SUPPRESS)
+    target_info.add_argument("--file", type=Path, required=True)
 
     # Hidden internal subcommands.
     r = sub.add_parser("_round", add_help=False)
@@ -943,17 +1001,24 @@ def resolve_pace(cmd: str | None, args) -> None:
     records a curve for a worker launched later, leaves this environment alone, and is validated as
     configuration (see WorkerSpec.from_dict).
 
+    The per-provider curves ($TAUCETI_PACE_CLAUDE / --pace-claude, and the same for codex) are settled
+    the same way, each flag against its own variable.
+
     Validation and installation live together, one step before dispatch, so no code can run against a
     curve that has been checked but not applied — or applied but not checked."""
-    override = getattr(args, "pace", None) if cmd in ("work", "_round") else None
-    spec, source = (override, "--pace") if override is not None else (os.environ.get("TAUCETI_PACE"), "$TAUCETI_PACE")
-    if spec is not None:
-        try:
-            parse_pace_curve(spec)
-        except ValueError as e:
-            raise Die(f"{source}: {e}") from None
-    if override is not None:
-        os.environ["TAUCETI_PACE"] = override
+    overrides = {}
+    for dest, var in (("pace", "TAUCETI_PACE"), *((f"pace_{p}", pace_env(p)) for p in PACE_PROVIDERS)):
+        override = getattr(args, dest, None) if cmd in ("work", "_round") else None
+        flag = "--" + dest.replace("_", "-")
+        spec, source = (override, flag) if override is not None else (os.environ.get(var), f"${var}")
+        if spec is not None:
+            try:
+                parse_pace_curve(spec)
+            except ValueError as e:
+                raise Die(f"{source}: {e}") from None
+        if override is not None:
+            overrides[var] = override
+    os.environ.update(overrides)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -963,6 +1028,11 @@ def main(argv: list[str] | None = None) -> int:
     selected_conf, remaining = conf_argument(list(sys.argv[1:] if argv is None else argv))
     args = parser.parse_args(remaining)
     cmd = args.cmd
+    if cmd == "_targets-inspect":
+        from .targets import describe_targets, load_targets
+
+        print(json.dumps(describe_targets(load_targets(args.file)), ensure_ascii=False))
+        return 0
     if cmd in (None, "work", "_round", "status"):
         from .worker_sources import configure
 
@@ -1027,8 +1097,12 @@ def main(argv: list[str] | None = None) -> int:
                     "events": True,
                     "activity": 1,
                     "roadmap_focus": 1,
+                    "roadmap_targets": 1,
+                    "targets_inspect": 1,
                     "self_tested": 1,
                     "source_selection": 1,
+                    "prefer_forge": 1,
+                    "review_first": 1,
                     "graceful_restart": 1,
                 }
             )
@@ -1284,14 +1358,20 @@ def cmd_status(args) -> int:
 
         worker = Worker(cfg, gh, rs, counters, None, None)
         options = RoundOpts(only=[], agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
-        sources = collect(worker, options)
+        sources = collect(worker, options, display=True)
         sv = next((item[2] for item in sources if item[0] == "github"), sources[0][2])
     else:
-        sv = survey(cfg, gh, rs, counters, deep=True)
+        from .umbrellas import display_umbrella
+
+        sv = survey(cfg, gh, rs, counters, deep=True, umbrella=display_umbrella(gh))
     _, quota_snap = Quota(cfg).choose(None)
 
     if getattr(args, "json", False):
-        out = {"survey": dataclasses.asdict(sv), "quota": {k: dataclasses.asdict(v) for k, v in quota_snap.items()}}
+        out = {
+            "survey": dataclasses.asdict(sv),
+            "quota": {k: dataclasses.asdict(v) for k, v in quota_snap.items()},
+            "pace_curves": effective_pace_specs(),
+        }
         if sources is not None:
             out["sources"] = {name: dataclasses.asdict(value) for name, _, value in sources}
         print(json.dumps(out, indent=2, default=str))
@@ -1324,9 +1404,12 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             raise Die(problem)
         require_admin()  # Before quota/model selection, including on the loop-driver path.
     if one_round and not getattr(args, "dry_run", False):
+        from . import review_app
         from .github_outbox import drain
 
         pending = drain()
+        # The review App's retained writes live in its own outbox and replay under its own token.
+        pending += review_app.drain()
         if pending:
             log(f"GitHub publications awaiting retry or reconciliation: {len(pending)}; retaining completed work")
             reason = f"{len(pending)} retained GitHub publications awaiting retry or reconciliation"
@@ -1345,6 +1428,11 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
             "--host is now the default (the agent runs directly on the host); it is a no-op. "
             "Pass --bubble to run inside the sandbox instead"
         )
+    normalize_claude_usage_credentials()
+    # The pacer reads this to know which Claude credential the agents receive; loop children re-pin it.
+    os.environ["TAUCETI_CLAUDE_AGENT_CREDENTIAL"] = claude_agent_credential_route(
+        only, bubble=getattr(args, "bubble", False)
+    )
     author_model = getattr(args, "author_model", None)
     author_effort = getattr(args, "author_effort", None)
     resolved_author_fallback_model = getattr(args, "resolved_author_fallback_model", None)
@@ -1363,6 +1451,15 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     # roadmap_skip()).
     if getattr(args, "roadmap_skip", None) is not None:
         os.environ["TAUCETI_ROADMAP_SKIP"] = args.roadmap_skip
+    # --roadmap-targets likewise. The path is made absolute for loop children, and the driver parses
+    # the file once so that a missing or unmarked list stops the worker at startup.
+    if getattr(args, "roadmap_targets", None) is not None:
+        chosen = args.roadmap_targets.strip()
+        os.environ["TAUCETI_ROADMAP_TARGETS"] = str(Path(chosen).expanduser().resolve()) if chosen else ""
+    if not one_round and roadmap_targets() is not None:
+        from .targets import load_targets
+
+        load_targets(roadmap_targets())
     # Persist the operator's choice into loop children and recovery rounds.
     if getattr(args, "self_tested", None) is not None:
         os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
@@ -1469,9 +1566,13 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
     from .activity import pin_root
 
     pin_root()
+    if problem := claude_usage_configuration_problem(Config.resolve(wid), check_identity=False):
+        raise Die(problem)
     if wid != "default" or getattr(args, "isolate_home", False):
         isolate_home(wid)
     cfg = Config.resolve(wid)
+    if problem := claude_usage_configuration_problem(cfg, check_identity=False):
+        raise Die(problem)
     # Tee this process's log() output to a per-worker file so a `work --loop` started in a bare terminal
     # still leaves an on-disk record to monitor. The loop driver picks one session file and exports its
     # path; the _round children it spawns inherit TAUCETI_LOG_FILE and append to the SAME file.
@@ -1714,6 +1815,21 @@ def cmd_host_doctor(args) -> int:
         rows.append(
             ("claude creds", _claude_keychain_creds() is not None, 'macOS login Keychain ("Claude Code-credentials")')
         )
+    usage_creds = claude_usage_credentials()
+    if usage_creds is not None:
+        problem = claude_usage_configuration_problem(cfg)
+        assertion = (
+            "local account fields agree"
+            if claude_usage_identity_verified(cfg)
+            else ("same-account identity is an operator assertion; no comparable local identity")
+        )
+        rows.append(
+            (
+                "claude usage",
+                _safe_exists(usage_creds) and not problem,
+                problem or f"{usage_creds} (usage only; {assertion}; agent phases checked by work)",
+            )
+        )
     kiro_db = kiro_data_dir(cfg.home) / "data.sqlite3"
     rows.append(
         (
@@ -1846,6 +1962,17 @@ def preflight(cfg: Config, opts: RoundOpts) -> None:
 
 def cli_main() -> int:
     """Console-script entry point (also used by ./tauceti). Maps the worker's exceptions to exit codes."""
+    from tauceti_tools.project import conf_argument
+
+    _, arguments = conf_argument(sys.argv[1:])
+    if arguments[:1] == ["_targets-inspect"]:
+        # Fleet's offline parser must not repair installed scripts or write failure/runtime
+        # records merely because an operator is validating a proposed list.
+        try:
+            return main() or 0
+        except Die as error:
+            print(f"tauceti: {error}", file=sys.stderr)
+            return 2
     # A service has no login shell to provide NIX_SSL_CERT_FILE, and uv's standalone CPython may not
     # know the host's CA-bundle path. Repair the process environment before quota telemetry and child
     # launches; this also gives other TLS-using subprocesses the same host trust store.

@@ -61,15 +61,18 @@ def start(unit):
     if not unit.endswith(".service") or pid_of(unit):
         return
     cwd = setting(unit, "WorkingDirectory")
-    proc = subprocess.Popen(["sleep", "600"], cwd=cwd, start_new_session=True, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    (state / f"{unit}.pid").write_text(str(proc.pid))
-    if unit.startswith("tauceti-queue-repair") and not unit.startswith("tauceti-queue-repair-cleanup"):
-        env = {}
+    repair = unit.startswith("tauceti-queue-repair") and not unit.startswith("tauceti-queue-repair-cleanup")
+    env = {}
+    if repair:
         for line in Path(setting(unit, "EnvironmentFile")).read_text().splitlines():
             if "=" in line and not line.startswith("#"):
                 key, value = line.split("=", 1)
                 env[key] = value
+    # the process gets its unit's EnvironmentFile, as under systemd
+    proc = subprocess.Popen(["sleep", "600"], cwd=cwd, start_new_session=True, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, **env})
+    (state / f"{unit}.pid").write_text(str(proc.pid))
+    if repair:
         root = Path(env["TAUCETI_QUEUE_TASK_ROOT"])
         root.mkdir(parents=True, exist_ok=True)
         baked = Path(cwd) / "tauceti_queue/_revision.py"
@@ -99,7 +102,12 @@ elif command == "is-active":
     sys.exit(0 if pid_of(rest[0]) else 3)
 elif command == "show":
     prop, unit = rest[1], rest[2]
-    print(pid_of(unit) if prop == "MainPID" else fragment(unit) if prop == "FragmentPath" else "")
+    if prop == "ControlGroup":
+        # where systemd put the running process: its unit's slice, under tauceti.slice when it names one
+        slice_ = None if os.environ.get("FAKE_SYSTEMD_IGNORES_SLICE") else setting(unit, "Slice")
+        print((f"/user.slice/tauceti.slice/{slice_}/{unit}" if slice_ else f"/user.slice/app.slice/{unit}") if pid_of(unit) else "")
+    else:
+        print(pid_of(unit) if prop == "MainPID" else fragment(unit) if prop == "FragmentPath" else "")
 elif command == "list-units":
     pass
 else:
@@ -319,6 +327,12 @@ class Releases(unittest.TestCase):
         )
         self.assertEqual(self.cwd("tauceti-queue-repair.service"), str(self.checkout))
         self.assertIn("--upgrade-package tauceti-tools", (self.state / "uv-calls").read_text())
+        self.assertEqual(
+            self.setting("tauceti-queue-clone-maintenance.service", "ExecStart"),
+            f"/usr/bin/env bash {release}/services/queue/clone-maintenance.sh",
+        )
+        calls = (self.state / "calls").read_text()
+        self.assertIn("tauceti-queue-clone-maintenance.timer", re.findall(r"^.*enable.*$", calls, re.M)[-1])
 
     def test_override_warns_and_rollback_reuses_an_existing_release(self):
         self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
@@ -348,6 +362,163 @@ class Releases(unittest.TestCase):
         log = self.run_script("install.sh", expect=1)
         self.assertIn("drop-in", log)
         self.assertFalse(self.releases.exists())
+
+    def claims(self, *rows):
+        """The controller's claims table with ROWS of (worker, expires_at, released_at)."""
+        import sqlite3
+
+        path = self.home / "TauCetiQueue-data/queue.sqlite3"
+        path.unlink()
+        with sqlite3.connect(path) as db:
+            db.execute(
+                "CREATE TABLE claims (id INTEGER PRIMARY KEY, operation TEXT, worker TEXT, task_id INTEGER,"
+                " expires_at REAL, released_at REAL)"
+            )
+            for worker, expires_at, released_at in rows:
+                db.execute(
+                    "INSERT INTO claims (operation, worker, task_id, expires_at, released_at) VALUES ('repair', ?, 7, ?, ?)",
+                    (worker, expires_at, released_at),
+                )
+
+    def test_when_idle_waits_while_the_worker_holds_a_claim(self):
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        pid = self.pid("tauceti-queue-repair@2.service")
+        self.commit("second")
+        self.claims(("repair-2@host", time.time() + 900, None))
+        log = self.run_script(
+            "install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "1", "--wait", "10", expect=3
+        )
+        self.assertIn("waiting before restarting tauceti-queue-repair@2.service: repair-2@host holds claim", log)
+        self.assertIn("(task 7, repair, expires_at +", log)
+        self.assertIn("was not restarted", log)
+        self.assertEqual(self.pid("tauceti-queue-repair@2.service"), pid)
+        self.assertEqual(len(self.release_dirs()), 1)
+
+    def test_when_idle_asks_about_the_identity_the_running_worker_has(self):
+        """An environment file edited since the worker started does not hide the running worker's claim."""
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        pid = self.pid("tauceti-queue-repair@2.service")
+        env_file = self.home / ".config/tauceti-queue/repair-environment-2"
+        env_file.write_text(env_file.read_text() + "TAUCETI_QUEUE_WORKER=renamed@host\n")
+        self.claims(("repair-2@host", time.time() + 900, None))
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "1", expect=3)
+        self.assertIn("repair-2@host holds claim", log)
+        self.assertEqual(self.pid("tauceti-queue-repair@2.service"), pid)
+
+    def test_when_idle_waits_for_an_expired_claim_the_controller_has_not_released(self):
+        """A renewal waiting for the controller's lock keeps an expired claim; only the release ends it."""
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        self.claims(("repair-2@host", time.time() - 5, None))
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "1", expect=3)
+        self.assertIn("repair-2@host holds claim", log)
+
+    def test_when_idle_ignores_released_and_other_workers_claims(self):
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        pid = self.pid("tauceti-queue-repair@2.service")
+        second = self.commit("second")
+        now = time.time()
+        self.claims(
+            ("repair-2@host", now + 900, now - 5),
+            ("repair-2@host", now - 900, now - 1000),
+            ("repair@host", now + 900, None),
+        )
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--wait", "10")
+        self.assertEqual(
+            log.count("tauceti-queue-repair@2.service holds no claim"), 2, log
+        )  # before the install, before the restart
+        self.assertNotEqual(self.pid("tauceti-queue-repair@2.service"), pid)
+        [release] = self.release_dirs(second)
+        self.assertEqual(self.cwd("tauceti-queue-repair@2.service"), str(release))
+
+    def test_when_idle_needs_a_restart_and_a_readable_database(self):
+        log = self.run_script("install-repair.sh", "--when-idle", "--no-restart", expect=1)
+        self.assertIn("exclusive", log)
+        (self.home / "TauCetiQueue-data/queue.sqlite3").unlink()
+        log = self.run_script("install-repair.sh", "--when-idle", expect=1)
+        self.assertIn("does not exist", log)
+        self.assertFalse(self.releases.exists())
+
+    def test_repair_workers_run_in_the_low_priority_slice(self):
+        """Every repair unit the installer writes runs niced, at the lowest best-effort IO priority and in tauceti-repair.slice, below
+        the fleet's VMs; the slice is installed as it is, naming no release."""
+        self.run_script("install-repair.sh", "--wait", "10")
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        for unit in ("tauceti-queue-repair.service", "tauceti-queue-repair@2.service"):
+            self.assertEqual(self.setting(unit, "Slice"), "tauceti-repair.slice", unit)
+            self.assertEqual(self.setting(unit, "Nice"), "10", unit)
+            self.assertEqual(self.setting(unit, "IOSchedulingClass"), "best-effort", unit)
+            self.assertEqual(self.setting(unit, "IOSchedulingPriority"), "7", unit)
+            self.assertEqual(self.setting(unit, "OOMScoreAdjust"), "1000", unit)
+        slice_unit = (self.units / "tauceti-repair.slice").read_text()
+        self.assertEqual(slice_unit, (REPO / "services/queue/tauceti-repair.slice").read_text())
+        self.assertNotIn("TauCetiQueue-releases", slice_unit, "the slice must not keep a release alive")
+        self.assertEqual(re.findall(r"^CPUWeight=(\d+)$", slice_unit, re.M), ["10"])
+        self.assertEqual(re.findall(r"^IOWeight=(\d+)$", slice_unit, re.M), ["10"])
+        # TauCetiFleet sets memory.high live under its shared ceiling; a unit value would fight it.
+        self.assertNotRegex(slice_unit, r"(?m)^Memory(High|Max)=")
+
+    def test_repair_install_fails_when_the_worker_is_not_in_its_slice(self):
+        self.env["FAKE_SYSTEMD_IGNORES_SLICE"] = "1"
+        log = self.run_script("install-repair.sh", "--wait", "4", expect=2)
+        self.assertIn("not tauceti-repair.slice", log)
+
+    def test_security_audit_install_moves_only_the_pool(self):
+        self.run_script("install-monitoring.sh", "--wait", "0")
+        monitoring_pid = self.pid("tauceti-queue-monitoring.service")
+        (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
+        (self.home / ".config/tauceti-queue/security-audit-anthropic-api-key").write_text("key")
+        (self.home / ".config/tauceti-security-audit").mkdir(exist_ok=True)
+        for name in ("github-app.json", "github-private-key.pem"):
+            (self.home / ".config/tauceti-security-audit" / name).write_text("{}")
+        second = self.commit("second")
+        self.run_script("install-security-audit.sh", "--wait", "0")
+        [release] = self.release_dirs(second)
+        unit = "tauceti-queue-security-audit.service"
+        self.assertEqual(self.setting(unit, "WorkingDirectory"), str(release))
+        exec_start = self.setting(unit, "ExecStart")
+        self.assertTrue(
+            exec_start.startswith(f"{release}/.venv/bin/python -m tauceti_worker.security_audit pool "), exec_start
+        )
+        self.assertIn("--state %h/TauCetiQueue-data/security-audit-pool/state/pool/security-audit", exec_start)
+        self.assertEqual(self.cwd(unit), str(release))
+        self.assertEqual(self.pid("tauceti-queue-monitoring.service"), monitoring_pid)
+
+    def test_security_audit_unit_state_is_the_pool_workers_audit_state(self):
+        text = (REPO / "services/queue/tauceti-queue-security-audit.service").read_text().replace("%h", str(self.home))
+        root = re.search(r"^Environment=TAUCETI_LEGACY_DATA_ROOT=(\S+)$", text, re.M).group(1)
+        state = Path(re.search(r"--state (\S+)", text).group(1))
+        script = (
+            "import sys; from pathlib import Path; from tauceti_worker.config import Config; "
+            "s = Path(sys.argv[1]); print(Config.resolve(s.parent.name).state / 'security-audit')"
+        )
+        env = dict(os.environ, TAUCETI_LEGACY_DATA_ROOT=root, HOME=str(self.home))
+        env.pop("TAUCETI_PROJECT_STATE", None)
+        resolved = subprocess.run(
+            [sys.executable, "-c", script, str(state)], cwd=REPO, env=env, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        self.assertEqual(Path(resolved), state)
+
+    def test_security_audit_drop_in_is_refused(self):
+        (self.home / ".config/tauceti-queue/security-audit-zulip.json").write_text("{}")
+        (self.home / ".config/tauceti-queue/security-audit-anthropic-api-key").write_text("key")
+        (self.home / ".config/tauceti-security-audit").mkdir(exist_ok=True)
+        for name in ("github-app.json", "github-private-key.pem"):
+            (self.home / ".config/tauceti-security-audit" / name).write_text("{}")
+        dropins = self.units / "tauceti-queue-security-audit.service.d"
+        dropins.mkdir(parents=True)
+        (dropins / "override.conf").write_text("[Service]\n")
+        log = self.run_script("install-security-audit.sh", "--wait", "0", expect=1)
+        self.assertIn("drop-in", log)
+        self.assertFalse((self.units / "tauceti-queue-security-audit.service").exists())
+
+    def test_repair_slice_drop_in_is_refused(self):
+        dropins = self.units / "tauceti-repair.slice.d"
+        dropins.mkdir()
+        (dropins / "override.conf").write_text("[Slice]\nCPUWeight=100\n")
+        log = self.run_script("install-repair.sh", "--wait", "10", expect=1)
+        self.assertIn("drop-in", log)
+        self.assertFalse(self.releases.exists())
+        self.assertFalse((self.units / "tauceti-repair.slice").exists())
 
     def test_failed_fetch_stops_the_install_rather_than_using_the_cached_origin(self):
         self.origin.rename(self.root / "origin-gone")
@@ -452,6 +623,127 @@ class Releases(unittest.TestCase):
         [release] = self.release_dirs(self.first)
         self.assertEqual(self.setting("tauceti-queue-repair-cleanup.service", "WorkingDirectory"), str(release))
         self.assertTrue((self.units / "tauceti-queue-repair-cleanup.timer").exists())
+
+
+def _kill_group(pid):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+class CloneMaintenance(unittest.TestCase):
+    """`clone-maintenance.sh` runs only concurrency-safe tasks and clears a lock nothing holds."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.clone = Path(self.tmp.name) / "clone"
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid"}
+        env.update(GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        self.env = env
+        # A commit may start a detached automatic maintenance, which takes and then removes
+        # objects/maintenance.lock behind the test (and counts as a maintenance run) whenever it is
+        # slow to finish, as on a loaded CI runner. The fixture's own commits never start one.
+        quiet = {**env, "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "maintenance.auto", "GIT_CONFIG_VALUE_0": "false"}
+        quiet.update(GIT_CONFIG_KEY_1="gc.auto", GIT_CONFIG_VALUE_1="0")
+        subprocess.run(["git", "init", "-q", str(self.clone)], check=True, env=quiet)
+        for index in range(3):
+            (self.clone / f"f{index}").write_text(f"{index}\n")
+            subprocess.run(["git", "-C", str(self.clone), "add", "-A"], check=True, env=quiet)
+            subprocess.run(["git", "-C", str(self.clone), "commit", "-qm", str(index)], check=True, env=quiet)
+            subprocess.run(["git", "-C", str(self.clone), "update-ref", f"refs/x/{index}", "HEAD"], check=True)
+        self.lock = self.clone / ".git/objects/maintenance.lock"
+
+    def run_script(self, *args):
+        return subprocess.run(
+            ["bash", str(REPO / "services/queue/clone-maintenance.sh"), "--clone", str(self.clone), *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", str(self.clone), *args], check=True, capture_output=True, text=True).stdout
+
+    def test_maintains_the_clone_and_turns_automatic_maintenance_off(self):
+        for _ in range(2):  # loose-objects packs them, and deletes the packed copies the next time
+            result = self.run_script()
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("config", "--local", "maintenance.auto").strip(), "false")
+        self.assertIn("refs/x/2", (self.clone / ".git/packed-refs").read_text(), "pack-refs ran")
+        self.assertEqual(self.git("count-objects", "-v").split("count: ")[1].split("\n")[0], "0", "loose-objects ran")
+        self.assertFalse(self.lock.exists())
+
+    def test_a_stale_unheld_lock_is_removed_and_a_recent_one_is_left(self):
+        self.lock.write_text("")
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already running", result.stderr)
+        self.assertTrue(self.lock.exists(), "a recent lock may belong to a live run")
+        old = time.time() - 7 * 3600
+        os.utime(self.lock, (old, old))
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removing a stale maintenance lock", result.stderr)
+        self.assertFalse(self.lock.exists())
+        self.assertIn("refs/x/2", (self.clone / ".git/packed-refs").read_text())
+
+    def test_an_old_lock_is_kept_while_any_git_maintenance_runs(self):
+        self.lock.write_text("")
+        old = time.time() - 7 * 3600
+        os.utime(self.lock, (old, old))
+        # A maintenance run elsewhere (a linked worktree's, say) that names no path of this clone.
+        fake = Path(self.tmp.name) / "bin/git"
+        fake.parent.mkdir()
+        fake.write_text("#!/bin/sh\nsleep 30\n")
+        fake.chmod(0o755)
+        direct = fake.with_name("git-maintenance")
+        shutil.copy(fake, direct)
+        for argv in ([str(fake), "maintenance", "run"], [str(direct), "run"]):
+            holder = subprocess.Popen(argv, start_new_session=True)
+            self.addCleanup(_kill_group, holder.pid)
+            time.sleep(0.2)
+            result = self.run_script()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("already running", result.stderr, argv)
+            self.assertTrue(self.lock.exists())
+            _kill_group(holder.pid)
+            holder.wait()
+
+    def test_a_second_run_waits_for_none_and_touches_nothing(self):
+        git_dir = self.clone / ".git"
+        holder = subprocess.Popen(
+            ["flock", str(git_dir / "tauceti-clone-maintenance.lock"), "sleep", "30"], start_new_session=True
+        )
+        self.addCleanup(_kill_group, holder.pid)
+        time.sleep(0.2)
+        self.lock.write_text("")
+        old = time.time() - 7 * 3600
+        os.utime(self.lock, (old, old))
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("another clone maintenance is running", result.stderr)
+        self.assertTrue(self.lock.exists(), "the running script's run owns what happens to it")
+
+    def test_the_unit_reads_the_controllers_environment(self):
+        unit = (REPO / "services/queue/tauceti-queue-clone-maintenance.service").read_text()
+        controller = (REPO / "services/queue/tauceti-queue.service").read_text()
+        environment = re.findall(r"^EnvironmentFile=.*$", controller, re.M)
+        self.assertTrue(environment)
+        for line in environment:
+            self.assertIn(line, unit)
+
+    def test_no_clone_yet_is_not_an_error(self):
+        result = subprocess.run(
+            ["bash", str(REPO / "services/queue/clone-maintenance.sh"), "--clone", str(self.clone / "missing")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("nothing to maintain yet", result.stderr)
 
 
 class Revision(unittest.TestCase):

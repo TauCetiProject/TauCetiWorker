@@ -161,7 +161,7 @@ class WebhookReceiver:
                 relevant = (
                     eligibility.KEEP
                     | self.controller._no_repair_labels()
-                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair"}
+                    | {"needs-rebase", "self-tested", "full-lint", "lint-repair", "large-refactor"}
                 )
                 return isinstance(label, str) and bool(label) and label.lower() not in relevant
             if action == "edited":

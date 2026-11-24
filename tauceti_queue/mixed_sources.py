@@ -6,10 +6,12 @@ import hashlib
 import threading
 import time
 
+from tauceti_tools.forge import ForgeError
+
 from . import chain
 from .admission_state import AdmissionState
 from .controller import ControllerError
-from .mixed_identity import SourceNumber
+from .mixed_identity import SourceNumber, source_record
 from .store import dumps, loads
 
 
@@ -127,7 +129,12 @@ class NativePoller:
 
     def __init__(self, registry, controller):
         self.registry, self.controller = registry, controller
-        self.state = AdmissionState(controller.store, registry.profile.forgejo.repository.key, clock=controller.clock)
+        self.state = AdmissionState(
+            controller.store,
+            registry.profile.forgejo.repository.key,
+            clock=controller.clock,
+            inputs=(controller.repository, source_record(registry.number(1))),
+        )
         self.last_summary = None
         self._serial = 0
         self._lock = threading.Lock()
@@ -657,7 +664,10 @@ class MixedSources:
         self.check_native(number)
         if not chain.object_exists(self.clone, head):
             ref = "refs/tauceti-queue/pulls/" + number.ref_key
-            self.native.fetch_refs(self.profile.forgejo.repository.name, [f"+refs/pull/{int(number)}/head:{ref}"])
+            try:
+                self.native.fetch_refs(self.profile.forgejo.repository.name, [f"+refs/pull/{int(number)}/head:{ref}"])
+            except ForgeError:
+                pass  # a fork PR can lack its pull ref; the exact head commit is still fetched below
         if not chain.object_exists(self.clone, head):
             self.native.fetch_refs(self.profile.forgejo.repository.name, [head])
         return chain.object_exists(self.clone, head)

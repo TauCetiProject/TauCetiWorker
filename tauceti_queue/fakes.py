@@ -14,6 +14,7 @@ no inference.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -37,6 +38,7 @@ from .ports import (
     PullRequest,
     Status,
     Task,
+    recovery_body,
 )
 
 
@@ -233,9 +235,8 @@ class FakeGitHub:
         self.repository_labels: dict[str, tuple[str, str]] = {}
         self.closed: dict[int, str] = {}
         self.statuses: dict[tuple[str, str], Status] = {}
+        self.main_integration_requests: list[tuple[int, str, str]] = []
         self.declaration_records: dict[str, dict] = {}
-        # `ci.yml`'s conclusion per pushed SHA of main (`main_ci_run`); no entry means no run.
-        self.main_ci: dict[str, str] = {}
         self.runs: list[FakeRun] = []
         # pr-build.yml's concurrency group with cancel-in-progress: a new dispatch for a candidate
         # cancels any queued or in-progress run for the same batch and head.
@@ -396,6 +397,10 @@ class FakeGitHub:
                     run.conclusion = "success"
                     post("build", "success", "Build succeeded")
                     policy = {}
+                elif run.verdict == "incomplete":
+                    # The `sandboxed-build` runner died before its report step: the finalizer posts this.
+                    run.conclusion = "failure"
+                    post("build", "failure", "sandboxed merge-group build did not complete")
                 elif run.verdict == "cancel":
                     run.conclusion = "cancelled"
                 elif run.verdict == "no-status":
@@ -501,6 +506,7 @@ class FakeGitHub:
         batch_id: str,
         members: Sequence[int],
         repair_outputs_revs: Sequence[str] = (),
+        attested: bool = False,
     ) -> str:
         with self.lock:
             self._call("dispatch_candidate", head_sha, base_sha, batch_id)
@@ -531,7 +537,7 @@ class FakeGitHub:
             )
             self.runs.append(run)
             dispatch = {
-                "event_type": "tauceti-bors-staging",
+                "event_type": "tauceti-bors-attested" if attested else "tauceti-bors-staging",
                 "client_payload": {
                     "head_sha": head_sha,
                     "base_sha": base_sha,
@@ -593,25 +599,16 @@ class FakeGitHub:
             self._call("commit_status", sha, context)
             return self.statuses.get((sha, context))
 
-    def main_ci_run(self, repo: str, sha: str) -> CandidateRun | None:
+    def dispatch_main_integration(self, repo: str, *, pr: int, head_sha: str, main_sha: str) -> None:
+        """Records the request; a test posts the `main-integration` status itself (`post_status`)."""
         with self.lock:
-            self._call("main_ci_run", sha)
-            if sha not in self.main_ci:
-                return None
-            conclusion = self.main_ci[sha]
-            return CandidateRun(
-                run_id=f"main-{sha[:12]}",
-                attempt=1,
-                status="in_progress" if conclusion == "in_progress" else "completed",
-                conclusion=None if conclusion == "in_progress" else conclusion,
-                created_at=None,
-                started_at=None,
-                completed_at=None,
-                runner_name=None,
-                runner_labels=(),
-                host=None,
-                html_url=f"https://github.invalid/actions/runs/main-{sha[:12]}",
-            )
+            self._call("dispatch_main_integration", pr, head_sha, main_sha)
+            self.main_integration_requests.append((pr, head_sha, main_sha))
+
+    def main_integration_statuses(self, repo: str, heads) -> dict[str, Status | None]:
+        with self.lock:
+            self._call("main_integration_statuses", tuple(heads))
+            return {head: self.statuses.get((head, "main-integration")) for head in heads}
 
     def fast_forward_leased(self, repo: str, branch: str, expected_parent: str, tip: str) -> FastForwardResult:
         return self.fast_forward(repo, branch, expected_parent, tip)
@@ -646,7 +643,9 @@ class FakeGitHub:
         else:
             run_git(self.repo.origin, "update-ref", ref, sha)
 
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
+    def post_comment(self, repo: str, number: int, body: str, marker: str, *, recovery_head: str | None = None) -> str:
+        if recovery_head is not None:
+            body = recovery_body(body, recovery_head)
         with self.lock:
             self._call("post_comment", number, marker)
             for comment in self.comments:
@@ -756,15 +755,34 @@ class FakeGitHub:
             paths = ()
         from tauceti_tools.self_tested import accepted, allowed_paths
 
-        local = accepted(
-            pull.labels, member=pull.author_login in getattr(self, "self_tested_members", set())
-        ) and allowed_paths(paths)
+        local = accepted(pull.labels) and allowed_paths(paths)
         from . import diff_guard
 
-        guard = diff_guard.violations(self.repo.clone, base, pull.head_sha) if local else ()
-        return AdmissionSnapshot(
-            pull, base, paths, tuple(source["comments"]), source["statuses"], base, self_tested=local, diff_guard=guard
+        exempt = pull.head_sha in getattr(self, "large_refactor_heads", set())
+        guard = (
+            diff_guard.violations(self.repo.clone, base, pull.head_sha, large_refactor=exempt)
+            if local or exempt
+            else ()
         )
+        return AdmissionSnapshot(
+            pull,
+            base,
+            paths,
+            tuple(source["comments"]),
+            source["statuses"],
+            base,
+            self_tested=local,
+            diff_guard=guard,
+            large_refactor=exempt,
+        )
+
+    def bump_guard(self, repo, head):
+        """`bump_verdicts[head]`: True or False is the verdict, None an unreadable input."""
+        self._call("bump_guard", head)
+        verdict = getattr(self, "bump_verdicts", {}).get(head, False)
+        if verdict is None:
+            raise GitHubUnavailable("fake bump-guard inputs unavailable")
+        return verdict
 
     def list_open_pull_requests(
         self, repo: str, *, review_app_id: int, admission=False, on_page=None
@@ -817,7 +835,8 @@ class ScriptedAgent:
     replayed mechanically onto the new tip; a member whose mechanical replay conflicts and has no
     resolution makes the agent give up (it releases the task with the given reason). Explanations are
     appended to the existing message, as the agent instruction requires; `omit_explanation` leaves
-    them off to exercise the controller's `explanation-required` rejection.
+    them off to exercise the controller's `explanation-required` rejection. `verified` reports, as a
+    worker does, that its own verification of the submitted tip passed (`local_verification`).
     """
 
     def __init__(
@@ -829,8 +848,10 @@ class ScriptedAgent:
         script: Script,
         *,
         omit_explanation: bool = False,
+        verified: bool = False,
     ) -> None:
         self.name = name
+        self.verified = verified
         self.login = login
         self.repo = repo
         self.workdir = Path(workdir)
@@ -858,9 +879,15 @@ class ScriptedAgent:
         tip = self.produce(task)
         if before_submit:
             before_submit(task)
-        result = controller.submit_task(task.task_id, task.claim_token, tip, worker_notes=f"{self.name} fixture run")
+        result = controller.submit_task(task.task_id, task.claim_token, tip, worker_notes=self.notes(tip))
         self.results.append(result)
         return result
+
+    def notes(self, tip: str) -> str:
+        """The worker notes a submission of `tip` carries."""
+        if not self.verified:
+            return f"{self.name} fixture run"
+        return json.dumps({"worker": self.name, "local_verification": {"tip": tip, "checks_passed": True}})
 
     def produce(self, task: Task) -> str:
         """Build the replacement chain in the agent's clone and push it to the task's submission ref."""

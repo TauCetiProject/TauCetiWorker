@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 
 from . import chain, declaration_names, diagnostics, diff_guard, github_app, ports
-from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status
+from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status, recovery_body
 
 API = github_app.API
 API_VERSION = "2022-11-28"
@@ -61,8 +61,13 @@ API_VERSION = "2022-11-28"
 DEFAULT_BACKGROUND_FLOOR = 1000
 USER_AGENT = "tauceti-queue (https://github.com/TauCetiProject/TauCetiWorker)"
 STAGING_EVENT = "tauceti-bors-staging"
+# Decision 200: a staging run of a candidate the queue's trusted worker verified, which pr-build lands
+# without rebuilding once the queue's observation attests it (TauCetiTools `bors_attested.py`).
+ATTESTED_EVENT = "tauceti-bors-attested"
+# The queue's idle-capacity test of an accepted head on current main (decision 175 B).
+MAIN_INTEGRATION_EVENT = "tauceti-main-integration"
+MAIN_INTEGRATION_CONTEXT = "main-integration"
 STAGING_WORKFLOW = "pr-build.yml"
-MAIN_WORKFLOW = "ci.yml"
 BUILD_JOB = "sandboxed-build"
 SHA = re.compile(r"[0-9a-f]{40}")
 RUN_URL = re.compile(r"/actions/runs/(\d+)(?:/|$)")
@@ -70,8 +75,6 @@ COMMENT_MARKER = "<!-- tauceti-queue {marker} -->"
 # Bors treats collaborators with push access as reviewers (`auto_reviewer_required_perm: :push`).
 REVIEWER_PERMISSIONS = frozenset({"admin", "maintain", "write"})
 MAX_LOG_BYTES = 64 * 1024 * 1024
-# How long a self-tested evaluation waits when the App cannot read team membership.
-MEMBERS_PERMISSION_RETRY_SECONDS = 900
 
 Transport = github_app.Transport
 log = logging.getLogger(__name__)
@@ -658,6 +661,21 @@ def dispatch_members(members: Sequence) -> list[dict]:
     return out
 
 
+# Bounds for the adapter's resident git caches: a few discovery passes of every open PR.
+DIFF_VERSION_CACHE = 20_000
+PRESENT_COMMIT_CACHE = 64
+# `_refresh_git_caches`'s fingerprint of a clone whose ancestry is its own: no graft, replacement or
+# shallow-file environment, no shallow file, no grafts file and no replacement refs.
+PLAIN_ANCESTRY = ((), None, None, ())
+
+
+def _remember(cache: dict, key, value, limit: int) -> None:
+    """Insert into a bounded, insertion-ordered cache, forgetting the oldest entries first."""
+    cache[key] = value
+    while len(cache) > limit:
+        del cache[next(iter(cache))]
+
+
 def _batch_id(value):
     return int(value) if str(value).isdigit() else value
 
@@ -703,6 +721,16 @@ class GitHubAdapter:
         self.merge_base_sources = {"local": 0, "compare": 0}
         # Slice 5: which admission evaluations took the single GraphQL read, and which fell back.
         self.snapshot_sources = {"single": 0, "full": 0}
+        # `_diff_version` of two commits never changes while the clone's ancestry is its own (no
+        # shallow boundary, grafts or replacements), and discovery asks it of every open PR against
+        # the same canonical tip on every pass: one git process per PR, not per pass. Both caches
+        # are checked again at the start of each discovery pass (`_refresh_git_caches`).
+        self._diff_versions: dict[tuple[str, str], str] = {}
+        self._present_commits: dict[str, None] = {}
+        self._ancestry: tuple | None = None
+        self._cache_lock = threading.Lock()
+        # Seconds this thread spent in `fetch_refs`, for admission's per-evaluation timing.
+        self._fetch_timing = threading.local()
 
     # -- pull requests
 
@@ -751,7 +779,15 @@ class GitHubAdapter:
             raise GitHubError("fetch_refs needs a clone directory")
         if self._tokens is None:
             raise GitHubError("fetch_refs needs the installation token source")
-        self._git_with_token(repo, ["fetch", "--no-tags", "--quiet", f"https://github.com/{repo}.git", *refspecs])
+        started = time.monotonic()
+        try:
+            self._git_with_token(repo, ["fetch", "--no-tags", "--quiet", f"https://github.com/{repo}.git", *refspecs])
+        finally:
+            self._fetch_timing.seconds = self.fetch_seconds() + time.monotonic() - started
+
+    def fetch_seconds(self) -> float:
+        """Seconds this thread has spent fetching into the clone (see `fetch_refs`)."""
+        return getattr(self._fetch_timing, "seconds", 0.0)
 
     def _git_with_token(self, repo: str, args: Sequence[str], *, check=True) -> subprocess.CompletedProcess:
         """Run git in the clone with the installation token as an `http.extraheader` in the environment."""
@@ -905,14 +941,16 @@ class GitHubAdapter:
         batch_id,
         members: Sequence,
         repair_outputs_revs: Sequence[str] = (),
+        attested: bool = False,
     ) -> str:
         """`repository_dispatch` of pr-build.yml as Bors sends it; returns the run title.
 
         The payload adds `repair_outputs_revs`, the revisions whose published build outputs CI may
-        restore when none are published for `head_sha` (empty when the caller names none).
+        restore when none are published for `head_sha` (empty when the caller names none). `attested`
+        sends it as an attested landing (`ATTESTED_EVENT`); the run title is the same.
         """
         payload = {
-            "event_type": STAGING_EVENT,
+            "event_type": ATTESTED_EVENT if attested else STAGING_EVENT,
             "client_payload": {
                 "head_sha": head_sha,
                 "base_sha": base_sha,
@@ -933,6 +971,62 @@ class GitHubAdapter:
                 ) from error
             raise
         return dispatch_title(base_ref, _batch_id(batch_id), head_sha, base_sha)
+
+    def dispatch_main_integration(self, repo: str, *, pr: int, head_sha: str, main_sha: str) -> None:
+        """`repository_dispatch` of TauCeti's main-integration.yml: build `head_sha` merged onto
+        exactly `main_sha` on idle Fleet PR capacity, reported as the `main-integration` status on
+        the head (TauCetiTools docs/main-integration.md). One call; never retried here."""
+        for sha in (head_sha, main_sha):
+            if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
+                raise ValueError("main-integration needs two commit SHAs")
+        payload = {
+            "event_type": MAIN_INTEGRATION_EVENT,
+            "client_payload": {"pr": int(pr), "head_sha": head_sha, "main_sha": main_sha},
+        }
+        try:
+            self.client.request("POST", f"repos/{repo}/dispatches", json_body=payload, ok=(204,), single_attempt=True)
+        except GitHubError as error:
+            if isinstance(error, RequestDeferred) or error.status in {400, 401, 403, 404, 405, 410, 415, 422, 429}:
+                raise ports.DispatchNotAccepted(
+                    str(error),
+                    retry_at=getattr(error, "retry_at", None),
+                    retryable=isinstance(error, RequestDeferred),
+                ) from error
+            raise
+
+    def main_integration_statuses(self, repo: str, heads: Sequence[str]) -> dict[str, ports.Status | None]:
+        """The latest `main-integration` status of each head, by GraphQL, 50 heads a query.
+
+        A head the repository does not have, or without the context, maps to None."""
+        owner, name = repo.split("/", 1)
+        result: dict[str, ports.Status | None] = {}
+        unique = [head for head in dict.fromkeys(heads) if re.fullmatch(r"[0-9a-f]{40}", head or "")]
+        for start in range(0, len(unique), 50):
+            chunk = unique[start : start + 50]
+            fields = " ".join(
+                f'h{index}: object(oid: "{head}") {{ ... on Commit {{ status {{ '
+                f'context(name: "{MAIN_INTEGRATION_CONTEXT}") {{ state description targetUrl createdAt }} }} }} }}'
+                for index, head in enumerate(chunk)
+            )
+            data = self.client.graphql(
+                f"query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ {fields} }} }}",
+                {"owner": owner, "name": name},
+            )
+            repository = (data or {}).get("repository") or {}
+            for index, head in enumerate(chunk):
+                node = repository.get(f"h{index}") or {}
+                context = ((node.get("status") or {}).get("context")) if isinstance(node, dict) else None
+                if not isinstance(context, dict):
+                    result[head] = None
+                    continue
+                result[head] = ports.Status(
+                    state=str(context.get("state") or "").lower(),
+                    description=str(context.get("description") or ""),
+                    target_url=str(context.get("targetUrl") or ""),
+                    updated_at=_timestamp(context.get("createdAt")),
+                    run_id=run_id_from_url(context.get("targetUrl")),
+                )
+        return result
 
     def find_candidate_run(
         self,
@@ -977,21 +1071,6 @@ class GitHubAdapter:
         if len(matches) > 1:
             raise AmbiguousCandidateRun(f"{len(matches)} runs titled {expected!r}")
         return self.candidate_run(repo, matches[0], with_jobs=with_jobs, with_diagnostics=with_diagnostics)
-
-    def main_ci_run(self, repo: str, sha: str) -> CandidateRun | None:
-        """`GET repos/{repo}/actions/workflows/ci.yml/runs?head_sha=<sha>&event=push`, newest first: one
-        call that raises instead of retrying or waiting, so the controller never sleeps on it."""
-        with self.client.deferred_requests(urgent=True):
-            response = self.client.request(
-                "GET",
-                f"repos/{repo}/actions/workflows/{MAIN_WORKFLOW}/runs",
-                params={"head_sha": sha, "event": "push", "per_page": 1},
-                single_attempt=True,
-            )
-        runs = (response.json() or {}).get("workflow_runs") or []
-        if not runs or not isinstance(runs[0], dict) or not runs[0].get("id"):
-            return None
-        return self.candidate_run(repo, runs[0], with_jobs=False, with_diagnostics=False)
 
     def read_run(self, repo: str, run_id: str, *, with_jobs: bool = False) -> CandidateRun | None:
         """`GET repos/{repo}/actions/runs/{run_id}`: the run as GitHub reports it now, `None` on 404."""
@@ -1173,23 +1252,6 @@ class GitHubAdapter:
         record = declaration_names.parse_log(log, head_sha)
         return {**record, "run_id": run_id, "run_attempt": attempt, "job_id": job["id"]}
 
-    def team_member_read(self, path: str):
-        """A team-membership read for the self-tested route, made by the queue App itself.
-
-        It needs the App's organization `members: read` permission. Without it the read is
-        deferred with a clear reason instead of falling back to a user token or answering "not a
-        member": an unknown membership never grants admission and never withdraws one.
-        """
-        granted = getattr(self._tokens or self.client._tokens, "granted_permissions", None)
-        if granted is not None and "members" not in granted():
-            log.warning("self-tested team membership needs the queue App's organization Members: read permission")
-            raise RequestDeferred(
-                "self-tested team membership needs the queue App's organization Members: read permission",
-                retry_at=self.client._clock() + MEMBERS_PERMISSION_RETRY_SECONDS,
-                resource="members-permission",
-            )
-        return self.client.get_json(path)[1]
-
     def eligibility_checks(self, repo: str, head: str) -> list[dict]:
         """Every `merge eligibility` check run on `head`, any App (`filter=all`), as Bors lists them."""
         return self.client.paginate(
@@ -1199,18 +1261,77 @@ class GitHubAdapter:
         )
 
     def _diff_version(self, base: str, head: str) -> str:
-        if (
-            not self.clone_dir
-            or not chain.object_exists(self.clone_dir, base)
-            or not chain.object_exists(self.clone_dir, head)
-        ):
+        """The PR's merge base with its target, or `unknown:<base>` while the clone lacks either.
+
+        Known results are kept (bounded) while the clone's ancestry is stable: the merge bases of
+        two commits are then fixed. One `git merge-base` answers the common case; only its failure
+        pays for the existence checks.
+        """
+        if not self.clone_dir:
             return "unknown:" + base
-        bases = sorted(chain.git(self.clone_dir, "merge-base", "--all", base, head).split())
+        key = (base, head)
+        with self._cache_lock:
+            known = self._diff_versions.get(key)
+            cacheable = self._ancestry == PLAIN_ANCESTRY
+        if known is not None:
+            return known
+        result = chain._git(self.clone_dir, "merge-base", "--all", base, head)
+        if result.returncode not in (0, 1) or result.returncode == 1 and result.stdout.strip():
+            if not chain.object_exists(self.clone_dir, base) or not chain.object_exists(self.clone_dir, head):
+                return "unknown:" + base
+            raise chain.ChainError(f"git merge-base --all failed ({result.returncode}): {result.stderr.strip()}")
+        bases = sorted(result.stdout.split())
         if not bases:
             raise GitHubError("PR and target have no merge base")
         # Advancing main normally leaves the reviewed diff unchanged. Multiple merge bases are
         # ambiguous: retain the target identity and let the compare API resolve a fresh decision.
-        return bases[0] if len(bases) == 1 else ",".join([*bases, base])
+        version = bases[0] if len(bases) == 1 else ",".join([*bases, base])
+        if cacheable:
+            with self._cache_lock:
+                _remember(self._diff_versions, key, version, DIFF_VERSION_CACHE)
+        return version
+
+    def _refresh_git_caches(self) -> None:
+        """At the start of a discovery pass: forget which commits the clone had (an unreferenced one
+        may since have been pruned), and every merge base if the clone's ancestry changed."""
+        ancestry = None
+        if self.clone_dir:
+            try:
+                paths = chain.git(self.clone_dir, "rev-parse", "--git-path", "shallow", "--git-path", "info/grafts")
+                marks = []
+                for path in paths.split():
+                    path = os.path.join(self.clone_dir, path)
+                    marks.append(os.stat(path).st_mtime_ns if os.path.exists(path) else None)
+                replaced = chain.git(
+                    self.clone_dir, "for-each-ref", "--format=%(refname) %(objectname)", "refs/replace/"
+                )
+                ancestry = (
+                    tuple(
+                        name
+                        for name in ("GIT_GRAFT_FILE", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE")
+                        if os.environ.get(name)
+                    ),
+                    *marks,
+                    tuple(replaced.split()),
+                )
+            except (chain.ChainError, OSError):
+                ancestry = None  # unknown: nothing is kept
+        with self._cache_lock:
+            self._present_commits.clear()
+            if ancestry is None or ancestry != self._ancestry:
+                self._diff_versions.clear()
+            self._ancestry = ancestry
+
+    def _has_commit(self, sha: str) -> bool:
+        """Whether the clone has commit `sha`; a commit once seen is not asked again in this pass."""
+        with self._cache_lock:
+            if sha in self._present_commits:
+                return True
+        if not chain.object_exists(self.clone_dir, sha):
+            return False
+        with self._cache_lock:
+            _remember(self._present_commits, sha, None, PRESENT_COMMIT_CACHE)
+        return True
 
     def _local_merge_base(self, base: str, head: str) -> str | None:
         """The merge base compare would report, from the clone, or None when the clone cannot vouch
@@ -1257,8 +1378,9 @@ class GitHubAdapter:
         )
 
     def _self_tested(self, repo, number, pull, paths, merge_base):
-        """Inline self-tested eligibility (live membership and bump reads) and, for an eligible head,
-        the PR-level diff guards PR CI would have run."""
+        """Inline self-tested eligibility (live bump reads), whether an admin's
+        `large-refactor` label lifts the size caps, and, for an eligible head, the PR-level diff
+        guards PR CI would have run."""
         from tauceti_tools.self_tested import eligible, requested
 
         local = False
@@ -1276,11 +1398,29 @@ class GitHubAdapter:
                 repo,
                 paths=paths,
                 read=lambda path: self.client.get_json(path)[1],
-                member_read=self.team_member_read,
             )
-        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here.
-        guard = diff_guard.violations(self.clone_dir, merge_base, pull.head_sha) if local else ()
-        return local, guard
+        # A self-tested head skips PR CI, so admission runs PR CI's diff guards on it here. A labelled
+        # large refactor is measured too: an admin's approval of one may stand in for PR CI and review
+        # (`AdmissionIntake._large_refactor_approval`), and the caps the label keeps still apply.
+        exempt = diff_guard.large_refactor(
+            self.clone_dir, pull.head_sha, lambda path: self.client.get_json(path)[1], repo, number, pull.labels
+        )
+        measured = local or exempt
+        guard = (
+            diff_guard.violations(self.clone_dir, merge_base, pull.head_sha, large_refactor=exempt) if measured else ()
+        )
+        return local, guard, exempt
+
+    def bump_guard(self, repo: str, head: str) -> bool:
+        """The trusted Mathlib-bump check (`check-bump.sh` on main's tip, the merge base and `head`),
+        as self-tested bump eligibility runs it. Raises `GitHubUnavailable` when its inputs could not
+        be read, so the evaluation stays pending rather than deciding either way."""
+        from tauceti_tools.self_tested import _bump_policy, _ReadAPI
+
+        verdict, output = _bump_policy().check_bump(_ReadAPI(lambda path: self.client.get_json(path)[1]), repo, head)
+        if verdict is None:
+            raise ports.GitHubUnavailable(f"bump-guard for {head[:12]}: {output}"[:300])
+        return bool(verdict)
 
     def admission_snapshot_single(self, repo: str, number: int, *, generation=0) -> ports.AdmissionSnapshot:
         """The same snapshot as `admission_snapshot`, from one GraphQL read (decision 38 step 4, slice 5).
@@ -1289,7 +1429,7 @@ class GitHubAdapter:
         separate fence is needed for them; the merge base and paths come from the clone. A PR whose
         read cannot be complete in one response (over 100 comments or labels), whose head commit
         does not match, or whose merge base the clone cannot vouch for, takes the full read. Live
-        self-tested reads (membership, bump guard) happen after the response, so a self-tested
+        self-tested reads (the bump guard) happen after the response, so a self-tested
         request is fenced again exactly as the full read fences.
         """
         owner, name = repo.split("/", 1)
@@ -1346,7 +1486,7 @@ class GitHubAdapter:
             return self._full_snapshot(repo, number, generation)
         comments = tuple(_graphql_comment(comment) for comment in connection["nodes"])
         paths = self._admission_paths(merge_base, head)
-        local, guard = self._self_tested(repo, number, pull, paths, merge_base)
+        local, guard, exempt = self._self_tested(repo, number, pull, paths, merge_base)
         statuses = {
             s["context"]: str(s.get("state") or "").lower()
             for s in (commit.get("status") or {}).get("contexts", ())
@@ -1354,8 +1494,8 @@ class GitHubAdapter:
         }
         from tauceti_tools.self_tested import requested
 
-        if requested(pull.labels):
-            # Membership and bump reads came after the response: fence them as the full read does.
+        if requested(pull.labels) or exempt:
+            # Bump-guard reads came after the response: fence them as the full read does.
             fresh, statuses = self._admission_fence(repo, number, pull)
             if (fresh.head_sha, fresh.base_sha, fresh.base_ref, fresh.state, fresh.draft, sorted(fresh.labels)) != (
                 pull.head_sha,
@@ -1381,6 +1521,7 @@ class GitHubAdapter:
             self._diff_version(base, head),
             self_tested=local,
             diff_guard=guard,
+            large_refactor=exempt,
         )
 
     def _full_snapshot(self, repo, number, generation):
@@ -1429,7 +1570,7 @@ class GitHubAdapter:
         comments = tuple(
             self.client.paginate(f"repos/{repo}/issues/{number}/comments", progress=progress.setdefault("comments", {}))
         )
-        local, guard = self._self_tested(repo, number, pull, paths, merge_base)
+        local, guard, exempt = self._self_tested(repo, number, pull, paths, merge_base)
         fresh, statuses = self._admission_fence(repo, number, pull, labels_progress=progress.setdefault("labels", {}))
         if (
             fresh.head_sha,
@@ -1466,6 +1607,7 @@ class GitHubAdapter:
             self._diff_version(pull.base_sha, pull.head_sha),
             self_tested=local,
             diff_guard=guard,
+            large_refactor=exempt,
         )
 
     def _admission_fence(self, repo, number, pull, *, labels_progress=None):
@@ -1515,6 +1657,8 @@ class GitHubAdapter:
 
     def _admission_pulls(self, repo, on_page):
         owner, name = repo.split("/", 1)
+        if repo not in self._admission_listing:
+            self._refresh_git_caches()
         progress = self._admission_listing.setdefault(
             repo, {"listed": [], "cursor": None, "connection": None, "index": 0, "batch": []}
         )
@@ -1565,7 +1709,7 @@ class GitHubAdapter:
         number, head, base = node["number"], node.get("headRefOid", ""), node.get("baseRefOid", "")
         # Fetch a new target once, so a normal canonical advance doesn't invalidate every
         # unchanged review. PR heads are fetched only when evaluating new/dirty work.
-        if self.clone_dir and SHA.fullmatch(base) and not chain.object_exists(self.clone_dir, base):
+        if self.clone_dir and SHA.fullmatch(base) and not self._has_commit(base):
             self.fetch_refs(repo, [base])
         comments = self._admission_comments(repo, number, node.get("comments"))
         label_connection = node.get("labels") or {}
@@ -1772,8 +1916,11 @@ class GitHubAdapter:
 
     # -- comments and labels
 
-    def post_comment(self, repo: str, number: int, body: str, marker: str) -> str:
+    def post_comment(self, repo: str, number: int, body: str, marker: str, *, recovery_head: str | None = None) -> str:
         """Post `body` once per `marker`: a comment already carrying the marker is edited instead."""
+        if recovery_head is not None:
+            # tauceti-queue[bot] is a trusted recovery author: only the request's own head is marked.
+            body = recovery_body(body, recovery_head)
         hidden = comment_marker(marker)
         existing = self.find_comment(repo, number, hidden)
         full = f"{body.rstrip()}\n\n{hidden}\n"
