@@ -3404,6 +3404,22 @@ class KnownGoodHeadTip(PreRebasedCase):
         self.controller.tick()
         self.assertEqual(len(self.pre_rebased_tasks()), 1, "while CI runs, the known-good tip is prepared on")
 
+    def test_an_offer_made_while_ci_ran_is_not_claimed_once_it_passed(self):
+        self.open_batch()
+        self.verify_head()
+        self.controller.tick()
+        [offer] = self.pre_rebased_tasks()
+        attempt = self.controller._current_attempt(self.head())
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass")
+        self.assertIsNone(
+            self.controller.claim_task("worker-1", "admin-worker"), "not newly claimed in the landing window"
+        )
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="infrastructure")
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.assertEqual(task.task_id, offer["id"], "an infrastructure outcome keeps it eligible")
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass")
+        self.controller.renew_task(task.task_id, task.claim_token)  # an owner already holding it finishes
+
     def test_a_head_repair_qualifies_its_tip_only_when_the_worker_verified_it(self):
         batch = self.open_batch()
         for attempt, verified in ((1, False), (2, True)):

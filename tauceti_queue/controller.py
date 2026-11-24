@@ -2204,7 +2204,11 @@ class Controller:
                     found.append((task, batch))
                 continue
             if self._pre_rebased_prepare(task):
-                if self._pre_rebased_prepare_current(task, batch):
+                # An offer made while the head's CI ran is not newly claimed once it passed (`_head_landing`);
+                # an owner already holding it finishes.
+                if self._pre_rebased_prepare_current(task, batch) and not (
+                    task["onto"] == (self._head() or {}).get("tip") and self._head_landing(self._head())
+                ):
                     found.append((task, batch))
                 continue
             if self._stale_prepare(task):
@@ -7066,6 +7070,14 @@ class Controller:
             and self.store.row("ci_attempts", {"head_sha": tip, "outcome": OUTCOME_SOURCE_FAILURE}) is not None
         )
 
+    def _head_landing(self, head: dict[str, Any] | None) -> bool:
+        """The head's current tip has passed CI: it lands within minutes. No preparation of the next batch
+        on that tip starts or is newly claimed then (`_pre_rebased_prepare_blocked`, `_claimable_tasks`)."""
+        if head is None:
+            return False
+        attempt = self._current_attempt(head)
+        return attempt is not None and attempt["head_sha"] == head["tip"] and attempt["outcome"] == OUTCOME_PASS
+
     def _pre_rebase_target_verified(self) -> bool:
         """`_head_tip_verified` for `_pre_rebase_target`: `main` once no head is left (it landed)."""
         head = self._head()
@@ -7515,8 +7527,7 @@ class Controller:
             assert head is not None
             return f"head {head['id']}'s tip {head['tip'][:12]} has not passed its own verification"
         assert head is not None
-        attempt = self._current_attempt(head)
-        if attempt is not None and attempt["head_sha"] == head["tip"] and attempt["outcome"] == OUTCOME_PASS:
+        if self._head_landing(head):
             # The head is about to land: a preparation started now would be preserved across the landing
             # and the seal would wait for it with staging idle (510's 1555 after 509, 24 Nov).
             return f"head {head['id']} passed CI and is landing"
