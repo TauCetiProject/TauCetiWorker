@@ -86,6 +86,7 @@ from tauceti_queue import (  # noqa: E402
     repair_audit,
     repair_context,
     repair_numproj,
+    repair_outputs,
     repair_parallel,
     repair_publish,
     repair_sandbox,
@@ -1258,6 +1259,11 @@ class Fixture(unittest.TestCase):
         background.start()
         self.addCleanup(background.stop)
         self.addCleanup(lambda: repair_publish.BACKGROUND.wait(60))
+        # The stub Lake's artifacts are not named by their bytes' Lake hash; output integrity has its
+        # own tests (queue_repair_outputs.py), and freeze_outputs' refusal is tested there too. The
+        # variable also reaches the background publishers, which are subprocesses here.
+        os.environ[repair_outputs.OFF_VARIABLE] = "off"
+        self.addCleanup(os.environ.pop, repair_outputs.OFF_VARIABLE, None)
         (BIN / "sandbox-env.json").write_text(json.dumps({"STUB_DIR": str(self.stub_dir)}))
         for key in (
             "STUB_FAIL_GROUP_WITH",
