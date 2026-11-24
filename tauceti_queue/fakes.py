@@ -742,9 +742,7 @@ class FakeGitHub:
             paths = ()
         from tauceti_tools.self_tested import accepted, allowed_paths
 
-        local = accepted(
-            pull.labels, member=pull.author_login in getattr(self, "self_tested_members", set())
-        ) and allowed_paths(paths)
+        local = accepted(pull.labels) and allowed_paths(paths)
         from . import diff_guard
 
         exempt = pull.head_sha in getattr(self, "large_refactor_heads", set())
