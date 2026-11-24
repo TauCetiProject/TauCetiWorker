@@ -135,7 +135,12 @@ def _transfer(view: Path, pool: Path, env: dict) -> None:
         return
     common = Path(os.path.commonpath([view.resolve(), pool.resolve()]))
     code = "from pathlib import Path\nfrom tauceti_worker.expanded_cache import transfer\ntransfer(Path(sys.argv[1]), Path(sys.argv[2]))"
-    argv = repair_sandbox.sandboxed_python(code, [str(view.resolve()), str(pool.resolve())], common, env)
+    # Writable: only the pool and the downloads directory; the users' registrations and every other
+    # entry beside them are read-only, so a link planted in the pool cannot redirect a write there.
+    writable = {p.resolve().relative_to(common).parts[0] for p in (view, pool) if p.resolve() != common}
+    argv = repair_sandbox.sandboxed_python(
+        code, [str(view.resolve()), str(pool.resolve())], common, env, writable=tuple(writable)
+    )
     done = subprocess.run(argv, capture_output=True, text=True, timeout=1800, check=False)
     if done.returncode:
         detail = (done.stderr or done.stdout).strip().splitlines()

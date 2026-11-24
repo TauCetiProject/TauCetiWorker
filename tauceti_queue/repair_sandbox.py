@@ -578,7 +578,9 @@ def ensure_toolchain(worktree: Path, env: dict, timeout: float = 1800) -> None:
     subprocess.run([elan, "toolchain", "install", name], env=clean, cwd="/", capture_output=True, timeout=timeout)
 
 
-def sandboxed_python(code: str, args: list[str], tree: Path, env: dict | None = None) -> list[str]:
+def sandboxed_python(
+    code: str, args: list[str], tree: Path, env: dict | None = None, *, writable: tuple[str, ...] | None = None
+) -> list[str]:
     """``python -I -c code args...`` of this worker's own interpreter and package, offline, with only
     ``tree`` writable (one bind, so hard links inside it work) and nothing else of the host but the
     system roots: for host-side maintenance of build-writable state, where a planted symlink must not
@@ -604,6 +606,12 @@ def sandboxed_python(code: str, args: list[str], tree: Path, env: dict | None = 
         argv += ["--ro-bind", str(root), str(root)]
     tree = Path(tree).resolve()
     argv += ["--bind", str(tree), str(tree)]
+    if writable is not None:
+        # Only these children of ``tree`` stay writable; the rest are bound read-only over themselves,
+        # so a link planted in a writable one cannot redirect a write into them.
+        for child in sorted(tree.iterdir()):
+            if child.name not in writable and not child.is_symlink():
+                argv += ["--ro-bind", str(child), str(child)]
     argv += _credential_masks(_binds(argv), env)
     argv += ["--remount-ro", "/", "--setenv", "PATH", "/usr/bin:/bin", "--chdir", str(tree), *NAMESPACE_FLAGS]
     code = f"import sys; sys.path[:] = {path!r}\n" + code

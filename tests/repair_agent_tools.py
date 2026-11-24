@@ -540,8 +540,18 @@ class Fetches(Fixture):
                 (view / "outputs" / "escape").mkdir(parents=True)
                 (view / "outputs" / "escape" / "authorized_keys").write_text("attacker")
         self.assertEqual(list(target.iterdir()), [], "nothing was written through the planted link")
-        # An ordinary download still reaches the pool.
+        # A link to the users' registrations beside the pool reaches them read-only.
         os.unlink(pool / "outputs" / "escape")
+        (pool.parent / "cache-users" / "worker.json").write_text("{}")
+        (pool / "outputs" / "users").symlink_to("../../cache-users")
+        with self.assertRaises(OSError):
+            with repair_cache.downloads(env) as fetch:
+                view = Path(fetch["LAKE_CACHE_DIR"])
+                (view / "outputs" / "users").mkdir(parents=True)
+                (view / "outputs" / "users" / "worker.json").write_text('{"root": "/attacker"}')
+        self.assertEqual((pool.parent / "cache-users" / "worker.json").read_text(), "{}")
+        os.unlink(pool / "outputs" / "users")
+        # An ordinary download still reaches the pool.
         with repair_cache.downloads(env) as fetch:
             view = Path(fetch["LAKE_CACHE_DIR"])
             (view / "outputs" / "TauCeti").mkdir(parents=True)
