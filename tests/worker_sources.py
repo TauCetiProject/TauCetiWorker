@@ -999,7 +999,8 @@ ci="one/project"
         from tauceti_worker.multi_source import run_round
         from tauceti_worker.work_units import RoundOpts
 
-        def walk(backoff, environment=None):
+        def walk(backoff, environment=None, app_backoff=0.0, routed=()):
+            throttled = []
             observations = self.observations([], [])
             github, forgejo = observations[0][2], observations[1][2]
             github.rebaseable.actionable.append(Candidate(1, "a" * 40))
@@ -1024,6 +1025,13 @@ ci="one/project"
                 patch("tauceti_worker.multi_source.random.shuffle"),
                 patch("tauceti_worker.survey.bump_prs", side_effect=lambda sv: {5} if sv is github else set()),
                 patch("tauceti_worker.github_transport.publication_backoff", return_value=backoff),
+                patch("tauceti_worker.review_app.publication_backoff", return_value=app_backoff),
+                patch("tauceti_worker.review_app.app_login", return_value="poster[bot]"),
+                patch("tauceti_worker.review_app.routes", side_effect=lambda repo, pr: pr in routed),
+                patch(
+                    "tauceti_worker.work_units.throttle_review",
+                    side_effect=lambda sv, opts: throttled.append(len(sv.reviewable.actionable)),
+                ),
                 patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
                 patch("tauceti_worker.work_units.run_round", side_effect=ClaimCollision("x")) as execute,
             ):
@@ -1032,6 +1040,13 @@ ci="one/project"
                         os.environ.pop(name, None)
                 with self.assertRaises(ClaimCollision):
                     run_round(None, options)
+            throttled_once.clear()
+            throttled_once.extend(throttled)
+            offered.clear()
+            offered.extend(
+                sorted(c.pr for c in call.kwargs["prepared_survey"].reviewable.actionable)
+                for call in execute.call_args_list
+            )
             return [
                 (
                     "github" if call.args[0] is observations[0][1] else "forgejo",
@@ -1040,6 +1055,8 @@ ci="one/project"
                 )
                 for call in execute.call_args_list
             ]
+
+        offered, throttled_once = [], []
 
         normal = [
             ("github", ["review"], 0),
@@ -1062,6 +1079,30 @@ ci="one/project"
             ("github", ["review"], 3),
         ]
         self.assertEqual(walk(600.0), backing_off)
+        # Only the backed-off identity's reviews wait. With the account backed off, PR 4 (the App's)
+        # keeps its place among the first reviews, while the account's re-review of PR 2 waits.
+        mixed = [
+            ("github", ["review"], 0),
+            ("github", ["rebase"], 1),
+            ("github", ["fix"], 2),
+            ("github", ["review"], 3),
+            ("forgejo", ["review"], 3),
+            ("github", ["overlap-scan"], 6),
+            ("github", ["review"], 1),
+        ]
+        self.assertEqual(walk(600.0, routed={4}), mixed)
+        self.assertEqual(offered[3], [4, 5])  # The App's first review and the bump.
+        self.assertEqual(offered[-1], [2])  # Only the account's review waits.
+        # The review throttles judged the whole GitHub queue once, before it was split.
+        self.assertEqual(throttled_once, [3])
+        # With the App backed off instead, only its review waits.
+        self.assertEqual(
+            walk(0.0, app_backoff=600.0, routed={4}), [*normal[:3], *normal[4:], ("github", ["review"], 3)]
+        )
+        self.assertEqual(offered[-1], [4])
+        self.assertNotIn(4, offered[3])
+        # Neither backed off: the ordinary order, whatever the routing.
+        self.assertEqual(walk(0.0, routed={2, 4}), normal)
         # Review-first workers also take Forgejo's review before an unpublishable GitHub one.
         self.assertEqual(
             walk(600.0, {"TAUCETI_REVIEW_FIRST": "1"}),

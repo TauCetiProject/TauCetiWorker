@@ -222,39 +222,75 @@ def run_round(w, opts, *, use_fleet_focus=True):
     # before any other PR work, and falls back to the landing order below when no review is
     # claimable. Automatic bumps still come first and overlap work last.
     review_first = os.environ.get("TAUCETI_REVIEW_FIRST") == "1"
-    # While GitHub rejects this account's content writes, a new GitHub review would do its model
-    # work and then sleep in the publication pacer, holding this slot for up to an hour. Offer it
-    # after every other choice instead, so the slot repairs PRs or reviews on Forgejo meanwhile.
-    # Automatic bumps keep their lead; with nothing else claimable the review still runs.
-    backoff = 0.0
+    # While GitHub rejects an identity's content writes, a new GitHub review it would publish would
+    # do its model work and then sleep in the publication pacer, holding this slot for up to an hour.
+    # Offer those reviews after every other choice instead, so the slot repairs PRs or reviews on
+    # Forgejo meanwhile. Each PR publishes as the account or the review App (review_app.routes), and
+    # each has its own rejection window, so only the backed-off identity's reviews wait. Automatic
+    # bumps keep their lead; with nothing else claimable the review still runs.
+    held = None
     if any(name == "github" for name, _, _ in executable) and want(opts.only, "review"):
+        from . import review_app
         from .github_transport import publication_backoff
 
-        backoff = publication_backoff()
-        if backoff:
-            log(f"github: publication backoff for {int(backoff)}s; offering GitHub reviews after other work")
+        backoff = {False: publication_backoff(), True: review_app.publication_backoff()}
+        for app, seconds in backoff.items():
+            if seconds:
+                who = review_app.app_login() if app else "the account"
+                log(f"github: publication backoff for {who}, {int(seconds)}s; offering its reviews after other work")
+        if any(backoff.values()):
+
+            def held(worker, pr):
+                repository = getattr(worker.gh, "review_repository", worker.gh.repo)
+                return backoff[review_app.routes(repository, pr)] > 0
+
     # One choice per (landing tier, source), walked tier by tier across sources: a re-review on
     # either forge is offered before any fix, a fix before any first review (survey.LANDING_TIERS).
     choices = []
     for name, worker, result in executable:
         bumps = bump_prs(result)
+        waiting = set()
+        if held and name == "github":
+            waiting = {
+                c.pr
+                for c in result.reviewable.actionable
+                if landing_tier("review", c, bumps) > 0 and held(worker, c.pr)
+            }
+        publishable, unpublishable = result, None
+        if waiting:
+            # The review throttles judge the whole queue, so apply them before splitting it, as
+            # ordinary_round would have once, and recompute what is left to wait.
+            if not getattr(result, "_review_throttle_applied", False):
+                from .work_units import throttle_review
+
+                throttle_review(result, opts)
+                result._review_throttle_applied = True
+            waiting = {c.pr for c in result.reviewable.actionable} & waiting
+        if waiting:
+            publishable, unpublishable = (
+                _with_reviews(result, [c for c in result.reviewable.actionable if c.pr not in keep])
+                for keep in (waiting, {c.pr for c in result.reviewable.actionable} - waiting)
+            )
         tiers = {}
         for stage in stages:
             for candidate in result.kind(stage).actionable:
                 tiers.setdefault(landing_tier(stage, candidate, bumps), []).append(stage)
         for tier, tier_stages in tiers.items():
             tier_stages = list(dict.fromkeys(tier_stages))
-            if backoff and name == "github" and tier > 0 and "review" in tier_stages:
-                choices.append((tier, name, worker, result, ["review"], False, True))
-                tier_stages = [stage for stage in tier_stages if stage != "review"]
-                if not tier_stages:
-                    continue
+            if waiting and "review" in tier_stages:
+                reviews = [c.pr for c in result.reviewable.actionable if landing_tier("review", c, bumps) == tier]
+                if any(pr in waiting for pr in reviews):
+                    choices.append((tier, name, worker, unpublishable, ["review"], False, True))
+                    if all(pr in waiting for pr in reviews):
+                        tier_stages = [stage for stage in tier_stages if stage != "review"]
+                        if not tier_stages:
+                            continue
             if review_first and tier > 0 and "review" in tier_stages and not review_first_rank("review", tier):
-                choices.append((tier, name, worker, result, ["review"], True, False))
+                choices.append((tier, name, worker, publishable, ["review"], True, False))
                 tier_stages = [stage for stage in tier_stages if stage != "review"]
                 if not tier_stages:
                     continue
-            choices.append((tier, name, worker, result, tier_stages, False, False))
+            choices.append((tier, name, worker, publishable, tier_stages, False, False))
     complete = all(
         not value.github_failed and not value.dependency_wait and getattr(value, "target_inventory_available", True)
         for _, _, value in observations
@@ -413,3 +449,12 @@ def publish_native_reviews(cfg, prs=()):
         return False
     with activate(source, cfg):
         return pending(source, cfg, numbers=prs)
+
+
+def _with_reviews(survey, reviews):
+    """A shallow copy of `survey` whose review queue is `reviews`; other work kinds are shared."""
+    import copy
+
+    selected = copy.copy(survey)
+    selected.reviewable = dataclasses.replace(survey.reviewable, actionable=list(reviews))
+    return selected
