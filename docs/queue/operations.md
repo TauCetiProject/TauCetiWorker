@@ -200,6 +200,15 @@ from. A release is built once and never resynced, so its TauCetiTools commit is 
 its creation. Data and configuration (`~/TauCetiQueue-data`, `~/.config/tauceti-queue`) stay where
 they are.
 
+Releases follow TauCetiTools main on purpose: the shared CI harness and TauCeti's workflows run
+Tools main, and the controller's admission and result checks must agree with them. Worker CI does
+not: it tests against the TauCetiTools commit in `pyproject.toml`'s `[tool.tauceti-ci] tools-rev`
+(`.github/scripts/tools-pin.sh apply`), so a TauCetiTools merge cannot turn Worker `main` red on
+its own. `.github/scripts/tools-pin.sh bump`, run from a clean Worker checkout with `gh`
+authenticated, opens a pull request that moves the pin to Tools main; its CI runs the Worker suite
+against the new commit. Bump after any TauCetiTools change the Worker relies on. A release still
+installs Tools main as it is at the time, which can be newer than the pin.
+
 `services/queue/release.sh status` lists each queue unit with the revision its unit file names and
 the revision its running process runs (marked `*` when the process still runs another directory,
 for example after `--no-restart`). After a successful install the installer removes release
