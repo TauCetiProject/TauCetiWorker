@@ -295,6 +295,20 @@ def request_environment(args):
         raise GitHubUnavailable(str(error), retry_at=time.time() + 60) from None
 
 
+def publication_backoff() -> float:
+    """Seconds this host's pacer still refuses the App's content writes; 0 when not configured.
+
+    Mints no token: the App's pacing state lives under its shared scope.
+    """
+    if directory() is None:
+        return 0.0
+    try:
+        credentials = _credentials()
+    except Exception:
+        return 0.0
+    return transport.publication_backoff(identity=shared_scope(credentials))
+
+
 def blocked_since(start: float) -> bool:
     """Whether GitHub blocked one of this worker's App requests since `start`."""
     try:

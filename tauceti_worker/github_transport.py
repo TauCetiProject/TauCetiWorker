@@ -696,13 +696,14 @@ def content_write(args):
     return len(args) > 1 and args[0] in ("pr", "issue") and args[1] in ("create", "comment", "review")
 
 
-def publication_backoff(env=None) -> float:
+def publication_backoff(env=None, *, identity=None) -> float:
     """Seconds this host's pacer still refuses content writes for the account after a rejection.
 
     A review admitted now would finish its model work and then sleep in the pacer holding its
     worker slot, so selection offers other work first while this is positive. Read-only, unlocked.
+    `identity` names a pacing identity directly (the review App's), instead of `env`'s credential.
     """
-    identity = quota_scope(scope(env))
+    identity = identity or quota_scope(scope(env))
     if not identity:
         return 0.0
     try:
