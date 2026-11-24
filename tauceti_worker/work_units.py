@@ -2709,7 +2709,9 @@ def _close_capped_pr(w, sv, c, *, explicit=False) -> int | None:
     if rc == 0:
         peer_claims.clear_fixed_heads(_claim_scope(w), c.pr)  # a reopened PR starts a fresh count
     else:
-        log(f"  fix #{c.pr}: {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds without an approval; not closed, no more fix rounds")
+        log(
+            f"  fix #{c.pr}: {MAX_FIX_ROUNDS_WITHOUT_APPROVAL} fix rounds without an approval; not closed, no more fix rounds"
+        )
     return rc
 
 
