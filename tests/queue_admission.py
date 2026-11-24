@@ -126,7 +126,6 @@ class AdmissionTests(unittest.TestCase):
         del self.github.statuses[(head, "build")]
         del self.github.statuses[(head, "scope")]
         self.github.labels[1].add("self-tested")
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         self.assertEqual(self.intake.run_once()["approved"], 1)
         self.controller.tick()
         self.assertEqual(self.controller.inputs()[0]["state"], "inserted")
@@ -137,7 +136,6 @@ class AdmissionTests(unittest.TestCase):
         head = self.github.create_pr(1, files)
         self.review(1)
         self.github.labels[1].add("self-tested")
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
         return head
 
     def test_self_tested_heads_must_pass_the_pr_level_diff_guards(self):
@@ -244,12 +242,11 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(self.intake.run_once()["approved"], 1)
         measure.assert_not_called()
 
-    def test_untrusted_label_and_label_removal_cannot_bypass_ci(self):
+    def test_any_authors_label_stands_in_for_ci_until_removed(self):
         head = self.ready()
         del self.github.statuses[(head, "build")]
-        self.github.labels[1].add("self-tested")
         self.assertEqual(self.intake.run_once()["approved"], 0)
-        self.github.self_tested_members = {self.github.fetch_pr(REPO, 1).author_login}
+        self.github.labels[1].add("self-tested")
         self.event("pull_request", {"number": 1, "action": "labeled", "label": {"name": "self-tested"}})
         self.assertEqual(self.intake.run_once()["approved"], 1)
         generation = self.intake.state.get(1)["generation"]

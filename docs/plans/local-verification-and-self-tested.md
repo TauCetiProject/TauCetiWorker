@@ -29,6 +29,9 @@ Land Tools support before its TauCeti and Worker consumers. Use the existing tes
 
 ## Stage 2 — Let trusted authors skip expensive PR CI
 
+Superseded in part (operator decision, 2026-11-24): the label now counts from any author. Neither
+the author's nor the labeller's membership of a team is checked; the scope rules below still apply.
+
 An author runs the Stage 1 commands and applies `self-tested`. The persistent label declares that the author runs local verification, including fix rounds. This rollout is manual opt-in only: do not add automatic worker labelling, contributor recommendations or announcements.
 
 One exception (operator decision, 2026-11-10): workers label automatic Mathlib bump PRs themselves after mechanically verifying the pushed head, because the bump otherwise waits a full PR build per repair round while main moves under it. The picker checks the labeler's team membership instead of the bot author's, allows exactly `lake-manifest.json` and `lean-toolchain` beside `TauCeti/`, and runs the real `bump-guard` validation. See [dependency bumps](../workers.md#dependency-bumps).
