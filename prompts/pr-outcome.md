@@ -57,7 +57,8 @@ requirements apply to repairs, not to a verified supersession closure.
 Use the current review rubric, not an obsolete finding's description of the rules. Repair the
 PR, narrow or split its scope, or answer a mistaken finding with concrete source and rubric
 evidence through the existing review process. A roadmap restriction is a scope constraint:
-choose work supported by the existing roadmaps; do not change roadmaps.
+choose work supported by the existing roadmaps; do not change roadmaps. A roadmap that is itself
+wrong is reported, not changed (below).
 
 Continue repairs or the existing evidence-based review response process within the bounded
 attempts. When instructed that this is the final resolution attempt, repair and push or close
@@ -68,6 +69,35 @@ commenting and closing, using the same checks above. Close only after re-reading
 your explanation comment posted, as above, then confirm closure succeeded.
 The closure authority above applies here too; never close somebody else's PR or a specially
 scoped automatic bump.
+
+### A roadmap statement that is wrong
+
+If this repair shows that the roadmap statement or `Suggested.lean` pin the PR works from is
+itself wrong (false, missing a hypothesis, unprovable or ill-typed as pinned, a definition with
+the wrong body, a circular route, or a renamed declaration), do not quietly weaken the PR's
+statement until it is provable. Prove the corrected statement and, where feasible, the
+counterexample or obstruction as a theorem, and add a roadmap report to the PR description,
+editing it as for the quality pass (`gh pr edit __PR__ --repo TauCetiProject/TauCeti --body-file <file>`):
+a `### Roadmap report` section saying what is wrong, why, and the corrected statement, then one
+marker line per error (at most five):
+```
+<!--tauceti-roadmap-report:v1 {"roadmap":"<folder>","file":"README.md","roadmap_sha":"<40-hex commit>","anchor":"<quote>","kind":"false-statement","effect":"worked-around","refutes":["TauCeti.<counterexample>"],"replaces":["TauCeti.<corrected>"]}-->
+```
+`roadmap` is the roadmap's folder under the `TauCetiRoadmap/` directory of
+TauCetiProject/TauCetiRoadmap (`Parent/Child` for a nested one) and `file` is `README.md` or
+`Suggested.lean`. `roadmap_sha` is the full commit you read the file at: take it from
+`gh api repos/TauCetiProject/TauCetiRoadmap/commits/main --jq .sha` and read the file at that
+commit. `anchor` is, for `Suggested.lean`, the declaration's name and, for `README.md`, a
+verbatim quote of the statement or its distinctive part, at most 300 characters, copied from that
+file. `kind` is one of `false-statement`, `missing-hypothesis`, `unprovable-pin`,
+`wrong-definition`, `circular-dependency`, `stale-name`; `effect` is `worked-around` when the PR
+proves a corrected statement in its place, `blocked` when it lands only a partial piece and the
+error still blocks the target; `refutes` and `replaces` optionally name (at
+most 10 each) the fully qualified declarations that refute the roadmap's statement and that state
+the corrected one. Check the edited description with `"__BIN__/roadmap-report-check" <file>`. If
+you cannot read the roadmap repository from here, write the section without the marker and say so
+in your final answer. This is the only sanctioned way to report a roadmap error; report only what
+you have proved or can show.
 
 Transient provider/GitHub failures and lost claims use the existing retry handling. A withdrawn request, changed head or lost claim needs no repetitive comment: stop
 safely; the changed shared state already routes future work.

@@ -32,7 +32,7 @@ Each line names one module. This extends environment lint without expanding the 
   `Set` or `RingEquiv`), as required by the naming rubric; do not nest it under `TauCeti`.
   Tau Ceti does not preserve backwards compatibility: if you rename or restate a lemma, update every
   use in the repository in the same change.
-- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`.
+- **Never write to the roadmaps.** Do not open a PR or an issue in `TauCetiProject/TauCetiRoadmap`. A roadmap that is itself wrong is reported in this PR's description, never changed: see the PR outcome instructions below.
 - Must end green AND axiom-clean: no `sorry`, no `native_decide`, no new axioms (allowlist: `propext`, `Classical.choice`, `Quot.sound`), and no `set_option` in `TauCeti/` at all (CI rejects it; it is how `maxHeartbeats` overrides and linter silencing happen).
 
 ## Verify before pushing (ALL of these MUST pass; they are what the `build` check runs)

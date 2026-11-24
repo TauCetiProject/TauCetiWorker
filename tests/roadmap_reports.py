@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Roadmap reports (docs/roadmap-reports.md): the marker reader and its checks, the checker script and
+gh-safe-pr-create's use of it, and the prompts, without GitHub or model access."""
+
+import contextlib
+import io
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+import tauceti_worker as tc
+from tauceti_worker import roadmap_reports as rr
+
+SHA = "a" * 40
+QUOTE = "every rank-one form is equivalent to a {diagonal} chain"
+README = "# Quadratic forms\n\nMilestone 2: " + QUOTE.replace(" chain", "\n  chain") + ".\n"
+
+
+def marker(**fields):
+    value = {
+        "roadmap": "QuadraticFormInvariants",
+        "file": "README.md",
+        "roadmap_sha": SHA,
+        "anchor": QUOTE,
+        "kind": "false-statement",
+        "effect": "worked-around",
+        "refutes": ["TauCeti.exists_rankOne_equivalent_not_diagonalChain"],
+        "replaces": ["TauCeti.diagonalChain_iff_equivalent_of_two_le"],
+    }
+    value.update(fields)
+    value = {key: item for key, item in value.items() if item is not None}
+    return rr.PREFIX + json.dumps(value) + "-->"
+
+
+def body(*markers):
+    return "This PR proves the corrected statement.\n\n### Roadmap report\n\nThe README is wrong.\n\n" + "\n".join(
+        markers
+    )
+
+
+class Reader(unittest.TestCase):
+    def test_a_valid_marker_with_braces_in_its_anchor(self):
+        reports, errors = rr.read(body(marker()))
+        self.assertEqual(errors, [])
+        (report,) = reports
+        self.assertEqual(report.anchor, QUOTE)
+        self.assertEqual(report.refutes, ("TauCeti.exists_rankOne_equivalent_not_diagonalChain",))
+
+    def test_optional_and_unknown_fields(self):
+        reports, errors = rr.read(marker(refutes=None, replaces=None, note="ignored"))
+        self.assertEqual(errors, [])
+        self.assertEqual(reports[0].refutes, ())
+
+    def test_each_invalid_marker_is_reported_and_the_others_still_count(self):
+        cases = {
+            rr.PREFIX + "{not json}-->": "not one JSON object",
+            rr.PREFIX + "[1]-->": "not a JSON object",
+            marker(roadmap="../Secrets"): "`roadmap`",
+            marker(roadmap="Representation Theory"): "`roadmap`",
+            marker(file="STATUS.md"): "`file`",
+            marker(roadmap_sha="abc"): "`roadmap_sha`",
+            marker(anchor="x" * 301): "longer than 300",
+            marker(anchor="  "): "`anchor`",
+            marker(kind="typo"): "`kind`",
+            marker(effect="fixed"): "`effect`",
+            marker(refutes=[f"TauCeti.n{i}" for i in range(11)]): "`refutes`",
+            marker(replaces=["two words"]): "`replaces`",
+            marker(roadmap=None): "`roadmap`",
+        }
+        for bad, expected in cases.items():
+            with self.subTest(bad=bad):
+                reports, errors = rr.read(body(bad, marker(roadmap="RepresentationTheory/CompactGroups")))
+                self.assertEqual([r.roadmap for r in reports], ["RepresentationTheory/CompactGroups"])
+                self.assertTrue(any(expected in error for error in errors), errors)
+
+    def test_at_most_five_markers_count(self):
+        markers = [marker(anchor=f"statement {i}") for i in range(7)]
+        reports, errors = rr.read(body(*markers))
+        self.assertEqual([r.anchor for r in reports], [f"statement {i}" for i in range(5)])
+        self.assertEqual(len(errors), 2)
+
+    def test_an_unclosed_marker(self):
+        self.assertEqual(rr.read(marker()[:-3])[0], [])
+        self.assertIn("no closing", rr.read(marker()[:-3])[1][0])
+
+    def test_a_comment_end_inside_the_json_ends_the_marker(self):
+        reports, errors = rr.read(marker(anchor="a --> b"))
+        self.assertEqual(reports, [])
+        self.assertIn("not one JSON object", errors[0])
+
+
+class Checks(unittest.TestCase):
+    def setUp(self):
+        self.roadmaps = Path(tempfile.mkdtemp(prefix="roadmap-reports-"))
+        (self.roadmaps / "QuadraticFormInvariants").mkdir()
+        (self.roadmaps / "QuadraticFormInvariants" / "README.md").write_text(README)
+
+    def test_the_anchor_is_found_up_to_whitespace(self):
+        self.assertEqual(rr.check(body(marker()), self.roadmaps), [])
+        self.assertIn("does not occur", rr.check(body(marker(anchor="something else")), self.roadmaps)[0])
+        self.assertIn("is not in the roadmap checkout", rr.check(body(marker(roadmap="Other")), self.roadmaps)[0])
+        self.assertEqual(rr.check(body(marker(anchor="something else"))), [])  # no checkout, no anchor check
+
+    def test_a_marker_needs_the_visible_section(self):
+        self.assertIn("### Roadmap report", rr.check("Text.\n" + marker())[0])
+        self.assertEqual(rr.check("A PR with no report."), [])
+
+    def test_the_checker_script(self):
+        script = REPO / "scripts" / "roadmap-report-check"
+        path = self.roadmaps / "body.md"
+        path.write_text(body(marker()))
+        good = subprocess.run([script, "--roadmaps", self.roadmaps, path], capture_output=True, text=True)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        self.assertIn("1 valid report marker", good.stdout)
+        bad = subprocess.run([script], input=body(marker(kind="typo")), capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("`kind`", bad.stderr)
+
+    def test_the_pr_wrapper_warns_and_still_opens_the_pr(self):
+        bin_dir = self.roadmaps / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "gh").write_text('#!/bin/sh\necho "created $*"\n')
+        (bin_dir / "gh").chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TAUCETI_")}
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        script = REPO / "scripts" / "gh-safe-pr-create"
+        bad = subprocess.run([script, "--body", body(marker(kind="typo"))], env=env, capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 0)
+        self.assertIn("created pr create", bad.stdout)
+        self.assertIn("malformed; the PR is opened anyway", bad.stderr)
+        good = subprocess.run([script, "--body", body(marker())], env=env, capture_output=True, text=True)
+        self.assertEqual(good.returncode, 0)
+        self.assertNotIn("malformed", good.stderr)
+
+
+class Round(unittest.TestCase):
+    """do_roadmap gives the agent the report section with its roadmap checkout's commit."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="roadmap-report-round-"))
+        self.env = patch.dict(
+            os.environ,
+            {"TAUCETI_RESPECT_CLAIMS": "false", "TAUCETI_ROADMAP_SKIP": "", "TAUCETI_ROADMAP_TARGETS": ""},
+        )
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        work = tc.work_units
+
+        def fetch_ref(repo, dest):
+            dest = Path(dest)
+            if repo == tc.ROADMAP and not (dest / ".git").exists():
+                (dest / "TauCetiRoadmap" / "QuadraticFormInvariants").mkdir(parents=True)
+                (dest / "TauCetiRoadmap" / "QuadraticFormInvariants" / "README.md").write_text(README)
+                git = ["git", "-C", str(dest), "-c", "user.name=t", "-c", "user.email=t@example.org"]
+                subprocess.run([*git, "init", "-q"], check=True)
+                subprocess.run([*git, "add", "."], check=True)
+                subprocess.run([*git, "commit", "-qm", "roadmap"], check=True)
+            dest.mkdir(parents=True, exist_ok=True)
+            return True
+
+        for name, value in {
+            "ensure_fork": lambda: "alice/TauCeti",
+            "claims_repo": lambda: "alice/TauCeti",
+            "avoid_list": lambda *_args: "none",
+            "fetch_ref": fetch_ref,
+            "prepare_checkout": lambda cfg, **_: True,
+            "run_agent_host": self.agent,
+        }.items():
+            patcher = patch.object(work, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.w = types.SimpleNamespace(
+            cfg=types.SimpleNamespace(
+                state=self.tmp, wid="worker3", checkout=self.tmp / "checkout", logdir=self.tmp / "logs"
+            ),
+            gh=None,
+        )
+
+    def agent(self, cwd, prompt, model, logdir, **_kwargs):
+        self.prompt = prompt
+        return 0
+
+    def test_the_prompt_carries_the_report_section_and_the_roadmap_commit(self):
+        opts = types.SimpleNamespace(agent_name="Claude Code", work_model="claude", source=None)
+        c = types.SimpleNamespace(reason="QuadraticFormInvariants", pr=0, head="", progress=None)
+        self.assertEqual(tc.work_units.do_roadmap(self.w, None, c, opts, bubble=False), 0)
+        sha = tc.work_units.roadmap_head(self.tmp / "refs" / "roadmap")
+        self.assertRegex(sha, "^[0-9a-f]{40}$")
+        self.assertIn("## If the roadmap is wrong", self.prompt)
+        self.assertIn(f'"roadmap_sha":"{sha}"', self.prompt)
+        self.assertIn(
+            f'roadmap-report-check" --roadmaps {self.tmp / "refs" / "roadmap" / "TauCetiRoadmap"}', self.prompt
+        )
+
+
+class Wiring(unittest.TestCase):
+    def test_every_prompt_variant_points_the_roadmap_rule_at_the_report(self):
+        prompts = REPO / "prompts"
+        for name in ("roadmap.md", "fix.md", "fix-ci.md", "bump.md", "rebase.md", "lint-repair.md"):
+            for path in (prompts / name, prompts / "v0" / name):
+                with self.subTest(path=path):
+                    text = path.read_text()
+                    self.assertIn("Never write to the roadmaps.", text)
+                    self.assertTrue("roadmap report (below)" in text or "reported in this PR's description" in text)
+        outcome = tc.agents.fill_prompt(prompts / "pr-outcome.md", PR=5, HEAD="b" * 40, BIN="/bin", CLOSE_AUTHORITY="")
+        self.assertIn('"/bin/roadmap-report-check"', outcome)
+        self.assertIn("### Roadmap report", outcome)
+
+    def test_the_checker_is_staged_for_bubble(self):
+        tmp = Path(tempfile.mkdtemp(prefix="roadmap-report-bubble-"))
+        cfg = types.SimpleNamespace(state=tmp / "state", home=tmp / "home", wid="w", logdir=tmp / "logs")
+        with (
+            patch.dict(os.environ, TAUCETI_AGENT_ECHO="1"),
+            patch.object(tc.agents, "ensure_bubble_home", lambda _cfg: dict(os.environ)),
+            patch.object(tc.agents, "_bubble_pop", lambda _cfg, _env: None),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            tc.run_in_bubble(
+                types.SimpleNamespace(cfg=cfg),
+                tc.TAUCETI,
+                "",
+                types.SimpleNamespace(work_model="claude"),
+                inner_cmd="true",
+            )
+        staged = cfg.state / "bubble-round"
+        check = subprocess.run(
+            [staged / "roadmap-report-check"], input=body(marker()), capture_output=True, text=True, cwd=tmp
+        )
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertTrue((staged / "roadmap_reports.py").is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

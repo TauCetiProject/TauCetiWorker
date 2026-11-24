@@ -53,6 +53,7 @@ CALL_SITES = {
     "pr-outcome.md": dict(
         PR=123,
         HEAD="a" * 40,
+        BIN="/bin",
         CLOSE_AUTHORITY="Closure authority is pinned by the worker.",
     ),
     "overlap-scan.md": dict(BATCH="/tmp/batch.json", RESULT="/tmp/result.json"),
@@ -73,6 +74,7 @@ CALL_SITES = {
         FORK="alice",
         WORKERID="worker5",
         ROADMAP_DIR="/opt/roadmap/TauCetiRoadmap",
+        ROADMAP_SHA="b" * 40,
         REVIEW_DIR="/opt/review",
         RUBRICS="/opt/rubrics/rubrics.md",
         SOURCE_GUIDANCE="",

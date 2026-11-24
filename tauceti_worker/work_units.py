@@ -2367,6 +2367,7 @@ def _do_fixlike(
         HERE / "prompts" / "pr-outcome.md",
         PR=pr,
         HEAD=head,
+        BIN=wrapper_bin(bubble),
         CLOSE_AUTHORITY=(
             "You may close this PR only while its live author is the authenticated account on this source forge"
             + _adopted_authors_note(sv)
@@ -3422,6 +3423,13 @@ def assign_target(w, path: Path, only: str, skip: list[str], within=None) -> tup
     )
 
 
+def roadmap_head(path: Path) -> str:
+    """The commit of the roadmap checkout at `path`, or "" when it cannot be read."""
+    head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True)
+    sha = head.stdout.strip() if head.returncode == 0 else ""
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else ""
+
+
 def do_roadmap(w, sv, c, opts, bubble) -> int:
     os.environ["TAUCETI_VERIFY_POLICY"] = "ordinary"
     only = c.reason or "any"
@@ -3461,6 +3469,8 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
         raise Die(f"fetch {REVIEW} failed")
     bundle = stage_rubrics(refs / "review", refs / "rubrics")
     os.environ["TAUCETI_REQUIRE_TARGET_MARKER"] = "1"
+    roadmap_dir_name = os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap")
+    roadmap_sha = roadmap_head(refs / "roadmap")
     # Author from the contributor's OWN fork: push the new branch there and open the PR from it, so the
     # worker never needs write access to canonical (and canonical stays free of WIP branches). The agent
     # builds against canonical main (the bubble/checkout still targets TAUCETI) — only the push redirects.
@@ -3542,7 +3552,8 @@ other contributors' claims, or the hard rules of the repo.
                 AGENT=opts.agent_name,
                 FORK=fork_owner,
                 WORKERID=w.cfg.wid,
-                ROADMAP_DIR="/opt/roadmap/" + os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap"),
+                ROADMAP_DIR="/opt/roadmap/" + roadmap_dir_name,
+                ROADMAP_SHA=roadmap_sha or "(unknown: run `git rev-parse HEAD` in the roadmap checkout)",
                 REVIEW_DIR="/opt/review",
                 RUBRICS=(
                     f"/opt/rubrics/{RUBRIC_BUNDLE}"
@@ -3571,7 +3582,8 @@ other contributors' claims, or the hard rules of the repo.
         AGENT=opts.agent_name,
         FORK=fork_owner,
         WORKERID=w.cfg.wid,
-        ROADMAP_DIR=str(refs / "roadmap" / os.environ.get("TAUCETI_ROADMAP_DIR", "TauCetiRoadmap")),
+        ROADMAP_DIR=str(refs / "roadmap" / roadmap_dir_name),
+        ROADMAP_SHA=roadmap_sha or "(unknown: run `git rev-parse HEAD` in the roadmap checkout)",
         REVIEW_DIR=str(refs / "review"),
         RUBRICS=(str(bundle) if bundle is not None else f"{refs / 'review' / 'rubrics'} (read every .md file in it)"),
         SOURCE_GUIDANCE=source_guidance,
