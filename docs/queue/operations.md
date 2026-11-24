@@ -730,8 +730,9 @@ provider tried or skipped with its reason and seconds. `--providers` and `--rate
 settings on the command line.
 
 The intended production provider for the three repair workers is `api`; the subscriptions rank above it
-only for testing and may stay logged out. Their skip lines (`provider claude skipped: no claude
-accessToken`, `provider codex skipped: codex token expired; refresh left to the operator`) are expected:
+only for testing and may stay logged out. Their skip lines for a missing or expired credential (such as
+`provider claude skipped: no claude accessToken` or `provider codex skipped: codex token expired; refresh
+left to the operator`) are expected:
 do not report, file or log in again over them unless Kim asks ([Providers](repair-task.md#providers)).
 
 Codex through a ChatGPT account serves the default Sol profile (`gpt-6.1-sol`, with its probe and
