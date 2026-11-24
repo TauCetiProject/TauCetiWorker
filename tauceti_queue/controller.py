@@ -8037,11 +8037,44 @@ class Controller:
             return DISPATCH_STAGING
         if self._attestation_problem(stored, tip) is not None:
             return DISPATCH_STAGING
+        if not self._policy_unchanged(base):
+            # The base (the head's tip, for an early run) changes `tauceti.toml` or `scripts/`: once it lands
+            # the attestation, judged against `main` before it, no longer counts.
+            return DISPATCH_STAGING
+        if self._state(self._fallback_key(tip, base)):
+            return DISPATCH_STAGING
         failed = self.store.query(
             "SELECT id FROM ci_attempts WHERE head_sha=? AND base_sha=? AND dispatch_kind=? AND outcome IN (?, ?) LIMIT 1",
             (tip, base, DISPATCH_ATTESTED, OUTCOME_INFRASTRUCTURE, OUTCOME_SOURCE_FAILURE),
         )
         return DISPATCH_STAGING if failed else DISPATCH_ATTESTED
+
+    @staticmethod
+    def _fallback_key(tip: str, base: str) -> str:
+        """Controller state naming a tip and base whose attested landing did not pass: staged in full from then on,
+        whatever later happens to that attempt's outcome (an operator's retry supersedes it)."""
+        return f"attested_fallback:{tip}:{base}"
+
+    def _policy_unchanged(self, commit: str) -> bool:
+        """`commit` has `main`'s `tauceti.toml` and `scripts/` (`ATTESTED_POLICY_PATHS`)."""
+        if self._canonical is None:
+            return False
+        if commit == self._canonical:
+            return True
+        for path in ATTESTED_POLICY_PATHS:
+            ours = chain._git(self.clone, "rev-parse", f"{self._canonical}:{path}")
+            theirs = chain._git(self.clone, "rev-parse", f"{commit}:{path}")
+            if ours.returncode != 0 or theirs.returncode != 0 or ours.stdout != theirs.stdout:
+                return False
+        return True
+
+    def _attested_still_counts(self, batch: dict[str, Any], attempt: dict[str, Any]) -> bool:
+        """An attested attempt may be adopted or promoted only while the attestation of its tip still counts
+        against `main` now (a landing in between can change the policy it was judged by)."""
+        if attempt.get("dispatch_kind") != DISPATCH_ATTESTED:
+            return True
+        stored = batch["pre_rebase_attestation"] if attempt.get("early") == EARLY_PENDING else batch["attestation"]
+        return self._attestation_problem(stored, attempt["head_sha"]) is None
 
     def _early_staging(self, now: float) -> None:
         """Send the trusted run of the next batch's prepared tip while the head is still staging.
@@ -8265,6 +8298,7 @@ class Controller:
                 or attempt["cancelled_at"] is not None
                 or self._cancelling(attempt)
                 or attempt["outcome"] not in (OUTCOME_PENDING, OUTCOME_PASS, OUTCOME_SOURCE_FAILURE)
+                or not self._attested_still_counts(batch, attempt)
             ):
                 continue
             self.store.update("ci_attempts", {"id": attempt["id"]}, batch_version=version, early=EARLY_ADOPTED)
@@ -8343,6 +8377,27 @@ class Controller:
                 self._create_task(head, TASK_REPAIR, head["base"], diagnostics, now, ci_attempt_id=attempt["id"])
             self._reasons.append(f"head {head['id']} waits for a worker to claim its repair task")
         elif attempt["outcome"] == OUTCOME_PASS:
+            if not self._attested_still_counts(head, attempt):
+                # Passed as an attested landing, but its attestation no longer counts: stage it in full.
+                with self.store.transaction():
+                    self._set_state(self._fallback_key(attempt["head_sha"], attempt["base_sha"]), True)
+                    self.store.update(
+                        "ci_attempts",
+                        {"id": attempt["id"], "outcome": OUTCOME_PASS},
+                        outcome=OUTCOME_SUPERSEDED,
+                        outcome_detail="attested-fallback: the attestation no longer counts against main",
+                    )
+                    self._count("attested_landing_fallbacks")
+                    self.store.journal(
+                        now,
+                        "attested-landing-fallback",
+                        head["id"],
+                        attempt_id=attempt["id"],
+                        tip=attempt["head_sha"],
+                        detail="the attestation no longer counts against main",
+                    )
+                self._dispatch(head, now, retry=0)
+                return
             self._infrastructure_recovered(head, attempt, now)
             self._promote(head, attempt, now)
 
@@ -9654,6 +9709,7 @@ class Controller:
         tip and base is full staging (`_dispatch_kind`)."""
         detail = f"attested-fallback: {values.get('outcome_detail') or 'the attested landing did not pass'}"
         values.update(outcome=OUTCOME_INFRASTRUCTURE, outcome_detail=detail[:2000], diagnostics=dumps([]))
+        self._set_state(self._fallback_key(attempt["head_sha"], attempt["base_sha"]), True)
         self._count("attested_landing_fallbacks")
         self.store.journal(
             now,

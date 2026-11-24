@@ -4135,6 +4135,58 @@ class AttestedLanding(Attestation):
         [entry] = self.controller.store.journal_entries("attested-landing-fallback")
         self.assertEqual(entry["detail"]["tip"], tip)
 
+    def test_the_fallback_holds_after_an_operator_supersedes_the_failed_attempt(self):
+        batch, tip = self.prepared()
+        run = self.runs_for(tip)[0]
+        run.verdict = "fail"
+        self.finish(run)
+        self.controller.tick()
+        first = self.early(batch)[0]
+        self.controller.store.update("ci_attempts", {"id": first["id"]}, outcome="superseded")
+        self.assertEqual(
+            self.controller._dispatch_kind(
+                self.row(batch), tip, first["base_sha"], self.row(batch)["pre_rebase_attestation"]
+            ),
+            "staging",
+        )
+
+    def test_a_head_that_changes_the_policy_files_gets_no_attested_early_run(self):
+        batch = self.open_batch()
+        self.verify_head()
+        head = self.head()
+        self.controller.tick()
+        task = self.controller.claim_task("worker-1", "admin-worker")
+        self.controller.release_task(
+            task.task_id, task.claim_token, "prepared_clean", notes={"attestation": self.note(task.tip)}
+        )
+        with mock.patch.object(self.controller, "_policy_unchanged", return_value=False) as unchanged:
+            self.controller.tick()
+            unchanged.assert_any_call(head["tip"])
+        [attempt] = self.early(self.row(batch))
+        self.assertEqual(attempt["dispatch_kind"], "staging")
+
+    def test_a_passed_attested_run_whose_attestation_stopped_counting_is_staged_in_full(self):
+        self.controller.set_setting("early_staging_enabled", False, "t")
+        batch, tip = self.prepared()
+        self.land_head()
+        head = self.head()
+        attempt = self.controller._current_attempt(head)
+        self.assertEqual(attempt["dispatch_kind"], "attested")
+        self.finish(self.runs_for(tip)[-1])
+        self.controller.store.update("ci_attempts", {"id": attempt["id"]}, outcome="pass", run_status="completed")
+        runs = len(self.github.runs)
+        with mock.patch.object(self.controller, "_attested_still_counts", return_value=False):
+            self.controller._ci(self.head(), self.clock())
+        self.assertEqual(self.controller.store.row("ci_attempts", {"id": attempt["id"]})["outcome"], "superseded")
+        promotions = [
+            r
+            for r in self.controller.store.rows("outbox", {"kind": "promote"})
+            if loads(r["payload"], {})["batch_id"] == batch["id"]
+        ]
+        self.assertEqual(promotions, [], "not promoted")
+        self.assertEqual(len(self.github.runs), runs + 1)
+        self.assertEqual(self.github.dispatches[-1]["event_type"], "tauceti-bors-staging")
+
     def test_a_head_that_seals_attested_is_dispatched_as_an_attested_landing(self):
         self.controller.set_setting("early_staging_enabled", False, "t")
         batch, tip = self.prepared()
