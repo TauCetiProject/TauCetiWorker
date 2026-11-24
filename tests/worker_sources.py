@@ -947,13 +947,6 @@ ci="one/project"
                         os.environ.pop(name, None)
                 with self.assertRaises(ClaimCollision):
                     run_round(None, options)
-            throttled_once.clear()
-            throttled_once.extend(throttled)
-            offered.clear()
-            offered.extend(
-                sorted(c.pr for c in call.kwargs["prepared_survey"].reviewable.actionable)
-                for call in execute.call_args_list
-            )
             return [
                 (
                     "github" if call.args[0] is observations[0][1] else "forgejo",
@@ -962,8 +955,6 @@ ci="one/project"
                 )
                 for call in execute.call_args_list
             ]
-
-        offered, throttled_once = [], []
 
         # The landing order: bump, rebases with re-reviews, fixes, first reviews, overlap.
         self.assertEqual(
