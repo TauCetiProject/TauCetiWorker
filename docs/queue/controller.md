@@ -777,6 +777,43 @@ and reported in status:
 | `emergency_evict` | false | the emergency batch takes the head from a running ordinary head unless it is about to land or publishing its final oleans (`_evict`); off, it waits for the running head to land |
 | `control_lane_enabled` | false | with mixed sources admitted under GitHub primary, stage GitHub PRs whose own diff leaves the native path policy in the control-file lane batch, sealed next after the emergency batch and never repaired ([mixed-sources.md](mixed-sources.md), "The control-file lane"); off stages a live lane batch as an ordinary one |
 | `no_repair_labels` | `["dont-repair-in-queue"]` | labels (case-insensitive) by which an author opts a PR out of agent edits; such a member is only ever emptied and withdrawn as `problem-anticipated` |
+| `main_integration_enabled` | false | the main-integration backfill (below): build queued members of unsealed batches on the current canonical commit while PR CI is idle |
+| `main_integration_take_out` | true | take a member whose main-integration build failed twice out of its unsealed batch; false only records results |
+| `main_integration_max_in_flight` | 8 | outstanding main-integration builds at most |
+| `main_integration_interval_seconds` | 120 | time between backfill passes |
+| `main_integration_fresh_seconds` | 21600 | a result younger than this is fresh evidence; older ones are asked again |
+| `main_integration_timeout_seconds` | 10800 | a build with no result after this long expires and is asked again (three times on the same head) |
+| `main_integration_deferred_retry_seconds` | 600 | how long a build CI deferred for lack of idle capacity waits before it is asked again |
+| `main_integration_checks_per_pass` | 20 | static stale checks (`stale_check.py`) a pass runs to order candidates |
+
+## Main-integration backfill
+
+`tauceti_queue/main_integration.py` (decision 175 B), one step of the pass after insertion and
+before sealing, off until `main_integration_enabled`. Members of open batches are mostly heads no
+CI built on a recent main (Forgejo and self-tested PRs), approved on bases up to a day old. The
+backfill asks CI to build them merged onto the current canonical commit, without pushing anything,
+through `dispatch_main_integration` (a `repository_dispatch` of TauCeti's `main-integration.yml`;
+TauCetiTools `docs/main-integration.md`), and reads the `main-integration` commit status of every
+outstanding head in one GraphQL query per pass (`main_integration_statuses`).
+
+- **Candidates:** members of open, unsealed, non-emergency, non-lane batches that are not the head,
+  from GitHub (Forgejo members later), whose input has no result younger than
+  `main_integration_fresh_seconds`. Order: a red result awaiting confirmation first, then the next
+  batch to seal, then members the static check flags (or has not checked), then the oldest base.
+  CI runs a build only on idle Fleet PR capacity and otherwise reports it deferred.
+- **Results** count only when the status names the main asked for and was posted after the
+  dispatch. Green is fresh evidence on the input (`inputs.main_integration`). A first red result is
+  asked again at once; a second takes the member out (below). An error (no verdict, a textual
+  conflict, deferral) is recorded and never acted on.
+- **Take-out before seal:** only while the batch is still unsealed, open and unclaimed, and only for
+  a member no agent has edited. The batch is replayed without the member's commit (the later
+  members are cherry-picked onto its parent, a new version), its open tasks are superseded and its
+  pre-rebase discarded; the member row is `removed` (`main-integration-failed`), the input cancelled
+  with that reason and its approval withdrawn, and the head goes back to its worker or author by a
+  head-bound recovery request naming the run (journal `main-integration-removed`). A batch sealed
+  meanwhile (decision 174's verification snapshot seals at the start of its preparation), an edited
+  member or a replay that conflicts keeps the member (journal `main-integration-kept`); the batch's
+  own verification and the head's repair deal with it as before.
 
 ## Ports
 
