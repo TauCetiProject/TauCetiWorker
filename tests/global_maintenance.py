@@ -238,7 +238,7 @@ class GlobalMaintenance(unittest.TestCase):
         with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
             self.assertFalse(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000))
             peer_claims.note_diff_guard("forgejo:one/project", 7, HEAD, now=1000)
-            self.assertTrue(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000 + 86400))
+            self.assertTrue(peer_claims.diff_guarded("forgejo:one/project", 7, HEAD, now=1000 + 3600))
             self.assertFalse(peer_claims.diff_guarded("forgejo:one/project", 7, "b" * 40, now=1001), "a push")
             self.assertFalse(peer_claims.diff_guarded("github:one/project", 7, HEAD, now=1001))
             self.assertFalse(peer_claims.hinted("forgejo:one/project", "review", 7, HEAD, now=1001))
@@ -264,6 +264,17 @@ class GlobalMaintenance(unittest.TestCase):
         guarded.assert_called_once()
         self.assertEqual(guarded.call_args.args[1:], (10, HEAD))
         dispatch.assert_not_called()
+        # A green build at the same head lifts the engine's guards: the review is offered again.
+        prepared.open_prs = [
+            PRInfo(10, HEAD, "roadmap/work", "science", "TauCeti", False, "MERGEABLE", "science", True, False)
+        ]
+        prepared.reviewable.actionable = [Candidate(10, HEAD)]
+        with (
+            patch.object(peer_claims, "diff_guarded", return_value=True),
+            patch.object(work, "dispatch", return_value=0) as dispatch,
+        ):
+            run_round(self.w, self.opts, prepared_survey=prepared)
+        dispatch.assert_called_once()
 
     def test_peer_claim_hints_expire_and_are_scoped(self):
         from tauceti_worker import peer_claims

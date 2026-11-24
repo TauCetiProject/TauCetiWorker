@@ -12,7 +12,9 @@ recorded or read.
 
 A head that the review engine declined because its diff fails the PR-level guards (too large to
 review, oversized new files) is recorded here too, for GUARD_TTL_S. The engine's verdict depends
-only on the head and its merge base, so peers skip that head until a push gives the PR a new one.
+on the head, its merge base and whether the head's build is green. Peers skip that head until a
+push gives the PR a new one or its build turns green; the TTL covers a merge base that moves under
+an unchanged head (a retargeted PR), at a few declined reviews a day rather than hundreds.
 """
 
 from __future__ import annotations
@@ -29,8 +31,7 @@ HINT_TTL_S = 600
 # A selected PR whose source could not be fetched is skipped host-wide this long (the per-worker
 # retry deadline, github_state.MAX_RETRY_AFTER), so one fetch failure does not draw every peer to it.
 UNAVAILABLE_TTL_S = 300
-# A head failing the diff guards stays failing; the TTL only bounds how long a stale record lingers.
-GUARD_TTL_S = 7 * 86400
+GUARD_TTL_S = 8 * 3600
 
 
 def _root() -> Path | None:

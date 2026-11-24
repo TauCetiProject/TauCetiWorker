@@ -850,9 +850,14 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             log(f"Global PR work: {stage} #{c.pr} source recently unavailable on this host — selecting other work")
             w.selection_changed = True
             continue
-        if stage == "review" and not opts.dry_run and peer_claims.diff_guarded(_claim_scope(w), c.pr, c.head):
-            # The engine declined this head on the diff guards; only a push can change that, so this
-            # is no work rather than a passing collision.
+        if (
+            stage == "review"
+            and not opts.dry_run
+            and peer_claims.diff_guarded(_claim_scope(w), c.pr, c.head)
+            and not any(p.number == c.pr and p.build_success for p in sv.open_prs)
+        ):
+            # The engine declined this head on the diff guards and would again: no work, not a
+            # passing collision. A green build at the head lifts the guards in the engine, so it does here.
             continue
         if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head):
             log(f"Global PR work: {stage} #{c.pr} recently found claimed by a peer — skipping before fresh PR reads")
