@@ -2648,9 +2648,10 @@ def run_in_bubble(
     (rounddir / "prompt.txt").write_text(prompt)
     # Stage the write wrappers (contract §1/§4): mounted read-only at /opt/round and put on PATH inside
     # the container, so the agent's ONLY push path is the branch-CAS git-safe-push.
-    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh", "tauceti-lean"):
+    for f in ("git-safe-push", "gh-safe-pr-create", "claim.sh", "tauceti-lean", "roadmap-report-check"):
         shutil.copy(HERE / "scripts" / f, rounddir / f)
         os.chmod(rounddir / f, 0o755)
+    shutil.copy(Path(__file__).with_name("roadmap_reports.py"), rounddir / "roadmap_reports.py")
     shutil.copy(HERE / "scripts/tauceti-lean", rounddir / "lean")
     (rounddir / "lean").chmod(0o755)
     (rounddir / "tauceti-tools").write_text('#!/bin/sh\nexec python3 -m tauceti_tools "$@"\n')
