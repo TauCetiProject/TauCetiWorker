@@ -41,37 +41,24 @@ LEAN_DIR = LEAN_ROOT.replace(".", "/")
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
 
 
-# A build whose Lean processes have used no CPU and printed nothing for this long is hung (a
-# deadlocked `lean` was seen idle for hours); it is stopped instead of waiting for the agent's
-# shell budget to kill it. Lean waiting for CPU capacity is not counted: until capacity frees,
-# its wrapper is a Python process, not the Lean binary.
-STALL_S = float(os.environ.get("TAUCETI_VERIFY_STALL_S", "900"))
-STALL_SAMPLE_S = 30.0
+# The agent's shell kills a command at its budget (`BASH_MAX_TIMEOUT_MS`, one hour by default) with
+# nothing recorded. The verifier stops itself this long before that, so the agent gets an incomplete
+# receipt naming the phase it reached instead of a killed command. Outputs already built are kept.
+DEADLINE_MARGIN_S = 120.0
 
 
-def lean_cpu(session):
-    """`(count, cpu ticks)` of the Lean compiler processes in `session` (Linux `/proc`)."""
-    count = ticks = 0
+def own_deadline(environ=None, now=None):
+    """The monotonic time this verification stops by, or None without a known budget."""
+    environ = os.environ if environ is None else environ
+    now = time.monotonic() if now is None else now
     try:
-        entries = os.scandir("/proc")
-    except OSError:
-        return 0, 0
-    with entries:
-        for entry in entries:
-            if not entry.name.isdigit():
-                continue
-            try:
-                raw = Path(entry.path, "stat").read_text()
-                fields = raw[raw.rindex(")") + 2 :].split()
-                if session not in (int(fields[2]), int(fields[3])):
-                    continue
-                if os.path.basename(os.readlink(os.path.join(entry.path, "exe"))) != "lean":
-                    continue
-                count += 1
-                ticks += int(fields[11]) + int(fields[12])
-            except (OSError, ValueError, IndexError):
-                continue
-    return count, ticks
+        if environ.get("TAUCETI_VERIFY_DEADLINE_S"):
+            return now + float(environ["TAUCETI_VERIFY_DEADLINE_S"])
+        if environ.get("BASH_MAX_TIMEOUT_MS"):
+            return now + max(60.0, float(environ["BASH_MAX_TIMEOUT_MS"]) / 1000 - DEADLINE_MARGIN_S)
+    except ValueError:
+        pass
+    return None
 
 
 class Incomplete(Exception):
@@ -376,6 +363,7 @@ class Verification:
         self.lint_modules = lint_modules
         self.requested = list(STAGES) if stage == "all" else [stage]
         self.reuse = reuse
+        self.deadline = own_deadline()  # From the start of the verification, as the shell counts.
         self.id = uuid.uuid4().hex
         self.directory = self.state / "verification" / self.id
         self.path = self.directory / "receipt.json"
@@ -459,21 +447,14 @@ class Verification:
                         stderr=output if capture else subprocess.STDOUT,
                     )
                 )
-                stall = dict(at=time.monotonic(), sampled=0.0, ticks=None, offset=0)
                 while process.poll() is None:
-                    if phase == "build" and not capture and time.monotonic() - stall["sampled"] >= STALL_SAMPLE_S:
-                        now = time.monotonic()
-                        stall["sampled"] = now
-                        count, ticks = lean_cpu(process.pid)
-                        if not count or ticks != stall["ticks"] or offset != stall["offset"]:
-                            stall.update(at=now, ticks=ticks, offset=offset)
-                        elif now - stall["at"] >= STALL_S:
-                            raise Incomplete(
-                                f"build: {count} Lean processes used no CPU and printed nothing for "
-                                f"{STALL_S / 60:.0f} min, so the build is hung; stopped it. Outputs already "
-                                "built are kept: rerun the verify, or build the module it was on directly.",
-                                reason="stalled",
-                            )
+                    if self.deadline is not None and time.monotonic() >= self.deadline:
+                        raise Incomplete(
+                            f"{phase}: stopped at the verification deadline, before the agent's shell budget "
+                            "would kill it. Outputs already built are kept: rerun the verify to continue, or "
+                            "build the modules you changed directly (`lake build Module`).",
+                            reason="deadline",
+                        )
                     if not capture:
                         with log.open("rb") as progress:
                             progress.seek(offset)

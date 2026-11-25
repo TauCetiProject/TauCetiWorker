@@ -1155,21 +1155,41 @@ class Canonical(unittest.TestCase):
         from tauceti_worker import background_relink
 
         checkout = self.checkout("w", "TauCeti.A")
+        state = self.root / "state" / "w"
+        state.mkdir(parents=True)
+        (state / "round.lock").touch()
         env = dict(os.environ, LAKE_CACHE_DIR=str(self.root / "w-store"))
         canonical.boundary(checkout, env, phase="prepare")
         marker = checkout / ".lake" / canonical.IN_PROGRESS
-        with (
-            patch.object(background_relink, "will_follow", lambda env: True),
-            patch.object(canonical, "relink", side_effect=AssertionError("the round waited for a pass")),
-        ):
-            with patch.object(canonical, "writers", lambda path: [1]):
+        requests = state / background_relink.REQUESTS
+        held = patch.dict(background_relink._HELD, {str(state): -1}, clear=True)
+        held.start()
+        self.addCleanup(held.stop)
+        passes = []
+        no_pass = patch.object(canonical, "relink", lambda *a, **k: passes.append(1) or {})
+        with patch.dict(os.environ, {background_relink.LOOP_ROUND: "1"}):
+            with no_pass, patch.object(canonical, "writers", lambda path: [1]):
                 self.assertEqual(canonical.boundary(checkout, env, phase="round-end"), {"skipped": "busy"})
             self.assertTrue(marker.exists())  # Not quiescent: the next round checks the tree.
-            self.assertEqual(canonical.boundary(checkout, env, phase="round-end"), {})
-        self.assertFalse(marker.exists())
-        # Without a pass to follow (no build-tree lock held), the round end relinks as before.
-        self.assertFalse(background_relink.will_follow(env))
-        self.assertEqual(canonical.boundary(checkout, env, phase="round-end")["published_local"], 5)
+            self.assertEqual(passes, [])
+            with no_pass, patch.object(background_relink, "request", lambda *a, **k: False):
+                canonical.boundary(checkout, env, phase="round-end")  # No request on disk: relink now.
+            self.assertEqual(passes, [1])
+            marker.touch()
+            passes.clear()
+            for count in range(1, background_relink.MAX_DEFERRED + 1):
+                with no_pass:
+                    self.assertEqual(canonical.boundary(checkout, env, phase="round-end"), {"deferred": True})
+                self.assertFalse(marker.exists())
+                self.assertEqual(json.loads(requests.read_text())[str(checkout.absolute())]["deferred"], count)
+                marker.touch()
+            self.assertEqual(passes, [])
+            # Deferred too often without a pass completing it: this round end relinks itself.
+            report = canonical.boundary(checkout, env, phase="round-end")
+            self.assertEqual(report["published_local"], 5)
+            self.assertFalse(marker.exists())
+        # A one-off round (not the loop's) has no pass to follow it.
+        self.assertFalse(background_relink.will_follow(env, checkout))
 
     def test_link_failure_is_fatal(self):
         first = self.checkout("first", "TauCeti.A")

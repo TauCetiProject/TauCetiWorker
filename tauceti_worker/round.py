@@ -185,6 +185,7 @@ def spawn_round(argv_tail: list[str], *, timeout: int = ROUND_TIMEOUT) -> subpro
     env = self_env()
     env["TAUCETI_ROUND_DEADLINE"] = str(time.time() + timeout)
     env["TAUCETI_ROUND_LOCK_WAIT"] = str(ROUND_LOCK_WAIT)
+    env["TAUCETI_LOOP_ROUND"] = "1"  # The loop starts the between-rounds relink after this round.
     return subprocess.Popen(cmd, start_new_session=True, env=env)
 
 

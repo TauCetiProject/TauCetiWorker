@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from functools import partial
 from pathlib import Path
@@ -93,34 +94,23 @@ class Resources(unittest.TestCase):
         self.assertNotIn("LEAN_NUM_THREADS", env)
         self.assertNotIn("RAYON_NUM_THREADS", env)
 
-    def test_a_hung_build_is_stopped_but_waiting_or_working_lean_is_not(self):
+    def test_a_verification_stops_itself_before_the_shell_budget(self):
         from tauceti_worker import verification
         from tauceti_worker.verification import Incomplete, Verification
 
-        verifier = Verification(self.root, self.root / "state")
+        self.assertEqual(verification.own_deadline({"BASH_MAX_TIMEOUT_MS": "3600000"}, now=0), 3480)
+        self.assertEqual(verification.own_deadline({"TAUCETI_VERIFY_DEADLINE_S": "30"}, now=5), 35)
+        self.assertEqual(verification.own_deadline({"BASH_MAX_TIMEOUT_MS": "1000"}, now=0), 60)
+        self.assertIsNone(verification.own_deadline({}, now=0))
+        with patch.dict(os.environ, {"TAUCETI_VERIFY_DEADLINE_S": "0.5"}):
+            verifier = Verification(self.root, self.root / "state")
         verifier.directory.mkdir(parents=True)
-        silent = [sys.executable, "-c", "import time; time.sleep(3)"]
-        samples = {"hung": lambda session: (2, 40), "waiting": lambda session: (0, 0)}
-        progress = iter(range(1000))
-        samples["working"] = lambda session: (2, next(progress))
-        for name, sample in samples.items():
-            with (
-                patch.object(verification, "STALL_S", 0.5),
-                patch.object(verification, "STALL_SAMPLE_S", 0.1),
-                patch.object(verification, "lean_cpu", sample),
-                contextlib.redirect_stderr(io.StringIO()),
-            ):
-                if name == "hung":
-                    with self.assertRaises(Incomplete) as stopped:
-                        verifier.command("build", silent)
-                    self.assertEqual(stopped.exception.reason, "stalled")
-                else:
-                    verifier.command("build", silent)  # Finishes on its own.
-        # Other phases are never judged, and the sampler finds only the Lean binary.
-        with patch.object(verification, "STALL_S", 0.5), patch.object(verification, "lean_cpu", samples["hung"]):
-            with contextlib.redirect_stderr(io.StringIO()):
-                verifier.command("lint", silent)
-        self.assertEqual(verification.lean_cpu(os.getsid(0)), (0, 0))
+        slow = [sys.executable, "-c", "import time; time.sleep(30)"]
+        started = time.monotonic()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(Incomplete) as stopped:
+            verifier.command("build", slow)
+        self.assertEqual(stopped.exception.reason, "deadline")
+        self.assertLess(time.monotonic() - started, 20)
 
     def test_defaults_preserve_explicit_values(self):
         self.assertEqual(v.defaults({}), {"LEAN_NUM_THREADS": "4", "RAYON_NUM_THREADS": "1"})
