@@ -1,4 +1,13 @@
-"""Bound idle repair pools to recent, reusable Lake snapshots.
+"""Bound idle repair pools to recent, reusable Lake snapshots, and give every batch a pool of its own.
+
+Each task's artifact pool (``lake-cache``, with the Mathlib cache and download views beside it) is
+its batch's own, ``<cache root>/batches/<batch id>`` (decision 202 a): PR code running in the build
+sandbox can write the pool, so a pool shared across batches would let one batch's code feed the
+outputs another batch's final verification restores. A batch pool starts empty and is filled only
+by the worker's fetches from the public and repair caches and by the batch's own builds. The worker
+records every repair-cache revision restored into it (``seeds.jsonl``, beside the pool and out of
+the sandbox's reach), which the attestation reports, so the controller can refuse outputs seeded
+from another batch's unlanded tip. A finished batch's pool is removed by collection.
 
 The root lease covers attempts and background publishers. Collection never runs with a task
 worktree present, including attempts started before cache leases were introduced. Parked batch
@@ -50,8 +59,24 @@ def cache_lease(root: Path, *, exclusive: bool = False):
         os.close(fd)
 
 
-def task_cache(root: Path, task_id: str | int) -> Path:
-    """Bind a task once; changing the fleet default cannot move a running attempt."""
+BATCHES = "batches"  # under a cache root: one pool root per batch, named by its controller ID
+BATCH_MARKER = "batch-pool.json"  # in a batch pool root: {"batch_id"}
+SEEDS = "seeds.jsonl"  # in a batch pool root: the repair-cache revisions restored into its pool
+
+
+def batch_pool(base: Path, batch_id: str | int) -> Path:
+    """The pool root of ``batch_id`` under the cache root ``base``."""
+    if not re.fullmatch(r"[1-9][0-9]*", str(batch_id)):
+        raise ValueError("batch pools require a controller batch ID")
+    return base.absolute() / BATCHES / str(batch_id)
+
+
+def task_cache(root: Path, task_id: str | int, batch_id: str | int | None = None) -> Path:
+    """Bind a task once; changing the fleet default cannot move a running attempt.
+
+    A new binding is the pool of the task's batch (``batch_pool``) under ``TAUCETI_QUEUE_CACHE_ROOT``,
+    or under the worker's own root when none is configured. Callers that only look a binding up may
+    omit ``batch_id``; creating one without it is refused, so no task falls back to a shared pool."""
     if not re.fullmatch(r"[1-9][0-9]*", str(task_id)):
         raise ValueError("cache bindings require a controller task ID")
     binding = root / "tasks" / str(task_id) / "cache-root.json"
@@ -59,14 +84,88 @@ def task_cache(root: Path, task_id: str | int) -> Path:
         raise ValueError("symlink task cache binding")
     if binding.exists():
         return Path(_record(binding)["root"])
-    configured = os.environ.get("TAUCETI_QUEUE_CACHE_ROOT")
-    # Existing attempts predate bindings and still use their private pool.
-    selected = root if (root / "worktrees" / f"task-{task_id}").exists() or not configured else Path(configured)
-    selected = selected.absolute()
+    if (root / "worktrees" / f"task-{task_id}").exists():
+        # Existing attempts predate bindings and still use their private pool.
+        selected = root.absolute()
+    else:
+        if batch_id is None:
+            raise ValueError(f"task {task_id} has no cache binding and no batch to bind it to")
+        configured = os.environ.get("TAUCETI_QUEUE_CACHE_ROOT")
+        selected = batch_pool(Path(configured) if configured else root, batch_id)
+        _mark_batch_pool(selected, str(batch_id))
     binding.parent.mkdir(parents=True, exist_ok=True)
     atomic_json(binding, {"root": str(selected)})
     register(selected, root)
     return selected
+
+
+def _mark_batch_pool(pool_root: Path, batch_id: str) -> None:
+    for directory in (pool_root.parent, pool_root):
+        if directory.is_symlink():
+            raise ValueError(f"symlink batch pool directory: {directory}")
+    pool_root.mkdir(parents=True, exist_ok=True)
+    marker = pool_root / BATCH_MARKER
+    if marker.is_symlink():
+        raise ValueError("symlink batch pool marker")
+    if marker.exists():
+        if str(_record(marker).get("batch_id")) != batch_id:
+            raise ValueError(f"{pool_root} is another batch's pool")
+        return
+    atomic_json(marker, {"batch_id": batch_id})
+
+
+def pool_batch(pool_root: Path) -> str | None:
+    """The batch whose own pool ``pool_root`` is, or None for a shared (pre-202) pool."""
+    marker = pool_root / BATCH_MARKER
+    if pool_root.parent.name != BATCHES or marker.is_symlink() or not marker.is_file():
+        return None
+    batch_id = str(_record(marker).get("batch_id", ""))
+    return batch_id if batch_id == pool_root.name and re.fullmatch(r"[1-9][0-9]*", batch_id) else None
+
+
+def _pool_root(env: dict) -> Path | None:
+    return Path(env["LAKE_CACHE_DIR"]).parent if env.get("LAKE_CACHE_DIR") else None
+
+
+def record_seed(env: dict, service: str, revision: str) -> None:
+    """Note that ``service``'s outputs for ``revision`` were restored into the task's batch pool.
+
+    Only the worker writes the ledger: it sits beside the pool, which the sandbox binds, never inside it."""
+    pool_root = _pool_root(env)
+    if pool_root is None or pool_batch(pool_root) is None or not REVISION.fullmatch(revision):
+        return
+    ledger = pool_root / SEEDS
+    line = json.dumps({"service": service, "revision": revision, "at": round(time.time(), 3)}, sort_keys=True)
+    fd = os.open(ledger, os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, (line + "\n").encode())
+    finally:
+        os.close(fd)
+
+
+def pool_identity(env: dict) -> dict:
+    """What the attestation says about the pool the verification restored from: ``{"scope": "batch",
+    "batch_id", "seeds": [{"service", "revision"}, ...]}`` for a batch pool (seeds in first-restored
+    order, without repeats), ``{"scope": "shared"}`` for any other, ``{"scope": "none"}`` without one."""
+    pool_root = _pool_root(env)
+    if pool_root is None:
+        return {"scope": "none"}
+    try:
+        batch_id = pool_batch(pool_root)
+        if batch_id is None:
+            return {"scope": "shared"}
+        seeds: list[dict] = []
+        ledger = pool_root / SEEDS
+        if ledger.is_symlink():
+            raise ValueError("symlink seed ledger")
+        for line in ledger.read_text().splitlines() if ledger.exists() else ():
+            row = json.loads(line)
+            seed = {"service": str(row["service"]), "revision": str(row["revision"])}
+            if seed not in seeds:
+                seeds.append(seed)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return {"scope": "unknown", "error": str(error)}
+    return {"scope": "batch", "batch_id": batch_id, "seeds": seeds}
 
 
 def register(pool_root: Path, worker_root: Path):
@@ -315,23 +414,90 @@ def _collect(root: Path, *, apply: bool, now: float, max_bytes: int, max_age: fl
     return result
 
 
+FINISHED = ("landed", "removed")  # batch states whose pool nothing will use again
+
+
+def batch_pools(root: Path) -> list[Path]:
+    """The batch pool roots under the cache root ``root``."""
+    directory = root / BATCHES
+    if directory.is_symlink():
+        raise ValueError(f"symlink batch pool directory: {directory}")
+    if not directory.is_dir():
+        return []
+    return sorted(p for p in directory.iterdir() if re.fullmatch(r"[1-9][0-9]*", p.name))
+
+
+def _collect_root(store, root: Path, *, apply, now, max_bytes, max_age, batch_id: str | None = None) -> dict:
+    """Collect one pool root under its exclusive lease. A batch pool whose batch has finished is removed
+    whole; any other idle pool is trimmed to its retention budget."""
+    result: dict = {"root": str(root)}
+    if batch_id is not None:
+        result["batch_id"] = int(batch_id)
+    try:
+        if root.is_symlink():
+            raise ValueError("symlink pool root")
+        with cache_lease(root, exclusive=True) as acquired:
+            if not acquired or any(_busy(store, source, now, cache_root=root) for source in participants(root)):
+                result["state"] = "busy"
+                return result
+            if batch_id is not None:
+                row = store.execute("SELECT state FROM batches WHERE id=?", (int(batch_id),)).fetchone()
+                if row is None:
+                    result["state"] = "unknown"  # another controller's batch, or not yet visible: keep it
+                    return result
+                if row[0] in FINISHED:
+                    result.update(state="removed" if apply else "eligible", reason="batch-finished")
+                    if apply:
+                        _remove_pool(root)
+                    return result
+            if batch_id is not None and not (root / "lake-cache").exists():
+                result["state"] = "absent"
+                return result
+            result.update(_collect(root, apply=apply, now=now, max_bytes=max_bytes, max_age=max_age))
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+        result.update(state="error", error=str(error))
+    return result
+
+
+def _remove_pool(root: Path) -> None:
+    """Remove a finished batch's pool root, keeping its lock file until last so the lease stays valid."""
+    for entry in root.iterdir():
+        if entry.name == "cache.lock":
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+    (root / "cache.lock").unlink(missing_ok=True)
+    root.rmdir()
+
+
 def collect(
     database: Path, roots: list[Path], *, apply=False, now=None, max_bytes=MAX_BYTES, max_age=MAX_AGE
 ) -> list[dict]:
+    """Collect each cache root, then every batch pool under it (``batch_pools``)."""
     now = time.time() if now is None else now
     results = []
     with contextlib.closing(sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as store:
         for root in roots:
-            result = {"root": str(root)}
+            results.append(_collect_root(store, root, apply=apply, now=now, max_bytes=max_bytes, max_age=max_age))
             try:
-                with cache_lease(root, exclusive=True) as acquired:
-                    if not acquired or any(_busy(store, source, now, cache_root=root) for source in participants(root)):
-                        result["state"] = "busy"
-                    else:
-                        result.update(_collect(root, apply=apply, now=now, max_bytes=max_bytes, max_age=max_age))
-            except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
-                result.update(state="error", error=str(error))
-            results.append(result)
+                pools = batch_pools(root)
+            except (OSError, ValueError) as error:
+                results.append({"root": str(root / BATCHES), "state": "error", "error": str(error)})
+                continue
+            for pool_root in pools:
+                results.append(
+                    _collect_root(
+                        store,
+                        pool_root,
+                        apply=apply,
+                        now=now,
+                        max_bytes=max_bytes,
+                        max_age=max_age,
+                        batch_id=pool_root.name,
+                    )
+                )
     return results
 
 

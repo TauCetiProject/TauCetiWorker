@@ -426,7 +426,12 @@ pre-rebase unchanged and discarded with the mark. `_attestation_problem` says wh
 in for staging's checks, or nothing when it would: it must name exactly the tip and its tree, the
 sandbox on, a verifier out of candidate code's reach (`verifier_isolated`), the whole-library lint, and a policy commit whose `tauceti.toml` and
 `scripts/` are `main`'s now, with the exact tools commit from the repository (and, for a SHA pin,
-the commit) `main` pins. Status
+the commit) `main` pins. Its build must also have restored from the batch's own artifact pool
+(decision 202, `_pool_problem`): `artifact_pool.scope` is `batch` with this batch's ID, and every
+repair-cache revision in `artifact_pool.seeds` lands with the tip or already has: the tip, one of
+its ancestors, one of the batch's own `batch_tips`, or the tip a `landed` batch landed as. Another
+batch's unlanded tip (a head's earlier tip, a landed batch's superseded one) can hold outputs of
+members that never land, so an attestation seeded with one does not count. Status
 shows it as `head.attestation_problem` and `pre_rebase.attestation_problem`.
 
 The attested landing (decision 200, setting `attested_landing_enabled`, default false) acts on it:
@@ -549,9 +554,10 @@ The list also names the published tips of the most recently landed heads. A land
 the repair cache, but the `main` commit it lands as reaches the public cache only once main's own CI
 has built it, which takes hours when the landing adds more commits than that CI walks back. The next
 head is based on that `main` commit, whose tree equals the landed tip's except for CI files, so
-between the head's own previous tips and its `base_sha` the controller appends the `batch_tips` of
-the last `REPAIR_OUTPUTS_LANDED_HEADS` (two) batches in state `landed`, newest batch first and each
-batch's tips newest first, at most four per batch (`Controller._landed_tips`), without repeats.
+between the head's own previous tips and its `base_sha` the controller appends the tips the last
+`REPAIR_OUTPUTS_LANDED_HEADS` (two) batches in state `landed` landed as, newest batch first
+(`Controller._landed_tips`), without repeats. A landed batch's earlier tips are not listed: they can
+hold outputs of members that never landed (decision 202).
 Every task's `warm_revs` (`Controller._warm_revs`) names the same tips after the batch tips it lists
 and before the base.
 

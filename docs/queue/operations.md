@@ -1344,8 +1344,19 @@ age, inference holds and stall conditions, each beside its baseline value.
 Set `TAUCETI_QUEUE_CACHE_ROOT` identically for all colocated repair workers, for example
 `/home/operator/TauCetiQueue-data/repair-shared`, and pass that path to
 `services/queue/install-repair-cleanup.sh --cache-root PATH` along with every worker root.
-They share one `lake-cache` and its ownership lease, while credentials/configuration,
-worktrees, logs and task checkpoints stay in their separate worker roots. Tasks persist
+Every batch has a pool root of its own under it, `batches/<batch id>` (decision 202 a), with its
+`lake-cache`, Mathlib cache, download views and ownership lease: the build sandbox can write the
+pool, so a pool shared across batches would let one batch's code feed another batch's final
+verification. The colocated workers share a batch's pool when they work on the same batch, while
+credentials/configuration, worktrees, logs and task checkpoints stay in their separate worker
+roots. Without `TAUCETI_QUEUE_CACHE_ROOT` the batch pools are under the worker's own root. A new
+batch pool starts empty and is filled only by the worker's fetches from the public and repair
+caches and by the batch's own builds; `seeds.jsonl` beside the pool records each repair-cache
+revision restored into it, for the attestation. A parked batch tree built from another pool (the
+shared pool before 202) is removed rather than adopted. Collection removes a batch's pool once the
+batch is `landed` or `removed` and no attempt or publisher holds it, and trims live idle ones like
+any other pool. The shared root's own `lake-cache` is used only by attempts bound before 202 and is
+collected as before. Tasks persist
 their selected cache root so a restart/configuration change cannot move an active attempt.
 Publishers receive that exact root in their spec. Fetches use disposable per-fetch
 views seeded by hardlinks to shared archives, then atomically transfer verified

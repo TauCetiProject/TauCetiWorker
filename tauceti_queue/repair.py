@@ -1041,6 +1041,20 @@ def _fetch_mapping(
     return fetch
 
 
+def _note_seed(env: dict, fetch: dict) -> None:
+    """Record a repair-cache restore in the batch pool's seed ledger (``repair_cache.record_seed``). Any
+    service but the public one counts: only the public cache is written by trusted CI alone. Only a
+    fetch that found no mapping restored nothing; one that failed otherwise may have restored part of
+    one, so it is recorded too."""
+    if fetch.get("service") == CACHE_SERVICE or (
+        not fetch.get("mapping_found") and "no published cache mapping" in str(fetch.get("reason"))
+    ):
+        return
+    from tauceti_queue.repair_cache import record_seed
+
+    record_seed(env, str(fetch["service"]), str(fetch["revision"]))
+
+
 def first_parent_ancestors(worktree: Path, revision: str, count: int) -> list[str]:
     """Up to ``count`` first-parent ancestors of ``revision``, newest first; empty when the history is
     not in the repository (a shallow fetch) or the commit is a root."""
@@ -1176,6 +1190,7 @@ def prepare_artifacts(
                 fetch["distance"] = None
                 warm_attempts.append(fetch)
                 seconds += fetch["seconds"]
+                _note_seed(env, fetch)
             warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
             record["warm_attempts"] = warm_attempts
             record["warmed_from"] = [fetch["revision"] for fetch in warmed]
@@ -1203,6 +1218,7 @@ def prepare_artifacts(
                 fetch["distance"] = distance
                 attempts.append(fetch)
                 seconds += fetch["seconds"]
+                _note_seed(env, fetch)
                 if fetch["mapping_found"]:
                     break
             found = attempts[-1] if attempts[-1]["mapping_found"] else None

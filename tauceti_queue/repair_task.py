@@ -76,6 +76,7 @@ from tauceti_queue import (
     repair,
     repair_additive,
     repair_audit,
+    repair_cache,
     repair_context,
     repair_lookahead,
     repair_numproj,
@@ -1476,12 +1477,16 @@ def latest_checks(tip: str, outcome: dict) -> dict | None:
     return parallel.get("checks") if parallel.get("verified_tip") == tip else None
 
 
-def attestation(clone: Path, tip: str, checks: dict | None, publish: dict | None = None) -> dict | None:
+def attestation(
+    clone: Path, tip: str, checks: dict | None, publish: dict | None = None, pool: dict | None = None
+) -> dict | None:
     """What the worker states about its passing verification of exactly ``tip`` (decision 200): the tip
     and its tree, the policy commit whose TauCetiTools pin and policy files the checks used, the tools
-    commit, the lint scope, whether the build sandbox was on, the tip's toolchain and whether its
-    outputs were published for that revision. None unless every check passed. The controller decides
-    whether it counts (`Controller._attestation_problem`); this only reports."""
+    commit, the lint scope, whether the build sandbox was on, the tip's toolchain, whether its
+    outputs were published for that revision, and the artifact pool the build restored from
+    (``repair_cache.pool_identity``: the batch's own, and the repair-cache revisions seeded into it;
+    decision 202). None unless every check passed. The controller decides whether it counts
+    (`Controller._attestation_problem`); this only reports."""
     if not isinstance(checks, dict) or checks.get("status") != "passed":
         return None
     try:
@@ -1502,6 +1507,7 @@ def attestation(clone: Path, tip: str, checks: dict | None, publish: dict | None
         # Whether the checks' scripts, scope files and drivers were outside every candidate-writable
         # directory and mounted read-only (`repair_audit.check`).
         "verifier_isolated": checks.get("verifier_isolated") is True,
+        "artifact_pool": pool if isinstance(pool, dict) else {"scope": "unknown"},
         "worker_revision": STARTUP_REVISION,
     }
 
@@ -2511,7 +2517,7 @@ def run_task(
         os.environ[repair_sandbox.BACKGROUND_VARIABLE] = "1"
     else:
         os.environ.pop(repair_sandbox.BACKGROUND_VARIABLE, None)
-    cache_root = task_cache(cfg.root, task.task_id)
+    cache_root = task_cache(cfg.root, task.task_id, task.batch_id)
     cache_cleanup = before_task(cache_root)
     if cache_cleanup["state"] != "busy":
         log(f"repair cache retention: {json.dumps(cache_cleanup, sort_keys=True)}")
@@ -3344,7 +3350,7 @@ def _run_task(
             verify_admin(task.repository)
         from tauceti_queue.repair_cache import task_cache
 
-        env_lake = repair.lake_env(cfg.root, cache_root=task_cache(cfg.root, task.task_id))
+        env_lake = repair.lake_env(cfg.root, cache_root=task_cache(cfg.root, task.task_id, task.batch_id))
         repair_publish.configure(env_lake, cfg.publish)
         if not resuming:
             try:
@@ -3363,7 +3369,9 @@ def _run_task(
                 raise
             from tauceti_queue import repair_cleanup
 
-            parked_at = repair_cleanup.adopt(cfg.clone, cfg.root, task.batch_id, worktree)
+            parked_at = repair_cleanup.adopt(
+                cfg.clone, cfg.root, task.batch_id, worktree, cache_root=Path(env_lake["LAKE_CACHE_DIR"]).parent
+            )
             outcome["sources"]["worktree_reused"] = checkout_worktree(cfg.clone, start_tip, worktree)
             # The batch's tree from an earlier task on this worker: its `.lake` is the warm state, so
             # nothing is fetched and Lake compiles only what changed since.
@@ -3563,7 +3571,13 @@ def _run_task(
                     )
                 where = "the head's tip" if pre_rebased(task) is not None else "its base"
                 log(f"task {task.task_id}: the open batch builds on {where}; nothing to prepare")
-                attested = attestation(cfg.clone, task.tip, stream.audit_record, outcome.get("publish"))
+                attested = attestation(
+                    cfg.clone,
+                    task.tip,
+                    stream.audit_record,
+                    outcome.get("publish"),
+                    repair_cache.pool_identity(env_lake),
+                )
                 released = release_task(
                     cfg,
                     client,
@@ -4001,7 +4015,13 @@ def _run_task(
             # Whether this exact tip passed the worker's own verification: the controller verifies and
             # repairs the next batch only on a head tip with such a pass (decision 174).
             notes["local_verification"] = {"tip": tip, "checks_passed": verified_unchanged(tip, outcome)}
-            attested = attestation(cfg.clone, tip, latest_checks(tip, outcome), outcome.get("publish"))
+            attested = attestation(
+                cfg.clone,
+                tip,
+                latest_checks(tip, outcome),
+                outcome.get("publish"),
+                repair_cache.pool_identity(env_lake),
+            )
             if attested is not None and verified_unchanged(tip, outcome):
                 notes["attestation"] = attested
             verification_note = admission_verification(
@@ -4328,9 +4348,14 @@ def retry_deliveries(cfg: RunnerConfig, client: TaskClient, *, stop: Stop | None
                     from tauceti_queue.repair_cleanup import worktree_lease
 
                     worktree = cfg.root / "worktrees" / f"task-{task.task_id}"
-                    with cache_lease(task_cache(cfg.root, task.task_id)), worktree_lease(cfg.root, task.task_id):
+                    with (
+                        cache_lease(task_cache(cfg.root, task.task_id, task.batch_id)),
+                        worktree_lease(cfg.root, task.task_id),
+                    ):
                         if worktree.is_dir():
-                            env = repair.lake_env(cfg.root, cache_root=task_cache(cfg.root, task.task_id))
+                            env = repair.lake_env(
+                                cfg.root, cache_root=task_cache(cfg.root, task.task_id, task.batch_id)
+                            )
                             publication = repair_publish.start_early(worktree, env)
                             if publication is not None:
                                 outcome["publish"] = publication

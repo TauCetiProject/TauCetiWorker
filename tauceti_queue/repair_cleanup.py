@@ -60,17 +60,40 @@ def _move(clone: Path, source: Path, destination: Path) -> None:
     repair.git(clone, "worktree", "unlock", str(destination))
 
 
-def adopt(clone: Path, root: Path, batch_id: str | int, worktree: Path) -> str | None:
+def parked_pool(root: Path, parked: Path) -> Path | None:
+    """The artifact pool the task that parked ``parked`` was bound to, or None when it is not known."""
+    record = parked / BATCH_RECORD
+    try:
+        if record.is_symlink() or not record.is_file():
+            return None
+        task_id = str(_record(record).get("task_id", ""))
+        binding = root / "tasks" / task_id / "cache-root.json"
+        if not re.fullmatch(r"[1-9][0-9]*", task_id) or binding.is_symlink() or not binding.is_file():
+            return None
+        return Path(_record(binding)["root"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def adopt(
+    clone: Path, root: Path, batch_id: str | int, worktree: Path, *, cache_root: Path | None = None
+) -> str | None:
     """Move the batch's parked tree to the task's ``worktree``, keeping its ``.lake``.
 
     Returns the commit the tree was parked at, or None when there is no parked tree (the task then
-    restores from the caches as a new tree does). A tree that cannot be moved is removed.
+    restores from the caches as a new tree does). A tree that cannot be moved is removed, and so is one
+    parked by a task bound to another pool than ``cache_root`` (when given): its ``.lake`` was built
+    from that pool, which before decision 202 was shared across batches.
     """
     parked = batch_tree(root, batch_id)
     if parked is None or worktree.exists():
         return None
     with worktree_lease(root, parked.name, wait=True):  # waits for a collection or a park of this tree
         if parked.is_symlink() or not parked.is_dir():
+            return None
+        if cache_root is not None and parked_pool(root, parked) != cache_root:
+            print(f"[repair-cleanup] removing batch tree {parked}: it was built from another artifact pool", flush=True)
+            repair.remove_worktree(clone, parked)
             return None
         try:
             head = repair.git(parked, "rev-parse", "HEAD").strip()
