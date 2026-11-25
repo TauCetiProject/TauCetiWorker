@@ -1092,6 +1092,65 @@ class Canonical(unittest.TestCase):
         self.assertFalse(copy.exists())
         self.assertEqual(report["stale_store_files"], 1)
 
+    def test_an_interrupted_round_gets_the_full_pass_before_the_next_agent(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        env = dict(os.environ, LAKE_CACHE_DIR=str(self.root / "w-store"))
+        marker = checkout / ".lake" / canonical.IN_PROGRESS
+        self.assertEqual(canonical.boundary(checkout, env, phase="prepare"), {})
+        self.assertTrue(marker.exists() and canonical.interrupted(checkout / ".lake"))
+        # The round is killed: no round-end. The next round checks the tree before its agent.
+        report = canonical.boundary(checkout, env, phase="prepare")
+        self.assertEqual(report["published_local"], 5)
+        self.assertTrue(marker.exists())
+        canonical.boundary(checkout, env, phase="round-end")
+        self.assertFalse(marker.exists())
+        self.assertEqual(canonical.boundary(checkout, env, phase="prepare"), {})
+        # A round end that found the tree busy is not quiescent: the marker stays.
+        with patch.object(canonical, "writers", lambda path: [1]):
+            canonical.boundary(checkout, env, phase="round-end")
+        self.assertTrue(marker.exists())
+
+    def test_a_suspect_private_copy_is_rechecked_even_after_an_interrupted_pass(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        store = self.root / "w-store"
+        self.relink(checkout)
+        module(checkout, "TauCeti.B", "same")
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "B.olean")
+        olean.write_bytes(b"interrupted rebuild")
+        os.utime(olean, (time.time() - 60,) * 2)
+        (store / "artifacts").mkdir(parents=True)
+        copy = store / "artifacts" / name
+        shutil.copyfile(olean, copy)
+        os.utime(copy, (time.time() - 60,) * 2)
+        report = {}
+        canonical.relink(
+            checkout,
+            store,
+            self.pool,
+            sweep_private=True,
+            report=report,
+            stop=lambda: report.get("invalidated_outputs", 0) > 0,
+        )
+        self.assertFalse(olean.exists())
+        self.assertTrue(copy.exists() and report["incomplete"])
+        # The checkout output is gone, so only the saved cursor can make the name suspect again.
+        report = canonical.relink(checkout, store, self.pool, sweep_private=True)
+        self.assertFalse(copy.exists())
+        self.assertEqual(report["stale_store_files"], 1)
+        self.assertFalse(report.get("incomplete"))
+
+    def test_a_private_copy_of_an_output_published_in_the_same_pass_converges(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        store = self.root / "w-store"
+        (store / "artifacts").mkdir(parents=True)
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "A.olean")
+        shutil.copyfile(olean, store / "artifacts" / name)  # Lake's private copy, a separate inode.
+        os.utime(store / "artifacts" / name, (time.time() - 60,) * 2)
+        report = canonical.relink(checkout, store, self.pool, sweep_private=True)
+        objects = canonical.store(self.pool) / "objects"
+        self.assertEqual((store / "artifacts" / name).stat().st_ino, (objects / name).stat().st_ino)
+        self.assertEqual(report["relinked_private"], 1)
+
     def test_link_failure_is_fatal(self):
         first = self.checkout("first", "TauCeti.A")
         self.relink(first)

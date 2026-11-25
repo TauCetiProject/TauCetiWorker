@@ -628,6 +628,8 @@ class Pass:
         self.trace_of = {}
         self.suspect = set()  # Names whose bytes failed here: their private aliases get checked.
         self.private_only = set()  # Private-store names with no object, left out of the work items.
+        self.suspects_checked = set()  # Suspect names whose private alias this pass re-examined.
+        self.published = set()  # Names this pass gave an object: their private aliases converge too.
         self.rejected = rejected(self.pool)  # Snapshots earlier passes proved wrong.
         for name in ("objects", "meta", "locks", "uses", "cursors", "hashes"):
             (self.directory / name).mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -864,6 +866,7 @@ class Pass:
                     raise Unavailable(f"cannot publish {name}: {error}") from None
                 record(self.directory, name, sha, size, "ci")
                 self.count("published_ci")
+                self.published.add(name)
                 return "again"  # Converge `path` on the object just adopted.
             verdict = False if pool_info.st_ino == info.st_ino else self.lake(path, name, info)
             if verdict is not True:
@@ -905,6 +908,7 @@ class Pass:
             raise Unavailable(f"cannot publish {name}: {error}") from None
         record(self.directory, name, sha, size, "local")
         self.count("published_local")
+        self.published.add(name)
         return None
 
 
@@ -943,7 +947,8 @@ def relink(
     budget = float(env.get("TAUCETI_RELINK_BUDGET_S", 180)) if budget is None else budget
     slots = int(env.get("TAUCETI_RELINK_SLOTS", 4)) if slots is None else slots
     slot_wait = float(env.get("TAUCETI_RELINK_SLOT_WAIT_S", 60)) if slot_wait is None else slot_wait
-    if busy := writers(tree):
+    # A parked tree's Lake may still name the checkout (its cwd), or the tree itself.
+    if busy := sorted(set(writers(checkout)) | set(writers(tree))):
         report["skipped"] = f"Lake or Lean processes {busy} name the checkout"
         return report
     pool = expanded_cache.root(env) if pool is None else Path(pool)
@@ -1002,6 +1007,11 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                 pass
             by_name.setdefault(name, []).append(path)
     report["outputs"] = found
+    key = hashlib.sha256(str(work.checkout.resolve()).encode()).hexdigest()[:16]
+    cursor_path = work.directory / "cursors" / (key + ".json")
+    cursor = read_json(cursor_path)
+    # Names an interrupted pass found bad but had not yet re-examined in the private store.
+    work.suspect.update(name for name in cursor.get("suspect") or () if isinstance(name, str))
     private_names = set()
     if sweep_private and work.private is not None and work.private.is_dir():
         for index, entry in enumerate(os.scandir(work.private)):
@@ -1013,11 +1023,17 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                 if (work.objects / entry.name).stat().st_ino == entry.stat(follow_symlinks=False).st_ino:
                     continue
             except FileNotFoundError:
-                # No object and no pool copy to adopt: `publish` leaves Lake's private metadata
-                # alone unless its bytes were rejected or its name turns suspect (checked below).
+                # No object, no pool copy to adopt, and no checkout output of the name that this pass
+                # may publish: `publish` leaves Lake's private metadata alone unless its bytes were
+                # rejected or its name turns suspect (re-examined after the work items).
                 with contextlib.suppress(FileNotFoundError):
                     info = entry.stat(follow_symlinks=False)
-                    if not legacy(work.pool, entry.name).exists() and fingerprint(info) not in work.rejected:
+                    if (
+                        entry.name not in by_name
+                        and entry.name not in work.suspect
+                        and not legacy(work.pool, entry.name).exists()
+                        and fingerprint(info) not in work.rejected
+                    ):
                         work.private_only.add(entry.name)
                         continue
             private_names.add(entry.name)
@@ -1031,9 +1047,6 @@ def _relink(work, build, sweep_private, delete_setup, limit):
         [(name, str(path), False) for name, paths in by_name.items() for path in paths]
         + [(name, str(work.private / name), True) for name in private_names]
     )
-    key = hashlib.sha256(str(work.checkout.resolve()).encode()).hexdigest()[:16]
-    cursor_path = work.directory / "cursors" / (key + ".json")
-    cursor = read_json(cursor_path)
     after = tuple(cursor.get("after") or ("", ""))
     split = next((i for i, item in enumerate(items) if item[:2] > after), len(items))
     order = items[split:] + items[:split]
@@ -1133,12 +1146,16 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                             work.deadline = max(deadline, time.monotonic() + GRACE)
                 index += len(group)
             offset += len(batch)
-        # A private-only name whose checkout bytes failed here may hold the same bad bytes.
-        for name in sorted(work.suspect & work.private_only):
-            if work.expired():
-                raise TimeoutError("relink budget reached")
-            with object_lock(work.directory, name, exclusive=True, deadline=work.deadline):
-                work.decide(work.private / name, name, True)
+        # A private alias of a name whose checkout bytes failed may hold the same bad bytes, and
+        # one of a name published here may now converge: either alias may have been skipped
+        # (private-only) or decided before its name turned suspect or got its object.
+        for name in sorted(work.suspect | work.published):
+            if work.private is not None and (work.private / name).exists():
+                if work.expired():
+                    raise TimeoutError("relink budget reached")
+                with object_lock(work.directory, name, exclusive=True, deadline=work.deadline):
+                    work.decide(work.private / name, name, True)
+            work.suspects_checked.add(name)
     except TimeoutError:
         pass
     finally:
@@ -1148,14 +1165,19 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                 {":".join(map(str, k)): v for k, v in work.lakes.items() if v is not None and k in work.seen},
             )
     work.deadline = deadline
-    complete = done >= len(order)
+    suspects = sorted(work.suspect - work.suspects_checked)
+    complete = done >= len(order) and not suspects
     report["remaining"] = len(order) - done
+    if suspects:
+        report["suspects_pending"] = len(suspects)
     state = {}
     if not complete:
         report["incomplete"] = True
         state["after"] = list(last) if last is not None else list(after)
     if slow:
         state["slow"] = sorted(slow)
+    if suspects:
+        state["suspect"] = suspects
     if state:
         expanded_cache.atomic_json(cursor_path, state)
     else:
@@ -1254,6 +1276,17 @@ def reconcile(pool, name, path, *, blocking=True, guard=None, refused=None):
         return False
 
 
+# In `.lake` from before the agent starts until a quiescent round end relinks the tree: a round
+# killed in between (or whose agent's cleanup was incomplete) leaves it, so the next one checks the
+# tree in full before its agent starts, and no between-rounds pass treats the tree as idle.
+IN_PROGRESS = ".tauceti-round-in-progress"
+
+
+def interrupted(lake) -> bool:
+    """Whether the last round on this `.lake` ended without a quiescent round-end relink."""
+    return (Path(lake) / IN_PROGRESS).exists()
+
+
 def _switched_off(env):
     """No canonical store for this round, or an operator switch (read each time: no restart)."""
     if env.get("TAUCETI_SHARED_ARTIFACTS", "1") == "0" or not env.get("LAKE_CACHE_DIR"):
@@ -1265,8 +1298,9 @@ def boundary(checkout, env, *, phase, prefix=()):
     """Relink at a round boundary. Only a failed hard-link probe before the agent starts raises.
 
     Before the agent (`prepare`) only the probe runs: the agent needs working hard links, not a
-    converged tree, and the full pass runs between rounds (`between_rounds`). Everything else
-    (I/O errors, busy checkouts, a busy host) is logged and left for the next boundary:
+    converged tree, and the full pass runs between rounds (`between_rounds`). After a round that
+    did not reach a quiescent end (`IN_PROGRESS`), the full pass runs here, as before. Everything
+    else (I/O errors, busy checkouts, a busy host) is logged and left for the next boundary:
     relinking is maintenance and must not discard or block a round.
     """
     checkout = Path(checkout)
@@ -1284,9 +1318,22 @@ def boundary(checkout, env, *, phase, prefix=()):
             raise
         except (OSError, ValueError) as error:
             raise Unavailable(f"hard-link probe failed: {type(error).__name__}: {error}") from error
-        log("canonical store (prepare): hard links verified; relinking runs between rounds")
-        return {}
-    return _logged(
+        marker = checkout / ".lake" / IN_PROGRESS
+        report = {}
+        if marker.exists():
+            log("canonical store (prepare): the last round on this tree was interrupted; relinking before the agent")
+            report = _logged(
+                phase,
+                lambda: relink(checkout, private_store, pool, env=env, sweep_private=True, delete_setup=True),
+            )
+        else:
+            log("canonical store (prepare): hard links verified; relinking runs between rounds")
+        try:
+            marker.touch()
+        except OSError as error:
+            log(f"canonical store (prepare): could not mark the tree in use: {error}")
+        return report or {}
+    report = _logged(
         phase,
         lambda: relink(
             checkout,
@@ -1297,6 +1344,9 @@ def boundary(checkout, env, *, phase, prefix=()):
             delete_setup=phase == "round-end",
         ),
     )
+    if phase == "round-end" and report is not None and not report.get("skipped"):
+        (checkout / ".lake" / IN_PROGRESS).unlink(missing_ok=True)  # A quiescent end was relinked.
+    return report
 
 
 def between_rounds(checkout, lake, env, *, stop=None):

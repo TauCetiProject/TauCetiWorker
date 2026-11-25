@@ -577,7 +577,11 @@ its cursor next time. It holds `<state>/build-tree.lock` while it works. The nex
 lock before it prepares any checkout: it asks the pass to stop at its next file, and kills it after
 20 s. Retention takes the same lock before deleting the worker's caches.
 `TAUCETI_BACKGROUND_RELINK=0` turns the between-rounds pass off, leaving only the round-end pass.
-It runs only on Linux.
+It runs only on Linux. A round marks its tree in use (`.lake/.tauceti-round-in-progress`) before
+its agent starts, and its round-end pass clears the mark once the agent's processes are gone. A
+round that is killed, or whose agent's cleanup is incomplete, leaves the mark: no between-rounds
+pass touches that tree, and the next round runs the full pass before its agent, as rounds did
+before.
 
 The collector measures allocated bytes across shared and worker-private caches, counting
 hard-linked inodes once. Its eviction target defaults to 25% of filesystem capacity;

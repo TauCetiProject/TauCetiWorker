@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -85,6 +86,7 @@ class BackgroundRelink(unittest.TestCase):
         process = self.holder(command="something-else")
         with (
             patch.object(background, "STOP_WAIT", 0.5),
+            patch.object(background, "KILL_WAIT", 0.5),
             contextlib.redirect_stderr(io.StringIO()),
             contextlib.redirect_stdout(io.StringIO()),
         ):
@@ -93,6 +95,31 @@ class BackgroundRelink(unittest.TestCase):
                 self.assertFalse(idle)
         self.assertIsNone(process.poll())
         self.assertNotIn(str(self.state), background._HELD)
+
+    def test_a_holder_that_cannot_be_signalled_still_times_out(self):
+        process = self.holder()
+        started = time.monotonic()
+        with (
+            patch.object(background, "STOP_WAIT", 0.3),
+            patch.object(background, "KILL_WAIT", 0.3),
+            patch.object(background, "_signal", side_effect=PermissionError(1, "denied")),
+            contextlib.redirect_stderr(io.StringIO()),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertFalse(background.stop(self.state))
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIsNone(process.poll())
+
+    def test_an_interrupted_round_tree_is_never_relinked_between_rounds(self):
+        checkout = self.state.parent.parent / "a" / "TauCeti"
+        background.parked(checkout).mkdir(parents=True)
+        (background.parked(checkout) / ".tauceti-round-in-progress").touch()
+        (self.state / background.REQUESTS).write_text(json.dumps({str(checkout): dict(env={})}))
+        calls = []
+        with patch("tauceti_worker.canonical_store.between_rounds", lambda *a, **k: calls.append(a) or {}):
+            background.main(str(self.state))
+        self.assertEqual(calls, [])
+        self.assertFalse((self.state / background.REQUESTS).exists())
 
     def test_paused_lets_the_lock_go(self):
         with background.paused(self.state) as idle:

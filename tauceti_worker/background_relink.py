@@ -21,6 +21,7 @@ Linux only: the stop handshake checks the holder's command line in `/proc`.
 from __future__ import annotations
 
 import contextlib
+import errno
 import fcntl
 import os
 import signal
@@ -149,26 +150,99 @@ def finish(running: subprocess.Popen | None) -> None:
             running.wait(KILL_WAIT)
 
 
-def _holder(fd: int, state: Path) -> int | None:
-    """The pid a between-rounds pass recorded in the lock, if that process is this worker's pass."""
+def _syscall(number, *args) -> int:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    result = libc.syscall(number, *args)
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return result
+
+
+def _pidfd_open(pid: int) -> int:
+    """`pidfd_open(2)`; some Python builds lack the wrapper. Linux's unified syscall table: 434."""
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    import ctypes
+
+    return _syscall(434, ctypes.c_int(pid), ctypes.c_uint(0))
+
+
+def _pidfd_signal(handle: int, sig: int) -> None:
+    """`pidfd_send_signal(2)`, 424 in the same table."""
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(handle, sig)
+        return
+    import ctypes
+
+    _syscall(424, ctypes.c_int(handle), ctypes.c_int(sig), None, ctypes.c_uint(0))
+
+
+class _Pid:
+    """A kernel without pidfds: signal by pid (the command line was checked just before)."""
+
+    def __init__(self, pid):
+        self.pid = pid
+
+
+def _signal(handle, sig: int) -> None:
+    if isinstance(handle, _Pid):
+        os.kill(handle.pid, sig)
+    else:
+        _pidfd_signal(handle, sig)
+
+
+def _close(handle) -> None:
+    if not isinstance(handle, _Pid):
+        with contextlib.suppress(OSError):
+            os.close(handle)
+
+
+def _holder(fd: int, state: Path):
+    """A handle on the process recorded in the lock, if it is this worker's pass, else None.
+
+    The pidfd is opened before the command line is read and checked alive after it, so the
+    process signalled is the one whose command line was checked, even if its pid is reused.
+    """
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         pid = int(os.read(fd, 32).decode().strip() or 0)
-        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except (OSError, ValueError):
         return None
-    ours = COMMAND.encode() in argv and str(state).encode() in argv
-    return pid if pid > 0 and ours else None
+    if pid <= 0:
+        return None
+    try:
+        handle = _pidfd_open(pid)
+    except OSError as error:
+        if error.errno != errno.ENOSYS:
+            return None
+        handle = _Pid(pid)
+    try:
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+        _signal(handle, 0)  # Still the process whose command line was read.
+    except OSError:
+        _close(handle)
+        return None
+    if COMMAND.encode() in argv and str(state).encode() in argv:
+        return handle
+    _close(handle)
+    return None
 
 
 def _acquire(state: Path) -> int | None:
-    """The worker's build-tree lock, stopping a between-rounds pass that holds it."""
+    """The worker's build-tree lock, stopping a between-rounds pass that holds it.
+
+    SIGTERM first; SIGKILL once `STOP_WAIT` has passed; failure once `KILL_WAIT` more has passed,
+    whatever happens to the holder or the signals.
+    """
     state.mkdir(parents=True, exist_ok=True)
     fd = os.open(state / LOCK, os.O_CREAT | os.O_RDWR, 0o600)
     os.set_inheritable(fd, False)
     started = time.monotonic()
-    deadline = started + STOP_WAIT
-    signalled = killed = None
+    stop_by, give_up = started + STOP_WAIT, started + STOP_WAIT + KILL_WAIT
+    signalled = killed = False
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -177,21 +251,26 @@ def _acquire(state: Path) -> int | None:
             return fd
         except BlockingIOError:
             pass
-        pid = _holder(fd, state)
         now = time.monotonic()
-        with contextlib.suppress(OSError):
-            if pid and pid != signalled:
-                os.kill(pid, signal.SIGTERM)
-                signalled = pid
-            elif pid and now >= deadline and pid != killed:
-                log(f"canonical store: the between-rounds relink {pid} did not stop; killing it")
-                os.kill(pid, signal.SIGKILL)
-                killed = pid
-                deadline = now + KILL_WAIT
-        if now >= deadline and (killed or not pid):
+        if now >= give_up:
             os.close(fd)
             log(f"canonical store: {state / LOCK} still held after {now - started:.0f}s")
             return None
+        if not killed and (not signalled or now >= stop_by):
+            handle = _holder(fd, state)
+            if handle is not None:
+                try:
+                    if not signalled:
+                        _signal(handle, signal.SIGTERM)
+                        signalled = True
+                    else:
+                        log("canonical store: the between-rounds relink did not stop; killing it")
+                        _signal(handle, signal.SIGKILL)
+                        killed = True
+                except OSError:
+                    pass  # Gone already, or not ours to signal: the deadline still applies.
+                finally:
+                    _close(handle)
         time.sleep(0.1)
 
 
@@ -257,8 +336,10 @@ def main(state_dir: str) -> int:
             done.append(checkout)
             continue
         lake = _idle_lake(Path(checkout), os.environ)
-        if lake is None:
-            done.append(checkout)  # Gone, or not idle: the next round-end asks again.
+        if lake is None or canonical_store.interrupted(lake):
+            # Gone, or not idle: the next round-end asks again. An interrupted round's tree may
+            # still have its agent's processes, and the next round checks it before its agent.
+            done.append(checkout)
             continue
         env = dict(os.environ)
         env.update({k: str(v) for k, v in (row.get("env") or {}).items() if k in CARRIED})
