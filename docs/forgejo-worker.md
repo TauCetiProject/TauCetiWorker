@@ -65,14 +65,15 @@ no conflict. Unset, no Forgejo recovery request is trusted.
 
 The same IDs are the only accounts whose `build` commit status a worker trusts on Forgejo. The
 merge queue runs TauCeti's pr-build on GitHub Actions for each Forgejo PR head that is not
-`self-tested` and posts the result as `build` (TauCeti decision 215). With the IDs set, a survey
+`self-tested` and posts the result as `build` (TauCeti decision 215). With the IDs set and
+`TAUCETI_FORGEJO_PR_CI=1` (turn it on once the queue posts `build`), a survey
 reads that status for each non-draft, non-self-tested head (`tauceti_worker/forgejo_builds.py`;
 a final verdict is read once per head and kept in `forgejo-builds.json` in the worker's state
 directory). Review then waits for a green `build` or `self-tested`, as on GitHub, and a red
 `build` on one of the worker's own PRs gets a `fix-ci` round. A contributor's red PR is left to
 the contributor's own fleet. A `build` from any other account, a contributor fleet's included,
-counts for nothing. Unset, the worker reviews Forgejo PRs without CI and runs no Forgejo `fix-ci`,
-as before.
+counts for nothing. A host's workers share each head's read for three minutes. Without the switch
+or the IDs, the worker reviews Forgejo PRs without CI and runs no Forgejo `fix-ci`, as before.
 
 The canonical instance defaults to those values. Other instances require
 explicit bindings. Token files must be private. A missing canonical credential

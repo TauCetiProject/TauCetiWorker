@@ -545,22 +545,27 @@ class SharedIndexSurveys(unittest.TestCase):
             ]
 
         self.api.statuses.side_effect = read
+        # The publisher's IDs alone (they also authenticate recovery requests) do not gate review.
         with patch.dict("os.environ", TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS=str(publisher)):
+            self.assertEqual({c.pr for c in self.survey(seed=0).reviewable.actionable}, set(self.heads))
+            self.assertEqual(reads, [])
+        switched = {"TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS": str(publisher), "TAUCETI_FORGEJO_PR_CI": "1"}
+        with patch.dict("os.environ", switched):
             result = self.survey(seed=0, stages=["rebase", "fix", "fix-ci", "review"])
             self.assertEqual({c.pr for c in result.reviewable.actionable}, {2})
             self.assertEqual({c.pr for c in result.red_ci.actionable}, {1, 7})
-            # A final verdict is read once per head; pending and missing ones are read again.
+            # The host's workers share the reads; a final verdict is kept for good.
             reads.clear()
-            from tauceti_worker.github_transport import invalidate_shared
-            from tauceti_worker.source_identity import discovery_scope
-
-            invalidate_shared(discovery_scope(self.source))
-            self.survey(seed=1, stages=["rebase", "fix", "fix-ci", "review"])
-            self.assertEqual(set(reads), set(self.heads) - {1, 2, 6, 7})
+            self.survey(seed=1, stages=["rebase", "fix", "fix-ci", "review"], cfg=self.peer("peer"))
+            self.assertEqual(reads, [])
+            # A verdict accepted from one publisher is not reused once another is trusted instead.
+            with patch.dict("os.environ", TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS="10"):
+                result = self.survey(seed=2, stages=["rebase", "fix", "fix-ci", "review"])
+                self.assertEqual({c.pr for c in result.reviewable.actionable}, set())
         self.assertTrue((self.cfg.state / forgejo_builds.CACHE_FILE).exists())
         # Without the publisher's identity the survey reviews without CI, as before.
         reads.clear()
-        result = self.survey(seed=2)
+        result = self.survey(seed=3)
         self.assertEqual(reads, [])
         self.assertEqual({c.pr for c in result.reviewable.actionable}, set(self.heads))
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -310,6 +311,12 @@ def _unavailable_server(failure):
     return failure.kind == "ForgeError" and (failure.status in (0, 408, 429) or failure.status >= 500)
 
 
+# The queue links a Forgejo `build` to its GitHub Actions run, and to nothing else.
+RUN_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/job/[0-9]+)?")
+# How long workers on one host share a head's `build` read (`trusted_build`).
+TRUSTED_BUILD_TTL = 180
+
+
 def _posted_at(value):
     """A Forgejo timestamp in whole epoch seconds; None when it is missing or malformed."""
     try:
@@ -453,6 +460,21 @@ class ForgejoReadSource:
         trusted = sorted({int(actor) for actor in trusted_ids})
 
         def fetch():
+            # Workers on one host share each head's answer for a few minutes; a pending build
+            # takes at least that long, so this coalesces without hiding a verdict for long.
+            if getattr(self, "shared_inventory", False) is True:
+                from .source_identity import advisory_scope
+
+                return transport.shared_read(
+                    [*advisory_scope(self, number), "trusted_build", head, trusted],
+                    read,
+                    ttl=TRUSTED_BUILD_TTL,
+                    identity=self.cache_namespace,
+                    lock_timeout=60,
+                )
+            return read()
+
+        def read():
             newest = None
             for row in self.api.statuses(self.repository, head):
                 if not isinstance(row, dict) or row.get("context") != "build":
@@ -470,10 +492,11 @@ class ForgejoReadSource:
             if state not in {"pending", "success", "failure", "error"}:
                 return {}
             url = newest.get("target_url") or ""
+            description = "".join(ch for ch in str(newest.get("description") or "") if ch.isprintable())
             return {
                 "state": state,
-                "description": str(newest.get("description") or "")[:200],
-                "url": url if isinstance(url, str) and url.startswith("https://github.com/") else "",
+                "description": description[:200],
+                "url": url if isinstance(url, str) and RUN_URL.fullmatch(url) else "",
                 "at": _posted_at(newest.get("created_at")),
             }
 

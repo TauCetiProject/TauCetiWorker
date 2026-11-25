@@ -7,8 +7,9 @@ publisher. That account's IDs are `TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS` (`source
 same identity whose recovery requests a worker already trusts; a `build` from anyone else, such as
 a contributor fleet with code write, counts for nothing.
 
-Forgejo's listing carries no statuses, so each non-draft, non-self-tested head is read once per
-survey until it has a final verdict (`success`, `failure` or `error`), which never changes for that
+The gate is on only with `TAUCETI_FORGEJO_PR_CI=1` as well (`enabled`). Forgejo's listing carries
+no statuses, so each non-draft, non-self-tested head is read (shared by a host's workers for a few
+minutes) until it has a final verdict (`success`, `failure` or `error`), which never changes for that
 head and is kept in `<state>/forgejo-builds.json`. A `pending` or missing status is read again by
 the next survey. Without configured publisher IDs nothing is read and `enabled` is False: the survey
 then reviews Forgejo PRs without CI, as before.
@@ -33,8 +34,15 @@ def trusted_ids() -> frozenset[int]:
     return recovery_author_ids()
 
 
+SWITCH_ENV = "TAUCETI_FORGEJO_PR_CI"
+
+
 def enabled() -> bool:
-    return bool(trusted_ids())
+    """Forgejo PR CI gates this worker: switched on, and the publisher's IDs known.
+
+    The switch is separate from the IDs, which also authenticate recovery requests: turn it on only
+    once the queue is posting `build`, or unlabelled PRs would wait for a build that never comes."""
+    return os.environ.get(SWITCH_ENV, "") == "1" and bool(trusted_ids())
 
 
 def _load(path: Path) -> dict:
@@ -73,7 +81,8 @@ def apply(state_dir, source, prs, ids=None):
         if pr.is_draft or pr.self_tested or not pr.head_oid:
             result.append(pr)
             continue
-        key = f"{source.repository.key}#{pr.number}@{pr.head_oid}"
+        # Bound to the trusted accounts: a verdict from a publisher no longer trusted is read again.
+        key = f"{source.repository.key}#{pr.number}@{pr.head_oid}:{','.join(map(str, sorted(ids)))}"
         entry = cache.get(key)
         if not isinstance(entry, dict) or entry.get("state") not in FINAL:
             entry = source.trusted_build(pr.number, pr.head_oid, ids)

@@ -343,7 +343,7 @@ def worker_survey(
 
     # Forgejo PR CI (decision 215): the queue's trusted `build`, when this worker knows its publisher.
     with_ci = forgejo_builds.enabled() and source.repository.forge.kind == "forgejo"
-    if with_ci:
+    if with_ci and deep and set(stages) & {"review", "fix-ci"}:
         result.open_prs = forgejo_builds.apply(cfg.state, source, result.open_prs)
     rs.observe(result.open_prs)
     from contextlib import nullcontext
