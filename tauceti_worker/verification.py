@@ -487,8 +487,7 @@ class Verification:
                     self.watch()
                     if capture and time.time() - entry["started_at"] > 300:
                         raise Incomplete(f"{phase}: toolchain probe timed out")
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        process.wait(timeout=POLL_S)  # Returns as soon as the phase exits.
+                    time.sleep(POLL_S)
                 entry["exit"] = process.returncode
         finally:
             try:
