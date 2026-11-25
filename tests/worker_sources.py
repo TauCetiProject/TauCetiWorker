@@ -1310,6 +1310,35 @@ ci="one/project"
         self.assertEqual([(only, tier) for only, tier, _ in calls], [(["review"], 0), (["fix"], 2)])
         self.assertIs(calls[1][2], focused[0][2])
 
+    def test_the_fractional_focus_slot_counts_as_focused_without_its_draw(self):
+        import time
+
+        from tauceti_worker.fleet_capacity import roadmap_focus
+
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        policy = Path(directory.name) / "admission.json"
+        policy.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "expires_at": time.time() + 20,
+                    "workers": [],
+                    "roadmap_focus": {
+                        "areas": ["PDE"],
+                        "workers": [],
+                        "fractional_worker": "w7",
+                        "fractional_percent": 1,
+                    },
+                }
+            )
+        )
+        env = {"TAUCETI_FLEET_ADMISSION_FILE": str(policy)}
+        with patch("tauceti_worker.fleet_capacity.random.randrange", return_value=99):
+            self.assertEqual(roadmap_focus("w7", env=env), [])
+            self.assertEqual(roadmap_focus("w7", env=env, draw=False), ["PDE"])
+        self.assertEqual(roadmap_focus("w8", env=env, draw=False), [])
+
     def test_priority_labels_are_comma_separated_and_case_insensitive(self):
         from tauceti_worker.survey import has_priority_label, priority_labels
 

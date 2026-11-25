@@ -49,11 +49,13 @@ def admission_reason(worker: str, *, env=None, now=None) -> str | None:
 _CURRENT_UNIT = None
 
 
-def roadmap_focus(worker: str, *, env=None, now=None) -> list[str]:
+def roadmap_focus(worker: str, *, env=None, now=None, draw=True) -> list[str]:
     """Read optional, live roadmap steering for this slot. Admission remains independent.
 
     Older controllers have no focus field; malformed or stale steering falls back
     to ordinary selection. It must never pause reviews, repairs, or admissions.
+    `draw=False` answers whether the slot may be focused at all: the fractional slot
+    counts without its per-round draw.
     """
     env = os.environ if env is None else env
     path = env.get("TAUCETI_FLEET_ADMISSION_FILE")
@@ -79,7 +81,7 @@ def roadmap_focus(worker: str, *, env=None, now=None) -> list[str]:
                 worker == focus.get("fractional_worker")
                 and type(fractional_percent) is int
                 and 0 < fractional_percent < 100
-                and random.randrange(100) < fractional_percent
+                and (not draw or random.randrange(100) < fractional_percent)
             ):
                 return sorted(set(areas))
     except (OSError, ValueError, KeyError, TypeError, AttributeError):

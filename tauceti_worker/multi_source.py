@@ -161,7 +161,8 @@ def deduplicate(observations):
 
 
 def _focus_slot(w, opts) -> bool:
-    """Whether this round may be a fleet roadmap focus round (work_units.round_scope's conditions)."""
+    """Whether this round may be a fleet roadmap focus round (work_units.round_scope's conditions).
+    The fractional slot counts whatever its draw: one extra survey costs less than a missed review."""
     from .config import roadmap_targets
     from .fleet_capacity import roadmap_focus
 
@@ -171,7 +172,7 @@ def _focus_slot(w, opts) -> bool:
         and not getattr(opts, "prs", ())
         and roadmap_only() in (None, "auto")
         and roadmap_targets() is None
-        and roadmap_focus(wid)
+        and roadmap_focus(wid, draw=False)  # round_scope makes the fractional slot's draw
     )
 
 
@@ -193,7 +194,9 @@ def run_round(w, opts, *, use_fleet_focus=True, priority_only=False):
         # for the other slots. Offer the leading tier across every area first, then the focus.
         try:
             return run_round(w, opts, use_fleet_focus=False, priority_only=True)
-        except (ClaimCollision, NoProgress) as error:
+        except (ClaimCollision, NoEligibleWork) as error:
+            # Nothing claimable there. Outages and pauses (an unavailable source after the round's
+            # cutoff, an admission wait) propagate as they would from any round.
             log(f"Fleet roadmap focus: no claimable priority work outside the focus ({type(error).__name__})")
     observations = collect(w, opts, use_fleet_focus=use_fleet_focus)
     deduplicate(observations)
@@ -371,8 +374,7 @@ def run_round(w, opts, *, use_fleet_focus=True, priority_only=False):
             log(f"{name}: selected work deferred ({type(error).__name__}); checking the other source")
             continue
     if priority_only:
-        if waits:
-            raise waits[0]
+        # A source that is waiting is the focused round's to report; this pass only found nothing.
         raise (ClaimCollision if collisions else NoEligibleWork)("no claimable priority work")
     destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
     # Partial discovery cannot prove that a roadmap target is unclaimed on the
