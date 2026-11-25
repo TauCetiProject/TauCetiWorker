@@ -684,7 +684,7 @@ DECLARATION = re.compile(
     r"\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|public|noncomputable|unsafe|partial|nonrec|meta|local|scoped)\s+)*"
     r"(def|abbrev|instance|theorem|lemma|opaque|axiom|structure|class|inductive|macro|macro_rules|elab|elab_rules"
     r"|syntax|declare_syntax_cat|notation\w*|infix\w*|prefix|postfix|initialize|builtin_initialize|simproc|dsimproc"
-    r"|irreducible_def|example|mutual)\b\s*(?:\(\s*name\s*:=\s*)?([^\s:({\[⦃)]*)"
+    r"|irreducible_def|example|mutual)\b\s*(?:\(\s*name\s*:=\s*)?((?:«[^»]*»|[^\s:({\[⦃)«])*)"
 )
 # Commands with no term form, which also end the previous command; only at column 0 here.
 COMMAND = re.compile(
@@ -703,7 +703,8 @@ def ident_char(c: str) -> bool:
 
 def literal_end(text: str, i: int) -> tuple[int, bool] | None:
     """Where the comment, string, character literal, syntax quotation or quoted name at `i` ends,
-    and whether it is blanked (a quoted name is code); None if none starts there.
+    and whether it is blanked (all are); None if none starts there. Every rule errs toward blanking
+    more: a region blanked wrongly only merges blocks, while one left unblanked could split one.
 
     Block comments nest, an interpolated string's `{...}` is scanned as code, and a quotation (`` `(...) ``, `` `(command| ...) ``) ends at its matching
     parenthesis, skipping everything inside by these same rules. Unterminated: the end of the text."""
@@ -722,12 +723,14 @@ def literal_end(text: str, i: int) -> tuple[int, bool] | None:
                 j += 1
         return min(j, n), True
     if c == '"':
-        # After `!` (s!, f!, m!, ...) a string interpolates: `{...}` is code, holding any literal.
-        interpolated, j = i > 0 and text[i - 1] == "!", i + 1
+        # Any string may interpolate (s!, m!, throwError, dbg_trace, ...): `{...}` is scanned as code
+        # holding any literal. For a plain string this ends at or after its real end, never before,
+        # so it can only blank more and lengthen a block.
+        j = i + 1
         while j < n and text[j] != '"':
             if text[j] == "\\":
                 j += 2
-            elif interpolated and text[j] == "{":
+            elif text[j] == "{":
                 depth, j = 1, j + 1
                 while j < n and depth:
                     if (inner := literal_end(text, j)) is not None:
@@ -744,9 +747,9 @@ def literal_end(text: str, i: int) -> tuple[int, bool] | None:
         return (n if end < 0 else end + 1 + len(raw.group(1))), True
     if c == "'" and not after_ident and (char := CHAR.match(text, i)):
         return char.end(), True
-    if c == "«":
+    if c == "«":  # A quoted name may span lines; blanked so nothing in it starts a block.
         end = text.find("»", i)
-        return (n if end < 0 else end + 1), False
+        return (n if end < 0 else end + 1), True
     if text.startswith("`(", i):
         depth, j = 1, i + 2
         while j < n and depth:
@@ -794,7 +797,9 @@ def declarations(lines: list[str]) -> list[tuple[int, int, str, str]]:
             continue
         if match := DECLARATION.match(code):
             starts.append(i)
-            kinds[i] = (match.group(1), match.group(2))
+            # The name from the source itself (a quoted name is blanked in the mask), at the same place.
+            named = DECLARATION.match(lines[i - 1], len(code) - len(code.lstrip()))
+            kinds[i] = (match.group(1), named.group(2) if named and named.group(1) == match.group(1) else "")
         elif COMMAND.match(code):
             starts.append(i)
     if not starts or starts[0] != 1:

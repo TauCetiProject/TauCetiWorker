@@ -1307,7 +1307,7 @@ class Parts(unittest.TestCase):
         deleted = {"files": [{"path": "TauCeti/Y.lean", "after": None, "diff": "-run_cmd pure ()\n"}]}
         self.assertEqual(sa.commit_context(deleted), [])
         self.assertEqual(
-            sa.defined_names(commit), ["evalAdd", "loop", "m", "mine", "p", "registerTraceClass", "slow", "x"]
+            sa.defined_names(commit), ['"go"', '"‖"', "evalAdd", "loop", "m", "mine", "p", "registerTraceClass", "slow"]
         )
 
     def test_context_carries_whole_declarations_and_the_code_they_call_across_files(self):
@@ -1379,14 +1379,23 @@ class Parts(unittest.TestCase):
                 '  let c := s!"pre {"',
                 "def fourth := 4",
                 '" ++ "x"} post"',
+                '  let d := s! /- c -/ "{"',
+                "def sixth := 6",
+                '"}"',
+                '  dbg_trace "{"',
+                "def seventh := 7",
+                '"}"; let «odd',
+                "def eighth» := 8",
                 "  )",
                 "  pure (tail a b)",
                 "theorem t : True := trivial",
             ]
         )
         blocks = sa.declarations(text.split("\n"))
-        self.assertEqual([(lo, hi, name) for lo, hi, _, name in blocks], [(1, 12, "gen"), (13, 13, "t")])
+        self.assertEqual([(lo, hi, name) for lo, hi, _, name in blocks], [(1, 19, "gen"), (20, 20, "t")])
         self.assertEqual(sa.code_mask(["x `(unterminated -- comment"]), ["x" + " " * 26])
+        quoted = sa.declarations(["def «my def» := 1", "def plain := 2"])
+        self.assertEqual([name for _, _, _, name in quoted], ["«my def»", "plain"])
 
     def test_a_pass_needs_the_plan_to_hold_every_hunk(self):
         batch = self.wide({})
