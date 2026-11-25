@@ -116,7 +116,10 @@ def api_get(url: str, token_file: Path | None = None):
 def open_pulls(base_url: str, repository: str, token_file: Path | None = None) -> list[dict]:
     pulls, page = [], 1
     while True:
-        batch = api_get(f"{base_url}/api/v1/repos/{repository}/pulls?state=open&limit=50&page={page}", token_file)
+        # stat=false: the restore reads number and head, not the diff stat Forgejo would compute per PR.
+        batch = api_get(
+            f"{base_url}/api/v1/repos/{repository}/pulls?state=open&stat=false&limit=50&page={page}", token_file
+        )
         pulls += batch
         if len(batch) < 50:
             return pulls

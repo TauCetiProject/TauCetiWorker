@@ -335,7 +335,10 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         self._bound(repo)
         result = []
         seen = set()
-        for row in self.client.pulls(self.repository, state="open"):
+        from tauceti_worker.forgejo_reads import without_listing_stat
+
+        # `_pull` reads no diff stat, so the listing need not compute one.
+        for row in without_listing_stat(self.client).pulls(self.repository, state="open"):
             if not isinstance(row, dict):
                 raise Incomplete("native pull listing is malformed")
             number = self._positive(row.get("number"))
@@ -377,7 +380,8 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         for page in range(1, max_pages + 1):
             rows = self.client.request(
                 "GET",
-                f"repos/{self.repository.name}/pulls?state=open&sort=recentupdate&limit={page_size}&page={page}",
+                f"repos/{self.repository.name}/pulls?state=open&sort=recentupdate&stat=false"
+                f"&limit={page_size}&page={page}",
             )
             if not isinstance(rows, list):
                 raise Incomplete("native recent pull listing is malformed")

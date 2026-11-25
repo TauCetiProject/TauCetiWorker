@@ -375,6 +375,48 @@ def _page_retrying(api, *, attempts=LISTING_PAGE_ATTEMPTS, sleep=time.sleep):
     return view
 
 
+# Projected PR fields Tools derives from a pull listing's diff stat (`additions`, `deletions`,
+# `changed_files`). `files` is here because Tools checks the file list against those counts.
+STAT_FIELDS = frozenset({"additions", "deletions", "changedFiles", "files"})
+_PULL_LISTING = re.compile(r"/?repos/[^/]+/[^/]+/pulls")
+
+
+def needs_stat(fields):
+    """Whether a projection of `fields` reads the diff stat. None means every field."""
+    return fields is None or bool(STAT_FIELDS & set(fields))
+
+
+def without_listing_stat(api):
+    """A view of a native client whose pull listings ask Forgejo not to compute diff stats.
+
+    Forgejo runs `git diff-tree --shortstat` for every PR a pull listing renders, for `additions`,
+    `deletions` and `changed_files`. The TauCeti fork's `stat=false`
+    (https://github.com/TauCetiProject/forgejo/pull/2) skips it and reports zeros; an unpatched
+    Forgejo ignores the parameter and computes them as before. Use the view only for reads that
+    project none of STAT_FIELDS. Only GETs of `repos/{owner}/{repo}/pulls` change, not single PRs
+    or other paths. Other clients are returned as is.
+    """
+    import copy
+    from urllib.parse import parse_qsl, urlencode, urlunsplit
+
+    from tauceti_tools.forge import Forgejo
+
+    if not isinstance(api, Forgejo):
+        return api
+    view = copy.copy(api)
+    request = api.request
+
+    def statless(method, path, *args, **kwargs):
+        parsed = urlsplit(path)
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if method.upper() == "GET" and _PULL_LISTING.fullmatch(parsed.path) and all(k != "stat" for k, _ in query):
+            path = urlunsplit(parsed._replace(query=urlencode([*query, ("stat", "false")])))
+        return request(method, path, *args, **kwargs)
+
+    view.request = statless
+    return view
+
+
 class ForgejoReadSource:
     """Worker-shaped PR metadata and discussion reads on one qualified source.
 
@@ -667,6 +709,10 @@ class ForgejoReadSource:
 
         return ForgejoReader(_ProjectionAPI(api))
 
+    def _fields_reader(self, fields):
+        """The reader for a pull listing projecting `fields`: without diff stats unless they are read."""
+        return self.reader if needs_stat(fields) else self._listing_reader(without_listing_stat(self.api))
+
     def open_prs(self, *, fresh=False):
         """Complete bounded open inventory, excluding unverified CI observations.
 
@@ -677,7 +723,8 @@ class ForgejoReadSource:
         fields = list(self.inventory_fields)
 
         def fetch():
-            return self._listing_reader(_page_retrying(self.api)).pulls(self.repository, fields, state="open")
+            api = without_listing_stat(_page_retrying(self.api))
+            return self._listing_reader(api).pulls(self.repository, fields, state="open")
 
         return self._read("open_prs", [], fetch, fresh=fresh)
 
@@ -720,7 +767,7 @@ class ForgejoReadSource:
             from tauceti_tools.forge import Incomplete
 
             api = _page_retrying(self.api)
-            reader = self._listing_reader(api)
+            reader = self._listing_reader(without_listing_stat(api))
 
             def issue_numbers(state, **query):
                 path = f"repos/{self.repository.name}/issues?" + urlencode({"type": "pulls", "state": state, **query})

@@ -393,6 +393,7 @@ class NativeSource(unittest.TestCase):
         def request(method, path, data=None, **kwargs):
             paths.append(path)
             self.assertIn("sort=recentupdate", path)
+            self.assertIn("stat=false", path)
             return copy.deepcopy(pages.get(int(path.rsplit("page=", 1)[1]), []))
 
         self.api.request = Mock(side_effect=request)

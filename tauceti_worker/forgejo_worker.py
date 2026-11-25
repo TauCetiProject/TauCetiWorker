@@ -112,7 +112,7 @@ class ForgejoWorkerSource(ForgejoReadSource):
     def pr_list(self, fields, *, author=None, state="open"):
         def fetch():
             if list(fields) != ["number"] or author is not None or state != "open":
-                return self.reader.pulls(self.repository, fields, state=state, author=author)
+                return self._fields_reader(fields).pulls(self.repository, fields, state=state, author=author)
             # A roadmap round's baseline needs only numbers: the issue index lists them without
             # the per-PR git work (head, base, diff stat) of a pull listing.
             numbers = []
@@ -143,7 +143,8 @@ class ForgejoWorkerSource(ForgejoReadSource):
         phrases = search_phrases(search)
         keyword = search_id(phrases) or next((p for p in phrases if p != MARKER_TAG), None)
         if keyword is None:
-            path = f"repos/{self.repository.name}/pulls?state=closed"
+            # Rows supply number, title, body, state, merged and base: no diff stat (`without_listing_stat`).
+            path = f"repos/{self.repository.name}/pulls?state=closed&stat=false"
         else:
             query = urllib.parse.urlencode({"type": "pulls", "state": "closed", "q": keyword})
             path = f"repos/{self.repository.name}/issues?{query}"
@@ -320,12 +321,11 @@ class ForgejoWorkerSource(ForgejoReadSource):
         if not owner or not branch:
             return None
         # Narrow discovery on the server; still verify its branch and owner below.
+        fields = ["number", "headRefName", "headRepositoryOwner"]
         rows = self._read(
             "pull_for_head",
             [owner, branch],
-            lambda: self.reader.pulls(
-                self.repository, ["number", "headRefName", "headRepositoryOwner"], state="open", head=branch
-            ),
+            lambda: self._fields_reader(fields).pulls(self.repository, fields, state="open", head=branch),
             fresh=True,
             cacheable=False,
         )

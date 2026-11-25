@@ -553,7 +553,7 @@ class Forgejo(unittest.TestCase):
         ]
         recent = self.source.merged_prs(f"{t.MERGED_SEARCH} sort:updated-desc", limit=1)
         self.assertEqual([(d["number"], d["url"]) for d in recent], [(4, self.repo.pull_url(4))])
-        self.assertEqual(self.api.pages.call_args.args[0], "repos/one/project/pulls?state=closed")
+        self.assertEqual(self.api.pages.call_args.args[0], "repos/one/project/pulls?state=closed&stat=false")
         self.api.max_pages = 1
         self.assertEqual(self.source.merged_prs(f"{t.MERGED_SEARCH} sort:created", limit=200), [])
         self.api.max_pages = 100
