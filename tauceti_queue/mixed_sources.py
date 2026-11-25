@@ -129,7 +129,12 @@ def self_tested_command(body):
     """True for a `self-tested` request, False for `-self-tested`, None for neither.
 
     Read as TauCeti's GitHub labels-from-comments workflow reads it: a command is a whole,
-    unindented line (trailing whitespace ignored, case-sensitive), and the last one wins."""
+    unindented line (trailing whitespace ignored, case-sensitive), and the last one wins. An
+    automated review scoreboard is never a command."""
+    from runner import admission_policy as policy
+
+    if policy.SCOREBOARD_MARKER in (body or ""):
+        return None
     found = None
     for raw in re.split(r"\r?\n", body or ""):
         line = raw.rstrip()
@@ -223,10 +228,11 @@ class NativePoller:
         for number, row in rows:
             body = row.get("body") or ""
             command = self_tested_command(body)
-            # Only a comment created in this window is a request: an edit to an older one is not,
-            # as on GitHub, where only a newly posted comment counts.
-            if command is not None and _forge_time(row.get("created_at")) >= since:
-                requests.append((_forge_time(row.get("created_at")), row["id"], number, row, command))
+            # Only a newly posted comment is a request, as on GitHub: one created in this window and
+            # never edited (the feed shows only the current body, so an edit could have added it).
+            created = _forge_time(row.get("created_at"))
+            if command is not None and created >= since and _forge_time(row.get("updated_at")) <= created:
+                requests.append((created, row["id"], number, row, command))
             key = (row["id"], row.get("updated_at"), hashlib.sha256(body.encode()).hexdigest())
             if key in self._comments_seen:
                 continue
@@ -264,23 +270,36 @@ class NativePoller:
         publisher applies the label. Whether the commenter is the PR's author, and for a request
         whether the PR is open, is checked against the live PR when the entry is performed. The
         outbox key is the comment, so a comment read again (the feed margin, a restart) or edited
-        later is never a second request."""
+        later is never a second request. Each commenter's newest request per PR is recorded too, so
+        an older entry performed later (a retry, or a comment the feed found late) is superseded."""
         registry, controller = self.registry, self.controller
         if registry.mode != "admit":
             return 0  # observation never publishes
         queued = 0
         with controller._lock, controller.store.transaction():
-            for _, comment_id, number, row, add in sorted(requests, key=lambda r: (r[0], r[1])):
+            for created, comment_id, number, row, add in sorted(requests, key=lambda r: (r[0], r[1])):
                 author = (row.get("user") or {}).get("id")
                 if type(author) is not int or author < 1:
                     continue
                 key = f"self-tested-request:{registry.profile.forgejo.repository.key}:{comment_id}"
                 if controller.store.row("outbox", {"key": key}) is not None:
                     continue
+                order = [created, comment_id]
+                # Per commenter: only the author's requests apply, and another's never supersedes them.
+                newest_key = f"state:self_tested_request:{registry.profile.forgejo.repository.key}:{number}:{author}"
+                if order > controller.store.get_setting(newest_key, [0, 0]):
+                    controller.store.set_setting(newest_key, order, "native queue policy", controller.clock())
                 controller._enqueue(
                     "self_tested_request",
                     key,
-                    {"number": registry.number(number), "comment_id": comment_id, "author_id": author, "add": add},
+                    {
+                        "number": registry.number(number),
+                        "comment_id": comment_id,
+                        "author_id": author,
+                        "add": add,
+                        "order": order,
+                        "newest_key": newest_key,
+                    },
                 )
                 queued += 1
         if queued:

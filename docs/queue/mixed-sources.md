@@ -46,11 +46,14 @@ listings and the comment feed off.
 In `admit` mode the comment feed also carries `self-tested` requests, read as
 TauCeti's GitHub `labels-from-comments` workflow reads them: a standalone,
 unindented `self-tested` or `-self-tested` line, the last one winning, in a
-comment created since the feed's last position (an edit to an older comment is
-not a request). Each such comment becomes one `self_tested_request` outbox entry,
-keyed by the comment, which applies or removes the label as the queue's
-publisher only if the commenter is the PR's current author, and adds it only
-while the PR is open. This is how a contributor fleet, whose account cannot edit
+comment created since the feed's last position and never edited (the feed shows
+only the current body, so an edited comment is not a request; repost instead),
+and never in a review scoreboard. Each such comment becomes one
+`self_tested_request` outbox entry, keyed by the comment, which applies or
+removes the label as the queue's publisher only if the commenter is the PR's
+current author, and adds it only while the PR is open. The queue records each
+commenter's newest request per PR, so an older entry performed later (a retry,
+or a comment the feed found late) reports `superseded` and changes nothing. This is how a contributor fleet, whose account cannot edit
 Forgejo labels, declares local verification.
 Because mixed
 landing freezes a contribution at admission, an approved Forgejo input is read

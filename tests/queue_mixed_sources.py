@@ -626,6 +626,28 @@ class Mixed(MixedFixture, unittest.TestCase):
         poller.run_once()
         self.controller.tick()
         self.assertNotIn("self-tested", self.native.labels[1])
+        feed[:] = [
+            # A scoreboard is never a command, even from the PR's author.
+            comment(64, 7, "<!--tauceti-scoreboard-->\nself-tested"),
+            # A recent comment edited since posting: the command may be the edit's, so it is not one.
+            comment(65, 7, "self-tested", created="2026-11-19T05:01:00Z", updated="2026-11-19T05:02:00Z"),
+        ]
+        self.clock.advance(registry.poll_seconds)
+        self.assertNotIn("self_tested_requests", poller.run_once()["comment_feed"])
+        # A request the feed finds after a newer one is superseded by it, whatever order they run in.
+        feed[:] = [comment(67, 7, "-self-tested", created="2026-11-19T05:10:00Z")]
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        feed[:] = [comment(66, 7, "self-tested", created="2026-11-19T05:05:00Z")]
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.controller.tick()
+        self.assertNotIn("self-tested", self.native.labels[1])
+        results = {
+            loads(e["payload"])["comment_id"]: e["result"]
+            for e in self.controller.store.rows("outbox", {"kind": "self_tested_request"})
+        }
+        self.assertEqual((results[66], results[67]), ("superseded", "already-unlabelled"))
 
     def test_native_insertion_rejudges_a_review_no_listing_or_feed_reported(self):
         poller, head = self.native_approved()

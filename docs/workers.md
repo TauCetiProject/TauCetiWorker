@@ -161,7 +161,8 @@ so Forgejo refuses its label edit with HTTP 403. The worker then asks instead,
 as on GitHub: if its account is the PR's author it posts a standalone
 `self-tested` comment, and the queue's publisher applies the label (see
 docs/queue/mixed-sources.md). After one refusal the worker goes straight to the
-comment. Agents get the same instruction. This route does not change any
+comment, and it does not post again while its own request is under an hour old.
+Agents get the same instruction. This route does not change any
 team's permissions.
 
 The label is a persistent author declaration. Keep it through fix/rebase pushes

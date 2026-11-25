@@ -11646,6 +11646,8 @@ class Controller:
 
             if not isinstance(payload["number"], SourceNumber):
                 raise ControllerError("self-tested-request", "comment requests are read from Forgejo only")
+            if payload["order"] < self.store.get_setting(payload["newest_key"], [0, 0]):
+                return "superseded"  # a newer request on this PR decides
             pull = self.source.fetch_pr(repo, payload["number"])
             if getattr(pull, "author_id", None) != payload["author_id"]:
                 return "not-author"

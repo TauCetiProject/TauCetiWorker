@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -441,14 +442,19 @@ class NativeSelfTested(unittest.TestCase):
         author = SourceActor.from_native(self.source.repository.forge, dict(id=7, login="reviewer"))
         self.source.authenticated_actor = Mock(return_value=author)
         self.fixture.api.request = Mock(return_value=dict(id=99))
+        self.source.issue_comments = Mock(return_value=[])
         requested = [(1, "requested: label edit refused, so a `self-tested` comment asks the queue to apply it")]
         self.assertEqual(self.label_round(worker, candidate, project), requested)
         self.fixture.api.request.assert_called_once_with(
             "POST", f"repos/{self.source.repo}/issues/1/comments", {"body": "self-tested"}
         )
-        # Once refused, later rounds go straight to the request.
+        # Once refused, later rounds go straight to the request, and a pending one is not repeated.
+        self.source.issue_comments = Mock(
+            return_value=[dict(user=dict(id=7), body="self-tested", created_at=datetime.now(UTC).isoformat())]
+        )
         self.assertEqual(self.label_round(worker, candidate, project), requested)
         self.source.add_label.assert_called_once()
+        self.fixture.api.request.assert_called_once()
         # Another author's PR gets neither an edit nor a comment.
         self.live["user"] = dict(id=8, login="someone")
         self.fixture.api.request.reset_mock()
