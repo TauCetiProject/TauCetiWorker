@@ -87,6 +87,7 @@ class Round:
         self.kind = "no-work"
         self.rc = 0
         self.observation = None
+        self.selections = 0
         os.environ["TAUCETI_ACTIVITY_ROUND_ID"] = self.id
         self.started_at = time.time()
         self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE", "inf"))
@@ -104,9 +105,14 @@ class Round:
     def select(self, kind):
         self.kind = kind
         self.observation = None
+        # A round that finds nothing to do in one stage selects another, for
+        # example a review that a peer owns followed by roadmap authoring. Each
+        # selection is its own receipt so the live kind follows the latest one.
+        self.selections += 1
         emit(
             "round_selected",
-            key=self.id + ":select",
+            key=f"{self.id}:select:{self.selections}",
+            selection=self.selections,
             round_id=self.id,
             worker=self.worker,
             round_type=kind,
@@ -198,6 +204,7 @@ def _connect():
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS round_publications(round_id TEXT,worker TEXT,scope TEXT,publication TEXT,
         PRIMARY KEY(round_id,worker,scope,publication));
+      CREATE TABLE IF NOT EXISTS round_selections(round_id TEXT PRIMARY KEY,selection INTEGER);
       CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,worker TEXT,scope TEXT,kind TEXT,
         started REAL,finished REAL,outcome TEXT,pid INTEGER,identity TEXT,hostname TEXT);
       DROP INDEX IF EXISTS round_finish_covering;
@@ -332,8 +339,19 @@ def _ingest(db, e):
                 (e["at"], e.get("pid"), e.get("process_identity"), e.get("hostname"), rid),
             )
         elif kind == "round_selected":
-            db.execute("UPDATE rounds SET kind=? WHERE id=?", (e["round_type"], rid))
+            # Receipts arrive in hash order, possibly across collector runs: only a
+            # round's latest selection names it, and the finish receipt's kind is final.
+            selection = e.get("selection")
+            selection = selection if type(selection) is int else 0  # receipts from before numbering
+            if db.execute(
+                """INSERT INTO round_selections SELECT id,? FROM rounds WHERE id=? AND finished IS NULL
+                   ON CONFLICT(round_id) DO UPDATE SET selection=excluded.selection
+                   WHERE excluded.selection>round_selections.selection""",
+                (selection, rid),
+            ).rowcount:
+                db.execute("UPDATE rounds SET kind=? WHERE id=?", (e["round_type"], rid))
         elif kind == "round_finished":
+            db.execute("DELETE FROM round_selections WHERE round_id=?", (rid,))
             db.execute(
                 "UPDATE rounds SET kind=?,finished=?,outcome=? WHERE id=?",
                 (e["round_type"], e["at"], e["outcome"], rid),

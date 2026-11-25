@@ -388,6 +388,36 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["interrupted_unfinished"], 1)
         self.assertEqual(s["running"], 0)
 
+    def test_live_round_kind_follows_its_latest_selection(self):
+        def kind(rid):
+            with contextlib.closing(a._connect()) as db, db:
+                a._consume(db, [])
+                return db.execute("SELECT kind FROM rounds WHERE id=?", (rid,)).fetchone()[0]
+
+        r = a.Round("worker")
+        r.select("review")
+        self.assertEqual(kind(r.id), "review")
+        pending = a.root() / "pending"
+        # Later selections apply in sequence order, not receipt arrival or clock order,
+        # including an older selection that reaches a later collector run.
+        with patch.object(a.time, "time", return_value=self.now - 60):
+            r.select("roadmap")
+        held = {path: path.read_bytes() for path in pending.glob("*.json")}
+        for path in held:
+            path.unlink()
+        r.select("fix")
+        self.assertEqual(kind(r.id), "fix")
+        for path, body in held.items():
+            path.write_bytes(body)
+        self.assertEqual(kind(r.id), "fix")
+        r.finish()
+        self.assertEqual(kind(r.id), "fix")
+        # A selection receipt replayed after the finish cannot relabel the finished round.
+        a.emit("round_selected", round_id=r.id, worker="worker", round_type="review", selection=99)
+        self.assertEqual(kind(r.id), "fix")
+        with contextlib.closing(a._connect()) as db, db:
+            self.assertIsNone(db.execute("SELECT 1 FROM round_selections WHERE round_id=?", (r.id,)).fetchone())
+
     def test_deferred_creation_keeps_origin_and_reconciles_without_moving_finish(self):
         from tauceti_worker import github_outbox as outbox
 
