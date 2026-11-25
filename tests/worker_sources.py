@@ -1672,7 +1672,7 @@ ci="one/project"
             count_all_roadmaps=True,
         )
         self.assertEqual([candidate.pr for candidate in result.reviewable.suppressed], [1])
-        self.assertEqual(result.review_stuck, [])
+        self.assertEqual(result.review_capped, [])
 
     def test_shared_preparation_failure_does_not_consume_inference_error_allowance(self):
         from tauceti_worker.config import NoProgress

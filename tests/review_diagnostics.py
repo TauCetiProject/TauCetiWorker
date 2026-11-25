@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Review-command failures retain useful public-safe diagnostics and enrich stuck issues."""
+"""Review-command failures retain useful public-safe diagnostics for the review-cap closing comment."""
 
-import json
 import os
 import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 from tauceti_worker import agents
-from tauceti_worker import github as gh_mod
 from tauceti_worker.review_diagnostics import (
     clear_review_failure,
     failure_summary,
@@ -243,54 +240,6 @@ public = public_review_failure(e2big)
 check("E2BIG has fixed public diagnostic", "review prompt exceeded the OS argument limit" in public, True)
 check("E2BIG raw summary stays private", "do-not-copy" in public, False)
 
-
-class FakeGitHub(gh_mod.GitHub):
-    def __init__(self, existing=None):
-        super().__init__("TauCetiProject/TauCeti")
-        self.existing = existing or []
-        self.calls = []
-
-    def _gh(self, args):
-        self.calls.append(args)
-        if args[:2] == ["issue", "list"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(self.existing))
-        return SimpleNamespace(returncode=0, stdout="")
-
-
-diagnostic = "- 2026-07-30T18:55:00Z: `reviewer-auth` via `claude` (exit 1): reviewer authentication failed"
-client = FakeGitHub()
-client.ensure_stuck_issue(1388, "its review errored", diagnostic)
-check("missing issue is created", client.calls[-1][:2], ["issue", "create"])
-body = client.calls[-1][client.calls[-1].index("--body") + 1]
-check("created issue carries diagnostic", diagnostic in body, True)
-check("created issue asks for infrastructure repair", "infrastructure repair" in body, True)
-
-existing_body = gh_mod.GitHub._stuck_issue_body(1388, "its review errored", diagnostic)
-client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": existing_body}])
-client.ensure_stuck_issue(1388, "its review errored", diagnostic)
-check("unchanged issue is not edited", len(client.calls), 1)
-
-client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": "old"}])
-client.ensure_stuck_issue(1388, "its review errored", diagnostic)
-check("existing issue is enriched", client.calls[-1][:2], ["issue", "edit"])
-check("right issue is edited", client.calls[-1][2], "1504")
-
-other_diagnostic = "- 2026-07-30T18:56:00Z: `review-command` via `codex` (exit 1): review command failed"
-existing_body = gh_mod.GitHub._stuck_issue_body(1388, "its review errored", diagnostic)
-client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": existing_body}])
-client.ensure_stuck_issue(1388, "its review errored again", other_diagnostic)
-check("peer diagnostic does not clobber existing evidence", len(client.calls), 1)
-
-generic_body = gh_mod.GitHub._stuck_issue_body(1388, "its review errored", other_diagnostic)
-client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": generic_body}])
-client.ensure_stuck_issue(1388, "its review errored", diagnostic)
-check("specific diagnosis replaces generic issue", client.calls[-1][:2], ["issue", "edit"])
-client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": generic_body}])
-client.ensure_stuck_issue(1388, "another peer failed", other_diagnostic.replace("codex", "claude"))
-check("equally generic peers do not churn", len(client.calls), 1)
-client = FakeGitHub([{"number": 1504, "title": "Review stuck: PR #1388", "body": existing_body}])
-client.ensure_stuck_issue(1388, "another peer failed", diagnostic.replace("claude", "codex"))
-check("equally specific peers do not churn", len(client.calls), 1)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)

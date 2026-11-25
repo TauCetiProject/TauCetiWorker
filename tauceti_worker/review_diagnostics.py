@@ -42,7 +42,7 @@ _PUBLIC_DETAILS = {
     "review-command": "review command failed",
 }
 _STAMP_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\Z")
-# Fixed, publishable explanations. Never copy arbitrary provider output into an issue.
+# Fixed, publishable explanations. Never copy arbitrary provider output into a public comment.
 _FAILURE_DETAILS = (
     (
         "argument-limit",
@@ -383,20 +383,3 @@ def public_review_failure(value: dict) -> str:
         )
         rows.append(f"- {stamp}: `{category}` via `{provider}` ({exit_note}): {detail}")
     return "\n".join(rows)
-
-
-def public_diagnostic_quality(body: str) -> int:
-    """Permit a strictly better public diagnosis, never peer-to-peer churn.
-
-    Only recognize complete fixed diagnostic rows, not arbitrary prose elsewhere
-    in the issue. Missing < generic command failure < engine error < specific cause.
-    """
-    quality = 0
-    for category, detail in re.findall(
-        r"^- .*: `([a-z-]+)` via `[a-z]+` \(exit (?:-?\d+|unknown)\): (.+)$", body, re.M
-    ):
-        if detail in {d for _, _, d, _ in _FAILURE_DETAILS}:
-            quality = max(quality, 3)
-        elif category in _PUBLIC_DETAILS and detail == _PUBLIC_DETAILS[category]:
-            quality = max(quality, 1 if category == "review-command" else 2 if category == "review-engine" else 3)
-    return quality

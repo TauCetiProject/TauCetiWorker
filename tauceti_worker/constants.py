@@ -41,8 +41,13 @@ MAX_FIX_ROUNDS_WITHOUT_APPROVAL = 6
 MAX_INFRA_REFUNDS = 20  # per-head: how many times a provider outage may hand an attempt back before
 # the budget starts charging anyway. Not a cost control — the escalating loop back-off already caps
 # retries at ~4/hour — but a stop on MISCLASSIFICATION: if some persistent, PR-specific failure ever
-# matched the transient patterns, an uncapped refund would retry it until a human noticed.
-MAX_REVIEW_ERRORS = 3  # per PR: after this many review rounds that ERROR without completing a review
+# matched the transient patterns, an uncapped refund would retry it forever.
+# Per PR and host: review rounds that ERROR without completing a review (the engine can't produce a
+# review at all) are retried with a back-off of REVIEW_ERROR_BACKOFF_S, doubling after each further
+# error. At MAX_REVIEW_ERRORS the fleet closes the PR if it maintains it (its own, or an adopted
+# Forgejo author's) and otherwise stops offering it review rounds. A completed review resets the count.
+MAX_REVIEW_ERRORS = 6
+REVIEW_ERROR_BACKOFF_S = 60 * 60
 
 # The tauceti-review engine's exit status for "I stopped because the provider is unusable, and I
 # posted nothing" (TauCetiReview `runner/review.py: PROVIDER_DOWN_EXIT`). It is a separate status
@@ -78,9 +83,6 @@ PROGRESS_TOOL_TAIL = 20
 # message at its full length. Wide enough for a traceback's last line, which is the one that matters.
 PROGRESS_TOOL_LINE = 500
 
-# (the engine can't produce a review at all), stop retrying and ESCALATE —
-# a loud per-round warning + a tracking issue — since a PR that can never be
-# reviewed neither merges nor reaches CI's round cap, so a human must step in.
 MAX_REVIEW_CONTESTS = 10  # per-PR lifetime cap on author-contest re-reviews (no-bar: anyone may
 
 # reply, so this bounds spend; separate from the review-round budget)

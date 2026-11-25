@@ -12,7 +12,7 @@ import re
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tauceti_tools.forge import RepositoryRef
@@ -45,6 +45,7 @@ from .constants import (
     REVIEW_AFFINITY_GRACE_S,
     REVIEW_AGE_CAP_S,
     REVIEW_AGE_SCALE_S,
+    REVIEW_ERROR_BACKOFF_S,
     STATUS_LABELS,
     TAUCETI,
     TAUCETI_OWNER,
@@ -207,6 +208,55 @@ TARGET_MARKER_RE = re.compile(r"<!--tauceti-target:v1 (\{[^}]*\})-->")
 TARGET_ID_RE = re.compile(r'"id"\s*:\s*"([^"]+)"')
 
 
+def review_error_key(pr: int) -> str:
+    """When this host's latest review error on `pr` happened (epoch seconds), for the retry back-off."""
+    return f"review-err-{pr}-at"
+
+
+def review_cap_close_key(pr: int) -> str:
+    """When this host may next try to close `pr` at the review-error cap (a declined close waits)."""
+    return f"review-cap-close-{pr}-retry-at"
+
+
+def review_error_retry_at(counters, pr: int, errors: int) -> float:
+    """The earliest time this host retries a review of `pr` after `errors` consecutive review errors.
+
+    The first error waits REVIEW_ERROR_BACKOFF_S and each further one doubles the wait, so a PR whose
+    review keeps failing is retried less and less often until it reaches MAX_REVIEW_ERRORS."""
+    if errors <= 0:
+        return 0.0
+    return counters.read(review_error_key(pr)) + REVIEW_ERROR_BACKOFF_S * 2 ** min(errors - 1, 16)
+
+
+def _review_error_state(counters, p, attempts: int, now: float) -> str:
+    """`capped`, `backoff` or `ready` for a review candidate with `attempts` errors on this host."""
+    if p.automatic_bump:
+        return "ready"
+    if attempts >= MAX_REVIEW_ERRORS:
+        return "capped"
+    return "backoff" if review_error_retry_at(counters, p.number, attempts) > now else "ready"
+
+
+def _file_review_candidate(sv, counters, p, c) -> None:
+    """Offer a review candidate, or hold it back while its review errors back off or once they are capped."""
+    state = _review_error_state(counters, p, c.attempts, time.time())
+    if state == "ready":
+        sv.reviewable.actionable.append(c)
+        return
+    if state == "capped":
+        reason = f"review errored {c.attempts} times without completing a review"
+        sv.review_capped.append(p.number)
+        # The fleet's own PRs close at the cap (a model-free unit, dispatch -> _close_review_capped_pr);
+        # anyone else's just get no more review rounds from this host.
+        if owns_pr(sv, p) and counters.read(review_cap_close_key(p.number)) <= time.time():
+            sv.reviewable.actionable.append(replace(c, reason=reason, close_at_review_cap=True))
+            return
+    else:
+        at = time.strftime("%H:%M", time.localtime(review_error_retry_at(counters, p.number, c.attempts)))
+        reason = f"review errored {c.attempts} times; retrying after {at}"
+    sv.reviewable.suppressed.append(replace(c, reason=reason))
+
+
 def _unchanged_review_recent(counters, pr: int, head: str) -> bool:
     check = getattr(counters, "unchanged_review_recent", None)
     return bool(check and check(pr, head))
@@ -351,6 +401,7 @@ class Candidate:
     bump_integration_failure: bool = False
     bump_pending: bool = False  # an automatic bump taken before its build finished
     final_resolution: bool = False  # existing own-PR fix budget is spent; resolve or close
+    close_at_review_cap: bool = False  # an owned PR whose review errored MAX_REVIEW_ERRORS times: close it
     partial_history: bool = False  # selected from PR facts; the agent/engine investigates missing history
     rereview: bool = False  # a review of a PR already reviewed at an earlier head: closest to approval
     # Any other review on a native forge (Forgejo), whoever authored the PR: a first review, or a
@@ -418,10 +469,10 @@ class Survey:
     detail_reads: int = 0
     detail_deferred: int = 0
     errors: list[str] = field(default_factory=list)
-    # PRs whose review keeps ERRORING (engine can't post a verdict) past MAX_REVIEW_ERRORS: the worker
-    # can't review them and CI's round cap can't catch them (rounds never advance), so each round
-    # escalates — a loud warning + a tracking issue — rather than stranding them silently.
-    review_stuck: list[int] = field(default_factory=list)
+    # PRs whose review has ERRORED (engine can't post a verdict) MAX_REVIEW_ERRORS times on this host.
+    # CI's round cap can't catch them (rounds never advance), so the round closes the ones the fleet
+    # maintains and offers no further reviews of the rest (work_units._close_review_capped).
+    review_capped: list[int] = field(default_factory=list)
     # Tended PRs that are NOT actionable for `fix`, each with a one-line reason (awaiting first review,
     # head moved since review, reviews all green, fix attempts spent, or a transient fetch failure). A
     # fix-focused worker logs these so it explains its idleness instead of sitting on a bare "no eligible
@@ -1223,7 +1274,7 @@ def classify_survey(
                     ready_at=p.build_status_at,
                     partial_history=True,
                 )
-                (sv.reviewable.suppressed if c.attempts >= c.budget else sv.reviewable.actionable).append(c)
+                _file_review_candidate(sv, counters, p, c)
             continue
         m = rs.gh_meta(p.number)
         if m.provenance == "deferred":
@@ -1244,11 +1295,7 @@ def classify_survey(
                 rereview=str(m.data.get("head_sha") or p.head_oid) != p.head_oid,
                 native_review=hasattr(sv, "source_repository"),
             )
-            if not p.automatic_bump and c.attempts >= c.budget:
-                sv.reviewable.suppressed.append(c)
-                sv.review_stuck.append(p.number)  # can't be reviewed → escalate (warn + issue)
-                continue
-            sv.reviewable.actionable.append(c)
+            _file_review_candidate(sv, counters, p, c)
             continue
         # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
         # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
@@ -1285,7 +1332,7 @@ def classify_survey(
         if not p.automatic_bump and (
             counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
             or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
-            or counters.read(f"review-err-{p.number}") >= MAX_REVIEW_ERRORS
+            or _review_error_state(counters, p, counters.read(f"review-err-{p.number}"), time.time()) != "ready"
         ):
             sv.reviewable.suppressed.append(c)
         else:

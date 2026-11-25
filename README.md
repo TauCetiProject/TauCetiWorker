@@ -479,9 +479,7 @@ and the branch claims all still hold: "work on these PRs"
 means "of the work you were already willing to do, only this". Progress and
 roadmap rounds name no existing PR, so a targeted round drops them rather than
 quietly authoring something unrelated when the named PRs turn out to have
-nothing to do, and it makes no GitHub writes at all about PRs you did not name —
-not even the tracking issue an untargeted round files for a PR whose review
-keeps erroring.
+nothing to do, and it makes no GitHub writes at all about PRs you did not name.
 
 An empty or unreadable value is an error, not "no targeting": `--pr ""` and
 `--pr 4 12` both stop the round rather than quietly turning it back into a

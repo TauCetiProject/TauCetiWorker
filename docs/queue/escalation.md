@@ -80,11 +80,11 @@ new code that fails the same way has not made progress either.
 
 **On a stall** the controller:
 
-- journals `escalated` (action `repair-stalled`) and raises one progress alert (below) with the
-  findings and the agent's own conclusion: the passage of its last message that says why it could
-  not make progress, from the `agent_conclusion` the worker sends with each checkpoint;
+- journals `escalated` (action `repair-stalled`) and raises one progress alert (below) naming the
+  task, its tip and its findings. It reports the stall as it is and does not quote the agent's
+  last message;
 - shows the stall among the status `alerts` (`repair stalled: batch B repair task T retained tip ...
-  since <AEDT time>; next claim at <AEDT time>; agent: ...`), in `loop_termination.repair_stalls`
+  since <AEDT time>; next claim at <AEDT time>`), in `loop_termination.repair_stalls`
   and in the head's `repair_stall`, and publishes a `repair_stalled` condition (its start and batch
   only) that `tauceti-fleet status` shows. The head's `task_unclaimed` alert is suppressed while the
   task waits on purpose;
@@ -121,7 +121,7 @@ next claim the backoff allows.
 **A head without progress.** Independently, once the head's version, tip, base, current CI attempt
 (and its outcome) and open task have all stayed the same for `head_progress_alert_seconds` (3
 hours), the controller journals `head-no-progress`, raises one progress alert naming the stage (and
-the stalled task and its agent's conclusion, if there is one) and publishes a `head_no_progress`
+the stalled task, if there is one) and publishes a `head_no_progress`
 condition. Claims of the same task are not progress. When any of those change, it sends one
 `head-progress-resumed` message. After a controller restart the clock starts at the first pass.
 

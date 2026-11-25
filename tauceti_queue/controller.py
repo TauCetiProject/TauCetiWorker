@@ -10099,8 +10099,8 @@ class Controller:
     ) -> None:
         """After a checkpoint: when the task's last `repair_stall_checkpoints` checkpoints share one
         failure signature (`repair_stall.signature`: the tip and the normalized findings), the task is
-        stalled. The first time, journal it and raise one progress alert quoting the agent's own
-        conclusion; each further identical checkpoint lengthens the backoff before the next claim. A
+        stalled. The first time, journal it and raise one progress alert naming the task, its tip and its
+        findings; each further identical checkpoint lengthens the backoff before the next claim. A
         checkpoint with another signature is progress and ends the stall."""
         limit = int(self.setting("repair_stall_checkpoints"))
         stalls = self._repair_stalls()
@@ -10126,7 +10126,6 @@ class Controller:
         tools_seen = list(
             dict.fromkeys(str(n["tools_revision"])[:120] for n in reversed(run_notes) if n.get("tools_revision"))
         )
-        conclusion = repair_stall.conclusion(notes.get("agent_conclusion"))
         findings = notes.get("repair_checkpoint") or []
         if current is not None and (current.get("signature") != latest or not limit):
             self._end_repair_stall(task, batch, current, now, "a checkpoint with other findings or another tip")
@@ -10153,7 +10152,6 @@ class Controller:
                 "revisions": revisions,
                 "tools": tools_seen[-20:],
                 "findings": repair_stall.describe_findings(findings),
-                "conclusion": conclusion,
             }
             stalls[key] = current
             self._set_state("repair_stalls", stalls)
@@ -10175,7 +10173,7 @@ class Controller:
                 key=f"repair-stalled:{task['id']}:{latest}:{now}",
                 counted=False,
                 channel="progress-alert",
-                extra={"task_id": task["id"], "tip": tip, "signature": latest, "conclusion": conclusion},
+                extra={"task_id": task["id"], "tip": tip, "signature": latest},
             )
             return
         current["checkpoints"] = run
@@ -10188,8 +10186,6 @@ class Controller:
         current["retry_at"] = now + delay
         current["revisions"] = list(dict.fromkeys([*current.get("revisions", []), *revisions]))
         current["tools"] = list(dict.fromkeys([*current.get("tools", []), *tools_seen]))[-20:]
-        if conclusion:
-            current["conclusion"] = conclusion
         stalls[key] = current
         self._set_state("repair_stalls", stalls)
         self.store.journal(
@@ -10268,7 +10264,6 @@ class Controller:
             "revisions": [],
             "tools": [],
             "findings": [f"{reason}: {message}"],
-            "conclusion": "",
         }
         stalls[key] = current
         self._set_state("repair_stalls", stalls)
@@ -10421,7 +10416,6 @@ class Controller:
                     key=f"head-no-progress:{head['id']}:{state['since']}",
                     counted=False,
                     channel="progress-alert",
-                    extra={"conclusion": (stall or {}).get("conclusion") or ""},
                 )
             return
         with self.store.transaction():
@@ -10473,8 +10467,6 @@ class Controller:
                 f"retained tip {stall['tip'][:12]} with the same findings {stall['checkpoints']} times since "
                 f"{repair_stall.clock(stall['since'])}; claimable again"
             )
-            if stall.get("conclusion"):
-                line += f"; agent: {stall['conclusion']}"
             alerts.append(line)
         state = self._state("head_progress")
         if state and state.get("alerted_at"):
@@ -10533,8 +10525,6 @@ class Controller:
         ]
         if record.get("lines"):
             lines += ["", "```text", *(escalation.quote(line, 300) for line in record["lines"]), "```"]
-        if record.get("conclusion"):
-            lines += ["", f"The agent's own conclusion: {escalation.quote(record['conclusion'], 1000)}"]
         if self.public_url:
             lines += ["", f"Status: {self.public_url.rstrip('/')}/status"]
         lines += ["", f"Alert ID: {marker}"]

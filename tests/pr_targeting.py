@@ -224,8 +224,8 @@ sv = survey_with(suppressed={"fix": [1]})
 check("out of attempts", reason(sv, Opts(prs=[1]), 1), "fix suppressed: fix at head (3/3 attempts spent)")
 
 sv = survey_with()
-sv.review_stuck.append(1)
-check("escalated for infrastructure repair", "needs infrastructure repair" in reason(sv, Opts(prs=[1]), 1), True)
+sv.review_capped.append(1)
+check("at the review-error cap", "no more review rounds" in reason(sv, Opts(prs=[1]), 1), True)
 
 sv = survey_with()
 sv.fix_waiting.append((1, "reviews at head are all green"))
@@ -273,7 +273,7 @@ check("open with genuinely nothing to do", "no work unit actionable" in reason(s
 # --- end to end: the real run_round ---------------------------------------------------------------
 # Everything below drives the actual cascade. `dispatch` is stubbed so no model runs, but it can also
 # be told to DECLINE a candidate (what a peer's branch claim looks like from here), and the GitHub
-# object records the one write run_round makes outside dispatch — the stuck-review tracking issue.
+# object records any write run_round makes outside dispatch (there should be none).
 home = Path(tempfile.mkdtemp())
 cfg = tc.Config(
     wid="t",
@@ -292,10 +292,10 @@ class FakeGitHub:
     """Records the GitHub writes a round makes outside dispatch."""
 
     def __init__(self):
-        self.stuck_issues = []
+        self.writes = []
 
-    def ensure_stuck_issue(self, pr, reason, diagnostic):
-        self.stuck_issues.append(pr)
+    def ensure_stuck_issue(self, *args):  # removed from the worker; a call would be a regression
+        self.writes.append(("ensure_stuck_issue", args))
 
 
 gh = FakeGitHub()
@@ -325,7 +325,7 @@ def round_over(make_survey, opts, *, decline=()):
     """run_round against `make_survey`, returning (dispatched units, NoProgress message or None)."""
     dispatched.clear()
     logged.clear()
-    gh.stuck_issues.clear()
+    gh.writes.clear()
     declines.clear()
     declines.update(decline)
     tc.work_units.survey = lambda *a, **k: make_survey()
@@ -428,28 +428,18 @@ check("a PR whose fix budget is spent is not fixed", units, [])
 check("...and the spent budget is the reported reason", said("attempts spent"), True)
 
 
-# --- GitHub writes outside dispatch stay inside the target set --------------------------------------
-def stuck_survey():
+# --- a PR at the review-error cap gets no tracking issue and no warning ----------------------------
+def capped_survey():
     sv = survey_with(actionable={"review": [412]})
     sv.open_prs += [pr_info(412), pr_info(999)]
-    sv.review_stuck.append(999)
+    sv.review_capped.append(999)
     return sv
 
 
-units, why = round_over(stuck_survey, opts_for(prs=[412]))
-check("a targeted round files no tracking issue for an unrelated PR", gh.stuck_issues, [])
-check("...and does not even warn about it", said("#999"), False)
-check("...while still doing the work it was asked for", units, [("review", 412)])
-
-units, why = round_over(stuck_survey, opts_for())
-check("without --pr the escalation still fires", gh.stuck_issues, [999])
-
-units, why = round_over(stuck_survey, opts_for(prs=[999]))
-check("naming the stuck PR does escalate it", gh.stuck_issues, [999])
-
-units, why = round_over(stuck_survey, opts_for(dry_run=True))
-check("--dry-run writes no tracking issue", gh.stuck_issues, [])
-check("...but still says what it would have filed", said("[dry-run] would open/refresh"), True)
+units, why = round_over(capped_survey, opts_for())
+check("a capped PR gets no GitHub write outside dispatch", gh.writes, [])
+check("...and no per-round warning", said("#999"), False)
+check("...while the round still does its work", units, [("review", 412)])
 
 
 # --- the loop re-applies the targeting every round --------------------------------------------------
