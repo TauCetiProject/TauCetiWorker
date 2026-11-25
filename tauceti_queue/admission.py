@@ -534,6 +534,8 @@ class AdmissionPoller:
             self.state.observe(
                 pull.number, pull.head_sha, version, recheck_after=pull.admission.get("recheck_seconds", 0)
             )
+            if isinstance(pull.admission.get("labels"), list):
+                self.controller.observe_labels(pull.number, pull.admission["labels"])
 
     def run_once(self, *, reason="interval"):
         with self._lock:

@@ -4698,6 +4698,78 @@ class BlockingLabelAfterApproval(ControllerCase):
         self.assertEqual(self.held(101), ("waiting", []))
 
 
+class SprintMode(ControllerCase):
+    """`sprint_label`: switching it on dissolves the open batches, keeping the head and every approval,
+    and only inputs whose PR carries the label enter batches until it is cleared."""
+
+    def label_event(self, number, action, name, labels):
+        self.controller.handle_event(
+            "pull_request",
+            {
+                "action": action,
+                "number": number,
+                "label": {"name": name},
+                "pull_request": {"number": number, "labels": [{"name": label} for label in labels]},
+            },
+        )
+
+    def batch_numbers(self, state):
+        return {
+            batch["id"]: sorted(m["number"] for m in self.controller.members(batch["id"]) if not m["withdrawn"])
+            for batch in self.controller.store.rows("batches", {"state": state})
+        }
+
+    def test_switching_on_dissolves_open_batches_and_admits_only_labelled_inputs(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.approve(102, {"B.lean": "b\n"}, labels=["GRH"])
+        self.approve(103, {"C.lean": "c\n"})
+        self.controller.tick()
+        self.assertEqual(list(self.batch_numbers("open").values()), [[102, 103]])
+        before = {n: self.controller.input_for(PROJECT, n) for n in (102, 103)}
+
+        self.controller.set_setting("sprint_label", "grh", "operator")
+        self.assertEqual(self.batch_numbers("head"), {head["id"]: [101]}, "the head is untouched")
+        self.assertEqual(self.batch_numbers("open"), {})
+        for number, row in before.items():
+            after = self.controller.input_for(PROJECT, number)
+            self.assertEqual(
+                (after["id"], after["state"], after["approved_at"], after["head_sha"]),
+                (row["id"], "waiting", row["approved_at"], row["head_sha"]),
+                "back to waiting with its approval and age kept",
+            )
+        self.assertEqual(self.controller.store.count("journal", {"kind": "sprint-evicted"}), 1)
+
+        self.controller.tick()
+        self.assertEqual(list(self.batch_numbers("open").values()), [[102]], "only the labelled input")
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["state"], "waiting")
+
+        self.label_event(103, "labeled", "grh", ["grh"])
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 103)["state"], "inserted")
+
+        self.controller.set_setting("sprint_label", "", "operator")
+        self.approve(104, {"D.lean": "d\n"})
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 104)["state"], "inserted", "normal batching again")
+        self.assertEqual(self.batch_numbers("head"), {head["id"]: [101]})
+
+    def test_discovery_records_labels_on_a_waiting_input(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.set_setting("sprint_label", "grh", "operator")
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "waiting")
+        self.controller.observe_labels(101, ["GRH", "t-algebra"])
+        self.assertEqual(json.loads(self.controller.input_for(PROJECT, 101)["labels"]), ["grh", "t-algebra"])
+        self.controller.tick()
+        self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
+
+    def test_the_label_is_a_plain_name(self):
+        with self.assertRaises(ControllerError):
+            self.controller.set_setting("sprint_label", " grh", "operator")
+
+
 class EditSummary(ControllerCase):
     def test_a_long_diff_is_capped_with_a_note_and_the_commit_link(self):
         self.github.ci_policy = lambda *_: ("fail", [{"kind": "compiler", "module": "Long.lean", "message": "boom"}])

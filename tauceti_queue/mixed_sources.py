@@ -210,6 +210,8 @@ class NativePoller:
         # can see, and comment edits from the feed, are noticed within a pass.
         recheck = self.controller.setting("forgejo_recheck_seconds") if details.get("recheck_seconds") else 0
         self.state.observe(pull.number, pull.head_sha, version, recheck_after=recheck)
+        if isinstance(details.get("labels"), list):
+            self.controller.observe_labels(self.registry.number(pull.number), details["labels"])
         if self.registry.mode == "admit":
             from . import forgejo_pr_build
 

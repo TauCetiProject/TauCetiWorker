@@ -12,7 +12,8 @@ Tables:
 - `inputs`: approved inputs, one row per accepted PR revision, with the waiting/reserved/inserted/
   landed/cancelled state, priority, urgency, the retained ref of the accepted head, the `no_repair`
   opt-out, the blocking labels its PR gained after approval (`blocked_labels`, which keep it out of
-  batches) and, for a `problem-anticipated` withdrawal, what it waits for (`anticipated`).
+  batches), its PR's labels as last seen (`labels`, which sprint mode reads) and, for a
+  `problem-anticipated` withdrawal, what it waits for (`anticipated`).
 - `admission_evidence`, `admission_evidence_comments`, `admission_evidence_statuses`: the PR
   evidence admission's shadow keeps from webhook deliveries and full reads
   (`tauceti_queue/admission_evidence.py`); empty unless `admission_evidence_mode` is `shadow`.
@@ -110,6 +111,7 @@ CREATE TABLE IF NOT EXISTS inputs (
     declaration_fetch_attempts INTEGER NOT NULL DEFAULT 0,
     declaration_retry_at REAL NOT NULL DEFAULT 0,
     blocked_labels TEXT NOT NULL DEFAULT '[]',
+    labels TEXT NOT NULL DEFAULT '[]',
     main_integration TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS inputs_state ON inputs (repository, state);
