@@ -118,6 +118,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
 
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(DRAIN_SIGNAL, request_drain)
+    from . import background_relink
+
+    relinking = None  # The between-rounds relink child, if one is running.
     try:
         while True:
             if drain["requested"]:
@@ -311,6 +314,9 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             if drain["requested"]:
                 log(f"round finished (rc={rc}); restart requested, exiting at the round boundary")
                 raise _LoopDrained
+            # Off the next round's critical path: that round stops it before touching a checkout.
+            if getattr(cfg, "state", None) is not None:
+                relinking = background_relink.start(cfg.state, relinking)
             if rc == EX_CLAIM_COLLISION:
                 streak = 0
                 collision_streak += 1
@@ -430,6 +436,7 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
         log("loop interrupted — stopping")
         return 130
     finally:
+        background_relink.finish(relinking)
         report_runtime("stopping", detail="loop stopping", phase=None, target=None, next_action_at=None)
         signal.signal(signal.SIGTERM, previous_sigterm)
         signal.signal(DRAIN_SIGNAL, previous_drain)

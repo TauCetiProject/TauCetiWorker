@@ -833,6 +833,12 @@ def prepare_checkout(
     left unpushed in the checkout is discarded here. A checkout that cannot be reset in place (no
     git metadata, a failed forced checkout) is deleted and cloned afresh.
     `work`/`pr`/`roadmap` name the round that takes the checkout (unused; kept for callers)."""
+    from . import background_relink
+
+    # From here until this round exits, no between-rounds relink may walk this worker's trees.
+    if not background_relink.stop(cfg.state):
+        log("checkout preparation refused: this worker's between-rounds relink would not stop")
+        return False
     sync_mathlib_pool(cfg)
     co = cfg.checkout
     from . import round_worktrees
@@ -1185,6 +1191,9 @@ def run_agent_host(
             log("canonical store (round-end): agent cleanup incomplete; relinking left for the next round")
         elif host_caches:
             relink_build_outputs(cwd, env, phase="round-end")
+            from . import background_relink
+
+            background_relink.request(cwd, env)
     if rc == 75:
         from .claude_api import blocked_reason
 

@@ -1026,6 +1026,72 @@ class Canonical(unittest.TestCase):
         self.assertEqual(report["stale_store_files"], 1)
         self.assertFalse((store / "artifacts" / name).exists())
 
+    def test_prepare_only_probes_and_between_rounds_relinks_the_parked_tree(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        env = dict(os.environ, LAKE_CACHE_DIR=str(self.root / "w-store"))
+        objects = canonical.store(self.pool) / "objects"
+        self.assertEqual(canonical.boundary(checkout, env, phase="prepare"), {})
+        self.assertFalse(objects.is_dir() and any(objects.iterdir()))  # The agent does not wait for it.
+        # Release parks `.lake` beside the worktree and removes the worktree itself.
+        parked = checkout.with_name(checkout.name + ".lake-between-rounds")
+        os.rename(checkout / ".lake", parked)
+        shutil.rmtree(checkout)
+        report = canonical.between_rounds(checkout, parked, env)
+        self.assertEqual(report["published_local"], 5)
+        self.assertEqual(report["setup_removed"], 1)  # The tree is idle: a boundary.
+        modules, _ = canonical.outputs(parked / "build")
+        for path, name in (pair for pairs in modules.values() for pair in pairs):
+            self.assertEqual(path.stat().st_ino, (objects / name).stat().st_ino)
+        # The next round unparks it: everything is already shared there.
+        checkout.mkdir()
+        os.rename(parked, checkout / ".lake")
+        report = canonical.boundary(checkout, env, phase="round-end")
+        self.assertEqual(report["in_place"], 5)
+
+    def test_a_stopped_pass_keeps_its_cursor_and_the_next_one_finishes(self):
+        checkout = self.checkout("w", "TauCeti.A", "TauCeti.B")
+        report = self.relink(checkout, stop=lambda: True)
+        self.assertTrue(report["stopped"] and report["incomplete"])
+        self.assertNotIn("published_local", report)
+        decided = []
+        real = canonical.Pass.decide
+
+        def decide(work, *args):
+            real(work, *args)
+            decided.append(args)
+
+        with patch.object(canonical.Pass, "decide", decide):
+            report = self.relink(checkout, stop=lambda: bool(decided))
+        self.assertTrue(report["stopped"] and report["incomplete"])
+        self.assertEqual((len(decided), report["published_local"]), (1, 1))  # It stops at the next file.
+        report = self.relink(checkout)
+        self.assertFalse(report.get("incomplete"))
+        self.assertEqual(report["published_local"], 9)
+
+    def test_private_only_names_are_not_work_items_unless_their_name_turns_suspect(self):
+        checkout = self.checkout("w", "TauCeti.A")
+        store = self.root / "w-store"
+        self.relink(checkout)
+        (store / "artifacts").mkdir(parents=True)
+        others = [store / "artifacts" / (f"{i:016x}" + ".olean") for i in range(50)]
+        for path in others:
+            path.write_bytes(b"lake metadata")
+        report = canonical.relink(checkout, store, self.pool, sweep_private=True, limit=1)
+        self.assertFalse(report.get("incomplete"), report)  # Nothing to do, so the pass completes.
+        self.assertTrue(all(path.stat().st_nlink == 1 for path in others))
+        # Stale bytes beside B's trace, and a private copy of them Lake could restore.
+        module(checkout, "TauCeti.B", "same")
+        olean, name = next((p, n) for p, n in paths(checkout) if p.name == "B.olean")
+        olean.write_bytes(b"interrupted rebuild")
+        os.utime(olean, (time.time() - 60,) * 2)
+        copy = store / "artifacts" / name
+        shutil.copyfile(olean, copy)
+        os.utime(copy, (time.time() - 60,) * 2)
+        report = canonical.relink(checkout, store, self.pool, sweep_private=True)
+        self.assertFalse(olean.exists())
+        self.assertFalse(copy.exists())
+        self.assertEqual(report["stale_store_files"], 1)
+
     def test_link_failure_is_fatal(self):
         first = self.checkout("first", "TauCeti.A")
         self.relink(first)

@@ -1,9 +1,11 @@
 """Store each TauCeti build output once per host, as one inode every checkout links to.
 
-The boundary is the worker's own process lifecycle: `relink()` runs before the agent starts and
-after the round's process group has been reaped (and after a worker-driven build). A `/proc` scan
-for Lake or Lean writers, an open-for-writing check and an mtime check are supplementary evidence;
-any doubt skips an output, it never publishes it.
+The boundary is the worker's own process lifecycle. Before the agent starts only the hard-link
+probe runs; `relink()` runs after the round's process group has been reaped (and after a
+worker-driven build), and the full pass, which also sweeps the private Lake store, runs between
+rounds on the idle tree (`between_rounds`, driven by `background_relink`). A `/proc` scan for Lake
+or Lean writers, an open-for-writing check and an mtime check are supplementary evidence; any
+doubt skips an output, it never publishes it.
 
 Objects live under the owned build-cache pool (`expanded_cache.root()`) in a versioned namespace:
 
@@ -108,8 +110,9 @@ def object_lock(directory, name, *, exclusive=False, blocking=True, deadline=Non
 
 
 @contextlib.contextmanager
-def slot(directory, *, count, wait):
-    """Yield True while holding one of `count` host-wide relink slots, or False after `wait` s."""
+def slot(directory, *, count, wait, stop=None):
+    """Yield True while holding one of `count` host-wide relink slots, or False after `wait` s
+    (or as soon as `stop()` is true)."""
     slots = directory / "slots"
     slots.mkdir(parents=True, exist_ok=True, mode=0o700)
     deadline = time.monotonic() + wait
@@ -126,7 +129,7 @@ def slot(directory, *, count, wait):
             finally:
                 stream.close()
             return
-        if time.monotonic() >= deadline:
+        if time.monotonic() >= deadline or (stop is not None and stop()):
             yield False
             return
         time.sleep(0.5)
@@ -229,14 +232,20 @@ def expected(directory, name, deadline=None):
     return sha, size, True
 
 
-def outputs(build):
+class Stopped(Exception):
+    """A between-rounds pass was asked to give the tree back to the next round."""
+
+
+def outputs(build, stop=None):
     """Completed module outputs as `{trace: [(path, name), ...]}`, and the setup files.
 
-    A file no trace names is not "completed" and is left alone.
+    A file no trace names is not "completed" and is left alone. `stop()` true raises `Stopped`.
     """
     lib, ir = build / "lib/lean", build / "ir"
     modules, setups = {}, []
     for base, dirs, files in os.walk(build, followlinks=False):
+        if stop is not None and stop():
+            raise Stopped
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base, d))]
         for file in files:
             if file.endswith(".setup.json"):
@@ -597,8 +606,10 @@ class Pass:
     removed with its module trace so Lake rebuilds it; a verified file is never deleted.
     """
 
-    def __init__(self, checkout, pool, private_store, env, report, *, deadline, not_after):
+    def __init__(self, checkout, pool, private_store, env, report, *, deadline, not_after, cwd=None, stop=None):
         self.checkout = checkout
+        self.cwd = checkout if cwd is None else cwd  # Where `lean` resolves the tree's toolchain.
+        self.stop = stop
         self.pool = Path(pool)
         self.env = env
         self.directory = store(self.pool)
@@ -616,12 +627,23 @@ class Pass:
         self.helper_failed = False
         self.trace_of = {}
         self.suspect = set()  # Names whose bytes failed here: their private aliases get checked.
+        self.private_only = set()  # Private-store names with no object, left out of the work items.
         self.rejected = rejected(self.pool)  # Snapshots earlier passes proved wrong.
         for name in ("objects", "meta", "locks", "uses", "cursors", "hashes"):
             (self.directory / name).mkdir(parents=True, exist_ok=True, mode=0o700)
 
     def count(self, key, amount=1):
         self.report[key] = self.report.get(key, 0) + amount
+
+    def stopped(self):
+        if self.stop is not None and self.stop():
+            self.report["stopped"] = True
+            return True
+        return False
+
+    def expired(self):
+        """The pass must end now: its deadline passed, or the next round wants the tree."""
+        return time.monotonic() >= self.deadline or self.stopped()
 
     def quiescent(self, path, before):
         """Unchanged since inspected, not open for writing, not modified since the boundary began."""
@@ -636,7 +658,7 @@ class Pass:
     def helper(self):
         if self.program is None and not self.helper_failed:
             try:
-                self.program = expanded_cache.native(self.checkout, dict(self.env), self.pool)
+                self.program = expanded_cache.native(self.cwd, dict(self.env), self.pool)
             except (OSError, subprocess.SubprocessError, ValueError) as error:
                 self.helper_failed = True
                 log(f"canonical store: Lake hash helper unavailable; deferring decisions ({error})")
@@ -646,7 +668,7 @@ class Pass:
         """Lake-hash `(path, name, info)` items in one helper call; unknown stays unknown."""
         self.seen.update(fingerprint(i) for _, _, i in items)
         items = [(p, n, i) for p, n, i in items if fingerprint(i) not in self.lakes]
-        if not items or time.monotonic() >= self.deadline or self.helper() is None:
+        if not items or self.expired() or self.helper() is None:
             return
         try:
             with tempfile.TemporaryDirectory(dir=self.directory, prefix="hash-") as tmp:
@@ -899,24 +921,29 @@ def relink(
     slot_wait=None,
     limit=None,
     report=None,
+    lake=None,
+    stop=None,
 ):
     """Converge `checkout/.lake/build` (and the private Lake store) on canonical objects.
 
     Bounded and resumable: at most `slots` relinks run on the host at once, a relink that cannot
     get a slot within `slot_wait` seconds is skipped, and a pass stops at `budget` seconds (or
-    after `limit` names), keeping a per-checkout cursor so the next pass continues where this one
-    stopped. Missing build directories are a no-op. Raises `Unavailable` only for link failures.
+    after `limit` names, or once `stop()` is true), keeping a per-checkout cursor so the next pass
+    continues where this one stopped. `lake` names the checkout's `.lake` when it is not inside
+    the checkout (parked between rounds); the cursor stays the checkout's. Missing build
+    directories are a no-op. Raises `Unavailable` only for link failures.
     """
     checkout = Path(checkout)
     report = {} if report is None else report
-    build = checkout / ".lake/build"
+    tree = checkout if lake is None else Path(lake)
+    build = (checkout / ".lake" if lake is None else Path(lake)) / "build"
     if not (build / "lib/lean").is_dir():
         return report
     env = os.environ if env is None else env
     budget = float(env.get("TAUCETI_RELINK_BUDGET_S", 180)) if budget is None else budget
     slots = int(env.get("TAUCETI_RELINK_SLOTS", 4)) if slots is None else slots
     slot_wait = float(env.get("TAUCETI_RELINK_SLOT_WAIT_S", 60)) if slot_wait is None else slot_wait
-    if busy := writers(checkout):
+    if busy := writers(tree):
         report["skipped"] = f"Lake or Lean processes {busy} name the checkout"
         return report
     pool = expanded_cache.root(env) if pool is None else Path(pool)
@@ -924,23 +951,42 @@ def relink(
         expanded_cache.same_filesystem(build, *([private_store] if private_store else []), pool)
     except expanded_cache.SharedLinkUnavailable as error:
         raise Unavailable(str(error)) from None
-    with slot(store(pool), count=slots, wait=slot_wait) as held:
+    with slot(store(pool), count=slots, wait=slot_wait, stop=stop) as held:
         if not held:
-            report["skipped"] = f"{slots} relinks already running on this host"
+            if stop is not None and stop():
+                report["stopped"] = True
+                report["skipped"] = "the next round needs the checkout"
+            else:
+                report["skipped"] = f"{slots} relinks already running on this host"
             return report
         started = time.monotonic()
-        work = Pass(checkout, pool, private_store, env, report, deadline=started + budget, not_after=time.time())
-        _relink(work, build, sweep_private, delete_setup, limit)
+        work = Pass(
+            checkout,
+            pool,
+            private_store,
+            env,
+            report,
+            deadline=started + budget,
+            not_after=time.time(),
+            cwd=checkout if lake is None or checkout.is_dir() else build,
+            stop=stop,
+        )
+        try:
+            _relink(work, build, sweep_private, delete_setup, limit)
+        except Stopped:
+            report["stopped"] = report["incomplete"] = True  # Stopped before converging anything.
         report["seconds"] = round(time.monotonic() - started, 3)
         return report
 
 
 def _relink(work, build, sweep_private, delete_setup, limit):
     report = work.report
-    modules, setups = outputs(build)
+    modules, setups = outputs(build, work.stopped)
     by_name = {}
     found = 0
     for trace, pairs in modules.items():
+        if work.stopped():
+            raise Stopped
         for path, name in pairs:
             found += 1
             work.trace_of[path] = trace
@@ -958,12 +1004,22 @@ def _relink(work, build, sweep_private, delete_setup, limit):
     report["outputs"] = found
     private_names = set()
     if sweep_private and work.private is not None and work.private.is_dir():
-        for entry in os.scandir(work.private):
+        for index, entry in enumerate(os.scandir(work.private)):
+            if index % 4096 == 0 and work.stopped():
+                raise Stopped
             if not expanded_cache.ARTIFACT.fullmatch(entry.name) or not entry.is_file(follow_symlinks=False):
                 continue
-            with contextlib.suppress(FileNotFoundError):
+            try:
                 if (work.objects / entry.name).stat().st_ino == entry.stat(follow_symlinks=False).st_ino:
                     continue
+            except FileNotFoundError:
+                # No object and no pool copy to adopt: `publish` leaves Lake's private metadata
+                # alone unless its bytes were rejected or its name turns suspect (checked below).
+                with contextlib.suppress(FileNotFoundError):
+                    info = entry.stat(follow_symlinks=False)
+                    if not legacy(work.pool, entry.name).exists() and fingerprint(info) not in work.rejected:
+                        work.private_only.add(entry.name)
+                        continue
             private_names.add(entry.name)
     elif work.private is not None:
         for name in by_name:
@@ -1006,7 +1062,7 @@ def _relink(work, build, sweep_private, delete_setup, limit):
             batch = order[offset : offset + BATCH]
             if limit is not None:
                 batch = batch[: max(0, limit - done)]
-            if not batch or time.monotonic() >= work.deadline:
+            if not batch or work.expired():
                 raise TimeoutError("relink budget reached")
             # Hash what this batch needs to decide new names, then converge this batch.
             fetch, names, sizes = [], set(), []
@@ -1052,7 +1108,7 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                 group = batch[index:end]
                 with object_lock(work.directory, name, exclusive=True, deadline=work.deadline):
                     for _, raw, is_private in group:
-                        if time.monotonic() >= work.deadline:
+                        if work.expired():
                             raise TimeoutError("relink budget reached")
                         skipped = False
                         try:
@@ -1077,6 +1133,12 @@ def _relink(work, build, sweep_private, delete_setup, limit):
                             work.deadline = max(deadline, time.monotonic() + GRACE)
                 index += len(group)
             offset += len(batch)
+        # A private-only name whose checkout bytes failed here may hold the same bad bytes.
+        for name in sorted(work.suspect & work.private_only):
+            if work.expired():
+                raise TimeoutError("relink budget reached")
+            with object_lock(work.directory, name, exclusive=True, deadline=work.deadline):
+                work.decide(work.private / name, name, True)
     except TimeoutError:
         pass
     finally:
@@ -1192,21 +1254,25 @@ def reconcile(pool, name, path, *, blocking=True, guard=None, refused=None):
         return False
 
 
+def _switched_off(env):
+    """No canonical store for this round, or an operator switch (read each time: no restart)."""
+    if env.get("TAUCETI_SHARED_ARTIFACTS", "1") == "0" or not env.get("LAKE_CACHE_DIR"):
+        return True
+    return env.get("TAUCETI_CANONICAL_RELINK", "1") == "0" or (store(expanded_cache.root(env)) / "disabled").exists()
+
+
 def boundary(checkout, env, *, phase, prefix=()):
     """Relink at a round boundary. Only a failed hard-link probe before the agent starts raises.
 
-    Everything else (I/O errors, busy checkouts, a busy host) is logged and left for the next
-    boundary: relinking is maintenance and must not discard or block a round.
+    Before the agent (`prepare`) only the probe runs: the agent needs working hard links, not a
+    converged tree, and the full pass runs between rounds (`between_rounds`). Everything else
+    (I/O errors, busy checkouts, a busy host) is logged and left for the next boundary:
+    relinking is maintenance and must not discard or block a round.
     """
-    if env.get("TAUCETI_SHARED_ARTIFACTS", "1") == "0" or not env.get("LAKE_CACHE_DIR"):
-        return None
     checkout = Path(checkout)
-    if not (checkout / ".lake/build/lib/lean").is_dir():
+    if not (checkout / ".lake/build/lib/lean").is_dir() or _switched_off(env):
         return None
     pool = expanded_cache.root(env)
-    # Operator switches, read at every boundary: no restart needed for the file.
-    if env.get("TAUCETI_CANONICAL_RELINK", "1") == "0" or (store(pool) / "disabled").exists():
-        return None
     private_store = Path(env["LAKE_CACHE_DIR"])
     if phase == "prepare":
         try:
@@ -1218,16 +1284,52 @@ def boundary(checkout, env, *, phase, prefix=()):
             raise
         except (OSError, ValueError) as error:
             raise Unavailable(f"hard-link probe failed: {type(error).__name__}: {error}") from error
-    try:
-        report = relink(
+        log("canonical store (prepare): hard links verified; relinking runs between rounds")
+        return {}
+    return _logged(
+        phase,
+        lambda: relink(
             checkout,
             private_store,
             pool,
             env=env,
-            sweep_private=phase == "prepare",
             # Lean reads setup files while compiling; delete them only at round boundaries.
-            delete_setup=phase in ("prepare", "round-end"),
-        )
+            delete_setup=phase == "round-end",
+        ),
+    )
+
+
+def between_rounds(checkout, lake, env, *, stop=None):
+    """The full pass on a worker's idle `.lake` (maybe parked beside its removed checkout).
+
+    The caller holds the worker's build-tree lock, so no round uses the tree; `stop()` turning
+    true (the next round wants it) ends the pass at the next file, keeping its cursor. It also
+    sweeps the private Lake store and deletes setup files once the tree has converged.
+    """
+    if _switched_off(env):
+        return None
+    budget = float(env.get("TAUCETI_BACKGROUND_RELINK_BUDGET_S", 900))
+    return _logged(
+        "between rounds",
+        lambda: relink(
+            checkout,
+            Path(env["LAKE_CACHE_DIR"]),
+            expanded_cache.root(env),
+            env=env,
+            sweep_private=True,
+            delete_setup=True,
+            budget=budget,
+            # Nobody waits for this pass, so it queues for a slot as long as it may run.
+            slot_wait=budget,
+            lake=lake,
+            stop=stop,
+        ),
+    )
+
+
+def _logged(phase, run):
+    try:
+        report = run()
     except Exception as error:  # noqa: BLE001 - maintenance; the next boundary retries
         log(f"canonical store ({phase}): relinking deferred ({type(error).__name__}: {error})")
         return None
@@ -1240,6 +1342,7 @@ def boundary(checkout, env, *, phase, prefix=()):
         f"{report.get('published_local', 0) + report.get('published_ci', 0)} published, "
         f"{report.get('invalidated_modules', 0)} stale modules removed, "
         f"{report.get('setup_removed', 0)} setup files removed"
+        f"{', stopped for the next round' if report.get('stopped') else ''}"
         f"{', incomplete' if report.get('incomplete') else ''}; {report.get('seconds', 0):.1f}s"
     )
     if report.get("integrity_failures"):

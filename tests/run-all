@@ -304,6 +304,7 @@ RUN_STDLIB=(
   workflow_backstop.py
   live_use.py
   round_worktrees.py
+  background_relink.py
   checkout_without_pull_ref.py
 )
 # special-cased python tests (handled explicitly in run_one)
