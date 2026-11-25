@@ -92,6 +92,7 @@ RUN_STDLIB=(
   queue_install_releases.py
   queue_repair_cache.py
   queue_repair_outputs.py
+  queue_repair_upload.py
   queue_claude_stdin.py
   expanded_cache.py
   canonical_store.py

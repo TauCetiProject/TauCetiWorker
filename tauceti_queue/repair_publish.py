@@ -1,10 +1,11 @@
 """Publish native Lake outputs without another whole-library graph scan.
 
 The final build writes .lake/outputs.jsonl. Native `lake cache stage` freezes
-its complete artifacts outside the disposable worktree; stock `put-staged`
-uploads them with explicit repository, revision and toolchain and never loads
-workspace configuration. The write key reaches only the native upload process.
-Lake uploads artifacts before the revision map. Failures remain visible in
+its complete artifacts outside the disposable worktree; `repair_upload` uploads
+them as stock `lake cache put-staged` would, with explicit repository, revision
+and toolchain and without loading workspace configuration, but skips artifacts
+the bucket already holds. The write key reaches only the upload's curl process.
+Artifacts are uploaded before the revision map. Failures remain visible in
 existing publication records and never change the compilation/audit verdict.
 
 Early publication can overlap checks. An independent transient unit owns its
@@ -27,7 +28,7 @@ import time
 import tomllib
 from pathlib import Path
 
-from tauceti_queue import repair
+from tauceti_queue import repair, repair_upload
 
 SERVICE = "tauceti-repair"
 UPLOAD_SERVICE = "tauceti-repair-upload"
@@ -70,6 +71,9 @@ class Settings:
     service: str = SERVICE
     upload_service: str = UPLOAD_SERVICE
     when: str = "after"  # TAUCETI_REPAIR_PUBLISH: after | before | off
+    # The host's record of artifacts already in the bucket (repair_upload.UploadRecord); None: the
+    # default under ~/.cache; "off": no record, every artifact is HEAD-checked.
+    upload_record: str | None = None
 
     @classmethod
     def from_env(cls, environ: dict | None = None) -> Settings:
@@ -78,6 +82,7 @@ class Settings:
         key_file = (env.get("TAUCETI_REPAIR_CACHE_KEY_FILE") or "").strip()
         timeout = (env.get("TAUCETI_REPAIR_CACHE_PUBLISH_TIMEOUT") or "").strip()
         when = (env.get("TAUCETI_REPAIR_PUBLISH") or "").strip().lower()
+        upload_record = (env.get("TAUCETI_REPAIR_UPLOAD_RECORD") or "").strip()
         if when and when not in WHEN:
             log(f"TAUCETI_REPAIR_PUBLISH={when!r} is not one of {', '.join(WHEN)}; publishing after submission")
         return cls(
@@ -87,6 +92,7 @@ class Settings:
             publish=True if flag in TRUE else False if flag in FALSE else None,
             timeout=float(timeout) if timeout else PUBLISH_TIMEOUT,
             when=when if when in WHEN else "after",
+            upload_record=upload_record or None,
         )
 
     def to_json(self) -> dict:
@@ -105,6 +111,11 @@ class Settings:
     @property
     def upload_base(self) -> str | None:
         return self.upload_url or self.url
+
+    def record_path(self) -> Path | None:
+        if (self.upload_record or "").lower() in FALSE:
+            return None
+        return Path(self.upload_record) if self.upload_record else repair_upload.default_record_path()
 
     def key(self) -> str | None:
         if self.key_file is None:
@@ -462,29 +473,24 @@ def publish_frozen(spec: dict) -> dict:
         if reason:
             record["skipped"] = reason
             return record
-        env = dict(os.environ, LAKE_CACHE_KEY=settings.key() or "", ELAN_TOOLCHAIN=frozen["toolchain"])
-        argv = [
-            *spec["lake"],
-            "cache",
-            "put-staged",
-            str(stage),
-            f"--rev={spec['revision']}",
-            "--service",
-            settings.upload_service,
-            "--repo",
-            spec["repository"],
-            f"--toolchain={frozen['toolchain']}",
-        ]
-        put = repair.run_logged(
-            niced(argv, int(spec.get("nice", NICE)), env),
+        env = dict(os.environ)
+        put = repair_upload.upload(
             stage,
-            Path(spec["logdir"]) / "cache-put.log",
+            base=str(settings.upload_base),
+            repository=spec["repository"],
+            toolchain=frozen["toolchain"],
+            revision=spec["revision"],
+            key=settings.key() or "",
             env=env,
+            log_path=Path(spec["logdir"]) / "cache-put.log",
             timeout=settings.timeout,
+            record_path=settings.record_path(),
+            prefix=tuple(niced([], int(spec.get("nice", NICE)), env)),
         )
         record["put"] = {k: put[k] for k in ("rc", "seconds", "timed_out", "log")}
+        record["upload"] = {k: put[k] for k in ("recorded", "present", "uploaded") if k in put}
         if put["rc"]:
-            record["error"] = f"lake cache put-staged exited {put['rc']}"
+            record["error"] = f"cache upload exited {put['rc']}"
         else:
             record["published"] = True
     except Exception as error:

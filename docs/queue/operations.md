@@ -1424,7 +1424,7 @@ measurements rather than inferred from one combined duration.
 
 With the default `TAUCETI_REPAIR_PUBLISH=after`, a green whole-library build freezes its
 output map and archive hardlinks before the remaining audit/lint checks start. A normal
-background publisher uploads the snapshot using stock `lake cache put-staged --rev=...`;
+background publisher uploads the snapshot for `--rev=...` as stock `lake cache put-staged` would, skipping artifacts already in the bucket;
 it does not depend on the live source tree or read a later checkout's Git revision.
 This applies to worker verification, clean preparation and the rebase agent's full-build
 helper. Snapshots require platform-independent root-package outputs and a fixed toolchain
