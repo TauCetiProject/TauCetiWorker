@@ -87,6 +87,7 @@ class Round:
         self.kind = "no-work"
         self.rc = 0
         self.observation = None
+        self.selections = 0
         os.environ["TAUCETI_ACTIVITY_ROUND_ID"] = self.id
         self.started_at = time.time()
         self.deadline = float(os.environ.get("TAUCETI_ROUND_DEADLINE", "inf"))
@@ -104,9 +105,13 @@ class Round:
     def select(self, kind):
         self.kind = kind
         self.observation = None
+        # A round that finds nothing to do in one stage selects another, for
+        # example a review that a peer owns followed by roadmap authoring. Each
+        # selection is its own receipt so the live kind follows the latest one.
+        self.selections += 1
         emit(
             "round_selected",
-            key=self.id + ":select",
+            key=f"{self.id}:select:{self.selections}",
             round_id=self.id,
             worker=self.worker,
             round_type=kind,
@@ -332,7 +337,8 @@ def _ingest(db, e):
                 (e["at"], e.get("pid"), e.get("process_identity"), e.get("hostname"), rid),
             )
         elif kind == "round_selected":
-            db.execute("UPDATE rounds SET kind=? WHERE id=?", (e["round_type"], rid))
+            # The finish receipt carries the final kind; a late selection must not replace it.
+            db.execute("UPDATE rounds SET kind=? WHERE id=? AND finished IS NULL", (e["round_type"], rid))
         elif kind == "round_finished":
             db.execute(
                 "UPDATE rounds SET kind=?,finished=?,outcome=? WHERE id=?",
@@ -349,11 +355,25 @@ def _ingest(db, e):
     _reconcile_publication(db, e, worker, scope)
 
 
+def _receipt_time(receipt):
+    at = receipt.get("at") if isinstance(receipt, dict) else None
+    return at if isinstance(at, (int, float)) else 0
+
+
 def _consume(db, errors):
+    receipts = []
     for path in sorted((root() / "pending").glob("*.json")):
         try:
+            receipts.append((json.loads(path.read_text()), path))
+        except (OSError, ValueError):
+            errors.append("Invalid or unreadable activity receipt: " + path.name)
+    # Receipt file names are hashes; apply them in emission order so a round's
+    # later selection lands after its earlier one.
+    receipts.sort(key=lambda item: _receipt_time(item[0]))
+    for receipt, path in receipts:
+        try:
             with db:
-                _ingest(db, json.loads(path.read_text()))
+                _ingest(db, receipt)
             path.unlink()
         except (OSError, ValueError, KeyError, sqlite3.Error):
             errors.append("Invalid or unreadable activity receipt: " + path.name)

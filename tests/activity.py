@@ -388,6 +388,26 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(s["interrupted_unfinished"], 1)
         self.assertEqual(s["running"], 0)
 
+    def test_live_round_kind_follows_its_latest_selection(self):
+        clock = [self.now]
+        with patch.object(a.time, "time", side_effect=lambda: clock[0]):
+            r = a.Round("worker")
+            for kind in ("review", "review", "roadmap"):
+                clock[0] += 1
+                r.select(kind)
+        # Hash-named receipt files must not decide the order selections apply in.
+        with contextlib.closing(a._connect()) as db, db:
+            a._consume(db, [])
+            self.assertEqual(db.execute("SELECT kind FROM rounds WHERE id=?", (r.id,)).fetchone()[0], "roadmap")
+        clock[0] += 1
+        with patch.object(a.time, "time", return_value=clock[0]):
+            r.finish()
+        # A selection receipt replayed after the finish cannot relabel the finished round.
+        a.emit("round_selected", round_id=r.id, worker="worker", round_type="review")
+        with contextlib.closing(a._connect()) as db, db:
+            a._consume(db, [])
+            self.assertEqual(db.execute("SELECT kind FROM rounds WHERE id=?", (r.id,)).fetchone()[0], "roadmap")
+
     def test_deferred_creation_keeps_origin_and_reconciles_without_moving_finish(self):
         from tauceti_worker import github_outbox as outbox
 
