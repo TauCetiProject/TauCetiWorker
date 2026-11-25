@@ -32,7 +32,6 @@ from .constants import (
     OPEN_PR_PAGE,
     TAUCETI,
 )
-from .review_diagnostics import public_diagnostic_quality
 
 
 def validate_github_account(value: str) -> str:
@@ -1082,77 +1081,6 @@ class GitHub:
         ) as error:
             log(f"bump #{pr}: integration handoff unavailable; leaving it for a later round ({type(error).__name__})")
             return None
-
-    @staticmethod
-    def _stuck_issue_body(pr: int, reason: str, diagnostic: str = "") -> str:
-        detail = (
-            f"\n\nLatest allow-listed worker diagnostics:\n\n{diagnostic}"
-            if diagnostic
-            else "\n\nNo public worker diagnostic was retained."
-        )
-        return (
-            f"The autonomous worker cannot make progress on #{pr}: {reason}\n"
-            f"{detail}\n\n"
-            f"It can be neither merged (not all-green) nor auto-retired (its review rounds "
-            f"are not advancing). This issue calls for an infrastructure repair, not a one-off "
-            f"manual review. The worker re-checks each round and will close this issue's PR-side "
-            f"concern once #{pr} merges or is closed.\n\n"
-            f"<!--tauceti-review-stuck:{pr}-->"
-        )
-
-    def ensure_stuck_issue(self, pr: int, reason: str, diagnostic: str = "") -> None:
-        """Ensure a tracking issue exists for a PR the automation can't make progress on (a permanent
-        record so a human notices). An existing issue is updated when a later worker has a better
-        diagnostic. Deduped by an exact title: one open issue per stuck PR across the whole fleet.
-        Best-effort — a GitHub failure is non-fatal (the per-round warning still fires); never raises."""
-        title = f"Review stuck: PR #{pr}"
-        try:
-            p = self._gh(
-                [
-                    "issue",
-                    "list",
-                    "--repo",
-                    self.repo,
-                    "--state",
-                    "open",
-                    "--search",
-                    f'in:title "{title}"',
-                    "--json",
-                    "number,title,body",
-                ]
-            )
-            body = self._stuck_issue_body(pr, reason, diagnostic)
-            matches = []
-            if p.returncode == 0:
-                matches = [
-                    issue
-                    for issue in json.loads(p.stdout or "[]")
-                    if isinstance(issue, dict) and issue.get("title") == title
-                ]
-            if matches:
-                issue = matches[0]
-                existing_body = issue.get("body") if isinstance(issue.get("body"), str) else ""
-                # Keep equally useful peer reports stable, but let an actual diagnosis
-                # replace "review command failed". The comparison uses fixed public
-                # categories only; raw subprocess output never crosses this boundary.
-                has_public_diagnostic = "Latest allow-listed worker diagnostics:" in existing_body
-                better = public_diagnostic_quality(body) > public_diagnostic_quality(existing_body)
-                if existing_body != body and (not has_public_diagnostic or better):
-                    self._gh(
-                        [
-                            "issue",
-                            "edit",
-                            str(issue["number"]),
-                            "--repo",
-                            self.repo,
-                            "--body",
-                            body,
-                        ]
-                    )
-                return
-            self._gh(["issue", "create", "--repo", self.repo, "--title", title, "--body", body])
-        except Exception:
-            pass
 
     def rebase_requested(self, pr: int, head: str) -> bool:
         """A trusted sweep handoff for this exact head; stale requests spend no attempts."""

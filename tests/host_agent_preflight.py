@@ -2,7 +2,7 @@
 """A host round shells out to `codex`/`claude`/`pi`. If that binary slips off the worker's PATH (an npm
 reinstall relocating codex is the case that bit us), the review engine rejects `--reviewer codex` and
 do_review counts it as a PER-PR review error — so a machine-wide outage marches PRs one-by-one to the
-"needs a human" escalation cap. dispatch() must preflight the binary and, when it is missing, pause the
+review-error cap, where they are closed. dispatch() must preflight the binary and, when it is missing, pause the
 round as NoProgress (⇒ backoff, no counter bump) rather than launch a doomed stage.
 
 This test drives dispatch() with the do_* stage stubbed out, so it needs no real Worker: the preflight

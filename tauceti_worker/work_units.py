@@ -78,6 +78,7 @@ from .constants import (
     MAX_FIX_ATTEMPTS,
     MAX_FIX_ROUNDS_WITHOUT_APPROVAL,
     MAX_INFRA_REFUNDS,
+    MAX_REVIEW_ERRORS,
     OPENROUTER_MODELS,
     PR_TASKS,
     PROGRESS_ATTEMPT_GAP,
@@ -127,6 +128,8 @@ from .survey import (
     owns_pr,
     prioritize_review_candidates,
     progress_argv,
+    review_cap_close_key,
+    review_error_key,
     spread_candidates,
     survey,
 )
@@ -439,7 +442,7 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
     joined rather than raced: the first one printed is not necessarily the only reason, and hiding
     the rest would send the operator to fix the wrong thing.
 
-    A stage's `suppressed` list, `review_stuck` and
+    A stage's `suppressed` list, `review_capped` and
     `fix_waiting` are the survey's own vocabulary for "considered and passed over"; anything left
     over is either not an open PR at all, a draft, or open with genuinely nothing to do.
     """
@@ -452,8 +455,8 @@ def pr_focus_reason(sv: Survey, opts, pr: int) -> str:
             if c.pr == pr:
                 spent = f" ({c.attempts}/{c.budget} attempts spent)" if c.budget else ""
                 notes.append(f"{stage} suppressed: {c.reason}{spent}")
-    if pr in sv.review_stuck:
-        notes.append("review keeps erroring without completing a review — needs infrastructure repair")
+    if pr in sv.review_capped:
+        notes.append(f"review errored {MAX_REVIEW_ERRORS} times without completing a review; no more review rounds")
     notes += [f"fix: {why}" for n, why in sv.fix_waiting if n == pr]
     # A throttle removes a candidate silently, so without this a PR the operator named would be
     # reported as having no work at all when in fact this worker was told to hold off on it.
@@ -783,35 +786,6 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         for pr, why in sv.fix_waiting:
             if in_scope(pr):
                 log(f"  fix #{pr}: {why}")
-
-    # Escalate every PR the worker can't review (its review keeps erroring). This fires EVERY round
-    # the condition holds — a bright-red warning so it can't be missed — and ensures one tracking issue
-    # per PR for a permanent record. These PRs neither merge nor advance toward CI's round cap, so a
-    # human must intervene; surfacing them loudly is the alternative to stranding them in silence.
-    #
-    # Two things it must not do. Under `--pr` it stays inside the target set: filing a tracking issue
-    # on GitHub for an unrelated PR is exactly the unrelated work a targeted round promises not to do,
-    # and it would repeat every round of a targeted loop. Under `--dry-run` it warns but writes
-    # nothing — neither the GitHub issue nor the local diagnostic backfill — because a dry run is how
-    # an operator inspects their setup and it is documented as acting on nothing.
-    for pr in sv.review_stuck:
-        if not in_scope(pr):
-            continue
-        n_err = w.counters.read(f"review-err-{pr}")
-        warn_red(
-            f"PR #{pr}: review has ERRORED {n_err}x without completing a review — the worker cannot "
-            f"review it. Needs infrastructure repair. {source_pull_url(pr)}"
-        )
-        if opts.dry_run:
-            log(f"[dry-run] would open/refresh the tracking issue for #{pr}")
-            continue
-        head = next((item.head_oid for item in sv.open_prs if item.number == pr), "")
-        retained = read_review_failure(w.cfg.state, pr)
-        if not retained:
-            retained = recover_review_failures(w.cfg.state, w.cfg.logdir, worker=w.cfg.wid, pr=pr, head=head)
-        diagnostic = public_review_failure(retained)
-        reason = f"its review has errored {n_err} times without completing a review"
-        w.gh.ensure_stuck_issue(pr, reason, diagnostic)
 
     if global_pick:
         counts = ", ".join(
@@ -1568,7 +1542,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
     if stage == "rebase" and not rebase_key:
         raise Die("rebase candidate has no selected retry budget; survey it again")
     keys = {
-        "review": (f"review-err-{pr}",),
+        "review": (f"review-err-{pr}", review_error_key(pr)),
         "fix": (f"fix-{pr}-{head}",),
         "fix-ci": (f"ci-{pr}-{head}", f"ci-pr-{pr}"),
         "rebase": (rebase_key,),
@@ -1765,6 +1739,8 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     os.environ["TAUCETI_GITHUB_PHASE"] = stage
     if stage == "fix" and c.final_resolution and w.counters.read(f"fix-{c.pr}-{c.head[:12]}") >= MAX_FIX_ATTEMPTS:
         return _close_spent_pr(w, sv, c, explicit=explicit)
+    if stage == "review" and c.close_at_review_cap:
+        return _close_review_capped_pr(w, sv, c, explicit=explicit)
     profile = _effective_authoring_profile(opts) if stage != "review" else None
     kiro_probe_profile = profile
     if stage == "review" and opts.work_model == "kiro":
@@ -1774,7 +1750,7 @@ def dispatch(stage: str, w: Worker, sv: Survey, c: Candidate, opts: RoundOpts) -
     # Preflight the host agent binary. A host round shells out to `codex`/`claude`/`pi`; if that binary
     # has slipped off the worker's PATH (an npm reinstall relocating codex is the case that bit us), the
     # review engine rejects `--reviewer codex` and do_review counts it as a PER-PR review error — so a
-    # machine-wide outage marches PRs one-by-one to the "needs a human" escalation cap. Catch it HERE,
+    # machine-wide outage marches PRs one-by-one to the review-error cap, which closes them. Catch it HERE,
     # before launch, as a loud self-healing pause (NoProgress ⇒ backoff, no counter bump): every PR
     # would hit the identical failure, so it must not be charged to any single PR's error budget.
     # A default Codex authoring round also makes its read-only entitlement probe on the host before
@@ -2181,9 +2157,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             # an exhausted subscription window — and it deliberately posted nothing (TauCetiReview#117).
             # That is MACHINE-WIDE in the same sense as an archive service outage: the next
             # PR the loop picks would abort identically, so charging it to whichever PR happened to be
-            # this round's candidate is charging a PR for someone else's outage. Three of them strand
-            # that PR at MAX_REVIEW_ERRORS: dropped from review candidacy and given a public "Review
-            # stuck" issue, for a condition it had nothing to do with. The round checks availability
+            # this round's candidate is charging a PR for someone else's outage. Enough of them bring
+            # that PR to MAX_REVIEW_ERRORS, where it is closed or dropped from review candidacy, for a
+            # condition it had nothing to do with. The round checks availability
             # before it launches, but a provider can go down between that check and the review, or during
             # it — and a worker running --ignore-quota keeps working through the soft blocks either side
             # of that, so it meets the case often. Warn loudly and back off instead.
@@ -2198,6 +2174,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
             if not runtime_snapshot().get("failure_reason"):
                 report_failure(f"review #{pr} exited with status {rc}", code=rc)
             w.counters.incr(errkey)
+            w.counters.write(review_error_key(pr), int(time.time()))  # starts the retry back-off
             failure = runtime_snapshot()
             record_review_failure(
                 w.cfg.state,
@@ -2715,8 +2692,46 @@ def _close_capped_pr(w, sv, c, *, explicit=False) -> int | None:
     return rc
 
 
-def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
-    """Close an owned PR still blocked at `c.head` with `comment`, after fresh checks; no model call."""
+REVIEW_CAP_COMMENT = (
+    "Closing automatically: the fleet's review of this PR has failed {errors} times without completing "
+    "a review, so the fleet is retiring this PR to keep things moving. The branch is kept, so nothing is "
+    "lost. It is completely fine to open a fresh PR. Add the `keep` label if you would rather it stay open."
+)
+REVIEW_CAP_CLOSE_RETRY_S = 6 * 60 * 60
+
+
+def _close_review_capped_pr(w, sv, c, *, explicit=False) -> int | None:
+    """At the review-error cap: close an owned PR, with no model call.
+
+    The survey offers only the fleet's own PRs this way; anyone else's at the cap just get no more
+    review rounds from this host. A close that is declined (a `keep` label, a moved head, a peer's
+    claim) is not retried for REVIEW_CAP_CLOSE_RETRY_S, so a kept PR costs one live read per window."""
+    w.counters.write(review_cap_close_key(c.pr), int(time.time() + REVIEW_CAP_CLOSE_RETRY_S))
+    comment = REVIEW_CAP_COMMENT.format(errors=MAX_REVIEW_ERRORS)
+    retained = read_review_failure(w.cfg.state, c.pr) or recover_review_failures(
+        w.cfg.state, w.cfg.logdir, worker=w.cfg.wid, pr=c.pr, head=c.head
+    )
+    if diagnostic := public_review_failure(retained):
+        comment += f"\n\nLatest review failures on this host:\n\n{diagnostic}"
+    rc = _close_owned_pr(
+        w,
+        sv,
+        c,
+        explicit=explicit,
+        stage="review",
+        detail=f"closing owned PR after {MAX_REVIEW_ERRORS} review errors",
+        comment=comment,
+    )
+    if rc != 0:
+        log(f"  review #{c.pr}: {MAX_REVIEW_ERRORS} review errors; not closed, no more review rounds")
+    return rc
+
+
+def _close_owned_pr(w, sv, c, *, explicit, detail, comment, stage="fix") -> int | None:
+    """Close an owned PR still blocked at `c.head` with `comment`, after fresh checks; no model call.
+
+    A fix-stage close first re-confirms the live review still asks for a fix; a review-stage close
+    (the review-error cap) has no verdict to re-confirm, only the live PR's state and labels."""
     from .github_transport import read_context
 
     p = next((p for p in sv.open_prs if p.number == c.pr), None)
@@ -2726,7 +2741,9 @@ def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
         return None
     try:
         with read_context(fresh=True, direct=True):
-            if not _still_actionable("fix", w, sv, replace(c, partial_history=False), explicit=explicit):
+            if stage == "fix" and not _still_actionable(
+                "fix", w, sv, replace(c, partial_history=False), explicit=explicit
+            ):
                 return None
             live = w.gh.pr_view(c.pr, ["state", "headRefOid", "author", "labels", "isDraft"])
             if (
@@ -2734,7 +2751,7 @@ def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
                 or live.get("state") != "OPEN"
                 or live.get("headRefOid") != c.head
                 or live.get("isDraft") is not False
-                or _selected_pr_matches("fix", c, live, explicit=explicit) is not True
+                or _selected_pr_matches(stage, c, live, explicit=explicit) is not True
                 or not owns_author(sv, live.get("author"))
                 or {str(label.get("name", "")).lower() for label in live.get("labels", [])}
                 & {"keep", "hold", "wip", "human", "on-hold", "do-not-close"}
@@ -2742,16 +2759,18 @@ def _close_owned_pr(w, sv, c, *, explicit, detail, comment) -> int | None:
                 return None
             from .activity import select
 
-            select("fix")
-            report_runtime("running", phase="fix", target=f"PR #{c.pr}", detail=detail)
+            select(stage)
+            report_runtime("running", phase=stage, target=f"PR #{c.pr}", detail=detail)
             # The selected source's own repository: gh_run routes a Forgejo source's name to its forge.
             repo = getattr(w.gh, "repo", "") or TAUCETI
             gh_run(["gh", "pr", "close", str(c.pr), "--repo", repo, "--comment", comment])
             after = w.gh.pr_view(c.pr, ["state"])
             if not after or after.get("state") not in {"CLOSED", "MERGED"}:
-                raise NoProgress(f"fix #{c.pr}: automatic closure not confirmed; retrying without another model call")
+                raise NoProgress(
+                    f"{stage} #{c.pr}: automatic closure not confirmed; retrying without another model call"
+                )
         w.rs.bust(c.pr)
-        log(f"fix #{c.pr}: confirmed closure ({detail})")
+        log(f"{stage} #{c.pr}: confirmed closure ({detail})")
         return 0
     finally:
         w.claims.stop_heartbeat()

@@ -2,8 +2,8 @@
 """gh_run waits out a GitHub rate limit and retries, rather than failing the round and discarding the
 agent's (expensive) work.
 
-A 403 mid-round used to fail the round outright — and, for a review, count against the review-ERROR cap
-that escalates a healthy PR to a human (the #302 false-escalation in the field log). Now a rate-limited
+A 403 mid-round used to fail the round outright — and, for a review, count against the review-ERROR cap,
+which retires a healthy PR (the #302 false alarm in the field log). Now a rate-limited
 `gh` call sleeps until the limit clears and retries in place, bounded only by the round's hard cap
 (ROUND_TIMEOUT); the loop-level preflight (cmd_loop) waits out the longer hourly primary reset. This harness
 pins gh_run's decisions without touching the live API: a scripted FakeRun replays (returncode, stderr)

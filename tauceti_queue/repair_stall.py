@@ -19,8 +19,6 @@ applies it at each checkpoint, backs the task off and raises the alert:
   normalized the same way. Repair task 1521 of batch 506 was released 332 times in 7 hours with
   `KeyError: 'members'` from the worker's prompt composition and never checkpointed, so the
   checkpoint rule never saw it.
-- `conclusion` is what the agent itself concluded in its last message, cut to the passage that says
-  why it could not make progress (for example that a human has to intervene).
 - `retry_delay` is the backoff: `first` seconds, doubling at each further identical checkpoint up to
   `most`.
 """
@@ -39,21 +37,13 @@ TIMEZONE = ZoneInfo("Australia/Sydney")
 # The status alert's wording, which the public observation recognises (`monitoring.py`).
 ALERT_TEXT = "repair stalled"
 HEAD_ALERT_TEXT = "made no progress"
-# What a signature keeps of one finding's message, and how much of the agent's conclusion an alert quotes.
+# What a signature keeps of one finding's message.
 MESSAGE_LIMIT = 500
-CONCLUSION_LIMIT = 700
 
 _SHA = re.compile(r"\b[0-9a-f]{7,64}\b")
 _TEMP_PATH = re.compile(r"(?:/tmp|/var/tmp|/private/tmp)/\S*")
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 _SPACE = re.compile(r"\s+")
-# Sentences of the agent's last message that explain why it cannot make progress.
-_NEEDS_HUMAN = re.compile(
-    r"\b(human|operator|manual(?:ly)?|intervene|intervention|cannot be fixed|can't be fixed|"
-    r"no (?:content |source )?change|nothing (?:I|the agent) can|has to be split|must be split|"
-    r"needs? to be fixed|outside (?:the|my) (?:scope|control)|human-owned)\b",
-    re.IGNORECASE,
-)
 
 
 def normalize(message: str) -> str:
@@ -110,18 +100,6 @@ def checkpoint_signature(tip: str, worker_notes: str | None) -> str | None:
 def revision(value: Any) -> str:
     """A worker revision as the claim endpoint accepts it (a hex commit id), else empty."""
     return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{7,64}", value) else ""
-
-
-def conclusion(text: str | None, limit: int = CONCLUSION_LIMIT) -> str:
-    """The agent's own conclusion from its last message: the paragraphs that say why it could not make
-    progress (a human has to intervene, no source change can fix it), else the message's opening, cut
-    to `limit` characters. Empty when the agent said nothing."""
-    if not isinstance(text, str) or not text.strip():
-        return ""
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    chosen = [p for p in paragraphs if _NEEDS_HUMAN.search(p)] or paragraphs[:1]
-    result = _SPACE.sub(" ", " ".join(chosen)).strip()
-    return result if len(result) <= limit else result[: limit - 1].rstrip() + "…"
 
 
 def retry_delay(retries: int, first: int, most: int) -> int:

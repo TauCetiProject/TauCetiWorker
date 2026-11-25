@@ -5,9 +5,9 @@ TauCetiReview#117 gave the engine a distinct exit status for "I stopped because 
 unusable, and I posted nothing": a revoked credential, or an exhausted subscription window. Before
 that the engine exited 0 having posted a scoreboard of `error` rows, so do_review took the success
 path. With a real non-zero status it would otherwise fall into the ordinary failure branch and
-charge `review-err-<pr>` — a per-PR, lifetime counter that only a posted review resets. Three of
-them drop the PR from review candidacy (survey) and open a public "Review stuck: PR #N" issue, so an
-outage lasting one quota window could strand several unrelated PRs. Review workers run
+charge `review-err-<pr>` — a per-PR, lifetime counter that only a posted review resets. At the cap
+the PR is closed (the fleet's own) or dropped from review candidacy (anyone else's), so an outage
+lasting one quota window could retire several unrelated PRs. Review workers run
 `--ignore-quota` precisely so they do not pace, which is what makes that a live risk rather than a
 theoretical one.
 
@@ -170,7 +170,7 @@ def main():
             drive(REVIEW_PROVIDER_DOWN_EXIT, state)[0].counters.read("review-err-42")
             for _ in range(MAX_REVIEW_ERRORS + 2)
         )
-        check("repeated outages never reach the stuck cap", charged < MAX_REVIEW_ERRORS)
+        check("repeated outages never reach the review-error cap", charged < MAX_REVIEW_ERRORS)
 
     # 5) the public category for an exhausted plan.
     cases = {

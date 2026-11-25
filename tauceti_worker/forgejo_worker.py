@@ -374,19 +374,6 @@ class ForgejoWorkerSource(ForgejoReadSource):
         result = self._gh(["api", path, "--jq", jq])
         return result.stdout.strip() if result.returncode == 0 else None
 
-    def ensure_stuck_issue(self, pr, reason, diagnostic=""):
-        # Use the originating PR conversation so an unavailable issue tracker cannot
-        # route a diagnostic to the same-numbered GitHub PR.
-        from tauceti_tools.forge_write import ForgejoWriter
-
-        marker = "<!--tauceti-worker-stuck-->"
-        comments = self.issue_comments(pr, fresh=True)
-        if comments is None or any(marker in row.get("body", "") for row in comments):
-            return
-        ForgejoWriter(self.api).comment(
-            self.repository, pr, marker + "\nWorker review requires attention. " + reason, pull=True
-        )
-
     def fresh_claim_age(self, comment_id, emoji="eyes"):
         return None
 

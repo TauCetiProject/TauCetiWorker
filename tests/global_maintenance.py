@@ -531,6 +531,81 @@ class GlobalMaintenance(unittest.TestCase):
         )
         return sv, work.Candidate(10, HEAD, final_resolution=True), live
 
+    def test_review_errors_back_off_then_cap(self):
+        import time
+
+        survey_mod = importlib.import_module("tauceti_worker.survey")
+        from tauceti_worker.constants import MAX_REVIEW_ERRORS, REVIEW_ERROR_BACKOFF_S
+
+        p = PRInfo.from_json(row(10, "Other")["pr"])
+        counters = self.w.counters
+        now = time.time()
+        self.assertEqual(survey_mod._review_error_state(counters, p, 0, now), "ready")
+        self.counter_values[survey_mod.review_error_key(10)] = int(now)
+        self.assertEqual(survey_mod._review_error_state(counters, p, 1, now), "backoff")
+        self.assertEqual(survey_mod._review_error_state(counters, p, 1, now + REVIEW_ERROR_BACKOFF_S + 1), "ready")
+        self.assertEqual(
+            survey_mod._review_error_state(counters, p, 3, now + 3 * REVIEW_ERROR_BACKOFF_S), "backoff", "doubles"
+        )
+        self.assertEqual(survey_mod._review_error_state(counters, p, MAX_REVIEW_ERRORS, now + 10**9), "capped")
+        # An error streak from before the back-off existed carries no timestamp: retried at once.
+        self.counter_values.pop(survey_mod.review_error_key(10))
+        self.assertEqual(survey_mod._review_error_state(counters, p, 3, now), "ready")
+
+    def test_a_pr_at_the_review_error_cap_is_offered_for_closing_only_if_maintained(self):
+        survey_mod = importlib.import_module("tauceti_worker.survey")
+        from tauceti_worker.constants import MAX_REVIEW_ERRORS
+
+        for mine in (True, False):
+            with self.subTest(mine=mine):
+                sv = work.Survey(worker_id="test", me_login="science" if mine else "someone-else")
+                p = PRInfo.from_json(row(10, "Other")["pr"])
+                c = work.Candidate(10, HEAD, attempts=MAX_REVIEW_ERRORS, budget=MAX_REVIEW_ERRORS)
+                survey_mod._file_review_candidate(sv, self.w.counters, p, c)
+                self.assertEqual(sv.review_capped, [10])
+                self.assertEqual([x.close_at_review_cap for x in sv.reviewable.actionable], [True] if mine else [])
+                self.assertEqual([x.pr for x in sv.reviewable.suppressed], [] if mine else [10])
+        # A declined close waits before it is offered again.
+        self.counter_values[survey_mod.review_cap_close_key(10)] = 2**40
+        sv = work.Survey(worker_id="test", me_login="science")
+        survey_mod._file_review_candidate(sv, self.w.counters, PRInfo.from_json(row(10, "Other")["pr"]), c)
+        self.assertEqual((sv.reviewable.actionable, [x.pr for x in sv.reviewable.suppressed]), ([], [10]))
+
+    def test_the_review_error_cap_closes_a_maintained_pr_without_a_model_call(self):
+        survey_mod = importlib.import_module("tauceti_worker.survey")
+        from tauceti_worker.constants import MAX_REVIEW_ERRORS
+
+        sv, _, live = self.spent_fixture()
+        self.w.cfg.logdir = self.w.cfg.state
+        c = work.Candidate(10, HEAD, close_at_review_cap=True)
+
+        def close(argv, **kwargs):
+            live["state"] = "CLOSED"
+            return SimpleNamespace(returncode=0)
+
+        with (
+            patch("tauceti_worker.github_outbox.pending_for", return_value=False),
+            patch.object(work, "_check_stage_read_quota"),
+            patch.object(work, "_still_actionable", side_effect=AssertionError("no review re-read")),
+            patch.object(work, "_effective_authoring_profile", side_effect=AssertionError("no model path")),
+            patch.object(work, "gh_run", side_effect=close) as mutation,
+        ):
+            self.assertEqual(work.dispatch("review", self.w, sv, c, self.opts), 0)
+        argv = mutation.call_args.args[0]
+        self.assertEqual(argv[:4], ["gh", "pr", "close", "10"])
+        self.assertIn(f"failed {MAX_REVIEW_ERRORS} times", argv[argv.index("--comment") + 1])
+        self.assertGreater(self.counter_values[survey_mod.review_cap_close_key(10)], 0)
+        self.w.claims.release.assert_called_once()
+
+    def test_the_review_error_cap_never_closes_a_kept_or_foreign_pr(self):
+        for changes in ({"labels": [{"name": "keep"}]}, {"author": {"login": "peer"}}):
+            with self.subTest(changes=changes):
+                sv, _, _ = self.spent_fixture(**changes)
+                self.w.cfg.logdir = self.w.cfg.state
+                with patch.object(work, "gh_run") as mutation:
+                    self.assertIsNone(work._close_review_capped_pr(self.w, sv, work.Candidate(10, HEAD)))
+                mutation.assert_not_called()
+
     def test_unlimited_bump_is_not_redirected_to_closure_by_its_attempt_count(self):
         sv, c, _ = self.spent_fixture()
         c.final_resolution = False

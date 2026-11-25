@@ -305,8 +305,7 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "Filters what the round would already have done — it can never make a PR actionable that "
         "the survey passed over, and never bypasses claims, attempt budgets, or the review caps. "
         "Combines with --only by intersection; drops the two work units that name no existing PR "
-        "(progress, roadmap), so a targeted round never falls through to unrelated work — including "
-        "the tracking issues it would otherwise file for unrelated stuck PRs. When none of the named "
+        "(progress, roadmap), so a targeted round never falls through to unrelated work. When none of the named "
         "PRs are actionable the round says why, per PR, and stops. An empty or unreadable value is "
         "an error, never 'no targeting' (or $TAUCETI_PR)",
     )

@@ -981,7 +981,7 @@ DRIVER_FAILURE = {
 
 
 class StallSignature(unittest.TestCase):
-    """The failure signature and the agent's conclusion (`tauceti_queue/repair_stall.py`)."""
+    """The failure signature (`tauceti_queue/repair_stall.py`)."""
 
     def test_identical_failures_share_a_signature_whatever_varies_between_runs(self):
         first = {
@@ -1011,15 +1011,6 @@ class StallSignature(unittest.TestCase):
             repair_stall.signature(tip, [dict(first, message="unused variable `x`")]),
             "another message",
         )
-
-    def test_the_conclusion_keeps_why_the_agent_cannot_progress(self):
-        text = repair_stall.conclusion(TASK_1415_CONCLUSION)
-        self.assertIn("a human has to do", text)
-        self.assertIn("No content change in the PRs will fix this failure", text)
-        self.assertNotIn("Focused checks", text)
-        self.assertLessEqual(len(text), repair_stall.CONCLUSION_LIMIT)
-        self.assertEqual(repair_stall.conclusion("Fixed the import.\n\nAll checks pass."), "Fixed the import.")
-        self.assertEqual(repair_stall.conclusion(None), "")
 
     def test_the_backoff_doubles_up_to_its_maximum(self):
         self.assertEqual(
@@ -1075,14 +1066,14 @@ class StalledRepair(QueueFixture):
         self.assertEqual((entry["state"], entry["result"]), ("done", "journal-only"))
         content = json.loads(entry["payload"])["content"]
         self.assertIn("repair-stalled", content)
-        self.assertIn("a human has to do", content)
         self.assertIn("driver failure", content)
+        self.assertNotIn("a human has to do", content, "the alert reports the stall, not the agent's message")
         status = self.controller.status()
         alerts = [a for a in status["alerts"] if a.startswith("repair stalled")]
         self.assertEqual(len(alerts), 1, status["alerts"])
         self.assertIn(f"task {task.task_id}", alerts[0])
         self.assertIn("AEDT", alerts[0])
-        self.assertIn("agent: ", alerts[0])
+        self.assertNotIn("agent: ", alerts[0])
         self.assertFalse(any("unclaimed for" in a for a in status["alerts"]), "backed off on purpose")
         self.assertEqual(status["head"]["repair_stall"]["checkpoints"], 3)
         # Backed off: the same code is not offered the task for 30 minutes, then 60, ...
@@ -1178,7 +1169,7 @@ class StalledRepair(QueueFixture):
             self.checkpoint()
         self.tick()
         self.assertEqual(len(target.messages), 1)
-        self.assertIn("The agent's own conclusion", target.messages[0])
+        self.assertNotIn("The agent's own conclusion", target.messages[0])
         self.assertEqual(self.notifier.messages, [], "never the escalation direct messages")
 
     def test_turning_the_head_alert_off_clears_an_active_one(self):

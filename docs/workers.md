@@ -139,6 +139,13 @@ PR the fleet fixes, such as a contributor's, stays open, and the host stops offe
 fix rounds. The count is per host, so a PR fixed on several hosts can take more rounds
 before it closes.
 
+A review that errors without completing a review (the engine cannot produce one) is
+retried with a back-off: an hour after the first error, doubling after each further one.
+After 6 errors on a host, the next worker there closes the PR if the fleet maintains it,
+with a comment that quotes the allow-listed failure categories, keeps the branch and
+offers the `keep` label. Any other PR just gets no more review rounds from that host. A
+completed review resets the count. No tracking issue is filed.
+
 While GitHub is rejecting the account's comments and the host's publication pacer is
 backing off, a both-source worker offers GitHub reviews after all its other work,
 including review-first workers. A review started then would finish its model work and
