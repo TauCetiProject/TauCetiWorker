@@ -17,8 +17,11 @@ mechanism is shaped the way it is.
    truncated on the way to the model, a pass means nothing. Defence: the Worker itself
    sends one Messages API request holding the whole bundle (`request.json`, digest in
    `execution.json`). The API reads all of it or rejects it ("prompt is too long"); it
-   never truncates silently. A rejected request is split, or held if one commit is too
-   large.
+   never truncates silently. A rejected range of several commits is split by commits,
+   and a single commit over the token budget is reviewed in parts (below).
+3. **A weak reviewer.** Missing a planted construct, or raising non-concerns, both make
+   the audit worse. The reviewers are chosen by measurement (below), and the Worker
+   supplies attribute provenance itself so a model never has to vouch for it.
 
 ## Single commits beyond the batch target
 
@@ -32,11 +35,50 @@ it); the complete after images
 are exactly what is built, and the diffs show every line added or changed. Removed code
 cannot run. The Worker still computes attribute provenance from the complete input, and
 `input.json` and its digest stay complete. The request is about half the size (about
-600k tokens for both commits above). A commit still too large is held for a human as
-before. Introducing this was judgment protocol 8.
-3. **A weak reviewer.** Missing a planted construct, or raising non-concerns, both make
-   the audit worse. The reviewers are chosen by measurement (below), and the Worker
-   supplies attribute provenance itself so a model never has to vouch for it.
+600k tokens for both commits above). Introducing this was judgment protocol 8.
+
+## Commits reviewed in parts
+
+A commit whose request is still over the token budget (850k input tokens, leaving room in
+the 1M context) is reviewed in parts instead of being held. The Worker counts the request's
+tokens with the API's free count first; a request within the budget by UTF-8 bytes needs no
+count, since every token is at least one byte.
+
+- **Parts are whole files**, packed in path order so that each part's request is within the
+  budget by bytes. A file too large for any part alone is split by diff hunks: each piece
+  holds the file's diff header, some consecutive hunks, the file's first 100 lines (imports,
+  options, `open`s) and, when they fit, 100 after-image lines on each side of each hunk. The
+  Worker checks that the parts carry every file exactly once, or every hunk of it exactly once.
+- **Every part carries the same commit-wide context**, extracted by the Worker from the after
+  images of every changed file: the changed paths with their line counts, and every line that
+  could define, register or run code (macro, notation, syntax, elaborator, `initialize`,
+  `set_option`, `attribute`, `export`, `opaque`/`axiom`, `unsafe`/`partial`/`meta`, IO and
+  environment names, `implemented_by`/`extern`, `native_decide`, any `#` command other than
+  read-only ones such as `#check`, and any attribute the baseline does not define or the policy
+  flags), with 20 lines around each (narrowed to 3, then 0, if the context would exceed 150 KB).
+  Removed lines are not context: they cannot run, and they stay in their own file's diff.
+- **The reviewer of each part is told** that names defined anywhere in the commit are new code,
+  not of trusted origin, and to judge a use in its part with the definition shown in the
+  context, and a definition in its part with the uses shown there. So a macro defined in one
+  part and used in another reaches the second part's reviewer with its definition, and the
+  attribute provenance is still computed from the whole commit.
+- **The commit passes only if every part passes.** Each part is triaged by Haiku and, on a
+  concern, escalated alone to Sonnet; any part's binding finding binds the commit and ends the
+  inspection. The plan (`parts.json`, written before any request) names every part, each part's
+  stages live in its own `part-NNNN/` directory of the attempt, and `execution.json` lists every
+  stage with its part. A pass needs a valid pass in every planned part; a part directory the plan
+  does not name, or a plan that cannot be read, holds the commit like any unreadable evidence.
+
+What this gives up: a part's reviewer reads its own files completely but the rest of the commit
+only through the extracted context. Every construct the policy flags, and every definition of a
+macro, notation, syntax, elaborator, attribute or option, is in the context of every part, so
+each is seen in full by the reviewer holding its file and as context by every other. A plain
+`def` is not context: it cannot run at build time unless something the context shows runs it.
+
+Only a single hunk too large for a part even without its surrounding lines, or commit-wide
+context over 150 KB even with no surrounding lines, still holds for a human. This is part of
+judgment protocol 8: it changes no judgment of a range already inspected, since such commits were
+held before.
 
 ## What it does not defend against
 

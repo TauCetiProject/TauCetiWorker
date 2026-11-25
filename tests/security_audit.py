@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1061,6 +1062,249 @@ class Authority(unittest.TestCase):
             patch.object(sa, "api", side_effect=response),
         ):
             sa.setup(Path(tmp))
+
+
+class Parts(unittest.TestCase):
+    """A single commit over the token budget is reviewed in parts that share commit-wide context."""
+
+    command = History.command
+    commit = History.commit
+    BUDGET = 60_000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / ".git"
+        self.command("init", "-q", "-b", "main")
+        self.body = "".join(f"theorem t{i} : {i} = {i} := rfl\n" for i in range(600))  # About 17 KB.
+        for name in "ABCDEF":
+            (self.root / f"TauCeti/{name}.lean").parent.mkdir(parents=True, exist_ok=True)
+            (self.root / f"TauCeti/{name}.lean").write_text(self.body)
+        self.command("add", ".")
+        self.command("commit", "-qm", "base")
+        self.base = self.command("rev-parse", "HEAD")
+        self.key = self.root / "key"
+        self.key.write_text("k")
+        self.key.chmod(0o600)
+        for name, value in (("BUDGET_TOKENS", self.BUDGET), ("CONTEXT_BYTES", 20_000)):
+            patcher = patch.object(sa, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def wide(self, edits: dict[str, str]) -> dict:
+        """One commit appending each edit to its file (every file gets an ordinary theorem)."""
+        for name in "ABCDEF":
+            extra = edits.get(name, f"theorem {name.lower()}New : True := trivial\n")
+            (self.root / f"TauCeti/{name}.lean").write_text(self.body + extra)
+        self.command("add", ".")
+        self.command("commit", "-qm", "wide")
+        head = self.command("rev-parse", "HEAD")
+        return sa.build_batch(self.repo, self.base, head, [head])
+
+    MACRO = 'macro "trust_me" : tactic => `(tactic| trivial)\n'
+    EVAL = '#eval IO.println "hello"\n'
+
+    def inspect(self, batch, answer, *, escalate=False):
+        """Run inspect; `answer(model, user_content)` returns each judgment. Returns (result, calls, attempt)."""
+        calls = []
+
+        def reviewer(request, key):
+            user = request["messages"][0]["content"]
+            calls.append((request["model"], user))
+            text = json.dumps(answer(request["model"], user))
+            return {"content": [{"type": "text", "text": text}], "stop_reason": "end_turn"}
+
+        attempt = self.root / "state" / f"attempt-{time.time_ns()}"
+        attempt.mkdir(parents=True)
+        with (
+            patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(self.key)}),
+            patch.object(sa, "count_tokens", side_effect=lambda request, key: sa.request_size(request)),
+            patch.object(sa, "call_reviewer", side_effect=reviewer),
+        ):
+            try:
+                result = sa.inspect(batch, attempt, escalate=escalate)
+            except Exception as exc:  # noqa: BLE001
+                result = exc
+        return result, calls, attempt
+
+    @staticmethod
+    def bundle_paths(user: str) -> set[str]:
+        bundle = json.loads(user.split("\nBundle:\n", 1)[1])
+        return {f["path"] for f in bundle["commits"][0]["files"]}
+
+    def test_an_over_budget_commit_is_split_into_parts_of_whole_files_with_the_same_context(self):
+        batch = self.wide({"B": self.MACRO, "E": "example : True := by trust_me\n", "F": self.EVAL})
+        self.assertGreater(sa.request_size(sa.judgment_request(batch, sa.TRIAGE_MODEL)), self.BUDGET)
+        parts = sa.plan_parts(batch)
+        self.assertGreater(len(parts), 2)
+        placed = [u["path"] for p in parts for u in p["units"]]
+        self.assertEqual(placed, [f["path"] for f in batch["commits"][0]["files"]])  # Each exactly once, in order.
+        for p in parts:
+            self.assertLessEqual(sa.request_size(sa.part_request(batch, p, sa.TRIAGE_MODEL)), self.BUDGET)
+            self.assertTrue(all(set(u) == {"path", "after", "diff"} for u in p["units"]))
+            self.assertEqual(p["context"], parts[0]["context"])
+        # The context shows the macro and the #eval to every part, wherever they are defined or used.
+        context = sa.serialize(parts[0]["context"])
+        self.assertIn("trust_me", context)
+        self.assertIn("#eval IO.println", context)
+        self.assertNotIn("theorem t300", context)
+        changed = parts[0]["context"]["changed_files"]
+        self.assertEqual([c["path"] for c in changed], [f"TauCeti/{n}.lean" for n in "ABCDEF"])
+        self.assertEqual({(c["added"], c["removed"]) for c in changed}, {(1, 0)})
+
+        result, calls, attempt = self.inspect(batch, lambda model, user: {"verdict": "pass", "findings": []})
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(result["input_digest"], batch["input_digest"])
+        self.assertEqual([m for m, _ in calls], [sa.TRIAGE_MODEL] * len(parts))
+        holding_e = next(user for _, user in calls if "TauCeti/E.lean" in self.bundle_paths(user))
+        self.assertNotIn("TauCeti/B.lean", self.bundle_paths(holding_e))
+        self.assertIn(self.MACRO.strip().replace('"', '\\"'), holding_e)  # The definition from another part.
+        self.assertIn(f"this is part {parts[0]['index']}", calls[0][1])
+        plan = json.loads((attempt / sa.PLANS).read_text())
+        self.assertEqual(len(plan["parts"]), len(parts))
+        self.assertEqual(audit_evidence.classify(attempt.parent, attempt, batch).kind, audit_evidence.PASS)
+        stages = json.loads((attempt / "execution.json").read_text())["stages"]
+        self.assertEqual([s["part"] for s in stages], [p["dir"] for p in plan["parts"]])
+
+    def test_a_finding_in_one_part_fails_the_commit(self):
+        batch = self.wide({"B": self.MACRO, "F": self.EVAL})
+
+        def answer(model, user):
+            if "TauCeti/F.lean" in self.bundle_paths(user):
+                return {"verdict": "finding", "findings": ["TauCeti/F.lean: #eval runs IO"]}
+            return {"verdict": "pass", "findings": []}
+
+        result, calls, attempt = self.inspect(batch, answer)
+        self.assertEqual(result["verdict"], "finding")
+        self.assertEqual(result["findings"], ["TauCeti/F.lean: #eval runs IO"])
+        self.assertEqual(result["commits"], [batch["commits"][0]["sha"]])
+        # Only the part holding F escalated, and its finding ended the inspection.
+        self.assertEqual([m for m, _ in calls].count(sa.ESCALATION_MODEL), 1)
+        self.assertEqual(calls[-1][0], sa.ESCALATION_MODEL)
+        self.assertIn("TauCeti/F.lean", self.bundle_paths(calls[-1][1]))
+        self.assertTrue(audit_evidence.escalated(attempt))
+        self.assertEqual(audit_evidence.classify(attempt.parent, attempt, batch).kind, audit_evidence.FINDING)
+        record = sa.review_record("admin", batch, attempt, result)
+        self.assertEqual(record["model"], sa.ESCALATION_MODEL)
+        self.assertTrue(record["triage"]["judgments"])
+
+    def test_a_triage_concern_in_one_part_escalates_only_that_part(self):
+        batch = self.wide({"C": "set_option maxHeartbeats 400000 in\ntheorem c : True := trivial\n"})
+
+        def answer(model, user):
+            if model == sa.TRIAGE_MODEL and "TauCeti/C.lean" in self.bundle_paths(user):
+                return {"verdict": "finding", "findings": ["set_option"]}
+            return {"verdict": "pass", "findings": []}
+
+        result, calls, attempt = self.inspect(batch, answer)
+        self.assertEqual(result["verdict"], "pass")
+        models = [m for m, _ in calls]
+        self.assertEqual(models.count(sa.ESCALATION_MODEL), 1)
+        self.assertEqual(models.count(sa.TRIAGE_MODEL), len(json.loads((attempt / sa.PLANS).read_text())["parts"]))
+        # A retry after a triage concern never asks the triage reviewer again, for any part.
+        _, calls, _ = self.inspect(batch, answer, escalate=True)
+        self.assertEqual({m for m, _ in calls}, {sa.ESCALATION_MODEL})
+
+    def test_a_pass_needs_every_planned_part(self):
+        batch = self.wide({})
+        result, _, attempt = self.inspect(batch, lambda model, user: {"verdict": "pass", "findings": []})
+        self.assertEqual(result["verdict"], "pass")
+        plan = json.loads((attempt / sa.PLANS).read_text())
+        last = attempt / plan["parts"][-1]["dir"] / "response.json"
+        answer = last.read_text()
+        last.unlink()
+        self.assertEqual(audit_evidence.classify(attempt.parent, attempt, batch).kind, audit_evidence.NOT_JUDGED)
+        last.write_text(answer)
+        (attempt / "part-9999").mkdir()  # Evidence the plan does not account for.
+        self.assertEqual(audit_evidence.classify(attempt.parent, attempt, batch).kind, audit_evidence.UNREADABLE)
+        (attempt / "part-9999").rmdir()
+        (attempt / sa.PLANS).write_text("{")
+        self.assertEqual(audit_evidence.classify(attempt.parent, attempt, batch).kind, audit_evidence.UNREADABLE)
+
+    def test_a_commit_that_fits_once_counted_is_one_request(self):
+        batch = self.wide({})
+        with patch.object(sa, "BUDGET_TOKENS", sa.request_size(sa.judgment_request(batch, sa.TRIAGE_MODEL)) - 1):
+            with (
+                patch.dict(os.environ, {sa.API_KEY_FILE_ENV: str(self.key)}),
+                patch.object(sa, "count_tokens", return_value=1000) as count,
+            ):
+                self.assertIsNone(sa.parts_needed(batch, sa.TRIAGE_MODEL, "k"))
+            count.assert_called_once()
+        with patch.object(sa, "count_tokens") as count:
+            small = sa.build_batch(self.repo, self.base, batch["commits"][0]["sha"], [batch["commits"][0]["sha"]])
+            with patch.object(sa, "BUDGET_TOKENS", 10**7):
+                self.assertIsNone(sa.parts_needed(small, sa.TRIAGE_MODEL, "k"))
+            count.assert_not_called()  # Within the budget by bytes: no count.
+        with patch.object(sa, "count_tokens", side_effect=RuntimeError("overloaded")):
+            with self.assertRaises(sa.NotJudged):
+                sa.parts_needed(batch, sa.TRIAGE_MODEL, "k")
+
+    def test_a_file_too_large_alone_is_split_by_hunks_and_a_hunk_too_large_holds(self):
+        lines = [f"theorem t{i} : {i} = {i} := rfl" for i in range(6000)]  # About 190 KB.
+        (self.root / "TauCeti/Big.lean").write_text("import TauCeti.A\n" + "\n".join(lines) + "\n")
+        self.command("add", ".")
+        self.command("commit", "-qm", "big")
+        base = self.command("rev-parse", "HEAD")
+        for i in range(100, 6000, 400):
+            lines[i] = f"theorem t{i} : {i} = {i} := by rfl"
+        (self.root / "TauCeti/Big.lean").write_text("import TauCeti.A\n" + "\n".join(lines) + "\n")
+        self.command("add", ".")
+        self.command("commit", "-qm", "many hunks")
+        head = self.command("rev-parse", "HEAD")
+        batch = sa.build_batch(self.repo, base, head, [head])
+        parts = sa.plan_parts(batch)
+        units = [u for p in parts for u in p["units"]]
+        self.assertGreater(len(units), 1)
+        self.assertTrue(all(u["path"] == "TauCeti/Big.lean" and "hunks" in u for u in units))
+        for u in units:
+            self.assertTrue(u["diff"].startswith("diff --git a/TauCeti/Big.lean b/TauCeti/Big.lean\n"))
+            self.assertEqual(u["after_excerpts"][0]["from_line"], 1)  # The file's first lines.
+            self.assertIn("import TauCeti.A", u["after_excerpts"][0]["text"])
+        diff = batch["commits"][0]["files"][0]["diff"]
+        self.assertEqual(sum(u["diff"].count("\n@@ ") for u in units), diff.count("\n@@ "))
+        sa.covered(batch["commits"][0], parts)
+        dropped = [dict(p, units=p["units"][1:] if i == 0 else p["units"]) for i, p in enumerate(parts)]
+        with self.assertRaises(Die):
+            sa.covered(batch["commits"][0], dropped)  # A missing hunk is never sent as a pass.
+        # One added block too large for any part holds the commit for a human.
+        (self.root / "TauCeti/Huge.lean").write_text("theorem huge : True := trivial\n" * 3000)
+        self.command("add", ".")
+        self.command("commit", "-qm", "huge")
+        huge = self.command("rev-parse", "HEAD")
+        with self.assertRaises(sa.Unreadable):
+            sa.plan_parts(sa.build_batch(self.repo, head, huge, [huge]))
+
+    def test_context_shows_definitions_registrations_and_execution_but_not_mathematics(self):
+        text = "\n".join(
+            [
+                "/-! ## Notation",
+                "The macro below is notation for a partial derivative. -/",
+                "@[simp] theorem ordinary : True := trivial",
+                'local notation "‖" x "‖" => norm x',
+                'syntax (name := mine) "mine" : attr',
+                "@[mine] theorem uses_local_attribute : True := trivial",
+                "@[implemented_by fast] def slow := 1",
+                "initialize registerTraceClass `x",
+                "set_option maxHeartbeats 0 in",
+                "run_cmd pure ()",
+                'elab "go" : tactic => pure ()',
+                "attribute [local instance] foo",
+                "def p : IO Unit := pure ()",
+                "theorem q : True := by native_decide",
+                "#check ordinary",
+                "#exit",
+                "public meta def m := 1",
+                "partial def loop : Nat → Nat := loop",
+            ]
+        )
+        commit = {"files": [{"path": "TauCeti/X.lean", "after": text, "diff": ""}]}
+        lines = [x["text"] for x in sa.commit_context(commit, 0)]
+        self.assertEqual(lines, ["\n".join(text.split("\n")[3:14]), "\n".join(text.split("\n")[15:18])])
+        wide = sa.commit_context(commit, 1)
+        self.assertEqual([(x["from_line"], x["to_line"]) for x in wide], [(3, 18)])
+        deleted = {"files": [{"path": "TauCeti/Y.lean", "after": None, "diff": "-run_cmd pure ()\n"}]}
+        self.assertEqual(sa.commit_context(deleted, 20), [])
 
 
 class Run(unittest.TestCase):
