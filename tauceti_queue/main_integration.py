@@ -6,8 +6,11 @@ them (Forgejo PRs and self-tested GitHub PRs) were never built on a recent main.
 canonical commit, without pushing anything (TauCetiTools `docs/main-integration.md`):
 
 - **Candidates** are the members of open, unsealed, non-emergency, non-lane batches whose input has
-  no result younger than `main_integration_fresh_seconds` (GitHub sources only, for now). They are
-  ordered by batch (the next to seal first), then by the cheap static check (`stale_check.py`:
+  no result younger than `main_integration_fresh_seconds`, from GitHub and from Forgejo. A Forgejo
+  member's head is retained on GitHub at admission, and its dispatch names `source` `forgejo`, so
+  the build never reads the same-numbered GitHub PR. A head whose Forgejo PR build is in flight
+  (`forgejo_pr_build.py`) waits for it: both report the head's one `main-integration` status. They
+  are ordered by batch (the next to seal first), then by the cheap static check (`stale_check.py`:
   flagged first), then by the age of their base (oldest first). At most
   `main_integration_max_in_flight` builds are outstanding; CI itself runs one only on idle Fleet PR
   capacity, and otherwise reports it deferred. After a deferral nothing new is asked for
@@ -36,7 +39,8 @@ import secrets
 import time
 from typing import Any
 
-from . import chain, ports, stale_check
+from . import chain, forgejo_pr_build, ports, stale_check
+from .mixed_identity import SourceNumber
 from .store import dumps, loads
 
 PENDING, DEFERRED, SUCCESS, FAILURE, ERROR, EXPIRED = "pending", "deferred", "success", "failure", "error", "expired"
@@ -105,7 +109,6 @@ def _candidates(ctl) -> list[tuple[dict[str, Any], dict[str, Any], dict[str, Any
                 row is None
                 or row["state"] != "inserted"
                 or row["batch_id"] != batch["id"]
-                or row["source_identity"]
                 or row["head_sha"] != member["accepted_head"]
             ):
                 continue
@@ -143,7 +146,10 @@ def _observe(ctl, now: float) -> None:
         if record.get("state") != PENDING:
             continue
         status = statuses.get(fresh["head_sha"])
-        if _answers(status, record):
+        trusted = (
+            set(ctl.setting("forgejo_pr_build_status_creators")) if isinstance(fresh["number"], SourceNumber) else None
+        )
+        if _answers(status, record, trusted):
             _settle(ctl, fresh, record, status, now)
         elif now - record.get("dispatched_at", now) > timeout:
             record.update(state=EXPIRED, observed_at=now, expired=record.get("expired", 0) + 1)
@@ -152,12 +158,19 @@ def _observe(ctl, now: float) -> None:
                 ctl.store.journal(now, "main-integration-expired", fresh["batch_id"], number=fresh["number"])
 
 
-def _answers(status: ports.Status | None, record: dict[str, Any]) -> bool:
-    """The status is this request's: it names the main asked for and was posted after the dispatch."""
+def _answers(status: ports.Status | None, record: dict[str, Any], trusted: set[str] | None = None) -> bool:
+    """The status is this request's: it names the main asked for and was posted after the dispatch.
+
+    With `trusted` (a Forgejo member's request), a verdict counts only from those accounts, and a
+    deferral also from the workflow's own token, which the picker posts it with."""
     if status is None or status.state not in (SUCCESS, FAILURE, ERROR):
         return False
     if not status.description.startswith(f"B={record.get('main', '')[:12]}"):
         return False
+    if trusted is not None:
+        deferral = status.state == ERROR and "deferred" in status.description
+        if status.creator not in trusted and not (deferral and status.creator == "github-actions"):
+            return False
     # A run already counted (the first red result, read again while its confirmation is queued)
     # never answers a later request.
     if status.target_url and status.target_url in record.get("runs", []):
@@ -361,7 +374,12 @@ def _dispatch(ctl, candidates, now: float) -> None:
     if budget <= 0 or not main:
         return
     fresh = ctl.setting("main_integration_fresh_seconds")
-    due = [(batch, member, row) for batch, member, row in candidates if _due(record_of(row), now, fresh)]
+    building = forgejo_pr_build.building_heads(ctl)
+    due = [
+        (batch, member, row)
+        for batch, member, row in candidates
+        if _due(record_of(row), now, fresh) and row["head_sha"] not in building and _on_github(ctl, row)
+    ]
     if not due:
         return
     _check(ctl, due, main, now)
@@ -385,7 +403,11 @@ def _dispatch(ctl, candidates, now: float) -> None:
         try:
             with ctl._lock.unlocked():
                 ctl.execution.dispatch_main_integration(
-                    ctl.repository, pr=int(row["number"]), head_sha=row["head_sha"], main_sha=main
+                    ctl.repository,
+                    pr=int(row["number"]),
+                    head_sha=row["head_sha"],
+                    main_sha=main,
+                    **({"source": "forgejo"} if isinstance(row["number"], SourceNumber) else {}),
                 )
         except Exception as error:  # noqa: BLE001 - the next pass tries again
             ctl._reasons.append(f"main-integration dispatch of {row['number']} not accepted: {error}")
@@ -399,6 +421,15 @@ def _dispatch(ctl, candidates, now: float) -> None:
             ctl.store.journal(
                 now, "main-integration-dispatched", batch["id"], number=row["number"], head=row["head_sha"], main=main
             )
+
+
+def _on_github(ctl, row: dict[str, Any]) -> bool:
+    """A Forgejo member's head is on GitHub only once admission's push of it is done; a GitHub
+    member's head is its PR's own."""
+    if not isinstance(row["number"], SourceNumber):
+        return True
+    entry = ctl.store.row("outbox", {"key": f"retain:{row['retained_ref']}:{row['head_sha']}"})
+    return entry is not None and entry["state"] == "done"
 
 
 def _check(ctl, due, main: str, now: float) -> None:

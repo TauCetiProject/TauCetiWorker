@@ -17,6 +17,7 @@ from tauceti_tools.forge import Forge, RepositoryRef  # noqa: E402
 from tauceti_queue import forgejo_pr_build  # noqa: E402
 from tauceti_queue.mixed_native import MixedNativeSource  # noqa: E402
 from tauceti_queue.mixed_sources import AdmissionInputs, NativePoller  # noqa: E402
+from tauceti_queue.ports import Status  # noqa: E402
 from tauceti_queue.store import loads  # noqa: E402
 
 
@@ -313,6 +314,77 @@ class ForgejoPRBuild(MixedFixture, unittest.TestCase):
         self.post(head, "success")
         self.cycle()
         self.assertEqual(loads(self.row(head)["runs"]), ["https://github.com/run/1"])
+
+
+class ForgejoMembersOnMain(MixedFixture, unittest.TestCase):
+    """The main-integration backfill (decision 208 E) builds queued Forgejo members too."""
+
+    def setUp(self):
+        super().setUp()
+        self.registry_ = self.registry()
+        self.poller = self.registry_.poller = NativePoller(self.registry_, self.controller)
+        self.controller.admission = AdmissionInputs(None, self.poller)
+        self.controller.set_setting("publication_enabled", True, "test")
+        # Forgejo PR 1 heads the queue, so PR 2 waits in the open batch behind it.
+        self.native.create_pr(1, {"TauCeti/A.lean": "theorem a : True := trivial\n"})
+        self.poller.run_once()
+        self.controller.tick()
+        self.native_head = self.native.create_pr(2, {"TauCeti/F.lean": "theorem f : True := trivial\n"})
+        self.clock.advance(self.registry_.poll_seconds + 1)
+        self.poller._discovery_at = 0
+        self.poller.run_once()
+        self.controller.tick()
+        member = self.controller.input_for(self.native_id.repository.key, 2)
+        self.assertEqual(member["state"], "inserted")
+        self.assertFalse(self.controller.store.row("batches", {"id": member["batch_id"]})["sealed"])
+        self.controller.set_setting("main_integration_interval_seconds", 0, "test")
+        self.controller.set_setting("main_integration_enabled", True, "test")
+
+    def test_a_forgejo_member_is_dispatched_with_its_source(self):
+        self.controller.tick()
+        requests = list(zip(self.github.main_integration_requests, self.github.main_integration_options, strict=True))
+        self.assertEqual(
+            requests, [((2, self.native_head, self.controller._canonical), {"source": "forgejo", "priority": "idle"})]
+        )
+
+    def test_a_member_waits_until_its_head_is_on_github(self):
+        row = self.controller.input_for(self.native_id.repository.key, 2)
+        key = f"retain:{row['retained_ref']}:{row['head_sha']}"
+        self.controller.store.update("outbox", {"key": key}, state="pending")
+        from tauceti_queue import main_integration
+
+        self.assertFalse(main_integration._on_github(self.controller, row))
+        self.controller.store.update("outbox", {"key": key}, state="done")
+        self.assertTrue(main_integration._on_github(self.controller, row))
+
+    def test_a_forgejo_members_verdict_counts_only_from_the_ci_app(self):
+        from tauceti_queue import main_integration
+
+        self.controller.tick()
+        record = main_integration.record_of(self.controller.input_for(self.native_id.repository.key, 2))
+        main = record["main"]
+        trusted = {"tauceti-live-ci"}
+        for creator, state, description, counts in (
+            ("kim-em", "failure", "failed", False),
+            ("github-actions", "failure", "failed", False),
+            ("github-actions", "error", "deferred: Fleet PR pool busy", True),
+            ("tauceti-live-ci", "failure", "failed", True),
+        ):
+            with self.subTest(creator=creator, state=state):
+                status = Status(state, f"B={main[:12]} {description}", "", record["dispatched_at"], None, creator)
+                self.assertIs(main_integration._answers(status, record, trusted), counts)
+
+    def test_a_head_with_a_pending_pr_build_waits_for_it(self):
+        self.controller.store.insert(
+            "pr_builds",
+            source=self.native_id.repository.key,
+            number=2,
+            head_sha=self.native_head,
+            state="pending",
+            main_sha=self.controller._canonical,
+        )
+        self.controller.tick()
+        self.assertEqual(self.github.main_integration_requests, [])
 
 
 class PublisherStatus(unittest.TestCase):
