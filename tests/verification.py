@@ -342,6 +342,39 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "incomplete")
         self.assertIn("mutat", result["error"])
 
+    def test_source_watch_backs_off_by_its_own_cost_and_the_final_watch_always_runs(self):
+        from tauceti_worker import verification
+
+        clock = [1000.0]
+        calls = []
+
+        def slow_stamps(paths):
+            calls.append(clock[0])
+            clock[0] += 1.0  # One watch costs a second, as on a 41,000-file checkout.
+            return dict(paths)
+
+        v = Verification(self.root, self.state, stage="build")
+        v.watched, v.watch_names = {"A.lean": 1}, {"A.lean"}
+        with (
+            patch.object(verification.time, "monotonic", lambda: clock[0]),
+            patch.object(verification, "stamps", slow_stamps),
+            patch.object(verification, "source_names", lambda root, base: {"A.lean"}),
+        ):
+            for _ in range(600):  # 150 s of the phase loop's polls: 50 watches at the old 2 s.
+                v.watch()
+                clock[0] += verification.POLL_S
+            self.assertLessEqual(len(calls), 600 / (verification.WATCH_DUTY * 4) + 1)
+            self.assertGreaterEqual(len(calls), 600 / (verification.WATCH_MAX_S * 4))
+            self.assertEqual(v.watch_interval, verification.WATCH_DUTY * 1.0)
+            before = len(calls)
+            v.watch()
+            self.assertEqual(len(calls), before, "a watch right after one waits out its backoff")
+            changed = lambda paths: {"A.lean": 2}  # noqa: E731 - a source edited since the snapshot
+            with patch.object(verification, "stamps", changed), patch.object(v.installations, "validate"):
+                v.watch()  # Still backing off: an edit is caught at the next watch or the final one.
+                with self.assertRaisesRegex(verification.Incomplete, "mutated"):
+                    v.final_watch()
+
     def test_proofwidgets_generated_digest_does_not_invalidate_success(self):
         write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json", "source lockfile")
         os.environ["FIXTURE_MODE"] = "widget-generated-hash"
