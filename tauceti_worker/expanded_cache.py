@@ -285,16 +285,84 @@ def entries(download, manifest=None):
             yield key, data
 
 
-def private_mapping(private, key, known):
+class Remembered:
+    """Parsed JSON files remembered between rounds by inode, size and mtime.
+
+    Preparation reads tens of thousands of small metadata files each round (this worker's private
+    mappings, the pool's `entry.json` files), and almost all are unchanged since its last round. A
+    remembered value is used only while the file's `(dev, ino, size, mtime_ns)` is exactly what it
+    was when read, so a replaced file (a new inode) or one rewritten in place (a new mtime) is read
+    again. A file modified within `RACY` seconds of being read is not remembered: a same-size
+    rewrite inside one timestamp tick would otherwise look unchanged. Stored in the private store,
+    which only this worker writes and which retention deletes as a whole.
+
+    `replaced_only` files (a pool `entry.json`) are only ever replaced by a rename, never rewritten,
+    and hydration moves their mtime as the pool's reuse clock: for them the mtime is left out.
+    """
+
+    RACY = 2.0
+    NAME = "tauceti-json-index.json"
+
+    def __init__(self, private):
+        self.path = Path(private) / self.NAME
+        self.rows = {}
+        self.used = {}
+        self.read_count = 0
+        try:
+            with open(self.path) as stream:
+                rows = json.load(stream)
+            if isinstance(rows, dict):
+                self.rows = rows
+        except (OSError, ValueError):
+            pass
+
+    def read(self, path, *, replaced_only=False):
+        key = str(path)
+        try:
+            info = os.stat(path)
+        except FileNotFoundError:
+            self.used.pop(key, None)
+            return {}
+        fingerprint = [info.st_dev, info.st_ino, info.st_size] + ([] if replaced_only else [info.st_mtime_ns])
+        row = self.rows.get(key)
+        if isinstance(row, list) and len(row) == 2 and row[0] == fingerprint and isinstance(row[1], dict):
+            self.used[key] = row
+            return row[1]
+        self.read_count += 1
+        value = read_json(path)
+        if (replaced_only or time.time() - info.st_mtime > self.RACY) and value:
+            self.used[key] = [fingerprint, value]
+        else:
+            self.used.pop(key, None)
+        return value
+
+    def save(self):
+        """Keep what this round used: a key nothing names any more ages out."""
+        with contextlib.suppress(OSError):
+            atomic_json(self.path, self.used)
+
+
+def private_mapping(private, key, known, remembered=None):
     if key not in known:
-        known[key] = read_json(private / "outputs/TauCeti" / (key + ".json"))
+        path = private / "outputs/TauCeti" / (key + ".json")
+        known[key] = read_json(path) if remembered is None else remembered.read(path)
     return known[key]
 
 
 def hydrate(
-    entry, private, input_hash, *, private_mappings=None, report=None, guard=None, refused=None, ci_outputs=None
+    entry,
+    private,
+    input_hash,
+    *,
+    private_mappings=None,
+    report=None,
+    guard=None,
+    refused=None,
+    ci_outputs=None,
+    remembered=None,
 ):
-    row = read_json(entry / "entry.json")
+    path = entry / "entry.json"
+    row = read_json(path) if remembered is None else remembered.read(path, replaced_only=True)
     names = list(dict.fromkeys(descriptions(row["data"])))
     try:
         if not all(stat.S_ISREG((entry / name).lstat().st_mode) for name in names):
@@ -304,7 +372,7 @@ def hydrate(
     desired = dict(schemaVersion=SCHEMA, service=None, data=row["data"])
     keys = input_hash if isinstance(input_hash, list) else [input_hash]
     known = {} if private_mappings is None else private_mappings
-    changed = [key for key in keys if private_mapping(private, key, known) != desired]
+    changed = [key for key in keys if private_mapping(private, key, known, remembered) != desired]
     from .canonical_store import Guard, fingerprint, rejected
 
     guard = Guard() if guard is None else guard
@@ -428,7 +496,18 @@ def named_archives(pool, cwd, env):
 
 
 def expand(
-    download, private, cwd, env, pool, report, *, manifest=None, private_mappings=None, deadline=None, ci_outputs=None
+    download,
+    private,
+    cwd,
+    env,
+    pool,
+    report,
+    *,
+    manifest=None,
+    private_mappings=None,
+    deadline=None,
+    ci_outputs=None,
+    remembered=None,
 ):
     """Expand and hydrate every selected archive, or raise: partial hydration is not a fallback.
 
@@ -466,6 +545,7 @@ def expand(
                     guard=guard,
                     refused=refused,
                     ci_outputs=ci_outputs,
+                    remembered=remembered,
                 )
                 report["hits"] += 1
 
@@ -603,6 +683,7 @@ def expand(
                         guard=guard,
                         refused=refused,
                         ci_outputs=ci_outputs,
+                        remembered=remembered,
                     )
                     report["expanded"] += 1
                     completed += 1
@@ -610,7 +691,7 @@ def expand(
         raise Unavailable(f"expanded {completed} of {len(pending)} selected archives")
 
 
-def transfer(download, private, seeded=(), *, manifest=None, private_mappings=None, guard=None):
+def transfer(download, private, seeded=(), *, manifest=None, private_mappings=None, guard=None, remembered=None):
     """Preserve downloads on unsupported toolchains, without linking mutable metadata."""
     manifest = mappings(download) if manifest is None else manifest
     known = {} if private_mappings is None else private_mappings
@@ -637,7 +718,7 @@ def transfer(download, private, seeded=(), *, manifest=None, private_mappings=No
                 shutil.copyfile(source, target)
                 continue
             key = source.stem if source.parent == download / "outputs/TauCeti" else None
-            before = private_mapping(private, key, known) if key in manifest else read_json(target)
+            before = private_mapping(private, key, known, remembered) if key in manifest else read_json(target)
             if directory == "outputs" and isinstance(before.get("data"), dict):
                 try:
                     descriptions(before["data"])
@@ -804,9 +885,17 @@ def preparation(cwd, env, *, refetch=None, report=None):
                 manifest = mappings(download)
                 report["mappings"] = len(manifest)
             private_mappings = {}
+            remembered = Remembered(private)
             try:
                 with measured(report, "transfer"):
-                    transfer(download, private, seeded, manifest=manifest, private_mappings=private_mappings)
+                    transfer(
+                        download,
+                        private,
+                        seeded,
+                        manifest=manifest,
+                        private_mappings=private_mappings,
+                        remembered=remembered,
+                    )
             except Exception as error:
                 if ready:
                     raise Unavailable(f"expanded cache transfer failed: {type(error).__name__}: {error}") from error
@@ -835,6 +924,7 @@ def preparation(cwd, env, *, refetch=None, report=None):
                                 private_mappings=private_mappings,
                                 deadline=deadline,
                                 ci_outputs=ci_outputs,
+                                remembered=remembered,
                             )
                     except CorruptArchive as error:
                         # A stale local .ltar must not poison every future round. Detach
@@ -854,7 +944,14 @@ def preparation(cwd, env, *, refetch=None, report=None):
                             manifest = mappings(download)
                             report["mappings"] = len(manifest)
                         with measured(report, "transfer"):
-                            transfer(download, private, seeded, manifest=manifest, private_mappings=private_mappings)
+                            transfer(
+                                download,
+                                private,
+                                seeded,
+                                manifest=manifest,
+                                private_mappings=private_mappings,
+                                remembered=remembered,
+                            )
                         with measured(report, "expand_hydrate"):
                             expand(
                                 download,
@@ -867,6 +964,7 @@ def preparation(cwd, env, *, refetch=None, report=None):
                                 private_mappings=private_mappings,
                                 deadline=deadline,
                                 ci_outputs=ci_outputs,
+                                remembered=remembered,
                             )
                     with measured(report, "ci_disagreeing"):
                         drop_disagreeing_traces(cwd, ci_outputs, report)
@@ -876,8 +974,12 @@ def preparation(cwd, env, *, refetch=None, report=None):
                     # Partial hydration would leave Lake unpacking private copies (case b).
                     raise Unavailable(f"expanded cache preparation failed: {type(error).__name__}: {error}") from error
                 finally:
+                    remembered.save()
+                    report["json_read"] = remembered.read_count
+                    report["json_remembered"] = len(remembered.used)
                     finish(pool, private, report, started, env, warm_env)
             else:
+                remembered.save()
                 finish(pool, private, report, started, env, warm_env)
 
 
