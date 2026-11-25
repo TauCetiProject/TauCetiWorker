@@ -339,6 +339,12 @@ def worker_survey(
             if numbers
             else [pr for pr in result.open_prs if result.covers(pr)]
         )
+    from . import forgejo_builds
+
+    # Forgejo PR CI (decision 215): the queue's trusted `build`, when this worker knows its publisher.
+    with_ci = forgejo_builds.enabled() and source.repository.forge.kind == "forgejo"
+    if with_ci and deep and set(stages) & {"review", "fix-ci"}:
+        result.open_prs = forgejo_builds.apply(cfg.state, source, result.open_prs)
     rs.observe(result.open_prs)
     from contextlib import nullcontext
     from dataclasses import replace
@@ -376,9 +382,10 @@ def worker_survey(
                 rs,
                 counters,
                 result,
-                enabled=set(stages) & {"review", "fix", "rebase"},
+                enabled=set(stages)
+                & ({"review", "fix", "rebase", "fix-ci"} if with_ci else {"review", "fix", "rebase"}),
                 deep=deep,
-                review_without_ci=True,
+                review_without_ci=not with_ci,
                 supports_external_repair=False,
                 pending=pending,
             )

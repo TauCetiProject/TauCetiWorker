@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -310,6 +311,20 @@ def _unavailable_server(failure):
     return failure.kind == "ForgeError" and (failure.status in (0, 408, 429) or failure.status >= 500)
 
 
+# The queue links a Forgejo `build` to its GitHub Actions run, and to nothing else.
+RUN_URL = re.compile(r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+(/job/[0-9]+)?")
+# How long workers on one host share a head's `build` read (`trusted_build`).
+TRUSTED_BUILD_TTL = 180
+
+
+def _posted_at(value):
+    """A Forgejo timestamp in whole epoch seconds; None when it is missing or malformed."""
+    try:
+        return int(datetime.fromisoformat(value).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
 def _updated(row):
     """A listed PR's update time in seconds; 0 when it has none."""
     try:
@@ -428,6 +443,64 @@ class ForgejoReadSource:
         except SourceBindingChanged:
             self._failure.value = ReadFailure("binding", 0, "SourceBindingChanged")
             return False
+
+    def trusted_build(self, number, head, trusted_ids):
+        """The newest `build` commit status on `head` posted by one of `trusted_ids`, or None when
+        the statuses cannot be read.
+
+        On Forgejo the merge queue's publisher posts `build` from its GitHub Actions PR build
+        (TauCeti decision 215). Anyone with code write can post a status, contributor fleets
+        included, so a `build` from any other account is ignored. The result is a dict with the
+        lowercased `state`, its `description`, run `url` and posting time `at` (epoch seconds),
+        or an empty dict when the head has no trusted `build`."""
+        import re
+
+        if type(number) is not int or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head or ""):
+            raise ValueError("a trusted build is read for one PR head")
+        trusted = sorted({int(actor) for actor in trusted_ids})
+
+        def fetch():
+            # Workers on one host share each head's answer for a few minutes; a pending build
+            # takes at least that long, so this coalesces without hiding a verdict for long.
+            if getattr(self, "shared_inventory", False) is True:
+                from .source_identity import advisory_scope
+
+                return transport.shared_read(
+                    [*advisory_scope(self, number), "trusted_build", head, trusted],
+                    read,
+                    ttl=TRUSTED_BUILD_TTL,
+                    identity=self.cache_namespace,
+                    lock_timeout=60,
+                )
+            return read()
+
+        def read():
+            newest = None
+            for row in self.api.statuses(self.repository, head):
+                if not isinstance(row, dict) or row.get("context") != "build":
+                    continue
+                creator = row.get("creator")
+                if not isinstance(creator, dict) or type(creator.get("id")) is not int or creator["id"] not in trusted:
+                    continue
+                if type(row.get("id")) is not int:
+                    continue
+                if newest is None or row["id"] > newest["id"]:
+                    newest = row
+            if newest is None:
+                return {}
+            state = str(newest.get("status") or newest.get("state") or "").lower()
+            if state not in {"pending", "success", "failure", "error"}:
+                return {}
+            url = newest.get("target_url") or ""
+            description = "".join(ch for ch in str(newest.get("description") or "") if ch.isprintable())
+            return {
+                "state": state,
+                "description": description[:200],
+                "url": url if isinstance(url, str) and RUN_URL.fullmatch(url) else "",
+                "at": _posted_at(newest.get("created_at")),
+            }
+
+        return self._read("trusted_build", [number, head, trusted], fetch, cacheable=False)
 
     def invalidate(self, number=None):
         if number is not None:
