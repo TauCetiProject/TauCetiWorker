@@ -79,19 +79,24 @@ class BatchPools(unittest.TestCase):
         root = cache.task_cache(self.worker, 1, 5)
         env = self.env(root)
         self.assertEqual(cache.pool_identity(env), {"scope": "batch", "batch_id": "5", "seeds": []})
-        cache.record_seed(env, "tauceti-repair", "a" * 40)
-        cache.record_seed(env, "tauceti-repair", "b" * 40)
-        cache.record_seed(env, "tauceti-repair", "a" * 40)
-        cache.record_seed(env, "tauceti-repair", "not-a-revision")
+        cache.record_seed(env, "tauceti-repair", "a" * 40, packages="seed")
+        cache.record_seed(env, "tauceti-repair", "b" * 40, packages="private")
+        cache.record_seed(env, "tauceti-repair", "a" * 40, packages="seed")
+        cache.record_seed(env, "mathlib", "", packages="private")
+        cache.record_seed(env, "tauceti-repair", "not-a-revision", packages="seed")
         self.assertEqual(
             cache.pool_identity(env)["seeds"],
-            [{"service": "tauceti-repair", "revision": "a" * 40}, {"service": "tauceti-repair", "revision": "b" * 40}],
+            [
+                {"service": "tauceti-repair", "revision": "a" * 40, "packages": "seed"},
+                {"service": "tauceti-repair", "revision": "b" * 40, "packages": "private"},
+                {"service": "mathlib", "revision": "", "packages": "private"},
+            ],
         )
         # The ledger is beside the pool, which the sandbox binds, not inside it.
         self.assertFalse((root / cache.SEEDS).is_relative_to(Path(env["LAKE_CACHE_DIR"])))
         shared = {"LAKE_CACHE_DIR": str(self.shared / "lake-cache")}
         self.assertEqual(cache.pool_identity(shared), {"scope": "shared"})
-        cache.record_seed(shared, "tauceti-repair", "a" * 40)
+        cache.record_seed(shared, "tauceti-repair", "a" * 40, packages="seed")
         self.assertFalse((self.shared / cache.SEEDS).exists())
         self.assertEqual(cache.pool_identity({}), {"scope": "none"})
 
@@ -101,29 +106,54 @@ class BatchPools(unittest.TestCase):
         outside.write_text("")
         (root / cache.SEEDS).symlink_to(outside)
         with self.assertRaises(OSError):
-            cache.record_seed(self.env(root), "tauceti-repair", "a" * 40)
+            cache.record_seed(self.env(root), "tauceti-repair", "a" * 40, packages="seed")
         self.assertEqual(cache.pool_identity(self.env(root))["scope"], "unknown")
 
-    def test_a_repair_cache_fetch_is_recorded_and_a_public_one_is_not(self):
-        from tauceti_queue import repair
+    def worktree(self, seeded):
+        from tauceti_queue import repair, repair_sandbox
+
+        tree = Path(self.temp.name) / ("seeded" if seeded else "private")
+        (tree / ".lake").mkdir(parents=True)
+        if seeded:
+            seed = Path(self.temp.name) / "seed/packages"
+            seed.mkdir(parents=True)
+            with patch.dict(os.environ, {repair_sandbox.READ_ONLY_VARIABLE: str(seed.parent)}):
+                repair.link_shared_packages(tree, seed)
+        return tree
+
+    def test_a_fetch_is_recorded_by_what_it_could_run_not_by_what_it_printed(self):
+        from tauceti_queue import repair, repair_sandbox
 
         root = cache.task_cache(self.worker, 1, 5)
         env = self.env(root)
-        repair._note_seed(env, {"service": repair.CACHE_SERVICE, "revision": "a" * 40, "mapping_found": True})
-        repair._note_seed(
-            env,
-            {
-                "service": "tauceti-repair",
-                "revision": "b" * 40,
-                "mapping_found": False,
-                "reason": "tauceti-repair: no published cache mapping for bbbbbbbbbbbb",
-            },
+        public = {"service": repair.CACHE_SERVICE, "revision": "a" * 40, "mapping_found": True}
+        missing = {
+            "service": "tauceti-repair",
+            "revision": "b" * 40,
+            "mapping_found": False,
+            "reason": "tauceti-repair: no published cache mapping for bbbbbbbbbbbb",
+        }
+        found = {"service": "tauceti-repair", "revision": "c" * 40, "mapping_found": True}
+        failed = {"service": "tauceti-repair", "revision": "d" * 40, "mapping_found": False, "reason": "exited 124"}
+        # With the read-only seed only Lake runs: a repair fetch that found nothing restored nothing.
+        seeded = self.worktree(seeded=True)
+        with patch.dict(os.environ, {repair_sandbox.READ_ONLY_VARIABLE: str(Path(self.temp.name) / "seed")}):
+            for fetch in (public, missing, found, failed):
+                repair._note_seed(env, fetch, seeded)
+        self.assertEqual(
+            [(s["revision"], s["packages"]) for s in cache.pool_identity(env)["seeds"]],
+            [("c" * 40, "seed"), ("d" * 40, "seed")],
         )
-        repair._note_seed(env, {"service": "tauceti-repair", "revision": "c" * 40, "mapping_found": True})
-        repair._note_seed(
-            env, {"service": "tauceti-repair", "revision": "d" * 40, "mapping_found": False, "reason": "exited 124"}
+        # With candidate-writable packages the fetch ran code candidate code may have written, which could
+        # fetch anything and print "not found": every fetch is recorded, public ones too.
+        private = self.worktree(seeded=False)
+        for fetch in (public, missing):
+            repair._note_seed(env, fetch, private)
+        repair.note_mathlib_fetch(env, private)
+        self.assertEqual(
+            [(s["revision"], s["packages"]) for s in cache.pool_identity(env)["seeds"][2:]],
+            [("a" * 40, "private"), ("b" * 40, "private"), ("", "private")],
         )
-        self.assertEqual([s["revision"] for s in cache.pool_identity(env)["seeds"]], ["c" * 40, "d" * 40])
 
     def test_collection_removes_a_finished_batchs_pool_only(self):
         landed = cache.task_cache(self.worker, 1, 5)
@@ -135,7 +165,9 @@ class BatchPools(unittest.TestCase):
         self.batch(6, "open")
         results = {r["root"]: r for r in cache.collect(self.database, [self.shared], apply=True)}
         self.assertEqual(results[str(landed)]["state"], "removed")
-        self.assertFalse(landed.exists())
+        self.assertEqual(sorted(p.name for p in landed.iterdir()), [cache.BATCH_MARKER, "cache-users", "cache.lock"])
+        again = {r["root"]: r for r in cache.collect(self.database, [self.shared], apply=True)}
+        self.assertEqual(again[str(landed)]["state"], "absent")
         self.assertEqual(results[str(open_)]["state"], "collected")
         self.assertTrue(open_.is_dir())
         self.assertEqual(results[str(unknown)]["state"], "unknown")
@@ -155,7 +187,8 @@ class BatchPools(unittest.TestCase):
             self.assertEqual(result["state"], "busy")
         result = next(r for r in cache.collect(self.database, [self.shared], apply=True) if r.get("batch_id") == 5)
         self.assertEqual(result["state"], "removed")
-        self.assertFalse(root.exists())
+        self.assertFalse((root / "lake-cache").exists())
+        self.assertEqual(cache.pool_batch(root), "5", "the marker stays with the lock")
 
     def test_the_verifier_drivers_build_without_any_pool(self):
         from tauceti_queue import repair_audit

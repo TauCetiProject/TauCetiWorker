@@ -1041,18 +1041,29 @@ def _fetch_mapping(
     return fetch
 
 
-def _note_seed(env: dict, fetch: dict) -> None:
-    """Record a repair-cache restore in the batch pool's seed ledger (``repair_cache.record_seed``). Any
-    service but the public one counts: only the public cache is written by trusted CI alone. Only a
-    fetch that found no mapping restored nothing; one that failed otherwise may have restored part of
-    one, so it is recorded too."""
-    if fetch.get("service") == CACHE_SERVICE or (
-        not fetch.get("mapping_found") and "no published cache mapping" in str(fetch.get("reason"))
-    ):
-        return
-    from tauceti_queue.repair_cache import record_seed
+def _note_seed(env: dict, fetch: dict, worktree: Path) -> None:
+    """Record an online fetch in the batch pool's seed ledger (``repair_cache.record_seed``).
 
-    record_seed(env, str(fetch["service"]), str(fetch["revision"]))
+    With candidate-writable packages every fetch is recorded, the public one included, since the fetch
+    loaded code candidate code may have written, which could fetch anything and print anything. With the
+    read-only seed only Lake itself runs and its output is the worker's to read: a repair-cache fetch is
+    recorded unless it found no mapping; a public one is not, since only trusted CI writes that cache."""
+    from tauceti_queue.repair_cache import record_seed, seeded_packages
+
+    packages = "seed" if seeded_packages(worktree, env) else "private"
+    if packages == "seed":
+        missing = not fetch.get("mapping_found") and "no published cache mapping" in str(fetch.get("reason"))
+        if fetch.get("service") == CACHE_SERVICE or missing:
+            return
+    record_seed(env, str(fetch["service"]), str(fetch["revision"]), packages=packages)
+
+
+def note_mathlib_fetch(env: dict, worktree: Path) -> None:
+    """Record Mathlib's ``lake exe cache get`` in the seed ledger: it runs the cache executable from the
+    worktree's packages, which candidate code may have rebuilt."""
+    from tauceti_queue.repair_cache import record_seed, seeded_packages
+
+    record_seed(env, "mathlib", "", packages="seed" if seeded_packages(worktree, env) else "private")
 
 
 def first_parent_ancestors(worktree: Path, revision: str, count: int) -> list[str]:
@@ -1172,6 +1183,7 @@ def prepare_artifacts(
                     1800,
                 )
                 record["mathlib_cache"] = deps
+                note_mathlib_fetch(env, worktree)
                 seconds += deps["seconds"]
                 if deps["rc"] != 0:
                     reasons.append(f"lake exe cache get exited {deps['rc']}")
@@ -1190,7 +1202,7 @@ def prepare_artifacts(
                 fetch["distance"] = None
                 warm_attempts.append(fetch)
                 seconds += fetch["seconds"]
-                _note_seed(env, fetch)
+                _note_seed(env, fetch, worktree)
             warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
             record["warm_attempts"] = warm_attempts
             record["warmed_from"] = [fetch["revision"] for fetch in warmed]
@@ -1218,7 +1230,7 @@ def prepare_artifacts(
                 fetch["distance"] = distance
                 attempts.append(fetch)
                 seconds += fetch["seconds"]
-                _note_seed(env, fetch)
+                _note_seed(env, fetch, worktree)
                 if fetch["mapping_found"]:
                     break
             found = attempts[-1] if attempts[-1]["mapping_found"] else None
@@ -1237,6 +1249,7 @@ def prepare_artifacts(
                     worktree, candidate, fetch_env, logdir, repository=repository, lake=lake, mappings_only=True
                 )
                 own["published"] = own["mapping_found"]
+                _note_seed(env, own, worktree)
                 record["candidate_outputs_published"] = own
                 seconds += own["seconds"]
     if build and not reasons:

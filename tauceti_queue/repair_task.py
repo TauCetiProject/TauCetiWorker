@@ -2778,6 +2778,7 @@ def resolve_one(
                 fetch_env,
                 1800,
             )
+            repair.note_mathlib_fetch(env_lake, worktree)
     # Projection-only conflicts after `main` renamed numeric projections resolve without the agent
     # (`repair_numproj`); any other outcome leaves the agent the conflict as before, or what is left.
     prepass = (
@@ -4015,6 +4016,10 @@ def _run_task(
             # Whether this exact tip passed the worker's own verification: the controller verifies and
             # repairs the next batch only on a head tip with such a pass (decision 174).
             notes["local_verification"] = {"tip": tip, "checks_passed": verified_unchanged(tip, outcome)}
+            # The pool the tip's outputs were built from, whatever the verification found: the controller
+            # lets a later batch's pool be seeded with this tip's published outputs only when it qualifies
+            # (decision 202, `Controller._record_provenance`).
+            notes["artifact_pool"] = repair_cache.pool_identity(env_lake)
             attested = attestation(
                 cfg.clone,
                 tip,

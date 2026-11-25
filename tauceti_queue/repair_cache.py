@@ -127,25 +127,40 @@ def _pool_root(env: dict) -> Path | None:
     return Path(env["LAKE_CACHE_DIR"]).parent if env.get("LAKE_CACHE_DIR") else None
 
 
-def record_seed(env: dict, service: str, revision: str) -> None:
-    """Note that ``service``'s outputs for ``revision`` were restored into the task's batch pool.
+def seeded_packages(worktree: Path, env: dict) -> bool:
+    """Whether ``worktree``'s dependencies are the worker's read-only seed packages: the one target the
+    worker recorded linking, inside a configured read-only tree. Only then does an online fetch load no
+    Lake configuration or executable that candidate code could have written."""
+    from tauceti_queue import repair_sandbox
+
+    recorded = repair_sandbox.linked_packages(worktree)
+    return len(recorded) == 1 and any(
+        recorded[0].is_relative_to(tree) for tree in repair_sandbox._read_only_trees({**os.environ, **env})
+    )
+
+
+def record_seed(env: dict, service: str, revision: str, *, packages: str) -> None:
+    """Note an online fetch into the task's batch pool: ``service``'s outputs for ``revision`` were (or may
+    have been) restored, with ``packages`` ``"seed"`` (read-only seed packages) or ``"private"`` (candidate-
+    writable ones, whose configurations and Mathlib's cache executable the fetch loaded). A fetch with no
+    single revision (Mathlib's ``lake exe cache get``) is recorded with an empty one.
 
     Only the worker writes the ledger: it sits beside the pool, which the sandbox binds, never inside it."""
     pool_root = _pool_root(env)
-    if pool_root is None or pool_batch(pool_root) is None or not REVISION.fullmatch(revision):
+    if pool_root is None or pool_batch(pool_root) is None or not (revision == "" or REVISION.fullmatch(revision)):
         return
     ledger = pool_root / SEEDS
-    line = json.dumps({"service": service, "revision": revision, "at": round(time.time(), 3)}, sort_keys=True)
+    row = {"service": service, "revision": revision, "packages": packages, "at": round(time.time(), 3)}
     fd = os.open(ledger, os.O_CREAT | os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW, 0o600)
     try:
-        os.write(fd, (line + "\n").encode())
+        os.write(fd, (json.dumps(row, sort_keys=True) + "\n").encode())
     finally:
         os.close(fd)
 
 
 def pool_identity(env: dict) -> dict:
     """What the attestation says about the pool the verification restored from: ``{"scope": "batch",
-    "batch_id", "seeds": [{"service", "revision"}, ...]}`` for a batch pool (seeds in first-restored
+    "batch_id", "seeds": [{"service", "revision", "packages"}, ...]}`` for a batch pool (seeds in first-restored
     order, without repeats), ``{"scope": "shared"}`` for any other, ``{"scope": "none"}`` without one."""
     pool_root = _pool_root(env)
     if pool_root is None:
@@ -160,7 +175,11 @@ def pool_identity(env: dict) -> dict:
             raise ValueError("symlink seed ledger")
         for line in ledger.read_text().splitlines() if ledger.exists() else ():
             row = json.loads(line)
-            seed = {"service": str(row["service"]), "revision": str(row["revision"])}
+            seed = {
+                "service": str(row["service"]),
+                "revision": str(row["revision"]),
+                "packages": str(row.get("packages", "private")),
+            }
             if seed not in seeds:
                 seeds.append(seed)
     except (OSError, ValueError, KeyError, TypeError) as error:
@@ -446,6 +465,9 @@ def _collect_root(store, root: Path, *, apply, now, max_bytes, max_age, batch_id
                     result["state"] = "unknown"  # another controller's batch, or not yet visible: keep it
                     return result
                 if row[0] in FINISHED:
+                    if {p.name for p in root.iterdir()} <= set(POOL_IDENTITY):
+                        result["state"] = "absent"
+                        return result
                     result.update(state="removed" if apply else "eligible", reason="batch-finished")
                     if apply:
                         _remove_pool(root)
@@ -459,17 +481,22 @@ def _collect_root(store, root: Path, *, apply, now, max_bytes, max_age, batch_id
     return result
 
 
+# What removal keeps of a finished batch's pool root: its lease, its identity and its users' registrations.
+POOL_IDENTITY = ("cache.lock", BATCH_MARKER, "cache-users")
+
+
 def _remove_pool(root: Path) -> None:
-    """Remove a finished batch's pool root, keeping its lock file until last so the lease stays valid."""
+    """Empty a finished batch's pool root under its exclusive lease. The lock file and the batch marker stay,
+    so a process waiting on the lease, or one resuming with a binding to this root, finds the same lock and
+    the same batch identity rather than a recreated, unmarked directory; the users' registrations stay so
+    later collection still sees their attempts."""
     for entry in root.iterdir():
-        if entry.name == "cache.lock":
+        if entry.name in POOL_IDENTITY:
             continue
         if entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
         else:
             entry.unlink()
-    (root / "cache.lock").unlink(missing_ok=True)
-    root.rmdir()
 
 
 def collect(

@@ -289,6 +289,11 @@ CREATE TABLE IF NOT EXISTS submissions (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS submissions_task ON submissions (task_id, id);
+CREATE TABLE IF NOT EXISTS output_provenance (
+    tip TEXT PRIMARY KEY,
+    batch_id INTEGER NOT NULL,
+    recorded_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS batch_tips (
     id INTEGER PRIMARY KEY,
     batch_id INTEGER NOT NULL,

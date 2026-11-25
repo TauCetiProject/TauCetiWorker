@@ -427,11 +427,17 @@ in for staging's checks, or nothing when it would: it must name exactly the tip 
 sandbox on, a verifier out of candidate code's reach (`verifier_isolated`), the whole-library lint, and a policy commit whose `tauceti.toml` and
 `scripts/` are `main`'s now, with the exact tools commit from the repository (and, for a SHA pin,
 the commit) `main` pins. Its build must also have restored from the batch's own artifact pool
-(decision 202, `_pool_problem`): `artifact_pool.scope` is `batch` with this batch's ID, and every
-repair-cache revision in `artifact_pool.seeds` lands with the tip or already has: the tip, one of
-its ancestors, one of the batch's own `batch_tips`, or the tip a `landed` batch landed as. Another
+(decision 202, `_pool_problem`): `artifact_pool.scope` is `batch` with this batch's ID; every fetch
+in `artifact_pool.seeds` ran with the read-only seed packages (`packages: "seed"`), since a fetch with
+candidate-writable packages loads configurations and Mathlib's cache executable that candidate code
+may have written, which could fetch anything into the pool; and every repair-cache revision seeded
+into it both lands with the tip or already has (the tip, one of its ancestors, one of the batch's
+own `batch_tips`, or the tip a `landed` batch landed as) and has clean provenance itself. Another
 batch's unlanded tip (a head's earlier tip, a landed batch's superseded one) can hold outputs of
-members that never land, so an attestation seeded with one does not count. Status
+members that never land. Provenance is the `output_provenance` table (`_record_provenance`): when a
+submission or clean release of a tip carries an `artifact_pool` that passes the same rule, the tip's
+published outputs may seed a later batch's pool. A tip built before decision 202, from the pool
+every batch shared, has none, so the rule holds by induction from the first clean pools. Status
 shows it as `head.attestation_problem` and `pre_rebase.attestation_problem`.
 
 The attested landing (decision 200, setting `attested_landing_enabled`, default false) acts on it:

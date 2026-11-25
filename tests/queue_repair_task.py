@@ -1448,7 +1448,9 @@ class HappyPath(Fixture):
         self.assertTrue(lake[2].startswith("build --iofail"))
         # Every Lake command ran in the sandbox, from a cleared environment: the cache fetches online, the
         # streaming build and the worker's verification build of the agent's chain offline.
-        sandboxed = self.bwrap_calls()
+        # The batch pool's download view is copied into the pool by a sandboxed transfer of its own
+        # (repair_cache.downloads), which is not a Lake command.
+        sandboxed = [c for c in self.bwrap_calls() if "expanded_cache import transfer" not in " ".join(c["argv"])]
         commands = [c["argv"][c["argv"].index("--") + 1 :] for c in sandboxed]
         self.assertEqual(commands[0], ["lake", "exe", "cache", "get"])
         self.assertEqual(commands[1][:3], ["lake", "cache", "get"])
@@ -7648,6 +7650,29 @@ class EarlyPublication(Fixture):
         os.mkfifo(mapping)
         with self.assertRaises(ValueError):
             repair_publish.validate_native_stage(stage)
+
+    def test_a_linked_stage_is_refused_and_staged_files_are_detached_from_the_pool(self):
+        # Decision 202: candidate code can leave the stage as a link into its batch pool, which later
+        # sandboxed builds can write; and staged archives may be hard links into that pool.
+        pool = self.root / "pool"
+        pool.mkdir()
+        good = '"2026-03-17"\n["11bb11bb11bb11bb","00aa00aa00aa00aa.ltar"]\n'
+        (pool / "outputs.jsonl").write_text(good)
+        (pool / "00aa00aa00aa00aa.ltar").write_bytes(b"compiled")
+        linked = self.root / "linked-stage"
+        linked.symlink_to(pool)
+        with self.assertRaises(ValueError):
+            repair_publish.validate_native_stage(linked)
+        stage = self.root / "stage"
+        stage.mkdir()
+        (stage / "outputs.jsonl").write_text(good)
+        os.link(pool / "00aa00aa00aa00aa.ltar", stage / "00aa00aa00aa00aa.ltar")
+        repair_publish.validate_native_stage(stage)
+        repair_publish.detach(stage)
+        self.assertEqual((stage / "00aa00aa00aa00aa.ltar").stat().st_nlink, 1)
+        (pool / "00aa00aa00aa00aa.ltar").write_bytes(b"rewritten by a later build")
+        self.assertEqual((stage / "00aa00aa00aa00aa.ltar").read_bytes(), b"compiled")
+        self.assertEqual(sorted(p.name for p in stage.iterdir()), ["00aa00aa00aa00aa.ltar", "outputs.jsonl"])
 
     BASE_FILES = {
         "lakefile.toml": 'name = "TauCeti"\nplatformIndependent = true\n',

@@ -420,7 +420,8 @@ def pristine_driver_root(worktree: Path, tools_root: Path, ref: str, env: dict) 
         return None
     # The cached drivers are keyed by the pin, the toolchain, the dependency manifest and the seed itself
     # (its path and Batteries' own manifest), so a changed seed never reuses an older driver.
-    seed = f"{shared}\n{hashlib.sha256(batteries).hexdigest()}\n"
+    # "pool-free": drivers built before decision 202 could restore outputs from a pool; none is reused.
+    seed = f"{shared}\n{hashlib.sha256(batteries).hexdigest()}\npool-free\n"
     root = (
         tools_root
         / DRIVERS_DIR

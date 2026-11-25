@@ -2802,6 +2802,7 @@ class Controller:
                 attestation=self._notes_attestation(worker_notes, tip_sha),
                 **prepared,
             )
+            self._record_provenance(worker_notes, tip_sha, batch["id"], now)
             self._record_tip(batch["id"], version, tip_sha, now)
             self.store.update(
                 "tasks",
@@ -4336,6 +4337,7 @@ class Controller:
                 self.store.update(
                     "batches", {"id": batch["id"]}, verified_tip=tip, attestation=self._notes_attestation(notes, tip)
                 )
+            self._record_provenance(notes, tip, batch["id"], now)
             if check:
                 self._count("parallel_checks_clean" if verified else "parallel_checks_unverified")
                 self.store.journal(
@@ -7147,12 +7149,38 @@ class Controller:
             return "the verification used another TauCetiTools"
         return self._pool_problem(note.get("artifact_pool"), tip, batch_id)
 
+    def _record_provenance(self, worker_notes: Any, tip: str, batch_id: int, now: float) -> None:
+        """Remember that the outputs a worker built for `tip` came from batch `batch_id`'s own pool seeded only
+        with outputs of clean provenance (`_pool_problem`, judged now), so a later batch's pool may be seeded
+        with `tip`'s published outputs. The submission's (or clean release's) `artifact_pool` says which pool;
+        without one, or from a pool that does not qualify, nothing is recorded and `tip` never may be."""
+        notes = worker_notes
+        if isinstance(notes, str):
+            try:
+                notes = loads(notes, {})
+            except ValueError:
+                return
+        if not isinstance(notes, dict):
+            return
+        pool = notes.get("artifact_pool")
+        if pool is None and isinstance(notes.get("attestation"), dict):
+            pool = notes["attestation"].get("artifact_pool")
+        if self._pool_problem(pool, tip, batch_id) is None:
+            self.store.execute(
+                "INSERT OR IGNORE INTO output_provenance (tip, batch_id, recorded_at) VALUES (?, ?, ?)",
+                (tip, batch_id, now),
+            )
+
     def _pool_problem(self, pool: Any, tip: str, batch_id: int | None) -> str | None:
         """Why the artifact pool an attestation's build restored from could hold outputs another batch's code
-        wrote (decision 202); None when it could not. The pool must be the batch's own, and every
-        repair-cache revision seeded into it must land with `tip` or already have landed: an ancestor of
-        `tip`, one of the batch's own tips, or the final tip of a landed batch. Another batch's unlanded tip
-        (a head's earlier tip, a landed batch's superseded one) may carry outputs of members that never land."""
+        wrote (decision 202); None when it could not. The pool must be the batch's own, every fetch into it
+        must have run with the read-only seed packages (otherwise it loaded configurations and executables
+        candidate code may have written, which could fetch or print anything), and every repair-cache
+        revision seeded into it must both land with `tip` or already have landed (an ancestor of `tip`, one
+        of the batch's own tips, or the final tip of a landed batch) and have clean provenance itself
+        (`output_provenance`, `_record_provenance`): its outputs were built the same way. Another batch's
+        unlanded tip may carry outputs of members that never land; a tip built before decision 202, from
+        the pool every batch shared, may carry anything."""
         if not isinstance(pool, dict) or pool.get("scope") != "batch":
             return "the verification restored from an artifact pool shared across batches"
         if batch_id is None or str(pool.get("batch_id")) != str(batch_id):
@@ -7162,8 +7190,14 @@ class Controller:
             return "the attestation does not list its artifact pool's seeds"
         for seed in seeds:
             revision = seed.get("revision") if isinstance(seed, dict) else None
-            if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            if not isinstance(revision, str) or not re.fullmatch(r"(?:[0-9a-f]{40})?", revision):
                 return "the attestation lists an invalid artifact pool seed"
+            if seed.get("packages") != "seed":
+                return "a fetch into the artifact pool ran with candidate-writable packages"
+            if not revision:
+                continue  # Mathlib's own cache fetch, with the read-only seed: nothing of any batch's
+            if self.store.row("output_provenance", {"tip": revision}) is None:
+                return f"the artifact pool was seeded with {revision[:12]}'s outputs, whose own pool is not known clean"
             if revision == tip or self.store.row("batch_tips", {"batch_id": batch_id, "tip": revision}) is not None:
                 continue
             if self.store.row("batches", {"repository": self.repository, "tip": revision, "state": BATCH_LANDED}):
@@ -7747,6 +7781,7 @@ class Controller:
                     pre_rebase_verified=task["tip"],
                     pre_rebase_attestation=self._notes_attestation(notes, task["tip"]),
                 )
+                self._record_provenance(notes, task["tip"], batch["id"], now)
             self._count("pre_rebased_prepares_clean")
             self.store.journal(
                 now, "prepared", task["batch_id"], task_id=task["id"], tip=task["tip"], clean=True, pre_rebased=True
@@ -7799,6 +7834,7 @@ class Controller:
                 verified=self._locally_verified(worker_notes, tip_sha),
                 attestation=self._notes_attestation(worker_notes, tip_sha),
             )
+            self._record_provenance(worker_notes, tip_sha, batch["id"], now)
             self.store.update(
                 "tasks",
                 {"id": task["id"]},

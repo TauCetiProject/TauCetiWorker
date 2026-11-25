@@ -339,8 +339,10 @@ outputs_published, worker_revision}`, what the checks took their pin and policy 
 whole-library lint ran, whether the build sandbox was on, and whether the checks' own scripts and
 drivers were out of candidate code's reach (`verifier_isolated`, `checks.verifier_isolated`), and
 `artifact_pool` (`repair_cache.pool_identity`): `{scope: "batch", batch_id, seeds}` for the batch's
-own pool, with every repair-cache revision restored into it, or `{scope: "shared"}` for a task bound
-before decision 202. A `prepare` task released `prepared_clean` after a clean
+own pool, with every online fetch into it (`seeds`: `{service, revision, packages}`, `packages` `seed`
+when the worktree's dependencies were the read-only seed packages, else `private`), or
+`{scope: "shared"}` for a task bound before decision 202. Every submission's `worker_notes` also carry
+`artifact_pool`, from which the controller records the tip's output provenance. A `prepare` task released `prepared_clean` after a clean
 streamed build with passing checks sends the same object as the release's `notes`. The worker only
 reports; the controller decides whether it counts. A `repair` task whose
 `parallel_check` diagnostic is proactive (`parallel_check_task`, the head's parallel check while

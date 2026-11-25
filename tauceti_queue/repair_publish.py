@@ -182,8 +182,11 @@ def validate_native_stage(stage: Path) -> None:
     """Keep only the native flat file boundary before credentials are available.
 
     The build and native staging processes have exited under the build lock;
-    Lake owns artifact validity. Do not follow any supplied path or special file.
+    Lake owns artifact validity. Do not follow any supplied path or special file,
+    the stage itself included: candidate code can leave a link in its place.
     """
+    if stage.is_symlink() or not stat.S_ISDIR(stage.lstat().st_mode):
+        raise ValueError("native staging accepts only an ordinary directory")
     fd = os.open(stage / "outputs.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(fd, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
@@ -215,6 +218,17 @@ def validate_native_stage(stage: Path) -> None:
     for name in names:
         if not stat.S_ISREG((stage / name).lstat().st_mode):
             raise ValueError("native staging accepts only ordinary files")
+
+
+def detach(stage: Path) -> None:
+    """Give every staged file a single name (decision 202). Native staging may hard-link archives from the
+    batch pool, which later sandboxed builds can write; the upload must read bytes nothing else can reach."""
+    for path in stage.iterdir():
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            copy = path.with_name("." + path.name + ".detached")
+            shutil.copyfile(path, copy, follow_symlinks=False)
+            os.replace(copy, path)
 
 
 def niced(argv: list[str], nice: int, env: dict) -> list[str]:
@@ -338,6 +352,8 @@ def freeze_outputs(worktree: Path, revision: str, env: dict, logdir: Path, lake:
         )
         return None
     stage = worktree / ".lake/publication-stage"
+    if stage.is_symlink():  # candidate code's link into a directory it can still write: never followed
+        stage.unlink()
     shutil.rmtree(stage, ignore_errors=True)
     argv = [*lake, "cache", "stage", ".lake/outputs.jsonl", ".lake/publication-stage"]
     wrapped = repair_sandbox.sandboxed_lake(argv, worktree, env)
@@ -363,7 +379,15 @@ def freeze_outputs(worktree: Path, revision: str, env: dict, logdir: Path, lake:
         validate_native_stage(stage)
         stage.rename(destination)
     except BaseException:
+        if stage.is_symlink():
+            stage.unlink()
         shutil.rmtree(stage, ignore_errors=True)
+        raise
+    try:
+        validate_native_stage(destination)
+        detach(destination)
+    except BaseException:
+        shutil.rmtree(destination, ignore_errors=True)
         raise
     artifacts = list(destination.glob("*.ltar"))
     return {

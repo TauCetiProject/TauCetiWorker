@@ -1351,8 +1351,12 @@ verification. The colocated workers share a batch's pool when they work on the s
 credentials/configuration, worktrees, logs and task checkpoints stay in their separate worker
 roots. Without `TAUCETI_QUEUE_CACHE_ROOT` the batch pools are under the worker's own root. A new
 batch pool starts empty and is filled only by the worker's fetches from the public and repair
-caches and by the batch's own builds; `seeds.jsonl` beside the pool records each repair-cache
-revision restored into it, for the attestation. A parked batch tree built from another pool (the
+caches and by the batch's own builds; `seeds.jsonl` beside the pool records the fetches into it for
+the attestation: each repair-cache restore, and with candidate-writable dependencies (no
+`TAUCETI_QUEUE_SEED_PACKAGES`) every fetch, Mathlib's `lake exe cache get` included, since such a
+fetch runs code candidate code may have written. Publication refuses a stage left as a link and
+copies any staged archive hard-linked into the pool, so the upload reads bytes no later build can
+write. A parked batch tree built from another pool (the
 shared pool before 202) is removed rather than adopted. Collection removes a batch's pool once the
 batch is `landed` or `removed` and no attempt or publisher holds it, and trims live idle ones like
 any other pool. The shared root's own `lake-cache` is used only by attempts bound before 202 and is
