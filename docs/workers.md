@@ -130,6 +130,23 @@ inside each step, and the worker falls back to the normal landing order (rebases
 rest) when no review is claimable. A few review-first workers keep approvals flowing into
 the queue while the rest of the pool works through long conflict rebases.
 
+Set `TAUCETI_PRIORITY_LABELS` in a worker's environment to a comma-separated list of labels
+(case-insensitive, for example `grh`) to have every worker review PRs carrying one of them before
+any other PR work, on either forge. On a fleet host, `tauceti-fleet workers HOST --env
+TAUCETI_PRIORITY_LABELS=grh` sets it for every worker and `--unset-env TAUCETI_PRIORITY_LABELS`
+switches it off; empty means off. Label names may contain spaces. Those reviews share the
+automatic bumps' lead (a bump's rebase or repair on either forge still comes first), skip the
+previous reviewer's first-refusal window and the review throttles, and on Forgejo their review
+state is refreshed first. A roadmap focus slot first looks across every area for that leading
+work (bump work and priority reviews) and returns to its focus area when none is claimable.
+Everything else that
+guards a review still applies: the build must be green, one worker claims each head, an
+unchanged head is not reviewed again, a review that errors backs off, and contest replies are
+still answered. Only reviews move: fixes, CI repairs and rebases of a priority PR keep their
+usual place, so the fleet does not race other agents pushing to it. Labels are read with each
+round's survey (GitHub's shared state takes label changes from webhooks), so a newly labelled
+PR is picked up by the next worker to start a round.
+
 Each host remembers which heads of a PR review sent back for a fix. Once review has
 sent back 6 earlier heads of a PR on a host and asks for changes again, the next worker
 there that confirms the fix on the live PR closes the PR instead of fixing it, if the
@@ -151,6 +168,7 @@ backing off, a both-source worker offers GitHub reviews after all its other work
 including review-first workers. A review started then would finish its model work and
 then wait, holding its slot, until GitHub accepted its comments again. Automatic bump
 reviews keep their lead, and the review is still offered when nothing else is claimable.
+Priority-labelled reviews wait too, and come first among the waiting reviews.
 
 ## Locally verified publications
 

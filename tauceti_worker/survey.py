@@ -431,6 +431,9 @@ class Candidate:
     # retry at a head whose review errored. Offered with the re-reviews: behind the fixes, which
     # never run out on Forgejo, these PRs were never offered at all.
     native_review: bool = False
+    # A review of a PR carrying one of the operator's priority labels (TAUCETI_PRIORITY_LABELS): offered
+    # with the automatic bumps, ahead of every other PR work. Reviews only; repairs keep their order.
+    priority: bool = False
     source_repository: RepositoryRef | None = None
     source_repository_id: int | None = None
     progress: dict | None = field(
@@ -1566,6 +1569,7 @@ def classify_survey(
         survey_overlaps(cfg, gh, sv)
     sv.discovery_gaps = len(gaps)
     sv.discovery_gap_prs = sorted(gaps)
+    mark_priority_reviews(sv)
     sv.next_auto_stage = _next_auto_stage(sv)
     return sv
 
@@ -1573,6 +1577,44 @@ def classify_survey(
 def bump_prs(sv: Survey) -> set[int]:
     """Open automatic Mathlib bump PRs in this survey."""
     return {p.number for p in sv.open_prs if p.automatic_bump}
+
+
+PRIORITY_LABELS_ENV = "TAUCETI_PRIORITY_LABELS"
+
+
+def priority_labels() -> frozenset[str]:
+    """The operator's priority labels, case-insensitive: TAUCETI_PRIORITY_LABELS, comma-separated
+    (a label name may contain spaces). Empty (the default) switches priority off."""
+    raw = os.environ.get(PRIORITY_LABELS_ENV, "")
+    return frozenset(label.strip().lower() for label in raw.split(",") if label.strip())
+
+
+def has_priority_label(pr: PRInfo, labels: frozenset[str] | None = None) -> bool:
+    labels = priority_labels() if labels is None else labels
+    return bool(labels) and any(label.lower() in labels for label in pr.labels)
+
+
+def mark_priority_reviews(sv: Survey) -> None:
+    """Flag the review candidates whose PR carries a priority label, so every landing order offers
+    them first (landing_tier). Labels come from this survey's PR listing, read afresh each round.
+    A model-free close at the review-error cap is not a review and keeps its place."""
+    labels = priority_labels()
+    if not labels:
+        return
+    flagged = {p.number for p in sv.open_prs if has_priority_label(p, labels)}
+    for c in sv.reviewable.actionable + sv.reviewable.suppressed:
+        if c.pr in flagged and not c.close_at_review_cap:
+            c.priority = True
+
+
+def priority_note(sv: Survey) -> str:
+    """One log line naming this survey's actionable priority reviews, or "" when there are none."""
+    prs = sorted({c.pr for c in sv.reviewable.actionable if c.priority})
+    if not prs:
+        return ""
+    return f"review: {len(prs)} PR(s) labelled {', '.join(sorted(priority_labels()))} offered first: " + ", ".join(
+        f"#{pr}" for pr in prs
+    )
 
 
 # Landing tiers: work is offered by how close it brings a PR to landing, not by a strict stage
@@ -1585,7 +1627,8 @@ def bump_prs(sv: Survey) -> set[int]:
 # left on Forgejo, so behind the fixes no such review was ever offered (several hundred of our own
 # first reviews, then every contributor's). Reviews within a tier are
 # drawn in one age-weighted random order, so neither kind starves the other. Then repairs of
-# changes-requested or red PRs. Then GitHub first reviews, then overlap work.
+# changes-requested or red PRs. Then GitHub first reviews, then overlap work. A review of a PR with
+# an operator priority label (TAUCETI_PRIORITY_LABELS) joins the bumps in tier 0.
 LANDING_TIERS = {
     "bump": 0,
     "rebase": 1,
@@ -1600,7 +1643,7 @@ LANDING_TIERS = {
 
 
 def landing_tier(stage: str, candidate: Candidate, bumps=frozenset()) -> int:
-    if candidate.pr in bumps:
+    if candidate.pr in bumps or (stage == "review" and candidate.priority):
         return 0
     if stage == "review" and (candidate.rereview or candidate.contest or candidate.native_review):
         return 1
@@ -1635,7 +1678,8 @@ def cascade(sv: Survey, stages, listed=frozenset(), *, tier=None, review_first=F
     Every stage's work on an automatic Mathlib bump comes first, in stage order: its conflicts,
     red build, review findings and pending reviews. Main moves faster than an ordinary queue
     position allows a bump round to start, so a bump that waits behind unrelated work goes stale
-    again before it can be admitted. Everything else follows in landing-tier order (LANDING_TIERS),
+    again before it can be admitted. Reviews of priority-labelled PRs share that lead (after the bump
+    repairs, by stage order). Everything else follows in landing-tier order (LANDING_TIERS),
     in stage order within a tier and the stage's own order within a stage. `tier` keeps one tier.
     `review_first` moves re-reviews, then first reviews, ahead of every other tier but the bumps.
 
