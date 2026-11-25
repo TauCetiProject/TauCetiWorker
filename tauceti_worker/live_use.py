@@ -1,9 +1,10 @@
 """Process ownership and live-use observations, and small Git helpers for worker checkouts.
 
 Cleanup never deletes a tree a live process still uses: ``live_users`` reports the visible
-processes whose working directory, root or open files lie inside a path. A caller that only
-rewrites or deletes files may pass ``readers=False`` to disregard read-only descriptors: a search
-of the whole filesystem (an agent's `find /`) holds one on every directory it walks, for minutes. ``process_owner`` and
+processes whose working directory, root or open files lie inside a path. Worktree preparation
+passes ``walkers=False`` to disregard read-only descriptors on directories: a search of the whole
+filesystem (an agent's `find /`) holds one on every directory it walks, in every worker's tree,
+for minutes. Files open for reading or writing, a working directory and a root still count. ``process_owner`` and
 ``owner_stopped`` record and test a process's birth identity without PID namespace support.
 """
 
@@ -197,9 +198,14 @@ def _darwin_process_references():
     return result
 
 
-def _read_only(entry: Path, fd: str) -> bool:
-    """Whether descriptor ``fd`` of process ``entry`` is open for reading only. Unknown is not."""
+def _walking(entry: Path, fd: str) -> bool:
+    """Whether descriptor ``fd`` of process ``entry`` is a directory open for reading only, as a
+    traversal holds it. Unknown is not."""
+    import stat
+
     try:
+        if not stat.S_ISDIR(os.stat(entry / "fd" / fd).st_mode):
+            return False
         for line in (entry / "fdinfo" / fd).read_text().splitlines():
             if line.startswith("flags:"):
                 return int(line.split()[1], 8) & os.O_ACCMODE == os.O_RDONLY
@@ -208,11 +214,11 @@ def _read_only(entry: Path, fd: str) -> bool:
     return False
 
 
-def process_references(*, readers_under: str | None = None):
+def process_references(*, walkers_under: str | None = None):
     """One read-only process inventory, reusable within a cleanup pass only.
 
-    With ``readers_under`` (a canonical path), read-only descriptors inside it are left out: the
-    working directory, root and every descriptor open for writing still count. Linux only; macOS
+    With ``walkers_under`` (a canonical path), read-only directory descriptors inside it are left
+    out; files open inside it, a working directory and a root still count. Linux only: macOS
     inventories keep every reference."""
     import sys
 
@@ -253,10 +259,10 @@ def process_references(*, readers_under: str | None = None):
                     if not where.startswith("/"):
                         continue
                     if (
-                        readers_under is not None
+                        walkers_under is not None
                         and link.parent.name == "fd"
-                        and (where == readers_under or where.startswith(readers_under.rstrip("/") + "/"))
-                        and _read_only(entry, link.name)
+                        and (where == walkers_under or where.startswith(walkers_under.rstrip("/") + "/"))
+                        and _walking(entry, link.name)
                     ):
                         continue
                     paths.append(where)
@@ -284,17 +290,17 @@ def referenced_users(repo: Path, references, *, session=None) -> list[str]:
     return found
 
 
-def live_users(repo: Path, *, session=None, readers=True) -> list[str]:
+def live_users(repo: Path, *, session=None, walkers=True) -> list[str]:
     """Fresh process references for ordinary callers; no cached negative liveness evidence.
 
-    ``readers=False`` disregards descriptors open for reading only (see the module docstring)."""
+    ``walkers=False`` disregards read-only directory descriptors (see the module docstring)."""
     under = None
-    if not readers:
+    if not walkers:
         try:
             under = str(canonical_candidate(repo))
         except OSError:
             return ["candidate path unavailable"]
-    return referenced_users(repo, process_references(readers_under=under), session=session)
+    return referenced_users(repo, process_references(walkers_under=under), session=session)
 
 
 def fsync_dir(path: Path) -> None:

@@ -810,17 +810,18 @@ def repair_origin(co: Path) -> bool:
     return subprocess.run(["git", "-C", str(co), "remote", "add", "origin", checkout_url()]).returncode == 0
 
 
-def discard_checkout(path: Path, why: str) -> bool:
+def discard_checkout(path: Path, why: str, *, walkers: bool = True) -> bool:
     """Delete a checkout that cannot be reset in place; anything unpushed in it is abandoned.
 
     Deletion goes through ``retention.remove``: never through a symlink, never a mount point, and
-    never a tree a live process still uses (that is reported and retried next round)."""
+    never a tree a live process still uses (that is reported and retried next round).
+    ``walkers=False``: a read-only directory descriptor alone is not a use (``live_use``)."""
     from . import retention
 
     report = retention.fresh_report()
     try:
         # Anchored one level up, so a symlinked parent directory is refused like any other link.
-        retention.remove(path, path.parent.parent, report, check_users=True)
+        retention.remove(path, path.parent.parent, report, check_users=True, walkers=walkers)
     except OSError as error:
         retention.note(report, "errors", f"{path}: {error}")
     for error in report["errors"]:
