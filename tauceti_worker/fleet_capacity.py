@@ -19,9 +19,12 @@ def admission_reason(worker: str, *, env=None, now=None) -> str | None:
     path = env.get("TAUCETI_FLEET_ADMISSION_FILE")
     if not path:
         return None
-    now = time.time() if now is None else now
     try:
         policy = json.loads(Path(path).read_text())
+        # Sample the clock after the read: under disk or CPU contention the read
+        # can stall for seconds while the controller rewrites the policy, and an
+        # earlier sample makes the fresh expiry look like a future clock.
+        now = time.time() if now is None else now
         if not isinstance(policy, dict):
             raise ValueError("invalid policy")
         expires = policy["expires_at"]
@@ -59,9 +62,9 @@ def roadmap_focus(worker: str, *, env=None, now=None) -> list[str]:
     path = env.get("TAUCETI_FLEET_ADMISSION_FILE")
     if not path:
         return []
-    now = time.time() if now is None else now
     try:
         policy = json.loads(Path(path).read_text())
+        now = time.time() if now is None else now  # after the read, as in admission_reason
         expires = policy["expires_at"]
         focus = policy.get("roadmap_focus", {})
         areas = focus.get("areas", [])
