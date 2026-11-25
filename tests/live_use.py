@@ -55,6 +55,38 @@ class LiveUse(unittest.TestCase):
         self.assertTrue(lu.owner_stopped(owner))
         self.assertEqual(lu.live_users(tree), [])
 
+    @unittest.skipUnless(sys.platform == "linux", "procfs observations")
+    def test_linux_walkers_are_not_users_when_preparing(self):
+        # A whole-filesystem search holds read-only descriptors on the directories it walks.
+        tree = self.root / "tree"
+        (tree / "sub").mkdir(parents=True)
+        (tree / "A.lean").write_text("x")
+        hold = "import os, sys, time; fds = [os.open(path, int(flags)) for path, flags in zip(sys.argv[1::2], sys.argv[2::2])]; print('ready', flush=True); time.sleep(30)"
+        directory, read, write = os.O_RDONLY | os.O_DIRECTORY, os.O_RDONLY, os.O_WRONLY | os.O_APPEND
+        cases = (
+            ("walker", [(tree, directory), (tree / "sub", directory)], "/", False),
+            ("O_PATH walker", [(tree / "sub", os.O_PATH | os.O_DIRECTORY)], "/", False),
+            ("file reader", [(tree / "sub", directory), (tree / "A.lean", read)], "/", True),
+            ("writer", [(tree / "A.lean", write)], "/", True),
+            ("working directory", [(tree / "sub", directory)], str(tree), True),
+        )
+        for name, held, cwd, counted in cases:
+            argv = [str(item) for path, flags in held for item in (path, flags)]
+            with (
+                self.subTest(name),
+                subprocess.Popen(
+                    [sys.executable, "-c", hold, *argv], cwd=cwd, stdout=subprocess.PIPE, text=True
+                ) as child,
+            ):
+                try:
+                    self.assertEqual(child.stdout.readline().strip(), "ready")
+                    mine = lambda users: any(user.startswith(f"{child.pid} ") for user in users)  # noqa: E731
+                    self.assertTrue(mine(lu.live_users(tree)))
+                    self.assertEqual(mine(lu.live_users(tree, walkers=False)), counted)
+                finally:
+                    child.terminate()
+                    child.wait(timeout=5)
+
     def test_checkout_kind(self):
         repo = self.root / "repo"
         subprocess.run(["git", "init", "-q", str(repo)], check=True)

@@ -170,14 +170,21 @@ def mount_points():
         return None
 
 
-def _remove(path, root, report, *, dry=False, check_users=True, opened=None, mounts=...):
-    """Rename first: a crash leaves an explicitly owned, resumable deletion."""
+def _remove(path, root, report, *, dry=False, check_users=True, opened=None, mounts=..., walkers=True):
+    """Rename first: a crash leaves an explicitly owned, resumable deletion.
+
+    ``walkers=False`` (checkout preparation only): read-only directory descriptors, as a
+    filesystem-wide search holds them, do not protect the tree (``live_use.live_users``)."""
     if not safe(path, root) or not path.exists():
         return
     from .live_use import live_users
 
     info = path.stat()
-    in_use = ((info.st_dev, info.st_ino) in opened) if opened is not None else check_users and live_users(path)
+    in_use = (
+        ((info.st_dev, info.st_ino) in opened)
+        if opened is not None
+        else check_users and live_users(path, walkers=walkers)
+    )
     if mounts is ...:
         mounts = mount_points()
     target = canonical_candidate(path)

@@ -382,6 +382,51 @@ def persistent_rounds(root, origin, seed):
             check("a broken worktree is re-added", agents.prepare_checkout(two, work="fix", pr=2))
     check("the fallback is logged", "adding a fresh worktree" in log.getvalue())
     check("and the new tree is at main", git(two.checkout, "rev-parse", "HEAD").strip() == advanced)
+
+    # 5b. A process that only walks the tree, such as an agent's `find /` walking every worker's
+    # tree, does not block preparation; one with a file open in it does.
+    def holder(code, *paths):
+        child = subprocess.Popen(
+            [sys.executable, "-c", code, *map(str, paths)], cwd="/", stdout=subprocess.PIPE, text=True
+        )
+        child.stdout.readline()
+        return child
+
+    walk = "import os, sys, time; d = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY); print(1, flush=True); time.sleep(60)"
+    read = "import sys, time; f = open(sys.argv[1]); print(1, flush=True); time.sleep(60)"
+    edit = "import sys, time; f = open(sys.argv[1], 'a'); print(1, flush=True); time.sleep(60)"
+    settled(two.checkout)
+    for what, code, path, prepared in (
+        ("a walker's", walk, two.checkout, True),
+        ("a file reader's", read, two.checkout / "B.lean", False),
+        ("a writer's", edit, two.checkout / "B.lean", False),
+    ):
+        child = holder(code, path)
+        try:
+            log = io.StringIO()
+            with contextlib.redirect_stderr(log), contextlib.redirect_stdout(log):
+                ok = agents.prepare_checkout(two, work="fix", pr=2)
+            check(f"{what} open descriptor {'does not block' if prepared else 'blocks'} preparation", ok == prepared)
+            check(
+                f"and {what} process is {'not ' if prepared else ''}named",
+                (str(child.pid) in log.getvalue()) != prepared,
+            )
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
+    check("the tree is still the worker's", rw.owns(two.checkout))
+    # A tree that must be deleted (no Git metadata) is deleted under a walker too.
+    (two.checkout / ".git").unlink()
+    child = holder(walk, two.checkout)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            replaced = agents.prepare_checkout(two, work="fix", pr=2)
+        check("a broken tree a walker holds is replaced", replaced)
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+    check("by a worktree of the clone", rw.owns(two.checkout))
+
     # 6. A tree something still uses is never reset or removed.
     with patch.object(rw, "_check_unused", side_effect=rw.InUse("in use")):
         check("an in-use worktree is refused", not agents.prepare_checkout(two, work="fix", pr=2))
