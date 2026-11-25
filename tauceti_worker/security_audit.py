@@ -705,7 +705,7 @@ def literal_end(text: str, i: int) -> tuple[int, bool] | None:
     """Where the comment, string, character literal, syntax quotation or quoted name at `i` ends,
     and whether it is blanked (a quoted name is code); None if none starts there.
 
-    Block comments nest, and a quotation (`` `(...) ``, `` `(command| ...) ``) ends at its matching
+    Block comments nest, an interpolated string's `{...}` is scanned as code, and a quotation (`` `(...) ``, `` `(command| ...) ``) ends at its matching
     parenthesis, skipping everything inside by these same rules. Unterminated: the end of the text."""
     n, c = len(text), text[i]
     if text.startswith("--", i):
@@ -722,9 +722,21 @@ def literal_end(text: str, i: int) -> tuple[int, bool] | None:
                 j += 1
         return min(j, n), True
     if c == '"':
-        j = i + 1
+        # After `!` (s!, f!, m!, ...) a string interpolates: `{...}` is code, holding any literal.
+        interpolated, j = i > 0 and text[i - 1] == "!", i + 1
         while j < n and text[j] != '"':
-            j += 2 if text[j] == "\\" else 1
+            if text[j] == "\\":
+                j += 2
+            elif interpolated and text[j] == "{":
+                depth, j = 1, j + 1
+                while j < n and depth:
+                    if (inner := literal_end(text, j)) is not None:
+                        j = max(inner[0], j + 1)
+                        continue
+                    depth += {"{": 1, "}": -1}.get(text[j], 0)
+                    j += 1
+            else:
+                j += 1
         return min(j + 1, n), True
     after_ident = i > 0 and ident_char(text[i - 1])
     if c == "r" and (raw := RAW.match(text, i)) and not after_ident:
