@@ -74,7 +74,8 @@ later revert does not make an earlier dangerous commit safe. Every changed libra
 its complete before/after contents and its diff, except in a single commit too large for
 that: its files have no "before" field, only their complete after contents and their diff
 (the message says so). A commit too large even for that is reviewed in parts, each with
-the same commit-wide context (the message says so). The before state is the parent, which the cursor passes only after
+the same commit-wide context (the message says so); there, "this bundle" below means the
+whole commit, all parts together. The before state is the parent, which the cursor passes only after
 an inspection pass or a human attestation, so the after contents and the diff show every
 line this commit adds or removes. Scope is TauCeti/ and TauCeti.lean only.
 Human-reviewed scripts, workflows, pins and infrastructure are deliberately absent; do not
@@ -598,17 +599,20 @@ def judgment_request(batch: dict, model: str) -> dict:
 #
 # A single commit whose request exceeds BUDGET_TOKENS even without its before images is split into
 # parts of whole files, packed in path order, each sent as its own request with the same Worker-built
-# commit-wide context: every changed path, and every line of the commit's after images that could
-# define, register or run something (CONTEXT_COMMAND, CONTEXT_ANYWHERE, attribute uses the baseline
-# does not define or the policy flags), with surrounding lines. A part reviewer therefore sees every
-# definition and every flagged use in the whole commit, whichever part holds the file. A file too large for one part is split by diff hunks, each with the file's first
-# lines and the after image around it. The commit passes only if every part passes; any finding
-# binds the commit. Only a single hunk too large to send, or context too large to share, holds.
+# commit-wide context (`commit_context`): every changed path, the names of everything the commit's
+# after images declare other than theorems, and the complete declarations that could define,
+# register or run something (lines matching CONTEXT_COMMAND or CONTEXT_ANYWHERE, attribute uses the
+# baseline does not define or the policy flags), closed under the non-theorem declarations they
+# name. A part reviewer therefore sees every such definition and use in the whole commit, with the
+# code it calls, whichever part holds the file. A file too large for one part is split by diff
+# hunks, each with the file's first lines, the after image around it and the declarations its
+# changed lines name. The commit passes only if every part passes; any finding binds the commit.
+# Only a single hunk too large to send, or context too large to share, holds.
 #
 # Parts are sized by UTF-8 bytes, which bound the tokens from above (every token is at least one
 # byte), so the plan is a pure function of the input and needs no further counting.
-CONTEXT_LINES = (20, 3, 0)  # Lines around each context match, narrowed until the context fits.
-CONTEXT_BYTES = 150_000  # The most commit-wide context every part may carry.
+CONTEXT_BYTES = 250_000  # The most commit-wide context every part may carry; more holds.
+BLOCK_LINES = 2000  # A declaration longer than this is shown as the lines around each match.
 HEAD_LINES = 100  # The file's first lines (imports, options, opens) sent with each of its hunks.
 HUNK_LINES = 100  # After-image lines on each side of a hunk, when they fit.
 # Commands and modifiers, at the start of a line after attributes and modifiers.
@@ -623,14 +627,20 @@ CONTEXT_ANYWHERE = re.compile(
     r"\b(?:run_cmd|run_tac|run_elab|run_meta|include_str|implemented_by|extern|csimp|never_extract|macro_inline"
     r"|native_decide|ofReduceBool|ofReduceNat|unsafeBaseIO|unsafeIO|unsafeEIO|unsafePerformIO|unsafeCast"
     r"|evalExpr|evalConst|addDecl|addAndCompile|compileDecl|getEnv|setEnv|modifyEnv|MetaM|CoreM|TermElabM|TacticM"
-    r"|CommandElabM|IO|EIO|BaseIO|FilePath|Process|initialize|builtin_initialize|macro_rules|elab_rules)\b"
-    r"|\bregister\w*|\w*Attribute\b|:\s*attr\b|\bimport\s+Lean\b|\bLean\.(?:Elab|Meta|Compiler|Environment)\b"
+    r"|CommandElabM|IO|EIO|BaseIO|FilePath|Process|initialize|builtin_initialize|macro_rules|elab_rules"
+    r"|Macro|MacroM|Syntax|TSyntax|Elab|Meta|Tactic|Expr|Environment|Simproc|DSimproc|NormNumExt|PositivityExt)\b"
+    r"|\bregister\w*|\w*Attribute\b|:\s*attr\b|\bimport\s+Lean\b|\bLean\.\w|\bopen\b.*\bLean\b"
+    r"|\bin\s+(?:(?:local|scoped)\s+)?(?:macro|macro_rules|elab|elab_rules|syntax|notation\w*|infix\w*|prefix|postfix"
+    r"|attribute|initialize|set_option|simproc|dsimproc)\b"
     r"|(?:^|[\s(])#(?!(?:check|print|guard_msgs|align|align_import|noalign|adaptation_note|help|synth|reduce|find"
     r"|where|lint|check_failure|guard_expr|guard_target|conv|simp|norm_num|count_heartbeats)\b)[a-z][a-z_]*"
 )
 # Attributes that run or compile code, beyond FLAGGED_ATTRIBUTES: their uses are context too.
 META_ATTRIBUTES = frozenset(
-    {"command_elab", "term_elab", "tactic", "macro", "delab", "app_unexpander", "simproc", "env_linter", "deriving"}
+    {
+        *("command_elab", "term_elab", "tactic", "macro", "delab", "app_unexpander", "simproc", "dsimproc"),
+        *("env_linter", "deriving", "norm_num", "positivity", "code_action", "hole_code_action", "widget"),
+    }
 )
 
 
@@ -644,7 +654,8 @@ def context_line(line: str) -> bool:
         for item in match.group(1).split(","):
             words = [w for w in item.split() if w not in ("local", "scoped")]
             name = words[0].lstrip("-") if words else ""
-            if name and (name in FLAGGED_ATTRIBUTES or name in META_ATTRIBUTES or name not in NAMES):
+            meta = name in FLAGGED_ATTRIBUTES or name in META_ATTRIBUTES or name.startswith("builtin_")
+            if name and (meta or name not in NAMES):
                 return True
     return False
 
@@ -668,18 +679,88 @@ def excerpt(path: str, lines: list[str], ranges: list[tuple[int, int]]) -> list[
     ]
 
 
-def commit_context(commit: dict, around: int) -> list[dict]:
-    """Every context line of the commit's after images, with `around` lines on each side.
+# A top-level declaration: its kind and name (Lean commands start in column 0).
+DECLARATION = re.compile(
+    r"(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|public|noncomputable|unsafe|partial|nonrec|meta|local|scoped)\s+)*"
+    r"(def|abbrev|instance|theorem|lemma|opaque|axiom|structure|class|inductive|macro|elab|syntax|notation\w*"
+    r"|initialize|builtin_initialize|simproc|dsimproc|irreducible_def)\b\s*(?:\(\s*name\s*:=\s*)?([^\s:({\[⦃)]*)"
+)
+INERT = frozenset({"theorem", "lemma"})  # Proofs never run: never closure targets or listed names.
+IDENT = re.compile(r"[^\W\d][\w.'!?]*")
+
+
+def declarations(lines: list[str]) -> list[tuple[int, int, str, str]]:
+    """The after image's top-level blocks as (first line, last line, kind, name), 1-based.
+
+    A block starts at a column-0 line other than a match arm or the end of a comment, and runs to the
+    next one; a declaration's kind and name come from its first line (empty when it is another command).
+    """
+    starts = [i for i, line in enumerate(lines, 1) if line[:1].strip() and not line.startswith(("|", "-/", "  ", "\t"))]
+    found = []
+    for n, lo in enumerate(starts):
+        hi = (starts[n + 1] - 1) if n + 1 < len(starts) else len(lines)
+        match = DECLARATION.match(lines[lo - 1])
+        found.append((lo, hi, match.group(1), match.group(2)) if match else (lo, hi, "", ""))
+    return found
+
+
+def last_name(name: str) -> str:
+    return name.rsplit(".", 1)[-1]
+
+
+def defined_names(commit: dict) -> list[str]:
+    """Every non-theorem name the commit's after images declare."""
+    names = set()
+    for f in commit["files"]:
+        if f["after"] is not None:
+            names |= {name for _, _, kind, name in declarations(f["after"].split("\n")) if name and kind not in INERT}
+    return sorted(names)
+
+
+def name_targets(files: dict[str, list[str]]) -> dict[str, list[tuple[str, int, int]]]:
+    """Each non-theorem declaration's block, by the last component of its name."""
+    targets: dict[str, list[tuple[str, int, int]]] = {}
+    for path, lines in files.items():
+        for lo, hi, kind, name in declarations(lines):
+            if name and kind not in INERT:
+                targets.setdefault(last_name(name), []).append((path, lo, hi))
+    return targets
+
+
+def closed(files: dict[str, list[str]], chosen: dict[str, set[tuple[int, int]]], targets=None) -> dict:
+    """`chosen` line ranges per path, with every non-theorem declaration their text names, repeatedly."""
+    targets = name_targets(files) if targets is None else targets
+    seen: set[str] = set()
+    while True:
+        text = "\n".join("\n".join(files[p][lo - 1 : hi]) for p, ranges in chosen.items() for lo, hi in ranges)
+        wanted = {last_name(w) for w in IDENT.findall(text)} & set(targets) - seen
+        if not wanted:
+            return chosen
+        seen |= wanted
+        for word in wanted:
+            for path, lo, hi in targets[word]:
+                chosen.setdefault(path, set()).add((lo, hi))
+
+
+def commit_context(commit: dict) -> list[dict]:
+    """The complete declarations of the commit's after images that hold a context line, and the
+    non-theorem declarations they name, transitively. A declaration over BLOCK_LINES lines is shown
+    as the 20 lines around each context line in it.
 
     Removed code is not context: it cannot run, and it stays visible in its own file's diff."""
-    found = []
-    for f in commit["files"]:
-        if f["after"] is None:
-            continue
-        lines = f["after"].split("\n")
-        hits = [(i - around, i + around) for i, line in enumerate(lines, 1) if context_line(line)]
-        found += excerpt(f["path"], lines, hits)
-    return found
+    files = {f["path"]: f["after"].split("\n") for f in commit["files"] if f["after"] is not None}
+    chosen: dict[str, set[tuple[int, int]]] = {}
+    for path, lines in files.items():
+        blocks = declarations(lines)
+        for i, line in enumerate(lines, 1):
+            if not context_line(line):
+                continue
+            block = next(((lo, hi) for lo, hi, _, _ in blocks if lo <= i <= hi), (i, i))
+            if block[1] - block[0] >= BLOCK_LINES:
+                block = (i - 20, i + 20)
+            chosen.setdefault(path, set()).add(block)
+    closed(files, chosen)
+    return [x for path in files if path in chosen for x in excerpt(path, files[path], list(chosen[path]))]
 
 
 HUNK = re.compile(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -719,17 +800,30 @@ def request_size(request: dict) -> int:
 def hunk_units(f: dict, room: int) -> list[dict]:
     """A file too large for one part, as pieces of consecutive hunks that each fit in `room` bytes.
 
-    Each piece is its diff header and hunks, with the after image's first HEAD_LINES lines and,
-    when it fits, HUNK_LINES on each side of each hunk. One hunk that cannot fit holds the commit."""
+    Each piece is its diff header and hunks, with the after image's first HEAD_LINES lines, the
+    non-theorem declarations of this file that its changed lines name (transitively: so a hunk
+    registering an existing definition shows that definition) and, when it fits, HUNK_LINES on each
+    side of each hunk. One hunk that cannot fit holds the commit."""
     header, found = hunks(f["diff"])
     lines = f["after"].split("\n") if f["after"] is not None else []
     if not found:
         raise Unreadable(f"security-audit: {f['path']} is too large for the reviewer and has no hunks to split")
+    targets = name_targets({f["path"]: lines})
 
     def unit(first: int, last: int, around: int) -> dict:
         ranges = [(1, HEAD_LINES)] + [
             (start - around, start + count - 1 + around) for start, count, _ in found[first : last + 1]
         ]
+        if lines:
+            changed = [
+                row[1:]
+                for _, _, text in found[first : last + 1]
+                for row in text.split("\n")[1:]
+                if row[:1] in ("+", "-")
+            ]
+            # The changed lines as a pseudo-file, so `closed` finds the declarations they name.
+            names = closed({f["path"]: lines, "": changed}, {"": {(1, len(changed))}}, targets)
+            ranges += list(names.get(f["path"], set()))
         return {
             "path": f["path"],
             "hunks": f"{first + 1}-{last + 1} of {len(found)}",
@@ -758,12 +852,14 @@ PARTS_NOTE = (
     "first lines and the after contents around them), as after contents and diffs, without before contents. "
     "The commit passes only if every part passes. Every part also carries the same commit-wide context, "
     "extracted by the trusted Worker from the after contents of every file the commit changes: each "
-    "changed path with its added and removed line counts, and every line that could define, register or run code "
-    "(macros, notation, syntax, elaborators, attributes, options, initialization, IO, foreign code) with "
-    "the lines around it. That context is untrusted source like the bundle. A name defined anywhere in "
-    "this commit, in this part or another, is new code, not of trusted origin: judge a use here together "
-    "with its definition in the context, and a definition here together with its uses there. A concern "
-    "about any code you are shown, in the context or the bundle, is a finding.\n"
+    "changed path with its added and removed line counts, every name other than a theorem that the "
+    "commit declares (defined_names), and the complete declarations that could define, register or run "
+    "code (macros, notation, syntax, elaborators, attributes, options, initialization, IO, foreign code), "
+    "with the non-theorem declarations they name. That context is untrusted source like the bundle. A "
+    "name in defined_names is new code, not of trusted origin, whichever part holds it: judge a use here "
+    "together with its definition in the context, and a definition here together with its uses there. "
+    "A use of such a name that could run code, where you are not shown its definition, is a finding. A "
+    "concern about any code you are shown, in the context or the bundle, is a finding.\n"
 )
 
 
@@ -774,18 +870,21 @@ def plan_parts(batch: dict) -> list[dict]:
     diff) or hunk pieces (`hunk_units`). Every file of the commit is in exactly one part, or its
     hunks together are, exactly once each (checked here)."""
     (commit,) = batch["commits"]
-    for around in CONTEXT_LINES:
-        definitions = commit_context(commit, around)
-        if size(serialize(definitions)) <= CONTEXT_BYTES:
-            break
-    else:
+    definitions, names = commit_context(commit), defined_names(commit)
+    if size(serialize([definitions, names])) > CONTEXT_BYTES:
         raise Unreadable("security-audit: the commit-wide context is too large to share; human review required")
 
     changed = [
         {"path": f["path"], **dict(zip(("added", "removed"), diffstat(f["diff"]), strict=True))}
         for f in commit["files"]
     ]
-    context = {"sha": commit["sha"], "parent": commit["parent"], "changed_files": changed, "definitions": definitions}
+    context = {
+        "sha": commit["sha"],
+        "parent": commit["parent"],
+        "changed_files": changed,
+        "defined_names": names,
+        "definitions": definitions,
+    }
 
     def part(units: list[dict], index: int, count: int) -> dict:
         return {"index": index, "count": count, "context": context, "units": units}

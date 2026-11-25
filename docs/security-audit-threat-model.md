@@ -50,18 +50,27 @@ count, since every token is at least one byte.
   options, `open`s) and, when they fit, 100 after-image lines on each side of each hunk. The
   Worker checks that the parts carry every file exactly once, or every hunk of it exactly once.
 - **Every part carries the same commit-wide context**, extracted by the Worker from the after
-  images of every changed file: the changed paths with their line counts, and every line that
-  could define, register or run code (macro, notation, syntax, elaborator, `initialize`,
-  `set_option`, `attribute`, `export`, `opaque`/`axiom`, `unsafe`/`partial`/`meta`, IO and
-  environment names, `implemented_by`/`extern`, `native_decide`, any `#` command other than
-  read-only ones such as `#check`, and any attribute the baseline does not define or the policy
-  flags), with 20 lines around each (narrowed to 3, then 0, if the context would exceed 150 KB).
-  Removed lines are not context: they cannot run, and they stay in their own file's diff.
-- **The reviewer of each part is told** that names defined anywhere in the commit are new code,
-  not of trusted origin, and to judge a use in its part with the definition shown in the
-  context, and a definition in its part with the uses shown there. So a macro defined in one
-  part and used in another reaches the second part's reviewer with its definition, and the
-  attribute provenance is still computed from the whole commit.
+  images of every changed file: the changed paths with their line counts; every name other than a
+  theorem that the commit declares (`defined_names`); and every complete top-level declaration
+  holding a line that could define, register or run code (macro, notation, syntax, elaborator,
+  `initialize`, `set_option`, `attribute`, `export`, `opaque`/`axiom`, `unsafe`/`partial`/`meta`,
+  `open Lean`, `Lean.*`, metaprogramming types such as `Macro`, `Syntax`, `Expr` and `MetaM`, IO
+  and environment names, `implemented_by`/`extern`, `native_decide`, any `#` command other than
+  read-only ones such as `#check`, and any attribute the baseline does not define, the policy
+  flags, or that attaches a metaprogram such as `macro`, `tactic`, `norm_num` or `positivity`).
+  That set is closed under the non-theorem declarations it names: a registration such as
+  `attribute [macro ...] latent` brings in `latent`, and `latent` brings in the helpers it calls,
+  whichever files hold them. A declaration over 2000 lines is shown as the 20 lines around each
+  matching line. Theorems are never pulled in: proofs do not run. Removed lines are not context:
+  they cannot run, and they stay in their own file's diff. Context over 250 KB holds the commit.
+- **A file split by hunks** also gets, with each piece, the non-theorem declarations of that file
+  its changed lines name (closed the same way), so a hunk that newly uses or registers existing
+  code in the file is shown that code, however far away it is.
+- **The reviewer of each part is told** that "this bundle" in the policy means the whole commit,
+  so a name in `defined_names` is new code, not of trusted origin, whichever part holds it; to
+  judge a use in its part with the definition shown in the context, and a definition in its part
+  with the uses shown there; and that a use of such a name that could run code, without its
+  definition shown, is a finding. The attribute provenance is still computed from the whole commit.
 - **The commit passes only if every part passes.** Each part is triaged by Haiku and, on a
   concern, escalated alone to Sonnet; any part's binding finding binds the commit and ends the
   inspection. The plan (`parts.json`, written before any request) names every part, each part's
@@ -70,13 +79,15 @@ count, since every token is at least one byte.
   does not name, or a plan that cannot be read, holds the commit like any unreadable evidence.
 
 What this gives up: a part's reviewer reads its own files completely but the rest of the commit
-only through the extracted context. Every construct the policy flags, and every definition of a
-macro, notation, syntax, elaborator, attribute or option, is in the context of every part, so
-each is seen in full by the reviewer holding its file and as context by every other. A plain
-`def` is not context: it cannot run at build time unless something the context shows runs it.
+only through the extracted context. Every construct the policy flags, and every declaration that
+defines, registers or runs code, is in the context of every part with the code it names, so each
+is seen in full by the reviewer holding its file and with its dependencies by every other. A
+plain `def` that nothing in the context names is not context: it cannot run at build time unless
+something the context shows runs it. The extraction is lexical (column-0 declarations, names
+matched by their last component), so it errs toward showing more.
 
 Only a single hunk too large for a part even without its surrounding lines, or commit-wide
-context over 150 KB even with no surrounding lines, still holds for a human. This is part of
+commit-wide context over 250 KB, still holds for a human. This is part of
 judgment protocol 8: it changes no judgment of a range already inspected, since such commits were
 held before.
 

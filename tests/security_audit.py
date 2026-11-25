@@ -1296,15 +1296,60 @@ class Parts(unittest.TestCase):
                 "#exit",
                 "public meta def m := 1",
                 "partial def loop : Nat → Nat := loop",
+                "@[norm_num _ + _] def evalAdd := 1",
+                'open Lean in macro "probe" : term => `(1)',
             ]
         )
         commit = {"files": [{"path": "TauCeti/X.lean", "after": text, "diff": ""}]}
-        lines = [x["text"] for x in sa.commit_context(commit, 0)]
-        self.assertEqual(lines, ["\n".join(text.split("\n")[3:14]), "\n".join(text.split("\n")[15:18])])
-        wide = sa.commit_context(commit, 1)
-        self.assertEqual([(x["from_line"], x["to_line"]) for x in wide], [(3, 18)])
+        shown = [x["text"] for x in sa.commit_context(commit)]
+        rows = text.split("\n")
+        self.assertEqual(shown, ["\n".join(rows[3:14]), "\n".join(rows[15:20])])
         deleted = {"files": [{"path": "TauCeti/Y.lean", "after": None, "diff": "-run_cmd pure ()\n"}]}
-        self.assertEqual(sa.commit_context(deleted, 20), [])
+        self.assertEqual(sa.commit_context(deleted), [])
+        self.assertEqual(
+            sa.defined_names(commit), ['"go"', '"‖"', "evalAdd", "loop", "m", "mine", "p", "registerTraceClass", "slow"]
+        )
+
+    def test_context_carries_whole_declarations_and_the_code_they_call_across_files(self):
+        padding = "\n".join(f"  have h{i} : True := trivial" for i in range(60))
+        helper = "def helper : Lean.MacroM Lean.Syntax :=\n" + padding + "\n  `(trivial)"
+        inert = "def latent :=\n  helper"
+        a = "\n".join(["theorem unrelated : True := trivial", helper, inert, "theorem other : True := trivial"])
+        b = "attribute [macro Lean.Parser.Term.trueVal] latent"
+        commit = {
+            "files": [
+                {"path": "TauCeti/A.lean", "after": a, "diff": ""},
+                {"path": "TauCeti/B.lean", "after": b, "diff": ""},
+            ]
+        }
+        shown = sa.serialize(sa.commit_context(commit))
+        # The registration in B pulls in latent from A, and latent pulls in helper, body and all.
+        self.assertIn("attribute [macro", shown)
+        self.assertIn("def latent", shown)
+        self.assertIn("have h59", shown)
+        self.assertNotIn("unrelated", shown)
+        self.assertNotIn("theorem other", shown)
+
+    def test_a_hunk_registering_existing_code_is_shown_that_code(self):
+        filler = [f"theorem filler{i} : True := trivial" for i in range(3000)]
+        lines = ["import Lean", *filler[:1500], "def latent : Lean.Macro := fun _ => Lean.Macro.throwUnsupported"]
+        lines += filler[1500:]
+        (self.root / "TauCeti/Big.lean").write_text("\n".join(lines) + "\n")
+        self.command("add", ".")
+        self.command("commit", "-qm", "inert")
+        base = self.command("rev-parse", "HEAD")
+        lines[200] = "theorem filler199 : True := by trivial"
+        lines.append("attribute [macro Lean.Parser.Command.check] latent")
+        (self.root / "TauCeti/Big.lean").write_text("\n".join(lines) + "\n")
+        self.command("add", ".")
+        self.command("commit", "-qm", "activate")
+        head = self.command("rev-parse", "HEAD")
+        f = sa.build_batch(self.repo, base, head, [head])["commits"][0]["files"][0]
+        units = sa.hunk_units(f, 30_000)
+        registering = next(u for u in units if "attribute [macro" in u["diff"])
+        # The definition is about 1300 lines from either hunk, beyond their surrounding lines.
+        self.assertIn("throwUnsupported", sa.serialize(registering["after_excerpts"]))
+        self.assertNotIn("filler1000 ", sa.serialize(registering["after_excerpts"]))
 
 
 class Run(unittest.TestCase):
