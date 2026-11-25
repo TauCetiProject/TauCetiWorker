@@ -198,12 +198,16 @@ def _apply_build_affinity(w, sv, opts) -> None:
     if opts.dry_run or getattr(opts, "prs", None) or not w.cfg.wid:
         return
     scope, bumps, now = _claim_scope(w), bump_prs(sv), time.time()
+    # A prepared survey is offered again for later tiers; keep what an earlier pass deferred so a
+    # candidate whose grace has since expired comes back.
+    held = sv.__dict__.setdefault("_build_affinity_deferred", {})
     for stage in build_affinity.STAGES:
-        if stage not in round_stages(opts) or _bubble(stage, opts):
+        if stage not in round_stages(opts) or not want(opts.only, stage) or _bubble(stage, opts):
             continue
         kind = sv.kind(stage)
+        candidates = kind.actionable + [c for c in held.get(stage, []) if c not in kind.actionable]
         try:
-            ordered, deferred = build_affinity.prioritize(scope, w.cfg.wid, kind.actionable, now=now)
+            ordered, deferred = build_affinity.prioritize(scope, w.cfg.wid, candidates, now=now)
         except Exception as error:  # noqa: BLE001 - a hint must never cost a round
             log(f"  {stage}: build affinity skipped ({type(error).__name__}: {error})")
             continue
@@ -212,6 +216,7 @@ def _apply_build_affinity(w, sv, opts) -> None:
         if sv.roadmap_backpressure and deferred:
             ordered.extend(deferred)
             deferred = []
+        held[stage] = deferred
         kind.actionable = ordered
         if deferred:
             log(
@@ -2613,6 +2618,7 @@ def _do_fixlike(
         push_scope = current_round_id() or os.urandom(16).hex()
         scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
         scoped_published_before = _rev(co, scoped_push_marker)
+        agent_started = time.time()
         try:
             with (
                 environment(TAUCETI_PUSH_SCOPE=push_scope),
@@ -2641,10 +2647,10 @@ def _do_fixlike(
                     if c.progress is None:
                         c.progress = {}
                     c.progress["published"] = published_after
-        if label in {"fix", "fix-ci", "rebase"}:
-            # The agent ran from this worker's checkout, so its Lake store now holds the PR's modules.
-            from . import build_affinity
+        from . import build_affinity
 
+        if label in {"fix", "fix-ci", "rebase"} and build_affinity.built_since(w.cfg.state, agent_started):
+            # The agent built from this worker's checkout, so its Lake store now holds the PR's modules.
             build_affinity.note_builder(_claim_scope(w), pr, w.cfg.wid)
     if rc == 0 and closed_by_round(c) or stop.outcome and rc in STOPPED_AGENT_CODES:
         # The agent closed its own PR (verified supersession or final resolution): a completed

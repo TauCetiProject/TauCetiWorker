@@ -80,7 +80,8 @@ def builders(scope: str, pr: int, *, now: float | None = None) -> set[str]:
 
 
 def _in_grace(scope: str, pr: int, head: str, now: float) -> bool:
-    """Whether peers still defer this head: true from the first deferral for FIX_AFFINITY_GRACE_S."""
+    """Whether this head is in its first-refusal window: FIX_AFFINITY_GRACE_S from the first time a
+    worker on the host considered it with builders recorded."""
     directory = _directory(scope, pr)
     if directory is None or not _NAME.fullmatch(head or ""):
         return False
@@ -102,40 +103,74 @@ def _in_grace(scope: str, pr: int, head: str, now: float) -> bool:
 def prioritize(scope: str, worker: str, candidates: list, *, now: float | None = None) -> tuple[list, list]:
     """(this worker's builder candidates, then the shared ones), and the peers' deferred ones.
 
-    Each group keeps the incoming order, so the stage's age-weighted spread still applies within it.
+    Both the builders' priority and the peers' deferral last only for the head's grace, so a warm
+    backlog cannot starve other PRs. Each group keeps the incoming order, so the stage's
+    age-weighted spread still applies within it.
     """
     stamp = time.time() if now is None else now
     owned, shared, deferred = [], [], []
     for candidate in candidates:
         found = builders(scope, candidate.pr, now=stamp) if candidate.pr else set()
-        if worker in found:
-            owned.append(candidate)
-        elif found and _in_grace(scope, candidate.pr, candidate.head, stamp):
-            deferred.append(candidate)
-        else:
+        if not found or not _in_grace(scope, candidate.pr, candidate.head, stamp):
             shared.append(candidate)
+        elif worker in found:
+            owned.append(candidate)
+        else:
+            deferred.append(candidate)
     return owned + shared, deferred
 
 
+def built_since(state: Path, since: float) -> bool:
+    """Whether this worker's verification receipts show a build started at or after `since`.
+
+    The receipts are the agent's own `tauceti-verify` calls (verification.py); a round whose agent
+    never built leaves its store as it was, and so earns no first refusal.
+    """
+    try:
+        entries = list(os.scandir(Path(state) / "verification"))
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            if entry.stat().st_mtime < since:
+                continue
+            receipt = json.loads((Path(entry.path) / "receipt.json").read_text())
+        except (OSError, ValueError):
+            continue
+        started = receipt.get("started_at") if isinstance(receipt, dict) else None
+        phases = receipt.get("phases") if isinstance(receipt, dict) else None
+        if isinstance(started, (int, float)) and started >= since and isinstance(phases, dict) and "build" in phases:
+            return True
+    return False
+
+
 def _prune(root: Path, now: float) -> None:
-    """Drop PR directories whose newest record is past every TTL."""
-    horizon = max(BUILDER_TTL_S, FIX_AFFINITY_GRACE_S)
+    """Delete records older than BUILDER_TTL_S, one file at a time, and then any empty directories.
+
+    Each file is judged by its own age just before it goes, so a concurrent refresh can at worst
+    lose one record (one cold round) or restart a day-old head's grace.
+    """
     try:
         directories = list(root.iterdir())
     except OSError:
         return
     for directory in directories:
-        try:
-            files = [
-                p for sub in ("workers", "deferred") if (directory / sub).is_dir() for p in (directory / sub).iterdir()
-            ]
-            if any(now - p.stat().st_mtime <= horizon for p in files):
+        for sub in ("workers", "deferred"):
+            try:
+                paths = list((directory / sub).iterdir())
+            except OSError:
                 continue
-            for path in files:
-                path.unlink(missing_ok=True)
-            for sub in ("workers", "deferred"):
-                if (directory / sub).is_dir():
-                    (directory / sub).rmdir()
+            for path in paths:
+                try:
+                    if now - path.stat().st_mtime > BUILDER_TTL_S:
+                        path.unlink()
+                except OSError:
+                    pass
+            try:
+                (directory / sub).rmdir()  # only succeeds when empty
+            except OSError:
+                pass
+        try:
             directory.rmdir()
         except OSError:
             pass

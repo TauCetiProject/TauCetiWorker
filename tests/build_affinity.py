@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build affinity: a PR's builders get first refusal on its next agent round (decision 210 C)."""
 
+import json
 import os
 import sys
 import tempfile
@@ -102,7 +103,7 @@ with tempfile.TemporaryDirectory() as tmp:
         return sv
 
     w = types.SimpleNamespace(cfg=types.SimpleNamespace(wid="w1"), gh=types.SimpleNamespace(repo=scope))
-    opts = types.SimpleNamespace(dry_run=False, prs=(), sandbox_host=True)
+    opts = types.SimpleNamespace(dry_run=False, prs=(), sandbox_host=True, only=[])
     real_time = work_units.time.time
     work_units.time.time = lambda: NOW
     try:
@@ -113,13 +114,52 @@ with tempfile.TemporaryDirectory() as tmp:
         work_units._apply_build_affinity(w, sv, opts)
         check("paused authoring keeps deferred PRs", sorted(prs(sv.needs_fix.actionable)), [30, 32])
         sv = survey(30, 32)
-        work_units._apply_build_affinity(w, sv, types.SimpleNamespace(dry_run=False, prs=(30,), sandbox_host=True))
+        work_units._apply_build_affinity(
+            w, sv, types.SimpleNamespace(dry_run=False, prs=(30,), sandbox_host=True, only=[])
+        )
         check("operator-named PRs bypass affinity", prs(sv.needs_fix.actionable), [30, 32])
         sv = survey(30, 32)
-        work_units._apply_build_affinity(w, sv, types.SimpleNamespace(dry_run=True, prs=(), sandbox_host=True))
+        work_units._apply_build_affinity(w, sv, types.SimpleNamespace(dry_run=True, prs=(), sandbox_host=True, only=[]))
         check("dry runs bypass affinity", prs(sv.needs_fix.actionable), [30, 32])
+        sv = survey(30, 32)
+        work_units._apply_build_affinity(
+            w, sv, types.SimpleNamespace(dry_run=False, prs=(), sandbox_host=True, only=["review"])
+        )
+        check("a worker not taking fixes neither defers nor starts a grace", prs(sv.needs_fix.actionable), [30, 32])
+        # A prepared survey offered again after the grace brings the deferred PR back.
+        note(33, "w2", at=NOW)
+        sv = survey(33, 34)
+        work_units._apply_build_affinity(w, sv, opts)
+        check("first pass defers the peer's PR", prs(sv.needs_fix.actionable), [34])
+        work_units.time.time = lambda: NOW + GRACE
+        work_units._apply_build_affinity(w, sv, opts)
+        check("a later pass after the grace restores it", sorted(prs(sv.needs_fix.actionable)), [33, 34])
     finally:
         work_units.time.time = real_time
+
+    # The builder's own priority expires with the grace too, so a warm backlog cannot starve others.
+    note(40, "w1", at=NOW)
+    ordered, _ = build_affinity.prioritize(scope, "w1", [candidate(41), candidate(40)], now=NOW)
+    check("a builder's priority within the grace", prs(ordered), [40, 41])
+    ordered, _ = build_affinity.prioritize(scope, "w1", [candidate(41), candidate(40)], now=NOW + GRACE)
+    check("no builder priority after the grace", prs(ordered), [41, 40])
+
+    # Only a round whose agent built counts as building.
+    state = Path(tmp) / "state"
+    check("no receipts: not built", build_affinity.built_since(state, NOW), False)
+    for name, started, phases in (("old", NOW - 5, {"build": {}}), ("lint", NOW + 5, {"lint": {}})):
+        receipt = state / "verification" / name / "receipt.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps(dict(started_at=started, phases=phases)))
+        os.utime(receipt.parent, (started, started))
+    check(
+        "an earlier build or a lint-only call is not this round's build", build_affinity.built_since(state, NOW), False
+    )
+    receipt = state / "verification" / "new" / "receipt.json"
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps(dict(started_at=NOW + 9, phases={"build": {"status": "failed"}})))
+    os.utime(receipt.parent, (NOW + 9, NOW + 9))
+    check("a build in this round counts, even a failed one", build_affinity.built_since(state, NOW), True)
 
 print(f"\n{'PASS' if not fails else 'FAIL'}: {fails} mismatch(es)")
 sys.exit(1 if fails else 0)
