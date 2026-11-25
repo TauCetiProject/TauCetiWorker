@@ -26,7 +26,7 @@ import json, os, shutil, sys
 from pathlib import Path
 bucket = Path(os.environ["BUCKET"])
 config = sys.stdin.read().splitlines()
-assert "--config" in sys.argv and "-" in sys.argv, sys.argv
+assert sys.argv[1:] == ["--disable", "--config", "-"], sys.argv
 assert not any("secret" in a for a in sys.argv), "the key never reaches the command line"
 def value(line):
     return json.loads(line.split("=", 1)[1].strip())
@@ -54,7 +54,7 @@ for i, (url, path) in enumerate(transfers):
             key.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, key)
             code = 200
-    print(json.dumps({"urlnum": i, "http_code": code, "exitcode": 0}))
+    print(f"{i} 0 {code} {url}")
 """
 
 
@@ -250,6 +250,56 @@ class Upload(unittest.TestCase):
         self.assertEqual(errors, [])
         record = repair_upload.UploadRecord(self.record)
         self.assertEqual(len(record.known([f"u{i}-{n}" for i in range(4) for n in range(50)])), 200)
+        record.close()
+
+    def test_a_control_character_never_reaches_the_curl_config(self):
+        with self.assertRaises(ValueError):
+            repair_upload._quoted("https://x/a\nlibcurl = /dev/stderr")
+        result = repair_upload.upload(
+            self.stage(),
+            base=BASE + "\nverbose",
+            repository=REPO,
+            toolchain=TOOLCHAIN,
+            revision=REV,
+            key="id:secret",
+            env=self.env,
+            log_path=self.root / "logs" / "cache-put.log",
+            timeout=60,
+            record_path=self.record,
+        )
+        self.assertEqual(result["rc"], 1)
+        self.assertEqual(self.requests(), [])
+
+    def test_retryable_answers_are_retried_and_confirmed_puts_survive_a_timeout(self):
+        import subprocess
+        from unittest.mock import patch
+
+        url = self.art("00aa00aa00aa00aa")
+        answers = iter([408, 200])
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, f"0 0 {next(answers)} {url}\n", "")
+
+        curl = repair_upload.Curl("id:secret", self.env, lambda _: None, deadline=time.monotonic() + 30)
+        with patch.object(repair_upload.subprocess, "run", run), patch.object(repair_upload.time, "sleep"):
+            self.assertEqual(curl.transfer("put", [(url, None)], "t"), {url: 200})
+        self.assertEqual(len(calls), 2)
+
+        def slow(argv, **kwargs):
+            if "head" in kwargs["input"].splitlines():
+                heads = "".join(f"{i} 0 404 {self.art(h)}\n" for i, h in enumerate(self.hashes))
+                return subprocess.CompletedProcess(argv, 0, heads, "")
+            # a report for a URL other than the transfer's is never taken for it
+            reports = f"0 0 200 {url}\n1 0 200 {self.art('ffffffffffffffff')}\n"
+            raise subprocess.TimeoutExpired(argv, 1, output=reports.encode())
+
+        with patch.object(repair_upload.subprocess, "run", slow):
+            result = self.upload(self.stage())
+        self.assertEqual((result["rc"], result["timed_out"]), (124, True))
+        record = repair_upload.UploadRecord(self.record)
+        self.assertEqual(record.known([self.art(h) for h in self.hashes]), {url}, "the confirmed PUT is recorded")
         record.close()
 
     def test_settings_choose_the_record(self):

@@ -35,7 +35,8 @@ ATTEMPTS = 3  # tries per transfer, as Lake's transferAttempts
 PARALLEL = 32
 RECORD_TTL = 7 * 86400.0  # seconds an entry is trusted before the artifact is checked again
 RECORD_LIMIT = 1_000_000  # entries kept; the oldest go first
-BUSY_TIMEOUT = 60.0  # seconds to wait for another process's write lock on the record
+BUSY_TIMEOUT = 5.0  # seconds to wait for another process's lock on the record before going without
+CHUNK = 2000  # transfers per curl run, so progress is recorded as it goes and reports stay small
 
 
 def default_record_path(environ: dict | None = None) -> Path:
@@ -164,7 +165,13 @@ class UploadRecord:
 
 
 def _quoted(value: str) -> str:
+    """A curl config string; a control character (a newline would start another option) is refused."""
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise ValueError("a control character in a curl config value")
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+RETRY = {408, 429}  # and every 5xx, and a transfer curl itself failed
 
 
 class Curl:
@@ -178,7 +185,9 @@ class Curl:
         self.env = env
         self.log = log
         self.deadline = deadline
-        self.argv = [*prefix, env.get("CURL") or "curl", "--config", "-"]
+        # --disable first: no ~/.curlrc, whose options or URLs would shift the transfers' numbering.
+        self.argv = [*prefix, env.get("CURL") or "curl", "--disable", "--config", "-"]
+        self.confirmed: set[str] = set()  # PUT URLs answered 200 or 201, kept when a later call times out
 
     def _left(self) -> float:
         left = self.deadline - time.monotonic()
@@ -186,12 +195,15 @@ class Curl:
             raise TimeoutError("the upload ran out of time")
         return left
 
-    def _once(self, kind: str, items: list[tuple[str, Path | None]], content_type: str | None) -> dict[int, dict]:
+    def _once(
+        self, kind: str, items: list[tuple[str, Path | None]], content_type: str | None
+    ) -> dict[int, tuple[int, int]]:
         lines = [
             f"user = {_quoted(self.key)}",
             'aws-sigv4 = "aws:amz:auto:s3"',
             "silent",
-            'write-out = "%{json}\\n"',
+            "location",
+            'write-out = "%{urlnum} %{exitcode} %{http_code} %{url}\\n"',
         ]
         if len(items) > 1:
             lines += ["parallel", f"parallel-max = {PARALLEL}"]
@@ -204,34 +216,50 @@ class Curl:
                 lines.append(f"upload-file = {_quoted(str(path))}")
             lines += [f"url = {_quoted(url)}", 'output = "/dev/null"']
         config = "\n".join(lines) + "\n"
-        proc = subprocess.run(
-            self.argv,
-            input=config,
-            env=self.env,
-            capture_output=True,
-            text=True,
-            timeout=self._left(),
-            check=False,
-        )
-        results: dict[int, dict] = {}
-        for line in proc.stdout.splitlines():
-            try:
-                out = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(out, dict) and isinstance(out.get("urlnum"), int):
-                results[out["urlnum"]] = out
-        if proc.stderr.strip():
-            self.log(f"curl {kind}: {proc.stderr.strip()[:2000]}")
+        try:
+            proc = subprocess.run(
+                self.argv,
+                input=config,
+                env=self.env,
+                capture_output=True,
+                text=True,
+                timeout=self._left(),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            self._parse(kind, items, error.stdout)
+            raise
+        results = self._parse(kind, items, proc.stdout)
+        stderr = proc.stderr.strip().replace(self.key, "<key>") if self.key else proc.stderr.strip()
+        if stderr:
+            self.log(f"curl {kind}: {stderr[:2000]}")
         if proc.returncode and not results:
             self.log(f"curl {kind} exited {proc.returncode} reporting no transfer")
+        return results
+
+    def _parse(self, kind: str, items: list[tuple[str, Path | None]], stdout) -> dict[int, tuple[int, int]]:
+        """(curl exit code, HTTP status) by transfer index, from reports naming the expected URL."""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        results: dict[int, tuple[int, int]] = {}
+        for line in (stdout or "").splitlines():
+            parts = line.split(" ", 3)
+            if len(parts) != 4 or not all(p.isdigit() for p in parts[:3]):
+                continue
+            index, exitcode, code = (int(p) for p in parts[:3])
+            if index >= len(items) or items[index][0] != parts[3] or index in results:
+                self.log(f"curl {kind}: ignoring an unexpected report {line[:300]!r}")
+                continue
+            results[index] = (exitcode, code)
+            if kind == "put" and exitcode == 0 and code in (200, 201):
+                self.confirmed.add(items[index][0])
         return results
 
     def transfer(
         self, kind: str, items: list[tuple[str, Path | None]], content_type: str | None = None
     ) -> dict[str, int | None]:
         """HTTP status by URL (None where curl failed the transfer itself), retrying failed transfers,
-        429s and 5xx answers up to ``ATTEMPTS`` times."""
+        408s, 429s and 5xx answers up to ``ATTEMPTS`` times."""
         final: dict[str, int | None] = {url: None for url, _ in items}
         pending = list(items)
         for attempt in range(1, ATTEMPTS + 1):
@@ -242,10 +270,9 @@ class Curl:
             results = self._once(kind, pending, content_type)
             retry = []
             for index, item in enumerate(pending):
-                out = results.get(index) or {}
-                code = out.get("http_code") if out.get("exitcode", 0) == 0 else None
-                final[item[0]] = code if isinstance(code, int) and code else None
-                if final[item[0]] is None or final[item[0]] == 429 or final[item[0]] >= 500:
+                exitcode, code = results.get(index, (1, 0))
+                final[item[0]] = code if exitcode == 0 and code else None
+                if final[item[0]] is None or final[item[0]] in RETRY or final[item[0]] >= 500:
                     retry.append(item)
             pending = retry
         return final
@@ -277,6 +304,8 @@ def upload(
 
     result: dict = {"rc": 1, "timed_out": False, "log": str(log_path)}
     record: UploadRecord | None = None
+    curl: Curl | None = None
+    urls: dict[str, str] = {}
     try:
         log(f"$ upload {stage} --rev={revision} --repo {repository} --toolchain={toolchain} to {base}")
         hashes = staged_artifacts(stage)
@@ -287,28 +316,37 @@ def upload(
         recorded = record.known(list(urls.values())) if record is not None else set()
         curl = Curl(key, env, log, deadline=started + timeout, prefix=prefix)
         unknown = [(h, urls[h]) for h in hashes if urls[h] not in recorded]
-        heads = curl.transfer("head", [(url, None) for _, url in unknown]) if unknown else {}
-        present = [url for _, url in unknown if heads.get(url) == 200]
-        if record is not None:
-            record.add(present)
-        missing = [(h, url) for h, url in unknown if heads.get(url) != 200]
-        result.update(artifacts=len(hashes), recorded=len(recorded), present=len(present), uploaded=0)
-        log(
-            f"{len(hashes)} artifacts: {len(recorded)} in the host record, {len(present)} found by HEAD, "
-            f"{len(missing)} to upload"
-        )
-        if missing:
+        result.update(artifacts=len(hashes), recorded=len(recorded), present=0, uploaded=0)
+        failed: dict[str, int | None] = {}
+        for start in range(0, len(unknown), CHUNK):
+            chunk = unknown[start : start + CHUNK]
+            heads = curl.transfer("head", [(url, None) for _, url in chunk])
+            present = [url for _, url in chunk if heads.get(url) == 200]
+            if record is not None:
+                record.add(present)
+            result["present"] += len(present)
+            missing = [(h, url) for h, url in chunk if heads.get(url) != 200]
+            if record is not None and missing:  # another publisher may have uploaded them meanwhile
+                again = record.known([url for _, url in missing])
+                result["recorded"] += len(again)
+                missing = [(h, url) for h, url in missing if url not in again]
+            if not missing:
+                continue
             puts = curl.transfer("put", [(url, stage / f"{h}.ltar") for h, url in missing], ARTIFACT_TYPE)
             done = [url for _, url in missing if puts.get(url) in (200, 201)]
             if record is not None:
                 record.add(done)
-            result["uploaded"] = len(done)
-            failed = [url for _, url in missing if puts.get(url) not in (200, 201)]
-            if failed:
-                for url in failed[:20]:
-                    log(f"failed to upload {url}: HTTP {puts.get(url)}")
-                log(f"{len(failed)} artifact upload(s) failed; the revision map is not uploaded")
-                return result
+            result["uploaded"] += len(done)
+            failed.update((url, puts.get(url)) for _, url in missing if puts.get(url) not in (200, 201))
+        log(
+            f"{len(hashes)} artifacts: {result['recorded']} in the host record, {result['present']} found by HEAD, "
+            f"{result['uploaded']} uploaded, {len(failed)} failed"
+        )
+        if failed:
+            for url, code in list(failed.items())[:20]:
+                log(f"failed to upload {url}: HTTP {code}")
+            log(f"{len(failed)} artifact upload(s) failed; the revision map is not uploaded")
+            return result
         map_url = revision_url(base, repository, toolchain, revision)
         put = curl.transfer("put", [(map_url, stage / "outputs.jsonl")], MAP_TYPE)
         if put.get(map_url) not in (200, 201):
@@ -328,6 +366,8 @@ def upload(
         log(f"{type(error).__name__}: {error}")
     finally:
         if record is not None:
+            if result["rc"] and curl is not None:  # artifacts confirmed before a timeout or error
+                record.add([url for url in urls.values() if url in curl.confirmed])
             record.close()
         result["seconds"] = round(time.monotonic() - started, 1)
         handle.close()

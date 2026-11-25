@@ -585,7 +585,7 @@ for i, (url, path) in enumerate(transfers):
             with (remote / "uploads.log").open("a") as uploads:
                 uploads.write(f"mapping {name[:-len('.jsonl')]}\n" if is_map else f"artifact {target.name}\n")
             code = 200
-    print(json.dumps({"urlnum": i, "http_code": code, "exitcode": 0}), flush=True)
+    print(f"{i} 0 {code} {url}", flush=True)
 """
 
 ELAN = r"""#!/bin/sh

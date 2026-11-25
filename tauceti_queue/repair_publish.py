@@ -49,7 +49,7 @@ SPEC = "publish-spec.json"
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 # The environment a publisher in a transient systemd unit gets (the user manager's own is not the
 # worker's); everything else, the worker's credentials included, stays behind.
-UNIT_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "ELAN_HOME", "PYTHONPATH")
+UNIT_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TMPDIR", "ELAN_HOME", "PYTHONPATH", "XDG_CACHE_HOME")
 
 
 def log(message: str) -> None:
