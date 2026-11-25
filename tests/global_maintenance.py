@@ -276,6 +276,50 @@ class GlobalMaintenance(unittest.TestCase):
             run_round(self.w, self.opts, prepared_survey=prepared)
         dispatch.assert_called_once()
 
+    def test_unchanged_review_records_are_per_head_scope_and_expire(self):
+        from tauceti_worker import peer_claims
+
+        shared = tempfile.TemporaryDirectory()
+        self.addCleanup(shared.cleanup)
+        with patch.dict(os.environ, TAUCETI_GITHUB_SHARED_DIR=shared.name):
+            self.assertFalse(peer_claims.unchanged_review_noted("github:one/project", 7, HEAD, now=1000))
+            peer_claims.note_unchanged_review("github:one/project", 7, HEAD, now=1000)
+            self.assertTrue(peer_claims.unchanged_review_noted("github:one/project", 7, HEAD, now=1000 + 3600))
+            self.assertFalse(peer_claims.unchanged_review_noted("github:one/project", 7, "b" * 40, now=1001), "a push")
+            self.assertFalse(peer_claims.unchanged_review_noted("forgejo:one/project", 7, HEAD, now=1001))
+            self.assertFalse(peer_claims.diff_guarded("github:one/project", 7, HEAD, now=1001))
+            self.assertFalse(
+                peer_claims.unchanged_review_noted(
+                    "github:one/project", 7, HEAD, now=1000 + peer_claims.UNCHANGED_REVIEW_TTL_S + 1
+                )
+            )
+        self.assertFalse(peer_claims.unchanged_review_noted("github:one/project", 7, HEAD), "no shared directory")
+
+    def test_a_review_head_found_unchanged_by_a_peer_is_skipped_as_no_work(self):
+        from tauceti_worker import peer_claims
+        from tauceti_worker.survey import Candidate, Survey
+
+        prepared = Survey(worker_id="test", roadmap_only="auto")
+        prepared._round_scope = (True, False)
+        prepared.reviewable.actionable = [Candidate(10, HEAD, partial_history=True)]
+        self.opts.only = ["review"]
+        with (
+            patch.object(peer_claims, "unchanged_review_noted", return_value=True) as noted,
+            patch.object(work, "dispatch") as dispatch,
+        ):
+            with self.assertRaises(work.NoEligibleWork):
+                run_round(self.w, self.opts, prepared_survey=prepared)
+        self.assertEqual(noted.call_args.args[1:], (10, HEAD))
+        dispatch.assert_not_called()
+        # A candidate from complete history, such as a new contest reply at the same head, is offered.
+        prepared.reviewable.actionable = [Candidate(10, HEAD, contest="reuse", contest_reply_id=999)]
+        with (
+            patch.object(peer_claims, "unchanged_review_noted", return_value=True),
+            patch.object(work, "dispatch", return_value=0) as dispatch,
+        ):
+            run_round(self.w, self.opts, prepared_survey=prepared)
+        dispatch.assert_called_once()
+
     def test_fixed_heads_are_recorded_per_pr_and_scope_and_expire(self):
         from tauceti_worker import peer_claims
 
