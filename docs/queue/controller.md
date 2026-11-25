@@ -901,8 +901,10 @@ TauCetiTools `docs/main-integration.md`), and reads the `main-integration` commi
 outstanding head in one GraphQL query per pass (`main_integration_statuses`).
 
 - **Candidates:** members of open, unsealed, non-emergency, non-lane batches that are not the head,
-  from GitHub (Forgejo members later), whose input has no result younger than
-  `main_integration_fresh_seconds`. Order: a red result awaiting confirmation first, then the next
+  from GitHub and Forgejo, whose input has no result younger than
+  `main_integration_fresh_seconds`. A Forgejo member is dispatched with `source` `forgejo`, and
+  waits while its head's Forgejo PR build is pending (both report the one `main-integration`
+  status on the head). Order: a red result awaiting confirmation first, then the next
   batch to seal, then members the static check flags (or has not checked), then the oldest base.
   CI runs a build only on idle Fleet PR capacity and otherwise reports it deferred. After a
   deferral nothing new is asked for `main_integration_deferred_retry_seconds`; then one build at a

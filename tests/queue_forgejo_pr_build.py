@@ -315,6 +315,50 @@ class ForgejoPRBuild(MixedFixture, unittest.TestCase):
         self.assertEqual(loads(self.row(head)["runs"]), ["https://github.com/run/1"])
 
 
+class ForgejoMembersOnMain(MixedFixture, unittest.TestCase):
+    """The main-integration backfill (decision 208 E) builds queued Forgejo members too."""
+
+    def setUp(self):
+        super().setUp()
+        self.registry_ = self.registry()
+        self.poller = self.registry_.poller = NativePoller(self.registry_, self.controller)
+        self.controller.admission = AdmissionInputs(None, self.poller)
+        self.controller.set_setting("publication_enabled", True, "test")
+        # Forgejo PR 1 heads the queue, so PR 2 waits in the open batch behind it.
+        self.native.create_pr(1, {"TauCeti/A.lean": "theorem a : True := trivial\n"})
+        self.poller.run_once()
+        self.controller.tick()
+        self.native_head = self.native.create_pr(2, {"TauCeti/F.lean": "theorem f : True := trivial\n"})
+        self.clock.advance(self.registry_.poll_seconds + 1)
+        self.poller._discovery_at = 0
+        self.poller.run_once()
+        self.controller.tick()
+        member = self.controller.input_for(self.native_id.repository.key, 2)
+        self.assertEqual(member["state"], "inserted")
+        self.assertFalse(self.controller.store.row("batches", {"id": member["batch_id"]})["sealed"])
+        self.controller.set_setting("main_integration_interval_seconds", 0, "test")
+        self.controller.set_setting("main_integration_enabled", True, "test")
+
+    def test_a_forgejo_member_is_dispatched_with_its_source(self):
+        self.controller.tick()
+        requests = list(zip(self.github.main_integration_requests, self.github.main_integration_options, strict=True))
+        self.assertEqual(
+            requests, [((2, self.native_head, self.controller._canonical), {"source": "forgejo", "priority": "idle"})]
+        )
+
+    def test_a_head_with_a_pending_pr_build_waits_for_it(self):
+        self.controller.store.insert(
+            "pr_builds",
+            source=self.native_id.repository.key,
+            number=2,
+            head_sha=self.native_head,
+            state="pending",
+            main_sha=self.controller._canonical,
+        )
+        self.controller.tick()
+        self.assertEqual(self.github.main_integration_requests, [])
+
+
 class PublisherStatus(unittest.TestCase):
     """The Forgejo write itself: only `build`, only as the publisher, only linking to GitHub."""
 

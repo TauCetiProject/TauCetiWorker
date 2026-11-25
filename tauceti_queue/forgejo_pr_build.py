@@ -125,6 +125,13 @@ def observe(ctl, pull) -> None:
             ctl.store.update("pr_builds", {"id": row["id"]}, state=SKIPPED, reason=reason, settled_at=None)
 
 
+def building_heads(ctl) -> set[str]:
+    """The Forgejo heads whose PR build is pending: the backfill leaves them to it."""
+    if getattr(ctl, "mixed", None) is None:
+        return set()
+    return {row["head_sha"] for row in _rows(ctl, PENDING)}
+
+
 def _current(ctl, row: dict[str, Any]) -> bool:
     """The PR is still open at this head, as the native poller last saw it (no API call)."""
     work = ctl.store.row("admission_work", {"repository": row["source"], "number": row["number"]})

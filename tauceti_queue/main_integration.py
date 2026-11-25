@@ -6,8 +6,11 @@ them (Forgejo PRs and self-tested GitHub PRs) were never built on a recent main.
 canonical commit, without pushing anything (TauCetiTools `docs/main-integration.md`):
 
 - **Candidates** are the members of open, unsealed, non-emergency, non-lane batches whose input has
-  no result younger than `main_integration_fresh_seconds` (GitHub sources only, for now). They are
-  ordered by batch (the next to seal first), then by the cheap static check (`stale_check.py`:
+  no result younger than `main_integration_fresh_seconds`, from GitHub and from Forgejo. A Forgejo
+  member's head is retained on GitHub at admission, and its dispatch names `source` `forgejo`, so
+  the build never reads the same-numbered GitHub PR. A head whose Forgejo PR build is in flight
+  (`forgejo_pr_build.py`) waits for it: both report the head's one `main-integration` status. They
+  are ordered by batch (the next to seal first), then by the cheap static check (`stale_check.py`:
   flagged first), then by the age of their base (oldest first). At most
   `main_integration_max_in_flight` builds are outstanding; CI itself runs one only on idle Fleet PR
   capacity, and otherwise reports it deferred. After a deferral nothing new is asked for
@@ -36,7 +39,8 @@ import secrets
 import time
 from typing import Any
 
-from . import chain, ports, stale_check
+from . import chain, forgejo_pr_build, ports, stale_check
+from .mixed_identity import SourceNumber
 from .store import dumps, loads
 
 PENDING, DEFERRED, SUCCESS, FAILURE, ERROR, EXPIRED = "pending", "deferred", "success", "failure", "error", "expired"
@@ -105,7 +109,6 @@ def _candidates(ctl) -> list[tuple[dict[str, Any], dict[str, Any], dict[str, Any
                 row is None
                 or row["state"] != "inserted"
                 or row["batch_id"] != batch["id"]
-                or row["source_identity"]
                 or row["head_sha"] != member["accepted_head"]
             ):
                 continue
@@ -361,7 +364,12 @@ def _dispatch(ctl, candidates, now: float) -> None:
     if budget <= 0 or not main:
         return
     fresh = ctl.setting("main_integration_fresh_seconds")
-    due = [(batch, member, row) for batch, member, row in candidates if _due(record_of(row), now, fresh)]
+    building = forgejo_pr_build.building_heads(ctl)
+    due = [
+        (batch, member, row)
+        for batch, member, row in candidates
+        if _due(record_of(row), now, fresh) and row["head_sha"] not in building
+    ]
     if not due:
         return
     _check(ctl, due, main, now)
@@ -385,7 +393,11 @@ def _dispatch(ctl, candidates, now: float) -> None:
         try:
             with ctl._lock.unlocked():
                 ctl.execution.dispatch_main_integration(
-                    ctl.repository, pr=int(row["number"]), head_sha=row["head_sha"], main_sha=main
+                    ctl.repository,
+                    pr=int(row["number"]),
+                    head_sha=row["head_sha"],
+                    main_sha=main,
+                    **({"source": "forgejo"} if isinstance(row["number"], SourceNumber) else {}),
                 )
         except Exception as error:  # noqa: BLE001 - the next pass tries again
             ctl._reasons.append(f"main-integration dispatch of {row['number']} not accepted: {error}")
