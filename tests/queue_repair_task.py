@@ -667,6 +667,15 @@ TOOLS_SCRIPTS = {
     "LintEnvDriver.lean": "-- stand-in\n",
     "Axioms.lean": "-- stand-in\n",
     "lint-env.sh": (
+        # --prepare (TauCetiTools #377) seals the scope in DIR; LINT_ENV_INPUTS must name such a DIR.
+        'scope_record() { echo "${LINT_CHANGED_ONLY:-0} $(cat "${LINT_ONLY_MODULES:-/dev/null}" | tr "\\n" " ")"; }\n'
+        'if [ "${1:-}" = --prepare ]; then mkdir -p "$2"; test -z "$(ls -A "$2")" || exit 1; '
+        '[ ! -f "$STUB_DIR/lint-prepare-fails" ] || { echo "LINT-ENV: FAIL cannot seal"; exit 1; }; '
+        'scope_record > "$2/scope"; chmod -R a-w "$2"; echo "$(scope_record)" >> "$STUB_DIR/lint-prepare.log"; exit 0; fi\n'
+        'if [ -n "${LINT_ENV_INPUTS:-}" ]; then '
+        '{ [ "$(id -u)" = 0 ] || [ ! -w "$LINT_ENV_INPUTS/scope" ]; } || { echo "LINT-ENV: FAIL writable"; exit 1; }; '
+        '[ "$(cat "$LINT_ENV_INPUTS/scope")" = "$(scope_record)" ] || { echo "LINT-ENV: FAIL other scope"; exit 1; }; '
+        'echo sealed >> "$STUB_DIR/lint-sealed.log"; else echo unsealed >> "$STUB_DIR/lint-sealed.log"; fi\n'
         'if [ -n "$LINT_ONLY_MODULES" ]; then cp "$LINT_ONLY_MODULES" "$STUB_DIR/lint-scope.txt"; '
         'else find TauCeti -name "*.lean" | sort | sed "s|/|.|g;s|.lean$||" > "$STUB_DIR/lint-scope.txt"; fi\n'
         'echo "${LINT_CHANGED_ONLY:-0}" $(cat "$STUB_DIR/lint-scope.txt") >> "$STUB_DIR/lint-runs.log"\n'
@@ -6736,6 +6745,9 @@ class WorkerAudits(Fixture):
             ],
         )
         self.assertEqual((self.stub_dir / "lint-shards.log").read_text().split(), ["2", "2", "2"])
+        # Every lint read the scope sealed on the host before it ran: the changed one twice, then the full one.
+        self.assertEqual((self.stub_dir / "lint-sealed.log").read_text().split(), ["sealed"] * 3)
+        self.assertIs(outcome["verification"][-1]["checks"]["lint_inputs_sealed"], True)
 
     def test_a_changed_only_driver_failure_falls_back_to_the_whole_library_lint(self):
         # Batch 465's tip: the changed-only docstring-scan driver could not compile its module list.
@@ -6791,6 +6803,63 @@ class WorkerAudits(Fixture):
             (self.stub_dir / "lint-runs.log").read_text().splitlines(),
             ["0 TauCeti.A TauCeti.One TauCeti.Three TauCeti.Two"],
         )
+
+    def test_the_lint_reads_inputs_sealed_on_the_host_and_mounted_read_only(self):
+        """TauCetiTools #377: `lint-env.sh --prepare` seals the module lists in the host-only verifier
+        directory before any sandboxed command runs, and each lint gets them in LINT_ENV_INPUTS."""
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        [verification] = outcome["verification"]
+        self.assertTrue(verification["ok"], verification)
+        self.assertIs(verification["checks"]["lint_inputs_sealed"], True)
+        # Each check seals once per scope, the whole library and then the changed modules, and both lints
+        # (changed, then full) read their own sealed scope.
+        lints = [c["argv"] for c in self.bwrap_calls() if any(a.endswith("/lint-env.sh") for a in c["argv"])]
+        checks = len(lints) // 2
+        self.assertGreater(checks, 0)
+        self.assertEqual(
+            (self.stub_dir / "lint-prepare.log").read_text().splitlines(),
+            ["0 ", "1 TauCeti.One TauCeti.Three TauCeti.Two "] * checks,
+        )
+        self.assertEqual((self.stub_dir / "lint-sealed.log").read_text().split(), ["sealed"] * len(lints))
+        for argv, name in zip(lints, ("lint-inputs-changed", "lint-inputs-full") * checks, strict=True):
+            setenv = {argv[i + 1]: argv[i + 2] for i, a in enumerate(argv[: argv.index("--")]) if a == "--setenv"}
+            inputs = Path(setenv["LINT_ENV_INPUTS"])
+            self.assertEqual(inputs.name, name)
+            self.assertIn(f"/{repair_audit.VERIFIER_DIR}/check-", str(inputs))
+            mounts = [argv[i + 1] for i, a in enumerate(argv) if a == "--ro-bind"]
+            self.assertTrue(any(inputs.resolve().is_relative_to(m) for m in mounts), "mounted read-only")
+            self.assertFalse(
+                any(inputs.resolve().is_relative_to(argv[i + 1]) for i, a in enumerate(argv) if a == "--bind")
+            )
+        # The sealed, read-only directories are removed with the rest of the verifier directory.
+        self.assertEqual(list((cfg.root / repair_audit.TOOLS_DIR / repair_audit.VERIFIER_DIR).iterdir()), [])
+
+    def test_a_tools_pin_without_sealed_lint_inputs_runs_the_lint_as_before(self):
+        with patch.object(repair_audit, "LINT_PREPARE_OPTION", "--a-later-option"):
+            cfg = self.config()
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(outcome["status"], "adopted", outcome)
+        [verification] = outcome["verification"]
+        self.assertTrue(verification["ok"], verification)
+        self.assertIs(verification["checks"]["lint_inputs_sealed"], False)
+        self.assertIs(verification["checks"]["verifier_isolated"], False)
+        self.assertFalse((self.stub_dir / "lint-prepare.log").exists())
+        sealed = (self.stub_dir / "lint-sealed.log").read_text().split()
+        self.assertEqual(sealed, ["unsealed"] * len(sealed))
+        self.assertTrue(sealed)
+
+    def test_inputs_that_cannot_be_sealed_leave_the_checks_unavailable(self):
+        self.findings("lint-prepare-fails", "")
+        cfg = self.config()
+        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        checks = outcome["verification"][0]["checks"]
+        self.assertEqual(checks["status"], "unavailable", checks)
+        self.assertIn("sealing the environment lint's inputs", checks["reason"])
+        self.assertIn("cannot seal", checks["reason"])
+        self.assertFalse((self.stub_dir / "lint-runs.log").exists(), "no lint ran unsealed")
+        self.assertEqual(list((cfg.root / repair_audit.TOOLS_DIR / repair_audit.VERIFIER_DIR).iterdir()), [])
 
     def test_a_finding_that_persists_is_never_submitted(self):
         self.findings("audit-findings-always", DUPLICATE_LINE)

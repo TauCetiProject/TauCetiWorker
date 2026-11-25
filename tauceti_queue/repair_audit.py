@@ -65,6 +65,11 @@ DRIVER_FAILURE = "LINT-ENV: FAIL \u2014 driver failure"  # lint-env.sh's fail() 
 # own process group, and without bwrap's --unshare-pid --die-with-parent nothing would collect the
 # shards when ``_sandboxed`` kills its own group on a timeout.
 LINT_SHARDS = "2"
+# ``lint-env.sh --prepare DIR`` (TauCetiTools #377) writes the module lists, docstring-scan source,
+# nonce and marker that fix its drivers' scope to DIR and makes them read-only; a run given DIR in
+# LINT_ENV_INPUTS reads them from there instead of generating them under the candidate-writable
+# ``$TMPDIR`` (``.lake/tmp`` in the sandbox), where code the docstring scan runs could shrink them.
+LINT_PREPARE_OPTION = "--prepare"
 MODULE_PATH = re.compile(r"^TauCeti(/[A-Za-z_][A-Za-z0-9_']*)+\.lean$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -535,6 +540,40 @@ def pool_free(env: dict) -> dict:
 # The checks
 
 
+def seal_lint_inputs(worktree: Path, scripts: Path, env: dict, dest: Path, scope_file: Path | None) -> Path | None:
+    """``dest``, sealed by the pinned ``lint-env.sh --prepare`` on the host for the whole library or, with
+    ``scope_file``, for the changed-only lint of its modules; None when the pin predates ``--prepare``.
+
+    Run before any of the check's sandboxed commands, from the trusted scripts and outside the worktree,
+    as pr-build does before candidate code runs: it only lists ``TauCeti/`` and writes text, running no
+    Lean. ``dest`` lies in the host-only verifier directory, mounted read-only into the lint."""
+    script = scripts / "lint-env.sh"
+    if LINT_PREPARE_OPTION not in script.read_text(errors="replace"):
+        return None
+    run_env = {k: v for k, v in {**os.environ, **env}.items() if k not in ("LINT_ENV_INPUTS", "WATCHDOG_TOOLCHAIN")}
+    run_env |= {
+        "TAUCETI_PROJECT_ROOT": str(worktree),
+        "TAUCETI_TRUSTED_SCRIPTS": str(scripts),
+        "LINT_CHANGED_ONLY": "1" if scope_file else "0",
+        "LINT_ONLY_MODULES": str(scope_file or ""),
+    }
+    try:
+        proc = _run(["bash", script, LINT_PREPARE_OPTION, dest], cwd=worktree, env=run_env, timeout=600)
+    except subprocess.TimeoutExpired as error:
+        raise Unavailable(f"sealing the environment lint's inputs: {error}") from error
+    if proc.returncode != 0 or not dest.is_dir():
+        raise Unavailable(f"sealing the environment lint's inputs: {_tail(proc.stdout + proc.stderr)}")
+    return dest
+
+
+def remove_tree(path: Path) -> None:
+    """``shutil.rmtree`` that first makes the directories writable again (the sealed lint inputs are not)."""
+    for directory, _, _ in os.walk(path):
+        with contextlib.suppress(OSError):
+            os.chmod(directory, 0o700)
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def changed_modules(worktree: Path, base: str) -> list[str]:
     """``lint-scope.sh``'s module list: the TauCeti modules changed between ``base`` and HEAD (no rename
     detection, deletions left out)."""
@@ -601,7 +640,7 @@ def check(
             verifier=verifier,
         )
     finally:
-        shutil.rmtree(verifier, ignore_errors=True)
+        remove_tree(verifier)
 
 
 def _check(
@@ -650,6 +689,31 @@ def _check(
             if source != worktree:
                 shutil.rmtree(source, ignore_errors=True)
         record["materialize_seconds"] = round(time.monotonic() - materialize_started, 3)
+        # The first lint covers the changed modules (staging's PR preflight scope). It misses findings
+        # in unchanged declarations, such as a new simp lemma breaking an old one's simp normal form,
+        # so a round that finds nothing ends with the whole-library lint below.
+        try:
+            modules = changed_modules(worktree, base)
+        except (Unavailable, OSError, subprocess.SubprocessError):
+            modules = None
+        if modules is not None and len(modules) > CHANGED_LINT_MODULE_LIMIT:
+            # Too many for the changed-only driver: the whole-library lint (CI's own scope) covers them.
+            record["changed_lint"] = {"skipped": "module_limit", "modules": len(modules)}
+            modules = None
+        scope_file = None
+        if modules is not None:
+            scope_file = verifier / "lint-modules.txt"
+            scope_file.write_text("".join(m + "\n" for m in modules))
+        # Sealed before any of this check's sandboxed commands run (TauCetiTools #377, as pr-build does).
+        sealing_started = time.monotonic()
+        full_inputs = seal_lint_inputs(worktree, scripts, env, verifier / "lint-inputs-full", None)
+        changed_inputs = (
+            seal_lint_inputs(worktree, scripts, env, verifier / "lint-inputs-changed", scope_file)
+            if scope_file is not None and full_inputs is not None
+            else None
+        )
+        record["lint_inputs_sealed"] = full_inputs is not None
+        record["lint_inputs_seconds"] = round(time.monotonic() - sealing_started, 3)
         drivers_started = time.monotonic()
         pristine = pristine_driver_root(worktree, tools_root, ref, env)
         if pristine is None:
@@ -700,23 +764,14 @@ def _check(
         "LINT_ONLY_MODULES": "",
         "LINT_SHARDS": "1" if repair_sandbox.disabled() else LINT_SHARDS,
         "TAUCETI_LINT_PROFILE": env.get("TAUCETI_LINT_PROFILE", "0"),
+        **({"LINT_ENV_INPUTS": full_inputs} if full_inputs is not None else {}),
     }
-    # The first lint covers the changed modules (staging's PR preflight scope). It misses findings
-    # in unchanged declarations, such as a new simp lemma breaking an old one's simp normal form,
-    # so a round that finds nothing ends with the whole-library lint below.
     lint_env = full_lint_env
-    try:
-        modules = changed_modules(worktree, base)
-    except (Unavailable, OSError, subprocess.SubprocessError):
-        modules = None
-    if modules is not None and len(modules) > CHANGED_LINT_MODULE_LIMIT:
-        # Too many for the changed-only driver: the whole-library lint (CI's own scope) covers them.
-        record["changed_lint"] = {"skipped": "module_limit", "modules": len(modules)}
-        modules = None
-    if modules is not None:
-        scope_file = verifier / "lint-modules.txt"
-        scope_file.write_text("".join(m + "\n" for m in modules))
+    if scope_file is not None:
         lint_env = {**full_lint_env, "LINT_ONLY_MODULES": scope_file, "LINT_CHANGED_ONLY": "1"}
+        lint_env.pop("LINT_ENV_INPUTS", None)
+        if changed_inputs is not None:
+            lint_env["LINT_ENV_INPUTS"] = changed_inputs
     dot_notation = [
         "python3",
         scripts / "lint-dot-notation.py",
@@ -797,10 +852,14 @@ def _check(
         record[name] = {k: v for k, v in runs[name].items() if k != "output"} | {"findings": len(found[name])}
         record["diagnostics"] += found[name]
     record["lint"]["scope"] = scope
-    # The scripts, scope files and drivers lived outside the worktree and were mounted read-only into
-    # every check (decision 200); without the sandbox nothing kept the candidate's code away from them.
+    # The scripts, scope files, sealed lint inputs and drivers lived outside the worktree and were mounted
+    # read-only into every check (decision 200); without the sandbox nothing kept the candidate's code away
+    # from them.
     record["verifier_isolated"] = (
-        record["sandbox"] and record.get("drivers_isolated") is True and "verifier_isolated_reason" not in record
+        record["sandbox"]
+        and record.get("drivers_isolated") is True
+        and record.get("lint_inputs_sealed") is True
+        and "verifier_isolated_reason" not in record
     )
     record["status"] = "failed" if record["diagnostics"] else "passed"
     record["seconds"] = round(time.monotonic() - started, 1)
