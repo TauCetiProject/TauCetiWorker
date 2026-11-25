@@ -889,6 +889,7 @@ and reported in status:
 | `forgejo_pr_build_timeout_seconds` | 21600 | a build with no result after this long is asked again |
 | `forgejo_pr_build_retry_seconds` | 600 | the wait before a head whose build gave no verdict (an error, a deferral, a timeout) is asked again |
 | `forgejo_pr_build_status_creators` | `["tauceti-live-ci"]` | the GitHub accounts whose `main-integration` status is a verdict |
+| `forgejo_admission_requires_build` | false | admit an unlabelled Forgejo head only once its PR build (below) is green, as GitHub admission waits for `build`; a `self-tested` head needs none |
 
 ## Main-integration backfill
 
@@ -952,6 +953,11 @@ nothing fires for a Forgejo PR, so the queue starts the same build and copies it
   (`MixedNativeSource.post_source_status`: context `build` only, a GitHub run URL only). Only the
   newest intent for a head is posted, so a retried `pending` never lands after the result. No
   Forgejo token reaches Actions: the build reads the head from GitHub.
+- **Admission:** with `forgejo_admission_requires_build`, `MixedNativePolicy` admits an unlabelled
+  head only when its newest `build` from the publisher (`MixedNativeSource._statuses`, the only
+  status it reads, and only while the setting is on) is `success`. Posting a verdict asks the
+  native poller to evaluate the PR again, since a status does not move Forgejo's update time.
+  Landing still requires the exact candidate CI.
 
 ## Ports
 

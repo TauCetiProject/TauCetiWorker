@@ -119,6 +119,27 @@ class ForgejoPRBuild(MixedFixture, unittest.TestCase):
         self.cycle()
         self.assertEqual(len(self.github.main_integration_requests), 1)
 
+    def test_a_posted_verdict_has_the_pr_evaluated_again(self):
+        head = self.native.create_pr(1, {"TauCeti/One.lean": "one\n"})
+        self.cycle()
+        work = self.poller.state.get(1)
+        self.assertEqual(work["generation"], work["evaluated_generation"])
+        self.post(head, "success")
+        self.controller.tick()  # settles: the result is queued
+        self.controller.tick()  # posts it, and asks the poller to evaluate the PR again
+        self.assertEqual(self.builds(head)[-1][2], "success")
+        work = self.poller.state.get(1)
+        self.assertGreater(work["generation"], work["evaluated_generation"])
+
+    def test_changing_the_build_requirement_has_unaccepted_prs_judged_again(self):
+        self.native.create_pr(1, {"TauCeti/One.lean": "one\n"})
+        self.cycle()
+        work = self.poller.state.get(1)
+        self.assertEqual(work["generation"], work["evaluated_generation"])
+        self.controller.set_setting("forgejo_admission_requires_build", True, "test")
+        work = self.poller.state.get(1)
+        self.assertGreater(work["generation"], work["evaluated_generation"])
+
     def test_red_is_copied_back_as_failure(self):
         head = self.native.create_pr(1, {"TauCeti/One.lean": "broken\n"})
         self.cycle()
@@ -436,6 +457,66 @@ class PublisherStatus(unittest.TestCase):
         with self.assertRaises(Incomplete):
             other.post_source_status("team/Math", sha, context="build", state="success", description="", target_url="")
         self.assertEqual(calls + other_calls, [])
+
+
+class AdmissionNeedsBuild(unittest.TestCase):
+    """With `forgejo_admission_requires_build`, an unlabelled head waits for the queue's green build."""
+
+    def policy(self, required):
+        from tauceti_queue.mixed_native import MixedNativePolicy
+
+        policy = MixedNativePolicy.__new__(MixedNativePolicy)
+        policy.publishers = SimpleNamespace(source=SimpleNamespace(record=lambda: {"source": "forgejo"}))
+        policy.require_build = lambda: required
+        return policy
+
+    def evaluate(self, policy, *, build="", labels=()):
+        from tauceti_queue.admission import AdmissionPolicy
+        from tauceti_queue.forgejo_source import NativeAdmissionPolicy
+
+        snapshot = SimpleNamespace(
+            pull=SimpleNamespace(head_sha="a" * 40, labels=tuple(labels)),
+            statuses={"build": build} if build else {},
+        )
+        ready = {"merge": False, "review_safe": True, "reason": "", "recovery_heads": []}
+        with (
+            patch.object(NativeAdmissionPolicy, "evaluate", lambda self, s: (dict(ready), "{}", {}, {}, {})),
+            patch.object(AdmissionPolicy, "evaluate", lambda self, s: ({"merge": True}, "{}", {}, {}, {})),
+            patch("dataclasses.replace", lambda s, **changes: s),
+        ):
+            result, _authorization, evidence, _comment, _meta = policy.evaluate(snapshot)
+        return result, evidence
+
+    def test_an_unlabelled_head_waits_for_a_green_build(self):
+        policy = self.policy(True)
+        for build in ("", "pending", "failure", "error"):
+            with self.subTest(build=build):
+                result, _evidence = self.evaluate(policy, build=build)
+                self.assertFalse(result["merge"])
+                self.assertIn("waiting for the Forgejo PR build", result["reason"])
+        result, evidence = self.evaluate(policy, build="success")
+        self.assertTrue(result["merge"])
+        self.assertEqual(evidence["observed_source_ci"], "success")
+        # A self-tested head needs no PR build, as on GitHub.
+        self.assertTrue(self.evaluate(policy, labels=["self-tested"])[0]["merge"])
+
+    def test_off_by_default_admits_as_before(self):
+        self.assertTrue(self.evaluate(self.policy(False))[0]["merge"])
+
+    def test_only_the_publishers_build_is_read(self):
+        native = MixedNativeSource.__new__(MixedNativeSource)
+        native.profile = SimpleNamespace(publisher=4)
+        native.admission_policy = SimpleNamespace(require_build=lambda: True)
+
+        def row(id, actor, state, context="build"):
+            return {"id": id, "context": context, "status": state, "creator": {"id": actor}}
+
+        rows = [row(1, 4, "failure"), row(2, 5, "success"), row(3, 4, "pending"), row(4, 4, "success", "scope")]
+        self.assertEqual(native._statuses("a" * 40, rows), {"build": "pending"})
+        self.assertEqual(native._statuses("a" * 40, [row(9, 5, "success")]), {})
+        native.admission_policy = SimpleNamespace(require_build=lambda: False)
+        native.client = SimpleNamespace(statuses=lambda *a: self.fail("read while nothing needs it"))
+        self.assertEqual(native._statuses("a" * 40), {})
 
 
 if __name__ == "__main__":

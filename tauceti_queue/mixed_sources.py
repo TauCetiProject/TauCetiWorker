@@ -774,6 +774,9 @@ class MixedSources:
 
     def connect(self, controller, github_poller):
         self.controller = controller
+        policy = getattr(self.native, "admission_policy", None)
+        if policy is not None and hasattr(type(policy), "require_build"):
+            policy.require_build = lambda: bool(controller.setting("forgejo_admission_requires_build"))
         self.check_github()
         self.poller = NativePoller(self, controller)
         if self.mode == "admit":

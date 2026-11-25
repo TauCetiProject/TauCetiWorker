@@ -396,4 +396,8 @@ def perform(ctl, repo: str, payload: dict[str, Any]) -> str:
         description=payload["description"],
         target_url=payload["target_url"],
     )
+    if payload["state"] in (SUCCESS, FAILURE, ERROR) and getattr(ctl, "admission", None) is not None:
+        # A status does not move the PR's Forgejo update time: evaluate it again now, so admission
+        # that waits for this build need not wait for the periodic recheck.
+        ctl.admission.invalidate(payload["number"])
     return f"build {payload['state']}"
