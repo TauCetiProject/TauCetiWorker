@@ -111,6 +111,11 @@ class Cache(unittest.TestCase):
         again = cache.Remembered(private)
         with patch.object(cache, "read_json", side_effect=AssertionError("re-read an unchanged file")):
             self.assertEqual(again.read(path), dict(data="old"))
+        # A damaged index (still valid JSON) is ignored, not trusted.
+        stored = json.loads((private / cache.Remembered.NAME).read_text())
+        stored["rows"][str(path)][1]["data"] = "forged"
+        (private / cache.Remembered.NAME).write_text(json.dumps(stored))
+        self.assertEqual(cache.Remembered(private).read(path), dict(data="old"))
         # Rewritten in place with the same size: the mtime differs, so it is read again.
         path.write_text(path.read_text().replace("old", "new"))
         os.utime(path, (2, 2))

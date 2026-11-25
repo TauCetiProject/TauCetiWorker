@@ -113,13 +113,15 @@ def atomic_json(path, value):
     # These are disposable cache indexes, not accounting/source records. Atomic rename
     # protects readers; fsync per module would serialize tens of thousands of writes.
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
-        temporary = Path(out.name)
-        json.dump(value, out)
+    temporary = None
     try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
+            temporary = Path(out.name)
+            json.dump(value, out)
         os.replace(temporary, path)
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)  # A failed write (ENOSPC) leaves no partial file.
 
 
 class LinkDeferred(Unavailable):
@@ -294,7 +296,8 @@ class Remembered:
     was when read, so a replaced file (a new inode) or one rewritten in place (a new mtime) is read
     again. A file modified within `RACY` seconds of being read is not remembered: a same-size
     rewrite inside one timestamp tick would otherwise look unchanged. Stored in the private store,
-    which only this worker writes and which retention deletes as a whole.
+    which only this worker writes and which retention deletes as a whole, with a sha256 over its
+    rows: an index that does not match it is ignored, so a damaged index is never trusted.
 
     `replaced_only` files (a pool `entry.json`) are only ever replaced by a rename, never rewritten,
     and hydration moves their mtime as the pool's reuse clock: for them the mtime is left out.
@@ -310,11 +313,16 @@ class Remembered:
         self.read_count = 0
         try:
             with open(self.path) as stream:
-                rows = json.load(stream)
-            if isinstance(rows, dict):
+                stored = json.load(stream)
+            rows = stored.get("rows")
+            if isinstance(rows, dict) and stored.get("sha256") == self._digest(rows):
                 self.rows = rows
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             pass
+
+    @staticmethod
+    def _digest(rows):
+        return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def read(self, path, *, replaced_only=False):
         key = str(path)
@@ -338,8 +346,10 @@ class Remembered:
 
     def save(self):
         """Keep what this round used: a key nothing names any more ages out."""
+        if not self.read_count and self.used.keys() == self.rows.keys():
+            return  # Every file was remembered: the index is already right.
         with contextlib.suppress(OSError):
-            atomic_json(self.path, self.used)
+            atomic_json(self.path, dict(sha256=self._digest(self.used), rows=self.used))
 
 
 def private_mapping(private, key, known, remembered=None):
