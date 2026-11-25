@@ -4,6 +4,7 @@
 import copy
 import dataclasses
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
@@ -39,7 +40,11 @@ class NativeFake(FakeGitHub):
         # Like the Forgejo adapter, the listing carries each PR's listed-facts version.
         return [
             dataclasses.replace(
-                pull, admission={"discovery_version": self._discovery_version(self.fetch_pr(repo, pull.number))}
+                pull,
+                admission={
+                    "discovery_version": self._discovery_version(self.fetch_pr(repo, pull.number)),
+                    "labels": sorted(self.labels.get(pull.number, ())),
+                },
             )
             for pull in super().list_open_pull_requests(repo, review_app_id=review_app_id, **kwargs)
         ]
@@ -424,6 +429,18 @@ class Mixed(MixedFixture, unittest.TestCase):
 
     def native_input(self):
         return self.controller.input_for(self.native_id.repository.key, 1)
+
+    def test_sprint_mode_reads_native_labels_from_the_listing(self):
+        poller, head = self.native_approved()
+        self.controller.set_setting("sprint_label", "grh", "operator")
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "waiting", "not labelled: it waits")
+        self.native.labels[1] = {"GRH"}
+        poller.request_discovery()
+        poller.run_once()
+        self.assertEqual(json.loads(self.native_input()["labels"]), ["grh"])
+        self.controller.tick()
+        self.assertEqual(self.native_input()["state"], "inserted", self.controller._reasons)
 
     def test_native_insertion_reads_the_pr_once_more_and_inserts_it_unchanged(self):
         poller, head = self.native_approved()

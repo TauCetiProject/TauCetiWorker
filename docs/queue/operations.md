@@ -1004,6 +1004,7 @@ means is in the settings table of [controller.md](controller.md); `insertion_pro
 | `forgejo_recent_listing` | `true` | `true` or `false`; between full Forgejo listings, list the open Forgejo PRs updated since the last listing on every pass ([mixed-sources.md](mixed-sources.md)) |
 | `forgejo_recheck_seconds` | `21600` | integer, at least 0; a settled Forgejo PR whose listed facts are unchanged is evaluated again this long after its last attempt ([mixed-sources.md](mixed-sources.md)) |
 | `control_lane_enabled` | `false` | `true` or `false`; stage GitHub control-file PRs in their own lane batch ([mixed-sources.md](mixed-sources.md), "The control-file lane") |
+| `sprint_label` | empty | text; while set, only PRs carrying this label enter batches, and setting it dissolves the open batches (below, "Sprint mode"); empty is normal batching |
 
 Escalations (the start and end of an infrastructure backoff) are sent as Zulip direct messages when
 `TAUCETI_QUEUE_ZULIP_CONFIG` in `~/.config/tauceti-queue/environment` names a mode-0600 bot
@@ -1272,6 +1273,33 @@ without a source change, for example after a chain tool fix changed the commit m
 head's CI failed on a consequence of the old format; it is refused while the head is claimed and when a
 member carries agent edits, which a rebuild would discard. `POST /admin/retry-ci` stays the action for
 persistent infrastructure failures; automatic retries continue with capped backoff.
+
+### Sprint mode: batching only PRs with one label
+
+For a sprint on a set of PRs (all labelled, say, `grh`), the queue can batch only those PRs:
+
+```sh
+uv run tauceti-queue settings set sprint_label grh   # on
+uv run tauceti-queue settings set sprint_label ""    # off: normal batching
+```
+
+Setting the label dissolves every open batch (ordinary and control-file lane; not the emergency
+batch, nor a head the emergency batch evicted, which becomes the head again after it). Their members go back to waiting at their original age with their approvals kept and their
+repair edits discarded; their open
+tasks are superseded, claims released and CI runs cancelled; the journal has a `sprint-evicted` entry
+per batch and one `sprint-started`. The head is never touched and lands normally. From then on only
+waiting inputs whose PR carries the label (case-insensitive) enter batches; every other approved
+input keeps its approval and waits. Clearing the setting returns to normal batching with nothing to
+undo. Changing to another label dissolves the open batches again.
+
+The controller reads a PR's labels at approval, from `labeled`/`unlabeled` webhooks, and from every
+GitHub and Forgejo discovery listing, and keeps them on the waiting input (`inputs.labels`). Switching
+the sprint on requests a discovery listing at once, so labels added since approval are seen within
+one listing (a few minutes); a label added later is seen by the next webhook or listing. The
+listings are those of policy admission (`admission_source = "policy"`, as deployed); under the older
+eligibility poller only approval-time labels and webhooks are seen. The emergency lane is separate:
+an open emergency batch is kept, and `bors emergency` (with `emergency_evict` too) still lands any PR
+it is asked to, labelled or not.
 
 ### Landing a PR urgently: `bors emergency`, not an admin merge
 

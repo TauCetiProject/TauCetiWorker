@@ -299,6 +299,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # in its own batch, which becomes the head ahead of every ordinary open batch, and is never repaired.
     # Off: every lane rule is off and a live lane batch is staged as an ordinary open batch.
     "control_lane_enabled": False,
+    # Sprint mode (docs/queue/operations.md, "Sprint mode"): while non-empty, only waiting inputs whose
+    # PR carries this label (case-insensitive, `inputs.labels`) enter batches, the control-file lane's
+    # included; every other approved input keeps its approval and waits. Setting a label dissolves
+    # every open batch but the emergency batch and a head it evicted (`_dissolve_open_batches`); the
+    # head is never touched, and the emergency lane works as usual.
+    # Empty: normal batching.
+    "sprint_label": "",
 }
 
 # The actor of the values `seed_setting` writes from the configuration file's `[settings]`.
@@ -896,6 +903,8 @@ class Controller:
                     raise ControllerError("bad-setting-value", f"{key} must be a list of strings")
             elif not isinstance(value, type(expected)):
                 raise ControllerError("bad-setting-value", f"{key} must be a {type(expected).__name__}")
+            if key == "sprint_label" and value != value.strip():
+                raise ControllerError("bad-setting-value", f"{key} must be a label name without surrounding spaces")
             if key == "admission_evidence_mode":
                 from .admission_evidence import MODES
 
@@ -908,9 +917,14 @@ class Controller:
                 if record is None or (record["actor"] == SEED_ACTOR and actor != SEED_ACTOR):
                     self.store.set_setting(key, value, actor, now)
                 return self.effective_settings()
+            dissolved: list[int] = []
             with self.store.transaction():
                 self.store.set_setting(key, value, actor, now)
                 self.store.journal(now, "setting", key=key, value=value, actor=actor)
+                if key == "sprint_label" and value:
+                    # One transaction: the sprint never starts with the open batches still in place.
+                    dissolved = self._dissolve_open_batches(actor, now)
+                    self.store.journal(now, "sprint-started", label=value, actor=actor, dissolved=dissolved)
                 if key == "publication_enabled" and value and not previous:
                     self._republish_retained_refs(now)
                 if (
@@ -920,6 +934,10 @@ class Controller:
                 ):
                     # Unaccepted Forgejo work was judged under the old rules: judge it again.
                     self.mixed.poller.admission_changed()
+            for batch_id in dissolved:
+                self._cancel_superseded_runs(batch_id, now, reason="batch removed (sprint-evicted)")
+            if key == "sprint_label" and value:
+                self._request_label_refresh()
             self._wake.set()
             self._refresh_snapshot()
             return self.effective_settings()
@@ -1279,6 +1297,7 @@ class Controller:
             if not self._fetch_head(pr, head_sha):
                 return {"accepted": False, "reason": "head-unavailable", "input": None}
             no_repair = self._carries_no_repair(getattr(pull, "labels", None))
+            labels = sorted({str(label).lower() for label in getattr(pull, "labels", None) or ()})
             ref = self.input_ref(pr, head_sha)
             with self.store.transaction():
                 if existing is not None and existing["state"] in (INPUT_WAITING, INPUT_RESERVED):
@@ -1303,6 +1322,7 @@ class Controller:
                     approved_at=approved_at if approved_at is not None else now,
                     retained_ref=ref,
                     no_repair=int(no_repair),
+                    labels=dumps(labels),
                 )
                 if self.admission is not None and (evidence or {}).get("kind") != "admission_policy":
                     self.admission.accept_manual(pr, head_sha)
@@ -1758,6 +1778,11 @@ class Controller:
         if current is None:
             return
         if action in ("labeled", "unlabeled"):
+            if isinstance(pull.get("labels"), list):
+                self.observe_labels(
+                    number,
+                    [label.get("name") if isinstance(label, dict) else label for label in pull["labels"]],
+                )
             self._blocking_label_event(current, payload, now)
             if self._no_repair_event(current, payload, now):
                 return
@@ -3422,11 +3447,45 @@ class Controller:
             return None
         return batch
 
+    def _sprint_inputs(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """`rows` restricted, while sprint mode is on (`sprint_label`), to inputs whose PR carries the
+        sprint label; the others keep their approval and wait."""
+        label = self.setting("sprint_label").lower()
+        if not label:
+            return rows
+        return [row for row in rows if label in loads(row["labels"], [])]
+
+    def observe_labels(self, number: Any, labels: Sequence[Any]) -> None:
+        """Record a PR's current labels (from a discovery listing or a label event) on its live
+        input, as `inputs.labels`, which sprint mode reads (also for a member, should it be returned)."""
+        from .mixed_identity import source_record
+
+        names = dumps(sorted({str(label).lower() for label in labels}))
+        where = {
+            "repository": self.repository,
+            "state": [INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED],
+            "number": int(number),
+            "source_identity": source_record(number),
+        }
+        with self._lock:
+            for row in self.store.rows("inputs", where):
+                if row["labels"] != names:
+                    self.store.update("inputs", {"id": row["id"]}, labels=names)
+                    if self.setting("sprint_label"):
+                        self._wake.set()
+
+    def _request_label_refresh(self) -> None:
+        """Ask the GitHub and Forgejo discovery listings to run now, so `inputs.labels` is current."""
+        for poller in (self.admission, getattr(self.mixed, "poller", None)):
+            request = getattr(poller, "request_discovery", None)
+            if request is not None:
+                request()
+
     def _ordinary_waiting(self) -> list[dict[str, Any]]:
         """`_waiting` without the inputs the active lane takes, which ordinary insertion never probes: a
         GitHub input enters an ordinary batch only once it is classified as not a control-file change
         (one approved while the tick ran is classified in the next)."""
-        rows = [row for row in self._waiting() if not self._label_blocked(row)]
+        rows = self._sprint_inputs([row for row in self._waiting() if not self._label_blocked(row)])
         if not self.setting("forgejo_placement_enabled"):
             rows = [row for row in rows if not isinstance(row["number"], SourceNumber)]
         if not self._control_lane_active():
@@ -3495,7 +3554,9 @@ class Controller:
             return
         self._classify_control_inputs(now)
         canonical = self._canonical
-        rows = [row for row in self._waiting() if self._control_input(row) and not self._label_blocked(row)]
+        rows = self._sprint_inputs(
+            [row for row in self._waiting() if self._control_input(row) and not self._label_blocked(row)]
+        )
         if canonical is None or not rows:
             return
         lane = self._lane_batch()
@@ -4645,6 +4706,14 @@ class Controller:
                     "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="blocked-label"
                 )
                 self._release_claim(claim, "blocked-label", now)
+            return False
+        if not self._sprint_inputs([fresh]):
+            # Sprint mode began, or the sprint label went, while the probe ran: it waits, unplaced.
+            with self.store.transaction():
+                self.store.update(
+                    "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="sprint-label"
+                )
+                self._release_claim(claim, "sprint-label", now)
             return False
         if failure is not None:
             with self.store.transaction():
@@ -8572,6 +8641,39 @@ class Controller:
                 "landed_on_base": result.landed_on_base,
             }
 
+    def _dissolve_batch(self, batch: dict[str, Any], reason: str, actor: str, now: float) -> int:
+        """Remove a live batch, returning its members to waiting at their original age with their
+        approvals kept: open tasks superseded, claims released, pre-rebases discarded. Called inside
+        the caller's transaction and lock; the caller cancels the batch's runs afterwards
+        (`_cancel_superseded_runs`). Returns how many members went back to waiting."""
+        members = self._members(batch["id"])
+        for stale in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
+            self.store.update("tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution=reason)
+        for claim in self._active_claims(batch["id"]):
+            self._release_claim(claim, "superseded", now)
+        self._set_pre_rebase(batch, "", now)
+        self._return_members(batch, members, reason, now)
+        self.store.journal(now, reason, batch["id"], actor=actor, state=batch["state"], members=len(members))
+        self._discard_pre_rebase(reason, now, batch)
+        self.store.update("batches", {"id": batch["id"]}, state=BATCH_REMOVED)
+        self.store.journal(now, "batch-removed", batch["id"], reason=reason)
+        self._clear_admission_state(batch["id"])
+        return sum(1 for member in members if not member["withdrawn"])
+
+    def _dissolve_open_batches(self, actor: str, now: float) -> list[int]:
+        """Sprint mode switched on (`sprint_label`): dissolve every open batch except the emergency
+        batch and a head the emergency batch evicted (`_eviction`, which becomes the head again), so
+        only sprint-labelled inputs form the next batches. The head is never touched. Called inside
+        the caller's transaction; the caller cancels the returned batches' runs after it."""
+        batches = [
+            batch
+            for batch in self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
+            if batch["urgent"] != URGENT_EMERGENCY and not self._eviction(batch)
+        ]
+        for batch in batches:
+            self._dissolve_batch(batch, "sprint-evicted", actor, now)
+        return [batch["id"] for batch in batches]
+
     def evict_native(self, repo: str, actor: str, *, withdraw: Sequence[int] = ()) -> dict[str, Any]:
         """Operator: break apart every live batch (the head and the open batches) that holds a Forgejo
         member or a GitHub PR named in `withdraw`, for when the Forgejo source cannot be used.
@@ -8608,27 +8710,7 @@ class Controller:
             # no insertion can place a returned input into a batch being removed or re-place a named PR.
             with self.store.transaction():
                 for batch in affected:
-                    members = self._members(batch["id"])
-                    for stale in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
-                        self.store.update(
-                            "tasks",
-                            {"id": stale["id"]},
-                            state=TASK_SUPERSEDED,
-                            resolved_at=now,
-                            resolution="native-evicted",
-                        )
-                    for claim in self._active_claims(batch["id"]):
-                        self._release_claim(claim, "superseded", now)
-                    self._set_pre_rebase(batch, "", now)
-                    self._return_members(batch, members, "native-evicted", now)
-                    returned += sum(1 for member in members if not member["withdrawn"])
-                    self.store.journal(
-                        now, "native-evicted", batch["id"], actor=actor, state=batch["state"], members=len(members)
-                    )
-                    self._discard_pre_rebase("native-evicted", now, batch)
-                    self.store.update("batches", {"id": batch["id"]}, state=BATCH_REMOVED)
-                    self.store.journal(now, "batch-removed", batch["id"], reason="native-evicted")
-                    self._clear_admission_state(batch["id"])
+                    returned += self._dissolve_batch(batch, "native-evicted", actor, now)
                 withdrawn = {
                     number: self._withdraw(repo, number, "cancelled", actor)["withdrawn"] for number in sorted(named)
                 }
