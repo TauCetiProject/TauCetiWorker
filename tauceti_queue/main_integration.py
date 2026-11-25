@@ -146,7 +146,10 @@ def _observe(ctl, now: float) -> None:
         if record.get("state") != PENDING:
             continue
         status = statuses.get(fresh["head_sha"])
-        if _answers(status, record):
+        trusted = (
+            set(ctl.setting("forgejo_pr_build_status_creators")) if isinstance(fresh["number"], SourceNumber) else None
+        )
+        if _answers(status, record, trusted):
             _settle(ctl, fresh, record, status, now)
         elif now - record.get("dispatched_at", now) > timeout:
             record.update(state=EXPIRED, observed_at=now, expired=record.get("expired", 0) + 1)
@@ -155,12 +158,19 @@ def _observe(ctl, now: float) -> None:
                 ctl.store.journal(now, "main-integration-expired", fresh["batch_id"], number=fresh["number"])
 
 
-def _answers(status: ports.Status | None, record: dict[str, Any]) -> bool:
-    """The status is this request's: it names the main asked for and was posted after the dispatch."""
+def _answers(status: ports.Status | None, record: dict[str, Any], trusted: set[str] | None = None) -> bool:
+    """The status is this request's: it names the main asked for and was posted after the dispatch.
+
+    With `trusted` (a Forgejo member's request), a verdict counts only from those accounts, and a
+    deferral also from the workflow's own token, which the picker posts it with."""
     if status is None or status.state not in (SUCCESS, FAILURE, ERROR):
         return False
     if not status.description.startswith(f"B={record.get('main', '')[:12]}"):
         return False
+    if trusted is not None:
+        deferral = status.state == ERROR and "deferred" in status.description
+        if status.creator not in trusted and not (deferral and status.creator == "github-actions"):
+            return False
     # A run already counted (the first red result, read again while its confirmation is queued)
     # never answers a later request.
     if status.target_url and status.target_url in record.get("runs", []):
@@ -368,7 +378,7 @@ def _dispatch(ctl, candidates, now: float) -> None:
     due = [
         (batch, member, row)
         for batch, member, row in candidates
-        if _due(record_of(row), now, fresh) and row["head_sha"] not in building
+        if _due(record_of(row), now, fresh) and row["head_sha"] not in building and _on_github(ctl, row)
     ]
     if not due:
         return
@@ -411,6 +421,15 @@ def _dispatch(ctl, candidates, now: float) -> None:
             ctl.store.journal(
                 now, "main-integration-dispatched", batch["id"], number=row["number"], head=row["head_sha"], main=main
             )
+
+
+def _on_github(ctl, row: dict[str, Any]) -> bool:
+    """A Forgejo member's head is on GitHub only once admission's push of it is done; a GitHub
+    member's head is its PR's own."""
+    if not isinstance(row["number"], SourceNumber):
+        return True
+    entry = ctl.store.row("outbox", {"key": f"retain:{row['retained_ref']}:{row['head_sha']}"})
+    return entry is not None and entry["state"] == "done"
 
 
 def _check(ctl, due, main: str, now: float) -> None:

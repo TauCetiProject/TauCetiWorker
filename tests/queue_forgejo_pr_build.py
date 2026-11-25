@@ -17,6 +17,7 @@ from tauceti_tools.forge import Forge, RepositoryRef  # noqa: E402
 from tauceti_queue import forgejo_pr_build  # noqa: E402
 from tauceti_queue.mixed_native import MixedNativeSource  # noqa: E402
 from tauceti_queue.mixed_sources import AdmissionInputs, NativePoller  # noqa: E402
+from tauceti_queue.ports import Status  # noqa: E402
 from tauceti_queue.store import loads  # noqa: E402
 
 
@@ -345,6 +346,33 @@ class ForgejoMembersOnMain(MixedFixture, unittest.TestCase):
         self.assertEqual(
             requests, [((2, self.native_head, self.controller._canonical), {"source": "forgejo", "priority": "idle"})]
         )
+
+    def test_a_member_waits_until_its_head_is_on_github(self):
+        row = self.controller.input_for(self.native_id.repository.key, 2)
+        key = f"retain:{row['retained_ref']}:{row['head_sha']}"
+        self.controller.store.update("outbox", {"key": key}, state="pending")
+        from tauceti_queue import main_integration
+
+        self.assertFalse(main_integration._on_github(self.controller, row))
+        self.controller.store.update("outbox", {"key": key}, state="done")
+        self.assertTrue(main_integration._on_github(self.controller, row))
+
+    def test_a_forgejo_members_verdict_counts_only_from_the_ci_app(self):
+        from tauceti_queue import main_integration
+
+        self.controller.tick()
+        record = main_integration.record_of(self.controller.input_for(self.native_id.repository.key, 2))
+        main = record["main"]
+        trusted = {"tauceti-live-ci"}
+        for creator, state, description, counts in (
+            ("kim-em", "failure", "failed", False),
+            ("github-actions", "failure", "failed", False),
+            ("github-actions", "error", "deferred: Fleet PR pool busy", True),
+            ("tauceti-live-ci", "failure", "failed", True),
+        ):
+            with self.subTest(creator=creator, state=state):
+                status = Status(state, f"B={main[:12]} {description}", "", record["dispatched_at"], None, creator)
+                self.assertIs(main_integration._answers(status, record, trusted), counts)
 
     def test_a_head_with_a_pending_pr_build_waits_for_it(self):
         self.controller.store.insert(
