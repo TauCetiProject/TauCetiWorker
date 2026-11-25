@@ -313,6 +313,15 @@ def _evict_tree(cfg, tree, anchor, report, *, dry=False, discard=False):
         dirs[:] = [name for name in dirs if name not in caches]
 
 
+def source_checkouts(cfg):
+    """A worker's per-source checkouts (`state/sources/<id>/checkout`), which also outlive rounds."""
+    root = cfg.state / "sources"
+    try:
+        return sorted(p for p in root.glob("*/checkout") if not p.is_symlink() and not p.parent.is_symlink())
+    except OSError:
+        return []
+
+
 def evict_workspace(cfg, report, *, dry=False):
     """Only the active generation; unrelated retained history never enters a round-start walk."""
     from .round_worktrees import parked_lake
@@ -321,6 +330,9 @@ def evict_workspace(cfg, report, *, dry=False):
     evict_tree(cfg, cfg.checkout, anchor, report, dry=dry)
     # Between rounds a worktree host keeps the worker's `.lake` beside its (removed) worktree.
     evict_tree(cfg, parked_lake(cfg), anchor, report, dry=dry)
+    for checkout in source_checkouts(cfg):
+        evict_tree(cfg, checkout, cfg.state, report, dry=dry)
+        evict_tree(cfg, checkout.with_name(checkout.name + ".lake-between-rounds"), cfg.state, report, dry=dry)
     for path, root in cache_roots(cfg):
         remove(path.with_name(path.name + ".retention-deleting"), root, report, dry=dry)
         remove(path, root, report, dry=dry)
@@ -333,6 +345,10 @@ def collect_retired(cfg, report, *, now, dry=False, discard_checkout=False):
 
         evict_tree(cfg, cfg.checkout, anchor, report, dry=dry, discard=True)
         remove(parked_lake(cfg), anchor, report, dry=dry)
+        # Workers keep a worktree per source too; Git's record of each is pruned by the next round.
+        for checkout in source_checkouts(cfg):
+            evict_tree(cfg, checkout, cfg.state, report, dry=dry, discard=True)
+            remove(checkout.with_name(checkout.name + ".lake-between-rounds"), cfg.state, report, dry=dry)
 
 
 def collect_review_scratch(cfg, report, *, dry=False):

@@ -1,21 +1,23 @@
-"""Run each round in its own worktree of one host clone (on unless a host opts out).
+"""Run each round in a worktree of one host clone (on unless a host opts out).
 
 Unless `TAUCETI_ROUND_WORKTREES=0`, a host keeps one bare clone of TauCeti (one object store and one
 set of refs) and every round works in a linked worktree of it at the worker's ordinary checkout
-path, `cfg.checkout`:
+path, `cfg.checkout`. Each worker keeps its worktree (one per host clone it uses) across rounds:
 
-- `prepare()` removes any leftover worktree, fetches the host clone under the host lock, and adds a
-  fresh worktree with a detached HEAD at `origin/main`. Nothing resets a shared `main`.
-- `release()` runs when the round's context exits and removes the worktree.
-- A crashed round's worktree is removed by the next `prepare()` on the host once no process holds
-  that worker's round lock or uses the tree.
+- `prepare()` fetches the host clone under the host lock, then, outside the lock, resets the
+  worker's worktree to a detached HEAD at `origin/main`: it clears a killed round's Git state,
+  forces a checkout (only changed files are written) and deletes every untracked file except
+  `.lake`. A first round, or a worktree that cannot be reset, gets a fresh worktree under the lock.
+  Nothing resets a shared `main`.
+- `release()` runs when the round's context exits. The worktree stays for the worker's next round.
 - An old permanent checkout is deleted on its worker's first round.
 
 Rounds are all-or-nothing: whatever an agent pushed (through git-safe-push) is on the remote, and
-anything unpushed is discarded with the worktree.
+anything unpushed is discarded when the worker's next round resets the worktree.
 
-`.lake` (the worker's warm build state and Lake's dependency checkouts) is moved beside the worktree
-between rounds instead of being deleted with it, so rounds keep today's warm builds.
+`TAUCETI_PERSISTENT_WORKTREES=0` returns to a fresh worktree per round: `release()` removes it and
+parks `.lake` beside it, and `prepare()` removes crashed rounds' worktrees on the host once no
+process holds that worker's round lock or uses the tree.
 """
 
 from __future__ import annotations
@@ -54,7 +56,16 @@ UNSAFE_CONFIG = (
     r"^sequence\.editor$",
     # Per-worktree config files would escape this check; keep them disabled.
     r"^extensions\.worktreeconfig$",
+    # A sparse checkout would let a reset skip files; persistent worktrees must get every file.
+    r"^core\.sparsecheckout(cone)?$",
+    r"^index\.sparse$",
 )
+
+
+def persistent(env=None) -> bool:
+    """Workers keep their worktrees across rounds unless `TAUCETI_PERSISTENT_WORKTREES=0`."""
+    env = os.environ if env is None else env
+    return env.get("TAUCETI_PERSISTENT_WORKTREES", "").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def enabled(env=None) -> bool:
@@ -247,12 +258,18 @@ def _round_lock(tree: Path) -> Path | None:
 
 
 def sweep(current: Path):
-    """Remove worktrees of crashed rounds, holding their worker's round lock."""
+    """Remove worktrees of crashed rounds, holding their worker's round lock.
+
+    With persistent worktrees every worker's tree outlives its rounds, so only Git's records of
+    trees that no longer exist (a retired worker's, deleted by retention) are pruned.
+    """
     from types import SimpleNamespace
 
     from .live_use import live_users
 
     _git("worktree", "prune", check=False)
+    if persistent():
+        return
     for tree in _worktrees():
         if tree.resolve() == current.resolve() or not tree.exists():
             continue
@@ -280,8 +297,151 @@ def sweep(current: Path):
             log(f"worktrees: removed the crashed round's worktree {tree}")
 
 
+# Per-worktree Git state a killed round can leave behind; a forced checkout would keep it.
+STALE_STATE = (
+    "index.lock",
+    "HEAD.lock",
+    "MERGE_HEAD",
+    "MERGE_MSG",
+    "MERGE_MODE",
+    "AUTO_MERGE",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "BISECT_START",
+    "BISECT_EXPECTED_REV",
+    "BISECT_TERMS",
+    "BISECT_NAMES",
+    "BISECT_ANCESTORS_OK",
+    "ORIG_HEAD",
+    "MERGE_AUTOSTASH",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+    "info/sparse-checkout",
+)
+# In the worker's state, beside the checkout's other records: when each checkout was last reset.
+RESETS = "worktree-resets.json"
+
+
+def _admin(tree: Path) -> Path:
+    """The worktree's own directory in the host clone (`worktrees/<id>`), registered to this tree.
+
+    Both directions must agree: `tree/.git` names the directory, and the directory's `gitdir`
+    names `tree/.git`. A `.git` repointed at another worker's registration is refused.
+    """
+    if tree.is_symlink() or (tree / ".git").is_symlink() or not (tree / ".git").is_file():
+        raise OSError(f"{tree} is not a plain linked worktree")
+    result = subprocess.run(
+        ["git", "-C", str(tree), "rev-parse", "--absolute-git-dir"], capture_output=True, text=True, timeout=60
+    )
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+    admin = Path(result.stdout.strip())
+    if admin.parent.name != "worktrees" or admin.parent.parent.resolve() != host_clone().resolve():
+        raise OSError(f"{tree} is not a linked worktree of {host_clone()} ({admin})")
+    try:
+        backlink = Path((admin / "gitdir").read_text().strip())
+    except OSError as error:
+        raise OSError(f"{admin} has no gitdir: {error}") from None
+    if os.path.realpath(backlink) != os.path.realpath(tree / ".git"):
+        raise OSError(f"{admin} is registered to {backlink}, not {tree}")
+    return admin
+
+
+def _flagged(tree: Path) -> bool:
+    """Whether the index marks any file skip-worktree or assume-unchanged (a checkout skips those)."""
+    result = subprocess.run(["git", "-C", str(tree), "ls-files", "-v", "-z"], capture_output=True, timeout=600)
+    if result.returncode:
+        return True
+    return any(entry[:1] == b"S" or entry[:1].islower() for entry in result.stdout.split(b"\0") if entry)
+
+
+def _scrub(tree: Path, since_ns: int | None) -> None:
+    """Remove nested Git directories, and every file changed since the last reset.
+
+    A file whose inode changed after `since_ns` (ctime, which no one can set back) is deleted, so
+    the checkout writes it afresh whatever the index claims about it. `.lake` is the worker's
+    build state and is kept; symlinks are removed, never followed.
+    """
+    import shutil
+
+    for base, dirs, files in os.walk(tree, followlinks=False):
+        here = Path(base)
+        if here == tree:
+            dirs[:] = [d for d in dirs if d != ".lake"]
+            files = [f for f in files if f != ".git"]
+        for name in [d for d in dirs if d == ".git" or (here / d).is_symlink()]:
+            path = here / name
+            if path.is_symlink():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+            dirs.remove(name)
+        for name in files:
+            path = here / name
+            try:
+                info = path.lstat()
+            except FileNotFoundError:
+                continue
+            if name == ".git" or since_ns is None or info.st_ctime_ns > since_ns:
+                path.unlink()
+
+
+def _reset(tree: Path, commit: str, resets: Path) -> None:
+    """Make an idle worktree a clean detached checkout of `commit`, keeping `.lake`.
+
+    Outside the host lock: a worktree's HEAD, index and files are its own, and the commit was
+    fetched under the lock. The caller holds the worker's round lock, so no other round of this
+    worker can be using it, and `_check_unused` covers anything else.
+
+    Nothing of the previous round is trusted: its Git state goes, files it changed are deleted
+    before the checkout, and an index with skipped files (or a tree with no reset on record) is
+    rebuilt from `commit`, writing every file.
+    """
+    import shutil
+
+    from .runtime_status import read_json
+
+    _check_unused(tree)
+    admin = _admin(tree)
+    lake = tree / ".lake"
+    if lake.is_symlink() or (lake.exists() and not lake.is_dir()):
+        lake.unlink()  # Only a real directory is the worker's build state; never write through a link.
+    for name in STALE_STATE:
+        path = admin / name
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    since = read_json(resets).get(str(tree))
+    since = since if isinstance(since, int) else None
+    rebuild = since is None or _flagged(tree)
+    _scrub(tree, since)
+    git = ["git", "-C", str(tree)]
+    if rebuild:
+        (admin / "index").unlink(missing_ok=True)
+        steps = (("update-ref", "--no-deref", "HEAD", commit), ("reset", "-q", "--hard", commit))
+    else:
+        steps = (("checkout", "-q", "-f", "--detach", commit),)
+    for args in (*steps, ("clean", "-ffdxq", "-e", "/.lake")):
+        result = subprocess.run([*git, *args], capture_output=True, text=True, timeout=1800)
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+    _record_reset(tree, resets)
+
+
+def _record_reset(tree: Path, resets: Path) -> None:
+    from .runtime_status import atomic_json, read_json
+
+    rows = read_json(resets)
+    rows = rows if isinstance(rows, dict) else {}
+    rows[str(tree)] = time.time_ns()
+    atomic_json(resets, rows)
+
+
 def prepare(cfg, url) -> bool:
-    """Leave `cfg.checkout` a fresh worktree of the host clone, detached at `origin/main`."""
+    """Leave `cfg.checkout` a clean worktree of the host clone, detached at `origin/main`."""
     from .live_use import checkout_kind
 
     co = cfg.checkout
@@ -302,32 +462,72 @@ def prepare(cfg, url) -> bool:
     elif kind is None and (co.exists() or co.is_symlink()):
         if not _discard(co, "the checkout has no git metadata"):
             return False
+    base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+    asked = time.monotonic()
+    waited = 0.0
+    reused = False
+
+    resets = Path(cfg.state) / RESETS
+
+    def add():
+        if co.exists() or co.is_symlink():
+            _check_unused(co)
+            with contextlib.suppress(OSError):
+                _park(cfg, co)
+            try:
+                if not owns(co):
+                    raise OSError("not a worktree of this clone")
+                _remove(co)
+            except (OSError, subprocess.SubprocessError) as error:
+                # A damaged registration `worktree remove` cannot find: delete the tree itself.
+                if not _discard(co, f"a worktree that could not be removed ({error})"):
+                    raise OSError(f"could not delete {co}") from error
+            _git("worktree", "prune", check=False)
+        co.parent.mkdir(parents=True, exist_ok=True)
+        _git("worktree", "add", "--quiet", "--detach", co, f"refs/remotes/origin/{base}")
+        if persistent():
+            _record_reset(co, resets)
+
     try:
         with host_lock():
+            waited = time.monotonic() - asked
             _ensure_clone(url)
             harden(url)
             _fetch()
-            if co.exists() and owns(co):
-                _check_unused(co)
-                with contextlib.suppress(OSError):
-                    _park(cfg, co)
-                _remove(co)
             sweep(co)
-            co.parent.mkdir(parents=True, exist_ok=True)
-            base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
-            _git("worktree", "add", "--quiet", "--detach", co, f"refs/remotes/origin/{base}")
+            commit = _git("rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}").stdout.strip()
+            reuse = persistent() and co.exists() and owns(co)
+            if not reuse:
+                add()
+        if reuse:
+            try:
+                _reset(co, commit, resets)
+                reused = True
+            except InUse:
+                raise
+            except (OSError, subprocess.SubprocessError) as error:
+                detail = getattr(error, "stderr", "") or ""
+                log(f"worktrees: could not reset {co} ({error} {ends(detail, 300)}); adding a fresh worktree")
+                again = time.monotonic()
+                with host_lock():
+                    waited += time.monotonic() - again
+                    add()
     except (OSError, subprocess.SubprocessError) as error:
         detail = getattr(error, "stderr", "") or ""
         log(f"worktrees: preparation failed: {error} {ends(detail, 300)}")
         return False
     _unpark(cfg, co)
+    log(
+        f"worktrees: {'reset' if reused else 'added'} {co.name} at {commit[:12]} "
+        f"(host lock wait {waited:.1f}s, total {time.monotonic() - asked:.1f}s)"
+    )
     PREPARED.append(cfg)
     CLONES[Path(co).resolve()] = host_clone()
     return True
 
 
 def release(cfg) -> None:
-    """At round end: remove each worktree this round prepared. Never raises."""
+    """At round end: forget each worktree this round prepared; without persistence, remove it. Never raises."""
     state = Path(getattr(cfg, "state", "/nonexistent")).resolve()
 
     def own(other):
@@ -346,8 +546,8 @@ def release(cfg) -> None:
         # and one left behind is swept by another worker's round while holding this worker's lock.
         clone = CLONES.pop(Path(co).resolve(), None)
         try:
-            if not enabled() or not co.exists() or not owns(co, clone):
-                continue
+            if not enabled() or persistent() or not co.exists() or not owns(co, clone):
+                continue  # A persistent worktree waits, with its `.lake`, for this worker's next round.
             _check_unused(co)
             _park(current, co)
             with host_lock():

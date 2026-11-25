@@ -165,11 +165,20 @@ class BackgroundRelink(unittest.TestCase):
             calls.append((checkout, lake, env["ELAN_TOOLCHAIN"], env["LAKE_CACHE_DIR"]))
             return {}
 
-        with patch("tauceti_worker.canonical_store.between_rounds", between_rounds):
+        with (
+            patch.dict(os.environ, {"TAUCETI_PERSISTENT_WORKTREES": "0"}),
+            patch("tauceti_worker.canonical_store.between_rounds", between_rounds),
+        ):
             self.assertEqual(background.main(str(self.state)), 0)
-        # A worktree still in place was never released: another worker's sweep may remove it.
+        # A per-round worktree still in place was never released: another worker's sweep may remove it.
         self.assertEqual(calls, [(worktree, background.parked(worktree), "leanprover/lean4:v4.37.0", "/s")])
         self.assertFalse((self.state / background.REQUESTS).exists())
+        # A persistent worktree keeps its `.lake` in place; one parked before the switch still counts.
+        (self.state / background.REQUESTS).write_text(json.dumps(rows))
+        calls.clear()
+        with patch("tauceti_worker.canonical_store.between_rounds", between_rounds):
+            background.main(str(self.state))
+        self.assertEqual(sorted(call[1] for call in calls), sorted([background.parked(worktree), unreleased / ".lake"]))
         # Without per-round worktrees the checkout keeps its `.lake` in place.
         (self.state / background.REQUESTS).write_text(json.dumps({str(ordinary): dict(env={})}))
         calls.clear()
