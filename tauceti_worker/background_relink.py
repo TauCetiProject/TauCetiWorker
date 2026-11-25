@@ -96,25 +96,59 @@ def _idle_lake(checkout: Path, env) -> Path | None:
     return lake if worktrees(env) and lake.is_dir() and not lake.is_symlink() and not inside.exists() else None
 
 
-def request(checkout: Path, env) -> None:
-    """Ask for a full pass on `checkout`'s tree after this round (the caller holds the lock)."""
-    if not enabled(env):
-        return
-    checkout = Path(checkout).absolute()
+# Set by the loop for the rounds it spawns: only a loop starts the between-rounds pass afterwards.
+LOOP_ROUND = "TAUCETI_LOOP_ROUND"
+# Round ends that may defer relinking in a row before one relinks itself again: a pass the next
+# rounds keep stopping before it converges anything must not leave a tree unshared for ever.
+MAX_DEFERRED = 3
+
+
+def _requests():
     if len(_HELD) != 1:
-        return  # Not a round that took one worker's build-tree lock: nothing would keep a pass out.
-    state = Path(next(iter(_HELD)))
+        return None, {}
+    path = Path(next(iter(_HELD))) / REQUESTS
+    rows = read_json(path)
+    return path, rows if isinstance(rows, dict) else {}
+
+
+def will_follow(env, checkout: Path) -> bool:
+    """Whether this round end may leave relinking to a between-rounds pass.
+
+    Only for a loop's round holding one worker's build-tree lock, and only while earlier rounds have
+    not deferred this tree `MAX_DEFERRED` times without a pass completing it.
+    """
+    if not enabled(env) or os.environ.get(LOOP_ROUND) != "1":
+        return False
+    path, rows = _requests()
+    if path is None:
+        return False
+    row = rows.get(str(Path(checkout).absolute()))
+    return not (isinstance(row, dict) and int(row.get("deferred", 0) or 0) >= MAX_DEFERRED)
+
+
+def request(checkout: Path, env, *, deferred=False) -> bool:
+    """Ask for a full pass on `checkout`'s tree after this round (the caller holds the lock).
+
+    `deferred` says this round end relinked nothing itself; consecutive deferrals are counted.
+    True once the request is on disk.
+    """
+    if not enabled(env):
+        return False
+    checkout = Path(checkout).absolute()
+    path, rows = _requests()
+    if path is None:
+        return False  # Not a round that took one worker's build-tree lock: nothing would keep a pass out.
     try:
         toolchain = (checkout / "lean-toolchain").read_text().strip()
     except OSError:
         toolchain = ""
-    path = state / REQUESTS
-    rows = read_json(path)
-    rows = rows if isinstance(rows, dict) else {}
+    previous = rows.get(str(checkout))
+    count = int(previous.get("deferred", 0) or 0) if isinstance(previous, dict) else 0
     rows[str(checkout)] = dict(
         requested_at=time.time(),
         toolchain=toolchain,
         env={key: env[key] for key in CARRIED if env.get(key) is not None},
+        deferred=count + 1 if deferred else 0,
     )
     from .runtime_status import atomic_json
 
@@ -122,6 +156,8 @@ def request(checkout: Path, env) -> None:
         atomic_json(path, rows)
     except OSError as error:
         log(f"canonical store: between-rounds relink not requested: {error}")
+        return False
+    return True
 
 
 def start(state: Path, running: subprocess.Popen | None = None) -> subprocess.Popen | None:

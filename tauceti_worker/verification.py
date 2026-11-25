@@ -41,6 +41,26 @@ LEAN_DIR = LEAN_ROOT.replace(".", "/")
 STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
 
 
+# The agent's shell kills a command at its budget (`BASH_MAX_TIMEOUT_MS`, one hour by default) with
+# nothing recorded. The verifier stops itself this long before that, so the agent gets an incomplete
+# receipt naming the phase it reached instead of a killed command. Outputs already built are kept.
+DEADLINE_MARGIN_S = 120.0
+
+
+def own_deadline(environ=None, now=None):
+    """The monotonic time this verification stops by, or None without a known budget."""
+    environ = os.environ if environ is None else environ
+    now = time.monotonic() if now is None else now
+    try:
+        if environ.get("TAUCETI_VERIFY_DEADLINE_S"):
+            return now + float(environ["TAUCETI_VERIFY_DEADLINE_S"])
+        if environ.get("BASH_MAX_TIMEOUT_MS"):
+            return now + max(60.0, float(environ["BASH_MAX_TIMEOUT_MS"]) / 1000 - DEADLINE_MARGIN_S)
+    except ValueError:
+        pass
+    return None
+
+
 class Incomplete(Exception):
     def __init__(self, message, *, reason="invalid-input"):
         super().__init__(message)
@@ -343,6 +363,7 @@ class Verification:
         self.lint_modules = lint_modules
         self.requested = list(STAGES) if stage == "all" else [stage]
         self.reuse = reuse
+        self.deadline = own_deadline()  # From the start of the verification, as the shell counts.
         self.id = uuid.uuid4().hex
         self.directory = self.state / "verification" / self.id
         self.path = self.directory / "receipt.json"
@@ -427,6 +448,13 @@ class Verification:
                     )
                 )
                 while process.poll() is None:
+                    if self.deadline is not None and time.monotonic() >= self.deadline:
+                        raise Incomplete(
+                            f"{phase}: stopped at the verification deadline, before the agent's shell budget "
+                            "would kill it. Outputs already built are kept: rerun the verify to continue, or "
+                            "build the modules you changed directly (`lake build Module`).",
+                            reason="deadline",
+                        )
                     if not capture:
                         with log.open("rb") as progress:
                             progress.seek(offset)

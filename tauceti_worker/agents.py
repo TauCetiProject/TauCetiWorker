@@ -1198,10 +1198,14 @@ def run_agent_host(
         if host_caches and rc == 70:
             log("canonical store (round-end): agent cleanup incomplete; relinking left for the next round")
         elif host_caches:
-            relink_build_outputs(cwd, env, phase="round-end")
-            from . import background_relink
+            report = relink_build_outputs(cwd, env, phase="round-end")
+            if not (report or {}).get("deferred"):
+                from . import background_relink
 
-            background_relink.request(cwd, env)
+                # A pass that ran resets the deferral count; one that failed or found the tree busy
+                # counts as deferred, so the next round end relinks itself sooner.
+                ran = report is not None and not report.get("skipped")
+                background_relink.request(cwd, env, deferred=not ran)
     if rc == 75:
         from .claude_api import blocked_reason
 
@@ -3011,6 +3015,17 @@ def _claude_review_model(reviewers: str) -> str | None:
     model = configured or AUTHORING_DEFAULTS["claude"][0]
     _reject_retired_opus(model, "$TAUCETI_CLAUDE_MODEL" if configured else "repository default")
     return model
+
+
+def review_roadmap(cfg) -> list[str]:
+    """`--roadmap-dir` naming the host's shared roadmap snapshot, refreshed at most every 5 minutes.
+
+    The engine otherwise clones the roadmap afresh for every review; without a snapshot it still does.
+    """
+    from .shared_repositories import attach
+
+    staged = cfg.state / "refs" / "review-roadmap"
+    return ["--roadmap-dir", str(staged)] if attach(ROADMAP, staged, ttl=300) else []
 
 
 def _codex_review_model_override(reviewers: str) -> str | None:

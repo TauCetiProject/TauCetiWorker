@@ -40,6 +40,7 @@ from .agents import (
     resolve_authoring_profile,
     resolve_codex_model_access,
     review_in_bubble,
+    review_roadmap,
     run_agent_host,
     run_in_bubble,
     run_to_logfile,
@@ -2084,6 +2085,7 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                     [
                         *runtime.command(),
                         str(pr),
+                        *review_roadmap(w.cfg),
                         "--repo",
                         repository,
                         "--workdir",

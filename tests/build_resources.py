@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from functools import partial
 from pathlib import Path
@@ -92,6 +93,24 @@ class Resources(unittest.TestCase):
             )
         self.assertNotIn("LEAN_NUM_THREADS", env)
         self.assertNotIn("RAYON_NUM_THREADS", env)
+
+    def test_a_verification_stops_itself_before_the_shell_budget(self):
+        from tauceti_worker import verification
+        from tauceti_worker.verification import Incomplete, Verification
+
+        self.assertEqual(verification.own_deadline({"BASH_MAX_TIMEOUT_MS": "3600000"}, now=0), 3480)
+        self.assertEqual(verification.own_deadline({"TAUCETI_VERIFY_DEADLINE_S": "30"}, now=5), 35)
+        self.assertEqual(verification.own_deadline({"BASH_MAX_TIMEOUT_MS": "1000"}, now=0), 60)
+        self.assertIsNone(verification.own_deadline({}, now=0))
+        with patch.dict(os.environ, {"TAUCETI_VERIFY_DEADLINE_S": "0.5"}):
+            verifier = Verification(self.root, self.root / "state")
+        verifier.directory.mkdir(parents=True)
+        slow = [sys.executable, "-c", "import time; time.sleep(30)"]
+        started = time.monotonic()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(Incomplete) as stopped:
+            verifier.command("build", slow)
+        self.assertEqual(stopped.exception.reason, "deadline")
+        self.assertLess(time.monotonic() - started, 20)
 
     def test_defaults_preserve_explicit_values(self):
         self.assertEqual(v.defaults({}), {"LEAN_NUM_THREADS": "4", "RAYON_NUM_THREADS": "1"})
