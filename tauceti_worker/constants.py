@@ -93,6 +93,11 @@ MAX_REVIEW_CONTESTS_PER_RUBRIC = 3  # per-rubric cap so one noisy thread can't s
 # fleet queue. Fixed fleet policy rather than an operator knob: reviewers must agree on the same grace.
 REVIEW_AFFINITY_GRACE_S = 20 * 60
 
+# Build affinity (build_affinity.py): a worker on the host that already built a PR gets first refusal
+# on its next fix, fix-ci or rebase round for ten minutes, so the round starts from that worker's warm
+# Lake store. Ten minutes keeps about two thirds of the decision 210 warm-start gain at a bounded delay.
+FIX_AFFINITY_GRACE_S = 10 * 60
+
 # Review candidates are drawn by an age-weighted lottery. One hour of waiting adds one unit of weight;
 # cap at one day so old work is strongly preferred without making every worker converge deterministically
 # on the single oldest PR.

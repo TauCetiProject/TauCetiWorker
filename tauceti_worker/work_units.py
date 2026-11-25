@@ -187,6 +187,44 @@ def _branch_claimed_elsewhere(w, pr: int) -> bool:
     return _claim_held_elsewhere(w, f"branch/{pr}", claims_repo())
 
 
+def _apply_build_affinity(w, sv, opts) -> None:
+    """Offer PRs this worker built first and defer peers' briefly (build_affinity.py).
+
+    Operator-named PRs, bumps and bubble rounds (whose builds use a container's store) never wait,
+    and a host whose authoring is paused does not leave workers idle for it.
+    """
+    from . import build_affinity
+
+    if opts.dry_run or getattr(opts, "prs", None) or not w.cfg.wid:
+        return
+    scope, bumps, now = _claim_scope(w), bump_prs(sv), time.time()
+    # A prepared survey is offered again for later tiers; keep what an earlier pass deferred so a
+    # candidate whose grace has since expired comes back.
+    held = sv.__dict__.setdefault("_build_affinity_deferred", {})
+    for stage in build_affinity.STAGES:
+        if stage not in round_stages(opts) or not want(opts.only, stage) or _bubble(stage, opts):
+            continue
+        kind = sv.kind(stage)
+        candidates = kind.actionable + [c for c in held.get(stage, []) if c not in kind.actionable]
+        try:
+            ordered, deferred = build_affinity.prioritize(scope, w.cfg.wid, candidates, now=now)
+        except Exception as error:  # noqa: BLE001 - a hint must never cost a round
+            log(f"  {stage}: build affinity skipped ({type(error).__name__}: {error})")
+            continue
+        ordered += [c for c in deferred if c.pr in bumps]
+        deferred = [c for c in deferred if c.pr not in bumps]
+        if sv.roadmap_backpressure and deferred:
+            ordered.extend(deferred)
+            deferred = []
+        held[stage] = deferred
+        kind.actionable = ordered
+        if deferred:
+            log(
+                f"  {stage}: deferring {len(deferred)} PR(s) to the workers that built them "
+                f"(first refusal for {build_affinity.FIX_AFFINITY_GRACE_S // 60}m)"
+            )
+
+
 def _claim_scope(w) -> str:
     """The repository a candidate's leases belong to, qualified by forge where the source has one."""
     gh = getattr(w, "gh", None)
@@ -821,6 +859,7 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         sv.kind(stage).actionable = (
             age_spread(candidates) if stage in ("rebase", "fix-ci", "fix") else spread_candidates(candidates)
         )
+    _apply_build_affinity(w, sv, opts)
 
     # The undocumented review throttles, off unless an expert asked for them. Applied here rather than
     # in survey() so they steer only what this round PICKS: the survey (and so `status`, the dashboard,
@@ -2579,6 +2618,7 @@ def _do_fixlike(
         push_scope = current_round_id() or os.urandom(16).hex()
         scoped_push_marker = f"refs/tauceti/published/scope/{push_scope}/{p.head_ref.removeprefix('refs/heads/')}"
         scoped_published_before = _rev(co, scoped_push_marker)
+        agent_started = time.time()
         try:
             with (
                 environment(TAUCETI_PUSH_SCOPE=push_scope),
@@ -2607,6 +2647,11 @@ def _do_fixlike(
                     if c.progress is None:
                         c.progress = {}
                     c.progress["published"] = published_after
+        from . import build_affinity
+
+        if label in {"fix", "fix-ci", "rebase"} and build_affinity.built_since(w.cfg.state, agent_started):
+            # The agent built from this worker's checkout, so its Lake store now holds the PR's modules.
+            build_affinity.note_builder(_claim_scope(w), pr, w.cfg.wid)
     if rc == 0 and closed_by_round(c) or stop.outcome and rc in STOPPED_AGENT_CODES:
         # The agent closed its own PR (verified supersession or final resolution): a completed
         # round with its own outcome, whether it exited by itself or was stopped after closing.
