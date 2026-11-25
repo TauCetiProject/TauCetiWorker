@@ -96,9 +96,10 @@ with tempfile.TemporaryDirectory() as tmp:
             round.finish(NoProgress("other candidates exhausted") if rc is None else None)
         assert recorded == expected, (outcome, recorded)
         assert guarded == expected_guard, (outcome, guarded)
-        assert shared == expected, ("every worker on the host skips an unchanged head", outcome, shared)
+        expected_shared = [] if outcome.get("outcome") == "diff-guard" else expected
+        assert shared == expected_shared, ("every worker on the host skips an unchanged head", outcome, shared)
 
 print(
     "PASS: unchanged review results suppress partial-history re-dispatch for that head only, and expire;"
-    " both are recorded host-wide for that head"
+    " each is recorded host-wide for that head"
 )

@@ -301,7 +301,7 @@ class GlobalMaintenance(unittest.TestCase):
 
         prepared = Survey(worker_id="test", roadmap_only="auto")
         prepared._round_scope = (True, False)
-        prepared.reviewable.actionable = [Candidate(10, HEAD)]
+        prepared.reviewable.actionable = [Candidate(10, HEAD, partial_history=True)]
         self.opts.only = ["review"]
         with (
             patch.object(peer_claims, "unchanged_review_noted", return_value=True) as noted,
@@ -311,6 +311,14 @@ class GlobalMaintenance(unittest.TestCase):
                 run_round(self.w, self.opts, prepared_survey=prepared)
         self.assertEqual(noted.call_args.args[1:], (10, HEAD))
         dispatch.assert_not_called()
+        # A candidate from complete history, such as a new contest reply at the same head, is offered.
+        prepared.reviewable.actionable = [Candidate(10, HEAD, contest="reuse", contest_reply_id=999)]
+        with (
+            patch.object(peer_claims, "unchanged_review_noted", return_value=True),
+            patch.object(work, "dispatch", return_value=0) as dispatch,
+        ):
+            run_round(self.w, self.opts, prepared_survey=prepared)
+        dispatch.assert_called_once()
 
     def test_fixed_heads_are_recorded_per_pr_and_scope_and_expire(self):
         from tauceti_worker import peer_claims
