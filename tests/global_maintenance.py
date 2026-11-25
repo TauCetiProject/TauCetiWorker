@@ -1241,6 +1241,57 @@ class GlobalMaintenance(unittest.TestCase):
                 )
             self.assertEqual([c.pr for c in result.reviewable.actionable] == [10], offered)
 
+    def review_survey(self, rows):
+        survey = importlib.import_module("tauceti_worker.survey")
+        with patch("tauceti_worker.github_state.read_survey", return_value=(True, rows)):
+            result = survey.survey(
+                self.w.cfg,
+                self.w.gh,
+                ReviewState(self.w.cfg, self.w.gh),
+                self.w.counters,
+                stages=["review"],
+                selected_roadmap="auto",
+                cached_only=True,
+            )
+        return [(c.pr, c.contest, c.contest_reply_id) for c in result.reviewable.actionable]
+
+    def test_contest_reply_is_found_before_the_unchanged_skips(self):
+        # An unchanged record says only that the head needs no review. A contest reply on that head,
+        # newer than the record, is still offered, whether this worker or a peer on the host made the
+        # record and whether or not the history is complete. Without one the head stays skipped, with
+        # no upstream read.
+        peer_claims = importlib.import_module("tauceti_worker.peer_claims")
+        recorded_at = 1_800_000_000
+
+        def contest(reply_id, at):
+            stamp = __import__("datetime").datetime.fromtimestamp(at, __import__("datetime").timezone.utc)
+            return {"id": reply_id, "rubric": "reuse", "created_at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+        def partial(r):
+            r["review"]["issue_complete"] = False
+            return r
+
+        fresh, old = contest(901, recorded_at + 600), contest(900, recorded_at - 600)
+        cases = [
+            ("no contest", row(10, "Other", blocking=False), []),
+            ("complete history", row(10, "Other", blocking=False, contest=fresh), [(10, "reuse", 901)]),
+            ("partial history, new reply", partial(row(10, "Other", contest=fresh)), [(10, "reuse", 901)]),
+            ("partial history, old reply", partial(row(10, "Other", contest=old)), []),
+            ("partial history, no reply", partial(row(10, "Other")), []),
+        ]
+        for owner in ("worker", "host"):
+            for name, r, expected in cases:
+                with self.subTest(owner=owner, case=name), tempfile.TemporaryDirectory() as shared:
+                    env = {"TAUCETI_GITHUB_SHARED_DIR": shared}
+                    with patch.dict(os.environ, env), patch("time.time", return_value=recorded_at + 1200):
+                        if owner == "worker":
+                            self.w.counters.unchanged_review_recent = lambda pr, head: head == HEAD
+                            self.w.counters.unchanged_review_at = lambda pr, head: float(recorded_at)
+                        else:
+                            self.w.counters.unchanged_review_recent = lambda pr, head: False
+                            peer_claims.note_unchanged_review("org/repo", 10, HEAD, now=recorded_at)
+                        self.assertEqual(self.review_survey([r]), expected)
+
     def test_disabled_maintenance_remains_disabled(self):
         self.opts.only = ["roadmap"]
         self.run_round([row(10, "Other", complete=False)])

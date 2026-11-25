@@ -228,10 +228,7 @@ def _apply_build_affinity(w, sv, opts) -> None:
 
 def _claim_scope(w) -> str:
     """The repository a candidate's leases belong to, qualified by forge where the source has one."""
-    gh = getattr(w, "gh", None)
-    repository = getattr(gh, "repository", None)
-    key = getattr(repository, "key", None)
-    return key if isinstance(key, str) else str(getattr(gh, "repo", ""))
+    return peer_claims.scope_of(getattr(w, "gh", None))
 
 
 def _fix_cap_spent(w, c: Candidate) -> bool:

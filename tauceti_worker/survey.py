@@ -125,12 +125,16 @@ class Counters:
     def unchanged_review_recent(self, pr: int, head: str, ttl: float = UNCHANGED_REVIEW_TTL) -> bool:
         """Whether the engine recently found `head`'s verdict already published. A partial history
         cannot show that, so without this record the same PRs are re-dispatched on every pass."""
+        return self.unchanged_review_at(pr, head, ttl) is not None
+
+    def unchanged_review_at(self, pr: int, head: str, ttl: float = UNCHANGED_REVIEW_TTL) -> float | None:
+        """When the engine found `head`'s verdict already published, if that is recent; else None."""
         try:
             value = json.loads((self.state / f"review-unchanged-{pr}.json").read_text())
             at = float(value["at"])
         except (OSError, ValueError, TypeError, KeyError):
-            return False
-        return value.get("head") == head and 0 <= time.time() - at < ttl
+            return None
+        return at if value.get("head") == head and 0 <= time.time() - at < ttl else None
 
     def foreign_repair_launched(self, pr: int) -> bool:
         # An unreadable/malformed receipt still consumes the optional canary.
@@ -258,9 +262,25 @@ def _file_review_candidate(sv, counters, p, c) -> None:
     sv.reviewable.suppressed.append(replace(c, reason=reason))
 
 
-def _unchanged_review_recent(counters, pr: int, head: str) -> bool:
+def _unchanged_review_at(counters, pr: int, head: str, scope: str = "") -> float | None:
+    """When this worker, or a peer on the host (`scope`), last found `head`'s verdict already
+    published, or None. Either record means the engine has nothing new to say about the head itself;
+    only a contest reply posted after it can, so callers look for one before skipping the PR."""
+    times = []
     check = getattr(counters, "unchanged_review_recent", None)
-    return bool(check and check(pr, head))
+    if check and check(pr, head):
+        when = getattr(counters, "unchanged_review_at", None)
+        at = when(pr, head) if when else None
+        times.append(at if isinstance(at, (int, float)) else 0.0)
+    if scope:
+        at = peer_claims.unchanged_review_noted_at(scope, pr, head)
+        if at is not None:
+            times.append(at)
+    return max(times) if times else None
+
+
+def _unchanged_review_recent(counters, pr: int, head: str, scope: str = "") -> bool:
+    return _unchanged_review_at(counters, pr, head, scope) is not None
 
 
 def target_marker_focuses(body: str) -> tuple[str, ...]:
@@ -1243,29 +1263,63 @@ def classify_survey(
     #    OR a fresh author CONTEST reply landed since the last review at a clean head (→ contest path,
     #    bounded by the contest caps). The only worker-side stop is the review-ERROR cap: a PR whose
     #    review keeps erroring without completing a review is escalated, not silently dropped.
+    def file_contest(p, reply, m):
+        """Offer a re-review of `reply`, an author contest no review round has answered yet."""
+        rubric = reply["rubric"]
+        c = Candidate(
+            p.number,
+            p.head_oid,
+            f"author contest on {rubric}",
+            contest=rubric,
+            contest_reply_id=reply["id"],
+            attempts=counters.read(f"review-contest-{p.number}"),
+            budget=MAX_REVIEW_CONTESTS,
+            ready_at=_parse_iso8601(reply.get("created_at")),
+            preferred_reviewer=_scoreboard_reviewer(m) if m is not None else "",
+        )
+        if not p.automatic_bump and (
+            counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
+            or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
+            or _review_error_state(counters, p, counters.read(f"review-err-{p.number}"), time.time()) != "ready"
+        ):
+            sv.reviewable.suppressed.append(c)
+        else:
+            sv.reviewable.actionable.append(c)
+
+    scope = peer_claims.scope_of(gh)
     for p in nondraft if "review" in enabled else []:
         if {label.lower() for label in p.labels} & {"hold", "wip", "human", "on-hold"}:
             continue
         if not review_ready(p) or (p.number, p.head_oid) in pending:
             continue
-        if _unchanged_review_recent(counters, p.number, p.head_oid):
-            continue
+        # This worker or a peer on the host recently had the engine find this head's verdict already
+        # published, so the head itself needs no review. A contest reply does not change the head, so
+        # it is looked for before the PR is skipped: otherwise a reply posted after the record would
+        # wait out the record's TTL. The lookups below read only the survey facts and the review index.
+        published_at = _unchanged_review_at(counters, p.number, p.head_oid, scope)
+        if published_at is not None and deep and cached_only:
+            covered = facts.get(p.number, {})
+            if not (covered.get("issue_complete") and covered.get("review_complete")):
+                # Partial history: no scoreboard to say which replies were answered, so offer a
+                # contest from complete review-comment facts only if it is newer than the record.
+                reply = covered.get("contest") if covered.get("review_complete") else None
+                created = _parse_iso8601(reply.get("created_at")) if isinstance(reply, dict) else None
+                if created is not None and created >= int(published_at):
+                    file_contest(p, reply, None)
+                continue
         if not deep:
-            sv.reviewable.actionable.append(
-                Candidate(
-                    p.number, p.head_oid, "ready for review, head not cleanly reviewed", ready_at=p.build_status_at
+            if published_at is None:
+                sv.reviewable.actionable.append(
+                    Candidate(
+                        p.number, p.head_oid, "ready for review, head not cleanly reviewed", ready_at=p.build_status_at
+                    )
                 )
-            )
             continue
         if not history_ready(p):
             # A partial projection is not an empty history. Let the review engine
             # inspect the selected PR and coordinate its real per-head claim.
             # Author-action PRs are handled by their writer instead.
-            if (
-                "awaiting-author" not in p.labels
-                and "ready-to-merge" not in p.labels
-                and not _unchanged_review_recent(counters, p.number, p.head_oid)
-            ):
+            if "awaiting-author" not in p.labels and "ready-to-merge" not in p.labels:
                 c = Candidate(
                     p.number,
                     p.head_oid,
@@ -1281,9 +1335,10 @@ def classify_survey(
         if m.provenance == "deferred":
             continue  # the index could not be refreshed for it this survey; a later survey reads it
         if m.provenance in {"stale", "fetch_failed"}:
-            gaps.add(p.number)
+            if published_at is None:
+                gaps.add(p.number)
             continue
-        if rs.ledger_clean_head(p.number) != p.head_oid:
+        if published_at is None and rs.ledger_clean_head(p.number) != p.head_oid:
             # normal review path: the head moved or the last round errored.
             c = Candidate(
                 p.number,
@@ -1298,7 +1353,8 @@ def classify_survey(
             )
             _file_review_candidate(sv, counters, p, c)
             continue
-        # Head is cleanly reviewed: only a NEW author contest reply re-opens it. The engine records
+        # Head is cleanly reviewed, or its verdict was found published: only a NEW author contest
+        # reply re-opens it. The engine records
         # the highest reply id it has adjudicated as `replies_through` in the scoreboard meta, so a
         # reply with a higher id is one no review round has answered yet — precise (monotonic id),
         # with no second-resolution ambiguity, and self-clearing (the contest round advances
@@ -1318,26 +1374,7 @@ def classify_survey(
         age = None if cached_only else gh.fresh_claim_age(reply["id"])
         if age is not None and age < CONTEST_CLAIM_TTL:
             continue
-        rubric = reply["rubric"]
-        c = Candidate(
-            p.number,
-            p.head_oid,
-            f"author contest on {rubric}",
-            contest=rubric,
-            contest_reply_id=reply["id"],
-            attempts=counters.read(f"review-contest-{p.number}"),
-            budget=MAX_REVIEW_CONTESTS,
-            ready_at=_parse_iso8601(reply.get("created_at")),
-            preferred_reviewer=_scoreboard_reviewer(m),
-        )
-        if not p.automatic_bump and (
-            counters.read(f"review-contest-{p.number}") >= MAX_REVIEW_CONTESTS
-            or counters.read(f"review-contest-{p.number}-{rubric}") >= MAX_REVIEW_CONTESTS_PER_RUBRIC
-            or _review_error_state(counters, p, counters.read(f"review-err-{p.number}"), time.time()) != "ready"
-        ):
-            sv.reviewable.suppressed.append(c)
-        else:
-            sv.reviewable.actionable.append(c)
+        file_contest(p, reply, m)
 
     if deep and "fix" in enabled:
         # 3) fix: tended (ours or bot-authored), reviewed-at-head, latest rubric blocking, under
