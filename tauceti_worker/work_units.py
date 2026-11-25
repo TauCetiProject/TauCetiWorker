@@ -954,11 +954,12 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         if (
             stage == "review"
             and not opts.dry_run
-            and getattr(c, "partial_history", False)
+            and not getattr(c, "contest", None)
             and peer_claims.unchanged_review_noted(_claim_scope(w), c.pr, c.head)
         ):
             # A peer on this host recently had the engine find this head's verdict already published.
-            # Only for PRs sent to the engine for want of history: a known contest is always offered.
+            # Each worker keeps its own review ledger, so without this every worker rediscovers it.
+            # A known contest reply does not change the head and is always offered.
             continue
         if not opts.dry_run and c.pr and peer_claims.hinted(_claim_scope(w), stage, c.pr, c.head):
             log(f"Global PR work: {stage} #{c.pr} recently found claimed by a peer — skipping before fresh PR reads")
