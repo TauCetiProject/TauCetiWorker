@@ -726,7 +726,13 @@ class ProgressAlertNotifier(unittest.TestCase):
         self.assertIn("ops", urllib.parse.unquote(calls[0][1]))
         posted = urllib.parse.parse_qs(calls[1][2].decode())
         self.assertEqual(
-            posted, {"type": ["stream"], "to": ["ops"], "topic": ["fleet health"], "content": ["hello m1"]}
+            posted,
+            {
+                "type": ["stream"],
+                "to": ["ops"],
+                "topic": ["fleet health"],
+                "content": [":robot: Claude says: hello m1"],
+            },
         )
         from tauceti_worker import audit_alerts
 

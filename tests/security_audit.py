@@ -2,12 +2,14 @@
 """Cursor invariants, complete history coverage, authorization, and reviewer isolation."""
 
 import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import DEFAULT, patch
@@ -359,6 +361,22 @@ class PrivateAlerts(unittest.TestCase):
         self.assertIn("Inspection incomplete", message)
         self.assertIn("Human review required", message)
         self.assertNotIn("operational stall", message)
+
+    def test_posted_messages_open_with_the_claude_says_prefix_once(self):
+        self.request.stop()
+        self.addCleanup(self.request.start)
+        posted = []
+
+        class Opener:
+            def open(self, req, timeout):
+                posted.append(urllib.parse.parse_qs(req.data.decode())["content"][0])
+                return io.BytesIO(b'{"result": "success", "id": 1}')
+
+        config = json.loads(self.config.read_text())
+        with patch.object(alerts.urllib.request, "build_opener", lambda *_: Opener()):
+            alerts.request(config, "POST", {"type": "direct", "content": "hold"})
+            alerts.request(config, "POST", {"type": "direct", "content": alerts.PREFIX + "hold"})
+        self.assertEqual(posted, [":robot: Claude says: hold"] * 2)
 
     def test_request_trusts_the_host_ca_bundle_without_ssl_cert_file(self):
         self.request.stop()

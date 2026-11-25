@@ -146,7 +146,8 @@ entry, not an alert):
   delivered message is not sent again.
 
 The Zulip client is the security audit's (`tauceti_worker/audit_alerts.py`): HTTPS origins only, no
-redirects, bot basic authentication. Configure it by pointing `TAUCETI_QUEUE_ZULIP_CONFIG` in the
+redirects, bot basic authentication. Every message it posts opens with ":robot: Claude says:" (decision
+135), so an automated alert is never mistaken for a person. Configure it by pointing `TAUCETI_QUEUE_ZULIP_CONFIG` in the
 service's environment (`~/.config/tauceti-queue/environment`) at a mode-0600 JSON file:
 
 ```json

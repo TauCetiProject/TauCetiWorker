@@ -19,10 +19,15 @@ from .config import log
 from .constants import TAUCETI
 from .paths import ensure_ssl_cert_file
 
+# Every message the bot posts (security audit, queue escalations and progress alerts, stuck heads)
+# opens with this, so the operator can tell an automated alert from a person at a glance.
+PREFIX = ":robot: Claude says: "
+
 
 def request(config: dict, method: str, params: dict, *, require_recipient: bool = True) -> dict:
     """One Zulip messages API call as the configured bot. `require_recipient` False is for a caller
-    that posts to a stream topic, which names no user (the queue's progress alerts)."""
+    that posts to a stream topic, which names no user (the queue's progress alerts). A posted
+    message's content gets `PREFIX` unless it already has it."""
     site = config["site"].rstrip("/")
     url = urllib.parse.urlsplit(site)
     if (
@@ -37,6 +42,8 @@ def request(config: dict, method: str, params: dict, *, require_recipient: bool 
         raise ValueError("Zulip site must be an HTTPS origin")
     if require_recipient and (type(config.get("recipient_id")) is not int or config["recipient_id"] <= 0):
         raise ValueError("Zulip recipient must be a positive user ID")
+    if method == "POST" and isinstance(params.get("content"), str) and not params["content"].startswith(PREFIX):
+        params = {**params, "content": PREFIX + params["content"]}
     encoded = urllib.parse.urlencode(params).encode()
     endpoint = site + "/api/v1/messages"
     auth = base64.b64encode(f"{config['email']}:{config['api_key']}".encode()).decode()
