@@ -1366,6 +1366,41 @@ class Parts(unittest.TestCase):
         self.assertIn("where mkEval", shown)
         self.assertNotIn("def helper", shown)  # Nothing names it.
 
+    def test_keywords_inside_syntax_quotations_never_end_a_definition(self):
+        text = "\n".join(
+            [
+                "def gen : Lean.MacroM Lean.Syntax := do",
+                "  let a ← `(command|",
+                "def first := 1)",
+                "  let b ← `(command|",
+                'def second := ")"  -- )',
+                "  )",
+                "  pure (tail a b)",
+                "theorem t : True := trivial",
+            ]
+        )
+        blocks = sa.declarations(text.split("\n"))
+        self.assertEqual([(lo, hi, name) for lo, hi, _, name in blocks], [(1, 7, "gen"), (8, 8, "t")])
+        self.assertEqual(sa.code_mask(["x `(unterminated -- comment"]), ["x" + " " * 26])
+
+    def test_a_pass_needs_the_plan_to_hold_every_hunk(self):
+        batch = self.wide({})
+        result, _, attempt = self.inspect(batch, lambda model, user: {"verdict": "pass", "findings": []})
+        self.assertEqual(result["verdict"], "pass")
+        plan = json.loads((attempt / sa.PLANS).read_text())
+        commit = batch["commits"][0]
+        self.assertTrue(audit_evidence.plan_covers(plan, commit))
+        diff = commit["files"][0]["diff"] + "@@ -9,1 +9,1 @@\n-x\n+y\n"  # Two hunks now.
+        split = {**commit, "files": [{**commit["files"][0], "diff": diff}, *commit["files"][1:]]}
+        first = {"path": commit["files"][0]["path"], "hunks": "1-1 of 2"}
+        rest = [{"units": [u for p in plan["parts"] for u in p["units"] if u["path"] != first["path"]]}]
+        self.assertTrue(
+            audit_evidence.plan_covers({"parts": [{"units": [first, {**first, "hunks": "2-2 of 2"}]}, *rest]}, split)
+        )
+        self.assertFalse(audit_evidence.plan_covers({"parts": [{"units": [first]}, *rest]}, split))  # A hunk dropped.
+        self.assertFalse(audit_evidence.plan_covers({"parts": [{"units": [first, first]}, *rest]}, split))
+        self.assertFalse(audit_evidence.plan_covers({"parts": rest}, split))  # A file dropped.
+
     def test_a_hunk_registering_existing_code_is_shown_that_code(self):
         filler = [f"theorem filler{i} : True := trivial" for i in range(3000)]
         lines = ["import Lean", *filler[:1500], "def latent : Lean.Macro := fun _ => Lean.Macro.throwUnsupported"]

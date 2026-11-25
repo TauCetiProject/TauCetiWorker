@@ -76,7 +76,8 @@ count, since every token is at least one byte.
   concern, escalated alone to Sonnet; any part's binding finding binds the commit and ends the
   inspection. The plan (`parts.json`, written before any request) names every part, each part's
   stages live in its own `part-NNNN/` directory of the attempt, and `execution.json` lists every
-  stage with its part. A pass needs a valid pass in every planned part; a part directory the plan
+  stage with its part. A pass needs a valid pass in every planned part, and a plan that holds every file whole or every
+  one of its hunks exactly once; a part directory the plan
   does not name, or a plan that cannot be read, holds the commit like any unreadable evidence.
 
 What this gives up: a part's reviewer reads its own files completely but the rest of the commit
@@ -86,8 +87,8 @@ is seen in full by the reviewer holding its file and with its dependencies by ev
 plain `def` that nothing in the context names is not context: it cannot run at build time unless
 something the context shows runs it. Blocks follow how Lean ends a command: one starts only at a
 declaration keyword (at any indentation) or, at column 0, a command with no term form, found after
-comments, strings and character literals are blanked, so neither a comment nor a string inside a
-definition can cut it short. Missing a command only lengthens a block, and names are matched by
+comments, strings, character literals and syntax quotations are blanked, so nothing quoted or
+commented inside a definition can cut it short. Missing a command only lengthens a block, and names are matched by
 their last component, so the extraction errs toward showing more.
 
 Only a single hunk too large for a part even without its surrounding lines, or commit-wide

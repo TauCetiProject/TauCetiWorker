@@ -702,10 +702,12 @@ def ident_char(c: str) -> bool:
 
 
 def code_mask(lines: list[str]) -> list[str]:
-    """The lines with comments, strings and character literals blanked, positions kept.
+    """The lines with comments, strings, character literals and syntax quotations blanked, positions kept.
 
-    Nested block comments, escapes and raw strings are followed. An unterminated comment or string
-    blanks the rest of the file, which only makes blocks longer."""
+    Nested block comments, escapes, raw strings and parentheses inside a quotation (`` `(...) ``,
+    `` `(command| ...) ``) are followed, so a keyword quoted inside a definition never ends it. An
+    unterminated comment, string or quotation blanks the rest of the file, which only makes blocks
+    longer."""
     text = "\n".join(lines)
     out, i, n = list(text), 0, len(text)
 
@@ -738,6 +740,23 @@ def code_mask(lines: list[str]) -> list[str]:
             j = n if end < 0 else end + 1 + len(raw.group(1))
         elif c == "'" and not (i and ident_char(text[i - 1])) and (char := CHAR.match(text, i)):
             j = char.end()
+        elif text.startswith("`(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text[j] == '"':  # A string inside the quotation: skip it whole.
+                    j += 1
+                    while j < n and text[j] != '"':
+                        j += 2 if text[j] == "\\" else 1
+                elif text.startswith("--", j):  # A line comment: skip to its end.
+                    end = text.find("\n", j)
+                    j = n if end < 0 else end
+                elif text.startswith("/-", j):  # A block comment (unnested here): skip past its end.
+                    end = text.find("-/", j + 2)
+                    j = n if end < 0 else end + 1
+                else:
+                    depth += {"(": 1, ")": -1}.get(text[j], 0)
+                j += 1
+            j = min(j, n)
         elif c == "«":
             end = text.find("»", i)
             i = n if end < 0 else end + 1  # A quoted name is code, whatever it contains.
@@ -1169,7 +1188,11 @@ def inspect_parts(batch: dict, work: Path, parts: list[dict], key: str, *, escal
             "input_digest": batch["input_digest"],
             "commit": batch["commits"][0]["sha"],
             "parts": [
-                {"dir": part_dir(work, p).name, "paths": list(dict.fromkeys(u["path"] for u in p["units"]))}
+                {
+                    "dir": part_dir(work, p).name,
+                    "paths": list(dict.fromkeys(u["path"] for u in p["units"])),
+                    "units": [{"path": u["path"], "hunks": u.get("hunks")} for u in p["units"]],
+                }
                 for p in parts
             ],
         },

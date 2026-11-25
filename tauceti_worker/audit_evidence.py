@@ -346,12 +346,11 @@ def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
     parts = planned_parts(attempt)
     if parts is not None:
         plan = json.loads((attempt / PLANS).read_text())
-        paths = {path for p in plan["parts"] for path in p["paths"]}
         if (
             len(batch["commits"]) != 1
             or plan["input_digest"] != batch["input_digest"]
             or plan["commit"] != batch["commits"][0]["sha"]
-            or paths != {f["path"] for f in batch["commits"][0]["files"]}
+            or not plan_covers(plan, batch["commits"][0])
         ):
             raise Die("security-audit: the part plan does not cover this exact commit")
     verdict = None
@@ -366,6 +365,33 @@ def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
         if verdict["verdict"] != "pass":
             raise Die(f"security-audit: {verdict['verdict']} without a recorded concern")
     return verdict
+
+
+HUNKS = re.compile(r"(\d+)-(\d+) of (\d+)")
+
+
+def plan_covers(plan: dict, commit: dict) -> bool:
+    """Whether the plan's parts hold every file of the commit exactly once: whole, or every hunk."""
+    from .security_audit import hunks
+
+    units: dict[str, list] = {}
+    for p in plan["parts"]:
+        for unit in p["units"]:
+            units.setdefault(unit["path"], []).append(unit["hunks"])
+    if set(units) != {f["path"] for f in commit["files"]}:
+        return False
+    for f in commit["files"]:
+        found = units[f["path"]]
+        if found == [None]:
+            continue
+        spans = [HUNKS.fullmatch(h) if isinstance(h, str) else None for h in found]
+        if not all(spans):
+            return False
+        count = len(hunks(f["diff"])[1])
+        covered = [k for m in spans for k in range(int(m[1]), int(m[2]) + 1)]
+        if any(int(m[3]) != count for m in spans) or covered != list(range(1, count + 1)):
+            return False
+    return True
 
 
 def classify(state: Path, attempt: Path, batch: dict, failure: BaseException | str | None = None) -> Outcome:
