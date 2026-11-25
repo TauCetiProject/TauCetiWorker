@@ -112,6 +112,7 @@ class Round:
         emit(
             "round_selected",
             key=f"{self.id}:select:{self.selections}",
+            selection=self.selections,
             round_id=self.id,
             worker=self.worker,
             round_type=kind,
@@ -203,6 +204,7 @@ def _connect():
       CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS round_publications(round_id TEXT,worker TEXT,scope TEXT,publication TEXT,
         PRIMARY KEY(round_id,worker,scope,publication));
+      CREATE TABLE IF NOT EXISTS round_selections(round_id TEXT PRIMARY KEY,selection INTEGER);
       CREATE TABLE IF NOT EXISTS rounds(id TEXT PRIMARY KEY,worker TEXT,scope TEXT,kind TEXT,
         started REAL,finished REAL,outcome TEXT,pid INTEGER,identity TEXT,hostname TEXT);
       DROP INDEX IF EXISTS round_finish_covering;
@@ -337,9 +339,19 @@ def _ingest(db, e):
                 (e["at"], e.get("pid"), e.get("process_identity"), e.get("hostname"), rid),
             )
         elif kind == "round_selected":
-            # The finish receipt carries the final kind; a late selection must not replace it.
-            db.execute("UPDATE rounds SET kind=? WHERE id=? AND finished IS NULL", (e["round_type"], rid))
+            # Receipts arrive in hash order, possibly across collector runs: only a
+            # round's latest selection names it, and the finish receipt's kind is final.
+            selection = e.get("selection")
+            selection = selection if type(selection) is int else 0  # receipts from before numbering
+            if db.execute(
+                """INSERT INTO round_selections SELECT id,? FROM rounds WHERE id=? AND finished IS NULL
+                   ON CONFLICT(round_id) DO UPDATE SET selection=excluded.selection
+                   WHERE excluded.selection>round_selections.selection""",
+                (selection, rid),
+            ).rowcount:
+                db.execute("UPDATE rounds SET kind=? WHERE id=?", (e["round_type"], rid))
         elif kind == "round_finished":
+            db.execute("DELETE FROM round_selections WHERE round_id=?", (rid,))
             db.execute(
                 "UPDATE rounds SET kind=?,finished=?,outcome=? WHERE id=?",
                 (e["round_type"], e["at"], e["outcome"], rid),
@@ -355,25 +367,11 @@ def _ingest(db, e):
     _reconcile_publication(db, e, worker, scope)
 
 
-def _receipt_time(receipt):
-    at = receipt.get("at") if isinstance(receipt, dict) else None
-    return at if isinstance(at, (int, float)) else 0
-
-
 def _consume(db, errors):
-    receipts = []
     for path in sorted((root() / "pending").glob("*.json")):
         try:
-            receipts.append((json.loads(path.read_text()), path))
-        except (OSError, ValueError):
-            errors.append("Invalid or unreadable activity receipt: " + path.name)
-    # Receipt file names are hashes; apply them in emission order so a round's
-    # later selection lands after its earlier one.
-    receipts.sort(key=lambda item: _receipt_time(item[0]))
-    for receipt, path in receipts:
-        try:
             with db:
-                _ingest(db, receipt)
+                _ingest(db, json.loads(path.read_text()))
             path.unlink()
         except (OSError, ValueError, KeyError, sqlite3.Error):
             errors.append("Invalid or unreadable activity receipt: " + path.name)
