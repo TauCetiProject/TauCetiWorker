@@ -1374,13 +1374,15 @@ class Parts(unittest.TestCase):
                 "def first := 1)",
                 "  let b ← `(command|",
                 'def second := ")"  -- )',
+                "  /- nested /- ) -/ ) -/ ')'",
+                "mutual def third := 3 end",
                 "  )",
                 "  pure (tail a b)",
                 "theorem t : True := trivial",
             ]
         )
         blocks = sa.declarations(text.split("\n"))
-        self.assertEqual([(lo, hi, name) for lo, hi, _, name in blocks], [(1, 7, "gen"), (8, 8, "t")])
+        self.assertEqual([(lo, hi, name) for lo, hi, _, name in blocks], [(1, 9, "gen"), (10, 10, "t")])
         self.assertEqual(sa.code_mask(["x `(unterminated -- comment"]), ["x" + " " * 26])
 
     def test_a_pass_needs_the_plan_to_hold_every_hunk(self):

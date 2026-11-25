@@ -701,71 +701,71 @@ def ident_char(c: str) -> bool:
     return c.isalnum() or c in "_'!?"
 
 
+def literal_end(text: str, i: int) -> tuple[int, bool] | None:
+    """Where the comment, string, character literal, syntax quotation or quoted name at `i` ends,
+    and whether it is blanked (a quoted name is code); None if none starts there.
+
+    Block comments nest, and a quotation (`` `(...) ``, `` `(command| ...) ``) ends at its matching
+    parenthesis, skipping everything inside by these same rules. Unterminated: the end of the text."""
+    n, c = len(text), text[i]
+    if text.startswith("--", i):
+        end = text.find("\n", i)
+        return (n if end < 0 else end), True
+    if text.startswith("/-", i):
+        depth, j = 1, i + 2
+        while j < n and depth:
+            if text.startswith("/-", j):
+                depth, j = depth + 1, j + 2
+            elif text.startswith("-/", j):
+                depth, j = depth - 1, j + 2
+            else:
+                j += 1
+        return min(j, n), True
+    if c == '"':
+        j = i + 1
+        while j < n and text[j] != '"':
+            j += 2 if text[j] == "\\" else 1
+        return min(j + 1, n), True
+    after_ident = i > 0 and ident_char(text[i - 1])
+    if c == "r" and (raw := RAW.match(text, i)) and not after_ident:
+        end = text.find('"' + raw.group(1), raw.end())
+        return (n if end < 0 else end + 1 + len(raw.group(1))), True
+    if c == "'" and not after_ident and (char := CHAR.match(text, i)):
+        return char.end(), True
+    if c == "«":
+        end = text.find("»", i)
+        return (n if end < 0 else end + 1), False
+    if text.startswith("`(", i):
+        depth, j = 1, i + 2
+        while j < n and depth:
+            if (inner := literal_end(text, j)) is not None:
+                j = max(inner[0], j + 1)
+                continue
+            depth += {"(": 1, ")": -1}.get(text[j], 0)
+            j += 1
+        return min(j, n), True
+    return None
+
+
 def code_mask(lines: list[str]) -> list[str]:
     """The lines with comments, strings, character literals and syntax quotations blanked, positions kept.
 
-    Nested block comments, escapes, raw strings and parentheses inside a quotation (`` `(...) ``,
-    `` `(command| ...) ``) are followed, so a keyword quoted inside a definition never ends it. An
+    A keyword quoted or commented inside a definition therefore never ends it (`literal_end`). An
     unterminated comment, string or quotation blanks the rest of the file, which only makes blocks
     longer."""
     text = "\n".join(lines)
     out, i, n = list(text), 0, len(text)
-
-    def blank(a: int, b: int) -> None:
-        for k in range(a, b):
-            if out[k] != "\n":
-                out[k] = " "
-
     while i < n:
-        c = text[i]
-        if text.startswith("--", i):
-            j = text.find("\n", i)
-            j = n if j < 0 else j
-        elif text.startswith("/-", i):
-            depth, j = 1, i + 2
-            while j < n and depth:
-                if text.startswith("/-", j):
-                    depth, j = depth + 1, j + 2
-                elif text.startswith("-/", j):
-                    depth, j = depth - 1, j + 2
-                else:
-                    j += 1
-        elif c == '"':
-            j = i + 1
-            while j < n and text[j] != '"':
-                j += 2 if text[j] == "\\" else 1
-            j = min(j + 1, n)
-        elif c == "r" and (raw := RAW.match(text, i)) and not (i and ident_char(text[i - 1])):
-            end = text.find('"' + raw.group(1), raw.end())
-            j = n if end < 0 else end + 1 + len(raw.group(1))
-        elif c == "'" and not (i and ident_char(text[i - 1])) and (char := CHAR.match(text, i)):
-            j = char.end()
-        elif text.startswith("`(", i):
-            depth, j = 1, i + 2
-            while j < n and depth:
-                if text[j] == '"':  # A string inside the quotation: skip it whole.
-                    j += 1
-                    while j < n and text[j] != '"':
-                        j += 2 if text[j] == "\\" else 1
-                elif text.startswith("--", j):  # A line comment: skip to its end.
-                    end = text.find("\n", j)
-                    j = n if end < 0 else end
-                elif text.startswith("/-", j):  # A block comment (unnested here): skip past its end.
-                    end = text.find("-/", j + 2)
-                    j = n if end < 0 else end + 1
-                else:
-                    depth += {"(": 1, ")": -1}.get(text[j], 0)
-                j += 1
-            j = min(j, n)
-        elif c == "«":
-            end = text.find("»", i)
-            i = n if end < 0 else end + 1  # A quoted name is code, whatever it contains.
-            continue
-        else:
+        found = literal_end(text, i)
+        if found is None:
             i += 1
             continue
-        blank(i, j)
-        i = j
+        end, blanked = found
+        if blanked:
+            for k in range(i, end):
+                if out[k] != "\n":
+                    out[k] = " "
+        i = max(end, i + 1)
     return "".join(out).split("\n")
 
 
