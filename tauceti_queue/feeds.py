@@ -755,7 +755,7 @@ class ControllerFeedSource:
             stored = row.get("pre_rebase_attestation") if latest.get("early") == 1 else row.get("attestation")
             note = _loads(stored, {})
             problem = getattr(self.controller, "_attestation_problem", None)
-            counts = problem is None or problem(stored, head_sha) is None
+            counts = problem is None or problem(stored, head_sha, int(row["id"])) is None
             if counts and isinstance(note, dict) and note.get("tip") == head_sha and note.get("tree"):
                 attestation = {"tip": note["tip"], "tree": note["tree"], "policy_commit": note.get("policy_commit")}
         generation = None

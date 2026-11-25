@@ -420,7 +420,8 @@ def pristine_driver_root(worktree: Path, tools_root: Path, ref: str, env: dict) 
         return None
     # The cached drivers are keyed by the pin, the toolchain, the dependency manifest and the seed itself
     # (its path and Batteries' own manifest), so a changed seed never reuses an older driver.
-    seed = f"{shared}\n{hashlib.sha256(batteries).hexdigest()}\n"
+    # "pool-free": drivers built before decision 202 could restore outputs from a pool; none is reused.
+    seed = f"{shared}\n{hashlib.sha256(batteries).hexdigest()}\npool-free\n"
     root = (
         tools_root
         / DRIVERS_DIR
@@ -499,7 +500,7 @@ def build_drivers(
         run = _sandboxed(
             ["bash", "-c", DRIVER_SCRIPT, "build-drivers", scripts, worktree, scratch],
             worktree,
-            env,
+            pool_free(env),
             None,
             log,
             timeout,
@@ -516,6 +517,18 @@ def build_drivers(
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     return dest, {k: v for k, v in run.items() if k != "output"}
+
+
+def pool_free(env: dict) -> dict:
+    """``env`` without the task's artifact pool, for the verifier's own driver builds (decision 202).
+
+    The drivers are kept under ``tools_root`` and reused by every later batch's checks, but the pool is
+    the batch's and candidate code can write it: a driver build that restored an output from it could
+    carry one batch's code into every later batch's verifier. Lake's artifact cache is off, so the
+    build reads only the pristine root and the read-only seed packages, and no pool is mounted."""
+    clean = {k: v for k, v in env.items() if k not in ("LAKE_CACHE_DIR", "LAKE_RESTORE_ARTIFACTS")}
+    clean["LAKE_ARTIFACT_CACHE"] = "false"
+    return clean
 
 
 # ----------------------------------------------------------------------------------------------

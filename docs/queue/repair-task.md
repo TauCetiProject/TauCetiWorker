@@ -337,7 +337,12 @@ repairs the next batch only on a head tip with such a pass (decision 174). With 
 tip, tree, policy_commit, tools_commit, lint_scope, sandbox, verifier_isolated, toolchain,
 outputs_published, worker_revision}`, what the checks took their pin and policy from, whether the
 whole-library lint ran, whether the build sandbox was on, and whether the checks' own scripts and
-drivers were out of candidate code's reach (`verifier_isolated`, `checks.verifier_isolated`). A `prepare` task released `prepared_clean` after a clean
+drivers were out of candidate code's reach (`verifier_isolated`, `checks.verifier_isolated`), and
+`artifact_pool` (`repair_cache.pool_identity`): `{scope: "batch", batch_id, seeds}` for the batch's
+own pool, with every online fetch into it (`seeds`: `{service, revision, packages}`, `packages` `seed`
+when the worktree's dependencies were the read-only seed packages, else `private`), or
+`{scope: "shared"}` for a task bound before decision 202. Every submission's `worker_notes` also carry
+`artifact_pool`, from which the controller records the tip's output provenance. A `prepare` task released `prepared_clean` after a clean
 streamed build with passing checks sends the same object as the release's `notes`. The worker only
 reports; the controller decides whether it counts. A `repair` task whose
 `parallel_check` diagnostic is proactive (`parallel_check_task`, the head's parallel check while
@@ -408,11 +413,13 @@ has a time budget holds because the service re-exposes the task.
    so never in the public cache, and a `prepare` task builds a batch whose own tips the workers may
    already have published. The controller therefore puts `warm_revs` on every `pre_rebase` and
    `prepare` task record, computed at claim time (`Controller._warm_revs`): for a `pre_rebase`, the
-   head's current tip and its previous tips (newest first, up to `REPAIR_OUTPUTS_PREVIOUS_TIPS`, from
-   `batch_tips`), then the head's base; for a `prepare` of the pre-rebased chain, the head's tips, then
+   head's current tip, then the head's base; for a `prepare` of the pre-rebased chain, the head's tip, then
    the batch's own tips (the one the pre-rebase covers first); for a `prepare` on its own base, the
-   batch's previous tips, then that base. Every kind also lists the tips of the last two landed heads
-   (`Controller._landed_tips`, see controller.md) after those batch tips and before the base. Before the agent runs, the worker fetches the repair namespace's outputs for every one
+   batch's previous tips (newest first, up to `REPAIR_OUTPUTS_PREVIOUS_TIPS`, from `batch_tips`), then
+   that base. Every kind also lists the tips the last two landed heads landed as
+   (`Controller._landed_tips`, see controller.md) after those batch tips and before the base. No
+   other batch's earlier tip is listed: it can hold outputs of members that never land, and the
+   batch's pool is the batch's own (decision 202, "Artifact pools" below). Before the agent runs, the worker fetches the repair namespace's outputs for every one
    of them, then for the task's `tip`, `onto` and `base` (`repair_publish.warm`, without repeats). All
    are tried, not only the first that answers: Lake keys outputs by input trace, so each mapping adds
    the artifacts of its own tree and a nearly identical tree's outputs serve nearly completely. A
@@ -436,7 +443,7 @@ has a time budget holds because the service re-exposes the task.
    synthetic root with the host's system directories bound read-only, `/tmp` a tmpfs, no home
    directory except the elan toolchains (read-only), the worktree read-only with only its `.lake`
    writable, CI's namespace flags including `--unshare-net`, and `LAKE_NO_CACHE=true`. The worker's
-   own additions are its artifact pool (`LAKE_CACHE_DIR`, writable, since Lake stores every built
+   own additions are its batch's artifact pool (`LAKE_CACHE_DIR`, writable, since Lake stores every built
    artifact there), `LAKE_CONFIG` and a shared `--seed-packages` tree (read-only), and the content
    clone's Git directory (read-only, so Lake's Git queries resolve). The arguments, `--iofail`
    included, and the exit status pass through unchanged. The worker's cache fetches (`lake cache get`,
@@ -636,7 +643,9 @@ has a time budget holds because the service re-exposes the task.
    as regular files (reused while pin, toolchain and manifest are unchanged, and never written again).
    The checks run in the sandbox with both directories mounted read-only, and name `timeout` and the
    toolchain's `lean` by absolute path, since `lake env` puts the worktree's build directories first on
-   `PATH`. All of that is `checks.verifier_isolated` (decision 200); without read-only seed packages the
+   `PATH`. The driver build mounts no artifact pool and runs with Lake's artifact cache off
+   (`repair_audit.pool_free`): the drivers outlive the batch, and a pool is the batch's, writable by its
+   code (decision 202). All of that is `checks.verifier_isolated` (decision 200); without read-only seed packages the
    drivers are built in the worktree as before and it is false (`checks.drivers_isolated`). Only the audit
    driver's phase markers stay under `.lake/tauceti-repair-audit`; the host reads them through their
    hard link in the log directory, never through that path, and a link left in the directory's place

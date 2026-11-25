@@ -2139,7 +2139,8 @@ class PreRebase(ControllerCase):
         self.controller.store.update("batches", {"id": head["id"]}, version=len(earlier))
         task = self.controller.claim_task("w", "admin-worker")
         self.assertEqual((task.kind, task.onto, task.batch_id), ("pre_rebase", head["tip"], batch["id"]))
-        expected = [head["tip"], "5" * 40, "4" * 40, "2" * 40, "3" * 40, head["base"]]
+        # Not the head's earlier tips: they can hold outputs of members it no longer has (decision 202).
+        expected = [head["tip"], head["base"]]
         self.assertEqual(task.warm_revs, expected)
         self.assertEqual(task.to_dict()["warm_revs"], expected)
 
@@ -2892,6 +2893,10 @@ class Preparation(ControllerCase):
             for row in self.controller.store.rows("batch_tips", {"batch_id": landed["id"]}, order="version DESC")
         ]
         self.assertEqual(landed_tips[:2], [published, earlier])
+        # Only the tip it landed as is listed (decision 202): its earlier tips may hold outputs of
+        # members that never landed.
+        self.controller.store.update("batches", {"id": landed["id"]}, tip=published)
+        landed_tips = [published]
         head = self.controller.store.row("batches", {"state": "head"})
         self.assertEqual(head["id"], first["id"])
         revs = self.controller._repair_outputs_revs(head)
@@ -2901,7 +2906,7 @@ class Preparation(ControllerCase):
             if sha and sha != head["tip"] and sha not in expected:
                 expected.append(sha)
         self.assertEqual(revs, expected, "the head's tips, then the landed head's, then the base and main")
-        self.assertLess(revs.index(earlier), revs.index(head["base"]))
+        self.assertNotIn(earlier, revs)
         batch = self.open_batch_behind((401, 402, 403))
         tips = [
             row["tip"]
@@ -2916,7 +2921,7 @@ class Preparation(ControllerCase):
             if sha not in expected:
                 expected.append(sha)
         self.assertEqual(task.warm_revs, expected, "the batch's tips, then the landed head's, then the base")
-        self.assertEqual(task.warm_revs[-3:], [published, earlier, batch["base"]])
+        self.assertEqual(task.warm_revs[-2:], [published, batch["base"]])
 
     def open_batch_behind(self, numbers):
         """An open batch of `numbers` behind the current head."""
@@ -3118,9 +3123,10 @@ class PreRebasedPreparation(PreRebasedCase):
         ]
         claimed = self.controller.claim_task("worker-1", "admin-worker")
         self.assertIn("pre_rebased", claimed.extra)
-        self.assertEqual(claimed.warm_revs[:2], [head["tip"], "1" * 40], "the head's tip, then its previous tip")
-        self.assertEqual(claimed.warm_revs[2], batch["tip"], "then the batch tip the pre-rebase covers")
-        self.assertEqual(claimed.warm_revs[3:], [t for t in own_tips if t != batch["tip"]][:4])
+        self.assertEqual(claimed.warm_revs[0], head["tip"], "the head's tip, never its earlier ones (decision 202)")
+        self.assertNotIn("1" * 40, claimed.warm_revs)
+        self.assertEqual(claimed.warm_revs[1], batch["tip"], "then the batch tip the pre-rebase covers")
+        self.assertEqual(claimed.warm_revs[2:], [t for t in own_tips if t != batch["tip"]][:4])
         self.assertEqual(len(claimed.warm_revs), len(set(claimed.warm_revs)))
 
     def test_adopting_the_pre_rebase_creates_a_prepare_task_for_the_pre_rebased_chain(self):
@@ -3926,9 +3932,12 @@ class Attestation(PreRebasedCase):
         self.controller.set_setting("prepare_min_members", 2, "t")
         self.controller.set_setting("prepare_quiet_seconds", 0, "t")
 
-    def note(self, of, **changes):
+    def note(self, of, batch_id=None, **changes):
+        """An attestation of `of` from batch `batch_id`'s own pool (default the newest batch's)."""
         shown = chain._git(self.repo.clone, "rev-parse", f"{of}^{{tree}}")
         tree = shown.stdout.strip() if shown.returncode == 0 else "0" * 40
+        if batch_id is None:
+            batch_id = max(b["id"] for b in self.controller.store.rows("batches", {}))
         note = {
             "schema": "tauceti-queue.attestation/v1",
             "tip": of,
@@ -3940,12 +3949,101 @@ class Attestation(PreRebasedCase):
             "verifier_isolated": True,
             "toolchain": "",
             "outputs_published": True,
+            "artifact_pool": {"scope": "batch", "batch_id": str(batch_id), "seeds": []},
         }
         note.update(changes)
         return note
 
     def problem(self, checked, **changes):
-        return self.controller._attestation_problem(json.dumps(self.note(checked, **changes)), checked)
+        """Whether the head's attestation of `checked` counts."""
+        head = self.head()["id"]
+        return self.controller._attestation_problem(json.dumps(self.note(checked, head, **changes)), checked, head)
+
+    def test_an_attestation_counts_only_from_the_batchs_own_pool_seeded_with_what_lands(self):
+        # Decision 202: the pool must be the batch's own, and each repair-cache seed must land with the tip.
+        batch = self.open_batch()
+        head = self.head()
+        tip = head["tip"]
+        shared = "the verification restored from an artifact pool shared across batches"
+        for pool in (None, {"scope": "shared"}, {"scope": "unknown"}, "batch"):
+            self.assertEqual(self.problem(tip, artifact_pool=pool), shared)
+        other = {"scope": "batch", "batch_id": str(batch["id"]), "seeds": []}
+        self.assertEqual(
+            self.problem(tip, artifact_pool=other), "the verification restored from another batch's artifact pool"
+        )
+        self.assertEqual(
+            self.controller._attestation_problem(json.dumps(self.note(tip, head["id"])), tip, None),
+            "the verification restored from another batch's artifact pool",
+        )
+
+        def seeded(*revisions, packages="seed"):
+            seeds = [{"service": "tauceti-repair", "revision": r, "packages": packages} for r in revisions]
+            return self.problem(tip, artifact_pool={"scope": "batch", "batch_id": str(head["id"]), "seeds": seeds})
+
+        def clean(*revisions):
+            for revision in revisions:
+                self.controller.store.execute(
+                    "INSERT OR IGNORE INTO output_provenance (tip, batch_id, recorded_at) VALUES (?, ?, 0)",
+                    (revision, head["id"]),
+                )
+
+        self.assertEqual(
+            self.problem(tip, artifact_pool={"scope": "batch", "batch_id": str(head["id"])}),
+            "the attestation does not list its artifact pool's seeds",
+        )
+        self.assertEqual(seeded("x"), "the attestation lists an invalid artifact pool seed")
+        # A fetch with candidate-writable packages could have fetched anything into the pool.
+        self.assertEqual(
+            seeded(tip, packages="private"), "a fetch into the artifact pool ran with candidate-writable packages"
+        )
+        self.assertEqual(
+            self.problem(
+                tip,
+                artifact_pool={
+                    "scope": "batch",
+                    "batch_id": str(head["id"]),
+                    "seeds": [{"service": "mathlib", "revision": "", "packages": "seed"}],
+                },
+            ),
+            None,
+        )
+        # Outputs nobody recorded as built from a clean batch pool (any built before decision 202) do not count.
+        self.assertEqual(
+            seeded(tip),
+            f"the artifact pool was seeded with {tip[:12]}'s outputs, whose own pool is not known clean",
+        )
+        # The tip itself, its ancestors (main), and the batch's own tips land with it.
+        clean(tip, head["base"], self.controller._canonical)
+        self.assertIsNone(seeded(tip, head["base"], self.controller._canonical))
+        # Another batch's unlanded tip does not: its outputs may be of members that never land.
+        unrelated = run_git(self.repo.scratch, "commit-tree", "-m", "elsewhere", f"{tip}^{{tree}}").strip()
+        run_git(self.repo.scratch, "push", "-q", "origin", f"{unrelated}:refs/heads/unrelated")
+        chain.git(self.repo.clone, "fetch", "-q", "origin", "unrelated")
+        clean(unrelated)
+        self.assertEqual(
+            seeded(tip, unrelated),
+            f"the artifact pool was seeded with {unrelated[:12]}'s outputs, which do not land with this tip",
+        )
+        # The tip a batch landed as does count.
+        self.controller.store.update("batches", {"id": batch["id"]}, tip=unrelated, state="landed")
+        self.assertIsNone(seeded(unrelated))
+
+    def test_a_submission_records_its_outputs_clean_only_from_a_qualifying_pool(self):
+        self.open_batch()
+        head = self.head()
+        tip = head["tip"]
+        pool = {"scope": "batch", "batch_id": str(head["id"]), "seeds": []}
+        self.controller._record_provenance({"artifact_pool": {"scope": "shared"}}, tip, head["id"], 1.0)
+        self.controller._record_provenance(json.dumps({"artifact_pool": pool}), tip, head["id"] + 1, 1.0)
+        self.controller._record_provenance("not json", tip, head["id"], 1.0)
+        self.assertIsNone(self.controller.store.row("output_provenance", {"tip": tip}))
+        # A seed without provenance of its own breaks the chain: the record is not made.
+        unknown = dict(pool, seeds=[{"service": "tauceti-repair", "revision": "e" * 40, "packages": "seed"}])
+        self.controller._record_provenance({"artifact_pool": unknown}, tip, head["id"], 1.0)
+        self.assertIsNone(self.controller.store.row("output_provenance", {"tip": tip}))
+        # A clean release's notes are the attestation itself.
+        self.controller._record_provenance({"attestation": {"artifact_pool": pool}}, tip, head["id"], 1.0)
+        self.assertEqual(self.controller.store.row("output_provenance", {"tip": tip})["batch_id"], head["id"])
 
     def test_the_offer_names_main_as_the_policy_commit(self):
         self.open_batch()
@@ -3958,7 +4056,7 @@ class Attestation(PreRebasedCase):
         self.open_batch()
         tip = self.head()["tip"]
         self.assertIsNone(self.problem(tip))
-        self.assertEqual(self.controller._attestation_problem(None, tip), "no attestation")
+        self.assertEqual(self.controller._attestation_problem(None, tip, self.head()["id"]), "no attestation")
         self.assertEqual(self.problem(tip, tip="0" * 40), "the attestation is of another tip")
         self.assertEqual(self.problem(tip, tree="0" * 40), "the attestation names another tree")
         self.assertEqual(self.problem(tip, sandbox=False), "the verification ran outside the build sandbox")
@@ -4006,7 +4104,7 @@ class Attestation(PreRebasedCase):
         self.land_head()
         head = self.head()
         self.assertEqual((head["id"], head["tip"]), (batch["id"], task.tip))
-        self.assertIsNone(self.controller._attestation_problem(head["attestation"], head["tip"]))
+        self.assertIsNone(self.controller._attestation_problem(head["attestation"], head["tip"], head["id"]))
         self.assertIsNone(self.controller.status()["head"]["attestation_problem"])
 
     def test_an_attestation_of_another_tip_is_not_kept(self):

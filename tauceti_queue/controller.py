@@ -2802,6 +2802,7 @@ class Controller:
                 attestation=self._notes_attestation(worker_notes, tip_sha),
                 **prepared,
             )
+            self._record_provenance(worker_notes, tip_sha, batch["id"], now)
             self._record_tip(batch["id"], version, tip_sha, now)
             self.store.update(
                 "tasks",
@@ -3648,8 +3649,7 @@ class Controller:
         return tips
 
     def _landed_tips(self, exclude: int | None = None) -> list[str]:
-        """The published tips of the last `REPAIR_OUTPUTS_LANDED_HEADS` landed batches, newest batch
-        first and each batch's tips newest first (at most `REPAIR_OUTPUTS_PREVIOUS_TIPS` per batch),
+        """The tips the last `REPAIR_OUTPUTS_LANDED_HEADS` landed batches landed as, newest batch first,
         without repeats and without batch `exclude`.
 
         A landed head's tip is published to the repair cache by the worker that verified it, but the
@@ -3663,23 +3663,20 @@ class Controller:
             order="landed_at DESC, id DESC",
             limit=REPAIR_OUTPUTS_LANDED_HEADS + (exclude is not None),
         )
+        # Only the tip each batch landed as: its earlier tips can hold outputs of members that never
+        # landed, which another batch's pool must not be seeded with (decision 202, `_pool_problem`).
         for batch in [b for b in landed if b["id"] != exclude][:REPAIR_OUTPUTS_LANDED_HEADS]:
-            own: list[str] = []
-            for row in self.store.rows("batch_tips", {"batch_id": batch["id"]}, order="version DESC"):
-                if len(own) >= REPAIR_OUTPUTS_PREVIOUS_TIPS:
-                    break
-                if row["tip"] and row["tip"] not in own:
-                    own.append(row["tip"])
-            tips.extend(tip for tip in own if tip not in tips)
+            if batch["tip"] and batch["tip"] not in tips:
+                tips.append(batch["tip"])
         return tips
 
     def _warm_revs(self, task: dict[str, Any], batch: dict[str, Any]) -> list[str]:
         """The revisions whose published repair outputs the worker restores before the agent runs.
 
         A `pre_rebase` task builds on the head's tip, which is never in the public cache: the head's
-        current tip (the task's `onto` first should the head have moved since), its previous tips
-        (newest first, at most `REPAIR_OUTPUTS_PREVIOUS_TIPS`), then the head's base. A `prepare` task
-        of the pre-rebased chain builds there too: the head's tips, then the batch's own tips (the one
+        current tip (the task's `onto` first should the head have moved since), then the head's base.
+        Never another batch's earlier tips (decision 202). A `prepare` task
+        of the pre-rebased chain builds there too: the head's tip, then the batch's own tips (the one
         the pre-rebase covers, then the earlier ones). A `prepare` task on the batch's own base: the
         batch's previous tips, then that base. A `repair` or `rebase_conflict` task on the head: the
         head's current tip, its previous tips, then its base and the canonical commit. Every kind also
@@ -3694,13 +3691,13 @@ class Controller:
                 revs.append(sha)
 
         def head_tips() -> dict[str, Any] | None:
+            # Only the head's current tip, which this batch builds on and so lands with: its earlier tips
+            # can hold outputs of members it no longer has (decision 202, `_pool_problem`).
             add(task["onto"])
             ahead = self._head()
             if ahead is None or ahead["id"] == batch["id"]:
                 return None
             add(ahead["tip"])
-            for tip in self._previous_tips(ahead):
-                add(tip)
             return ahead
 
         def landed() -> None:
@@ -4340,6 +4337,7 @@ class Controller:
                 self.store.update(
                     "batches", {"id": batch["id"]}, verified_tip=tip, attestation=self._notes_attestation(notes, tip)
                 )
+            self._record_provenance(notes, tip, batch["id"], now)
             if check:
                 self._count("parallel_checks_clean" if verified else "parallel_checks_unverified")
                 self.store.journal(
@@ -7107,11 +7105,13 @@ class Controller:
             return None
         return dumps(note)
 
-    def _attestation_problem(self, stored: str | None, tip: str) -> str | None:
+    def _attestation_problem(self, stored: str | None, tip: str, batch_id: int | None) -> str | None:
         """Why the stored attestation does not let the worker's verification of `tip` stand in for staging's
         checks (decision 200); None when it does. It must be of exactly `tip` and its tree, have run every
-        check with the whole-library lint inside the build sandbox, and have taken its TauCetiTools pin and
-        policy files from a commit whose `tauceti.toml` and `scripts/` are `main`'s now."""
+        check with the whole-library lint inside the build sandbox, have taken its TauCetiTools pin and
+        policy files from a commit whose `tauceti.toml` and `scripts/` are `main`'s now, and have built from
+        batch `batch_id`'s own artifact pool seeded only with outputs that land with it (decision 202,
+        `_pool_problem`)."""
         note = loads(stored, None) if stored else None
         if not isinstance(note, dict) or note.get("schema") != ATTESTATION_SCHEMA:
             return "no attestation"
@@ -7147,6 +7147,64 @@ class Controller:
         exact = re.fullmatch(re.escape(repo) + r"@([0-9a-f]{40})", commit)
         if exact is None or (ref != "main" and exact[1] != ref):
             return "the verification used another TauCetiTools"
+        return self._pool_problem(note.get("artifact_pool"), tip, batch_id)
+
+    def _record_provenance(self, worker_notes: Any, tip: str, batch_id: int, now: float) -> None:
+        """Remember that the outputs a worker built for `tip` came from batch `batch_id`'s own pool seeded only
+        with outputs of clean provenance (`_pool_problem`, judged now), so a later batch's pool may be seeded
+        with `tip`'s published outputs. The submission's (or clean release's) `artifact_pool` says which pool;
+        without one, or from a pool that does not qualify, nothing is recorded and `tip` never may be."""
+        notes = worker_notes
+        if isinstance(notes, str):
+            try:
+                notes = loads(notes, {})
+            except ValueError:
+                return
+        if not isinstance(notes, dict):
+            return
+        pool = notes.get("artifact_pool")
+        if pool is None and isinstance(notes.get("attestation"), dict):
+            pool = notes["attestation"].get("artifact_pool")
+        if self._pool_problem(pool, tip, batch_id) is None:
+            self.store.execute(
+                "INSERT OR IGNORE INTO output_provenance (tip, batch_id, recorded_at) VALUES (?, ?, ?)",
+                (tip, batch_id, now),
+            )
+
+    def _pool_problem(self, pool: Any, tip: str, batch_id: int | None) -> str | None:
+        """Why the artifact pool an attestation's build restored from could hold outputs another batch's code
+        wrote (decision 202); None when it could not. The pool must be the batch's own, every fetch into it
+        must have run with the read-only seed packages (otherwise it loaded configurations and executables
+        candidate code may have written, which could fetch or print anything), and every repair-cache
+        revision seeded into it must both land with `tip` or already have landed (an ancestor of `tip`, one
+        of the batch's own tips, or the final tip of a landed batch) and have clean provenance itself
+        (`output_provenance`, `_record_provenance`): its outputs were built the same way. Another batch's
+        unlanded tip may carry outputs of members that never land; a tip built before decision 202, from
+        the pool every batch shared, may carry anything."""
+        if not isinstance(pool, dict) or pool.get("scope") != "batch":
+            return "the verification restored from an artifact pool shared across batches"
+        if batch_id is None or str(pool.get("batch_id")) != str(batch_id):
+            return "the verification restored from another batch's artifact pool"
+        seeds = pool.get("seeds")
+        if not isinstance(seeds, list):
+            return "the attestation does not list its artifact pool's seeds"
+        for seed in seeds:
+            revision = seed.get("revision") if isinstance(seed, dict) else None
+            if not isinstance(revision, str) or not re.fullmatch(r"(?:[0-9a-f]{40})?", revision):
+                return "the attestation lists an invalid artifact pool seed"
+            if seed.get("packages") != "seed":
+                return "a fetch into the artifact pool ran with candidate-writable packages"
+            if not revision:
+                continue  # Mathlib's own cache fetch, with the read-only seed: nothing of any batch's
+            if self.store.row("output_provenance", {"tip": revision}) is None:
+                return f"the artifact pool was seeded with {revision[:12]}'s outputs, whose own pool is not known clean"
+            if revision == tip or self.store.row("batch_tips", {"batch_id": batch_id, "tip": revision}) is not None:
+                continue
+            if self.store.row("batches", {"repository": self.repository, "tip": revision, "state": BATCH_LANDED}):
+                continue
+            if chain._git(self.clone, "merge-base", "--is-ancestor", revision, tip).returncode == 0:
+                continue
+            return f"the artifact pool was seeded with {revision[:12]}'s outputs, which do not land with this tip"
         return None
 
     def _head_tip_verified(self, head: dict[str, Any] | None) -> bool:
@@ -7723,6 +7781,7 @@ class Controller:
                     pre_rebase_verified=task["tip"],
                     pre_rebase_attestation=self._notes_attestation(notes, task["tip"]),
                 )
+                self._record_provenance(notes, task["tip"], batch["id"], now)
             self._count("pre_rebased_prepares_clean")
             self.store.journal(
                 now, "prepared", task["batch_id"], task_id=task["id"], tip=task["tip"], clean=True, pre_rebased=True
@@ -7775,6 +7834,7 @@ class Controller:
                 verified=self._locally_verified(worker_notes, tip_sha),
                 attestation=self._notes_attestation(worker_notes, tip_sha),
             )
+            self._record_provenance(worker_notes, tip_sha, batch["id"], now)
             self.store.update(
                 "tasks",
                 {"id": task["id"]},
@@ -8035,7 +8095,7 @@ class Controller:
         of this tip and base has already failed; `staging` otherwise, which is also the fallback."""
         if not self.setting("attested_landing_enabled") or self._candidate_coordinator(batch_id=batch["id"]):
             return DISPATCH_STAGING
-        if self._attestation_problem(stored, tip) is not None:
+        if self._attestation_problem(stored, tip, batch["id"]) is not None:
             return DISPATCH_STAGING
         if not self._policy_unchanged(base):
             # The base (the head's tip, for an early run) changes `tauceti.toml` or `scripts/`: once it lands
@@ -8074,7 +8134,7 @@ class Controller:
         if attempt.get("dispatch_kind") != DISPATCH_ATTESTED:
             return True
         stored = batch["pre_rebase_attestation"] if attempt.get("early") == EARLY_PENDING else batch["attestation"]
-        return self._attestation_problem(stored, attempt["head_sha"]) is None
+        return self._attestation_problem(stored, attempt["head_sha"], batch["id"]) is None
 
     def _early_staging(self, now: float) -> None:
         """Send the trusted run of the next batch's prepared tip while the head is still staging.
@@ -12233,7 +12293,7 @@ class Controller:
             # Decision 200: why the worker's verification of the prepared tip would not stand in for
             # staging's checks; None when it would. Only for a verified tip.
             "attestation_problem": self._attestation_problem(
-                batch["pre_rebase_attestation"], batch["pre_rebase_verified"]
+                batch["pre_rebase_attestation"], batch["pre_rebase_verified"], batch["id"]
             )
             if batch["pre_rebase_verified"] and batch["pre_rebase_verified"] == batch["pre_rebase_tip"]
             else None,
@@ -12305,7 +12365,7 @@ class Controller:
         # Decision 200: why the worker's verification of the head's tip would not stand in for staging's
         # checks; None when it would (only for a verified tip).
         info["attestation_problem"] = (
-            self._attestation_problem(head["attestation"], head["tip"]) if info["tip_verified"] else None
+            self._attestation_problem(head["attestation"], head["tip"], head["id"]) if info["tip_verified"] else None
         )
         task = self._open_task(head)
         info["task"] = None if task is None else self._task_status(task)

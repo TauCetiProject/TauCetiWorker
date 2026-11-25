@@ -202,7 +202,7 @@ class Cleanup(unittest.TestCase):
 
         self.tree(state="submitted")
         cfg = SimpleNamespace(root=self.worker, binding=None)
-        task = SimpleNamespace(task_id="1", kind="repair", binding=None, extra={})
+        task = SimpleNamespace(task_id="1", batch_id="1", kind="repair", binding=None, extra={})
 
         def attempt(*args, **kwargs):
             with cache_lease(self.worker, exclusive=True) as acquired:
@@ -294,6 +294,23 @@ class Cleanup(unittest.TestCase):
         self.assertFalse((target / ".tauceti-repair").exists())
         self.assertIn(str(target), self.git("worktree", "list", "--porcelain"))
         self.assertIsNone(cleanup.adopt(self.clone, self.worker, "1", self.worker / "worktrees/task-3"))
+
+    def test_a_tree_parked_from_another_pool_is_removed_not_adopted(self):
+        # Decision 202: a tree built from the pre-202 shared pool, or another batch's, is not reused.
+        pools = {1: self.worker.parent / "shared", 2: self.worker.parent / "shared/batches/1"}
+        for task_id, pool in pools.items():
+            (self.worker / "tasks" / str(task_id)).mkdir(parents=True, exist_ok=True)
+            (self.worker / "tasks" / str(task_id) / "cache-root.json").write_text(json.dumps({"root": str(pool)}))
+        cleanup.retire(self.clone, self.worker, "1", 1, self.tree(1, batch="head"), keep=True)
+        target = self.worker / "worktrees/task-2"
+        self.assertIsNone(cleanup.adopt(self.clone, self.worker, "1", target, cache_root=pools[2]))
+        self.assertFalse((self.worker / "worktrees/batch-1").exists())
+        self.assertFalse(target.exists())
+        # Parked by a task bound to the same batch pool: adopted.
+        cleanup.retire(self.clone, self.worker, "1", 2, self.tree(2, batch="head"), keep=True)
+        target = self.worker / "worktrees/task-3"
+        self.assertIsNotNone(cleanup.adopt(self.clone, self.worker, "1", target, cache_root=pools[2]))
+        self.assertTrue(target.is_dir())
 
     def test_unprepared_trees_and_second_trees_of_a_batch_are_removed(self):
         first, second, third = (self.tree(n) for n in (1, 2, 3))
