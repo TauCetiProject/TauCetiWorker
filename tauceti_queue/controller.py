@@ -914,11 +914,11 @@ class Controller:
                 if key == "publication_enabled" and value and not previous:
                     self._republish_retained_refs(now)
                 if (
-                    key == "forgejo_admission_enabled"
-                    and value
+                    (key == "forgejo_admission_enabled" and value or key == "forgejo_admission_requires_build")
                     and self.mixed is not None
                     and self.mixed.poller is not None
                 ):
+                    # Unaccepted Forgejo work was judged under the old rules: judge it again.
                     self.mixed.poller.admission_changed()
             self._wake.set()
             self._refresh_snapshot()

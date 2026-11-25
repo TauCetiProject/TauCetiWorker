@@ -130,6 +130,15 @@ class ForgejoPRBuild(MixedFixture, unittest.TestCase):
         work = self.poller.state.get(1)
         self.assertGreater(work["generation"], work["evaluated_generation"])
 
+    def test_changing_the_build_requirement_has_unaccepted_prs_judged_again(self):
+        self.native.create_pr(1, {"TauCeti/One.lean": "one\n"})
+        self.cycle()
+        work = self.poller.state.get(1)
+        self.assertEqual(work["generation"], work["evaluated_generation"])
+        self.controller.set_setting("forgejo_admission_requires_build", True, "test")
+        work = self.poller.state.get(1)
+        self.assertGreater(work["generation"], work["evaluated_generation"])
+
     def test_red_is_copied_back_as_failure(self):
         head = self.native.create_pr(1, {"TauCeti/One.lean": "broken\n"})
         self.cycle()
