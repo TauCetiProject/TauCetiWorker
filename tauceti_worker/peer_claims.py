@@ -19,6 +19,12 @@ review, oversized new files) is recorded here too, for GUARD_TTL_S. The engine's
 on the head, its merge base and whether the head's build is green. Peers skip that head until a
 push gives the PR a new one or its build turns green; the TTL covers a merge base that moves under
 an unchanged head (a retargeted PR), at a few declined reviews a day rather than hundreds.
+
+A head whose verdict the review engine found already published is recorded here as well, for
+UNCHANGED_REVIEW_TTL_S. When the shared state service lacks a PR's review history, the worker
+cannot see that verdict itself and hands the PR to the engine, which spends about five REST reads
+to find it unchanged. Recorded per worker only, every worker on the host paid those reads once
+per PR; recorded here, the host pays them once.
 """
 
 from __future__ import annotations
@@ -36,6 +42,8 @@ HINT_TTL_S = 600
 # retry deadline, github_state.MAX_RETRY_AFTER), so one fetch failure does not draw every peer to it.
 UNAVAILABLE_TTL_S = 300
 GUARD_TTL_S = 8 * 3600
+# Also the per-worker survey.UNCHANGED_REVIEW_TTL, which explains the bound.
+UNCHANGED_REVIEW_TTL_S = 6 * 3600
 
 
 def _root() -> Path | None:
@@ -155,37 +163,39 @@ def clear_fixed_heads(scope: str, pr: int) -> None:
         pass
 
 
-def _guard_path(scope: str, pr: int, head: str) -> Path | None:
+_HEAD_RECORD_DIRS = {"diff-guard": "review-diff-guards", "unchanged": "review-unchanged"}
+
+
+def _head_record_path(kind: str, scope: str, pr: int, head: str) -> Path | None:
     shared = os.environ.get("TAUCETI_GITHUB_SHARED_DIR")
     if not shared or not pr or not head:
         return None
-    return Path(shared) / "review-diff-guards" / (_key(scope, f"diff-guard/{pr}/{head}") + ".json")
+    return Path(shared) / _HEAD_RECORD_DIRS[kind] / (_key(scope, f"{kind}/{pr}/{head}") + ".json")
 
 
-def note_diff_guard(scope: str, pr: int, head: str, *, now: float | None = None) -> None:
-    """Record that the review engine declined this exact head on the PR-level diff guards."""
-    path = _guard_path(scope, pr, head)
+def _note_head(kind: str, ttl: int, scope: str, pr: int, head: str, now: float | None) -> None:
+    path = _head_record_path(kind, scope, pr, head)
     if path is None:
         return
     stamp = time.time() if now is None else now
     try:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-        temporary.write_text(json.dumps({"expires_at": stamp + GUARD_TTL_S}))
+        temporary.write_text(json.dumps({"expires_at": stamp + ttl}))
         os.replace(temporary, path)
         if random.random() < 0.02:
             for old in path.parent.glob("*.json"):
                 try:
-                    if stamp - old.stat().st_mtime > GUARD_TTL_S:
+                    if stamp - old.stat().st_mtime > ttl:
                         old.unlink()
                 except OSError:
                     pass
     except OSError:
-        pass  # without the record, peers each pay one more declined review
+        pass  # without the record, peers each pay one more engine check
 
 
-def diff_guarded(scope: str, pr: int, head: str, *, now: float | None = None) -> bool:
-    path = _guard_path(scope, pr, head)
+def _head_noted(kind: str, ttl: int, scope: str, pr: int, head: str, now: float | None) -> bool:
+    path = _head_record_path(kind, scope, pr, head)
     if path is None:
         return False
     try:
@@ -193,4 +203,22 @@ def diff_guarded(scope: str, pr: int, head: str, *, now: float | None = None) ->
     except (OSError, ValueError, AttributeError):
         return False
     stamp = time.time() if now is None else now
-    return isinstance(expires, (int, float)) and stamp < expires <= stamp + GUARD_TTL_S
+    return isinstance(expires, (int, float)) and stamp < expires <= stamp + ttl
+
+
+def note_diff_guard(scope: str, pr: int, head: str, *, now: float | None = None) -> None:
+    """Record that the review engine declined this exact head on the PR-level diff guards."""
+    _note_head("diff-guard", GUARD_TTL_S, scope, pr, head, now)
+
+
+def diff_guarded(scope: str, pr: int, head: str, *, now: float | None = None) -> bool:
+    return _head_noted("diff-guard", GUARD_TTL_S, scope, pr, head, now)
+
+
+def note_unchanged_review(scope: str, pr: int, head: str, *, now: float | None = None) -> None:
+    """Record that the review engine found this exact head's verdict already published."""
+    _note_head("unchanged", UNCHANGED_REVIEW_TTL_S, scope, pr, head, now)
+
+
+def unchanged_review_noted(scope: str, pr: int, head: str, *, now: float | None = None) -> bool:
+    return _head_noted("unchanged", UNCHANGED_REVIEW_TTL_S, scope, pr, head, now)

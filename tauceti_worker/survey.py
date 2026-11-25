@@ -17,6 +17,7 @@ from pathlib import Path
 
 from tauceti_tools.forge import RepositoryRef
 
+from . import peer_claims
 from .config import Config, log, roadmap_only, roadmap_skip
 from .config import max_open_prs as configured_max_open_prs
 from .constants import (
@@ -67,7 +68,7 @@ class RebaseBudgetUnavailable(ValueError):
 # How long an engine "already published at this head" result suppresses re-dispatching a PR whose
 # review history is incomplete. A new push changes the head and is reviewed at once; the TTL bounds
 # how late a contest reply on such a PR is noticed while its history is still being filled in.
-UNCHANGED_REVIEW_TTL = 6 * 3600
+UNCHANGED_REVIEW_TTL = peer_claims.UNCHANGED_REVIEW_TTL_S
 
 
 class Counters:

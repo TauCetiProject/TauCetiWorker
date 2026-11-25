@@ -66,6 +66,7 @@ with tempfile.TemporaryDirectory() as tmp:
         return 0
 
     guarded = []
+    shared = []
     for outcome, expected, expected_guard in (
         ({"head_sha": HEAD, "changed": False}, [(42, HEAD)], []),
         ({"head_sha": HEAD, "changed": True}, [], []),
@@ -75,9 +76,13 @@ with tempfile.TemporaryDirectory() as tmp:
     ):
         recorded.clear()
         guarded.clear()
+        shared.clear()
         with (
             patch.object(
                 wu.peer_claims, "note_diff_guard", side_effect=lambda _s, pr, head: guarded.append((pr, head))
+            ),
+            patch.object(
+                wu.peer_claims, "note_unchanged_review", side_effect=lambda _s, pr, head: shared.append((pr, head))
             ),
             patch.object(wu.time, "strftime", return_value="fixed"),
             patch.object(wu, "run_to_logfile", side_effect=engine),
@@ -91,8 +96,9 @@ with tempfile.TemporaryDirectory() as tmp:
             round.finish(NoProgress("other candidates exhausted") if rc is None else None)
         assert recorded == expected, (outcome, recorded)
         assert guarded == expected_guard, (outcome, guarded)
+        assert shared == expected, ("every worker on the host skips an unchanged head", outcome, shared)
 
 print(
     "PASS: unchanged review results suppress partial-history re-dispatch for that head only, and expire;"
-    " a diff-guard result is recorded host-wide for that head"
+    " both are recorded host-wide for that head"
 )
