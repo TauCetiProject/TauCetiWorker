@@ -117,8 +117,9 @@ The warm bound assumes a matching validated installation identity. A new identit
 mount/provenance change or identity-cache cleanup may require a full cold payload hash under the
 installation lock; other callers reuse the resulting seal. Writable/unavailable-cache fallbacks
 retain ordinary stat-keyed hashes and complete input validation.
-Temporary shim archives are removed after use. Source metadata sampling every two seconds catches mutations restored to their original bytes; a final full digest
-check rejects changed inputs. Mutable toolchain/dependency metadata is checked at phase boundaries rather
+Temporary shim archives are removed after use. Source metadata sampling catches mutations restored to their original bytes; a final full digest
+check rejects changed inputs. Each sample waits at least 20 times the previous one's cost (2 to 60 s; about 25 s on a
+42,000-file checkout), so sampling costs about 5% of a core; a file created and deleted again between samples is not seen. Mutable toolchain/dependency metadata is checked at phase boundaries rather
 than repeatedly scanning large installations during tool execution. Environment hashing is limited to build
 configuration and tool-search variables; provider credentials and agent-session variables are excluded. Generated Lake outputs are not source inputs. These fingerprints identify
 built inputs; they do not establish proof correctness or make writable caches or local receipts a

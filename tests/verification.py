@@ -342,6 +342,54 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(result["status"], "incomplete")
         self.assertIn("mutat", result["error"])
 
+    def test_source_watch_backs_off_by_its_own_cost_and_the_final_watch_always_runs(self):
+        from tauceti_worker import verification
+
+        clock = [10.0]  # Soon after boot: below the longest interval.
+        calls = []
+        cost = [1.0]  # One watch costs a second, as on a 41,000-file checkout.
+
+        def timed_stamps(paths):
+            calls.append(clock[0])
+            clock[0] += cost[0]
+            return dict(paths)
+
+        v = Verification(self.root, self.state, stage="build")
+        v.watched, v.watch_names = {"A.lean": 1}, {"A.lean"}
+        with (
+            patch.object(verification.time, "monotonic", lambda: clock[0]),
+            patch.object(verification, "stamps", timed_stamps),
+            patch.object(verification, "source_names", lambda root, base: {"A.lean"}),
+        ):
+            for _ in range(600):  # 150 s of the phase loop's polls: 50 watches at the old 2 s.
+                v.watch()
+                clock[0] += verification.POLL_S
+            self.assertLessEqual(len(calls), 9)
+            self.assertEqual(v.watch_interval, verification.WATCH_DUTY * 1.0)
+            for seconds, interval in ((0.01, verification.WATCH_MIN_S), (10.0, verification.WATCH_MAX_S)):
+                cost[0] = seconds
+                v.last_watch = float("-inf")
+                v.watch()
+                self.assertEqual(v.watch_interval, interval, f"a {seconds} s watch")
+            before = len(calls)
+            v.watch()
+            self.assertEqual(len(calls), before, "a watch right after one waits out its backoff")
+            clock[0] = 30.0  # Under 60 s since boot: only an unconditional final watch runs now.
+            v.last_watch = clock[0] - 1  # One second into a 60 s backoff.
+            changed = lambda paths: {"A.lean": 2}  # noqa: E731 - a source edited since the snapshot
+            with patch.object(verification, "stamps", changed), patch.object(v.installations, "validate"):
+                v.watch()  # Still backing off: an edit is caught at the next watch or the final one.
+                with self.assertRaisesRegex(verification.Incomplete, "mutated"):
+                    v.final_watch()
+            v.mutated = False
+            clock[0], v.last_watch = 30.0, 29.0
+            with (
+                patch.object(verification, "source_names", lambda root, base: {"A.lean", "New.lean"}),
+                patch.object(v.installations, "validate"),
+                self.assertRaisesRegex(verification.Incomplete, "mutated"),
+            ):
+                v.final_watch()  # A new name, with every old stamp unchanged.
+
     def test_proofwidgets_generated_digest_does_not_invalidate_success(self):
         write(self.root, ".lake/packages/proofwidgets/widget/package-lock.json", "source lockfile")
         os.environ["FIXTURE_MODE"] = "widget-generated-hash"

@@ -45,6 +45,15 @@ STAGES = ("shim-expiry", "build", "axioms", "module-system", "lint")
 # nothing recorded. The verifier stops itself this long before that, so the agent gets an incomplete
 # receipt naming the phase it reached instead of a killed command. Outputs already built are kept.
 DEADLINE_MARGIN_S = 120.0
+# The source watch stats every tracked file and lists the tree: on a 41,000-file checkout under
+# load, about a second each time. Rerun every 2 s it kept a core 40% busy for a whole build, so
+# the next watch waits at least WATCH_DUTY times the last one's cost (at most WATCH_MAX_S): about
+# 1/WATCH_DUTY of a core. The final watch still compares everything before a result is recorded.
+WATCH_MIN_S = 2.0
+WATCH_MAX_S = 60.0
+WATCH_DUTY = 20
+# How often a running phase's log is copied to stderr and its exit and deadline are checked.
+POLL_S = 0.25
 
 
 def own_deadline(environ=None, now=None):
@@ -387,6 +396,7 @@ class Verification:
         self.dependency_names = None
         self.mutated = False
         self.last_watch = 0.0
+        self.watch_interval = WATCH_MIN_S
         self.live_lease = None
         self.installations = Installations(
             self.state,
@@ -406,14 +416,17 @@ class Verification:
         print(message, file=sys.stderr, flush=True)
 
     def watch(self):
-        if self.watched and time.monotonic() - self.last_watch >= 2:
+        if self.watched and time.monotonic() - self.last_watch >= self.watch_interval:
+            started = time.monotonic()
+            changed = stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names
             self.last_watch = time.monotonic()
-            if stamps(self.watched) != self.watched or source_names(self.root, self.base) != self.watch_names:
+            self.watch_interval = min(WATCH_MAX_S, max(WATCH_MIN_S, WATCH_DUTY * (self.last_watch - started)))
+            if changed:
                 self.mutated = True
                 raise Incomplete("verification inputs mutated during execution")
 
     def final_watch(self):
-        self.last_watch = 0
+        self.last_watch = float("-inf")  # Always, however long the last watch's backoff.
         self.watch()
         self.installations.validate()
         if stamps(self.static_stamps) != self.static_stamps or any(
@@ -474,7 +487,7 @@ class Verification:
                     self.watch()
                     if capture and time.time() - entry["started_at"] > 300:
                         raise Incomplete(f"{phase}: toolchain probe timed out")
-                    time.sleep(0.05)
+                    time.sleep(POLL_S)
                 entry["exit"] = process.returncode
         finally:
             try:
