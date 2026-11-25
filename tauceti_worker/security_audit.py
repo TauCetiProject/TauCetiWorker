@@ -612,7 +612,6 @@ def judgment_request(batch: dict, model: str) -> dict:
 # Parts are sized by UTF-8 bytes, which bound the tokens from above (every token is at least one
 # byte), so the plan is a pure function of the input and needs no further counting.
 CONTEXT_BYTES = 250_000  # The most commit-wide context every part may carry; more holds.
-BLOCK_LINES = 2000  # A declaration longer than this is shown as the lines around each match.
 HEAD_LINES = 100  # The file's first lines (imports, options, opens) sent with each of its hunks.
 HUNK_LINES = 100  # After-image lines on each side of a hunk, when they fit.
 # Commands and modifiers, at the start of a line after attributes and modifiers.
@@ -679,28 +678,100 @@ def excerpt(path: str, lines: list[str], ranges: list[tuple[int, int]]) -> list[
     ]
 
 
-# A top-level declaration: its kind and name (Lean commands start in column 0).
+# A declaration command, at any indentation, after attributes and modifiers: its kind and name.
+# Lean ends the previous command at any of these keywords, so a block never runs past one.
 DECLARATION = re.compile(
-    r"(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|public|noncomputable|unsafe|partial|nonrec|meta|local|scoped)\s+)*"
-    r"(def|abbrev|instance|theorem|lemma|opaque|axiom|structure|class|inductive|macro|elab|syntax|notation\w*"
-    r"|initialize|builtin_initialize|simproc|dsimproc|irreducible_def)\b\s*(?:\(\s*name\s*:=\s*)?([^\s:({\[⦃)]*)"
+    r"\s*(?:@\[[^\]]*\]\s*)*(?:(?:private|protected|public|noncomputable|unsafe|partial|nonrec|meta|local|scoped)\s+)*"
+    r"(def|abbrev|instance|theorem|lemma|opaque|axiom|structure|class|inductive|macro|macro_rules|elab|elab_rules"
+    r"|syntax|declare_syntax_cat|notation\w*|infix\w*|prefix|postfix|initialize|builtin_initialize|simproc|dsimproc"
+    r"|irreducible_def|example|mutual)\b\s*(?:\(\s*name\s*:=\s*)?([^\s:({\[⦃)]*)"
 )
-INERT = frozenset({"theorem", "lemma"})  # Proofs never run: never closure targets or listed names.
+# Commands with no term form, which also end the previous command; only at column 0 here.
+COMMAND = re.compile(
+    r"(?:namespace|section|end|variable|universe|attribute|export|deriving|run_cmd|run_tac|run_elab|run_meta"
+    r"|import|module|omit|include|add_decl_doc|alias|#[a-z]\w*)\b"
+)
+INERT = frozenset({"theorem", "lemma", "example"})  # Proofs never run: never closure targets or listed names.
 IDENT = re.compile(r"[^\W\d][\w.'!?]*")
+CHAR = re.compile(r"'(?:\\(?:x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)|[^'\\\n])'")
+RAW = re.compile(r'r(#*)"')
+
+
+def ident_char(c: str) -> bool:
+    return c.isalnum() or c in "_'!?"
+
+
+def code_mask(lines: list[str]) -> list[str]:
+    """The lines with comments, strings and character literals blanked, positions kept.
+
+    Nested block comments, escapes and raw strings are followed. An unterminated comment or string
+    blanks the rest of the file, which only makes blocks longer."""
+    text = "\n".join(lines)
+    out, i, n = list(text), 0, len(text)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, b):
+            if out[k] != "\n":
+                out[k] = " "
+
+    while i < n:
+        c = text[i]
+        if text.startswith("--", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+        elif text.startswith("/-", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/-", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("-/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            j = min(j + 1, n)
+        elif c == "r" and (raw := RAW.match(text, i)) and not (i and ident_char(text[i - 1])):
+            end = text.find('"' + raw.group(1), raw.end())
+            j = n if end < 0 else end + 1 + len(raw.group(1))
+        elif c == "'" and not (i and ident_char(text[i - 1])) and (char := CHAR.match(text, i)):
+            j = char.end()
+        elif c == "«":
+            end = text.find("»", i)
+            i = n if end < 0 else end + 1  # A quoted name is code, whatever it contains.
+            continue
+        else:
+            i += 1
+            continue
+        blank(i, j)
+        i = j
+    return "".join(out).split("\n")
 
 
 def declarations(lines: list[str]) -> list[tuple[int, int, str, str]]:
-    """The after image's top-level blocks as (first line, last line, kind, name), 1-based.
+    """The after image's command blocks as (first line, last line, kind, name), 1-based.
 
-    A block starts at a column-0 line other than a match arm or the end of a comment, and runs to the
-    next one; a declaration's kind and name come from its first line (empty when it is another command).
-    """
-    starts = [i for i, line in enumerate(lines, 1) if line[:1].strip() and not line.startswith(("|", "-/", "  ", "\t"))]
+    A block starts at a line whose code (`code_mask`) begins with a declaration keyword
+    (DECLARATION, at any indentation) or, at column 0, another command with no term form (COMMAND),
+    and runs to the next. A line that only holds attributes starts nothing, so it ends the block
+    before the declaration it annotates. Missing a command only lengthens a block."""
+    starts, kinds = [], {}
+    for i, code in enumerate(code_mask(lines), 1):
+        if re.fullmatch(r"\s*(?:@\[[^\]]*\]\s*)+", code):
+            continue
+        if match := DECLARATION.match(code):
+            starts.append(i)
+            kinds[i] = (match.group(1), match.group(2))
+        elif COMMAND.match(code):
+            starts.append(i)
+    if not starts or starts[0] != 1:
+        starts.insert(0, 1)
     found = []
     for n, lo in enumerate(starts):
         hi = (starts[n + 1] - 1) if n + 1 < len(starts) else len(lines)
-        match = DECLARATION.match(lines[lo - 1])
-        found.append((lo, hi, match.group(1), match.group(2)) if match else (lo, hi, "", ""))
+        found.append((lo, hi, *kinds.get(lo, ("", ""))))
     return found
 
 
@@ -727,6 +798,12 @@ def name_targets(files: dict[str, list[str]]) -> dict[str, list[tuple[str, int, 
     return targets
 
 
+def enclosing(blocks: list[tuple[int, int, str, str]], line: int, *, following: bool = False) -> list:
+    """The block holding `line`, and with `following` the next block too."""
+    n = next(k for k, (lo, hi, _, _) in enumerate(blocks) if lo <= line <= hi)
+    return [(lo, hi) for lo, hi, _, _ in blocks[n : n + (2 if following else 1)]]
+
+
 def closed(files: dict[str, list[str]], chosen: dict[str, set[tuple[int, int]]], targets=None) -> dict:
     """`chosen` line ranges per path, with every non-theorem declaration their text names, repeatedly."""
     targets = name_targets(files) if targets is None else targets
@@ -743,9 +820,9 @@ def closed(files: dict[str, list[str]], chosen: dict[str, set[tuple[int, int]]],
 
 
 def commit_context(commit: dict) -> list[dict]:
-    """The complete declarations of the commit's after images that hold a context line, and the
-    non-theorem declarations they name, transitively. A declaration over BLOCK_LINES lines is shown
-    as the 20 lines around each context line in it.
+    """The complete blocks of the commit's after images that hold a context line, each with the block
+    after it (which an attribute line annotates), and the non-theorem declarations they name,
+    transitively. Nothing is truncated: context too large to share holds the commit (`plan_parts`).
 
     Removed code is not context: it cannot run, and it stays visible in its own file's diff."""
     files = {f["path"]: f["after"].split("\n") for f in commit["files"] if f["after"] is not None}
@@ -753,12 +830,8 @@ def commit_context(commit: dict) -> list[dict]:
     for path, lines in files.items():
         blocks = declarations(lines)
         for i, line in enumerate(lines, 1):
-            if not context_line(line):
-                continue
-            block = next(((lo, hi) for lo, hi, _, _ in blocks if lo <= i <= hi), (i, i))
-            if block[1] - block[0] >= BLOCK_LINES:
-                block = (i - 20, i + 20)
-            chosen.setdefault(path, set()).add(block)
+            if context_line(line):
+                chosen.setdefault(path, set()).update(enclosing(blocks, i, following=True))
     closed(files, chosen)
     return [x for path in files if path in chosen for x in excerpt(path, files[path], list(chosen[path]))]
 
@@ -809,6 +882,7 @@ def hunk_units(f: dict, room: int) -> list[dict]:
     if not found:
         raise Unreadable(f"security-audit: {f['path']} is too large for the reviewer and has no hunks to split")
     targets = name_targets({f["path"]: lines})
+    blocks = declarations(lines) if lines else []
 
     def unit(first: int, last: int, around: int) -> dict:
         ranges = [(1, HEAD_LINES)] + [
@@ -822,7 +896,12 @@ def hunk_units(f: dict, room: int) -> list[dict]:
                 if row[:1] in ("+", "-")
             ]
             # The changed lines as a pseudo-file, so `closed` finds the declarations they name.
-            names = closed({f["path"]: lines, "": changed}, {"": {(1, len(changed))}}, targets)
+            # The blocks holding the changed after lines, and the declarations those lines name.
+            chosen = {"": {(1, len(changed))}}
+            for start, count, _ in found[first : last + 1]:
+                for line in range(max(1, start), min(len(lines), start + max(count, 1) - 1) + 1):
+                    chosen.setdefault(f["path"], set()).update(enclosing(blocks, line, following=True))
+            names = closed({f["path"]: lines, "": changed}, chosen, targets)
             ranges += list(names.get(f["path"], set()))
         return {
             "path": f["path"],

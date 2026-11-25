@@ -60,8 +60,9 @@ count, since every token is at least one byte.
   flags, or that attaches a metaprogram such as `macro`, `tactic`, `norm_num` or `positivity`).
   That set is closed under the non-theorem declarations it names: a registration such as
   `attribute [macro ...] latent` brings in `latent`, and `latent` brings in the helpers it calls,
-  whichever files hold them. A declaration over 2000 lines is shown as the 20 lines around each
-  matching line. Theorems are never pulled in: proofs do not run. Removed lines are not context:
+  whichever files hold them. A matching block also brings the block after it, which an attribute
+  line on its own annotates. Nothing is truncated. Theorems are never pulled in by name: proofs do
+  not run. Removed lines are not context:
   they cannot run, and they stay in their own file's diff. Context over 250 KB holds the commit.
 - **A file split by hunks** also gets, with each piece, the non-theorem declarations of that file
   its changed lines name (closed the same way), so a hunk that newly uses or registers existing
@@ -83,8 +84,11 @@ only through the extracted context. Every construct the policy flags, and every 
 defines, registers or runs code, is in the context of every part with the code it names, so each
 is seen in full by the reviewer holding its file and with its dependencies by every other. A
 plain `def` that nothing in the context names is not context: it cannot run at build time unless
-something the context shows runs it. The extraction is lexical (column-0 declarations, names
-matched by their last component), so it errs toward showing more.
+something the context shows runs it. Blocks follow how Lean ends a command: one starts only at a
+declaration keyword (at any indentation) or, at column 0, a command with no term form, found after
+comments, strings and character literals are blanked, so neither a comment nor a string inside a
+definition can cut it short. Missing a command only lengthens a block, and names are matched by
+their last component, so the extraction errs toward showing more.
 
 Only a single hunk too large for a part even without its surrounding lines, or commit-wide
 commit-wide context over 250 KB, still holds for a human. This is part of

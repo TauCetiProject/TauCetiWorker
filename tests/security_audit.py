@@ -1303,11 +1303,11 @@ class Parts(unittest.TestCase):
         commit = {"files": [{"path": "TauCeti/X.lean", "after": text, "diff": ""}]}
         shown = [x["text"] for x in sa.commit_context(commit)]
         rows = text.split("\n")
-        self.assertEqual(shown, ["\n".join(rows[3:14]), "\n".join(rows[15:20])])
+        self.assertEqual(shown, ["\n".join(rows[3:20])])
         deleted = {"files": [{"path": "TauCeti/Y.lean", "after": None, "diff": "-run_cmd pure ()\n"}]}
         self.assertEqual(sa.commit_context(deleted), [])
         self.assertEqual(
-            sa.defined_names(commit), ['"go"', '"‖"', "evalAdd", "loop", "m", "mine", "p", "registerTraceClass", "slow"]
+            sa.defined_names(commit), ["evalAdd", "loop", "m", "mine", "p", "registerTraceClass", "slow", "x"]
         )
 
     def test_context_carries_whole_declarations_and_the_code_they_call_across_files(self):
@@ -1329,6 +1329,42 @@ class Parts(unittest.TestCase):
         self.assertIn("have h59", shown)
         self.assertNotIn("unrelated", shown)
         self.assertNotIn("theorem other", shown)
+
+    def test_blocks_follow_lean_commands_not_comments_strings_or_columns(self):
+        # A column-0 comment or string inside a definition never ends it; an indented one is a declaration.
+        latent = "\n".join(
+            [
+                "def latent : Lean.Macro := fun _ =>",
+                "/- def decoy := 1",
+                "end Decoy -/",
+                '  let s := "',
+                'def alsoDecoy := 2"',
+                "  pure <| mkEval s",
+                "  where mkEval s := s",
+            ]
+        )
+        a = "\n".join(["namespace X", "  def helper := 1", latent, "theorem t : True := trivial"])
+        b = "attribute [macro probeSyntax] latent"
+        commit = {
+            "files": [
+                {"path": "TauCeti/A.lean", "after": a, "diff": ""},
+                {"path": "TauCeti/B.lean", "after": b, "diff": ""},
+            ]
+        }
+        blocks = sa.declarations(a.split("\n"))
+        self.assertEqual(
+            [(lo, hi, kind, name) for lo, hi, kind, name in blocks][1:],
+            [
+                (2, 2, "def", "helper"),
+                (3, 9, "def", "latent"),
+                (10, 10, "theorem", "t"),
+            ],
+        )
+        self.assertEqual(sa.defined_names(commit), ["helper", "latent"])
+        shown = sa.serialize(sa.commit_context(commit))
+        self.assertIn("pure <| mkEval s", shown)
+        self.assertIn("where mkEval", shown)
+        self.assertNotIn("def helper", shown)  # Nothing names it.
 
     def test_a_hunk_registering_existing_code_is_shown_that_code(self):
         filler = [f"theorem filler{i} : True := trivial" for i in range(3000)]
