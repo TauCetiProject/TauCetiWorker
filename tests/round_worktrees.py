@@ -225,6 +225,7 @@ def main():
 def persistent_rounds(root, origin, seed):
     import contextlib
     import io
+    import json
     from unittest.mock import patch
 
     agents = tc.agents
@@ -285,6 +286,64 @@ def persistent_rounds(root, origin, seed):
     check("and HEAD is main again", git(one.checkout, "rev-parse", "HEAD").strip() == main_oid)
     status = git(one.checkout, "status")
     check("git agrees", "rebase" not in status and "merging" not in status.lower())
+
+    # 2b. Index flags a checkout would skip, a nested repository and a merge autostash do not survive.
+    git(one.checkout, "update-index", "--skip-worktree", "A.lean")
+    git(one.checkout, "update-index", "--assume-unchanged", ".gitignore")
+    (one.checkout / "A.lean").write_text("theorem kept : True := trivial\n")
+    (one.checkout / ".gitignore").write_text("*\n")
+    git(one.checkout, "init", "-q", "nested")  # Untracked nested repository...
+    (one.checkout / "sub").mkdir()
+    git(one.checkout / "sub", "init", "-q")  # ...and one inside a directory.
+    (admin / "MERGE_AUTOSTASH").write_text(main_oid + "\n")
+    settled(one.checkout)
+    check("a flagged index is rebuilt", agents.prepare_checkout(one, work="fix", pr=1))
+    check("skip-worktree bytes are gone", (one.checkout / "A.lean").read_text() == "theorem a : True := trivial\n")
+    check("assume-unchanged bytes are gone", (one.checkout / ".gitignore").read_text() == ".lake/\n")
+    check("no index flags remain", not rw._flagged(one.checkout))
+    check(
+        "nested repositories are gone", not (one.checkout / "nested").exists() and not (one.checkout / "sub").exists()
+    )
+    check("no autostash reaches the shared stash", not git(one.checkout, "stash", "list"))
+    check("still clean", not git(one.checkout, "status", "--porcelain"))
+    check("warm .lake kept through a rebuild", (one.checkout / ".lake/build/A.olean").read_text() == "warm build")
+
+    # 2c. A file changed after the last reset is deleted before the checkout, whatever the index says.
+    planted = one.checkout / "Planted.lean"
+    rw._record_reset(one.checkout, one.state / rw.RESETS)
+    time.sleep(0.05)
+    planted.write_text("x")
+    rw._scrub(one.checkout, json.loads((one.state / rw.RESETS).read_text())[str(one.checkout)])
+    check("a file changed since the reset is deleted", not planted.exists())
+    check("unchanged files are kept", (one.checkout / "A.lean").exists())
+
+    # 2d. A `.git` repointed at another registration is refused, and the tree is replaced.
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        check("p2 prepares", agents.prepare_checkout(two, work="fix", pr=2))
+    two_admin = rw._admin(two.checkout)
+    (one.checkout / ".git").write_text(f"gitdir: {two_admin}\n")
+    try:
+        rw._admin(one.checkout)
+        refused = False
+    except OSError:
+        refused = True
+    check("a .git naming another worker's registration is refused", refused)
+    (two_admin / "index.lock").write_text("")  # p2's state, which p1's reset must not touch.
+    settled(one.checkout)
+    log = io.StringIO()
+    with contextlib.redirect_stderr(log), contextlib.redirect_stdout(log):
+        check("the repointed tree is replaced", agents.prepare_checkout(one, work="fix", pr=1))
+    check("p2's registration is untouched", (two_admin / "index.lock").exists())
+    (two_admin / "index.lock").unlink()
+    check("p1 has its own registration again", rw._admin(one.checkout) != two_admin)
+
+    # 2e. A registration `worktree remove` cannot find (no gitdir) is still replaced.
+    (rw._admin(one.checkout) / "gitdir").unlink()
+    (rw._admin(two.checkout) / "index").write_bytes(b"corrupt")
+    settled(one.checkout)
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        check("a damaged registration is replaced", agents.prepare_checkout(one, work="fix", pr=1))
+    check("and the tree works", git(one.checkout, "rev-parse", "HEAD").strip() == main_oid)
 
     # 3. Another worker's round never removes an idle worker's worktree.
     rw.release(one)

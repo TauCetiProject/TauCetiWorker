@@ -573,17 +573,27 @@ its `workers.toml` `env` table) of one bare host clone,
 sits at the worker's usual checkout path, detached at `origin/main`. Each worker keeps its worktree
 (one per host clone it uses) across rounds. Under `host-repositories/TauCeti.lock` a round only
 fetches the host clone (at most once a minute), repairs its config and, on a worker's first round,
-adds the worktree. Outside the lock it then resets its own worktree: it clears Git state a killed
-round left (a stale `index.lock`, a rebase, merge or cherry-pick in progress), forces a detached
-checkout of `origin/main`, which writes only the files that differ, and deletes every untracked or
-ignored file except `.lake`. A `.lake` that is not a real directory is removed, never followed. A
-worktree that cannot be reset is removed and added afresh under the lock. Anything unpushed is
+adds the worktree. Outside the lock it then resets its own worktree, trusting nothing the last round
+left. The worktree's `.git` and its registration in the host clone must name each other. Git state
+a killed round left goes (a stale `index.lock`, a rebase, merge, cherry-pick or bisect in progress,
+a merge autostash, a sparse-checkout file). Every nested `.git` goes. So does every file whose
+inode changed after the last reset (by ctime, which cannot be set back; each reset's time is kept
+in `<state>/worktree-resets.json`). Then a forced detached checkout of `origin/main` writes only
+the files that differ, and every untracked or ignored file except `.lake` is deleted. An index
+that marks files skip-worktree or assume-unchanged, or a tree with no reset on record, is rebuilt
+from `origin/main` instead, writing every file. Sparse-checkout settings in the shared config are
+cleared with the other unsafe keys. A `.lake` that is not a real directory is removed, never
+followed. A worktree that cannot be reset is removed and added afresh under the lock; if Git
+cannot find its registration, the directory is deleted and the registration pruned. Anything unpushed is
 discarded by the worker's next reset. The log line `worktrees: reset` or `worktrees: added` gives
 the host lock wait and the total preparation time. On its first round each worker deletes its old
 permanent checkout. Shared Git config that could run code for every
 round (hooks, fsmonitor, filters, aliases, credential and URL rewrites, includes) is cleared at each
 round. A retired worker's worktree is deleted with its other state by retention, and the next round
-on the host prunes Git's record of it.
+on the host prunes Git's record of it; that includes its per-source checkouts
+(`<state>/sources/<id>/checkout`), whose caches retention now also evicts under storage pressure.
+Set `TAUCETI_PERSISTENT_WORKTREES` the same way for every worker of a host: a worker with it off
+removes other workers' idle worktrees as crashed ones (their next round adds them again).
 
 `TAUCETI_PERSISTENT_WORKTREES=0` returns to a fresh worktree per round: the worktree is removed at
 round end with anything unpushed in it, its `.lake` waits beside it as
