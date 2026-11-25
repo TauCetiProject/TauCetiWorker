@@ -11638,6 +11638,28 @@ class Controller:
             self._ensure_labels(repo, payload.get("ensure", []))
             self.source.set_labels(repo, payload["number"], payload.get("add", []), payload.get("remove", []))
             return "labels"
+        if kind == "self_tested_request":
+            # A Forgejo PR author's `self-tested` or `-self-tested` comment (`NativePoller`), applied
+            # as GitHub's labels-from-comments workflow applies it: only from the PR's current author,
+            # and a request only while the PR is open.
+            from tauceti_tools.self_tested import LABEL
+
+            if not isinstance(payload["number"], SourceNumber):
+                raise ControllerError("self-tested-request", "comment requests are read from Forgejo only")
+            pull = self.source.fetch_pr(repo, payload["number"])
+            if getattr(pull, "author_id", None) != payload["author_id"]:
+                return "not-author"
+            if payload["add"]:
+                if pull.state != "open":
+                    return "not-open"
+                if LABEL in pull.labels:
+                    return "already-labelled"
+                self.source.set_labels(repo, payload["number"], [LABEL], [])
+                return "self-tested"
+            if LABEL not in pull.labels:
+                return "already-unlabelled"
+            self.source.set_labels(repo, payload["number"], [], [LABEL])
+            return "-self-tested"
         if kind == "close_pr":
             pull = self.source.fetch_pr(repo, payload["number"])
             if pull.state == "closed":

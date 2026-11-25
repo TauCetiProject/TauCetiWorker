@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import threading
 import time
 
@@ -124,6 +125,21 @@ RECENT_MARGIN_SECONDS = 120
 COMMENT_FEED_PAGES = 200  # the most pages of the comment feed one pass reads
 
 
+def self_tested_command(body):
+    """True for a `self-tested` request, False for `-self-tested`, None for neither.
+
+    Read as TauCeti's GitHub labels-from-comments workflow reads it: a command is a whole,
+    unindented line (trailing whitespace ignored, case-sensitive), and the last one wins."""
+    found = None
+    for raw in re.split(r"\r?\n", body or ""):
+        line = raw.rstrip()
+        if line == "self-tested":
+            found = True
+        elif line == "-self-tested":
+            found = False
+    return found
+
+
 class NativePoller:
     """Direct native discovery with the existing due/dirty intake ledger."""
 
@@ -203,9 +219,14 @@ class NativePoller:
         rows, newest, complete = registry.native.list_recent_comments(
             registry.profile.forgejo.repository.name, since=since, max_pages=COMMENT_FEED_PAGES
         )
-        dirtied = set()
+        dirtied, requests = set(), []
         for number, row in rows:
             body = row.get("body") or ""
+            command = self_tested_command(body)
+            # Only a comment created in this window is a request: an edit to an older one is not,
+            # as on GitHub, where only a newly posted comment counts.
+            if command is not None and _forge_time(row.get("created_at")) >= since:
+                requests.append((_forge_time(row.get("created_at")), row["id"], number, row, command))
             key = (row["id"], row.get("updated_at"), hashlib.sha256(body.encode()).hexdigest())
             if key in self._comments_seen:
                 continue
@@ -220,6 +241,8 @@ class NativePoller:
                 self._reevaluate(work)
                 dirtied.add(number)
         summary["comment_feed"] = {"read": len(rows), "dirtied": len(dirtied)}
+        if requests:
+            summary["comment_feed"]["self_tested_requests"] = self._enqueue_self_tested(requests)
         if not complete:
             # Unread pages may hold older edits: keep the position (rechecks stay the backstop).
             summary["errors"].append("comment feed: more than one bounded read")
@@ -232,6 +255,37 @@ class NativePoller:
             self._comments_seen = {k: v for k, v in self._comments_seen.items() if v >= self._comments_since}
         if dirtied:
             self.wake()
+
+    def _enqueue_self_tested(self, requests):
+        """Publish each `self-tested` or `-self-tested` comment request once, in posting order.
+
+        A contributor fleet's Forgejo account has no write on the pull-requests unit, so it cannot
+        label even its own PR; its author asks in a comment instead, as on GitHub, and the queue's
+        publisher applies the label. Whether the commenter is the PR's author, and for a request
+        whether the PR is open, is checked against the live PR when the entry is performed. The
+        outbox key is the comment, so a comment read again (the feed margin, a restart) or edited
+        later is never a second request."""
+        registry, controller = self.registry, self.controller
+        if registry.mode != "admit":
+            return 0  # observation never publishes
+        queued = 0
+        with controller._lock, controller.store.transaction():
+            for _, comment_id, number, row, add in sorted(requests, key=lambda r: (r[0], r[1])):
+                author = (row.get("user") or {}).get("id")
+                if type(author) is not int or author < 1:
+                    continue
+                key = f"self-tested-request:{registry.profile.forgejo.repository.key}:{comment_id}"
+                if controller.store.row("outbox", {"key": key}) is not None:
+                    continue
+                controller._enqueue(
+                    "self_tested_request",
+                    key,
+                    {"number": registry.number(number), "comment_id": comment_id, "author_id": author, "add": add},
+                )
+                queued += 1
+        if queued:
+            controller._wake.set()
+        return queued
 
     def request_discovery(self):
         self._serial += 1

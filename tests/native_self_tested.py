@@ -5,6 +5,7 @@ import contextlib
 import json
 import multiprocessing
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -356,30 +357,106 @@ class NativeSelfTested(unittest.TestCase):
             discovery_inventory(self.source)
             self.assertEqual(prune.call_count, 2)
 
-    def test_a_verified_native_push_makes_no_label_edit(self):
-        # Regression: a contributor fleet's account has no write on Forgejo's pull-requests unit, so
-        # every verified round logged "self-tested labelling failed (Forgejo POST returned HTTP 403)"
-        # for a label nothing on Forgejo reads. The worker no longer reads or edits PRs to label them.
+    def verified_roadmap_round(self):
+        """A roadmap round that published `roadmap/x` with a matching complete receipt."""
         from types import SimpleNamespace
 
+        from tauceti_worker import verification
+
+        root, state = self.fixture.clone / "content", self.fixture.clone / "verification-state"
+        (root / "TauCeti").mkdir(parents=True)
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "test")
+        git("config", "user.email", "test@example.com")
+        (root / "TauCeti/A.lean").write_text("-- base\n")
+        git("add", ".")
+        git("commit", "-q", "-m", "base")
+        base = git("rev-parse", "HEAD")
+        git("remote", "add", "origin", self.source.repository.clone_url)
+        git("update-ref", "refs/remotes/origin/main", base)
+        (root / "TauCeti/A.lean").write_text("-- verified change\n")
+        git("commit", "-q", "-am", "change")
+        head = git("rev-parse", "HEAD")
+        self.live["head"].update(sha=head, ref="roadmap/x")
+        self.source.reader.pulls = Mock(
+            return_value=[dict(number=1, headRefName="roadmap/x", headRepositoryOwner=dict(login="team"))]
+        )
+        project = self.fixture.clone / "project.toml"
+        self.source.write_cli_configuration(project)
+        inputs = dict(base=base, sources=verification.inventory(root, base))
+        fingerprint = verification.digest(inputs)
+        inputs_path = state / "inputs.json"
+        inputs_path.parent.mkdir()
+        inputs_path.write_text(json.dumps(inputs))
+        receipt = state / "verification" / "run" / "receipt.json"
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(
+            json.dumps(
+                dict(
+                    schema=verification.SCHEMA,
+                    status="success",
+                    requested_phases=list(verification.STAGES),
+                    phases={name: dict(status="success") for name in verification.STAGES},
+                    scope=dict(policy="ordinary"),
+                    inputs=dict(path=str(inputs_path), sha256=fingerprint),
+                    fingerprint=fingerprint,
+                )
+            )
+        )
+        worker = SimpleNamespace(gh=self.source, cfg=SimpleNamespace(checkout=root, state=state))
+        candidate = SimpleNamespace(
+            pr=None, progress=dict(published_branches={"roadmap/x": head}, published_owner="team")
+        )
+        return worker, candidate, head, project
+
+    def label_round(self, worker, candidate, project):
         from tauceti_worker import self_tested_label
 
-        self.source.add_label.side_effect = AssertionError("no Forgejo label edit")
-        self.source.live_pull = Mock(side_effect=AssertionError("no Forgejo PR read"))
-        self.source.pull_for_head = Mock(side_effect=AssertionError("no Forgejo PR lookup"))
-        worker = SimpleNamespace(
-            gh=self.source, cfg=SimpleNamespace(checkout=self.fixture.clone, state=self.fixture.clone)
-        )
-        for candidate in (
-            SimpleNamespace(pr=1, progress=dict(published="a" * 40)),
-            SimpleNamespace(pr=None, progress=dict(published_branches={"roadmap/x": "a" * 40}, published_owner="team")),
+        with (
+            patch.dict(os.environ, TAUCETI_SELF_TESTED="1", TAUCETI_SOURCE_GH_CONF=str(project)),
+            patch("tauceti_worker.worker_sources.canonical_mathematics_source", return_value=True),
         ):
-            with (
-                patch.dict(os.environ, TAUCETI_SELF_TESTED="1"),
-                patch("tauceti_worker.worker_sources.canonical_mathematics_source", return_value=True),
-            ):
-                self.assertEqual(self_tested_label.label_round_pushes(worker, candidate, "roadmap", time.time()), [])
-        self.source.add_label.assert_not_called()
+            os.environ.pop("TAUCETI_CONF", None)
+            result = self_tested_label.label_round_pushes(worker, candidate, "roadmap", time.time() - 5)
+            self.assertNotIn("TAUCETI_CONF", os.environ)
+        return result
+
+    def test_native_roadmap_receipt_through_persistent_label(self):
+        worker, candidate, head, project = self.verified_roadmap_round()
+        result = self.label_round(worker, candidate, project)
+        self.assertEqual(result, [(1, f"labelled {head[:12]}: persistent self-tested label applied")])
+        self.source.add_label.assert_called_once_with(1, "self-tested")
+
+    def test_a_refused_native_label_edit_becomes_the_authors_comment_request(self):
+        # A contributor fleet's account has no write on Forgejo's pull-requests unit, so the label edit
+        # returns 403; the PR's author then asks the queue with a standalone `self-tested` comment.
+        from tauceti_worker.source_identity import SourceActor
+
+        worker, candidate, head, project = self.verified_roadmap_round()
+        self.source.add_label = Mock(side_effect=ForgeError("Forgejo POST returned HTTP 403", status=403))
+        author = SourceActor.from_native(self.source.repository.forge, dict(id=7, login="reviewer"))
+        self.source.authenticated_actor = Mock(return_value=author)
+        self.fixture.api.request = Mock(return_value=dict(id=99))
+        requested = [(1, "requested: label edit refused, so a `self-tested` comment asks the queue to apply it")]
+        self.assertEqual(self.label_round(worker, candidate, project), requested)
+        self.fixture.api.request.assert_called_once_with(
+            "POST", f"repos/{self.source.repo}/issues/1/comments", {"body": "self-tested"}
+        )
+        # Once refused, later rounds go straight to the request.
+        self.assertEqual(self.label_round(worker, candidate, project), requested)
+        self.source.add_label.assert_called_once()
+        # Another author's PR gets neither an edit nor a comment.
+        self.live["user"] = dict(id=8, login="someone")
+        self.fixture.api.request.reset_mock()
+        self.assertEqual(
+            self.label_round(worker, candidate, project),
+            [(1, "not labelled: label edit refused and this account is not the PR author")],
+        )
+        self.fixture.api.request.assert_not_called()
 
     def test_native_checkout_separates_local_branch_from_remote_pr_branch(self):
         from tauceti_worker.source_cli import checkout
@@ -422,8 +499,13 @@ class CanonicalSource(unittest.TestCase):
                 source = SimpleNamespace(repository=repository, identity=RepositoryIdentity(repository, native_id))
                 with patch("tauceti_worker.worker_sources.current", return_value=source):
                     self.assertEqual(enabled() == "", eligible)
-                    # Nothing on Forgejo reads the label, so no agent is asked to apply it.
-                    self.assertFalse(self_tested_guidance("ordinary"))
+                    guidance = self_tested_guidance("ordinary")
+                    self.assertEqual(bool(guidance), eligible)
+                    # Forgejo has no triage permission to check: try the edit, and on 403 ask by comment.
+                    if eligible:
+                        self.assertIn("HTTP 403", guidance)
+                        self.assertIn("--body self-tested", guidance)
+                        self.assertNotIn(".permissions.triage", guidance)
                     self.assertFalse(self_tested_guidance("full-lint"))
 
 

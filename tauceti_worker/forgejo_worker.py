@@ -13,7 +13,7 @@ from .forgejo_reads import ForgejoReadSource
 
 class ForgejoWorkerSource(ForgejoReadSource):
     supports_contest_reactions = False
-    supports_label_requests = False
+    supports_label_requests = True  # the queue applies an author's `self-tested` comment
     worker_capable = True
     supports_review_sandbox = False
 
@@ -272,6 +272,20 @@ class ForgejoWorkerSource(ForgejoReadSource):
         ForgejoWriter(self.api).edit(self.repository, pr, pull=True, add_labels=[name])
         self.invalidate(pr)
         self.invalidate_discovery()
+        return True
+
+    def request_label(self, pr, name):
+        """Ask for `name` with a standalone comment as the PR's author; the queue's publisher applies it.
+
+        A contributor fleet's account has no write on Forgejo's pull-requests unit, so it cannot
+        label even its own PR. As on GitHub, the author asks in a comment instead (the queue reads
+        Forgejo's comment feed for it). False, posting nothing, unless this account is the author."""
+        actor = self.authenticated_actor()
+        row = self.live_pull(pr)
+        if actor is None or row is None or (row.get("user") or {}).get("id") != int(actor.principal.native_id):
+            return False
+        self.api.request("POST", f"repos/{self.repo}/issues/{int(pr)}/comments", {"body": name})
+        self.invalidate(pr)
         return True
 
     def pull_for_head(self, owner, branch):
