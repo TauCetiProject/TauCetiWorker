@@ -1587,7 +1587,7 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
     """
     from .claude_api import blocked_failure, check_result
     from .config import AdmissionUnavailable, GitHubUnavailable
-    from .github_transport import blocked_since, blocking_event_since
+    from .github_transport import blocked_since, blocking_event_since, reset_jitter
 
     pr, head = c.pr, c.head[:12]
     rebase_key = c.rebase_budget_key if stage == "rebase" else None
@@ -1634,8 +1634,12 @@ def _run_github_stage(stage, fn, w, sv, c, opts, bubble):
             # Another infrastructure handler may already have refunded this attempt.
             w.counters.write(key, min(value, w.counters.read(key)))
         event = blocking_event_since(started) or {}
+        retry_at = event.get("reset")
+        if isinstance(retry_at, (int, float)) and event.get("resource") not in ("secondary", "publication"):
+            # Each worker paused on this account's quota sees the same reset; spread their retries.
+            retry_at += reset_jitter()
         raise GitHubUnavailable(
-            f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR", retry_at=event.get("reset")
+            f"{stage}: GitHub API exhausted — waiting for reset, not charged to the PR", retry_at=retry_at
         )
 
     try:
@@ -1689,14 +1693,16 @@ def _check_stage_read_quota(stage):
     if current() is not None:
         return
     from .config import GitHubUnavailable
-    from .github_transport import observed_budget
+    from .github_transport import observed_budget, reset_jitter
 
     if stage in ("overlap-scan", "overlap-fix"):
         return
     buckets = ("core",) if github_state_enabled() else ("core", "graphql")
     exhausted = {k: reset for k, (remaining, reset) in observed_budget().items() if k in buckets and remaining == 0}
     if exhausted:
-        raise GitHubUnavailable("GitHub read quota exhausted — waiting for reset", retry_at=max(exhausted.values()))
+        raise GitHubUnavailable(
+            "GitHub read quota exhausted — waiting for reset", retry_at=max(exhausted.values()) + reset_jitter()
+        )
 
 
 BUBBLE_WORK_REFUSED = (

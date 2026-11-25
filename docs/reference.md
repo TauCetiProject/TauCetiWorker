@@ -315,6 +315,21 @@ through an inherited `gh` wrapper. Commands bypassing that PATH, direct HTTP cli
 separate proxy are outside this accounting. The current science fleet runs on the host.
 The log rotates at 64 MiB and retains one previous file.
 
+When the state service fails (any reason except a coverage gap), the host records a two-minute
+fallback window in `state/github-shared/fallback.json`. Read-only direct `gh` requests in that
+window draw from a host-wide token bucket per account and quota bucket, under
+`state/github-shared/fallback-pacing/`. It allows a burst of 20 requests, then refills at
+`TAUCETI_GH_FALLBACK_SHARE` of the account's remaining quota, less 200 kept for writes, spread over
+the time left before the reset. Concurrent readers reserve successive refills instead of racing
+for one token. A caller that would fail fast on quota waits at most 60 seconds, then records a
+quota pause. Writes, quota probes and reads served by the service are not paced.
+
+A command is not sent while its quota bucket is known to be exhausted. Commands other than
+`gh api` are classified in advance: `gh pr`, `gh issue` and `gh repo` spend GraphQL (except
+`gh pr diff`), the rest REST core. Waits for an hourly reset, in the `gh` wrapper, the loop and
+stage pauses, add a random delay of up to `TAUCETI_GH_RESET_JITTER` seconds so the fleet does not
+wake together.
+
 Complete open-PR inventories share a 15-second cache; comment histories and permission reads
 share a 30-second cache. Keys include credential fingerprints and PR revision hints. Per-key
 file locks coalesce concurrent misses. Failed or incomplete histories never enter the cache.
@@ -437,6 +452,8 @@ Most variables are tuning knobs with sane defaults.
 | `TAUCETI_GH_MIN_BUDGET` | `200` | GitHub requests (REST core and GraphQL) the loop requires before launching a round; below it on either bucket, the loop waits for the hourly reset. A loop dedicated to `overlap-scan` requires only REST core. |
 | `TAUCETI_OVERLAP_BATCH_COMMITS` | `160` | First-parent Mathlib commits examined per overlap-scan conversation; `--overlap-batch-commits` overrides it. Calibrated with Codex `gpt-6.1-sol` at high effort. |
 | `TAUCETI_GH_PROXY_WAIT` | `900` | Maximum host child `gh` quota wait, capped at 900 seconds to preserve the round deadline. |
+| `TAUCETI_GH_FALLBACK_SHARE` | `0.5` | Fraction of the account's remaining GitHub quota per hour one host may spend on direct reads while the state service is unavailable. |
+| `TAUCETI_GH_RESET_JITTER` | `120` | Maximum random delay (seconds) added to a wait for a GitHub quota reset. |
 | `TAUCETI_GITHUB_SHARED_DIR` | `state/github-shared` | Stable cross-worker cache, quota state, host gh wrapper and HTTP accounting directory. |
 | `TAUCETI_GITHUB_CACHE_BYPASS` | _(unset)_ | Set to `1` to bypass shared cached reads for diagnosis. |
 | `TAUCETI_META_TTL` | `120` | How long a cached scoreboard stays fresh (seconds). |

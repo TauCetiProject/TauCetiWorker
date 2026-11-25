@@ -140,6 +140,9 @@ def _unavailable(repo, operation, reason, detail="", *, status=None, retry_at=No
         if operation == "survey" and payload.get("complete") is True:
             _planning_survey.set(payload)
     _last_failure.set(record)
+    if reason != "coverage_unavailable":
+        # The service itself is failing, so this host's workers read GitHub directly; pace them.
+        transport.note_fallback()
     transport.event(
         {
             "kind": "gateway_fallback",
