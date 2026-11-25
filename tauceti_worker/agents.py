@@ -562,27 +562,35 @@ def self_tested_guidance(policy: str) -> str:
     from .self_tested_label import enabled, forgejo
     from .worker_sources import current
 
-    if policy != "ordinary" or enabled() or forgejo(current()):
+    if policy != "ordinary" or enabled():
         return ""
     comment_requests = getattr(current(), "supports_label_requests", True)
-    # Most authors lack triage permission on TauCeti; send them straight to the comment request
-    # rather than through a label edit GitHub will deny.
-    permission = (
-        "First check whether you can edit labels: `gh api repos/TauCetiProject/TauCeti --jq .permissions.triage`. "
-        if comment_requests
-        else ""
+    request = (
+        "confirm you are the PR author and its head still matches the verified commit, then post a new "
+        "standalone `self-tested` comment with "
+        "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
+        "The comment handler is asynchronous; do not post duplicate requests while it runs. "
     )
-    fallback = (
-        (
-            " If that check did not print `true`, you lack label permissions: do not run `gh pr edit` with "
-            "`--add-label` or `--remove-label`. Instead confirm you are the PR author and its head still "
-            "matches the verified commit, then post a new standalone `self-tested` comment with "
-            "`gh pr comment <number> --repo TauCetiProject/TauCeti --body self-tested`. "
-            "The comment handler is asynchronous; do not post duplicate requests while it runs. "
+    if forgejo(current()):
+        # Forgejo reports no triage permission to check, and a contributor fleet's account has no
+        # write on the pull-requests unit: try the edit, and on refusal ask the queue in a comment.
+        permission = ""
+        fallback = (
+            " If Forgejo refuses the label edit (HTTP 403), you lack label permissions: do not retry it. Instead "
+            + request
         )
-        if comment_requests
-        else " "
-    )
+    elif comment_requests:
+        # Most authors lack triage permission on TauCeti; send them straight to the comment request
+        # rather than through a label edit GitHub will deny.
+        permission = (
+            "First check whether you can edit labels: `gh api repos/TauCetiProject/TauCeti --jq .permissions.triage`. "
+        )
+        fallback = (
+            " If that check did not print `true`, you lack label permissions: do not run `gh pr edit` with "
+            "`--add-label` or `--remove-label`. Instead " + request
+        )
+    else:
+        permission, fallback = "", " "
     remove_fallback = (
         " (or post `-self-tested` as the PR author if you lack label permissions)" if comment_requests else ""
     )

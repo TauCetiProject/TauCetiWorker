@@ -578,6 +578,77 @@ class Mixed(MixedFixture, unittest.TestCase):
         poller.run_once()
         self.assertEqual(poller._comments_since, newest - 120)
 
+    def test_a_forgejo_authors_self_tested_comment_is_applied_once_by_the_queue(self):
+        from tauceti_queue.forgejo_source import NativePullRequest
+        from tauceti_queue.mixed_sources import self_tested_command
+
+        self.assertIs(self_tested_command("Verified locally.\r\nself-tested  \n"), True)
+        self.assertIs(self_tested_command("self-tested\n-self-tested"), False)
+        self.assertIsNone(self_tested_command(" self-tested\nSelf-tested\nself-tested please"))
+        registry, poller, recent_calls = self.recent_fixture()
+        self.controller.set_setting("publication_enabled", True, "fixture")
+        feed = []
+        self.native.list_recent_comments = lambda repo, *, since, **kw: (list(feed), 0.0, True)
+        plain = self.native.fetch_pr
+        self.native.fetch_pr = lambda repo, number: NativePullRequest(
+            **dataclasses.asdict(plain(repo, number)), author_id=7
+        )
+        self.native.create_pr(1, {"One.lean": "one\n"})
+        self.updated[1] = "2026-11-19T04:00:00Z"
+        poller.run_once()
+
+        def comment(id, user, body, created="2026-11-19T04:30:00Z", updated=None):
+            return (
+                1,
+                {"id": id, "user": {"id": user}, "body": body, "created_at": created, "updated_at": updated or created},
+            )
+
+        feed[:] = [
+            comment(60, 8, "self-tested"),  # not the PR's author
+            comment(61, 7, "Verified.\nself-tested\n"),
+            # An edit to a comment from before the feed's window is not a new request.
+            comment(62, 7, "-self-tested", created="2026-11-01T00:00:00Z", updated="2026-11-19T04:31:00Z"),
+        ]
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["comment_feed"]["self_tested_requests"], 2)
+        self.controller.tick()
+        self.assertIn("self-tested", self.native.labels[1])
+        results = {
+            loads(e["payload"])["comment_id"]: e["result"]
+            for e in self.controller.store.rows("outbox", {"kind": "self_tested_request"})
+        }
+        self.assertEqual(results, {60: "not-author", 61: "self-tested"})
+        # Read again (the feed's margin, or after a restart): no second request.
+        self.clock.advance(registry.poll_seconds)
+        self.assertEqual(poller.run_once()["comment_feed"]["self_tested_requests"], 0)
+        feed[:] = [comment(63, 7, "-self-tested", created="2026-11-19T05:00:00Z")]
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.controller.tick()
+        self.assertNotIn("self-tested", self.native.labels[1])
+        feed[:] = [
+            # A scoreboard is never a command, even from the PR's author.
+            comment(64, 7, "<!--tauceti-scoreboard-->\nself-tested"),
+            # A recent comment edited since posting: the command may be the edit's, so it is not one.
+            comment(65, 7, "self-tested", created="2026-11-19T05:01:00Z", updated="2026-11-19T05:02:00Z"),
+        ]
+        self.clock.advance(registry.poll_seconds)
+        self.assertNotIn("self_tested_requests", poller.run_once()["comment_feed"])
+        # A request the feed finds after a newer one is superseded by it, whatever order they run in.
+        feed[:] = [comment(67, 7, "-self-tested", created="2026-11-19T05:10:00Z")]
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        feed[:] = [comment(66, 7, "self-tested", created="2026-11-19T05:05:00Z")]
+        self.clock.advance(registry.poll_seconds)
+        poller.run_once()
+        self.controller.tick()
+        self.assertNotIn("self-tested", self.native.labels[1])
+        results = {
+            loads(e["payload"])["comment_id"]: e["result"]
+            for e in self.controller.store.rows("outbox", {"kind": "self_tested_request"})
+        }
+        self.assertEqual((results[66], results[67]), ("superseded", "already-unlabelled"))
+
     def test_native_insertion_rejudges_a_review_no_listing_or_feed_reported(self):
         poller, head = self.native_approved()
         original = self.native.admission_policy.evaluate

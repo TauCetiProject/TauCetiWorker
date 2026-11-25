@@ -162,9 +162,15 @@ Pin changes, infrastructure changes and full-lint/lint-repair requests do not
 qualify. This is the same eligibility check for GitHub and Forgejo.
 
 Both forges use the same add-label flow through their source adapters; no picker
-or separate status publication is required. Provision the `self-tested`
-repository label on Forgejo before enabling this route. This rollout does not
-change publisher grants.
+or separate status publication is required. On Forgejo a contributor fleet's
+account (the `contributor-fleets` team) has no write on the pull-requests unit,
+so Forgejo refuses its label edit with HTTP 403. The worker then asks instead,
+as on GitHub: if its account is the PR's author it posts a standalone
+`self-tested` comment, and the queue's publisher applies the label (see
+docs/queue/mixed-sources.md). After one refusal the worker goes straight to the
+comment, and it does not post again while its own request is under an hour old.
+Agents get the same instruction. This route does not change any
+team's permissions.
 
 The label is a persistent author declaration. Keep it through fix/rebase pushes
 after successful verification; remove it when verification fails or is

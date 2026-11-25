@@ -10,10 +10,13 @@ from tauceti_tools.forge import ForgeError, Incomplete, RepositoryRef
 
 from .forgejo_reads import ForgejoReadSource
 
+# How long a posted label request counts as pending before a new verified round may ask again.
+LABEL_REQUEST_PENDING_SECONDS = 3600
+
 
 class ForgejoWorkerSource(ForgejoReadSource):
     supports_contest_reactions = False
-    supports_label_requests = False
+    supports_label_requests = True  # the queue applies an author's `self-tested` comment
     worker_capable = True
     supports_review_sandbox = False
 
@@ -272,6 +275,44 @@ class ForgejoWorkerSource(ForgejoReadSource):
         ForgejoWriter(self.api).edit(self.repository, pr, pull=True, add_labels=[name])
         self.invalidate(pr)
         self.invalidate_discovery()
+        return True
+
+    def request_label(self, pr, name):
+        """Ask for `name` with a standalone comment as the PR's author; the queue's publisher applies it.
+
+        A contributor fleet's account has no write on Forgejo's pull-requests unit, so it cannot
+        label even its own PR. As on GitHub, the author asks in a comment instead (the queue reads
+        Forgejo's comment feed for it). False, posting nothing, unless this account is the author.
+        True, posting nothing again, when this account's newest request asks for it and is under
+        `LABEL_REQUEST_PENDING_SECONDS` old (an earlier round's, or its agent's, that the queue has
+        not applied yet); an older one may since have been answered and the label removed."""
+        actor = self.authenticated_actor()
+        row = self.live_pull(pr)
+        if actor is None or row is None or (row.get("user") or {}).get("id") != int(actor.principal.native_id):
+            return False
+        comments = self.issue_comments(pr, fresh=True)
+        if comments is None:
+            raise Incomplete("Forgejo PR comments are unavailable")
+        import time
+        from datetime import datetime
+
+        latest, posted = None, 0.0
+        for comment in comments:
+            if (comment.get("user") or {}).get("id") != row["user"]["id"]:
+                continue
+            for line in str(comment.get("body") or "").split("\n"):
+                if line.rstrip() in (name, "-" + name):
+                    latest = line.rstrip() == name
+                    try:
+                        posted = datetime.fromisoformat(
+                            str(comment.get("created_at")).replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        posted = 0.0
+        if latest and time.time() - posted < LABEL_REQUEST_PENDING_SECONDS:
+            return True
+        self.api.request("POST", f"repos/{self.repo}/issues/{int(pr)}/comments", {"body": name})
+        self.invalidate(pr)
         return True
 
     def pull_for_head(self, owner, branch):
