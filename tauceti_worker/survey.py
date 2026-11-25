@@ -118,9 +118,11 @@ class Counters:
         self.write(name, v)
         return v
 
-    def record_unchanged_review(self, pr: int, head: str) -> None:
-        """Remember that the review engine found this head's verdict already published."""
-        self._atomic_write(f"review-unchanged-{pr}.json", json.dumps({"head": head, "at": time.time()}))
+    def record_unchanged_review(self, pr: int, head: str, *, at: float | None = None) -> None:
+        """Remember that the review engine, in a round started at `at`, found this head's verdict
+        already published."""
+        stamp = time.time() if at is None else at
+        self._atomic_write(f"review-unchanged-{pr}.json", json.dumps({"head": head, "at": stamp}))
 
     def unchanged_review_recent(self, pr: int, head: str, ttl: float = UNCHANGED_REVIEW_TTL) -> bool:
         """Whether the engine recently found `head`'s verdict already published. A partial history
@@ -1301,8 +1303,9 @@ def classify_survey(
             covered = facts.get(p.number, {})
             if not (covered.get("issue_complete") and covered.get("review_complete")):
                 # Partial history: no scoreboard to say which replies were answered, so offer a
-                # contest from complete review-comment facts only if it is newer than the record.
-                reply = covered.get("contest") if covered.get("review_complete") else None
+                # known contest reply only if it is newer than the record. Incomplete review-comment
+                # coverage cannot show there is none, but a reply it did find is real.
+                reply = covered.get("contest")
                 created = _parse_iso8601(reply.get("created_at")) if isinstance(reply, dict) else None
                 if created is not None and created >= int(published_at):
                     file_contest(p, reply, None)
@@ -1363,9 +1366,15 @@ def classify_survey(
         if not reply:
             continue
         through = m.data.get("replies_through")
-        through = through if isinstance(through, int) else 0
-        if reply["id"] <= through:
-            continue  # already adjudicated by some review round
+        if isinstance(through, int):
+            if reply["id"] <= through:
+                continue  # already adjudicated by some review round
+        elif published_at is not None:
+            # No watermark to compare with: a reply older than the published-verdict record was
+            # there for the round that made it, and offering it would repeat on every survey.
+            created = _parse_iso8601(reply.get("created_at"))
+            if created is None or created < int(published_at):
+                continue
         # A 👀 on the contesting reply claims an in-flight re-review: it suppresses a re-fire in the
         # window before the new scoreboard lands, across the WHOLE fleet (the claim is on GitHub, not
         # in a per-worker store). A claim left by a crashed worker frees itself after CONTEST_CLAIM_TTL.

@@ -1267,15 +1267,34 @@ class GlobalMaintenance(unittest.TestCase):
             stamp = __import__("datetime").datetime.fromtimestamp(at, __import__("datetime").timezone.utc)
             return {"id": reply_id, "rubric": "reuse", "created_at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ")}
 
-        def partial(r):
-            r["review"]["issue_complete"] = False
+        def partial(r, *, issue=False, review=True):
+            r["review"]["issue_complete"] = issue
+            r["review"]["review_complete"] = review
+            return r
+
+        def watermark(r, through):
+            r["review"]["meta"]["replies_through"] = through
             return r
 
         fresh, old = contest(901, recorded_at + 600), contest(900, recorded_at - 600)
         cases = [
             ("no contest", row(10, "Other", blocking=False), []),
             ("complete history", row(10, "Other", blocking=False, contest=fresh), [(10, "reuse", 901)]),
+            # Without a watermark only the record's time says whether the reply was there before.
+            ("complete history, no watermark, old reply", row(10, "Other", contest=old), []),
+            # A watermark is exact, whatever the record's time.
+            (
+                "complete history, old reply past watermark",
+                watermark(row(10, "Other", contest=old), 899),
+                [(10, "reuse", 900)],
+            ),
+            ("complete history, reply answered", watermark(row(10, "Other", contest=fresh), 901), []),
             ("partial history, new reply", partial(row(10, "Other", contest=fresh)), [(10, "reuse", 901)]),
+            (
+                "partial review comments, new reply",
+                partial(row(10, "Other", contest=fresh), issue=True, review=False),
+                [(10, "reuse", 901)],
+            ),
             ("partial history, old reply", partial(row(10, "Other", contest=old)), []),
             ("partial history, no reply", partial(row(10, "Other")), []),
         ]
