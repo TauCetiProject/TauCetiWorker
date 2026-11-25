@@ -4780,6 +4780,19 @@ class SprintMode(ControllerCase):
         self.assertEqual((row["state"], row["last_probe"]), ("waiting", "sprint-label"))
         self.assertEqual(self.controller.store.count("members"), 0)
 
+    def test_a_head_the_emergency_batch_evicted_is_kept(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.controller.tick()
+        [evicted] = self.batch_numbers("open")
+        eviction = self.controller._eviction
+        with mock.patch.object(
+            self.controller, "_eviction", side_effect=lambda b: {"version": 1} if b["id"] == evicted else eviction(b)
+        ):
+            self.controller.set_setting("sprint_label", "grh", "operator")
+        self.assertEqual(self.batch_numbers("open"), {evicted: [102]})
+
     def test_a_failed_dissolution_leaves_the_sprint_off(self):
         self.approve(101, {"A.lean": "a\n"})
         self.controller.tick()

@@ -302,7 +302,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Sprint mode (docs/queue/operations.md, "Sprint mode"): while non-empty, only waiting inputs whose
     # PR carries this label (case-insensitive, `inputs.labels`) enter batches, the control-file lane's
     # included; every other approved input keeps its approval and waits. Setting a label dissolves
-    # every open batch but the emergency batch (`_dissolve_open_batches`); the head is never touched.
+    # every open batch but the emergency batch and a head it evicted (`_dissolve_open_batches`); the
+    # head is never touched, and the emergency lane works as usual.
     # Empty: normal batching.
     "sprint_label": "",
 }
@@ -8661,12 +8662,13 @@ class Controller:
 
     def _dissolve_open_batches(self, actor: str, now: float) -> list[int]:
         """Sprint mode switched on (`sprint_label`): dissolve every open batch except the emergency
-        batch, so only sprint-labelled inputs form the next batches. The head is never touched. Called
-        inside the caller's transaction; the caller cancels the returned batches' runs after it."""
+        batch and a head the emergency batch evicted (`_eviction`, which becomes the head again), so
+        only sprint-labelled inputs form the next batches. The head is never touched. Called inside
+        the caller's transaction; the caller cancels the returned batches' runs after it."""
         batches = [
             batch
             for batch in self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
-            if batch["urgent"] != URGENT_EMERGENCY
+            if batch["urgent"] != URGENT_EMERGENCY and not self._eviction(batch)
         ]
         for batch in batches:
             self._dissolve_batch(batch, "sprint-evicted", actor, now)

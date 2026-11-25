@@ -1284,7 +1284,7 @@ uv run tauceti-queue settings set sprint_label ""    # off: normal batching
 ```
 
 Setting the label dissolves every open batch (ordinary and control-file lane; not the emergency
-batch). Their members go back to waiting at their original age with their approvals kept and their
+batch, nor a head the emergency batch evicted, which becomes the head again after it). Their members go back to waiting at their original age with their approvals kept and their
 repair edits discarded; their open
 tasks are superseded, claims released and CI runs cancelled; the journal has a `sprint-evicted` entry
 per batch and one `sprint-started`. The head is never touched and lands normally. From then on only
@@ -1298,7 +1298,8 @@ the sprint on requests a discovery listing at once, so labels added since approv
 one listing (a few minutes); a label added later is seen by the next webhook or listing. The
 listings are those of policy admission (`admission_source = "policy"`, as deployed); under the older
 eligibility poller only approval-time labels and webhooks are seen. The emergency lane is separate:
-an open emergency batch is kept, and `bors emergency` still lands any PR it is asked to.
+an open emergency batch is kept, and `bors emergency` (with `emergency_evict` too) still lands any PR
+it is asked to, labelled or not.
 
 ### Landing a PR urgently: `bors emergency`, not an admin merge
 
