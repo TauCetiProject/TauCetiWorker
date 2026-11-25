@@ -48,6 +48,11 @@ Tables:
 - `failures`: history only, no longer written: one row per failed CI attempt of a head from when
   a recurring failure could withdraw members or bisect the head, with its fingerprint, finding lines
   and what the controller did about it (`action`: `repair`, `withdraw`, `bisect`, `dissolve`, `hold`).
+- `pr_builds`: the PR builds of Forgejo PR heads (`forgejo_pr_build.py`, decision 215), one row per
+  listed head: its state (`wanted`, `skipped` and why, `retaining`, `pending`, then `success`,
+  `failure`, `error` or `superseded`), the retained ref, the main it was built on, the dispatch time
+  and count, the result's description and run URL, the runs already counted (`runs`) and the newest
+  `build` status intent (`posted`), which alone the outbox posts.
 - `journal`: an append-only log of what the controller did, for status and tests.
 - `identity_cache`: answers GitHub gave about workers and operators, kept across restarts so a
   restart during a quota outage does not lock them out: per `namespace` (`bearer`, a token's
@@ -409,6 +414,27 @@ CREATE TABLE IF NOT EXISTS identity_cache (
     verified_at REAL NOT NULL,
     PRIMARY KEY (namespace, key)
 );
+CREATE TABLE IF NOT EXISTS pr_builds (
+    id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    state TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    observed_at REAL NOT NULL DEFAULT 0,
+    retry_at REAL NOT NULL DEFAULT 0,
+    ref TEXT NOT NULL DEFAULT '',
+    main_sha TEXT NOT NULL DEFAULT '',
+    dispatched_at REAL NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    description TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    runs TEXT NOT NULL DEFAULT '[]',
+    posted TEXT NOT NULL DEFAULT '',
+    settled_at REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS pr_build_head ON pr_builds (source, number, head_sha);
+CREATE INDEX IF NOT EXISTS pr_build_state ON pr_builds (source, state);
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY,
     at REAL NOT NULL,

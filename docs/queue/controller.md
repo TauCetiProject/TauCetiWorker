@@ -883,6 +883,12 @@ and reported in status:
 | `main_integration_timeout_seconds` | 10800 | a build with no result after this long expires and is asked again (three times on the same head) |
 | `main_integration_deferred_retry_seconds` | 600 | after CI defers a build for lack of idle capacity, how long the backfill asks for nothing new (then it probes with one build) |
 | `main_integration_checks_per_pass` | 20 | static stale checks (`stale_check.py`) a pass runs to order candidates |
+| `forgejo_pr_build_enabled` | false | the PR builds of Forgejo PR heads (below): run TauCeti's pr-build for each new or updated Forgejo PR head that is not self-tested and post the result on Forgejo as `build` |
+| `forgejo_pr_build_interval_seconds` | 120 | time between passes; each reads every outstanding build's status in one GraphQL query |
+| `forgejo_pr_build_max_in_flight` | 16 | heads being pushed to GitHub or built at once |
+| `forgejo_pr_build_timeout_seconds` | 21600 | a build with no result after this long is asked again |
+| `forgejo_pr_build_retry_seconds` | 600 | the wait before a head whose build gave no verdict (an error, a deferral, a timeout) is asked again |
+| `forgejo_pr_build_status_creators` | `["tauceti-live-ci"]` | the GitHub accounts whose `main-integration` status is a verdict |
 
 ## Main-integration backfill
 
@@ -914,6 +920,35 @@ outstanding head in one GraphQL query per pass (`main_integration_statuses`).
   meanwhile (decision 174's verification snapshot seals at the start of its preparation), an edited
   member or a replay that conflicts keeps the member (journal `main-integration-kept`); the batch's
   own verification and the head's repair deal with it as before.
+
+## Forgejo PR builds
+
+`tauceti_queue/forgejo_pr_build.py` (decision 215), one step of the pass after the
+main-integration backfill, off until `forgejo_pr_build_enabled` and inert unless Forgejo is in
+`admit` mode with publication on. On GitHub, `pull_request_target` runs pr-build for every PR push;
+nothing fires for a Forgejo PR, so the queue starts the same build and copies its result back.
+
+- **Heads:** the native poller records every listed Forgejo PR at its current head
+  (`pr_builds`). A draft, a PR on another base, or a `self-tested` PR without `full-lint` or
+  `lint-repair` is skipped, as GitHub's pr-build skips it; the labels are read again at each
+  listing, so a label change before the build starts is honoured. A head a push or a close
+  overtakes before its build starts is `superseded`.
+- **Build:** the oldest wanted heads, up to `forgejo_pr_build_max_in_flight`, are fetched from
+  Forgejo and retained on GitHub under the queue's input ref; once that push is done, each is
+  dispatched as a main-integration build of the head merged onto the current canonical commit with
+  `source` `forgejo` (no GitHub lookup by the colliding number) and `priority` `pr` (the Fleet PR
+  class, like any PR build). A `pending` `build` is posted on the Forgejo head at dispatch.
+- **Results:** one GraphQL read per pass of every outstanding head's `main-integration` status. A
+  verdict answers only if it was posted after the dispatch, is not a run already counted, and was
+  posted by an account in `forgejo_pr_build_status_creators`. It may name another main than the one
+  asked for: the backfill's build of the same head shares the context, and is as good a PR build. A
+  picker deferral (posted with the workflow token) only asks again, and only for the main asked for. Green and red are posted on Forgejo as
+  `build` with the run's description and URL. An error is asked once more, and a deferral or a
+  timeout asked again, up to three dispatches; then the head's `build` is `error`.
+- **Posting:** the `source_status` outbox entry posts as the queue's Forgejo publisher
+  (`MixedNativeSource.post_source_status`: context `build` only, a GitHub run URL only). Only the
+  newest intent for a head is posted, so a retried `pending` never lands after the result. No
+  Forgejo token reaches Actions: the build reads the head from GitHub.
 
 ## Ports
 

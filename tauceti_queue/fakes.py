@@ -236,6 +236,7 @@ class FakeGitHub:
         self.closed: dict[int, str] = {}
         self.statuses: dict[tuple[str, str], Status] = {}
         self.main_integration_requests: list[tuple[int, str, str]] = []
+        self.main_integration_options: list[dict[str, str]] = []
         self.declaration_records: dict[str, dict] = {}
         self.runs: list[FakeRun] = []
         # pr-build.yml's concurrency group with cancel-in-progress: a new dispatch for a candidate
@@ -412,11 +413,17 @@ class FakeGitHub:
             return completed
 
     def post_status(
-        self, sha: str, state: str, run_id: str | None, description: str = "", context: str = "build"
+        self,
+        sha: str,
+        state: str,
+        run_id: str | None,
+        description: str = "",
+        context: str = "build",
+        creator: str = "tauceti-live-ci",
     ) -> None:
         """A status from somewhere other than the candidate's own run (a stale callback, a PR build)."""
         with self.lock:
-            self.statuses[(sha, context)] = Status(state, description, "", self.clock(), run_id)
+            self.statuses[(sha, context)] = Status(state, description, "", self.clock(), run_id, creator)
 
     def cancel_runs(self, head_sha: str) -> None:
         with self.lock:
@@ -599,11 +606,14 @@ class FakeGitHub:
             self._call("commit_status", sha, context)
             return self.statuses.get((sha, context))
 
-    def dispatch_main_integration(self, repo: str, *, pr: int, head_sha: str, main_sha: str) -> None:
+    def dispatch_main_integration(
+        self, repo: str, *, pr: int, head_sha: str, main_sha: str, source: str = "github", priority: str = "idle"
+    ) -> None:
         """Records the request; a test posts the `main-integration` status itself (`post_status`)."""
         with self.lock:
             self._call("dispatch_main_integration", pr, head_sha, main_sha)
             self.main_integration_requests.append((pr, head_sha, main_sha))
+            self.main_integration_options.append({"source": source, "priority": priority})
 
     def main_integration_statuses(self, repo: str, heads) -> dict[str, Status | None]:
         with self.lock:

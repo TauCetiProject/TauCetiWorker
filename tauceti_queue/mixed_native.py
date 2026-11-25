@@ -89,6 +89,19 @@ class MixedNativeSource(ForgejoSourceAdapter):
         self._publisher()
         return super().close_pr(*args, **kwargs)
 
+    def post_source_status(self, repo, sha, *, context, state, description, target_url):
+        """Post a commit status on `sha` as the queue's publisher: the Forgejo PR build's `build`
+        (`forgejo_pr_build.py`). Workers and admission count a `build` only from this account."""
+        self._publisher()
+        self._bound(repo)
+        self._sha(sha)
+        if context != "build" or state not in {"pending", "success", "failure", "error"}:
+            raise ValueError("only a build status with a Forgejo state is posted")
+        if target_url and not target_url.startswith("https://github.com/"):
+            raise ValueError("a build status links only to its GitHub run")
+        body = {"context": context, "state": state, "description": description[:140], "target_url": target_url}
+        return self.client.request("POST", f"repos/{self.repository.name}/statuses/{sha}", body)
+
     def update_refs(self, *args, **kwargs):
         self._publisher()
         return super().update_refs(*args, **kwargs)

@@ -542,6 +542,16 @@ class Adapter(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             a.dispatch_main_integration(TAUCETI, pr=7, head_sha="main", main_sha=BASE)
+        # A Forgejo PR's build names its forge and asks for PR priority; nothing else is sent.
+        transport.add("POST", f"https://api.github.com/repos/{TAUCETI}/dispatches", 204)
+        a.dispatch_main_integration(TAUCETI, pr=550, head_sha=HEAD, main_sha=BASE, source="forgejo", priority="pr")
+        self.assertEqual(
+            json.loads(transport.calls[1][3])["client_payload"],
+            {"pr": 550, "head_sha": HEAD, "main_sha": BASE, "source": "forgejo", "priority": "pr"},
+        )
+        for options in (dict(source="gitlab"), dict(priority="urgent")):
+            with self.subTest(**options), self.assertRaises(ValueError):
+                a.dispatch_main_integration(TAUCETI, pr=7, head_sha=HEAD, main_sha=BASE, **options)
         url = f"https://github.com/{TAUCETI}/actions/runs/99"
         transport.add(
             "POST",
@@ -557,6 +567,7 @@ class Adapter(unittest.TestCase):
                                     "description": "B=abc failed",
                                     "targetUrl": url,
                                     "createdAt": "2026-11-24T04:00:00Z",
+                                    "creator": {"login": "tauceti-live-ci"},
                                 }
                             }
                         },
@@ -570,6 +581,8 @@ class Adapter(unittest.TestCase):
         self.assertIn('context(name: "main-integration")', query)
         self.assertEqual(query.count("object(oid:"), 2)
         self.assertEqual((statuses[HEAD].state, statuses[HEAD].run_id), ("failure", "99"))
+        self.assertIn("creator { login }", query)
+        self.assertEqual(statuses[HEAD].creator, "tauceti-live-ci")
         self.assertIsNone(statuses[TIP])
 
     def test_dispatch_candidate_sends_the_bors_payload(self):
