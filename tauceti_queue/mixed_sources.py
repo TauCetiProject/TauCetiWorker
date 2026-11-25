@@ -54,6 +54,13 @@ class SourcePorts:
         port, name, native = self._pull(repo, number)
         return port.close_pr(name, native, *args, **kwargs)
 
+    def post_source_status(self, repo, number, sha, **kwargs):
+        """A commit status on a Forgejo PR's head; GitHub statuses are posted by its own CI."""
+        if not isinstance(number, SourceNumber):
+            raise ValueError("source statuses are posted on Forgejo only")
+        port, name, _native = self._pull(repo, number)
+        return port.post_source_status(name, sha, **kwargs)
+
     def ensure_label(self, repo, *args, **kwargs):
         if repo == self.registry.profile.forgejo.repository.key:
             self.registry.check_native()
@@ -203,6 +210,10 @@ class NativePoller:
         # can see, and comment edits from the feed, are noticed within a pass.
         recheck = self.controller.setting("forgejo_recheck_seconds") if details.get("recheck_seconds") else 0
         self.state.observe(pull.number, pull.head_sha, version, recheck_after=recheck)
+        if self.registry.mode == "admit":
+            from . import forgejo_pr_build
+
+            forgejo_pr_build.observe(self.controller, pull)
 
     def _reevaluate(self, work, *, urgent=False):
         """Evaluate a PR again for evidence its listed facts do not show, keeping those facts:

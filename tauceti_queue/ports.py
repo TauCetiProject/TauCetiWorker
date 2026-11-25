@@ -155,6 +155,8 @@ class Status:
     target_url: str
     updated_at: float | None
     run_id: str | None
+    # The login of the account that posted it, when the read reports one (GraphQL `creator`).
+    creator: str = ""
 
 
 @dataclass(frozen=True)

@@ -51,6 +51,7 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
+from typing import Any
 
 from . import chain, declaration_names, diagnostics, diff_guard, github_app, ports
 from .ports import CandidatePhase, CandidateRun, FastForwardResult, Status, recovery_body
@@ -972,17 +973,27 @@ class GitHubAdapter:
             raise
         return dispatch_title(base_ref, _batch_id(batch_id), head_sha, base_sha)
 
-    def dispatch_main_integration(self, repo: str, *, pr: int, head_sha: str, main_sha: str) -> None:
+    def dispatch_main_integration(
+        self, repo: str, *, pr: int, head_sha: str, main_sha: str, source: str = "github", priority: str = "idle"
+    ) -> None:
         """`repository_dispatch` of TauCeti's main-integration.yml: build `head_sha` merged onto
         exactly `main_sha` on idle Fleet PR capacity, reported as the `main-integration` status on
-        the head (TauCetiTools docs/main-integration.md). One call; never retried here."""
+        the head (TauCetiTools docs/main-integration.md). One call; never retried here.
+
+        `source` `forgejo` says `pr` is a Forgejo PR's number, which the build must not look up on
+        GitHub; `priority` `pr` queues it on the Fleet PR class like any PR build instead of only
+        on idle capacity (`forgejo_pr_build.py`). The defaults send neither field."""
         for sha in (head_sha, main_sha):
             if not re.fullmatch(r"[0-9a-f]{40}", sha or ""):
                 raise ValueError("main-integration needs two commit SHAs")
-        payload = {
-            "event_type": MAIN_INTEGRATION_EVENT,
-            "client_payload": {"pr": int(pr), "head_sha": head_sha, "main_sha": main_sha},
-        }
+        if source not in ("github", "forgejo") or priority not in ("idle", "pr"):
+            raise ValueError("main-integration source or priority is unknown")
+        client_payload: dict[str, Any] = {"pr": int(pr), "head_sha": head_sha, "main_sha": main_sha}
+        if source != "github":
+            client_payload["source"] = source
+        if priority != "idle":
+            client_payload["priority"] = priority
+        payload = {"event_type": MAIN_INTEGRATION_EVENT, "client_payload": client_payload}
         try:
             self.client.request("POST", f"repos/{repo}/dispatches", json_body=payload, ok=(204,), single_attempt=True)
         except GitHubError as error:
@@ -1005,7 +1016,7 @@ class GitHubAdapter:
             chunk = unique[start : start + 50]
             fields = " ".join(
                 f'h{index}: object(oid: "{head}") {{ ... on Commit {{ status {{ '
-                f'context(name: "{MAIN_INTEGRATION_CONTEXT}") {{ state description targetUrl createdAt }} }} }} }}'
+                f'context(name: "{MAIN_INTEGRATION_CONTEXT}") {{ state description targetUrl createdAt creator {{ login }} }} }} }} }}'
                 for index, head in enumerate(chunk)
             )
             data = self.client.graphql(
@@ -1025,6 +1036,7 @@ class GitHubAdapter:
                     target_url=str(context.get("targetUrl") or ""),
                     updated_at=_timestamp(context.get("createdAt")),
                     run_id=run_id_from_url(context.get("targetUrl")),
+                    creator=str((context.get("creator") or {}).get("login") or ""),
                 )
         return result
 

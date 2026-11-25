@@ -360,6 +360,8 @@ class ForgejoSourceAdapter(ForgejoGitSource):
             "discovery_version": self._discovery_version(pull),
             "recheck_seconds": self.refresh_seconds,
             "updated_at": pull.updated_at,
+            # The Forgejo PR build skips self-tested heads (`forgejo_pr_build.skip_reason`).
+            "labels": list(pull.labels),
         }
         return ports.OpenPullRequest(pull.number, pull.head_sha, pull.base_ref, pull.draft, (), details)
 

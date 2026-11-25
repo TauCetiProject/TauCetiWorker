@@ -34,7 +34,16 @@ from collections.abc import Callable, Iterator, Sequence
 from datetime import datetime
 from typing import Any
 
-from . import admission_planning, chain, declaration_names, escalation, main_integration, repair_stall, stuck_heads
+from . import (
+    admission_planning,
+    chain,
+    declaration_names,
+    escalation,
+    forgejo_pr_build,
+    main_integration,
+    repair_stall,
+    stuck_heads,
+)
 from .eligibility import KEEP as BLOCKING_LABELS
 from .mixed_identity import SourceNumber
 from .ports import (
@@ -112,6 +121,17 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "main_integration_timeout_seconds": 3 * 3600,
     "main_integration_deferred_retry_seconds": 600,
     "main_integration_checks_per_pass": 20,
+    # PR builds of Forgejo PR heads (`forgejo_pr_build.py`, decision 215): the queue dispatches
+    # TauCeti's pr-build for each new or updated Forgejo PR head that is not self-tested and copies
+    # the result to Forgejo as the `build` status. Off by default; the runtime switch.
+    "forgejo_pr_build_enabled": False,
+    # One pass (one GraphQL read of every outstanding build's status) at most this often.
+    "forgejo_pr_build_interval_seconds": 120,
+    "forgejo_pr_build_max_in_flight": 16,
+    "forgejo_pr_build_timeout_seconds": 6 * 3600,
+    "forgejo_pr_build_retry_seconds": 600,
+    # The GitHub accounts whose `main-integration` status is a verdict (the CI status App).
+    "forgejo_pr_build_status_creators": ["tauceti-live-ci"],
     "insertion_age_window": 16,
     "open_batch_limit": 2,
     # Freeze oldest unsealed batches at this size until two active batches are sealed in total.
@@ -3901,6 +3921,7 @@ class Controller:
         offer()
         # Before sealing, so a member it takes out never reaches the next head (decision 175 B).
         main_integration.run(self, now)
+        forgejo_pr_build.run(self, now)
         for step in (
             self._supersede_stale_pre_rebase,
             self._emergency,
@@ -11655,6 +11676,10 @@ class Controller:
         if kind == "retain_ref":
             self.source.update_ref(repo, payload["ref"], payload["sha"])
             return "retained"
+        if kind == "source_status":
+            if not isinstance(payload.get("number"), SourceNumber):
+                raise ControllerError("source-status", "source statuses are posted on Forgejo only")
+            return forgejo_pr_build.perform(self, repo, payload)
         if kind == "comment":
             return "comment " + str(
                 self.source.post_comment(repo, payload["number"], payload["body"], payload["marker"])
