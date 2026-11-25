@@ -643,7 +643,8 @@ class Verification:
                 (baseline / "mathlib-shims.json").write_bytes(manifest)
                 # No shell pipeline: both git and tar exits are checked independently.
                 archive = self.directory / "base.tar"
-                archive.write_bytes(git(self.root, "archive", merge, LEAN_DIR))
+                paths = base_shim_paths(self.root, merge, manifest)
+                archive.write_bytes(git(self.root, "--literal-pathspecs", "archive", merge, "--", *paths))
                 self.command("shim-baseline", ["tar", "-xf", str(archive), "-C", str(baseline)])
                 args += ["--base-manifest", str(baseline / "mathlib-shims.json"), "--base-root", str(baseline)]
                 pins = git(
@@ -658,6 +659,14 @@ class Verification:
                 )
                 if not pins and self.policy != "bump":
                     args += ["--only-new"]
+                    # As in CI's ordinary-PR scope: everything outside the complete diff is the
+                    # merge base's, which passed the full scan, so the checker rescans only changed
+                    # sources and sources dropped from the base registry instead of every module.
+                    changed = selected["changed"]
+                    if shim_checker_scopes(script) and not any("\n" in path or "\r" in path for path in changed):
+                        listing = self.directory / "shim-changed-paths.txt"
+                        listing.write_text("".join(f"{path}\n" for path in changed))
+                        args += ["--changed-paths", str(listing)]
             return [(args, env)]
         if phase not in {"module-system", "lint"}:
             raise ValueError(f"unknown verification phase {phase}")
@@ -896,6 +905,52 @@ class Verification:
         ):
             return path
         return None
+
+
+def base_shim_paths(root: Path, merge: str, manifest: bytes) -> list[str]:
+    """The merge-base paths the shim checker reads under ``--base-root`` (literal pathspecs).
+
+    The checker opens only the base registry and the base registry's own sources there, so
+    extracting those instead of every library module gives it identical inputs. A registry it
+    cannot read falls back to the whole library: the checker then reports the registry error.
+    """
+    try:
+        entries = json.loads(manifest)
+    except ValueError:
+        return [LEAN_DIR]
+    wanted = {f"{LEAN_DIR}/mathlib-shims.json"}
+    for entry in entries if isinstance(entries, list) else [None]:
+        sources = entry.get("sources") if isinstance(entry, dict) else None
+        if not isinstance(sources, list) or not all(isinstance(source, str) for source in sources):
+            return [LEAN_DIR]
+        wanted.update(sources)
+    # A base registry may name a source its own commit lacks; the checker reports it if it matters.
+    names = git(root, "ls-tree", "-r", "-z", "--name-only", merge, "--", LEAN_DIR).split(b"\0")
+    present = {name.decode(errors="surrogateescape") for name in names if name}
+    return sorted(wanted & present)
+
+
+def shim_checker_scopes(script: Path) -> bool:
+    """Whether this checkout's shim checker accepts ``--changed-paths`` (TauCetiTools #203)."""
+    try:
+        text = script.read_text(errors="replace")
+    except OSError:
+        return False
+    if "--changed-paths" in text:
+        return True
+    if (
+        "run_script('check-expired-mathlib-shims.py'" not in text
+        and 'run_script("check-expired-mathlib-shims.py"' not in text
+    ):
+        return False
+    try:
+        from tauceti_tools.templates import ASSETS
+    except ImportError:
+        return False
+    try:
+        return "--changed-paths" in (ASSETS / "scripts" / "check-expired-mathlib-shims.py").read_text(errors="replace")
+    except OSError:
+        return False
 
 
 def add_parser(sub):

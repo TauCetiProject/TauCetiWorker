@@ -26,8 +26,12 @@ All stages run the whole-library `lake build --iofail`, fast changed-file axiom 
 module-system, source style lint, changed-module environment/documentation lint, and the shim ratchet.
 A stage-only call runs that stage; it does not assert that prerequisites or other stages passed.
 The shim checker receives merge-base source and registry snapshots, strict `--fail-on-available`,
-and `--only-new` for unchanged pins outside bump policy. Older source revisions without the checker
-record an empty shim phase. CI still owns whole-library environment lint. For failures in unchanged
+and `--only-new` for unchanged pins outside bump policy. The base snapshot holds only the registry
+and the sources it tracks, which is all the checker reads there. With unchanged pins outside bump
+policy, the checker also receives `--changed-paths` listing the complete local diff against the
+merge base, as CI's ordinary-PR scope does, so its coverage scan reads the changed sources and
+sources dropped from the base registry instead of every module; checkers that predate the option
+keep the full scan. Older source revisions without the checker record an empty shim phase. CI still owns whole-library environment lint. For failures in unchanged
 modules, `--lint-modules /absolute/list` adds validated existing dotted TauCeti module names to the
 local lint list; its contents are fingerprinted. Use the same option for final verification. Write this
 list and any extra diagnostic logs outside the checkout; untracked checkout files are inputs.
