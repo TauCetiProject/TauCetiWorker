@@ -227,12 +227,16 @@ class InUse(OSError):
 
 
 def _check_unused(tree: Path) -> None:
-    """Raise ``InUse`` while a live process uses ``tree`` or a mount lies inside it."""
+    """Raise ``InUse`` while a live process uses ``tree`` or a mount lies inside it.
+
+    Read-only descriptors do not count: resetting or deleting files cannot harm a reader, and a
+    whole-filesystem search (`find /`) would otherwise hold every worker's tree for minutes. A
+    working directory or root inside the tree, or any descriptor open for writing, still does."""
     from .live_use import live_users
     from .paths import canonical_candidate
     from .retention import mount_points
 
-    users = live_users(tree)
+    users = live_users(tree, readers=False)
     mounts = mount_points()
     target = canonical_candidate(tree)
     if users or mounts is None or any(point == target or point.is_relative_to(target) for point in mounts):
@@ -282,7 +286,7 @@ def sweep(current: Path):
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 continue  # a live round
-            if live_users(tree):
+            if live_users(tree, readers=False):
                 continue
             state = lock.parent
             owner = SimpleNamespace(wid=state.name, state=state, checkout=tree, data_home=state / "home")

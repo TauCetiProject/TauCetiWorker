@@ -55,6 +55,36 @@ class LiveUse(unittest.TestCase):
         self.assertTrue(lu.owner_stopped(owner))
         self.assertEqual(lu.live_users(tree), [])
 
+    @unittest.skipUnless(sys.platform == "linux", "procfs observations")
+    def test_linux_read_only_descriptors_are_not_users_for_writers(self):
+        # A whole-filesystem search holds read-only descriptors on the directories it walks.
+        tree = self.root / "tree"
+        (tree / "sub").mkdir(parents=True)
+        (tree / "A.lean").write_text("x")
+        reader = (
+            "import os, sys, time; d = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY); "
+            "f = open(sys.argv[2]); print('ready', flush=True); time.sleep(30)"
+        )
+        writer = "import sys, time; f = open(sys.argv[1], 'a'); print('ready', flush=True); time.sleep(30)"
+        cases = (
+            ("reader", [reader, str(tree / "sub"), str(tree / "A.lean")], "/", False),
+            ("writer", [writer, str(tree / "A.lean")], "/", True),
+            ("working directory", [reader, str(tree / "sub"), str(tree / "A.lean")], str(tree), True),
+        )
+        for name, argv, cwd, counted in cases:
+            with (
+                self.subTest(name),
+                subprocess.Popen([sys.executable, "-c", *argv], cwd=cwd, stdout=subprocess.PIPE, text=True) as child,
+            ):
+                try:
+                    self.assertEqual(child.stdout.readline().strip(), "ready")
+                    mine = lambda users: any(user.startswith(f"{child.pid} ") for user in users)  # noqa: E731
+                    self.assertTrue(mine(lu.live_users(tree)))
+                    self.assertEqual(mine(lu.live_users(tree, readers=False)), counted)
+                finally:
+                    child.terminate()
+                    child.wait(timeout=5)
+
     def test_checkout_kind(self):
         repo = self.root / "repo"
         subprocess.run(["git", "init", "-q", str(repo)], check=True)

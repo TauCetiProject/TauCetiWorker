@@ -1,7 +1,9 @@
 """Process ownership and live-use observations, and small Git helpers for worker checkouts.
 
 Cleanup never deletes a tree a live process still uses: ``live_users`` reports the visible
-processes whose working directory, root or open files lie inside a path. ``process_owner`` and
+processes whose working directory, root or open files lie inside a path. A caller that only
+rewrites or deletes files may pass ``readers=False`` to disregard read-only descriptors: a search
+of the whole filesystem (an agent's `find /`) holds one on every directory it walks, for minutes. ``process_owner`` and
 ``owner_stopped`` record and test a process's birth identity without PID namespace support.
 """
 
@@ -195,8 +197,23 @@ def _darwin_process_references():
     return result
 
 
-def process_references():
-    """One read-only process inventory, reusable within a cleanup pass only."""
+def _read_only(entry: Path, fd: str) -> bool:
+    """Whether descriptor ``fd`` of process ``entry`` is open for reading only. Unknown is not."""
+    try:
+        for line in (entry / "fdinfo" / fd).read_text().splitlines():
+            if line.startswith("flags:"):
+                return int(line.split()[1], 8) & os.O_ACCMODE == os.O_RDONLY
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
+def process_references(*, readers_under: str | None = None):
+    """One read-only process inventory, reusable within a cleanup pass only.
+
+    With ``readers_under`` (a canonical path), read-only descriptors inside it are left out: the
+    working directory, root and every descriptor open for writing still count. Linux only; macOS
+    inventories keep every reference."""
     import sys
 
     if sys.platform == "darwin":
@@ -233,8 +250,16 @@ def process_references():
             for link in links:
                 with contextlib.suppress(OSError):
                     where = os.readlink(link)
-                    if where.startswith("/"):
-                        paths.append(where)
+                    if not where.startswith("/"):
+                        continue
+                    if (
+                        readers_under is not None
+                        and link.parent.name == "fd"
+                        and (where == readers_under or where.startswith(readers_under.rstrip("/") + "/"))
+                        and _read_only(entry, link.name)
+                    ):
+                        continue
+                    paths.append(where)
         result.append((entry.name, session, entry.name, paths))
     return result
 
@@ -259,9 +284,17 @@ def referenced_users(repo: Path, references, *, session=None) -> list[str]:
     return found
 
 
-def live_users(repo: Path, *, session=None) -> list[str]:
-    """Fresh process references for ordinary callers; no cached negative liveness evidence."""
-    return referenced_users(repo, process_references(), session=session)
+def live_users(repo: Path, *, session=None, readers=True) -> list[str]:
+    """Fresh process references for ordinary callers; no cached negative liveness evidence.
+
+    ``readers=False`` disregards descriptors open for reading only (see the module docstring)."""
+    under = None
+    if not readers:
+        try:
+            under = str(canonical_candidate(repo))
+        except OSError:
+            return ["candidate path unavailable"]
+    return referenced_users(repo, process_references(readers_under=under), session=session)
 
 
 def fsync_dir(path: Path) -> None:
