@@ -264,6 +264,7 @@ RUN_STDLIB=(
   synchronous_state_repair.py
   source_mergeability.py
   review_scheduling.py
+  build_affinity.py
   review_state_freshness.py
   review_throttles.py
   roadmap_backpressure.py
