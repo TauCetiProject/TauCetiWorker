@@ -22,7 +22,7 @@ import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from .config import Die
 from .constants import LEAN_ROOT
@@ -662,8 +662,9 @@ class Verification:
                     # As in CI's ordinary-PR scope: everything outside the complete diff is the
                     # merge base's, which passed the full scan, so the checker rescans only changed
                     # sources and sources dropped from the base registry instead of every module.
+                    # Like CI, this assumes main passed the scan under the same checker rules.
                     changed = selected["changed"]
-                    if shim_checker_scopes(script) and not any("\n" in path or "\r" in path for path in changed):
+                    if checker_lines_preserve(changed) and shim_checker_scopes(script, self.root, env):
                         listing = self.directory / "shim-changed-paths.txt"
                         listing.write_text("".join(f"{path}\n" for path in changed))
                         args += ["--changed-paths", str(listing)]
@@ -923,34 +924,38 @@ def base_shim_paths(root: Path, merge: str, manifest: bytes) -> list[str]:
         sources = entry.get("sources") if isinstance(entry, dict) else None
         if not isinstance(sources, list) or not all(isinstance(source, str) for source in sources):
             return [LEAN_DIR]
-        wanted.update(sources)
+        # The checker reads each source as ``base_root / Path(source)``; match its normal form.
+        wanted.update(PurePosixPath(source).as_posix() for source in sources)
     # A base registry may name a source its own commit lacks; the checker reports it if it matters.
     names = git(root, "ls-tree", "-r", "-z", "--name-only", merge, "--", LEAN_DIR).split(b"\0")
     present = {name.decode(errors="surrogateescape") for name in names if name}
     return sorted(wanted & present)
 
 
-def shim_checker_scopes(script: Path) -> bool:
-    """Whether this checkout's shim checker accepts ``--changed-paths`` (TauCetiTools #203)."""
+def shim_checker_scopes(script: Path, root: Path, env: dict) -> bool:
+    """Whether this checkout's shim checker accepts ``--changed-paths`` (TauCetiTools #203).
+
+    Ask the checker itself, through the same interpreter and environment as the real run: older
+    standalone checkers reject the option, and any doubt keeps the full scan.
+    """
     try:
-        text = script.read_text(errors="replace")
-    except OSError:
+        completed = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
-    if "--changed-paths" in text:
-        return True
-    if (
-        "run_script('check-expired-mathlib-shims.py'" not in text
-        and 'run_script("check-expired-mathlib-shims.py"' not in text
-    ):
-        return False
-    try:
-        from tauceti_tools.templates import ASSETS
-    except ImportError:
-        return False
-    try:
-        return "--changed-paths" in (ASSETS / "scripts" / "check-expired-mathlib-shims.py").read_text(errors="replace")
-    except OSError:
-        return False
+    return completed.returncode == 0 and "--changed-paths" in completed.stdout
+
+
+def checker_lines_preserve(paths) -> bool:
+    """Whether the checker's ``splitlines()`` reader would read back exactly these paths."""
+    return all(path and path.splitlines() == [path] for path in paths)
 
 
 def add_parser(sub):

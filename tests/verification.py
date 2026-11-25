@@ -551,7 +551,9 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         return base
 
     def test_shim_check_scans_only_the_complete_diff_like_ci(self):
-        base = self.shim_fixture("# accepts --changed-paths\n")
+        base = self.shim_fixture(
+            "import sys\nif sys.argv[1:] == ['--help']:\n    print('usage: --changed-paths CHANGED_PATHS')\n    sys.exit(0)\n"
+        )
         write(self.root, "TauCeti/B.lean", "edited\n")
         write(self.root, "TauCeti/New.lean", "untracked\n")
         result = self.verify(stage="shim-expiry", base=base)
@@ -572,29 +574,31 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertIsNone(seen["changed"])
 
     def test_shim_check_keeps_full_scan_for_older_checkers(self):
-        base = self.shim_fixture("")
+        base = self.shim_fixture(
+            "import sys\nif sys.argv[1:] == ['--help']:\n    print('usage: --only-new')\n    sys.exit(0)\n"
+        )
         write(self.root, "TauCeti/B.lean", "edited\n")
         self.verify(stage="shim-expiry", base=base)
         seen = json.loads((self.root / ".lake/shim-seen").read_text())
         self.assertNotIn("--changed-paths", seen["args"])
 
-    def test_delegating_checker_scopes_only_when_the_pinned_tools_support_it(self):
-        import tauceti_tools.templates as templates
+    def test_scoping_asks_the_checker_and_keeps_paths_it_cannot_read_back(self):
+        from tauceti_worker.verification import checker_lines_preserve, shim_checker_scopes
 
-        from tauceti_worker.verification import shim_checker_scopes
-
-        script = write(
-            self.home,
-            "entry.py",
-            "from tauceti_tools.templates import run_script\nrun_script('check-expired-mathlib-shims.py', [])\n",
+        old = write(
+            self.home, "old.py", "import argparse\n# mentions --changed-paths\nargparse.ArgumentParser().parse_args()\n"
         )
-        assets = self.home / "assets"
-        shared = write(assets, "scripts/check-expired-mathlib-shims.py", "old checker\n")
-        with patch.object(templates, "ASSETS", assets):
-            self.assertFalse(shim_checker_scopes(script))
-            shared.write_text("parser.add_argument('--changed-paths')\n")
-            self.assertTrue(shim_checker_scopes(script))
-        self.assertFalse(shim_checker_scopes(self.home / "missing.py"))
+        new = write(
+            self.home,
+            "new.py",
+            "import argparse\np = argparse.ArgumentParser()\np.add_argument('--changed-paths')\np.parse_args()\n",
+        )
+        self.assertFalse(shim_checker_scopes(old, self.home, dict(os.environ)))
+        self.assertTrue(shim_checker_scopes(new, self.home, dict(os.environ)))
+        self.assertFalse(shim_checker_scopes(self.home / "missing.py", self.home, dict(os.environ)))
+        self.assertTrue(checker_lines_preserve(["TauCeti/A.lean", "lean-toolchain"]))
+        for odd in ("TauCeti/A\u2028B.lean", "TauCeti/A\x0bB.lean", "TauCeti/A\rB.lean"):
+            self.assertFalse(checker_lines_preserve(["TauCeti/A.lean", odd]))
 
     def test_unreadable_base_registry_extracts_the_whole_library(self):
         from tauceti_worker.verification import base_shim_paths
@@ -604,7 +608,7 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.assertEqual(base_shim_paths(self.root, head, b"{"), ["TauCeti"])
         self.assertEqual(base_shim_paths(self.root, head, b'[{"sources": 1}]'), ["TauCeti"])
         self.assertEqual(
-            base_shim_paths(self.root, head, b'[{"sources": ["TauCeti/A.lean", "TauCeti/Gone.lean"]}]'),
+            base_shim_paths(self.root, head, b'[{"sources": ["TauCeti/./A.lean", "TauCeti/Gone.lean"]}]'),
             ["TauCeti/A.lean", "TauCeti/mathlib-shims.json"],
         )
 
