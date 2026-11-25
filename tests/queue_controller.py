@@ -4765,6 +4765,32 @@ class SprintMode(ControllerCase):
         self.controller.tick()
         self.assertEqual(self.controller.input_for(PROJECT, 101)["state"], "inserted")
 
+    def test_the_label_going_during_the_probe_keeps_the_input_out(self):
+        self.approve(101, {"A.lean": "a\n"}, labels=["grh"])
+        self.controller.set_setting("sprint_label", "grh", "operator")
+        build = chain.build
+
+        def unlabel_then_build(*args, **kwargs):
+            self.label_event(101, "unlabeled", "grh", [])
+            return build(*args, **kwargs)
+
+        with mock.patch.object(chain, "build", unlabel_then_build):
+            self.controller.tick()
+        row = self.controller.input_for(PROJECT, 101)
+        self.assertEqual((row["state"], row["last_probe"]), ("waiting", "sprint-label"))
+        self.assertEqual(self.controller.store.count("members"), 0)
+
+    def test_a_failed_dissolution_leaves_the_sprint_off(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.controller.tick()
+        with mock.patch.object(self.controller, "_dissolve_batch", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.controller.set_setting("sprint_label", "grh", "operator")
+        self.assertEqual(self.controller.setting("sprint_label"), "")
+        self.assertEqual(len(self.batch_numbers("open")), 1, "the open batch is kept")
+
     def test_the_label_is_a_plain_name(self):
         with self.assertRaises(ControllerError):
             self.controller.set_setting("sprint_label", " grh", "operator")

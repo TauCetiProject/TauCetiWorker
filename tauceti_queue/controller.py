@@ -916,9 +916,14 @@ class Controller:
                 if record is None or (record["actor"] == SEED_ACTOR and actor != SEED_ACTOR):
                     self.store.set_setting(key, value, actor, now)
                 return self.effective_settings()
+            dissolved: list[int] = []
             with self.store.transaction():
                 self.store.set_setting(key, value, actor, now)
                 self.store.journal(now, "setting", key=key, value=value, actor=actor)
+                if key == "sprint_label" and value:
+                    # One transaction: the sprint never starts with the open batches still in place.
+                    dissolved = self._dissolve_open_batches(actor, now)
+                    self.store.journal(now, "sprint-started", label=value, actor=actor, dissolved=dissolved)
                 if key == "publication_enabled" and value and not previous:
                     self._republish_retained_refs(now)
                 if (
@@ -928,9 +933,9 @@ class Controller:
                 ):
                     # Unaccepted Forgejo work was judged under the old rules: judge it again.
                     self.mixed.poller.admission_changed()
+            for batch_id in dissolved:
+                self._cancel_superseded_runs(batch_id, now, reason="batch removed (sprint-evicted)")
             if key == "sprint_label" and value:
-                dissolved = self._dissolve_open_batches(actor, now)
-                self.store.journal(now, "sprint-started", label=value, actor=actor, dissolved=dissolved)
                 self._request_label_refresh()
             self._wake.set()
             self._refresh_snapshot()
@@ -3450,14 +3455,14 @@ class Controller:
         return [row for row in rows if label in loads(row["labels"], [])]
 
     def observe_labels(self, number: Any, labels: Sequence[Any]) -> None:
-        """Record a PR's current labels (from a discovery listing or a label event) on its waiting
-        input, as `inputs.labels`, which sprint mode reads."""
+        """Record a PR's current labels (from a discovery listing or a label event) on its live
+        input, as `inputs.labels`, which sprint mode reads (also for a member, should it be returned)."""
         from .mixed_identity import source_record
 
         names = dumps(sorted({str(label).lower() for label in labels}))
         where = {
             "repository": self.repository,
-            "state": [INPUT_WAITING, INPUT_RESERVED],
+            "state": [INPUT_WAITING, INPUT_RESERVED, INPUT_INSERTED],
             "number": int(number),
             "source_identity": source_record(number),
         }
@@ -4700,6 +4705,14 @@ class Controller:
                     "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="blocked-label"
                 )
                 self._release_claim(claim, "blocked-label", now)
+            return False
+        if not self._sprint_inputs([fresh]):
+            # Sprint mode began, or the sprint label went, while the probe ran: it waits, unplaced.
+            with self.store.transaction():
+                self.store.update(
+                    "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="sprint-label"
+                )
+                self._release_claim(claim, "sprint-label", now)
             return False
         if failure is not None:
             with self.store.transaction():
@@ -8648,17 +8661,15 @@ class Controller:
 
     def _dissolve_open_batches(self, actor: str, now: float) -> list[int]:
         """Sprint mode switched on (`sprint_label`): dissolve every open batch except the emergency
-        batch, so only sprint-labelled inputs form the next batches. The head is never touched."""
+        batch, so only sprint-labelled inputs form the next batches. The head is never touched. Called
+        inside the caller's transaction; the caller cancels the returned batches' runs after it."""
         batches = [
             batch
             for batch in self.store.rows("batches", {"repository": self.repository, "state": BATCH_OPEN}, order="id")
             if batch["urgent"] != URGENT_EMERGENCY
         ]
-        with self.store.transaction():
-            for batch in batches:
-                self._dissolve_batch(batch, "sprint-evicted", actor, now)
         for batch in batches:
-            self._cancel_superseded_runs(batch["id"], now, reason="batch removed (sprint-evicted)")
+            self._dissolve_batch(batch, "sprint-evicted", actor, now)
         return [batch["id"] for batch in batches]
 
     def evict_native(self, repo: str, actor: str, *, withdraw: Sequence[int] = ()) -> dict[str, Any]:

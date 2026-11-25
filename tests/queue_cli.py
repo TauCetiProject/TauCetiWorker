@@ -542,7 +542,7 @@ class SettingsCommand(Base):
             elif isinstance(initial, int):
                 raw, expected = str(initial + 1), initial + 1
             else:
-                raw, expected = f"{initial}-x", f"{initial}-x"
+                raw = expected = f"{initial}-x" if initial else "x"  # "-x" would read as an option
             fetch = mock.Mock(return_value={"settings": {key: expected}})
             with self.subTest(key=key), captured():
                 args = parser.parse_args(["settings", "--url", "http://q", "set", key, raw, "--token", "t"])

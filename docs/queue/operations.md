@@ -1295,7 +1295,10 @@ undo. Changing to another label dissolves the open batches again.
 The controller reads a PR's labels at approval, from `labeled`/`unlabeled` webhooks, and from every
 GitHub and Forgejo discovery listing, and keeps them on the waiting input (`inputs.labels`). Switching
 the sprint on requests a discovery listing at once, so labels added since approval are seen within
-one listing (a few minutes); a label added later is seen by the next webhook or listing.
+one listing (a few minutes); a label added later is seen by the next webhook or listing. The
+listings are those of policy admission (`admission_source = "policy"`, as deployed); under the older
+eligibility poller only approval-time labels and webhooks are seen. The emergency lane is separate:
+an open emergency batch is kept, and `bors emergency` still lands any PR it is asked to.
 
 ### Landing a PR urgently: `bors emergency`, not an admin merge
 
