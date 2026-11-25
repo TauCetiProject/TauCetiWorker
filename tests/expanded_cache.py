@@ -100,6 +100,65 @@ class Cache(unittest.TestCase):
         self.assertEqual(json.loads(one.read_text())["data"], data)
         self.assertEqual((self.root / "1/artifacts" / artifact).read_bytes(), b"cached")
 
+    def test_remembered_json_is_reread_whenever_the_file_changes(self):
+        private = self.root / "private"
+        path = private / "outputs/TauCeti" / ("d" * 16 + ".json")
+        atomic_json(path, dict(data="old"))
+        os.utime(path, (1, 1))  # Long before this pass: not racy.
+        first = cache.Remembered(private)
+        self.assertEqual(first.read(path), dict(data="old"))
+        first.save()
+        again = cache.Remembered(private)
+        with patch.object(cache, "read_json", side_effect=AssertionError("re-read an unchanged file")):
+            self.assertEqual(again.read(path), dict(data="old"))
+        # A damaged index (still valid JSON) is ignored, not trusted.
+        stored = json.loads((private / cache.Remembered.NAME).read_text())
+        stored["rows"][str(path)][1]["data"] = "forged"
+        (private / cache.Remembered.NAME).write_text(json.dumps(stored))
+        self.assertEqual(cache.Remembered(private).read(path), dict(data="old"))
+        # Rewritten in place with the same size: the mtime differs, so it is read again.
+        path.write_text(path.read_text().replace("old", "new"))
+        os.utime(path, (2, 2))
+        self.assertEqual(again.read(path)["data"], "new")
+        # Replaced by a rename (a new inode), even with the old mtime.
+        atomic_json(path, dict(data="ren"))
+        os.utime(path, (2, 2))
+        self.assertEqual(again.read(path)["data"], "ren")
+        # Just written: not remembered, so a same-tick rewrite cannot hide.
+        atomic_json(path, dict(data="hot"))
+        again.read(path)
+        self.assertNotIn(str(path), again.used)
+        path.unlink()
+        self.assertEqual(again.read(path), {})
+
+    def test_remembered_entries_ignore_the_reuse_clock_but_not_replacement(self):
+        entry = self.pool / "entries" / ("a" * 16)
+        entry.mkdir(parents=True)
+        data = dict(o=["b" * 16 + ".olean"], i="c" * 16 + ".ilean", m=False)
+        for name in cache.descriptions(data):
+            (entry / name).write_bytes(b"cached")
+        atomic_json(entry / "entry.json", dict(data=data))
+        private = self.root / "private"
+        remembered = cache.Remembered(private)
+        cache.hydrate(entry, private, "d" * 16, remembered=remembered)
+        os.utime(entry / "entry.json", (5, 5))  # The pool's reuse clock moves every round.
+        remembered.save()
+        later = cache.Remembered(private)
+        with patch.object(cache, "read_json", wraps=cache.read_json) as reads:
+            cache.hydrate(entry, private, "d" * 16, remembered=later, private_mappings={})
+        self.assertNotIn(entry / "entry.json", [call.args[0] for call in reads.call_args_list])
+        # Re-expansion replaces the entry: the new one is read.
+        other = dict(data, i="e" * 16 + ".ilean")
+        (entry / other["i"]).write_bytes(b"cached")
+        atomic_json(entry / "entry.json", dict(data=other))
+        cache.hydrate(entry, private, "d" * 16, remembered=later, private_mappings={})
+        mapping = json.loads((private / "outputs/TauCeti" / ("d" * 16 + ".json")).read_text())
+        self.assertEqual(mapping["data"], other)
+        # Damaged payloads are still found: hydration still checks every name.
+        (entry / other["i"]).unlink()
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            cache.hydrate(entry, private, "d" * 16, remembered=later, private_mappings={})
+
     def _trace(self, checkout, module, dep, outputs):
         trace = checkout / ".lake/build/lib/lean" / (module + ".trace")
         atomic_json(trace, dict(schemaVersion="2025-09-10", depHash=dep, outputs=outputs))
