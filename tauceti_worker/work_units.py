@@ -371,6 +371,18 @@ def _bubble(stage: str, opts: RoundOpts) -> bool:
 
 
 def throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
+    """Apply the review throttles (_throttle_review), never to a model-free close at the review-error cap."""
+    closing = [c for c in sv.reviewable.actionable if c.close_at_review_cap]
+    if not closing:
+        return _throttle_review(sv, opts, now=now)
+    sv.reviewable.actionable = [c for c in sv.reviewable.actionable if not c.close_at_review_cap]
+    try:
+        _throttle_review(sv, opts, now=now)
+    finally:
+        sv.reviewable.actionable = closing + sv.reviewable.actionable
+
+
+def _throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
     """Apply the two review throttles to this round's review queue, in place.
 
     UNDOCUMENTED — expert use only. `--review-min-queue N` / `--review-min-age M` (and their
@@ -2727,6 +2739,23 @@ def _close_review_capped_pr(w, sv, c, *, explicit=False) -> int | None:
     return rc
 
 
+def _review_cap_still_holds(w, c) -> bool:
+    """Whether `c.head` still has no completed review, read fresh, and this host's errors are still capped.
+
+    A peer may have reviewed the head since the survey; an unreadable review state is not evidence
+    that nobody has, so it declines too."""
+    if w.counters.read(f"review-err-{c.pr}") < MAX_REVIEW_ERRORS:
+        return False
+    meta = w.rs.gh_meta(c.pr, force=True)
+    if getattr(meta, "provenance", "") in {"deferred", "stale", "fetch_failed"}:
+        log(f"  review #{c.pr}: review state unreadable; not closing at the review-error cap this round")
+        return False
+    if w.rs.ledger_clean_head(c.pr) == c.head:
+        log(f"  review #{c.pr}: reviewed at {c.head[:12]} since the survey; not closing")
+        return False
+    return True
+
+
 def _close_owned_pr(w, sv, c, *, explicit, detail, comment, stage="fix") -> int | None:
     """Close an owned PR still blocked at `c.head` with `comment`, after fresh checks; no model call.
 
@@ -2744,6 +2773,8 @@ def _close_owned_pr(w, sv, c, *, explicit, detail, comment, stage="fix") -> int 
             if stage == "fix" and not _still_actionable(
                 "fix", w, sv, replace(c, partial_history=False), explicit=explicit
             ):
+                return None
+            if stage == "review" and not _review_cap_still_holds(w, c):
                 return None
             live = w.gh.pr_view(c.pr, ["state", "headRefOid", "author", "labels", "isDraft"])
             if (

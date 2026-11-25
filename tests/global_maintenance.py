@@ -577,6 +577,9 @@ class GlobalMaintenance(unittest.TestCase):
 
         sv, _, live = self.spent_fixture()
         self.w.cfg.logdir = self.w.cfg.state
+        self.counter_values["review-err-10"] = MAX_REVIEW_ERRORS
+        self.w.rs.gh_meta = lambda *a, **k: SimpleNamespace(data={}, provenance="fresh")
+        self.w.rs.ledger_clean_head = lambda pr: ""
         c = work.Candidate(10, HEAD, close_at_review_cap=True)
 
         def close(argv, **kwargs):
@@ -597,14 +600,35 @@ class GlobalMaintenance(unittest.TestCase):
         self.assertGreater(self.counter_values[survey_mod.review_cap_close_key(10)], 0)
         self.w.claims.release.assert_called_once()
 
-    def test_the_review_error_cap_never_closes_a_kept_or_foreign_pr(self):
-        for changes in ({"labels": [{"name": "keep"}]}, {"author": {"login": "peer"}}):
-            with self.subTest(changes=changes):
+    def test_the_review_error_cap_never_closes_a_kept_foreign_or_since_reviewed_pr(self):
+        from tauceti_worker.constants import MAX_REVIEW_ERRORS
+
+        cases = (
+            ({"labels": [{"name": "keep"}]}, "", "fresh", MAX_REVIEW_ERRORS),
+            ({"author": {"login": "peer"}}, "", "fresh", MAX_REVIEW_ERRORS),
+            ({}, HEAD, "fresh", MAX_REVIEW_ERRORS),  # a peer reviewed the head since the survey
+            ({}, "", "fetch_failed", MAX_REVIEW_ERRORS),  # review state unreadable
+            ({}, "", "fresh", 0),  # this host's review succeeded since the survey
+        )
+        for changes, clean, provenance, errors in cases:
+            with self.subTest(changes=changes, clean=clean, provenance=provenance, errors=errors):
                 sv, _, _ = self.spent_fixture(**changes)
                 self.w.cfg.logdir = self.w.cfg.state
+                self.counter_values["review-err-10"] = errors
+                self.w.rs.gh_meta = lambda *a, provenance=provenance, **k: SimpleNamespace(
+                    data={}, provenance=provenance
+                )
+                self.w.rs.ledger_clean_head = lambda pr, clean=clean: clean
                 with patch.object(work, "gh_run") as mutation:
                     self.assertIsNone(work._close_review_capped_pr(self.w, sv, work.Candidate(10, HEAD)))
                 mutation.assert_not_called()
+
+    def test_review_throttles_never_hold_back_a_review_cap_close(self):
+        sv = work.Survey(worker_id="test", me_login="science")
+        sv.open_prs = [PRInfo.from_json(row(10, "Other")["pr"])]
+        sv.reviewable.actionable = [work.Candidate(10, HEAD, close_at_review_cap=True)]
+        work.throttle_review(sv, SimpleNamespace(review_min_queue=5, review_min_age=0))
+        self.assertEqual([c.pr for c in sv.reviewable.actionable], [10])
 
     def test_unlimited_bump_is_not_redirected_to_closure_by_its_attempt_count(self):
         sv, c, _ = self.spent_fixture()

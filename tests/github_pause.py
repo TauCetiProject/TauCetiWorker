@@ -37,7 +37,7 @@ class GitHubPauseTests(unittest.TestCase):
             patch.object(transport.subprocess, "run") as send,
             patch.object(activity, "emit") as emit,
         ):
-            values = {"review-err-7": 2}
+            values = {"review-err-7": 2, "review-err-7-at": 1000}
             worker = SimpleNamespace(
                 counters=SimpleNamespace(
                     read=lambda key: values[key], write=lambda key, value: values.__setitem__(key, value)
@@ -47,6 +47,7 @@ class GitHubPauseTests(unittest.TestCase):
 
             def paced(*_args):
                 values["review-err-7"] += 1
+                values["review-err-7-at"] = 2000
                 return transport.execute(
                     ["gh", "api", "-X", "POST", "repos/org/repo/issues/7/comments", "-f", "body=review"],
                     wait=True,
@@ -58,6 +59,7 @@ class GitHubPauseTests(unittest.TestCase):
                 work_units._run_github_stage("review", paced, worker, None, candidate, None, False)
             round_.finish(waiting.exception)
             self.assertEqual(values["review-err-7"], 2)
+            self.assertEqual(values["review-err-7-at"], 1000, "the back-off timestamp is restored too")
             self.assertGreater(waiting.exception.retry_at, round_.started_at + 59)
             self.assertIn("round_waited", [call.args[0] for call in emit.call_args_list])
             self.assertNotIn("round_finished", [call.args[0] for call in emit.call_args_list])
