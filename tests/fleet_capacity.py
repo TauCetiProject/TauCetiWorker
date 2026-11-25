@@ -25,6 +25,29 @@ from tauceti_worker.usage_lifecycle import identity
 
 
 class FleetTests(unittest.TestCase):
+    def test_clock_is_sampled_after_a_slow_policy_read(self):
+        # The controller rewrites the policy (expiry = write time + 25s) while a
+        # worker's read blocks for 10s on a contended disk; the expiry is valid.
+        with tempfile.TemporaryDirectory() as root:
+            p = Path(root) / "policy.json"
+            env = {"TAUCETI_FLEET_ADMISSION_FILE": str(p)}
+            policy = dict(version=1, expires_at=1025, workers=["a"], roadmap_focus=dict(workers=["a"], areas=["PDE"]))
+            p.write_text(json.dumps(policy))
+            clock = {"now": 990.0}
+            real = Path.read_text
+
+            def slow_read(path, *args, **kwargs):
+                clock["now"] = 1000.0
+                return real(path, *args, **kwargs)
+
+            with (
+                patch.object(Path, "read_text", slow_read),
+                patch("tauceti_worker.fleet_capacity.time.time", side_effect=lambda: clock["now"]),
+            ):
+                self.assertIsNone(admission_reason("a", env=env))
+                clock["now"] = 990.0
+                self.assertEqual(roadmap_focus("a", env=env), ["PDE"])
+
     def test_unmanaged_and_expired(self):
         self.assertIsNone(admission_reason("a", env={}))
         with tempfile.TemporaryDirectory() as root:
