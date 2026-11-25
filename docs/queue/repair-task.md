@@ -635,7 +635,14 @@ has a time budget holds because the service re-exposes the task.
    pin is fetched once into
    `<root>/tauceti-tools/<ref>`, materialized with `python -m tauceti_tools materialize` and that
    policy directory into a fresh host-only directory for the check (`<root>/tauceti-tools/verifier/check-*`,
-   removed afterwards), which also holds the lint scope file. Both drivers are compiled by the
+   removed afterwards), which also holds the lint scope file and the environment lint's sealed inputs:
+   before any sandboxed command of the check runs, the pinned `lint-env.sh --prepare` writes the module
+   lists, docstring-scan source, nonce and marker there on the host, once for the whole library
+   (`lint-inputs-full`) and once for the changed modules (`lint-inputs-changed`), and makes them read-only;
+   each lint gets its directory in `LINT_ENV_INPUTS` (TauCetiTools #377, as pr-build does), so code the
+   docstring scan runs cannot shrink the `#lint` driver's scope. A pin whose `lint-env.sh` has no
+   `--prepare` lints as before, with `checks.lint_inputs_sealed` false, and a failed seal leaves the
+   checks `unavailable`. Both drivers are compiled by the
    pinned `build-lint-driver.sh` and `build-audit-driver.sh` inside the sandbox, from a root candidate
    code never wrote (`<root>/tauceti-tools/drivers/root-<key>`: a copy of the toolchain pin and the
    worker's recorded seed packages, only when they lie in a configured read-only tree), in a scratch
@@ -645,11 +652,11 @@ has a time budget holds because the service re-exposes the task.
    toolchain's `lean` by absolute path, since `lake env` puts the worktree's build directories first on
    `PATH`. The driver build mounts no artifact pool and runs with Lake's artifact cache off
    (`repair_audit.pool_free`): the drivers outlive the batch, and a pool is the batch's, writable by its
-   code (decision 202). All of that is `checks.verifier_isolated` (decision 200); without read-only seed packages the
+   code (decision 202). All of that, with sealed lint inputs, is `checks.verifier_isolated` (decision 200); without read-only seed packages the
    drivers are built in the worktree as before and it is false (`checks.drivers_isolated`). Only the audit
    driver's phase markers stay under `.lake/tauceti-repair-audit`; the host reads them through their
    hard link in the log directory, never through that path, and a link left in the directory's place
-   is removed, not followed. The lint scripts' own scratch files under `.lake/tmp` are as writable as in
+   is removed, not followed. The lint scripts' other scratch files under `.lake/tmp` are as writable as in
    staging, which runs the same scripts. Their output is read by
    `diagnostics.parse_log`, so each finding is the diagnostic the controller would create from CI
    (`{"kind": "audit", "module", "path", "message": "duplicate-declarations: ..."}` once per TauCeti module,
