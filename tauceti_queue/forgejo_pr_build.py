@@ -32,8 +32,10 @@ writes to Forgejo. Workers and admission trust a Forgejo `build` only from the p
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
+from . import chain
 from .store import dumps, loads
 
 WANTED, SKIPPED, RETAINING, PENDING = "wanted", "skipped", "retaining", "pending"
@@ -46,6 +48,11 @@ SELF_TESTED, FULL_LINT, LINT_REPAIR = "self-tested", "full-lint", "lint-repair"
 MAX_ATTEMPTS = 3
 # A head whose retained ref has not reached GitHub after this many outbox attempts is reported.
 MAX_RETAIN_ATTEMPTS = 6
+# Heads fetched from Forgejo in one pass, and the wall time those fetches may take.
+FETCHES_PER_PASS = 8
+FETCH_SECONDS = 60
+# `main_integration_statuses` reads 50 heads a query: more in flight would need a second query.
+MAX_IN_FLIGHT = 50
 PASS_AT = "forgejo_pr_build_pass_at"
 
 
@@ -109,10 +116,13 @@ def observe(ctl, pull) -> None:
                 reason=reason,
                 observed_at=now,
             )
-        elif row["state"] == SKIPPED and not reason:
-            ctl.store.update("pr_builds", {"id": row["id"]}, state=WANTED, reason="")
-        elif row["state"] == WANTED and reason:
-            ctl.store.update("pr_builds", {"id": row["id"]}, state=SKIPPED, reason=reason)
+        elif row["state"] in (SKIPPED, SUPERSEDED) and not reason:
+            # A label withdrawn, or a head listed again (a push undone, a PR reopened): never built,
+            # since a head is superseded only before its dispatch.
+            ctl.store.update("pr_builds", {"id": row["id"]}, state=WANTED, reason="", retry_at=0, settled_at=None)
+        elif row["state"] in (WANTED, RETAINING, SUPERSEDED) and reason:
+            # Before its dispatch, a head that gains `self-tested` (or becomes a draft) is not built.
+            ctl.store.update("pr_builds", {"id": row["id"]}, state=SKIPPED, reason=reason, settled_at=None)
 
 
 def _current(ctl, row: dict[str, Any]) -> bool:
@@ -142,31 +152,48 @@ def _rows(ctl, *states: str) -> list[dict[str, Any]]:
 
 
 def _start(ctl, now: float) -> None:
-    """Retain the oldest wanted heads on GitHub, within the in-flight budget."""
-    budget = ctl.setting("forgejo_pr_build_max_in_flight") - len(_rows(ctl, *IN_FLIGHT))
+    """Retain the oldest wanted heads on GitHub, within the in-flight budget.
+
+    A head the clone lacks is fetched from Forgejo with the controller lock let go, at most
+    `FETCHES_PER_PASS` heads and `FETCH_SECONDS` a pass; one that cannot be fetched waits
+    `forgejo_pr_build_retry_seconds` and the others go on. Every transition is conditional on the
+    row being unchanged, since the poller thread records observations meanwhile."""
+    limit = min(ctl.setting("forgejo_pr_build_max_in_flight"), MAX_IN_FLIGHT)
+    budget = limit - len(_rows(ctl, *IN_FLIGHT))
     if budget <= 0:
         return
     wanted = sorted(
         (row for row in _rows(ctl, WANTED) if row["retry_at"] <= now),
         key=lambda row: (row["observed_at"], row["id"]),
     )
+    fetches, deadline = 0, time.monotonic() + FETCH_SECONDS
+    retry = now + ctl.setting("forgejo_pr_build_retry_seconds")
     for row in wanted:
         if budget <= 0:
             break
         if not _current(ctl, row):
-            ctl.store.update("pr_builds", {"id": row["id"]}, state=SUPERSEDED, settled_at=now)
+            ctl.store.update("pr_builds", {"id": row["id"], "state": WANTED}, state=SUPERSEDED, settled_at=now)
             continue
         number = ctl.mixed.number(row["number"])
-        if not ctl._fetch_head(number, row["head_sha"]):
-            ctl._reasons.append(f"Forgejo PR build of {row['number']}: head {row['head_sha'][:12]} unavailable")
-            ctl.store.update(
-                "pr_builds", {"id": row["id"]}, retry_at=now + ctl.setting("forgejo_pr_build_retry_seconds")
-            )
-            continue
+        if not chain.object_exists(ctl.clone, row["head_sha"]):
+            if fetches >= FETCHES_PER_PASS or time.monotonic() > deadline:
+                break
+            fetches += 1
+            try:
+                with ctl._lock.unlocked():
+                    fetched = ctl._fetch_head(number, row["head_sha"])
+            except Exception as error:  # noqa: BLE001 - this head waits; the others go on
+                ctl.log.warning("fetch of Forgejo head %s failed: %s", row["head_sha"], error)
+                fetched = False
+            if not fetched:
+                ctl._reasons.append(f"Forgejo PR build of {row['number']}: head {row['head_sha'][:12]} unavailable")
+                ctl.store.update("pr_builds", {"id": row["id"], "state": WANTED}, retry_at=retry)
+                continue
         ref = ctl.input_ref(number, row["head_sha"])
         with ctl.store.transaction():
+            if not ctl.store.update("pr_builds", {"id": row["id"], "state": WANTED}, state=RETAINING, ref=ref):
+                continue  # observed meanwhile (skipped or superseded)
             ctl._retain(ref, row["head_sha"])
-            ctl.store.update("pr_builds", {"id": row["id"]}, state=RETAINING, ref=ref)
         budget -= 1
 
 
@@ -181,7 +208,7 @@ def _dispatch_retained(ctl, now: float) -> None:
         if not main:
             return
         if not _current(ctl, row):
-            ctl.store.update("pr_builds", {"id": row["id"]}, state=SUPERSEDED, settled_at=now)
+            ctl.store.update("pr_builds", {"id": row["id"], "state": RETAINING}, state=SUPERSEDED, settled_at=now)
             continue
         try:
             with ctl._lock.unlocked():
@@ -198,16 +225,17 @@ def _dispatch_retained(ctl, now: float) -> None:
             return
         fresh = ctl.store.row("pr_builds", {"id": row["id"]})
         if fresh is None or fresh["state"] != RETAINING:
-            continue
+            continue  # skipped meanwhile: the build runs, and its result is not posted
         with ctl.store.transaction():
-            ctl.store.update(
+            if not ctl.store.update(
                 "pr_builds",
-                {"id": row["id"]},
+                {"id": row["id"], "state": RETAINING},
                 state=PENDING,
                 main_sha=main,
                 dispatched_at=now,
                 attempts=fresh["attempts"] + 1,
-            )
+            ):
+                continue
             _post(ctl, fresh, "pending", f"B={main[:12]} queued: the PR build runs on GitHub Actions", "")
             ctl._count("forgejo_pr_build_dispatched")
             ctl.store.journal(

@@ -6,6 +6,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -155,6 +156,58 @@ class ForgejoPRBuild(MixedFixture, unittest.TestCase):
         self.cycle()
         self.assertEqual(self.row(old)["state"], "superseded")
         self.assertEqual([r[:2] for r in self.github.main_integration_requests], [(1, new)])
+
+    def test_a_head_listed_again_after_a_push_is_built(self):
+        self.controller.set_setting("forgejo_pr_build_max_in_flight", 0, "test")
+        first = self.native.create_pr(1, {"TauCeti/One.lean": "one\n"})
+        self.cycle()
+        self.native.push_pr(1, {"TauCeti/One.lean": "one, changed\n"})
+        self.cycle()
+        self.assertEqual(self.row(first)["state"], "superseded")
+        self.native.prs[1]["head_sha"] = first  # the push is undone (a force-push back)
+        self.controller.set_setting("forgejo_pr_build_max_in_flight", 4, "test")
+        self.cycle()
+        self.cycle()
+        self.assertEqual([r[:2] for r in self.github.main_integration_requests], [(1, first)])
+
+    def test_a_label_added_before_dispatch_skips_the_head(self):
+        head = self.native.create_pr(1, {"TauCeti/One.lean": "one\n"})
+        self.cycle(passes=1)
+        self.assertEqual(self.row(head)["state"], "retaining")
+        self.native.labels[1] = {"self-tested"}
+        self.cycle()
+        self.assertEqual((self.row(head)["state"], self.row(head)["reason"]), ("skipped", "self-tested"))
+        self.assertEqual(self.github.main_integration_requests, [])
+
+    def test_an_unfetchable_head_waits_and_the_others_go_on(self):
+        first = self.native.create_pr(1, {"TauCeti/One.lean": "one\n"})
+        second = self.native.create_pr(2, {"TauCeti/Two.lean": "two\n"})
+        missing = {first}
+        exists = forgejo_pr_build.chain.object_exists
+
+        def fetch(number, sha):
+            if sha in missing:
+                raise RuntimeError("Forgejo Git is unavailable")
+            return True
+
+        with (
+            patch.object(
+                forgejo_pr_build.chain, "object_exists", lambda clone, sha: sha not in missing and exists(clone, sha)
+            ),
+            patch.object(self.controller, "_fetch_head", fetch),
+        ):
+            self.cycle()
+        self.assertEqual(self.row(first)["state"], "wanted")
+        self.assertGreater(self.row(first)["retry_at"], self.clock())
+        self.assertEqual([r[:2] for r in self.github.main_integration_requests], [(2, second)])
+
+    def test_in_flight_builds_never_exceed_one_status_query(self):
+        self.controller.set_setting("forgejo_pr_build_max_in_flight", 500, "test")
+        self.assertEqual(forgejo_pr_build.MAX_IN_FLIGHT, 50)
+        for number in range(1, 53):
+            self.native.create_pr(number, {f"TauCeti/F{number}.lean": f"f{number}\n"})
+        self.cycle(passes=3)
+        self.assertEqual(len(self.github.main_integration_requests), 50)
 
     def test_untrusted_stale_or_other_main_statuses_are_not_answers(self):
         head = self.native.create_pr(1, {"TauCeti/One.lean": "one\n"})

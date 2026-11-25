@@ -885,7 +885,7 @@ and reported in status:
 | `main_integration_checks_per_pass` | 20 | static stale checks (`stale_check.py`) a pass runs to order candidates |
 | `forgejo_pr_build_enabled` | false | the PR builds of Forgejo PR heads (below): run TauCeti's pr-build for each new or updated Forgejo PR head that is not self-tested and post the result on Forgejo as `build` |
 | `forgejo_pr_build_interval_seconds` | 120 | time between passes; each reads every outstanding build's status in one GraphQL query |
-| `forgejo_pr_build_max_in_flight` | 16 | heads being pushed to GitHub or built at once |
+| `forgejo_pr_build_max_in_flight` | 16 | heads being pushed to GitHub or built at once; at most 50, so one GraphQL query reads them all |
 | `forgejo_pr_build_timeout_seconds` | 21600 | a build with no result after this long is asked again |
 | `forgejo_pr_build_retry_seconds` | 600 | the wait before a head whose build gave no verdict (an error, a deferral, a timeout) is asked again |
 | `forgejo_pr_build_status_creators` | `["tauceti-live-ci"]` | the GitHub accounts whose `main-integration` status is a verdict |
@@ -934,7 +934,8 @@ nothing fires for a Forgejo PR, so the queue starts the same build and copies it
   listing, so a label change before the build starts is honoured. A head a push or a close
   overtakes before its build starts is `superseded`.
 - **Build:** the oldest wanted heads, up to `forgejo_pr_build_max_in_flight`, are fetched from
-  Forgejo and retained on GitHub under the queue's input ref; once that push is done, each is
+  Forgejo (with the controller lock let go, a few a pass; a head that cannot be fetched waits and
+  the others go on) and retained on GitHub under the queue's input ref; once that push is done, each is
   dispatched as a main-integration build of the head merged onto the current canonical commit with
   `source` `forgejo` (no GitHub lookup by the colliding number) and `priority` `pr` (the Fleet PR
   class, like any PR build). A `pending` `build` is posted on the Forgejo head at dispatch.
