@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Rounds in per-round worktrees of one host clone: all-or-nothing, nothing unpushed is kept.
+"""Rounds in worktrees of one host clone: all-or-nothing, nothing unpushed is kept.
+
+`main` runs the per-round scenario (`TAUCETI_PERSISTENT_WORKTREES=0`: a fresh worktree per round);
+`persistent_rounds` the default, where each worker keeps and resets its worktree.
 
 Local git fixtures only (no GitHub, no agents). Exit 0 = all assertions hold; 1 = a mismatch.
 """
@@ -106,6 +109,7 @@ def main():
         (one.checkout / ".lake/build").mkdir(parents=True)
         (one.checkout / ".lake/build/A.olean").write_text("warm build")
         os.environ["TAUCETI_ROUND_WORKTREES"] = "1"
+        os.environ["TAUCETI_PERSISTENT_WORKTREES"] = "0"
         settled(one.checkout)
         # A live round holds its worker's round lock, as RoundContext does.
         live = (one.state / "round.lock").open("a+")
@@ -211,8 +215,119 @@ def main():
         check("an ordinary clone again", live_use.checkout_kind(one.checkout) == "standalone")
         check(".lake kept across the switch", (one.checkout / ".lake/build/A.olean").is_file())
         live.close()
+        os.environ["TAUCETI_ROUND_WORKTREES"] = "1"
+        del os.environ["TAUCETI_PERSISTENT_WORKTREES"]
+        persistent_rounds(root, origin, seed)
     print("PASS" if not fails else f"FAIL ({fails})")
     return 1 if fails else 0
+
+
+def persistent_rounds(root, origin, seed):
+    import contextlib
+    import io
+    from unittest.mock import patch
+
+    agents = tc.agents
+    os.environ["TAUCETI_HOST_REPOSITORIES"] = str(root / "persistent-host")
+    main_oid = git(origin, "rev-parse", "main").strip()
+    check("persistent worktrees are the default", rw.persistent({}))
+    check("0 opts out", not rw.persistent({"TAUCETI_PERSISTENT_WORKTREES": "0"}))
+    one, two = worker(root, "p1"), worker(root, "p2")
+    lock_one = (one.state / "round.lock").open("a+")
+    fcntl.flock(lock_one, fcntl.LOCK_EX)
+    log = io.StringIO()
+    with contextlib.redirect_stderr(log), contextlib.redirect_stdout(log):
+        check("a first round adds the worktree", agents.prepare_checkout(one, work="fix", pr=1))
+    check("adding is logged with the lock wait", "worktrees: added checkout at" in log.getvalue())
+    check("and the lock wait is measured", "host lock wait" in log.getvalue())
+    (one.checkout / ".lake/build").mkdir(parents=True)
+    (one.checkout / ".lake/build/A.olean").write_text("warm build")
+    untouched = (one.checkout / ".gitignore").stat()
+
+    # 1. Round end keeps the tree; the next round discards everything unpushed, keeping `.lake`.
+    identity(one.checkout)
+    git(one.checkout, "switch", "-q", "-c", "tauceti/p1/pr-1")
+    (one.checkout / "A.lean").write_text("theorem lost : True := trivial\n")
+    git(one.checkout, "commit", "-qam", "unpushed commit")
+    (one.checkout / "A.lean").write_text("theorem dirty : True := trivial\n")
+    (one.checkout / "Draft.lean").write_text("untracked draft\n")
+    (one.checkout / "build").mkdir()
+    (one.checkout / "build/ignored").write_text("x")
+    settled(one.checkout)
+    rw.release(one)
+    check("round end keeps the worktree", rw.owns(one.checkout))
+    check(".lake stays in place", (one.checkout / ".lake/build/A.olean").is_file())
+    check("nothing is parked", not rw.parked_lake(one).exists())
+    log = io.StringIO()
+    with contextlib.redirect_stderr(log), contextlib.redirect_stdout(log):
+        check("the next round resets it", agents.prepare_checkout(one, work="fix", pr=1))
+    check("reset, not re-added", "worktrees: reset checkout at" in log.getvalue())
+    check("detached at origin/main", git(one.checkout, "rev-parse", "HEAD").strip() == main_oid)
+    check("no branch is checked out", not git(one.checkout, "symbolic-ref", "-q", "HEAD", check_rc=False).strip())
+    check("tracked files are main's", (one.checkout / "A.lean").read_text() == "theorem a : True := trivial\n")
+    check("untracked and ignored files are gone", not (one.checkout / "Draft.lean").exists())
+    check("build output outside .lake is gone", not (one.checkout / "build").exists())
+    check("the tree is clean", not git(one.checkout, "status", "--porcelain"))
+    check("warm .lake kept", (one.checkout / ".lake/build/A.olean").read_text() == "warm build")
+    check("an unchanged file is not rewritten", (one.checkout / ".gitignore").stat().st_ino == untouched.st_ino)
+    check("nothing of the round was saved", legacy_absent(one))
+
+    # 2. A killed round's Git state (a stale index.lock, a rebase in progress) does not survive.
+    git(one.checkout, "switch", "-q", "tauceti/p1/pr-1")
+    git(one.checkout, "rebase", "-q", "--onto", main_oid, main_oid, "--exec", "false", check_rc=False)
+    admin = rw._admin(one.checkout)
+    (admin / "index.lock").write_text("")
+    (admin / "MERGE_HEAD").write_text(main_oid + "\n")
+    check("the fixture left a rebase in progress", (admin / "rebase-merge").is_dir())
+    settled(one.checkout)
+    check("a crashed round's worktree resets", agents.prepare_checkout(one, work="fix", pr=1))
+    check("no rebase or merge is in progress", not any((admin / n).exists() for n in rw.STALE_STATE))
+    check("and HEAD is main again", git(one.checkout, "rev-parse", "HEAD").strip() == main_oid)
+    status = git(one.checkout, "status")
+    check("git agrees", "rebase" not in status and "merging" not in status.lower())
+
+    # 3. Another worker's round never removes an idle worker's worktree.
+    rw.release(one)
+    lock_one.close()  # between rounds: the round lock is free
+    settled(one.checkout)
+    lock_two = (two.state / "round.lock").open("a+")
+    fcntl.flock(lock_two, fcntl.LOCK_EX)
+    check("a second worker prepares", agents.prepare_checkout(two, work="fix", pr=2))
+    check("the idle worker's worktree is kept", rw.owns(one.checkout))
+    check("with its .lake", (one.checkout / ".lake/build/A.olean").is_file())
+
+    # 4. Main moves: the reset follows it; a replaced `.lake` link is removed, never followed.
+    identity(seed)
+    (seed / "B.lean").write_text("theorem b : True := trivial\n")
+    git(seed, "add", "-A")
+    git(seed, "commit", "-qm", "advance")
+    git(seed, "push", "-q", str(origin), "main")
+    advanced = git(origin, "rev-parse", "main").strip()
+    outside = root / "outside-lake"
+    outside.mkdir()
+    (outside / "keep").write_text("not the worker's")
+    os.symlink(outside, two.checkout / ".lake")
+    os.utime(rw.host_clone() / "FETCH_HEAD", (0, 0))  # The fetch interval has passed.
+    settled(two.checkout)
+    check("the next round prepares", agents.prepare_checkout(two, work="fix", pr=2))
+    check("it is at the new main", git(two.checkout, "rev-parse", "HEAD").strip() == advanced)
+    check("with main's new file", (two.checkout / "B.lean").is_file())
+    check("the .lake link is gone", not (two.checkout / ".lake").is_symlink())
+    check("its target is untouched", (outside / "keep").read_text() == "not the worker's")
+
+    # 5. A worktree that cannot be reset is replaced by a fresh one.
+    settled(two.checkout)
+    with patch.object(rw, "_reset", side_effect=subprocess.CalledProcessError(128, ["git"], "", "index corrupt")):
+        log = io.StringIO()
+        with contextlib.redirect_stderr(log), contextlib.redirect_stdout(log):
+            check("a broken worktree is re-added", agents.prepare_checkout(two, work="fix", pr=2))
+    check("the fallback is logged", "adding a fresh worktree" in log.getvalue())
+    check("and the new tree is at main", git(two.checkout, "rev-parse", "HEAD").strip() == advanced)
+    # 6. A tree something still uses is never reset or removed.
+    with patch.object(rw, "_check_unused", side_effect=rw.InUse("in use")):
+        check("an in-use worktree is refused", not agents.prepare_checkout(two, work="fix", pr=2))
+    check("and kept", rw.owns(two.checkout))
+    lock_two.close()
 
 
 if __name__ == "__main__":

@@ -567,24 +567,37 @@ The pool defaults to `~/.cache/tauceti/builds` under the login user's home. Conf
 cache overrides are preserved. Only directories carrying a valid TauCeti ownership record
 are collected; an arbitrary nonempty directory is never adopted or deleted.
 
-Every round works in its own linked worktree (a host opts out with `TAUCETI_ROUND_WORKTREES=0` in
+Every round works in a linked worktree (a host opts out with `TAUCETI_ROUND_WORKTREES=0` in
 its `workers.toml` `env` table) of one bare host clone,
 `<state>/host-repositories/TauCeti.git` (override with `TAUCETI_HOST_REPOSITORIES`). The worktree
-sits at the worker's usual checkout path, detached at `origin/main`; the host clone is fetched at
-most once a minute under `host-repositories/TauCeti.lock`. At round end the worktree is removed
-with anything unpushed in it; its `.lake` waits beside it as `checkout.lake-between-rounds`. A
-crashed round's worktree is removed by the next round on the host once its worker's round lock is
-free. On its first round each worker deletes its old permanent checkout. Shared Git config that could run code for every
+sits at the worker's usual checkout path, detached at `origin/main`. Each worker keeps its worktree
+(one per host clone it uses) across rounds. Under `host-repositories/TauCeti.lock` a round only
+fetches the host clone (at most once a minute), repairs its config and, on a worker's first round,
+adds the worktree. Outside the lock it then resets its own worktree: it clears Git state a killed
+round left (a stale `index.lock`, a rebase, merge or cherry-pick in progress), forces a detached
+checkout of `origin/main`, which writes only the files that differ, and deletes every untracked or
+ignored file except `.lake`. A `.lake` that is not a real directory is removed, never followed. A
+worktree that cannot be reset is removed and added afresh under the lock. Anything unpushed is
+discarded by the worker's next reset. The log line `worktrees: reset` or `worktrees: added` gives
+the host lock wait and the total preparation time. On its first round each worker deletes its old
+permanent checkout. Shared Git config that could run code for every
 round (hooks, fsmonitor, filters, aliases, credential and URL rewrites, includes) is cleared at each
-round. Turning the flag off again is safe: the next round finds a worktree of a clone it does not
-manage, removes it, and clones an ordinary checkout as before.
+round. A retired worker's worktree is deleted with its other state by retention, and the next round
+on the host prunes Git's record of it.
+
+`TAUCETI_PERSISTENT_WORKTREES=0` returns to a fresh worktree per round: the worktree is removed at
+round end with anything unpushed in it, its `.lake` waits beside it as
+`checkout.lake-between-rounds`, and a crashed round's worktree is removed by the next round on the
+host once its worker's round lock is free. Turning `TAUCETI_ROUND_WORKTREES` off again is safe: the
+next round finds a worktree of a clone it does not manage, removes it, and clones an ordinary
+checkout as before.
 
 Each TauCeti build output is stored once per host as a canonical object that every checkout hard
 links. Before the agent starts, a round only checks that hard links work in the agent's namespace;
 if they do not, the agent is not started, because Lake would silently copy. After the agent exits,
 the round relinks what its agent built (`TAUCETI_RELINK_BUDGET_S`, default 180 s). The full pass,
 which also sweeps the worker's private Lake store and deletes setup files, runs between rounds in a
-child of the worker's loop, on the `.lake` the round left (parked beside a removed worktree). It
+child of the worker's loop, on the `.lake` the round left (in place, or parked beside a removed per-round worktree). It
 runs at `nice` 10 for at most `TAUCETI_BACKGROUND_RELINK_BUDGET_S` (default 900 s) and resumes from
 its cursor next time. It holds `<state>/build-tree.lock` while it works. The next round takes that
 lock before it prepares any checkout: it asks the pass to stop at its next file, and kills it after

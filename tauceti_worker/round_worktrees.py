@@ -1,21 +1,23 @@
-"""Run each round in its own worktree of one host clone (on unless a host opts out).
+"""Run each round in a worktree of one host clone (on unless a host opts out).
 
 Unless `TAUCETI_ROUND_WORKTREES=0`, a host keeps one bare clone of TauCeti (one object store and one
 set of refs) and every round works in a linked worktree of it at the worker's ordinary checkout
-path, `cfg.checkout`:
+path, `cfg.checkout`. Each worker keeps its worktree (one per host clone it uses) across rounds:
 
-- `prepare()` removes any leftover worktree, fetches the host clone under the host lock, and adds a
-  fresh worktree with a detached HEAD at `origin/main`. Nothing resets a shared `main`.
-- `release()` runs when the round's context exits and removes the worktree.
-- A crashed round's worktree is removed by the next `prepare()` on the host once no process holds
-  that worker's round lock or uses the tree.
+- `prepare()` fetches the host clone under the host lock, then, outside the lock, resets the
+  worker's worktree to a detached HEAD at `origin/main`: it clears a killed round's Git state,
+  forces a checkout (only changed files are written) and deletes every untracked file except
+  `.lake`. A first round, or a worktree that cannot be reset, gets a fresh worktree under the lock.
+  Nothing resets a shared `main`.
+- `release()` runs when the round's context exits. The worktree stays for the worker's next round.
 - An old permanent checkout is deleted on its worker's first round.
 
 Rounds are all-or-nothing: whatever an agent pushed (through git-safe-push) is on the remote, and
-anything unpushed is discarded with the worktree.
+anything unpushed is discarded when the worker's next round resets the worktree.
 
-`.lake` (the worker's warm build state and Lake's dependency checkouts) is moved beside the worktree
-between rounds instead of being deleted with it, so rounds keep today's warm builds.
+`TAUCETI_PERSISTENT_WORKTREES=0` returns to a fresh worktree per round: `release()` removes it and
+parks `.lake` beside it, and `prepare()` removes crashed rounds' worktrees on the host once no
+process holds that worker's round lock or uses the tree.
 """
 
 from __future__ import annotations
@@ -55,6 +57,12 @@ UNSAFE_CONFIG = (
     # Per-worktree config files would escape this check; keep them disabled.
     r"^extensions\.worktreeconfig$",
 )
+
+
+def persistent(env=None) -> bool:
+    """Workers keep their worktrees across rounds unless `TAUCETI_PERSISTENT_WORKTREES=0`."""
+    env = os.environ if env is None else env
+    return env.get("TAUCETI_PERSISTENT_WORKTREES", "").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def enabled(env=None) -> bool:
@@ -247,12 +255,18 @@ def _round_lock(tree: Path) -> Path | None:
 
 
 def sweep(current: Path):
-    """Remove worktrees of crashed rounds, holding their worker's round lock."""
+    """Remove worktrees of crashed rounds, holding their worker's round lock.
+
+    With persistent worktrees every worker's tree outlives its rounds, so only Git's records of
+    trees that no longer exist (a retired worker's, deleted by retention) are pruned.
+    """
     from types import SimpleNamespace
 
     from .live_use import live_users
 
     _git("worktree", "prune", check=False)
+    if persistent():
+        return
     for tree in _worktrees():
         if tree.resolve() == current.resolve() or not tree.exists():
             continue
@@ -280,8 +294,71 @@ def sweep(current: Path):
             log(f"worktrees: removed the crashed round's worktree {tree}")
 
 
+# Per-worktree Git state a killed round can leave behind; a forced checkout would keep it.
+STALE_STATE = (
+    "index.lock",
+    "HEAD.lock",
+    "MERGE_HEAD",
+    "MERGE_MSG",
+    "MERGE_MODE",
+    "AUTO_MERGE",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "BISECT_START",
+    "BISECT_EXPECTED_REV",
+    "BISECT_TERMS",
+    "BISECT_NAMES",
+    "BISECT_ANCESTORS_OK",
+    "ORIG_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+)
+
+
+def _admin(tree: Path) -> Path:
+    """The worktree's own directory in the host clone (`worktrees/<id>`)."""
+    result = subprocess.run(
+        ["git", "-C", str(tree), "rev-parse", "--absolute-git-dir"], capture_output=True, text=True, timeout=60
+    )
+    if result.returncode:
+        raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+    admin = Path(result.stdout.strip())
+    if admin.parent.name != "worktrees" or admin.parent.parent.resolve() != host_clone().resolve():
+        raise OSError(f"{tree} is not a linked worktree of {host_clone()} ({admin})")
+    return admin
+
+
+def _reset(tree: Path, commit: str) -> None:
+    """Make an idle worktree a clean detached checkout of `commit`, keeping `.lake`.
+
+    Outside the host lock: a worktree's HEAD, index and files are its own, and the commit was
+    fetched under the lock. The caller holds the worker's round lock, so no other round of this
+    worker can be using it, and `_check_unused` covers anything else.
+    """
+    import shutil
+
+    _check_unused(tree)
+    admin = _admin(tree)
+    lake = tree / ".lake"
+    if lake.is_symlink() or (lake.exists() and not lake.is_dir()):
+        lake.unlink()  # Only a real directory is the worker's build state; never write through a link.
+    for name in STALE_STATE:
+        path = admin / name
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    git = ["git", "-C", str(tree)]
+    for args in (("checkout", "-q", "-f", "--detach", commit), ("clean", "-ffdxq", "-e", "/.lake")):
+        result = subprocess.run([*git, *args], capture_output=True, text=True, timeout=1800)
+        if result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, result.args, result.stdout, result.stderr)
+
+
 def prepare(cfg, url) -> bool:
-    """Leave `cfg.checkout` a fresh worktree of the host clone, detached at `origin/main`."""
+    """Leave `cfg.checkout` a clean worktree of the host clone, detached at `origin/main`."""
     from .live_use import checkout_kind
 
     co = cfg.checkout
@@ -302,32 +379,60 @@ def prepare(cfg, url) -> bool:
     elif kind is None and (co.exists() or co.is_symlink()):
         if not _discard(co, "the checkout has no git metadata"):
             return False
+    base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
+    asked = time.monotonic()
+    waited = 0.0
+    reused = False
+
+    def add():
+        if co.exists() and owns(co):
+            _check_unused(co)
+            with contextlib.suppress(OSError):
+                _park(cfg, co)
+            _remove(co)
+        sweep(co)
+        co.parent.mkdir(parents=True, exist_ok=True)
+        _git("worktree", "add", "--quiet", "--detach", co, f"refs/remotes/origin/{base}")
+
     try:
         with host_lock():
+            waited = time.monotonic() - asked
             _ensure_clone(url)
             harden(url)
             _fetch()
-            if co.exists() and owns(co):
-                _check_unused(co)
-                with contextlib.suppress(OSError):
-                    _park(cfg, co)
-                _remove(co)
-            sweep(co)
-            co.parent.mkdir(parents=True, exist_ok=True)
-            base = os.environ.get("TAUCETI_BASE_BRANCH", "main")
-            _git("worktree", "add", "--quiet", "--detach", co, f"refs/remotes/origin/{base}")
+            commit = _git("rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}").stdout.strip()
+            reuse = persistent() and co.exists() and owns(co)
+            if not reuse:
+                add()
+        if reuse:
+            try:
+                _reset(co, commit)
+                reused = True
+            except InUse:
+                raise
+            except (OSError, subprocess.SubprocessError) as error:
+                detail = getattr(error, "stderr", "") or ""
+                log(f"worktrees: could not reset {co} ({error} {ends(detail, 300)}); adding a fresh worktree")
+                again = time.monotonic()
+                with host_lock():
+                    waited += time.monotonic() - again
+                    add()
     except (OSError, subprocess.SubprocessError) as error:
         detail = getattr(error, "stderr", "") or ""
         log(f"worktrees: preparation failed: {error} {ends(detail, 300)}")
         return False
     _unpark(cfg, co)
+    log(
+        f"worktrees: {'reset' if reused else 'added'} {co.name} at {commit[:12]} "
+        f"(host lock wait {waited:.1f}s, total {time.monotonic() - asked:.1f}s)"
+    )
     PREPARED.append(cfg)
     CLONES[Path(co).resolve()] = host_clone()
     return True
 
 
 def release(cfg) -> None:
-    """At round end: remove each worktree this round prepared. Never raises."""
+    """At round end: forget each worktree this round prepared; without persistence, remove it. Never raises."""
     state = Path(getattr(cfg, "state", "/nonexistent")).resolve()
 
     def own(other):
@@ -346,8 +451,8 @@ def release(cfg) -> None:
         # and one left behind is swept by another worker's round while holding this worker's lock.
         clone = CLONES.pop(Path(co).resolve(), None)
         try:
-            if not enabled() or not co.exists() or not owns(co, clone):
-                continue
+            if not enabled() or persistent() or not co.exists() or not owns(co, clone):
+                continue  # A persistent worktree waits, with its `.lake`, for this worker's next round.
             _check_unused(co)
             _park(current, co)
             with host_lock():

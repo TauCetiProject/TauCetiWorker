@@ -80,15 +80,20 @@ def _idle_lake(checkout: Path, env) -> Path | None:
     """The tree's `.lake` once the round has let go of it, or None.
 
     A per-round worktree's `.lake` is relinked only where release parked it: a worktree still in
-    place was not released, and another worker's sweep may remove it under the round lock.
+    place was not released, and another worker's sweep may remove it under the round lock. A
+    persistent worktree, like an ordinary checkout, keeps its `.lake` in place between rounds.
     """
     from .round_worktrees import enabled as worktrees
+    from .round_worktrees import persistent
 
     inside = checkout / ".lake"
-    if worktrees(env):
-        lake = parked(checkout)
+    lake = parked(checkout)
+    if worktrees(env) and not persistent(env):
         return lake if lake.is_dir() and not lake.is_symlink() and not inside.exists() else None
-    return inside if inside.is_dir() and not inside.is_symlink() else None
+    if inside.is_dir() and not inside.is_symlink():
+        return inside
+    # Parked by a round before this host kept its worktrees, and not yet unparked.
+    return lake if worktrees(env) and lake.is_dir() and not lake.is_symlink() and not inside.exists() else None
 
 
 def request(checkout: Path, env) -> None:
