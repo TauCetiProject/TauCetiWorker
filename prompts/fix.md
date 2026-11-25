@@ -29,8 +29,8 @@ For each finding, judge whether it is actually correct:
 
 ## Verify before pushing (all MUST pass)
 __LOCAL_VERIFICATION__
-While fixing, use the helper's `--stage build` for diagnosis. After all source edits,
-run the helper with its default all stages. Exact-input receipts reuse successful phases.
+While fixing, check edits with targeted `lake build <Module>` builds, not the helper. After all
+source edits, run the helper with its default all stages. Exact-input receipts reuse successful phases.
 Never describe failed or incomplete verification as green. If every finding was contested
 and no inputs changed, existing exact-input evidence remains reusable. Never push red.
 

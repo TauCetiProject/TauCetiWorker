@@ -528,6 +528,90 @@ print('imports timing 1ms; duplicates timing 2ms; axioms timing 3ms', flush=True
         self.verify(stage="shim-expiry", base=base)
         self.assertNotIn("--only-new", json.loads((self.root / ".lake/shim-args").read_text()))
 
+    def shim_fixture(self, checker):
+        """A base registry tracking TauCeti/A.lean, and a checker recording what it was given."""
+        write(self.root, "TauCeti/mathlib-shims.json", json.dumps([dict(sources=["TauCeti/A.lean"])]))
+        write(self.root, "TauCeti/A.lean", "base A\n")
+        write(self.root, "TauCeti/Deep/C.lean", "base C\n")
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "registry")
+        base = git(self.root, "rev-parse", "HEAD")
+        record = (
+            "import json, sys\nfrom pathlib import Path\n"
+            "args = sys.argv[1:]\nroot = Path(args[args.index('--base-root') + 1])\n"
+            "seen = sorted(str(p.relative_to(root)) for p in root.rglob('*') if p.is_file())\n"
+            "flag = '--changed' + '-paths'\n"
+            "changed = Path(args[args.index(flag) + 1]).read_text().splitlines() if flag in args else None\n"
+            "Path('.lake').mkdir(exist_ok=True)\n"
+            "Path('.lake/shim-seen').write_text(json.dumps(dict(args=args, base=seen, changed=changed)))\n"
+        )
+        write(self.root, "scripts/check-expired-mathlib-shims.py", checker + record)
+        git(self.root, "add", ".")
+        git(self.root, "commit", "-qm", "checker")
+        return base
+
+    def test_shim_check_scans_only_the_complete_diff_like_ci(self):
+        base = self.shim_fixture(
+            "import sys\nif sys.argv[1:] == ['--help']:\n    print('usage: --changed-paths CHANGED_PATHS')\n    sys.exit(0)\n"
+        )
+        write(self.root, "TauCeti/B.lean", "edited\n")
+        write(self.root, "TauCeti/New.lean", "untracked\n")
+        result = self.verify(stage="shim-expiry", base=base)
+        self.assertEqual(result["status"], "success", result.get("error"))
+        seen = json.loads((self.root / ".lake/shim-seen").read_text())
+        self.assertIn("--only-new", seen["args"])
+        self.assertEqual(
+            seen["changed"],
+            ["TauCeti/B.lean", "TauCeti/New.lean", "scripts/check-expired-mathlib-shims.py"],
+        )
+        # The checker reads only the base registry and its sources under --base-root.
+        self.assertEqual(seen["base"], ["TauCeti/A.lean", "TauCeti/mathlib-shims.json", "mathlib-shims.json"])
+        # A pin change keeps the full scan, as CI does for bumps.
+        write(self.root, "lean-toolchain", "pin change")
+        self.verify(stage="shim-expiry", base=base)
+        seen = json.loads((self.root / ".lake/shim-seen").read_text())
+        self.assertNotIn("--changed-paths", seen["args"])
+        self.assertIsNone(seen["changed"])
+
+    def test_shim_check_keeps_full_scan_for_older_checkers(self):
+        base = self.shim_fixture(
+            "import sys\nif sys.argv[1:] == ['--help']:\n    print('usage: --only-new')\n    sys.exit(0)\n"
+        )
+        write(self.root, "TauCeti/B.lean", "edited\n")
+        self.verify(stage="shim-expiry", base=base)
+        seen = json.loads((self.root / ".lake/shim-seen").read_text())
+        self.assertNotIn("--changed-paths", seen["args"])
+
+    def test_scoping_asks_the_checker_and_keeps_paths_it_cannot_read_back(self):
+        from tauceti_worker.verification import checker_lines_preserve, shim_checker_scopes
+
+        old = write(
+            self.home, "old.py", "import argparse\n# mentions --changed-paths\nargparse.ArgumentParser().parse_args()\n"
+        )
+        new = write(
+            self.home,
+            "new.py",
+            "import argparse\np = argparse.ArgumentParser()\np.add_argument('--changed-paths')\np.parse_args()\n",
+        )
+        self.assertFalse(shim_checker_scopes(old, self.home, dict(os.environ)))
+        self.assertTrue(shim_checker_scopes(new, self.home, dict(os.environ)))
+        self.assertFalse(shim_checker_scopes(self.home / "missing.py", self.home, dict(os.environ)))
+        self.assertTrue(checker_lines_preserve(["TauCeti/A.lean", "lean-toolchain"]))
+        for odd in ("TauCeti/A\u2028B.lean", "TauCeti/A\x0bB.lean", "TauCeti/A\rB.lean"):
+            self.assertFalse(checker_lines_preserve(["TauCeti/A.lean", odd]))
+
+    def test_unreadable_base_registry_extracts_the_whole_library(self):
+        from tauceti_worker.verification import base_shim_paths
+
+        self.shim_fixture("")
+        head = git(self.root, "rev-parse", "HEAD")
+        self.assertEqual(base_shim_paths(self.root, head, b"{"), ["TauCeti"])
+        self.assertEqual(base_shim_paths(self.root, head, b'[{"sources": 1}]'), ["TauCeti"])
+        self.assertEqual(
+            base_shim_paths(self.root, head, b'[{"sources": ["TauCeti/./A.lean", "TauCeti/Gone.lean"]}]'),
+            ["TauCeti/A.lean", "TauCeti/mathlib-shims.json"],
+        )
+
     def test_shim_wrapper_uses_worker_python_and_preserves_nested_sibling_imports(self):
         os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
         bare = self.home / "bare-python"

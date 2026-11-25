@@ -1,6 +1,14 @@
 ### Local verification
 
-After your last source edit, run the shared local verification once, synchronously:
+Iterate with targeted builds: after each edit, run `lake build <Module>` for each module you
+edited (for example `lake build TauCeti.Topology.CompactOpen`). It builds that module and what it
+imports, usually in seconds. A full `lake build --iofail` or verification call also rebuilds every
+importer and takes several minutes, so do not use one to check an edit. When you change a
+statement, name or instance other modules use, also build the modules that import it
+(`grep -rl "import TauCeti.Topology.CompactOpen" TauCeti`).
+
+After your last source edit, run the shared local verification once, synchronously. It is
+required before any push, however small the edit, and targeted builds never replace it:
 
 ```bash
 __LOCAL_CHECKS__ verify --policy __SCOPE_POLICY__
@@ -25,9 +33,9 @@ shorter tool timeout. Compiler capacity waits count toward wall time; do not imp
 timeout or start a second verification while the first is running. If a build or verification is
 stopped at the limit, run it again: Lake keeps what it built and phase receipts keep what passed. If Codex returns a session ID,
 wait on that session with write_stdin until it exits. If piping output, use `set -o pipefail`.
-After a failure, rerun the failing phase (`sources`, `axioms`, `module-system`, `style`,
-`environment` or `shim-expiry`) as needed; `lake build --iofail` is the build command. Repeat
-successful checks only if their inputs changed. Push work when it is ready: anything unpushed is
+After a failure, repair it with targeted builds and rerun the failing phase (`sources`, `axioms`,
+`module-system`, `style`, `environment` or `shim-expiry`) as needed, then run the full
+verification once more before pushing. Repeat successful checks only if their inputs changed. Push work when it is ready: anything unpushed is
 discarded when the round ends.
 
 If verification reports resource exhaustion or exits 75, stop retrying in this round; the worker
