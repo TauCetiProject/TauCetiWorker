@@ -490,6 +490,80 @@ class GlobalMaintenance(unittest.TestCase):
             self.assertEqual(run_round(self.w, self.opts, prepared_survey=prepared), 0)
         self.assertFalse(global_round.call_args.kwargs["use_fleet_focus"])
 
+    def test_priority_labelled_reviews_come_before_all_other_pr_work(self):
+        from tauceti_worker.config import NoProgress as Declined
+
+        def labelled(item, *names):
+            item["pr"]["labels"].extend({"name": name} for name in names)
+            return item
+
+        rows = [
+            row(10, "Other"),  # our fix
+            row(20, "Other", author="peer", blocking=False),  # a first review
+            labelled(row(30, "Other", author="peer", blocking=False), "GRH"),  # a priority review
+            row(40, "Other", blocking=False, mergeable="CONFLICTING"),  # our conflict rebase
+            labelled(row(50, "Other"), "grh"),  # our fix on a priority PR: not raised
+        ]
+        self.opts.only = ["rebase", "fix", "review"]
+
+        def order(environment):
+            with patch.dict(os.environ, environment):
+                if not environment:
+                    os.environ.pop("TAUCETI_PRIORITY_LABELS", None)
+                with self.assertRaises(Declined):
+                    self.run_round(rows, lambda stage, candidate: None)
+            return [(s, n) for s, n, *_ in self.calls]
+
+        ordinary = order({})
+        # Reviews within one tier are drawn in a random order.
+        self.assertEqual(ordinary[:3], [("rebase", 40), ("fix", 10), ("fix", 50)])
+        self.assertEqual(sorted(ordinary[3:]), [("review", 20), ("review", 30), ("review", 40)])
+        # The labelled PR's review leads; its fix, and every other unit, keeps its place.
+        prioritized = order({"TAUCETI_PRIORITY_LABELS": "wip, grh"})
+        self.assertEqual(prioritized[:4], [("review", 30), ("rebase", 40), ("fix", 10), ("fix", 50)])
+        self.assertEqual(sorted(prioritized[4:]), [("review", 20), ("review", 40)])
+        # An empty setting is off.
+        self.assertEqual(order({"TAUCETI_PRIORITY_LABELS": " "})[:3], ordinary[:3])
+        # Hold labels still stop a priority PR's review.
+        labelled(rows[2], "on-hold")
+        self.assertNotIn(("review", 30), order({"TAUCETI_PRIORITY_LABELS": "grh"}))
+
+    def test_priority_reviews_skip_reviewer_affinity_and_review_throttles(self):
+        import time
+
+        from tauceti_worker.survey import Candidate, Survey
+
+        sv = Survey(worker_id="test")
+        sv.reviewable.actionable = [
+            Candidate(1, HEAD, ready_at=int(time.time()), priority=True),
+            Candidate(2, HEAD, ready_at=int(time.time())),
+        ]
+        # The throttles hold back a fresh, short queue, but never a priority review.
+        work.throttle_review(sv, SimpleNamespace(review_min_queue=5, review_min_age=60))
+        self.assertEqual([c.pr for c in sv.reviewable.actionable], [1])
+
+        # A peer reviewer's first-refusal window defers an ordinary re-review, never a priority one.
+        prepared = Survey(worker_id="test", roadmap_only="auto")
+        prepared._round_scope = (True, False)
+        recent = int(time.time()) - 60
+        prepared.reviewable.actionable = [
+            Candidate(1, HEAD, ready_at=recent, preferred_reviewer="peer", rereview=True),
+            Candidate(2, HEAD, ready_at=recent, preferred_reviewer="peer", priority=True),
+        ]
+        self.opts.only = ["review"]
+        offered = []
+
+        def perform(stage, _w, _sv, candidate, _opts):
+            offered.append(candidate.pr)
+
+        with (
+            patch.object(work, "dispatch", side_effect=perform),
+            patch.object(work, "review_publisher", return_value="science"),
+            self.assertRaises(NoProgress),
+        ):
+            run_round(self.w, self.opts, prepared_survey=prepared)
+        self.assertEqual(offered, [2])
+
     def test_held_prs_do_not_consume_automatic_maintenance_or_reviews(self):
         for label in ("on-hold", "human", "hold", "keep", "do-not-close"):
             held = row(10, "Other", mergeable="CONFLICTING")

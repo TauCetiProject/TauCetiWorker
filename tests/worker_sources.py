@@ -1143,6 +1143,77 @@ ci="one/project"
             ],
         )
 
+    def test_priority_reviews_lead_on_either_forge_and_wait_out_a_publication_backoff(self):
+        import contextlib
+
+        from tauceti_worker.config import ClaimCollision
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        def walk(backoff):
+            observations = self.observations([], [])
+            github, forgejo = observations[0][2], observations[1][2]
+            github.rebaseable.actionable.append(Candidate(1, "a" * 40))
+            github.reviewable.actionable.append(Candidate(2, "b" * 40, priority=True))
+            github.reviewable.actionable.append(Candidate(3, "c" * 40, rereview=True))
+            github.needs_fix.actionable.append(Candidate(2, "b" * 40))
+            forgejo.reviewable.actionable.append(Candidate(4, "d" * 40, rereview=True))
+            forgejo.reviewable.actionable.append(Candidate(5, "e" * 40, priority=True))
+            for _, worker, _ in observations:
+                worker.cfg = self.cfg
+            options = RoundOpts(
+                only=["rebase", "fix", "review"], agent="auto", work_model="auto", sandbox_host=True, dry_run=True
+            )
+            with (
+                patch("tauceti_worker.multi_source.collect", return_value=observations),
+                patch("tauceti_worker.multi_source.random.shuffle"),
+                patch("tauceti_worker.github_transport.publication_backoff", return_value=backoff),
+                patch("tauceti_worker.review_app.publication_backoff", return_value=0.0),
+                patch("tauceti_worker.review_app.routes", return_value=False),
+                patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+                patch("tauceti_worker.work_units.run_round", side_effect=ClaimCollision("x")) as execute,
+            ):
+                for name in ("TAUCETI_PREFER_FORGE", "TAUCETI_REVIEW_FIRST"):
+                    os.environ.pop(name, None)
+                with self.assertRaises(ClaimCollision):
+                    run_round(None, options)
+            return [
+                (
+                    "github" if call.args[0] is observations[0][1] else "forgejo",
+                    call.args[1].only,
+                    call.args[1].landing_tier,
+                    sorted(c.pr for c in call.kwargs["prepared_survey"].reviewable.actionable),
+                )
+                for call in execute.call_args_list
+            ]
+
+        # Priority reviews on both forges come first; the priority PR's fix keeps its tier.
+        self.assertEqual(
+            [step[:3] for step in walk(0.0)],
+            [
+                ("github", ["review"], 0),
+                ("forgejo", ["review"], 0),
+                ("github", ["rebase", "review"], 1),
+                ("forgejo", ["review"], 1),
+                ("github", ["fix"], 2),
+            ],
+        )
+        # While the account's publication backs off, GitHub's priority review waits like any other
+        # GitHub review, Forgejo's keeps its lead, and the waiting priority review is offered first.
+        backing_off = walk(600.0)
+        self.assertEqual(
+            [step[:3] for step in backing_off],
+            [
+                ("forgejo", ["review"], 0),
+                ("github", ["rebase"], 1),
+                ("forgejo", ["review"], 1),
+                ("github", ["fix"], 2),
+                ("github", ["review"], 0),
+                ("github", ["review"], 1),
+            ],
+        )
+        self.assertEqual(backing_off[-2][3], [2, 3])  # the waiting reviews; tier 0 selects #2
+
     def test_publication_backoff_reads_the_accounts_rejection_window(self):
         import json
         import tempfile

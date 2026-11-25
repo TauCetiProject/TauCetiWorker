@@ -759,5 +759,42 @@ class SharedIndexSurveys(unittest.TestCase):
         self.assertEqual({c.pr for c in result.reviewable.actionable}, {2, 4, 6, 8, 10, 12})
 
 
+class PriorityRefresh(unittest.TestCase):
+    def test_a_refresh_cut_short_still_reads_the_priority_labelled_prs(self):
+        import contextlib
+        import os
+
+        from tauceti_worker.source_survey import REFRESH_FAILURE_LIMIT, refresh_index
+
+        read = []
+
+        class Index:
+            thread_failures = set()
+
+            def current(self, number, contest=False):
+                return False
+
+            def refresh_lock(self, wait):
+                return contextlib.nullcontext(True)
+
+            def gh_meta(self, number):
+                read.append(number)
+                return SimpleNamespace(provenance="fetch_failed")  # every read fails: the refresh stops
+
+        entries = [
+            (
+                PRInfo(
+                    n, "a" * 40, "b", "o", "r", False, "MERGEABLE", "x", True, False, labels=("GRH",) * (n in (17, 23))
+                ),
+                frozenset({"review"}),
+            )
+            for n in range(1, 30)
+        ]
+        with patch.dict(os.environ, {"TAUCETI_PRIORITY_LABELS": "grh"}):
+            reads, deferred = refresh_index(Index(), entries)
+        self.assertEqual(reads, REFRESH_FAILURE_LIMIT)
+        self.assertEqual(sorted(read[:2]), [17, 23])
+
+
 if __name__ == "__main__":
     unittest.main()

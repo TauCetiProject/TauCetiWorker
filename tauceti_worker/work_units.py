@@ -128,6 +128,7 @@ from .survey import (
     owns_author,
     owns_pr,
     prioritize_review_candidates,
+    priority_note,
     progress_argv,
     review_cap_close_key,
     review_error_key,
@@ -410,15 +411,16 @@ def _bubble(stage: str, opts: RoundOpts) -> bool:
 
 
 def throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
-    """Apply the review throttles (_throttle_review), never to a model-free close at the review-error cap."""
-    closing = [c for c in sv.reviewable.actionable if c.close_at_review_cap]
-    if not closing:
+    """Apply the review throttles (_throttle_review), never to a model-free close at the review-error
+    cap or to a review of a priority-labelled PR, which the operator asked to have reviewed at once."""
+    exempt = [c for c in sv.reviewable.actionable if c.close_at_review_cap or c.priority]
+    if not exempt:
         return _throttle_review(sv, opts, now=now)
-    sv.reviewable.actionable = [c for c in sv.reviewable.actionable if not c.close_at_review_cap]
+    sv.reviewable.actionable = [c for c in sv.reviewable.actionable if not (c.close_at_review_cap or c.priority)]
     try:
         _throttle_review(sv, opts, now=now)
     finally:
-        sv.reviewable.actionable = closing + sv.reviewable.actionable
+        sv.reviewable.actionable = exempt + sv.reviewable.actionable
 
 
 def _throttle_review(sv: Survey, opts, *, now: float | None = None) -> None:
@@ -819,6 +821,8 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
         report(count_account(w, {"github": sv}), sv)
 
     log(f"open PRs: {sv.status_label_line()}")
+    if prepared_survey is None and (note := priority_note(sv)):
+        log(note)  # multi_source logs its prepared surveys' notes once, not once per landing tier
     # `--pr` scopes what this round SAYS as well as what it does. Every note below is about one named
     # PR, and pr_focus_reason repeats the ones that apply to a target anyway, so leaving them
     # unfiltered would bury the operator's answer under a report about PRs they did not ask about.
@@ -884,10 +888,11 @@ def run_round(w: Worker, opts: RoundOpts, *, use_fleet_focus=True, prepared_surv
             except Die as exc:
                 log(f"  review: {exc}; reviewer affinity disabled for this round")
         ordered, deferred = prioritize_review_candidates(sv.reviewable.actionable, reviewer, now=stamp)
-        # A bump review never waits for its previous reviewer's first-refusal window.
+        # A bump review, or a priority-labelled PR's, never waits for its previous reviewer's
+        # first-refusal window.
         bumps = bump_prs(sv)
-        ordered += [c for c in deferred if c.pr in bumps]
-        deferred = [c for c in deferred if c.pr not in bumps]
+        ordered += [c for c in deferred if c.pr in bumps or c.priority]
+        deferred = [c for c in deferred if not (c.pr in bumps or c.priority)]
         if sv.roadmap_backpressure and deferred:
             log("  review: authoring paused; previous-reviewer preference will not leave workers idle")
             ordered.extend(deferred)

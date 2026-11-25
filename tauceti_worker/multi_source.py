@@ -10,7 +10,7 @@ from tauceti_tools.forge import ForgeError
 from .config import Die, NoProgress, log, roadmap_only
 from .constants import AUTO_STAGES
 from .review_state import ReviewState
-from .survey import Counters, Survey, survey
+from .survey import Counters, Survey, priority_note, survey
 from .worker_sources import activate, native_source, source_config
 
 
@@ -176,6 +176,8 @@ def run_round(w, opts, *, use_fleet_focus=True):
             log(f"{name}: unavailable; " + "; ".join(result.errors))
         else:
             log(f"{name}: {result.n_open_nondraft} open PRs; {result.status_label_line()}")
+            if note := priority_note(result):
+                log(f"{name}: {note}")
             if result.detail_reads or result.detail_deferred:
                 log(
                     f"{name}: review index refreshed with {result.detail_reads} read(s); "
@@ -251,11 +253,9 @@ def run_round(w, opts, *, use_fleet_focus=True):
         bumps = bump_prs(result)
         waiting = set()
         if held and name == "github":
-            waiting = {
-                c.pr
-                for c in result.reviewable.actionable
-                if landing_tier("review", c, bumps) > 0 and held(worker, c.pr)
-            }
+            # A priority-labelled PR's review shares the bumps' tier but still waits: it could not
+            # publish any sooner, and leads the waiting reviews once nothing else is claimable.
+            waiting = {c.pr for c in result.reviewable.actionable if c.pr not in bumps and held(worker, c.pr)}
         publishable, unpublishable = result, None
         if waiting:
             # The review throttles judge the whole queue, so apply them before splitting it, as

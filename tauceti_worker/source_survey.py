@@ -13,7 +13,7 @@ from tauceti_tools.forge import Incomplete, RepositoryRef
 
 from .constants import MERGEABILITY_CHECKS, REFRESH_FAILURE_LIMIT, REFRESH_LOCK_WAIT_S
 from .source_identity import SourceActor, maintains_author
-from .survey import PRInfo, Survey, bucket_status_labels, roadmap_open_count
+from .survey import PRInfo, Survey, bucket_status_labels, has_priority_label, priority_labels, roadmap_open_count
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -289,8 +289,11 @@ def refresh_index(rs, entries):
     if not stale:
         return 0, 0
     # Classification reads the whole index, so refresh order matters only when a refresh ends
-    # early. Random order keeps a few PRs that persistently fail to read from ending every refresh.
+    # early. Random order keeps a few PRs that persistently fail to read from ending every refresh;
+    # priority-labelled PRs still go first, so a refresh cut short never defers their reviews.
     random.shuffle(stale)
+    labels = priority_labels()
+    stale.sort(key=lambda entry: not has_priority_label(entry[0], labels))
     reads = failures = 0
     with rs.refresh_lock(REFRESH_LOCK_WAIT_S) as held:
         if not held:
