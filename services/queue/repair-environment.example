@@ -72,12 +72,16 @@ TAUCETI_QUEUE_PROVIDERS=claude,codex,api
 # The workers' own Lake cache namespace (docs/queue/repair-task.md, "Repair cache publication").
 # Repairs read it before the public cache and, after a green repair, publish their outputs to it.
 # The read URL is public; the upload URL is the S3 endpoint of the same bucket. The write key file
-# holds the `access-key-id:secret` pair of an R2 token scoped to that bucket only (mode 0600).
+# holds the `access-key-id:secret` pair of an R2 token scoped to that bucket only (mode 0600), with
+# object read as well as write, so the upload can HEAD artifacts it need not upload again.
 # Publication is on when the key file and an upload URL are set; TAUCETI_QUEUE_PUBLISH_CACHE=0
 # turns it off.
 #TAUCETI_REPAIR_CACHE_URL=https://repair-cache.taucetiproject.org
 #TAUCETI_REPAIR_CACHE_UPLOAD_URL=https://<account>.r2.cloudflarestorage.com/tauceti-repair-cache
 #TAUCETI_REPAIR_CACHE_KEY_FILE=/home/operator/.config/tauceti-queue/repair-cache-key
+# The host's record of artifacts already in the bucket, shared by every worker (default
+# ~/.cache/tauceti-queue/repair-uploaded.sqlite3; off: HEAD-check every artifact instead).
+#TAUCETI_REPAIR_UPLOAD_RECORD=/home/operator/.cache/tauceti-queue/repair-uploaded.sqlite3
 #TAUCETI_QUEUE_PUBLISH_CACHE=1
 
 # Concurrent agents for a repair whose failures split into independent groups (different members,

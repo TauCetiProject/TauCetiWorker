@@ -67,6 +67,7 @@ BIN.mkdir()
 HOME = TMP / "home"
 HOME.mkdir()
 os.environ["PATH"] = f"{BIN}:{os.environ.get('PATH', '')}"
+os.environ["CURL"] = str(BIN / "curl-stub")  # the repair upload's curl (repair_upload.Curl), as Lake reads $CURL
 # Bind inference to this fixture even when another launch context supplies its own PATH.
 os.environ["TAUCETI_CLAUDE_CMD"] = str(BIN / "claude")
 os.environ["HOME"] = str(HOME)
@@ -105,10 +106,7 @@ LAKE = r'''#!/usr/bin/env python3
 """lake stub: `cache get` succeeds unless STUB_LAKE_CACHE_FAIL=1 or the `--rev` is listed in
 STUB_LAKE_CACHE_FAIL_REVS (comma separated); from the repair namespace (`--service tauceti-repair`)
 only the revisions in STUB_LAKE_REPAIR_REVS are published. `build` fails modules containing BROKEN,
-and those named in STUB_LAKE_NUMPROJ (comma separated stems) with a numeric projection, and with `-o FILE` writes an output map naming one artifact in the pool. `cache put` records the
-key it was given in `lake-put-key` and fails when STUB_LAKE_PUT_FAIL=1; otherwise it uploads, as Lake
-does, each artifact the map names and then the map to `remote/` under STUB_DIR, logging each upload
-in `remote/uploads.log`, and with STUB_LAKE_PUT_FAIL=partial fails after the artifacts. `build --iofail` replays the
+and those named in STUB_LAKE_NUMPROJ (comma separated stems) with a numeric projection, and with `-o FILE` writes an output map naming one artifact in the pool. `build --iofail` replays the
 file STUB_LAKE_BUILD_SCRIPT when set (literal lines, `sleep S`, `exit N`), the first time only. `env CMD ...`
 runs CMD, as `lake env` does."""
 import os, sys, time
@@ -148,37 +146,6 @@ if args[:2] == ["build", "--iofail"] and os.environ.get("STUB_LAKE_BUILD_SCRIPT"
     sys.exit(0)
 if args[:1] == ["env"]:
     os.execvp(args[1], args[1:])
-if args[:2] in (["cache", "put"], ["cache", "put-staged"]):
-    import json, shutil, subprocess
-    (stub / "lake-put-key").write_text(os.environ.get("LAKE_CACHE_KEY", ""))
-    (stub / "lake-put-toolchain").write_text(os.environ.get("ELAN_TOOLCHAIN", ""))
-    if os.environ.get("STUB_LAKE_PUT_FAIL") == "1":
-        sys.exit(1)
-    remote = stub / "remote"
-    (remote / "artifacts").mkdir(parents=True, exist_ok=True)
-    uploads = (remote / "uploads.log").open("a")
-    staged = args[1] == "put-staged"
-    mapping = Path(args[2]) / "outputs.jsonl" if staged else Path(args[2])
-    artifact_root = Path(args[2]) if staged else Path(os.environ["LAKE_CACHE_DIR"]) / "artifacts"
-    if staged:
-        (stub / "staged-upload-started").touch()
-        gate = stub / "staged-upload-gate"
-        while gate.exists():
-            time.sleep(0.05)
-    for line in mapping.read_text().splitlines():
-        row = json.loads(line)
-        if isinstance(row, list):
-            shutil.copy(artifact_root / row[1], remote / "artifacts" / row[1])
-            uploads.write(f"artifact {row[1]}\n")
-            uploads.flush()
-    if os.environ.get("STUB_LAKE_PUT_FAIL") == "partial":
-        sys.exit(1)
-    rev = (next(a.split("=", 1)[1] for a in args if a.startswith("--rev=")) if staged else
-           subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip())
-    (remote / "revisions").mkdir(exist_ok=True)
-    shutil.copy(mapping, remote / "revisions" / f"{rev}.jsonl")
-    uploads.write(f"mapping {rev}\n")
-    sys.exit(0)
 if args[:2] == ["cache", "get"] and "tauceti-repair" in args:
     rev = next((a[len("--rev="):] for a in args if a.startswith("--rev=")), "")
     if rev not in os.environ.get("STUB_LAKE_REPAIR_REVS", "").split(","):
@@ -572,12 +539,62 @@ os.execv(real, [real, *args])
 '''.replace("PYTHON", sys.executable)
 
 # elan stub: the fetch sandbox installs a missing official toolchain first; record it, never download.
+CURL = r"""#!/usr/bin/env python3
+'''curl stub for the repair upload (`curl --config -`): an S3 bucket in `remote/` under STUB_DIR.
+A HEAD answers 200 when `remote/artifacts/<hash>.ltar` exists, else 404; a PUT of an artifact writes
+it there and of a revision map writes `remote/revisions/<rev>.jsonl`, each upload logged in
+`remote/uploads.log`; every request is logged in `curl-requests.log` and the key in `upload-key`.
+STUB_LAKE_PUT_FAIL=1 fails every PUT (HTTP 403), =partial only the map's. While
+`staged-upload-gate` exists a PUT waits, after touching `staged-upload-started`.'''
+import json, os, shutil, sys, time
+from pathlib import Path
+stub = Path(os.environ["STUB_DIR"])
+remote = stub / "remote"
+config = sys.stdin.read().splitlines()
+def value(line):
+    return json.loads(line.split("=", 1)[1].strip())
+head = "head" in config
+transfers, upload = [], None
+for line in config:
+    if line.startswith("user ="):
+        (stub / "upload-key").write_text(value(line))
+    elif line.startswith("upload-file ="):
+        upload = value(line)
+    elif line.startswith("url ="):
+        transfers.append((value(line), upload)); upload = None
+requests = (stub / "curl-requests.log").open("a")
+fail = os.environ.get("STUB_LAKE_PUT_FAIL")
+for i, (url, path) in enumerate(transfers):
+    name = url.rsplit("/", 1)[1]
+    requests.write(f"{'HEAD' if head else 'PUT'} {url}\n"); requests.flush()
+    if head:
+        code = 200 if (remote / "artifacts" / name.replace(".art", ".ltar")).is_file() else 404
+    else:
+        gate = stub / "staged-upload-gate"
+        if gate.exists():
+            (stub / "staged-upload-started").touch()
+            while gate.exists():
+                time.sleep(0.05)
+        is_map = "/revisions/" in url
+        if fail == "1" or (fail == "partial" and is_map):
+            code = 403
+        else:
+            target = remote / "revisions" / name if is_map else remote / "artifacts" / name.replace(".art", ".ltar")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(path, target)
+            with (remote / "uploads.log").open("a") as uploads:
+                uploads.write(f"mapping {name[:-len('.jsonl')]}\n" if is_map else f"artifact {target.name}\n")
+            code = 200
+    print(f"{i} 0 {code} {url}", flush=True)
+"""
+
 ELAN = r"""#!/bin/sh
 echo "$*" >> "${STUB_DIR:-/dev/null}/elan-calls.log" 2>/dev/null || true
 """
 
 for name, text in (
     ("lake", LAKE),
+    ("curl-stub", CURL),
     ("elan", ELAN),
     ("env", ENV),
     ("gh", GH),
@@ -1277,6 +1294,7 @@ class Fixture(unittest.TestCase):
         self.stub_dir = self.root / "stub"
         self.stub_dir.mkdir()
         os.environ["STUB_DIR"] = str(self.stub_dir)
+        os.environ["XDG_CACHE_HOME"] = str(self.stub_dir / "cache")  # the host's upload record, per test
         os.environ["STUB_AGENT_MODE"] = "repair"
         os.environ.pop("STUB_AGENT_MODES", None)
         os.environ.pop("ANTHROPIC_API_KEY", None)
@@ -3815,8 +3833,15 @@ class PublishOutputs(Fixture):
         values.update(overrides)
         return repair_publish.Settings(**values)
 
+    def requests(self) -> list[str]:
+        """The upload's requests to the bucket, ``HEAD url`` or ``PUT url``."""
+        path = self.stub_dir / "curl-requests.log"
+        return path.read_text().splitlines() if path.exists() else []
+
     def puts(self) -> list[str]:
-        return [c for c in self.lake_calls() if c.startswith("cache put")]
+        return [r for r in self.requests() if r.startswith("PUT ")] + [
+            c for c in self.lake_calls() if c.startswith("cache put")
+        ]
 
     def published(self) -> dict:
         """The background publication's record, once its publisher has finished."""
@@ -3850,10 +3875,17 @@ class PublishOutputs(Fixture):
         self.assertLess(builds[-1]["finished"], submitted[0])
         self.assertFalse(any("--no-build" in b["args"] for b in self.lake_builds()))
         calls = self.lake_calls()
-        put = next(c for c in calls if c.startswith("cache put-staged "))
-        self.assertIn(f"--service tauceti-repair-upload --repo {PROJECT}", put)
-        self.assertEqual((self.stub_dir / "lake-put-key").read_text(), self.KEY)
-        self.assertEqual((self.stub_dir / "lake-put-toolchain").read_text(), "leanprover/lean4:v4.36.0-rc2")
+        self.assertEqual(
+            self.requests(),
+            [
+                f"HEAD https://repair-cache.example/artifacts/{PROJECT}/00aa00aa00aa00aa.art",
+                f"PUT https://repair-cache.example/artifacts/{PROJECT}/00aa00aa00aa00aa.art",
+                f"PUT https://repair-cache.example/revisions/{PROJECT}/tc/leanprover--lean4---v4.36.0-rc2/"
+                f"{outcome['tip']}.jsonl",
+            ],
+        )
+        self.assertEqual((self.stub_dir / "upload-key").read_text(), self.KEY)
+        self.assertEqual(record["upload"], {"recorded": 0, "present": 0, "uploaded": 1})
         self.assertIsNone(self.agent_calls()[0]["env"]["LAKE_CACHE_KEY"], "and never the agent")
         logs = self.root / "state" / "tasks" / "1" / "logs"
         self.assertTrue((logs / repair_publish.BACKGROUND_LOG).is_file())
@@ -4014,7 +4046,7 @@ class PublishOutputs(Fixture):
         outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         record = self.published()
-        self.assertEqual((record["state"], record["error"]), ("failed", "lake cache put-staged exited 1"))
+        self.assertEqual((record["state"], record["error"]), ("failed", "cache upload exited 1"))
         self.assertTrue((self.stub_dir / "remote" / "artifacts" / "00aa00aa00aa00aa.ltar").is_file())
         self.assertFalse((self.stub_dir / "remote" / "revisions").exists(), "no mapping for a partial set")
 
@@ -4027,11 +4059,11 @@ class PublishOutputs(Fixture):
         self.assertTrue(self.service.results[0]["response"]["accepted"])
         record = self.published()
         self.assertFalse(record["published"])
-        self.assertEqual((record["state"], record["error"]), ("failed", "lake cache put-staged exited 1"))
+        self.assertEqual((record["state"], record["error"]), ("failed", "cache upload exited 1"))
         repair_task.write_heartbeat(cfg, {}, "idle")
         heartbeat = json.loads(repair_task.heartbeat_path(cfg).read_text())["publish"]
         self.assertEqual((heartbeat["published"], heartbeat["failed"]), (0, 1))
-        self.assertEqual(heartbeat["last_failure"]["error"], "lake cache put-staged exited 1")
+        self.assertEqual(heartbeat["last_failure"]["error"], "cache upload exited 1")
         self.assertEqual(self.state()["state"], "adopted", "the checkpoint keeps the submission's outcome")
 
     def test_a_publisher_that_cannot_start_does_not_fail_the_task(self):

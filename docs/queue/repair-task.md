@@ -801,9 +801,19 @@ with it and CI's fetch for the exact staging head finds these outputs.
 ## Repair cache publication
 
 The final build writes `.lake/outputs.jsonl` with `--rehash -o` when publication is configured.
-`lake cache stage` copies that native map and its complete artifacts; stock `lake cache put-staged`
-uploads them with an explicit repository, revision and toolchain from an isolated staging directory,
-without loading candidate workspace configuration. There is no second build scan or reconnect pass.
+`lake cache stage` copies that native map and its complete artifacts; `tauceti_queue/repair_upload.py`
+uploads them from an isolated staging directory for an explicit repository, revision and toolchain,
+without loading candidate workspace configuration. It writes what stock `lake cache put-staged` would
+(the same URLs, content types and signing, through `curl`), but only the artifacts the bucket does not
+already hold: Lake's `put-staged` has no way to skip them, and re-uploading the roughly 42,000
+artifacts of every publication cost about 1.7M R2 Class A operations a day (decision 218). An
+artifact is skipped when the host's upload record lists it (a SQLite file shared by every repair
+worker and publisher of the user, `~/.cache/tauceti-queue/repair-uploaded.sqlite3`, or
+`TAUCETI_REPAIR_UPLOAD_RECORD`; `off` disables it) from the last 7 days, or when a signed HEAD
+answers 200; everything else is uploaded. Artifact URLs end in the content hash, so a record entry
+stands only for the same bytes; a stale one (an object deleted from the bucket within 7 days) leaves
+a map naming a missing artifact, which a fetch treats as a miss. There is no second build scan or
+reconnect pass.
 The upload has a bounded timeout (`TAUCETI_REPAIR_CACHE_PUBLISH_TIMEOUT`, default 1800 s),
 and the outcome's `publish` record holds artifact count, bytes and seconds. A failure or a skip
 is logged and recorded and never fails the task. The namespace is two services the worker writes
@@ -812,7 +822,7 @@ fetches without credentials) and `tauceti-repair-upload` writes to `TAUCETI_REPA
 (the S3 endpoint of the same bucket; default the read URL), each holding `artifacts/` and `revisions/`
 laid out like the public cache. The write key, the `access-key-id:secret` pair Lake takes as
 `LAKE_CACHE_KEY`, is read from the file named by `TAUCETI_REPAIR_CACHE_KEY_FILE` and given only to the
-`lake cache put-staged` process; `LAKE_CACHE_KEY` is removed from the environment the agent inherits. Use a
+upload's `curl`, on its standard input; `LAKE_CACHE_KEY` is removed from the environment the agent inherits. Use a
 bucket of its own with an R2 token scoped to it, so the worker's key cannot write the public cache
 CI publishes to (`LAKE_CACHE_KEY` in TauCeti's `publish-lake-cache.yml`). `TAUCETI_QUEUE_PUBLISH_CACHE`
 (`1`/`0`) switches publication on or off; unset, it is on when the key file and an upload URL are
@@ -841,9 +851,9 @@ on a stop or restart), elsewhere a new session, so a stopping worker does not ta
 `tasks/<id>/logs/publish.log` and its record `tasks/<id>/logs/publish.json` (`published`, `skipped`
 or `failed`), removes the task's worktree when done, and `worker.json` reports running publications,
 counts and the last result and failure under `publish`; a failure is logged there and in the journal
-and never changes the task's outcome. Native upload runs under `nice -n 10`, so
-a concurrent repair or build on the host keeps the CPU. `lake cache put-staged` uploads every artifact
-before the revision mapping the fetcher reads, and exits without writing the mapping when an
+and never changes the task's outcome. The upload runs under `nice -n 10`, so
+a concurrent repair or build on the host keeps the CPU. The upload confirms every artifact
+before it writes the revision mapping the fetcher reads, and stops without writing the mapping when an
 artifact upload fails, so CI never sees a mapping for a partially uploaded set; a publisher killed
 mid-upload leaves no mapping, which the fetch script treats as the normal miss. `before` keeps the
 first ordering (publish in the task, before the push) and `off` publishes nothing; the read side is
