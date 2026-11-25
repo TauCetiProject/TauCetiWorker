@@ -1394,6 +1394,10 @@ class Parts(unittest.TestCase):
         blocks = sa.declarations(text.split("\n"))
         self.assertEqual([(lo, hi, name) for lo, hi, _, name in blocks], [(1, 19, "gen"), (20, 20, "t")])
         self.assertEqual(sa.code_mask(["x `(unterminated -- comment"]), ["x" + " " * 26])
+        # A plain "{" before a quotation: read as interpolated it would swallow the quotation opener.
+        plain = ["def gen : Lean.MacroM Lean.Syntax := do", '  let _ := "{"', "  `(command| mutual"]
+        plain += ['def first := "}"', "def second := 2", "end)", "theorem t : True := trivial"]
+        self.assertEqual([(lo, hi) for lo, hi, _, _ in sa.declarations(plain)], [(1, 6), (7, 7)])
         quoted = sa.declarations(["def «my def» := 1", "def plain := 2"])
         self.assertEqual([name for _, _, _, name in quoted], ["«my def»", "plain"])
 

@@ -701,10 +701,9 @@ def ident_char(c: str) -> bool:
     return c.isalnum() or c in "_'!?"
 
 
-def literal_end(text: str, i: int) -> tuple[int, bool] | None:
+def literal_end(text: str, i: int, interpolate: bool) -> tuple[int, bool] | None:
     """Where the comment, string, character literal, syntax quotation or quoted name at `i` ends,
-    and whether it is blanked (all are); None if none starts there. Every rule errs toward blanking
-    more: a region blanked wrongly only merges blocks, while one left unblanked could split one.
+    and whether it is blanked (all are); None if none starts there.
 
     Block comments nest, an interpolated string's `{...}` is scanned as code, and a quotation (`` `(...) ``, `` `(command| ...) ``) ends at its matching
     parenthesis, skipping everything inside by these same rules. Unterminated: the end of the text."""
@@ -723,17 +722,17 @@ def literal_end(text: str, i: int) -> tuple[int, bool] | None:
                 j += 1
         return min(j, n), True
     if c == '"':
-        # Any string may interpolate (s!, m!, throwError, dbg_trace, ...): `{...}` is scanned as code
-        # holding any literal. For a plain string this ends at or after its real end, never before,
-        # so it can only blank more and lengthen a block.
+        # With `interpolate`, every string is read as interpolated (s!, m!, throwError, dbg_trace, ...):
+        # its `{...}` is code holding any literal. Lean decides by parser context, so neither reading
+        # is right for every string; `declarations` requires both to agree.
         j = i + 1
         while j < n and text[j] != '"':
             if text[j] == "\\":
                 j += 2
-            elif text[j] == "{":
+            elif interpolate and text[j] == "{":
                 depth, j = 1, j + 1
                 while j < n and depth:
-                    if (inner := literal_end(text, j)) is not None:
+                    if (inner := literal_end(text, j, interpolate)) is not None:
                         j = max(inner[0], j + 1)
                         continue
                     depth += {"{": 1, "}": -1}.get(text[j], 0)
@@ -753,7 +752,7 @@ def literal_end(text: str, i: int) -> tuple[int, bool] | None:
     if text.startswith("`(", i):
         depth, j = 1, i + 2
         while j < n and depth:
-            if (inner := literal_end(text, j)) is not None:
+            if (inner := literal_end(text, j, interpolate)) is not None:
                 j = max(inner[0], j + 1)
                 continue
             depth += {"(": 1, ")": -1}.get(text[j], 0)
@@ -762,16 +761,15 @@ def literal_end(text: str, i: int) -> tuple[int, bool] | None:
     return None
 
 
-def code_mask(lines: list[str]) -> list[str]:
+def code_mask(lines: list[str], interpolate: bool = False) -> list[str]:
     """The lines with comments, strings, character literals and syntax quotations blanked, positions kept.
 
-    A keyword quoted or commented inside a definition therefore never ends it (`literal_end`). An
-    unterminated comment, string or quotation blanks the rest of the file, which only makes blocks
-    longer."""
+    `interpolate` reads every string as interpolated (`literal_end`). An unterminated comment,
+    string or quotation blanks the rest of the file, which only makes blocks longer."""
     text = "\n".join(lines)
     out, i, n = list(text), 0, len(text)
     while i < n:
-        found = literal_end(text, i)
+        found = literal_end(text, i, interpolate)
         if found is None:
             i += 1
             continue
@@ -789,18 +787,21 @@ def declarations(lines: list[str]) -> list[tuple[int, int, str, str]]:
 
     A block starts at a line whose code (`code_mask`) begins with a declaration keyword
     (DECLARATION, at any indentation) or, at column 0, another command with no term form (COMMAND),
-    and runs to the next. A line that only holds attributes starts nothing, so it ends the block
+    under both readings of strings (`code_mask`), and runs to the next. A line that only holds attributes starts nothing, so it ends the block
     before the declaration it annotates. Missing a command only lengthens a block."""
     starts, kinds = [], {}
-    for i, code in enumerate(code_mask(lines), 1):
+    # A line starts a block only if it is code under both readings of strings, plain and
+    # interpolated: text inside a literal under either reading never splits a definition.
+    for i, (code, other) in enumerate(zip(code_mask(lines), code_mask(lines, True), strict=True), 1):
         if re.fullmatch(r"\s*(?:@\[[^\]]*\]\s*)+", code):
             continue
-        if match := DECLARATION.match(code):
+        match, again = DECLARATION.match(code), DECLARATION.match(other)
+        if match and again and again.group(1) == match.group(1):
             starts.append(i)
             # The name from the source itself (a quoted name is blanked in the mask), at the same place.
             named = DECLARATION.match(lines[i - 1], len(code) - len(code.lstrip()))
             kinds[i] = (match.group(1), named.group(2) if named and named.group(1) == match.group(1) else "")
-        elif COMMAND.match(code):
+        elif COMMAND.match(code) and COMMAND.match(other):
             starts.append(i)
     if not starts or starts[0] != 1:
         starts.insert(0, 1)

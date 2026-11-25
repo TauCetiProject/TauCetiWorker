@@ -87,9 +87,13 @@ is seen in full by the reviewer holding its file and with its dependencies by ev
 plain `def` that nothing in the context names is not context: it cannot run at build time unless
 something the context shows runs it. Blocks follow how Lean ends a command: one starts only at a
 declaration keyword (at any indentation) or, at column 0, a command with no term form, found after
-comments, strings (scanned as if interpolated), character literals, quoted names and syntax
-quotations are blanked. Every rule errs toward blanking more, which only merges blocks, so nothing
-quoted or commented inside a definition can cut it short. Missing a command only lengthens a block, and names are matched by
+comments, strings, character literals, quoted names and syntax quotations are blanked. Whether a
+string interpolates depends on Lean's parser context, so the Worker masks the file twice, reading
+every string as plain and as interpolated, and a line starts a block only if it is code under both:
+text inside a literal under either reading never cuts a definition short. This is lexical, not
+Lean's own parse; the residual risk is a definition whose text misleads both readings at the same
+line, and it matters only for the context, since each file's own reviewer reads it whole (or, in
+hunk pieces, its changed lines and what they name). Missing a command only lengthens a block, and names are matched by
 their last component, so the extraction errs toward showing more.
 
 Only a single hunk too large for a part even without its surrounding lines, or commit-wide
