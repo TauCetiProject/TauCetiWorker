@@ -975,6 +975,8 @@ def build_parser() -> argparse.ArgumentParser:
     ep = sub.add_parser("_egress-probe", add_help=False)
     ep.add_argument("--worker-id", dest="worker_id", default=None)
     add_github_account_flag(ep)
+    rb = sub.add_parser("_relink-between-rounds", add_help=False)
+    rb.add_argument("--state-dir", required=True)
     mr = sub.add_parser("_managed-run", add_help=False)
     mr.add_argument("--spec", required=True)
     mr.add_argument("--state-dir", required=True)
@@ -1025,6 +1027,10 @@ def main(argv: list[str] | None = None) -> int:
     selected_conf, remaining = conf_argument(list(sys.argv[1:] if argv is None else argv))
     args = parser.parse_args(remaining)
     cmd = args.cmd
+    if cmd == "_relink-between-rounds":
+        from .background_relink import main as relink_between_rounds
+
+        return relink_between_rounds(args.state_dir)
     if cmd == "_targets-inspect":
         from .targets import describe_targets, load_targets
 

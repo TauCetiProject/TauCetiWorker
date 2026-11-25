@@ -441,42 +441,49 @@ def recycle(cfg, *, now=None, dry=False):
     )
     if valid and not forced and now - born < LIFETIME and not pending:
         return report
-    # These paths were renamed only after being eligible for disposal. Retry them without
-    # removing younger replacement workspaces.
-    for path, root in pending:
-        remove(path, root, report, dry=dry)
-    if not valid and not forced:
+    # Deleting this worker's caches: a between-rounds relink must not be walking them.
+    from .background_relink import paused
+
+    with contextlib.nullcontext(True) if dry else paused(cfg.state) as idle:
+        if not idle:
+            note(report, "protected", f"{cfg.state}: a between-rounds relink holds the build tree")
+            return report
+        # These paths were renamed only after being eligible for disposal. Retry them without
+        # removing younger replacement workspaces.
+        for path, root in pending:
+            remove(path, root, report, dry=dry)
+        if not valid and not forced:
+            if not dry:
+                try:
+                    atomic_json(marker, dict(started_at=now))
+                except OSError as error:
+                    note(report, "errors", str(error))
+            return report
+        if not forced and now - born < LIFETIME:
+            return report
+        cache_result = fresh_report(now)
+        private_only = forced and not critical and (not valid or now - born < LIFETIME)
+        if private_only:
+            # Drop old private artifact-store references, retaining the warm build tree.
+            for path, anchor in cache_roots(cfg):
+                remove(path, anchor, cache_result, dry=dry)
+        else:
+            evict_workspace(cfg, cache_result, dry=dry)
+        merge_report(report, cache_result)
+        # A blocked candidate must not keep every other cache in an expired generation. Renamed
+        # deletions retry independently; paths still in use can wait for the next generation boundary.
         if not dry:
             try:
-                atomic_json(marker, dict(started_at=now))
+                atomic_json(
+                    marker,
+                    dict(
+                        started_at=born if valid and private_only else now,
+                        last_pressure_at=now if forced else row.get("last_pressure_at", 0),
+                    ),
+                )
             except OSError as error:
                 note(report, "errors", str(error))
         return report
-    if not forced and now - born < LIFETIME:
-        return report
-    cache_result = fresh_report(now)
-    private_only = forced and not critical and (not valid or now - born < LIFETIME)
-    if private_only:
-        # Drop old private artifact-store references, retaining the warm build tree.
-        for path, anchor in cache_roots(cfg):
-            remove(path, anchor, cache_result, dry=dry)
-    else:
-        evict_workspace(cfg, cache_result, dry=dry)
-    merge_report(report, cache_result)
-    # A blocked candidate must not keep every other cache in an expired generation. Renamed
-    # deletions retry independently; paths still in use can wait for the next generation boundary.
-    if not dry:
-        try:
-            atomic_json(
-                marker,
-                dict(
-                    started_at=born if valid and private_only else now,
-                    last_pressure_at=now if forced else row.get("last_pressure_at", 0),
-                ),
-            )
-        except OSError as error:
-            note(report, "errors", str(error))
-    return report
 
 
 def worker_configs():

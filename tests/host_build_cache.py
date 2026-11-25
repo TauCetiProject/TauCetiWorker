@@ -304,7 +304,8 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
         assert not any(r["args"] == ["exe", "cache", "clean"] for r in records)
     print("[OK] Mathlib prunes stale private archive links once daily and records current-tree pool reuse")
 
-    # H1 probes hard links in the agent's namespace and relinks before launch; H2 after it exits.
+    # H1 only probes hard links in the agent's namespace before launch; H2 relinks after it exits.
+    # The full pass runs between rounds (tests/background_relink.py), so the agent never waits for it.
     import errno
     import shutil
 
@@ -312,19 +313,27 @@ elif args[0]=='rev-list': print('b'*40+'\\n'+'c'*40)
 
     (co / ".lake/build/lib/lean").mkdir(parents=True)
     phases = []
+    passes = []
     real_boundary = canonical_store.boundary
+    real_pass = canonical_store.relink
 
     def observed(cwd, env, *, phase, prefix=()):
         phases.append((phase, len(launched)))
         return real_boundary(cwd, env, phase=phase, prefix=prefix)
 
+    def relinked(*args, **kwargs):
+        passes.append(len(launched))
+        return real_pass(*args, **kwargs)
+
     with (
         patch("tauceti_worker.expanded_cache.preparation", private_preparation),
         patch.object(canonical_store, "boundary", observed),
+        patch.object(canonical_store, "relink", relinked),
     ):
         rc, records, text = run(**overrides)
     assert rc == 0, text
     assert phases == [("prepare", 0), ("round-end", 1)], phases
+    assert passes == [1], passes  # No relink pass before the agent.
     # EXDEV both in-process and inside the agent's namespace (the shared Mathlib view's prefix).
     real_run = canonical_store.subprocess.run
 
