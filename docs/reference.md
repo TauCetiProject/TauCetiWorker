@@ -316,19 +316,23 @@ separate proxy are outside this accounting. The current science fleet runs on th
 The log rotates at 64 MiB and retains one previous file.
 
 When the state service fails (any reason except a coverage gap), the host records a two-minute
-fallback window in `state/github-shared/fallback.json`. Read-only direct `gh` requests in that
-window draw from a host-wide token bucket per account and quota bucket, under
-`state/github-shared/fallback-pacing/`. It allows a burst of 20 requests, then refills at
-`TAUCETI_GH_FALLBACK_SHARE` of the account's remaining quota, less 200 kept for writes, spread over
-the time left before the reset. Concurrent readers reserve successive refills instead of racing
-for one token. A caller that would fail fast on quota waits at most 60 seconds, then records a
-quota pause. Writes, quota probes and reads served by the service are not paced.
+fallback window in `state/github-shared/fallback.json`. A read-only direct `gh` command started in
+that window, including any quota waits it then makes, draws from a host-wide token bucket per
+account and quota bucket under `state/github-shared/fallback-pacing/`. It allows a burst of 20
+requests, then refills at `TAUCETI_GH_FALLBACK_SHARE` of the account's remaining quota, less 200
+kept for writes, spread over the time left before the reset. Concurrent readers reserve successive
+refills instead of racing for one token; requests and GraphQL points beyond one per command,
+such as pagination, are debited after the command. While the remaining quota is within the 200
+kept back, readers wait for the reset without reserving. A caller that would fail fast on quota
+waits at most 60 seconds (never past `TAUCETI_GH_PROXY_WAIT`), optional reads not at all, then
+records a quota pause. Quota and cooldowns are checked again after each pacing wait. Writes,
+quota probes and reads served by the service are not paced.
 
-A command is not sent while its quota bucket is known to be exhausted. Commands other than
-`gh api` are classified in advance: `gh pr`, `gh issue` and `gh repo` spend GraphQL (except
-`gh pr diff`), the rest REST core. Waits for an hourly reset, in the `gh` wrapper, the loop and
-stage pauses, add a random delay of up to `TAUCETI_GH_RESET_JITTER` seconds so the fleet does not
-wake together.
+A command is not sent while a quota bucket it spends is known to be exhausted. Commands other than
+`gh api` are classified in advance: `gh pr`, `gh issue` and `gh repo` spend GraphQL, `gh pr diff`
+also REST core, and `gh repo sync`, `gh repo fork` and the rest REST core only. Waits for an
+hourly reset, in the `gh` wrapper, the loop and stage pauses, add a random delay of up to
+`TAUCETI_GH_RESET_JITTER` seconds so the fleet does not wake together.
 
 Complete open-PR inventories share a 15-second cache; comment histories and permission reads
 share a 30-second cache. Keys include credential fingerprints and PR revision hints. Per-key

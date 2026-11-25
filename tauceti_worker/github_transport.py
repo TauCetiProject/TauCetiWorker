@@ -790,24 +790,39 @@ def fallback_active() -> bool:
         return False
 
 
-def opaque_resource(args) -> str:
-    """The quota bucket a non-`api` gh command spends: pull request, issue and repo reads use GraphQL."""
-    if args[:1] in (["pr"], ["issue"], ["repo"]) and args[1:2] != ["diff"]:
-        return "graphql"
-    return "core"
+def opaque_buckets(args) -> tuple[str, ...]:
+    """The quota buckets a non-`api` gh command spends, the one it is paced on first.
+
+    Pull request, issue and repository commands find their object with GraphQL; `pr diff` then
+    fetches the diff over REST. `repo sync` and `repo fork` are REST operations.
+    """
+    if args[:2] in (["repo", "sync"], ["repo", "fork"]):
+        return ("core",)
+    if args[:2] == ["pr", "diff"]:
+        return ("graphql", "core")
+    if args[:1] in (["pr"], ["issue"], ["repo"]):
+        return ("graphql",)
+    return ("core",)
+
+
+def _fallback_path(env, resource):
+    identity = quota_scope(scope(env))
+    return root() / "fallback-pacing" / identity / (resource + ".json") if identity else None
 
 
 def fallback_slot(env, resource, max_delay):
-    """Reserve one paced direct read; return the seconds to wait first, or None past `max_delay`.
+    """Reserve one paced direct read. Return (seconds to wait, whether a token was reserved).
 
     A reservation may run the bucket into debt, so concurrent callers queue behind each other
-    rather than all waking for the same refilled token. A refused caller reserves nothing.
+    rather than all waking for the same refilled token. While the account's remaining quota is
+    within the reserve nothing is reserved: the caller waits for the reset and asks again, so
+    waiting readers neither share one wakeup nor leave debt for the next window. A wait over
+    `max_delay` reserves nothing either.
     """
-    identity = quota_scope(scope(env))
-    if not identity:
-        return 0
+    path = _fallback_path(env, resource)
+    if path is None:
+        return 0.0, False
     share = _float_env("TAUCETI_GH_FALLBACK_SHARE", 0.5, 0.01, 1.0)
-    path = root() / "fallback-pacing" / identity / (resource + ".json")
     try:
         with locked(path.with_suffix(".lock"), timeout=5):
             try:
@@ -822,22 +837,51 @@ def fallback_slot(env, resource, max_delay):
                 window = max(60.0, reset - now)
             else:
                 remaining, reset, window = DEFAULT_LIMIT, None, 3600.0
-            rate = share * max(0, remaining - FALLBACK_RESERVE) / window
+            if remaining <= FALLBACK_RESERVE:
+                # The rest of this window is kept for writes; the next one starts unindebted.
+                atomic(path, {"tokens": min(tokens, 0.0), "updated": now})
+                return max(1.0, (reset or now + 60) - now + 2) + reset_jitter(), False
+            rate = share * (remaining - FALLBACK_RESERVE) / window
             tokens = min(float(FALLBACK_BURST), tokens + max(0.0, now - updated) * rate)
-            if tokens >= 1:
-                delay = 0.0
-            elif rate > 0:
-                delay = (1 - tokens) / rate
-            else:
-                # The account's remaining quota is reserved; fallback reads resume after the reset.
-                delay = max(1.0, (reset or now + 60) - now + 2) + reset_jitter()
+            delay = 0.0 if tokens >= 1 else (1 - tokens) / rate
             if delay > max_delay:
                 atomic(path, {"tokens": tokens, "updated": now})
-                return None
+                return delay, False
             atomic(path, {"tokens": tokens - 1, "updated": now})
-            return delay
+            return delay, True
+    except LockWaitExpired:
+        # Readers piling up behind a stalled holder must not all go straight to GitHub.
+        return 1.0, False
     except OSError:
-        return 0
+        return 0.0, True  # Broken local storage never blocks a read.
+
+
+def fallback_charge(env, records, resource, reserved):
+    """Debit the requests and GraphQL points a paced command spent beyond its one reservation."""
+    spent = {}
+    for record in records:
+        if not isinstance(record, dict) or record.get("kind", "http") != "http":
+            continue
+        bucket = record.get("resource") if isinstance(record.get("resource"), str) else resource
+        cost = record.get("graphql_cost") if bucket == "graphql" else None
+        spent[bucket] = spent.get(bucket, 0) + (cost if isinstance(cost, int) and cost > 0 else 1)
+    if reserved:
+        spent[resource] = spent.get(resource, 0) - 1
+    for bucket, extra in spent.items():
+        path = _fallback_path(env, bucket) if extra > 0 and re.fullmatch(r"[a-z_-]+", bucket) else None
+        if path is None:
+            continue
+        try:
+            with locked(path.with_suffix(".lock"), timeout=5):
+                try:
+                    state = json.loads(path.read_text())
+                    tokens, updated = float(state["tokens"]), float(state["updated"])
+                except (OSError, ValueError, KeyError, TypeError):
+                    tokens, updated = float(FALLBACK_BURST), time.time()
+                # Debt is repaid by the refill; it is bounded by what was actually sent.
+                atomic(path, {"tokens": tokens - extra, "updated": updated})
+        except OSError:
+            pass
 
 
 def parse_trace(stderr: str, *, identity=None, records=None) -> str:
@@ -1115,13 +1159,19 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
         if endpoint and endpoint.startswith("search/")
         else "core"
     )
+    buckets = (resource,)
     if endpoint is None:
-        # Opaque commands report no endpoint, but their quota bucket is still known in advance:
+        # Opaque commands report no endpoint, but their quota buckets are still known in advance:
         # a pull request view sent once GraphQL is known exhausted only spends a failed request.
-        resource = opaque_resource(args)
+        buckets = opaque_buckets(args)
+        resource = buckets[0]
     started = time.monotonic()
     ceiling = min(3600, max(0, int(effective.get("TAUCETI_GH_PROXY_WAIT", "3600"))))
     sent_intent = False
+    # A command that met a service fallback stays paced through long quota waits: the marker
+    # can expire while every reader on the host sleeps, which is not evidence of recovery.
+    fallback_paced = readonly and not quota_probe and fallback_active()
+    reserved = None
     while True:
         cooling = cooldown(effective)
         if cooling and not quota_probe:
@@ -1133,26 +1183,32 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
                 blocked.github_before_request = True
                 return blocked
             time.sleep(cooling)
-        known = observed_budget(effective).get(resource)
-        delay = max(1, known[1] - time.time() + 2) if known and known[0] == 0 and not quota_probe else 0
+        budget_now = observed_budget(effective)
+        exhausted = [(b, budget_now[b]) for b in dict.fromkeys((resource, *buckets)) if budget_now.get(b, (1,))[0] == 0]
+        known = max(exhausted, key=lambda item: item[1][1])[1] if exhausted and not quota_probe else None
+        delay = max(1, known[1] - time.time() + 2) if known else 0
         if delay:
+            bucket = max(exhausted, key=lambda item: item[1][1])[0]
             if not wait or time.monotonic() - started + delay > ceiling:
-                record_block(resource, known[1], scope(effective))
+                record_block(bucket, known[1], scope(effective))
                 blocked = subprocess.CompletedProcess(
-                    argv, 1, "", f"gh: API rate limit exceeded ({resource}); reset at {known[1]}\n"
+                    argv, 1, "", f"gh: API rate limit exceeded ({bucket}); reset at {known[1]}\n"
                 )
                 blocked.github_before_request = True
                 return blocked
             # Every worker waiting on this account sees the same reset; spread their wakeups.
             delay = min(delay + reset_jitter(), max(delay, ceiling - (time.monotonic() - started)))
-            print(f"gh: API rate limit exhausted ({resource}); waiting {int(delay)}s for reset", file=sys.stderr)
+            print(f"gh: API rate limit exhausted ({bucket}); waiting {int(delay)}s for reset", file=sys.stderr)
             time.sleep(delay)
             continue
-        if readonly and not quota_probe and fallback_active():
-            budget = ceiling - (time.monotonic() - started) if wait else FALLBACK_NOWAIT
-            delay = fallback_slot(effective, resource, max(0, budget))
-            if delay is None:
-                retry = time.time() + max(1, min(budget, 60))
+        fallback_paced = fallback_paced or (readonly and not quota_probe and fallback_active())
+        if fallback_paced and reserved is None:
+            # Optional reads yield at once, as they do for other quota waits.
+            limit = ceiling - (time.monotonic() - started)
+            budget = max(0, limit if wait else min(FALLBACK_NOWAIT, limit)) if retry_reads() else 0
+            delay, granted = fallback_slot(effective, resource, budget)
+            if delay > budget:
+                retry = time.time() + max(1, min(delay, 3600))
                 record_block(resource, int(retry) + 1, scope(effective))
                 blocked = subprocess.CompletedProcess(
                     argv,
@@ -1162,8 +1218,14 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
                 )
                 blocked.github_before_request = True
                 return blocked
+            if granted:
+                reserved = resource
             if delay:
                 time.sleep(delay)
+            if delay or not granted:
+                # Revalidate quota and cooldowns a peer may have recorded meanwhile, keeping
+                # any reservation; an ungranted wait asks the bucket again.
+                continue
         if paced:
             delay = mutation_slot(effective)
             if delay:
@@ -1199,6 +1261,9 @@ def _execute(argv, *, env=None, wait: bool = False, _intent=None, **kwargs):
             raise
         p.stderr = parse_trace(p.stderr or "", identity=scope(effective), records=records)
         p.github_records = records
+        if fallback_paced:
+            fallback_charge(effective, records, resource, reserved == resource)
+            reserved = None  # A retry is another request and reserves again.
         if effective.get("_TAUCETI_REVIEW_APP_TOKEN") == "1" and (
             "HTTP 401" in p.stderr or any(r.get("status") == 401 for r in records if isinstance(r, dict))
         ):

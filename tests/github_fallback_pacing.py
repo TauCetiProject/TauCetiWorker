@@ -7,6 +7,7 @@ kept sending pull request views at zero remaining. These cases pin the host-wide
 the zero-remaining check for opaque commands and the spread of wakeups after a reset.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -81,10 +82,14 @@ class FallbackPacing(unittest.TestCase):
         self.assertEqual(self.sent(), [])
         # An exhausted REST bucket does not stop a GraphQL-only command, nor GraphQL a REST command.
         self.assertEqual(self.run_gh(clock, "run", "list").returncode, 0)
+        # `pr diff` finds the pull request with GraphQL, then reads the diff over REST.
+        self.assertEqual(self.run_gh(clock, "pr", "diff", "1").returncode, 1)
+        # `repo sync` is a REST operation; GraphQL exhaustion does not hold it back.
+        self.assertEqual(self.run_gh(clock, "repo", "sync", "o/r").returncode, 0)
         self.exhaust(clock, "core")
         self.exhaust(clock, "graphql", remaining=4000, reset_in=1200)
         self.assertEqual(self.run_gh(clock, "pr", "diff", "1").returncode, 1)
-        self.assertEqual(self.sent(), ["run list"])
+        self.assertEqual(self.sent(), ["run list", "repo sync o/r"])
 
     def test_waiting_read_wakes_after_reset_with_jitter(self):
         clock = Clock()
@@ -162,25 +167,92 @@ class FallbackPacing(unittest.TestCase):
         self.assertEqual(len(clock.sleeps), 1)
         self.assertAlmostEqual(clock.sleeps[0], 10.0, places=3)
 
-    def test_reserved_quota_waits_for_the_reset(self):
+    def bucket(self, resource="core"):
+        return tr.root() / "fallback-pacing" / tr.quota_scope(tr.scope()) / (resource + ".json")
+
+    def test_reserved_quota_waits_for_the_reset_without_debt(self):
+        clock = Clock()
+        with patch.object(tr.time, "time", clock.time):
+            tr.note_fallback()
+        self.exhaust(clock, "core", remaining=tr.FALLBACK_RESERVE, reset_in=300)
+        # Even a full burst is not spent from the reserve, and refusals leave no debt.
+        for _ in range(100):
+            p = self.run_gh(clock, "api", "repos/o/r/pulls")
+            self.assertEqual(p.returncode, 1)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(clock.sleeps, [])
+        self.run_gh(clock, "api", "repos/o/r/pulls", wait=True)
+        self.assertEqual(clock.sleeps, [302])
+        self.assertEqual(self.sent(), ["api repos/o/r/pulls"])
+        # The next window starts with refill, not with the refused callers' debt.
+        clock.sleeps.clear()
+        clock.now += 10
+        self.assertEqual(self.run_gh(clock, "api", "repos/o/r/pulls").returncode, 0)
+        self.assertEqual(clock.sleeps, [])
+
+    def test_pacing_survives_a_long_quota_wait(self):
+        clock = Clock()
+        with patch.object(tr.time, "time", clock.time):
+            tr.note_fallback()
+            tr.atomic(self.bucket("graphql"), {"tokens": 5, "updated": clock.now})
+        self.exhaust(clock, "graphql", reset_in=600)
+        self.assertEqual(self.run_gh(clock, "pr", "view", "1", wait=True).returncode, 0)
+        with patch.object(tr.time, "time", clock.time):
+            self.assertFalse(tr.fallback_active())
+        state = json.loads(self.bucket("graphql").read_text())
+        self.assertEqual(state["updated"], clock.now)  # The send still drew from the bucket.
+
+    def test_peer_exhaustion_during_a_pacing_sleep_stops_the_send(self):
+        clock = Clock()
+        with patch.object(tr.time, "time", clock.time):
+            tr.note_fallback()
+            tr.atomic(self.bucket("graphql"), {"tokens": 0, "updated": clock.now})
+        sleep = clock.sleep
+
+        def peer_exhausts(seconds):
+            sleep(seconds)
+            self.exhaust(clock, "graphql", reset_in=900)
+
+        clock.sleep = peer_exhausts
+        p = self.run_gh(clock, "pr", "view", "1")
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(len(clock.sleeps), 1)
+        self.assertEqual(self.sent(), [])
+
+    def test_optional_reads_and_zero_ceiling_do_not_sleep(self):
         clock = Clock(advance=False)
         with patch.object(tr.time, "time", clock.time):
             tr.note_fallback()
-            path = tr.root() / "fallback-pacing" / tr.quota_scope(tr.scope()) / "core.json"
-            tr.atomic(path, {"tokens": 0, "updated": clock.now})
-        self.exhaust(clock, "core", remaining=tr.FALLBACK_RESERVE, reset_in=300)
-        p = self.run_gh(clock, "api", "repos/o/r/pulls")
-        self.assertEqual(p.returncode, 1)
+            tr.atomic(self.bucket(), {"tokens": 0, "updated": clock.now})
+        with tr.read_context(retry=False):
+            self.assertEqual(self.run_gh(clock, "api", "repos/o/r/pulls").returncode, 1)
+        os.environ["TAUCETI_GH_PROXY_WAIT"] = "0"
+        self.assertEqual(self.run_gh(clock, "api", "repos/o/r/pulls").returncode, 1)
+        self.assertEqual(clock.sleeps, [])
         self.assertEqual(self.sent(), [])
-        self.run_gh(clock, "api", "repos/o/r/pulls", wait=True)
-        self.assertEqual(clock.sleeps, [302])
+
+    def test_contended_lock_refuses_instead_of_sending(self):
+        with patch.object(tr, "locked", side_effect=tr.LockWaitExpired("held")):
+            self.assertEqual(tr.fallback_slot(None, "core", 60), (1.0, False))
+
+    def test_requests_and_points_beyond_the_reservation_are_debited(self):
+        clock = Clock(advance=False)
+        with patch.object(tr.time, "time", clock.time):
+            tr.atomic(self.bucket("graphql"), {"tokens": 10, "updated": clock.now})
+            records = [
+                {"kind": "http", "resource": "graphql", "graphql_cost": 30},
+                {"kind": "http", "resource": "core"},
+                {"kind": "http", "resource": "core"},
+            ]
+            tr.fallback_charge(None, records, "graphql", True)
+        self.assertEqual(json.loads(self.bucket("graphql").read_text())["tokens"], 10 - 29)
+        self.assertEqual(json.loads(self.bucket("core").read_text())["tokens"], tr.FALLBACK_BURST - 2)
 
     def test_writes_and_quota_probes_are_not_paced(self):
         clock = Clock(advance=False)
         with patch.object(tr.time, "time", clock.time):
             tr.note_fallback()
-            path = tr.root() / "fallback-pacing" / tr.quota_scope(tr.scope()) / "core.json"
-            tr.atomic(path, {"tokens": -1000, "updated": clock.now})
+            tr.atomic(self.bucket(), {"tokens": -1000, "updated": clock.now})
         self.assertEqual(self.run_gh(clock, "api", "-X", "PATCH", "repos/o/r/issues/1").returncode, 0)
         self.assertEqual(self.run_gh(clock, "api", "rate_limit").returncode, 0)
         self.assertEqual(clock.sleeps, [])
