@@ -18,6 +18,10 @@ from .mixed_identity import SourceNumber
 
 
 class MixedNativePolicy(NativeAdmissionPolicy):
+    # Whether an unlabelled head needs the queue's own green PR build (`forgejo_pr_build.py`) before
+    # admission: the runtime setting `forgejo_admission_requires_build`, wired in by the controller.
+    require_build = staticmethod(lambda: False)
+
     def evaluate(self, snapshot):
         # Admission here reserves a candidate for execution, never permission
         # to land. No native success status or build result is fabricated.
@@ -33,8 +37,23 @@ class MixedNativePolicy(NativeAdmissionPolicy):
                 if static["merge"]
                 else static["reason"]
             )
+        from tauceti_tools.self_tested import requested
+
+        build = snapshot.statuses.get("build", "")
+        if (
+            result.get("merge")
+            and self.require_build()
+            and build != "success"
+            and not requested(list(snapshot.pull.labels))
+        ):
+            # Like GitHub admission, an unlabelled head waits for its PR build. The PR is evaluated
+            # again when the build's result is posted (`forgejo_pr_build.perform`).
+            result["merge"] = False
+            result["reason"] = f"waiting for the Forgejo PR build (`build` {build or 'missing'})"
         evidence.update(
-            source=self.publishers.source.record(), candidate_ci_required=True, observed_source_ci="unknown"
+            source=self.publishers.source.record(),
+            candidate_ci_required=True,
+            observed_source_ci=build or "unknown",
         )
         return result, authorization, evidence, comment, meta
 
@@ -61,7 +80,25 @@ class MixedNativeSource(ForgejoSourceAdapter):
         self.profile, self.mode = profile, config.forgejo_mode
 
     def _statuses(self, head, rows=None):
-        return {}  # Source commit statuses never stand in for execution evidence.
+        """Only the queue's own `build`, posted by its publisher from its PR build of this head.
+
+        Anyone with code write can post a status, contributor fleets included, so no other status
+        is read. The `build` only gates admission of unlabelled heads (`MixedNativePolicy`); it never
+        stands in for the exact candidate CI that landing requires."""
+        if rows is None and not self.admission_policy.require_build():
+            return {}  # nothing reads it: spare Forgejo the request
+        rows = self.client.statuses(self.repository, head) if rows is None else rows
+        newest = None
+        for row in rows:
+            if not isinstance(row, dict) or row.get("context") != "build" or type(row.get("id")) is not int:
+                continue
+            creator = row.get("creator")
+            if not isinstance(creator, dict) or creator.get("id") != self.profile.publisher:
+                continue
+            if newest is None or row["id"] > newest["id"]:
+                newest = row
+        state = "" if newest is None else (newest.get("status") or newest.get("state") or "")
+        return {"build": state} if state in {"pending", "success", "failure", "error"} else {}
 
     def list_open_pull_requests(self, repo, **options):
         return super().list_open_pull_requests(repo, admission=True)

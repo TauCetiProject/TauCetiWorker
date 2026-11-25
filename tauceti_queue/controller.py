@@ -132,6 +132,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "forgejo_pr_build_retry_seconds": 600,
     # The GitHub accounts whose `main-integration` status is a verdict (the CI status App).
     "forgejo_pr_build_status_creators": ["tauceti-live-ci"],
+    # Admit an unlabelled Forgejo head only once the queue's PR build of it is green, as GitHub
+    # admission waits for `build`. A `self-tested` head is admitted without one. Off by default.
+    "forgejo_admission_requires_build": False,
     "insertion_age_window": 16,
     "open_batch_limit": 2,
     # Freeze oldest unsealed batches at this size until two active batches are sealed in total.
