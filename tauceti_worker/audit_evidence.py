@@ -16,6 +16,11 @@ Every finished, failed or interrupted attempt is exactly one outcome, in this pr
 
 A concern is a judgment's nonempty findings, or a `finding` label even without findings.
 Concerns are collected before any validation, so an invalid attempt can never discard one.
+
+A commit reviewed in parts keeps each part's stages in its own directory, named by the attempt's
+part plan (`PLANS`). Each part is read like a whole attempt, and the attempt is their union: any
+part's concern or unreadable evidence binds the commit, any part's unescalated triage concern
+escalates it, and it passes only if every planned part has a valid pass.
 """
 
 from __future__ import annotations
@@ -31,6 +36,8 @@ from .config import Die
 FINDING, UNREADABLE, PASS, NOT_JUDGED = "finding", "unreadable", "pass", "not-judged"
 ESCALATE = "escalate"
 TRIAGE, ESCALATION = "", "escalation-"  # The file-name prefix of each stage (security_audit).
+PLANS = "parts.json"  # The part plan of a commit reviewed in parts (security_audit.PLANS).
+PART = re.compile(r"part-\d{4}")
 
 # Text that mentions a judgment key must contain a readable judgment.
 KEYS = ("verdict", "findings")  # Either key makes a decoded object a judgment.
@@ -168,13 +175,44 @@ def read_response(path: Path, evidence: Evidence) -> None:
             evidence.tools.append(str(block.get("type")))
 
 
+def planned_parts(attempt: Path) -> list[Path] | None:
+    """The part directories a commit reviewed in parts needs, or None for a single-request attempt.
+
+    Raises ValueError when the plan cannot be read, or when part directories exist without one."""
+    path = attempt / PLANS
+    if not path.exists():
+        if any(attempt.glob("part-*")):
+            raise ValueError("part directories without a part plan")
+        return None
+    plan = json.loads(path.read_text(encoding="utf-8"))
+    names = [p["dir"] for p in plan["parts"]]
+    if not names or len(set(names)) != len(names) or not all(isinstance(n, str) and PART.fullmatch(n) for n in names):
+        raise ValueError("malformed part plan")
+    if any(p.name not in names for p in attempt.glob("part-*")):
+        raise ValueError("a part directory the plan does not name")
+    return [attempt / name for name in names]
+
+
+def stage_dirs(attempt: Path) -> list[Path]:
+    """Every directory holding stages of this attempt: itself, and its planned parts."""
+    try:
+        return [attempt, *(planned_parts(attempt) or [])]
+    except (OSError, ValueError, KeyError, TypeError):
+        return [attempt, *sorted(attempt.glob("part-*"))]
+
+
+def stage_escalated(here: Path) -> bool:
+    return (here / f"{ESCALATION}request.json").exists()
+
+
 def escalated(attempt: Path) -> bool:
-    return (attempt / f"{ESCALATION}request.json").exists()
+    """Whether the escalation reviewer was asked, for the attempt or any of its parts."""
+    return any(stage_escalated(here) for here in stage_dirs(attempt))
 
 
-def answer_path(attempt: Path) -> Path:
-    """The response that decides the attempt: the escalation reviewer's once it was asked."""
-    return attempt / f"{ESCALATION if escalated(attempt) else TRIAGE}response.json"
+def answer_path(here: Path) -> Path:
+    """The response that decides an attempt (or one part): the escalation reviewer's once asked."""
+    return here / f"{ESCALATION if stage_escalated(here) else TRIAGE}response.json"
 
 
 def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] | None = None) -> Evidence:
@@ -190,17 +228,12 @@ def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] 
         evidence.unreadable.append(f"{attempt}: cyclic continuation lineage")
         return evidence
     seen.add(attempt)
-    if escalated(attempt):
-        read_response(answer_path(attempt), evidence)
-    else:
-        triage = Evidence()
-        read_response(answer_path(attempt), triage)
-        reasons = [text for _, texts in triage.concerns() for text in texts] + triage.unreadable
-        if reasons:
-            evidence.escalate.extend(reasons)
-        else:
-            evidence.judgments.extend(triage.judgments)
-            evidence.tools.extend(triage.tools)
+    try:
+        planned_parts(attempt)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        evidence.unreadable.append(f"{attempt / PLANS}: {exc}")
+    for here in stage_dirs(attempt):
+        collect_stages(here, evidence)
     previous = attempt / "previous-block.json"
     if previous.exists():
         try:
@@ -214,10 +247,26 @@ def collect(attempt: Path, evidence: Evidence | None = None, *, seen: set[Path] 
     return evidence
 
 
-def triage_judgment(attempt: Path) -> dict:
-    """The triage reviewer's judgment, for the record of an escalated attempt."""
+def collect_stages(here: Path, evidence: Evidence) -> None:
+    """The binding evidence of one attempt directory, or of one part of a commit reviewed in parts."""
+    if stage_escalated(here):
+        read_response(answer_path(here), evidence)
+        return
     triage = Evidence()
-    read_response(attempt / f"{TRIAGE}response.json", triage)
+    read_response(answer_path(here), triage)
+    reasons = [text for _, texts in triage.concerns() for text in texts] + triage.unreadable
+    if reasons:
+        evidence.escalate.extend(reasons)
+    else:
+        evidence.judgments.extend(triage.judgments)
+        evidence.tools.extend(triage.tools)
+
+
+def triage_judgment(attempt: Path) -> dict:
+    """The triage reviewer's judgments (of every part), for the record of an escalated attempt."""
+    triage = Evidence()
+    for here in stage_dirs(attempt):
+        read_response(here / f"{TRIAGE}response.json", triage)
     return {"judgments": triage.judgments, "unreadable": triage.unreadable}
 
 
@@ -294,16 +343,55 @@ def completed_pass(attempt: Path, batch: dict, evidence: Evidence) -> dict:
         raise Die(
             f"security-audit: reviewer answered with unexpected content: {', '.join(sorted(set(evidence.tools)))}"
         )
-    response = json.loads(answer_path(attempt).read_text())
-    if response.get("stop_reason") != "end_turn":
-        raise Die(f"security-audit: reviewer stopped with {response.get('stop_reason')}")
-    texts = [b["text"] for b in response["content"] if b.get("type") == "text"]
-    if len(texts) != 1:
-        raise Die("security-audit: reviewer answer is not exactly one judgment")
-    verdict = sa.bind_verdict(json.loads(texts[0]), batch)
-    if verdict["verdict"] != "pass":
-        raise Die(f"security-audit: {verdict['verdict']} without a recorded concern")
+    parts = planned_parts(attempt)
+    if parts is not None:
+        plan = json.loads((attempt / PLANS).read_text())
+        if (
+            len(batch["commits"]) != 1
+            or plan["input_digest"] != batch["input_digest"]
+            or plan["commit"] != batch["commits"][0]["sha"]
+            or not plan_covers(plan, batch["commits"][0])
+        ):
+            raise Die("security-audit: the part plan does not cover this exact commit")
+    verdict = None
+    for here in parts if parts is not None else [attempt]:
+        response = json.loads(answer_path(here).read_text())
+        if response.get("stop_reason") != "end_turn":
+            raise Die(f"security-audit: reviewer stopped with {response.get('stop_reason')}")
+        texts = [b["text"] for b in response["content"] if b.get("type") == "text"]
+        if len(texts) != 1:
+            raise Die("security-audit: reviewer answer is not exactly one judgment")
+        verdict = sa.bind_verdict(json.loads(texts[0]), batch)
+        if verdict["verdict"] != "pass":
+            raise Die(f"security-audit: {verdict['verdict']} without a recorded concern")
     return verdict
+
+
+HUNKS = re.compile(r"(\d+)-(\d+) of (\d+)")
+
+
+def plan_covers(plan: dict, commit: dict) -> bool:
+    """Whether the plan's parts hold every file of the commit exactly once: whole, or every hunk."""
+    from .security_audit import hunks
+
+    units: dict[str, list] = {}
+    for p in plan["parts"]:
+        for unit in p["units"]:
+            units.setdefault(unit["path"], []).append(unit["hunks"])
+    if set(units) != {f["path"] for f in commit["files"]}:
+        return False
+    for f in commit["files"]:
+        found = units[f["path"]]
+        if found == [None]:
+            continue
+        spans = [HUNKS.fullmatch(h) if isinstance(h, str) else None for h in found]
+        if not all(spans):
+            return False
+        count = len(hunks(f["diff"])[1])
+        covered = [k for m in spans for k in range(int(m[1]), int(m[2]) + 1)]
+        if any(int(m[3]) != count for m in spans) or covered != list(range(1, count + 1)):
+            return False
+    return True
 
 
 def classify(state: Path, attempt: Path, batch: dict, failure: BaseException | str | None = None) -> Outcome:
@@ -352,12 +440,13 @@ def engaged(attempt: Path) -> bool:
 
     An attempt that is not a judgment is divided only then; a provider or setup failure, where
     no reviewer engaged, is retried on the same range."""
-    for stage in (TRIAGE, ESCALATION):
-        if (attempt / f"{stage}response.json").exists():
-            return True
-        try:
-            if json.loads((attempt / f"{stage}reviewer-error.json").read_text()).get("too_large") is True:
+    for here in stage_dirs(attempt):
+        for stage in (TRIAGE, ESCALATION):
+            if (here / f"{stage}response.json").exists():
                 return True
-        except (OSError, ValueError, AttributeError):
-            pass
+            try:
+                if json.loads((here / f"{stage}reviewer-error.json").read_text()).get("too_large") is True:
+                    return True
+            except (OSError, ValueError, AttributeError):
+                pass
     return False
