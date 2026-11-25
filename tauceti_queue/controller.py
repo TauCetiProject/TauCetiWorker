@@ -3452,12 +3452,18 @@ class Controller:
     def observe_labels(self, number: Any, labels: Sequence[Any]) -> None:
         """Record a PR's current labels (from a discovery listing or a label event) on its waiting
         input, as `inputs.labels`, which sprint mode reads."""
+        from .mixed_identity import source_record
+
         names = dumps(sorted({str(label).lower() for label in labels}))
+        where = {
+            "repository": self.repository,
+            "state": [INPUT_WAITING, INPUT_RESERVED],
+            "number": int(number),
+            "source_identity": source_record(number),
+        }
         with self._lock:
-            for row in self.store.rows(
-                "inputs", {"repository": self.repository, "state": [INPUT_WAITING, INPUT_RESERVED]}
-            ):
-                if row["number"] == number and row["labels"] != names:
+            for row in self.store.rows("inputs", where):
+                if row["labels"] != names:
                     self.store.update("inputs", {"id": row["id"]}, labels=names)
                     if self.setting("sprint_label"):
                         self._wake.set()
