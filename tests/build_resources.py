@@ -93,6 +93,35 @@ class Resources(unittest.TestCase):
         self.assertNotIn("LEAN_NUM_THREADS", env)
         self.assertNotIn("RAYON_NUM_THREADS", env)
 
+    def test_a_hung_build_is_stopped_but_waiting_or_working_lean_is_not(self):
+        from tauceti_worker import verification
+        from tauceti_worker.verification import Incomplete, Verification
+
+        verifier = Verification(self.root, self.root / "state")
+        verifier.directory.mkdir(parents=True)
+        silent = [sys.executable, "-c", "import time; time.sleep(3)"]
+        samples = {"hung": lambda session: (2, 40), "waiting": lambda session: (0, 0)}
+        progress = iter(range(1000))
+        samples["working"] = lambda session: (2, next(progress))
+        for name, sample in samples.items():
+            with (
+                patch.object(verification, "STALL_S", 0.5),
+                patch.object(verification, "STALL_SAMPLE_S", 0.1),
+                patch.object(verification, "lean_cpu", sample),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                if name == "hung":
+                    with self.assertRaises(Incomplete) as stopped:
+                        verifier.command("build", silent)
+                    self.assertEqual(stopped.exception.reason, "stalled")
+                else:
+                    verifier.command("build", silent)  # Finishes on its own.
+        # Other phases are never judged, and the sampler finds only the Lean binary.
+        with patch.object(verification, "STALL_S", 0.5), patch.object(verification, "lean_cpu", samples["hung"]):
+            with contextlib.redirect_stderr(io.StringIO()):
+                verifier.command("lint", silent)
+        self.assertEqual(verification.lean_cpu(os.getsid(0)), (0, 0))
+
     def test_defaults_preserve_explicit_values(self):
         self.assertEqual(v.defaults({}), {"LEAN_NUM_THREADS": "4", "RAYON_NUM_THREADS": "1"})
         self.assertEqual(v.defaults({"RAYON_NUM_THREADS": "2"})["RAYON_NUM_THREADS"], "2")

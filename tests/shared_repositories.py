@@ -238,3 +238,25 @@ with s.borrowed_snapshot('org/roadmap') as source:
         with shared.borrowed_snapshot("org/roadmap"):
             assert not garbage.exists(), "optional cleanup failures must be retried without failing readers"
 print("PASS: shared snapshot TTL, immutability, old-round retention and self-contained Git metadata")
+
+# Reviews read the roadmap from the host snapshot instead of cloning it per review; without one,
+# the engine's own clone is the fallback.
+from types import SimpleNamespace  # noqa: E402
+
+from tauceti_worker import agents  # noqa: E402
+
+with tempfile.TemporaryDirectory() as scratch:
+    state = Path(scratch)
+    attached = []
+
+    def fake_attach(repo, destination, *, ttl):
+        attached.append((repo, destination, ttl))
+        return True
+
+    with patch.object(shared, "attach", fake_attach):
+        flags = agents.review_roadmap(SimpleNamespace(state=state))
+    assert flags == ["--roadmap-dir", str(state / "refs/review-roadmap")], flags
+    assert attached == [(agents.ROADMAP, state / "refs/review-roadmap", 300)], attached
+    with patch.object(shared, "attach", lambda *a, **k: False):
+        assert agents.review_roadmap(SimpleNamespace(state=state)) == []
+print("PASS: reviews use the shared roadmap snapshot, refreshed every 5 minutes")

@@ -3013,6 +3013,17 @@ def _claude_review_model(reviewers: str) -> str | None:
     return model
 
 
+def review_roadmap(cfg) -> list[str]:
+    """`--roadmap-dir` naming the host's shared roadmap snapshot, refreshed at most every 5 minutes.
+
+    The engine otherwise clones the roadmap afresh for every review; without a snapshot it still does.
+    """
+    from .shared_repositories import attach
+
+    staged = cfg.state / "refs" / "review-roadmap"
+    return ["--roadmap-dir", str(staged)] if attach(ROADMAP, staged, ttl=300) else []
+
+
 def _codex_review_model_override(reviewers: str) -> str | None:
     """Independent review-model override, or None for the engine's own policy."""
     m = os.environ.get("TAUCETI_REVIEW_CODEX_MODEL")

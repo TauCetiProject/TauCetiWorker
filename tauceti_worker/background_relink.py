@@ -96,6 +96,11 @@ def _idle_lake(checkout: Path, env) -> Path | None:
     return lake if worktrees(env) and lake.is_dir() and not lake.is_symlink() and not inside.exists() else None
 
 
+def will_follow(env) -> bool:
+    """Whether a between-rounds pass will follow this round (so its round end need not relink)."""
+    return enabled(env) and len(_HELD) == 1
+
+
 def request(checkout: Path, env) -> None:
     """Ask for a full pass on `checkout`'s tree after this round (the caller holds the lock)."""
     if not enabled(env):

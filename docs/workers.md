@@ -605,7 +605,10 @@ checkout as before.
 Each TauCeti build output is stored once per host as a canonical object that every checkout hard
 links. Before the agent starts, a round only checks that hard links work in the agent's namespace;
 if they do not, the agent is not started, because Lake would silently copy. After the agent exits,
-the round relinks what its agent built (`TAUCETI_RELINK_BUDGET_S`, default 180 s). The full pass,
+the round only confirms that no Lake or Lean process still names the checkout and leaves the
+relinking to the between-rounds pass. Where no such pass will follow (it is turned off, or the
+round did not take the build-tree lock), the round relinks what its agent built itself
+(`TAUCETI_RELINK_BUDGET_S`, default 180 s). The full pass,
 which also sweeps the worker's private Lake store and deletes setup files, runs between rounds in a
 child of the worker's loop, on the `.lake` the round left (in place, or parked beside a removed per-round worktree). It
 runs at `nice` 10 for at most `TAUCETI_BACKGROUND_RELINK_BUDGET_S` (default 900 s) and resumes from

@@ -1151,6 +1151,26 @@ class Canonical(unittest.TestCase):
         self.assertEqual((store / "artifacts" / name).stat().st_ino, (objects / name).stat().st_ino)
         self.assertEqual(report["relinked_private"], 1)
 
+    def test_round_end_only_marks_the_tree_when_a_between_rounds_pass_follows(self):
+        from tauceti_worker import background_relink
+
+        checkout = self.checkout("w", "TauCeti.A")
+        env = dict(os.environ, LAKE_CACHE_DIR=str(self.root / "w-store"))
+        canonical.boundary(checkout, env, phase="prepare")
+        marker = checkout / ".lake" / canonical.IN_PROGRESS
+        with (
+            patch.object(background_relink, "will_follow", lambda env: True),
+            patch.object(canonical, "relink", side_effect=AssertionError("the round waited for a pass")),
+        ):
+            with patch.object(canonical, "writers", lambda path: [1]):
+                self.assertEqual(canonical.boundary(checkout, env, phase="round-end"), {"skipped": "busy"})
+            self.assertTrue(marker.exists())  # Not quiescent: the next round checks the tree.
+            self.assertEqual(canonical.boundary(checkout, env, phase="round-end"), {})
+        self.assertFalse(marker.exists())
+        # Without a pass to follow (no build-tree lock held), the round end relinks as before.
+        self.assertFalse(background_relink.will_follow(env))
+        self.assertEqual(canonical.boundary(checkout, env, phase="round-end")["published_local"], 5)
+
     def test_link_failure_is_fatal(self):
         first = self.checkout("first", "TauCeti.A")
         self.relink(first)

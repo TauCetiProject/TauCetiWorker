@@ -22,6 +22,12 @@ history. Missing canonical main fails closed with an incomplete receipt: there i
 bind evidence to. Unknown lint scope remains incomplete instead of silently establishing lint evidence.
 A stage-only build or audit does not claim the skipped requested lint succeeded.
 
+A build whose Lean processes use no CPU and print nothing for `TAUCETI_VERIFY_STALL_S` seconds
+(default 900) is hung: the verifier stops it and records the phase as incomplete with reason
+`stalled`, instead of leaving it to the agent's one-hour shell budget. Only the Lean binary counts;
+a Lean invocation still waiting for CPU capacity runs as its Python wrapper and is never judged.
+Outputs already built are kept, so rerunning the verify continues the build.
+
 All stages run the whole-library `lake build --iofail`, fast changed-file axiom diagnostics,
 module-system, source style lint, changed-module environment/documentation lint, and the shim ratchet.
 A stage-only call runs that stage; it does not assert that prerequisites or other stages passed.

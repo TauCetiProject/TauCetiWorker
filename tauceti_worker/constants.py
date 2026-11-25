@@ -167,7 +167,9 @@ ROUND_TIMEOUT = int(os.environ.get("TAUCETI_ROUND_TIMEOUT", "21600"))  # 6 h
 # of a restarted loop can still be finishing.
 ROUND_LOCK_WAIT = int(os.environ.get("TAUCETI_ROUND_LOCK_WAIT", "120"))
 
-INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "20"))  # min gap after a PRODUCTIVE round
+# Min gap after a PRODUCTIVE round. Short: the next round's own selection, claims and admission
+# already pace the loop; decision 210 found the old 20 s cost about 50 slot-hours a day.
+INTERROUND = int(os.environ.get("TAUCETI_INTERROUND", "2"))
 
 # A managed worker's wrapper sends this to its loop driver (never to a round's process group) to
 # request a graceful restart: the loop exits at its next round boundary, or at once between rounds.

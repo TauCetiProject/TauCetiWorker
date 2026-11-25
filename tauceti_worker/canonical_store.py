@@ -1333,6 +1333,18 @@ def boundary(checkout, env, *, phase, prefix=()):
         except OSError as error:
             log(f"canonical store (prepare): could not mark the tree in use: {error}")
         return report or {}
+    if phase == "round-end":
+        from . import background_relink
+
+        if background_relink.will_follow(env):
+            # The agent's processes are gone; the full pass runs between rounds, so the round
+            # itself waits for nothing but this check.
+            if busy := sorted(writers(checkout)):
+                log(f"canonical store (round-end): Lake or Lean processes {busy} name the checkout; not quiescent")
+                return {"skipped": "busy"}
+            (checkout / ".lake" / IN_PROGRESS).unlink(missing_ok=True)
+            log("canonical store (round-end): quiescent; relinking runs between rounds")
+            return {}
     report = _logged(
         phase,
         lambda: relink(
