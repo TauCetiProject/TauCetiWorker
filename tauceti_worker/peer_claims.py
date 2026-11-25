@@ -194,16 +194,23 @@ def _note_head(kind: str, ttl: int, scope: str, pr: int, head: str, now: float |
         pass  # without the record, peers each pay one more engine check
 
 
-def _head_noted(kind: str, ttl: int, scope: str, pr: int, head: str, now: float | None) -> bool:
+def _head_noted_at(kind: str, ttl: int, scope: str, pr: int, head: str, now: float | None) -> float | None:
+    """When the live record for this head was written, or None without one."""
     path = _head_record_path(kind, scope, pr, head)
     if path is None:
-        return False
+        return None
     try:
         expires = json.loads(path.read_text()).get("expires_at")
     except (OSError, ValueError, AttributeError):
-        return False
+        return None
     stamp = time.time() if now is None else now
-    return isinstance(expires, (int, float)) and stamp < expires <= stamp + ttl
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)) or not stamp < expires <= stamp + ttl:
+        return None
+    return float(expires - ttl)
+
+
+def _head_noted(kind: str, ttl: int, scope: str, pr: int, head: str, now: float | None) -> bool:
+    return _head_noted_at(kind, ttl, scope, pr, head, now) is not None
 
 
 def note_diff_guard(scope: str, pr: int, head: str, *, now: float | None = None) -> None:
@@ -222,3 +229,15 @@ def note_unchanged_review(scope: str, pr: int, head: str, *, now: float | None =
 
 def unchanged_review_noted(scope: str, pr: int, head: str, *, now: float | None = None) -> bool:
     return _head_noted("unchanged", UNCHANGED_REVIEW_TTL_S, scope, pr, head, now)
+
+
+def unchanged_review_noted_at(scope: str, pr: int, head: str, *, now: float | None = None) -> float | None:
+    """When a worker on this host found this head's verdict already published, or None."""
+    return _head_noted_at("unchanged", UNCHANGED_REVIEW_TTL_S, scope, pr, head, now)
+
+
+def scope_of(source) -> str:
+    """The repository a source's leases and head records belong to, qualified by forge where it has one."""
+    repository = getattr(source, "repository", None)
+    key = getattr(repository, "key", None)
+    return key if isinstance(key, str) else str(getattr(source, "repo", ""))

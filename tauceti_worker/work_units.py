@@ -228,10 +228,21 @@ def _apply_build_affinity(w, sv, opts) -> None:
 
 def _claim_scope(w) -> str:
     """The repository a candidate's leases belong to, qualified by forge where the source has one."""
-    gh = getattr(w, "gh", None)
-    repository = getattr(gh, "repository", None)
-    key = getattr(repository, "key", None)
-    return key if isinstance(key, str) else str(getattr(gh, "repo", ""))
+    return peer_claims.scope_of(getattr(w, "gh", None))
+
+
+def _note_published(w, pr: int, head: str, at: float, *, shared: bool = True) -> None:
+    """Record that `head`'s verdict was published, with every contest reply before `at` answered,
+    for this worker and (`shared`) its peers on the host. Only an optimization: without the records
+    the next survey re-dispatches and the engine re-checks."""
+    if shared:
+        peer_claims.note_unchanged_review(_claim_scope(w), pr, head, now=at)
+    record = getattr(w.counters, "record_unchanged_review", None)
+    if record:
+        try:
+            record(pr, head, at=at)
+        except OSError:
+            pass
 
 
 def _fix_cap_spent(w, c: Candidate) -> bool:
@@ -1577,6 +1588,10 @@ def _still_actionable_direct(stage: str, w: Worker, sv: Survey, c: Candidate, *,
         through = meta.data.get("replies_through")
         if isinstance(through, int) and reply["id"] <= through:
             log(f"  review #{c.pr}: this contest was adjudicated since the survey — skipping")
+            if w.rs.ledger_clean_head(c.pr) == c.head:
+                # Spare the next surveys the same fresh reads: a survey without the scoreboard
+                # compares the reply with this record's time.
+                _note_published(w, c.pr, c.head, time.time())
             return False
         age = w.gh.fresh_claim_age(c.contest_reply_id)
         if age is not None and age < CONTEST_CLAIM_TTL:
@@ -2177,14 +2192,10 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 peer_claims.note_diff_guard(_claim_scope(w), pr, head)
             if isinstance(result, dict) and result.get("head_sha") == head and result.get("changed") is False:
                 log(f"  review #{pr}: published verdict unchanged — selecting other work")
-                if result.get("outcome") != "diff-guard":  # the guard record governs those, green build included
-                    peer_claims.note_unchanged_review(_claim_scope(w), pr, head)
-                record = getattr(w.counters, "record_unchanged_review", None)
-                if record:
-                    try:
-                        record(pr, head)
-                    except OSError:
-                        pass  # Only an optimization: the next survey re-dispatches and the engine re-checks.
+                # Stamped with the start of this round, not its end: a contest reply posted while the
+                # engine ran is newer than the record, so the survey still offers it.
+                # The guard record governs a diff-guard outcome, green build included.
+                _note_published(w, pr, head, github_started, shared=result.get("outcome") != "diff-guard")
                 w.rs.bust(pr)
                 from .activity import select
 
@@ -2215,6 +2226,9 @@ def do_review(w: Worker, sv: Survey, c: Candidate, opts: RoundOpts, bubble: bool
                 # is dropped. Just bump the contest caps.
                 w.counters.incr(f"review-contest-{pr}")
                 w.counters.incr(f"review-contest-{pr}-{c.contest}")
+                # The head's verdict is published and every reply before this round answered. Without
+                # a newer record, a survey without the scoreboard would offer this reply again.
+                _note_published(w, pr, head, github_started)
             w.rs.bust(pr)
         elif blocked_since(github_started) or (app_env and review_app.blocked_since(github_started)):
             raise NoProgress(f"review #{pr}: GitHub API exhausted — waiting for reset, not charged to the PR")

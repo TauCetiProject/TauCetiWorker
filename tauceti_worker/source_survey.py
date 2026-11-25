@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 
 from tauceti_tools.forge import Incomplete, RepositoryRef
 
+from . import peer_claims
 from .constants import MERGEABILITY_CHECKS, REFRESH_FAILURE_LIMIT, REFRESH_LOCK_WAIT_S
 from .source_identity import SourceActor, maintains_author
 from .survey import PRInfo, Survey, bucket_status_labels, roadmap_open_count
@@ -233,31 +234,40 @@ def _tended(result):
     return [p for p in _nondraft(result) if result.owns(p) and not _labels(p) & (_PAUSED | {"bors-staging"})]
 
 
-def index_order(result, counters, stages, pending):
+def index_order(result, counters, stages, pending, scope=""):
     """The PRs whose review state could make them fix or review work, with the stages they could be.
 
-    The filters are classify_survey's own (draft, pause labels, ownership, pending publication, a
-    recent unchanged review), so no PR it could not select is read. Automatic Mathlib bumps first,
-    then owned PRs, then everyone else's.
+    The filters are classify_survey's own (draft, pause labels, ownership, pending publication), so
+    no PR it could not select is read. A head recently found unchanged (`scope` names the host's
+    shared records) can only become a contest re-review, so it is read as `contest`: its scoreboard
+    and contest thread, each once per change of the PR. Automatic Mathlib bumps first, then owned
+    PRs, then everyone else's.
     """
     from .survey import _unchanged_review_recent
 
-    reviewable = (
-        {
-            p.number
+    candidates = (
+        [
+            p
             for p in _nondraft(result)
-            if not _labels(p) & {"hold", "wip", "human", "on-hold"}
-            and (p.number, p.head_oid) not in pending
-            and not _unchanged_review_recent(counters, p.number, p.head_oid)
-        }
+            if not _labels(p) & {"hold", "wip", "human", "on-hold"} and (p.number, p.head_oid) not in pending
+        ]
         if "review" in stages
-        else set()
+        else []
     )
+    published = {p.number for p in candidates if _unchanged_review_recent(counters, p.number, p.head_oid, scope)}
+    reviewable = {p.number for p in candidates} - published
     owned = {p.number for p in _tended(result)} if "fix" in stages else set()
     entries = [
-        (p, frozenset(({"fix"} if p.number in owned else set()) | ({"review"} if p.number in reviewable else set())))
+        (
+            p,
+            frozenset(
+                ({"fix"} if p.number in owned else set())
+                | ({"review"} if p.number in reviewable else set())
+                | ({"contest"} if p.number in published else set())
+            ),
+        )
         for p in _nondraft(result)
-        if p.number in owned | reviewable
+        if p.number in owned | reviewable | published
     ]
     entries.sort(key=lambda entry: (not entry[0].automatic_bump, entry[0].number not in owned))
     return entries
@@ -266,8 +276,10 @@ def index_order(result, counters, stages, pending):
 def _wants_thread(rs, p, stages):
     """classify_survey reads the contest thread of a cleanly reviewed head, and of an owned head
     with blocking findings. Call only when the PR's scoreboard is current, so no remote read."""
-    return ("review" in stages and rs.ledger_clean_head(p.number) == p.head_oid) or (
-        "fix" in stages and rs.ledger_blocking(p.number, p.head_oid)
+    return (
+        "contest" in stages
+        or ("review" in stages and rs.ledger_clean_head(p.number) == p.head_oid)
+        or ("fix" in stages and rs.ledger_blocking(p.number, p.head_oid))
     )
 
 
@@ -370,7 +382,7 @@ def worker_survey(
         ]
         if deep and callable(getattr(type(rs), "cache_only", None)):
             result.detail_reads, result.detail_deferred = refresh_index(
-                rs, index_order(result, counters, stages, pending)
+                rs, index_order(result, counters, stages, pending, peer_claims.scope_of(source))
             )
             classify_context = rs.cache_only()
         else:

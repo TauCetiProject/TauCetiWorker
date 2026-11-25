@@ -53,13 +53,16 @@ with tempfile.TemporaryDirectory() as tmp:
         counters=SimpleNamespace(
             read=lambda k: values.get(k, 0),
             write=lambda k, v: values.update({k: v}),
-            record_unchanged_review=lambda pr, head: recorded.append((pr, head)),
+            record_unchanged_review=lambda pr, head, at: recorded.append((pr, head, at)),
         ),
         rs=SimpleNamespace(review_rounds=lambda *_: 1, bust=lambda _: None),
     )
     c = SimpleNamespace(pr=42, head=HEAD, contest=None)
 
+    engine_at = []
+
     def engine(*args, **kwargs):
+        engine_at.append(time.time())
         path = args[1].parent / "review-results" / (args[1].stem + ".json")
         path.parent.mkdir(exist_ok=True)
         path.write_text(json.dumps(outcome))
@@ -82,7 +85,9 @@ with tempfile.TemporaryDirectory() as tmp:
                 wu.peer_claims, "note_diff_guard", side_effect=lambda _s, pr, head: guarded.append((pr, head))
             ),
             patch.object(
-                wu.peer_claims, "note_unchanged_review", side_effect=lambda _s, pr, head: shared.append((pr, head))
+                wu.peer_claims,
+                "note_unchanged_review",
+                side_effect=lambda _s, pr, head, now: shared.append((pr, head, now)),
             ),
             patch.object(wu.time, "strftime", return_value="fixed"),
             patch.object(wu, "run_to_logfile", side_effect=engine),
@@ -92,12 +97,48 @@ with tempfile.TemporaryDirectory() as tmp:
         ):
             round = Round("w")
             round.select("review")
+            started = time.time()
             rc = wu.do_review(w, None, c, SimpleNamespace(work_model="claude"), False)
             round.finish(NoProgress("other candidates exhausted") if rc is None else None)
-        assert recorded == expected, (outcome, recorded)
+        assert [(pr, head) for pr, head, _ in recorded] == expected, (outcome, recorded)
         assert guarded == expected_guard, (outcome, guarded)
         expected_shared = [] if outcome.get("outcome") == "diff-guard" else expected
-        assert shared == expected_shared, ("every worker on the host skips an unchanged head", outcome, shared)
+        assert [(pr, head) for pr, head, _ in shared] == expected_shared, (
+            "every worker on the host skips an unchanged head",
+            outcome,
+            shared,
+        )
+        # Stamped when the round began, so a contest reply posted while the engine ran is newer.
+        assert all(started <= at <= engine_at[-1] for _, _, at in recorded + shared), (recorded, shared, engine_at)
+
+    # A contest round records the published verdict too, stamped at its start, so a survey without
+    # the scoreboard does not offer the reply it just answered again.
+    values.clear()
+    w.counters.incr = lambda k: values.update({k: values.get(k, 0) + 1}) or values[k]
+    c = SimpleNamespace(pr=42, head=HEAD, contest="reuse", contest_reply_id=0)
+    outcome = {"head_sha": HEAD, "changed": True}
+    recorded.clear()
+    shared.clear()
+    with (
+        patch.object(
+            wu.peer_claims,
+            "note_unchanged_review",
+            side_effect=lambda _s, pr, head, now: shared.append((pr, head, now)),
+        ),
+        patch.object(wu.time, "strftime", return_value="fixed"),
+        patch.object(wu, "run_to_logfile", side_effect=engine),
+        patch.object(wu, "me", return_value="tester"),
+        patch.object(wu, "_sync_review_outbox", return_value=0),
+        patch.object(activity, "emit"),
+    ):
+        round = Round("w")
+        round.select("review")
+        started = time.time()
+        wu.do_review(w, None, c, SimpleNamespace(work_model="claude"), False)
+        round.finish(None)
+    assert [(pr, head) for pr, head, _ in recorded] == [(42, HEAD)], recorded
+    assert [(pr, head) for pr, head, _ in shared] == [(42, HEAD)], shared
+    assert all(started <= at <= engine_at[-1] for _, _, at in recorded + shared), (recorded, shared)
 
 print(
     "PASS: unchanged review results suppress partial-history re-dispatch for that head only, and expire;"
