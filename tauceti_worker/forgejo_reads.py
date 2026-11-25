@@ -310,6 +310,14 @@ def _unavailable_server(failure):
     return failure.kind == "ForgeError" and (failure.status in (0, 408, 429) or failure.status >= 500)
 
 
+def _posted_at(value):
+    """A Forgejo timestamp in whole epoch seconds; None when it is missing or malformed."""
+    try:
+        return int(datetime.fromisoformat(value).timestamp())
+    except (TypeError, ValueError):
+        return None
+
+
 def _updated(row):
     """A listed PR's update time in seconds; 0 when it has none."""
     try:
@@ -428,6 +436,48 @@ class ForgejoReadSource:
         except SourceBindingChanged:
             self._failure.value = ReadFailure("binding", 0, "SourceBindingChanged")
             return False
+
+    def trusted_build(self, number, head, trusted_ids):
+        """The newest `build` commit status on `head` posted by one of `trusted_ids`, or None when
+        the statuses cannot be read.
+
+        On Forgejo the merge queue's publisher posts `build` from its GitHub Actions PR build
+        (TauCeti decision 215). Anyone with code write can post a status, contributor fleets
+        included, so a `build` from any other account is ignored. The result is a dict with the
+        lowercased `state`, its `description`, run `url` and posting time `at` (epoch seconds),
+        or an empty dict when the head has no trusted `build`."""
+        import re
+
+        if type(number) is not int or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head or ""):
+            raise ValueError("a trusted build is read for one PR head")
+        trusted = sorted({int(actor) for actor in trusted_ids})
+
+        def fetch():
+            newest = None
+            for row in self.api.statuses(self.repository, head):
+                if not isinstance(row, dict) or row.get("context") != "build":
+                    continue
+                creator = row.get("creator")
+                if not isinstance(creator, dict) or type(creator.get("id")) is not int or creator["id"] not in trusted:
+                    continue
+                if type(row.get("id")) is not int:
+                    continue
+                if newest is None or row["id"] > newest["id"]:
+                    newest = row
+            if newest is None:
+                return {}
+            state = str(newest.get("status") or newest.get("state") or "").lower()
+            if state not in {"pending", "success", "failure", "error"}:
+                return {}
+            url = newest.get("target_url") or ""
+            return {
+                "state": state,
+                "description": str(newest.get("description") or "")[:200],
+                "url": url if isinstance(url, str) and url.startswith("https://github.com/") else "",
+                "at": _posted_at(newest.get("created_at")),
+            }
+
+        return self._read("trusted_build", [number, head, trusted], fetch, cacheable=False)
 
     def invalidate(self, number=None):
         if number is not None:

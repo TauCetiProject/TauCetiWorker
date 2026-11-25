@@ -459,7 +459,7 @@ class SharedIndexSurveys(unittest.TestCase):
         )
         return source_config(base, self.source)
 
-    def survey(self, *, numbers=(), seed=0, cfg=None):
+    def survey(self, *, numbers=(), seed=0, cfg=None, stages=("rebase", "fix", "review")):
         from tauceti_worker.review_state import ReviewState
         from tauceti_worker.source_survey import worker_survey
         from tauceti_worker.survey import Counters
@@ -475,7 +475,7 @@ class SharedIndexSurveys(unittest.TestCase):
                 roadmap="any",
                 skip=[],
                 deep=True,
-                stages=["rebase", "fix", "review"],
+                stages=list(stages),
                 numbers=numbers,
                 count_all_roadmaps=True,
             )
@@ -513,6 +513,56 @@ class SharedIndexSurveys(unittest.TestCase):
         result = self.survey(seed=3, cfg=self.peer("peer"))
         self.assertEqual(self.detail, [], "the first survey refreshed the index for the host")
         self.assertEqual({c.pr for c in result.needs_fix.actionable}, {n for n in self.heads if n % 2})
+
+    def test_forgejo_pr_ci_gates_review_and_sends_our_red_prs_to_fix_ci(self):
+        from tauceti_worker import forgejo_builds
+
+        self.heads = {n: f"{n:040x}" for n in self.heads}
+        publisher, contributor = 9, 4
+        statuses = {
+            1: [("build", "failure", publisher)],  # ours, red: fix-ci
+            2: [("build", "success", publisher)],  # another author's, green: review
+            3: [("build", "success", contributor)],  # a contributor's own `build` counts for nothing
+            5: [("build", "pending", publisher)],  # still building
+            6: [("build", "failure", publisher)],  # another author's red PR: their fleet fixes it
+            7: [("build", "success", publisher), ("build", "failure", publisher)],  # the newest wins
+        }
+        reads = []
+
+        def read(repository, head):
+            number = int(head, 16)
+            reads.append(number)
+            return [
+                {
+                    "id": index + 1,
+                    "context": context,
+                    "status": state,
+                    "creator": {"id": actor},
+                    "created_at": "2026-11-25T00:00:00Z",
+                    "target_url": "https://github.com/o/r/actions/runs/1",
+                }
+                for index, (context, state, actor) in enumerate(statuses.get(number, []))
+            ]
+
+        self.api.statuses.side_effect = read
+        with patch.dict("os.environ", TAUCETI_FORGEJO_RECOVERY_AUTHOR_IDS=str(publisher)):
+            result = self.survey(seed=0, stages=["rebase", "fix", "fix-ci", "review"])
+            self.assertEqual({c.pr for c in result.reviewable.actionable}, {2})
+            self.assertEqual({c.pr for c in result.red_ci.actionable}, {1, 7})
+            # A final verdict is read once per head; pending and missing ones are read again.
+            reads.clear()
+            from tauceti_worker.github_transport import invalidate_shared
+            from tauceti_worker.source_identity import discovery_scope
+
+            invalidate_shared(discovery_scope(self.source))
+            self.survey(seed=1, stages=["rebase", "fix", "fix-ci", "review"])
+            self.assertEqual(set(reads), set(self.heads) - {1, 2, 6, 7})
+        self.assertTrue((self.cfg.state / forgejo_builds.CACHE_FILE).exists())
+        # Without the publisher's identity the survey reviews without CI, as before.
+        reads.clear()
+        result = self.survey(seed=2)
+        self.assertEqual(reads, [])
+        self.assertEqual({c.pr for c in result.reviewable.actionable}, set(self.heads))
 
     def test_every_forgejo_review_ranks_with_the_rereviews_whoever_authored_it(self):
         from tauceti_worker.survey import LANDING_TIERS, landing_tier

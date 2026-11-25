@@ -2490,6 +2490,11 @@ def _do_fixlike(
         LOCAL_VERIFICATION=local_verification(policy, bubble),
         QUALITY_SCOPE=quality_scope(),
     )
+    if label == "fix-ci" and getattr(getattr(w.gh, "repository", None), "forge", None) is not None:
+        if w.gh.repository.forge.kind == "forgejo":
+            from . import forgejo_builds
+
+            prompt += forgejo_builds.describe(w.gh, pr, head)
     if label == "rebase":
         evidence = w.gh.rebase_request_body(pr, head)
         prompt += (
