@@ -289,8 +289,10 @@ def refresh_index(rs, entries):
     if not stale:
         return 0, 0
     # Classification reads the whole index, so refresh order matters only when a refresh ends
-    # early. Random order keeps a few PRs that persistently fail to read from ending every refresh;
-    # priority-labelled PRs still go first, so a refresh cut short never defers their reviews.
+    # early. Random order keeps a few PRs that persistently fail to read from ending every refresh.
+    # Priority-labelled PRs go first, so a refresh cut short never defers their reviews; their
+    # failures do not count towards ending the refresh, or a few persistently failing priority
+    # PRs would end every refresh before any other PR was read.
     random.shuffle(stale)
     labels = priority_labels()
     stale.sort(key=lambda entry: not has_priority_label(entry[0], labels))
@@ -307,7 +309,10 @@ def refresh_index(rs, entries):
                 reads += 1
                 rs.newest_contest_reply(p.number)
                 failed = p.number in rs.thread_failures
-            failures = failures + 1 if failed else 0
+            if not failed:
+                failures = 0
+            elif not has_priority_label(p, labels):
+                failures += 1
             if failures >= REFRESH_FAILURE_LIMIT:
                 return reads, len(stale) - index - 1
     return reads, 0

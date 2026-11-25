@@ -1537,10 +1537,10 @@ PRIORITY_LABELS_ENV = "TAUCETI_PRIORITY_LABELS"
 
 
 def priority_labels() -> frozenset[str]:
-    """The operator's priority labels, case-insensitive: TAUCETI_PRIORITY_LABELS, comma- or
-    space-separated. Empty (the default) switches priority off."""
+    """The operator's priority labels, case-insensitive: TAUCETI_PRIORITY_LABELS, comma-separated
+    (a label name may contain spaces). Empty (the default) switches priority off."""
     raw = os.environ.get(PRIORITY_LABELS_ENV, "")
-    return frozenset(label.strip().lower() for label in re.split(r"[,\s]+", raw) if label.strip())
+    return frozenset(label.strip().lower() for label in raw.split(",") if label.strip())
 
 
 def has_priority_label(pr: PRInfo, labels: frozenset[str] | None = None) -> bool:

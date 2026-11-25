@@ -1214,6 +1214,117 @@ ci="one/project"
         )
         self.assertEqual(backing_off[-2][3], [2, 3])  # the waiting reviews; tier 0 selects #2
 
+    def test_a_bump_repair_on_either_forge_precedes_every_priority_review(self):
+        import contextlib
+
+        from tauceti_worker.config import ClaimCollision
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        observations = self.observations([], [])
+        github, forgejo = observations[0][2], observations[1][2]
+        github.rebaseable.actionable.append(Candidate(1, "a" * 40))  # an automatic bump's rebase
+        github.reviewable.actionable.append(Candidate(1, "a" * 40))  # and its review
+        forgejo.reviewable.actionable.append(Candidate(2, "b" * 40, priority=True))
+        for _, worker, _ in observations:
+            worker.cfg = self.cfg
+        options = RoundOpts(only=["rebase", "review"], agent="auto", work_model="auto", sandbox_host=True, dry_run=True)
+        for order in (observations, observations[::-1]):  # whichever source the shuffle puts first
+            with (
+                patch("tauceti_worker.multi_source.collect", return_value=list(order)),
+                patch("tauceti_worker.multi_source.random.shuffle"),
+                patch("tauceti_worker.survey.bump_prs", side_effect=lambda sv: {1} if sv is github else set()),
+                patch("tauceti_worker.github_transport.publication_backoff", return_value=0.0),
+                patch("tauceti_worker.review_app.publication_backoff", return_value=0.0),
+                patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+                patch("tauceti_worker.work_units.run_round", side_effect=ClaimCollision("x")) as execute,
+            ):
+                with self.assertRaises(ClaimCollision):
+                    run_round(None, options)
+            steps = [
+                ("github" if call.args[0] is observations[0][1] else "forgejo", call.args[1].only)
+                for call in execute.call_args_list
+            ]
+            self.assertEqual(steps[0], ("github", ["rebase"]))
+            self.assertEqual(sorted(steps[1:]), [("forgejo", ["review"]), ("github", ["review"])])
+
+    def test_a_focus_slot_takes_priority_reviews_outside_its_area_first(self):
+        import contextlib
+
+        from tauceti_worker.config import ClaimCollision
+        from tauceti_worker.multi_source import run_round
+        from tauceti_worker.work_units import RoundOpts
+
+        def walk(claimable):
+            focused, everywhere = self.observations([], []), self.observations([], [])
+            focused[0][2].needs_fix.actionable.append(Candidate(1, "a" * 40))
+            everywhere[0][2].needs_fix.actionable.append(Candidate(3, "c" * 40))
+            everywhere[1][2].reviewable.actionable.append(Candidate(2, "b" * 40, priority=True))
+            for _, worker, _ in focused + everywhere:
+                worker.cfg = self.cfg
+            options = RoundOpts(
+                only=["fix", "review"], agent="auto", work_model="auto", sandbox_host=True, dry_run=True
+            )
+            surveys = []
+
+            def collect(w, opts, *, use_fleet_focus=True, display=False):
+                surveys.append(use_fleet_focus)
+                return everywhere if not use_fleet_focus else focused
+
+            def execute(worker, selected, prepared_survey):
+                if prepared_survey.reviewable.actionable and not claimable:
+                    raise ClaimCollision("x")
+                return 0
+
+            with (
+                patch.dict(os.environ, {"TAUCETI_PRIORITY_LABELS": "grh"}),
+                patch("tauceti_worker.multi_source._focus_slot", return_value=True),
+                patch("tauceti_worker.multi_source.collect", side_effect=collect),
+                patch("tauceti_worker.multi_source.random.shuffle"),
+                patch("tauceti_worker.github_transport.publication_backoff", return_value=0.0),
+                patch("tauceti_worker.review_app.publication_backoff", return_value=0.0),
+                patch("tauceti_worker.account_pressure.count_account", return_value={"github": 0, "forgejo": 0}),
+                patch("tauceti_worker.account_pressure.report"),
+                patch("tauceti_worker.multi_source.activate", return_value=contextlib.nullcontext()),
+                patch("tauceti_worker.work_units.run_round", side_effect=execute) as ran,
+            ):
+                self.assertEqual(run_round(None, options), 0)
+            return (
+                surveys,
+                [
+                    (call.args[1].only, call.args[1].landing_tier, call.kwargs["prepared_survey"])
+                    for call in ran.call_args_list
+                ],
+                focused,
+                everywhere,
+            )
+
+        surveys, calls, focused, everywhere = walk(True)
+        # The unfocused pass offers only the leading tier: the priority review, not the global fix.
+        self.assertEqual(surveys, [False])
+        self.assertEqual([(only, tier) for only, tier, _ in calls], [(["review"], 0)])
+        self.assertIs(calls[0][2], everywhere[1][2])
+        # Nothing claimable there: the round goes on to the focus area's own work.
+        surveys, calls, focused, everywhere = walk(False)
+        self.assertEqual(surveys, [False, True])
+        self.assertEqual([(only, tier) for only, tier, _ in calls], [(["review"], 0), (["fix"], 2)])
+        self.assertIs(calls[1][2], focused[0][2])
+
+    def test_priority_labels_are_comma_separated_and_case_insensitive(self):
+        from tauceti_worker.survey import has_priority_label, priority_labels
+
+        pr = PRInfo.from_json({"number": 1, "headRefOid": "a" * 40, "labels": [{"name": "High Priority"}]})
+        for value, expected in (
+            ("high priority, grh", True),
+            ("GRH,,high", False),
+            ("", False),
+            (" , ", False),
+        ):
+            with patch.dict(os.environ, {"TAUCETI_PRIORITY_LABELS": value}):
+                self.assertEqual(has_priority_label(pr), expected, value)
+        with patch.dict(os.environ, {"TAUCETI_PRIORITY_LABELS": " GRH , high priority "}):
+            self.assertEqual(priority_labels(), frozenset({"grh", "high priority"}))
+
     def test_publication_backoff_reads_the_accounts_rejection_window(self):
         import json
         import tempfile

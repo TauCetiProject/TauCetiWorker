@@ -160,15 +160,41 @@ def deduplicate(observations):
             kind.actionable = [candidate for candidate in kind.actionable if candidate.pr not in duplicates]
 
 
-def run_round(w, opts, *, use_fleet_focus=True):
+def _focus_slot(w, opts) -> bool:
+    """Whether this round may be a fleet roadmap focus round (work_units.round_scope's conditions)."""
+    from .config import roadmap_targets
+    from .fleet_capacity import roadmap_focus
+
+    wid = getattr(getattr(w, "cfg", None), "wid", None)
+    return bool(
+        wid
+        and not getattr(opts, "prs", ())
+        and roadmap_only() in (None, "auto")
+        and roadmap_targets() is None
+        and roadmap_focus(wid)
+    )
+
+
+def run_round(w, opts, *, use_fleet_focus=True, priority_only=False):
+    """One round across both sources. `priority_only` offers only the landing tier that leads
+    everywhere (automatic bump work and priority-labelled reviews) and never authors."""
     import os
 
+    from .config import ClaimCollision
+    from .survey import priority_labels
     from .work_units import NoEligibleWork, want
     from .work_units import run_round as ordinary_round
 
     if use_fleet_focus and isinstance(getattr(opts, "unavailable_sources", None), list):
         # One outage cutoff across every source and landing tier; the unfocused fallback keeps it.
         opts.unavailable_sources.clear()
+    if use_fleet_focus and priority_labels() and want(opts.only, "review") and _focus_slot(w, opts):
+        # A focus slot's survey covers its area only, so a priority-labelled PR elsewhere would wait
+        # for the other slots. Offer the leading tier across every area first, then the focus.
+        try:
+            return run_round(w, opts, use_fleet_focus=False, priority_only=True)
+        except (ClaimCollision, NoProgress) as error:
+            log(f"Fleet roadmap focus: no claimable priority work outside the focus ({type(error).__name__})")
     observations = collect(w, opts, use_fleet_focus=use_fleet_focus)
     deduplicate(observations)
     for name, _, result in observations:
@@ -209,9 +235,12 @@ def run_round(w, opts, *, use_fleet_focus=True):
 
     # Every healthy survey judges authoring against the account's open PRs on all project forges;
     # a forge this worker does not survey is read, and a failed survey's forge counts as unknown.
+    # A priority-only pass never authors, so it neither counts nor reports.
     unknown_forges = {name for name, _, value in observations if value.github_failed or value.dependency_wait}
-    account = count_account(w, {name: result for name, _, result in healthy}, unknown=unknown_forges)
-    report(account, healthy[0][2])
+    account = {}
+    if not priority_only:
+        account = count_account(w, {name: result for name, _, result in healthy}, unknown=unknown_forges)
+        report(account, healthy[0][2])
     executable = [(name, worker, result) for name, worker, result in healthy if name == "github" or opts.sandbox_host]
     if len(executable) != len(healthy):
         log("Forgejo agent rounds currently require host mode")
@@ -285,6 +314,13 @@ def run_round(w, opts, *, use_fleet_focus=True):
                         tier_stages = [stage for stage in tier_stages if stage != "review"]
                         if not tier_stages:
                             continue
+            if tier == 0 and "review" in tier_stages and len(tier_stages) > 1:
+                # Bump repairs lead on every forge; tier-0 reviews (bumps' and priority-labelled
+                # PRs') follow them, so one forge's priority review never overtakes another's bump.
+                choices.append(
+                    (tier, name, worker, publishable, [s for s in tier_stages if s != "review"], False, False)
+                )
+                tier_stages = ["review"]
             if review_first and tier > 0 and "review" in tier_stages and not review_first_rank("review", tier):
                 choices.append((tier, name, worker, publishable, ["review"], True, False))
                 tier_stages = [stage for stage in tier_stages if stage != "review"]
@@ -310,14 +346,15 @@ def run_round(w, opts, *, use_fleet_focus=True):
         return (
             unpublishable,
             band,
+            band == 0 and item[4] == ["review"],
             not reviewing,
             tier if reviewing else 0,
             band == 1 and bool(preferred) and name != preferred,
             tier,
         )
 
-    for tier, name, worker, result, tier_stages, *_ in sorted(choices, key=order):
-        if name in execution_failed:
+    for tier, name, worker, result, tier_stages, _, unpublishable in sorted(choices, key=order):
+        if name in execution_failed or (priority_only and (tier != 0 or unpublishable)):
             continue
         selected = dataclasses.replace(opts, only=tier_stages, landing_tier=tier)
         try:
@@ -333,6 +370,10 @@ def run_round(w, opts, *, use_fleet_focus=True):
                 execution_failed.add(name)
             log(f"{name}: selected work deferred ({type(error).__name__}); checking the other source")
             continue
+    if priority_only:
+        if waits:
+            raise waits[0]
+        raise (ClaimCollision if collisions else NoEligibleWork)("no claimable priority work")
     destination = os.environ.get("TAUCETI_NEW_PR_FORGE", "github")
     # Partial discovery cannot prove that a roadmap target is unclaimed on the
     # other source. Existing PR review/repair above remains available.

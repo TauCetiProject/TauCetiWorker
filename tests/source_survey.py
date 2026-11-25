@@ -792,8 +792,11 @@ class PriorityRefresh(unittest.TestCase):
         ]
         with patch.dict(os.environ, {"TAUCETI_PRIORITY_LABELS": "grh"}):
             reads, deferred = refresh_index(Index(), entries)
-        self.assertEqual(reads, REFRESH_FAILURE_LIMIT)
+        # Both priority PRs are read first, and their failures do not end the refresh: the
+        # ordinary PRs after them still get the usual run of failures before it stops.
         self.assertEqual(sorted(read[:2]), [17, 23])
+        self.assertEqual(reads, 2 + REFRESH_FAILURE_LIMIT)
+        self.assertEqual(deferred, len(entries) - reads)
 
 
 if __name__ == "__main__":

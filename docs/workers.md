@@ -134,9 +134,12 @@ Set `TAUCETI_PRIORITY_LABELS` in a worker's environment to a comma-separated lis
 (case-insensitive, for example `grh`) to have every worker review PRs carrying one of them before
 any other PR work, on either forge. On a fleet host, `tauceti-fleet workers HOST --env
 TAUCETI_PRIORITY_LABELS=grh` sets it for every worker and `--unset-env TAUCETI_PRIORITY_LABELS`
-switches it off; empty means off. Those reviews share the automatic bumps' lead (a bump's
-rebase or repair still comes first), skip the previous reviewer's first-refusal window and the
-review throttles, and on Forgejo their review state is refreshed first. Everything else that
+switches it off; empty means off. Label names may contain spaces. Those reviews share the
+automatic bumps' lead (a bump's rebase or repair on either forge still comes first), skip the
+previous reviewer's first-refusal window and the review throttles, and on Forgejo their review
+state is refreshed first. A roadmap focus slot first looks across every area for that leading
+work (bump work and priority reviews) and returns to its focus area when none is claimable.
+Everything else that
 guards a review still applies: the build must be green, one worker claims each head, an
 unchanged head is not reviewed again, a review that errors backs off, and contest replies are
 still answered. Only reviews move: fixes, CI repairs and rebases of a priority PR keep their
