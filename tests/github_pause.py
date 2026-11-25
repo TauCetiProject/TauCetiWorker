@@ -88,7 +88,8 @@ class GitHubPauseTests(unittest.TestCase):
             with self.assertRaises(GitHubUnavailable) as raised:
                 work_units._run_github_stage("fix", interrupted, worker, None, candidate, None, False)
             self.assertEqual(values["fix-7-abc"], 3)
-            self.assertEqual(raised.exception.retry_at, reset)
+            # Workers paused on one account retry over a jittered window after its reset.
+            self.assertTrue(reset <= raised.exception.retry_at <= reset + 120)
 
     def test_unrelated_search_and_mirrored_read_quotas_do_not_gate_stages(self):
         with (
@@ -111,7 +112,7 @@ class GitHubPauseTests(unittest.TestCase):
             self.assertRaises(GitHubUnavailable) as waiting,
         ):
             work_units._check_stage_read_quota("review")
-        self.assertEqual(waiting.exception.retry_at, 2000)
+        self.assertTrue(2000 <= waiting.exception.retry_at <= 2000 + 120)
 
     def test_post_write_progress_bypasses_webhook_lag(self):
         from tauceti_worker.github import GitHub

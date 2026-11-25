@@ -113,7 +113,7 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
             try:
                 work_units._check_stage_read_quota("review")
             except GitHubUnavailable as error:
-                assert not expected_launch and error.retry_at == 9999999999
+                assert not expected_launch and 9999999999 <= error.retry_at <= 9999999999 + 120
             else:
                 assert expected_launch
     # Plain gh-auth workers retain their pre-existing probe because no token

@@ -233,8 +233,11 @@ def cmd_loop(args, cfg: Config, *, only: list[str], agent: str, prs: tuple[int, 
             minimum = 1 if mirrored else GH_MIN_BUDGET
             low = {k: v for k, v in (gb or {}).items() if k in buckets and v[0] < minimum}
             if low:
+                from .github_transport import reset_jitter
+
                 reset = max(v[1] for v in low.values())
-                nap = max(POLL, min(reset - int(time.time()) + 5, 3600))
+                # Every loop on the account waits for the same reset; spread their relaunches.
+                nap = max(POLL, min(reset - int(time.time()) + 5 + int(reset_jitter()), 3600))
                 detail = ", ".join(f"{k}={gb[k][0]}" for k in low)
                 log(
                     f"github: REST budget low ({detail} remaining < {minimum}) — "
