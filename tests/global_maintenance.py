@@ -311,7 +311,16 @@ class GlobalMaintenance(unittest.TestCase):
                 run_round(self.w, self.opts, prepared_survey=prepared)
         self.assertEqual(noted.call_args.args[1:], (10, HEAD))
         dispatch.assert_not_called()
-        # A candidate from complete history, such as a new contest reply at the same head, is offered.
+        # So is a candidate from complete history that this worker's own ledger has not seen reviewed.
+        prepared.reviewable.actionable = [Candidate(10, HEAD)]
+        with (
+            patch.object(peer_claims, "unchanged_review_noted", return_value=True),
+            patch.object(work, "dispatch") as dispatch,
+        ):
+            with self.assertRaises(work.NoEligibleWork):
+                run_round(self.w, self.opts, prepared_survey=prepared)
+        dispatch.assert_not_called()
+        # A new contest reply at the same head is offered.
         prepared.reviewable.actionable = [Candidate(10, HEAD, contest="reuse", contest_reply_id=999)]
         with (
             patch.object(peer_claims, "unchanged_review_noted", return_value=True),
