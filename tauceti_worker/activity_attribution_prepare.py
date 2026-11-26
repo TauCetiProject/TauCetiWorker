@@ -108,9 +108,16 @@ def round_sessions(db, rid, now, source="cost"):
         queue(db, source, row)
     round = db.execute("SELECT worker,started,finished FROM rounds WHERE id=?", (rid,)).fetchone()
     if round and round[1] is not None:
+        # CostTargets.containing resolves a session to its worker's latest round
+        # started by then, so this round decides only sessions before the next
+        # one starts. An unfinished (waited) round must not span until now.
+        later = db.execute(
+            "SELECT MIN(started) FROM rounds WHERE worker=? AND started>?", (round[0], round[1])
+        ).fetchone()[0]
+        end = round[2] if round[2] is not None else now
         for row in db.execute(
-            "SELECT id FROM cost_sessions WHERE worker=? AND started BETWEEN ? AND ?",
-            (round[0], round[1], round[2] if round[2] is not None else now),
+            "SELECT id FROM cost_sessions WHERE worker=? AND started>=? AND started<=? AND (? IS NULL OR started<?)",
+            (round[0], round[1], end, later, later),
         ):
             if (
                 source == "legacy_cost"
@@ -361,7 +368,8 @@ def prepare(db, now):
     if history_pending(db):
         db.execute("INSERT OR REPLACE INTO meta VALUES ('attribution-report-backfilling','1')")
     changed = False
-    for source in ("round", "receipt", "cost", "pr", "legacy_cost", "legacy_pr", "legacy_receipt"):
+    live = ("round", "receipt", "cost", "pr")
+    for source in (*live, "legacy_cost", "legacy_pr", "legacy_receipt"):
         if source == "pr":
             started = time.monotonic()
             priority = [
@@ -370,10 +378,18 @@ def prepare(db, now):
             ]
             a.prepare_reviews(db, now, priority)
             deadline += time.monotonic() - started
+        # Each live stage gets an equal share of the time left, so a backlog in an
+        # earlier stage cannot starve PR facts; unused time carries forward and
+        # history backfill keeps only what live work leaves.
+        stage = (
+            time.monotonic() + (deadline - time.monotonic()) / (len(live) - live.index(source))
+            if source in live
+            else deadline
+        )
         maximum = MAX_SESSIONS if source in {"cost", "legacy_cost"} else MAX_FACTS
         keys = [r[0] for r in db.execute("SELECT key FROM attribution_dirty WHERE source=? LIMIT ?", (source, maximum))]
         for encoded in keys:
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= stage:
                 break
             key = json.loads(encoded)
             db.execute("DELETE FROM attribution_dirty WHERE source=? AND key=?", (source, encoded))
