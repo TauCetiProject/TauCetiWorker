@@ -777,6 +777,32 @@ class ActivityTests(unittest.TestCase):
         # The failed PR waits for its retry instead of being read on every pass.
         self.assertEqual(reads.count("/pulls/1"), 1)
 
+    def test_forgejo_read_cut_short_by_the_pass_budget_is_not_a_failure(self):
+        from tauceti_worker import activity_forgejo
+
+        with contextlib.closing(a._connect()) as db, db:
+            db.execute(
+                "INSERT INTO prs(repo,number,worker,scope,created,landed,state) VALUES (?,?,?,?,?,?,'CLOSED')",
+                ("forgejo:x", 1, "w", "m", self.now - 1000, self.now - 100),
+            )
+        clock = [0.0]
+
+        def get(repo, path, timeout=10):
+            clock[0] += timeout  # The read times out exactly at the end of the budget.
+            raise TimeoutError("timed out")
+
+        errors = []
+        with (
+            contextlib.closing(a._connect()) as db,
+            patch.object(activity_forgejo, "repository", return_value=SimpleNamespace(key="forgejo:x")),
+            patch.object(activity_forgejo, "_get", side_effect=get),
+            patch.object(activity_forgejo.time, "monotonic", side_effect=lambda: clock[0]),
+        ):
+            activity_forgejo.measure(db, self.now, errors, {})
+            self.assertEqual(errors, [])
+            # No attempt is recorded, so the next pass reads this PR again.
+            self.assertIsNone(db.execute("SELECT 1 FROM pr_review_counts").fetchone())
+
     def test_missing_finishes_show_start_windows_latest_round_and_scope(self):
         # These were all discovered together. Recent counts must use their
         # recorded starts, never pretend discovery is the interruption time.

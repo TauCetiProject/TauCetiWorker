@@ -143,7 +143,12 @@ def _read(repo, path, stop):
     left = stop - time.monotonic()
     if left <= 0:
         raise _Deadline
-    return _get(repo, path, timeout=min(10, left))
+    try:
+        return _get(repo, path, timeout=min(10, left))
+    except OSError:
+        if time.monotonic() >= stop:
+            raise _Deadline from None  # The pass's budget cut this read short; the PR did not fail.
+        raise
 
 
 def _pages(repo, path, stop):
