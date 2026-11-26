@@ -708,13 +708,15 @@ inserts nothing, such as `probe-error`, `batch-moved` or `admission-recheck`, ke
 `main` without the lock with the same checks and then, in one transaction, inserted into a new E
 whose ownership of the input (`inputs.batch_id`) replaces B's (the prospective singleton; a refusal
 leaves it in B). A waiting input admission has not evaluated at its accepted head gets no allocation
-until it has (its probe would end `admission-pending`). A kept request is allocated again on the next
-pass once; each further empty allocation in a row for the same accepted head backs off
-exponentially, 15 s doubling up to 300 s (`evidence.emergency.retry`: `failures`, `reason` from
-`last_probe`, `since`, `next_at`), so a persistent failure (a fetch that keeps failing, an insertion
-check that keeps holding) does not allocate a batch every pass. The second in a row journals
+until it has (its probe would end `admission-pending`). A request whose batch failed to build (an
+empty allocation that kept it, including one left by a crash or an unhandled error, or a singleton
+replay error) is tried again on the next pass once; each further failure in a row for the same
+accepted head backs off exponentially, 15 s doubling up to 300 s (`evidence.emergency.retry`:
+`failures`, `reason`, `since`, `last_at`, `next_at`, written in the transaction that ends the
+allocation), so a persistent failure (a fetch that keeps failing, an insertion check that keeps
+holding) does not allocate a batch every pass. The second in a row journals
 `emergency-backoff` and raises one progress alert for the streak; a status alert stays while it
-lasts, and an insertion ends it (`emergency-backoff-cleared`). Meanwhile a younger request may be
+lasts, and a built batch ends it (`emergency-backoff-cleared`). Meanwhile a younger request may be
 served. A request whose PR is in the running head waits for that head to land, unless
 eviction (below) displaces it. One E is live at a time; later requests queue behind it, first in
 first out. E is never evicted. With `emergency_evict` off E waits for the running head to land

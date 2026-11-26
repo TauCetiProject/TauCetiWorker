@@ -4515,7 +4515,7 @@ class EmergencyLane(QueueFixture):
             self.persistent_empty_allocations(102, "error: accepted head")
         # Capped at a few minutes.
         for _ in range(8):
-            self.controller._record_emergency_retry(self.controller.input_for(PROJECT, 102), self.clock())
+            self.controller._record_emergency_retry(self.controller.input_for(PROJECT, 102), "test", self.clock())
         retry = self.controller.status()["emergency"]["queued"][0]["retry"]
         self.assertEqual(retry["next_at"], self.clock() + 300)
         self.clock.advance(300)
@@ -4541,6 +4541,46 @@ class EmergencyLane(QueueFixture):
         )
         with patch.object(self.controller, "admission", admission):
             self.persistent_empty_allocations(102, "admission-recheck")
+
+    def test_an_unhandled_probe_error_after_allocation_backs_off(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.emergency(102)
+        with patch.object(self.controller, "_probe", side_effect=RuntimeError("probe crashed")):
+            for _ in range(5):
+                try:
+                    self.tick()
+                except RuntimeError:
+                    pass
+        # Allocation 1 crashes; the next pass ends it and allocates again (2), which crashes; the next
+        # ends that one and backs off; the remaining passes allocate nothing.
+        self.assertEqual(len(self.emergency_batches()), 2)
+        retry = self.controller.status()["emergency"]["queued"][0]["retry"]
+        self.assertEqual((retry["failures"], retry["reason"]), (2, "no member after the allocation"))
+        self.assertEqual(len(self.journal("emergency-backoff")), 1)
+
+    def test_a_persistent_singleton_replay_error_backs_off_and_serves_a_younger_request(self):
+        head, successor = self.running_head_with_successor()
+        self.approve(104, {"D.lean": "d\n"})
+        self.emergency(103)
+        self.emergency(104)
+        fetch = self.controller._fetch_head
+        with patch.object(
+            self.controller, "_fetch_head", side_effect=lambda number, sha: number != 103 and fetch(number, sha)
+        ):
+            self.tick(2)
+            self.assertEqual(len(self.journal("emergency-build-error")), 2, "one immediate retry")
+            self.tick(3)
+            self.assertEqual(len(self.journal("emergency-build-error")), 2, "then it backs off")
+            status = self.controller.status()
+            served = status["emergency"]["batch"]
+            self.assertEqual(served["number"], 104, "the younger request is served meanwhile")
+            [queued] = status["emergency"]["queued"]
+            self.assertEqual(queued["number"], 103)
+            self.assertTrue(queued["retry"]["reason"].startswith("emergency-build-error:"), queued)
+            self.assertEqual(self.controller.input_for(PROJECT, 103)["batch_id"], successor["id"])
+            self.assertEqual(len(self.journal("emergency-backoff")), 1)
 
     def test_an_emergency_request_waits_for_admission_without_allocating(self):
         self.approve(101, {"A.lean": "a\n"})
