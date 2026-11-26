@@ -11,6 +11,9 @@ The bounds matter as much as the saving. A line COUNT bounds nothing when a tool
 printing a newline, and the resulting text goes both to an operator's terminal and into an exception.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import stat
 import subprocess
 import sys

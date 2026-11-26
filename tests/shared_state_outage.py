@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Shared-state outages are typed dependency waits, never no-work rounds or GitHub fallback scans."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import http.client
 import io
 import json

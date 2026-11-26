@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The Forgejo contributor-fleets team follows the GitHub claim repository's collaborators."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import unittest
 from pathlib import Path

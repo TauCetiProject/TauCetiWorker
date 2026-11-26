@@ -9,6 +9,9 @@ satisfies the TauCetiTools `bors_observation.py` and `bors_scope_approval.py` re
 scope-approval check and the workers use; and a `batch_id` query fills `requested_batch`.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import copy
 import importlib.util

@@ -13,6 +13,9 @@ trusted CI independently supplies build, scope, and bump-guard status.
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sys

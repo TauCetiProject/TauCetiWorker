@@ -9,6 +9,9 @@ credentials, shared compiled caches, model launch, or production mutation occurs
 GitHub CI/review state is simulated; this is not deployed repair acceptance.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import argparse
 import importlib
 import importlib.util

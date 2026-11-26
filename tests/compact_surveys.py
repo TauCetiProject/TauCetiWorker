@@ -1,5 +1,8 @@
 """Selection parity, roadmap-first filtering, outage fallback and compact coverage."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import importlib
 import io

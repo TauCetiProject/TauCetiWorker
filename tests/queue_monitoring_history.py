@@ -1,5 +1,8 @@
 """Public history uses pilot definitions without including another repository."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import json
 import runpy

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Qualified direct review-state reads never consult the shared service or gh."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import concurrent.futures
 import fcntl
 import json

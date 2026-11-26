@@ -1,5 +1,8 @@
 """The Forgejo mirror against fake remotes: plain bare repositories laid out like a forge."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import datetime as dt
 import fcntl

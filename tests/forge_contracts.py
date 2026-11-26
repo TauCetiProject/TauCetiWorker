@@ -1,5 +1,8 @@
 """Contract discovery must retain ambiguity instead of claiming compatibility."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import hashlib
 import importlib.util
 import json

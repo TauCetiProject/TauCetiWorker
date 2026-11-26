@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The main-integration backfill (decision 175 B): dispatch, results, confirmation, take-out before seal."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import json
 import subprocess

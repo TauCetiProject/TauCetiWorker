@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A reused repair tree's outputs that differ from their traces are found, discarded and never published."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sys
 import tempfile

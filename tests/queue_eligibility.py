@@ -10,6 +10,9 @@ keep labels blocking, a moved merge base waiting, and the webhook receiver routi
 deliveries to it.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sys
 import unittest

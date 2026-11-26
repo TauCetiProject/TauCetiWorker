@@ -29,6 +29,9 @@ reading of a 5-hour window, and the parser now says so.
 Dependency-free; no network.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import sys
 import time

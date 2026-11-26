@@ -4,6 +4,9 @@ A fake `lake cache get` behaves like Lake: it walks `git rev-list HEAD -n <max-r
 `--rev`), uses a revision map already in LAKE_CACHE_DIR or a "published" one, and writes it there.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import http.server
 import io

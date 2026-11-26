@@ -7,6 +7,9 @@ kept sending pull request views at zero remaining. These cases pin the host-wide
 the zero-remaining check for opaque commands and the spread of wakeups after a reset.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sys

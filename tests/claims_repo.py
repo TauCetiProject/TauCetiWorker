@@ -7,6 +7,9 @@ so naming it means every acquire errors and a whole fleet works unclaimed. Every
 `gh_run`, so no test touches GitHub.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 from types import SimpleNamespace

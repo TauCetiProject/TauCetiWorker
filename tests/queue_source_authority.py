@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Fresh source authority refuses revocation, outages and reused identities."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import http.client
 import json

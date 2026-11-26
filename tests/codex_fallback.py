@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Default Codex authoring probes Sol safely, caches access, and runs no authoring prompt itself."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

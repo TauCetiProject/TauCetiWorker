@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A native queue peer cannot extend a request deadline by trickling data."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import datetime
 import ipaddress
 import json

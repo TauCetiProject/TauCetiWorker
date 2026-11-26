@@ -15,6 +15,9 @@ also the instant the PR became reviewable, and it resets when a push moves the h
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import argparse
 import dataclasses
 import os

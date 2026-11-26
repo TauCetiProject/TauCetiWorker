@@ -7,6 +7,9 @@ that review-host preflight passes without `lake`, while an authoring stage still
 
 Exit 0 = both cases agree; 1 = a mismatch."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 from types import SimpleNamespace

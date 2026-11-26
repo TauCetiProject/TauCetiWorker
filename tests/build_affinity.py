@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Build affinity: a PR's builders get first refusal on its next agent round (decision 210 C)."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sys

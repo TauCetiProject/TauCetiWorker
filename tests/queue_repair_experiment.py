@@ -7,6 +7,9 @@ against a throwaway Git repository.
 
 from __future__ import annotations
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

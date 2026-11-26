@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Cross-worker cache isolation, mutation pacing, throttle retention and stable state roots."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import multiprocessing
 import os

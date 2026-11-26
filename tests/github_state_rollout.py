@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Rollout changes existing read policies only and protects observation boundaries."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib.util
 import json
 import sys

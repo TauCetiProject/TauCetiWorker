@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The one evidence classification: FINDING > UNREADABLE > PASS > NOT_JUDGED, for API responses."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import hashlib
 import json
 import sys

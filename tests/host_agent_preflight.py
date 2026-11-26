@@ -9,6 +9,9 @@ This test drives dispatch() with the do_* stage stubbed out, so it needs no real
 raises before any stage work. Exit 0 = every case agrees; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 from types import SimpleNamespace

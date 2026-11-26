@@ -1,5 +1,8 @@
 """Unpaid process fixtures for durable launch, crash recovery and late evidence."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import signal

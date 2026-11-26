@@ -1,5 +1,8 @@
 """Complete source pagination, resource waits and safe git diff reads for primary intake."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import json
 import os

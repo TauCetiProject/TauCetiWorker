@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Cross-process cache correctness, complete GraphQL histories and safe exhaustion behavior."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import multiprocessing
 import os

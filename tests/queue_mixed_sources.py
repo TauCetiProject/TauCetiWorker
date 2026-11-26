@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Default inertness and qualified mixed admission over real local Git history."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import dataclasses
 import hashlib

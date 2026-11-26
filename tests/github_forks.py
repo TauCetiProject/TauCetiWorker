@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Fork intent recovery requires authenticated ownership, ancestry and complete visibility."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

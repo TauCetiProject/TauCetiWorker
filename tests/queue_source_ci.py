@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Controller source-candidate dispatch, restart and fresh promotion evidence."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sys
 import tempfile

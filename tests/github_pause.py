@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Quota pauses retain stage work and reach the driver without failed-round backoff."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

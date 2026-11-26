@@ -308,6 +308,7 @@ RUN_STDLIB=(
   workflow_backstop.py
   live_use.py
   round_worktrees.py
+  direct_run_isolation.py
   background_relink.py
   checkout_without_pull_ref.py
 )
@@ -350,6 +351,7 @@ unclassified=()
 for f in tests/*.py tests/*.sh; do
   base=$(basename "$f")
   [ "$base" = "run-all" ] && continue
+  [[ "$base" == _* ]] && continue  # shared helpers such as _isolated_state.py, not test modules
   [[ "${known[*]}" == *" $base "* ]] || unclassified+=("$base")
 done
 if ((${#unclassified[@]})); then
@@ -405,12 +407,15 @@ run_one() {
   d="$RUN_ROOT/${t%.*}"
   mkdir -p "$d/activity"
   [ -e "$RUN_ROOT/stop" ] && exit 0
-  export TAUCETI_ACTIVITY_DIR="$d/activity"
-  export TAUCETI_FLEET_EVENTS="$d/activity/worker-events.jsonl"
-  export TAUCETI_SHARED_MATHLIB_ROOT="$d/activity/mathlib-builds"
-  export TAUCETI_BUILD_CACHE_ROOT="$d/activity/builds"
-  export TAUCETI_REVIEW_MATHLIB_CACHE="$d/activity/review-sources"
-  export TAUCETI_VERIFY_STORAGE_DIR="$d/activity/verification-storage"
+  # tests/_isolated_state.py owns the list of redirected paths; every Python module also applies it
+  # itself on import, so a direct run is isolated too. The exports cover the bash tests.
+  export TAUCETI_TEST_STATE_ROOT="$d"
+  local exports
+  if ! exports="$("$PY" tests/_isolated_state.py --exports 2>&1)"; then
+    echo "$exports" >"$d/output"; echo 1 >"$d/rc"; echo "  [FAIL] $t (state isolation)"
+    return 1
+  fi
+  eval "$exports"
   start=$SECONDS
   case "$t" in
     parity_selectors.py) "$PY" tests/parity_selectors.py tests/fixtures/pr_selectors.json >"$d/output" 2>&1 ;;

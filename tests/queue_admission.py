@@ -1,5 +1,8 @@
 """Primary intake with real controller/SQLite/git: safe decisions, fairness and crash recovery."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sys
 import tempfile

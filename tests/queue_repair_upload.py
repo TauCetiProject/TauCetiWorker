@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The repair upload skips artifacts already in the bucket and otherwise uploads as `lake cache put-staged` does."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import stat

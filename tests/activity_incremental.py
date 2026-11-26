@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Incremental accounting correctness, crash recovery and history-independent idle work."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import importlib.util
 import json

@@ -1,5 +1,8 @@
 """Stopped-session policy, evidence priority, identity protection and audit reconciliation."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import fcntl
 import hashlib
 import json

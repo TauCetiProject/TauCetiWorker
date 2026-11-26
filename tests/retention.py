@@ -1,5 +1,8 @@
 """Local storage-reclamation fixtures; never inspect or mutate the real worker fleet."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import shutil
 import signal

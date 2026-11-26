@@ -10,6 +10,9 @@ token might not be ours — no opt-in, a stripped worker mirror, an inspecting c
 alone, or the process that shares the file is left holding a credential the server has retired.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import shutil

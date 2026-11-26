@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Dependency repair remains actionable past legacy caps, with ordinary gates intact."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib
 import json
 import os

@@ -1,5 +1,8 @@
 """Native Lake cache restoration and safe publication; real Lean fixtures are tiny and offline."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import json
 import os

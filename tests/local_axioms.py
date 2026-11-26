@@ -6,6 +6,9 @@ The wrapper/dispatch tests elsewhere run without Lean. This intentionally tests 
 not equivalence to the full transitive/global CI audit.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import runpy
 import shutil

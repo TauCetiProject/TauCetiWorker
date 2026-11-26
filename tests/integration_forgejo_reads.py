@@ -5,6 +5,9 @@ Set FORGEJO_BINARY to run. Every repository, credential, cookie and server proce
 belongs to a temporary loopback-only instance; no installed worker is executed.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import contextlib
 import getpass

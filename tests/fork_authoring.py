@@ -16,6 +16,9 @@ not land roadmap work). This harness pins three pure-ish decisions without touch
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys

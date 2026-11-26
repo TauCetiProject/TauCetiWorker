@@ -5,6 +5,9 @@ The rotation core lives in `tauceti_worker.oauth`, shared by the standalone refr
 pacer's own auto-refresh, so this exercises the module rather than the script.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import http.client
 import json

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The audit cursor is advancing, or the operator has a private DM: one watchdog decides."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sys

@@ -8,6 +8,9 @@ the fake repair worker writes the `worker.json` heartbeat a started worker write
 `tauceti-queue status` answers from the baked revision of the controller process's directory.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import re

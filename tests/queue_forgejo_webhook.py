@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Native signatures, repository binding, durable invalidation and redelivery."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import hashlib
 import hmac
 import json

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Idle observations permit useful work without probes, and retain real restrictions."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import sys
 import tempfile

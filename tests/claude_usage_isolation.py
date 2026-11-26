@@ -1,5 +1,8 @@
 """Separate usage credentials retain their path, identity and ownership across worker isolation."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sys

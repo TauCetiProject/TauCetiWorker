@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Real worktrees are collected only after terminal queue evidence and exclusive ownership."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sqlite3
 import subprocess

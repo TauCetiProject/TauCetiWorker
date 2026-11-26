@@ -3,6 +3,9 @@
 --isolate-home survive a walled-off ~/.codex / ~/.claude (e.g. under a sandbox or macOS data
 protection). Regression test for the `doctor` crash on PermissionError from a raw Path.exists()."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 

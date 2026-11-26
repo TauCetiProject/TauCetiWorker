@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Webhook noise must not compete with worker claims or amplify controller lock wakeups."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import http.client
 import json
 import sys

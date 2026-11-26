@@ -12,6 +12,9 @@ drift and must never silently unlock spending. And a payload with NO usable wind
 fail-open on a vacuously-true all(...). Dependency-free; no network.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import sys
 from pathlib import Path

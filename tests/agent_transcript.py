@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Structured Codex/Claude events become readable, bounded transcripts."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sys
 from pathlib import Path

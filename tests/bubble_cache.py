@@ -5,6 +5,9 @@ The review/probe path supplies its own command and must remain untouched: it doe
 not gain project-cache egress. Exit 0 = the bootstrap/config/argv contract agrees; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import os

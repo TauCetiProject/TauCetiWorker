@@ -1,5 +1,8 @@
 """The check before an approved head joins a batch: inert when off, holds on changed or unreadable inputs."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sys
 import tempfile

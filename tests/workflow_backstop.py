@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Independent workflow-clock decisions preserve active work and require authoritative reads."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import fcntl
 import io

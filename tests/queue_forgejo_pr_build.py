@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """PR builds of Forgejo PR heads (decision 215): dispatch, result copy-back, skips and spoofing."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import sys
 import unittest

@@ -14,6 +14,11 @@ cleanup() {
   rm -rf "$LIFECYCLE_TMP"
 }
 trap cleanup EXIT
+# Keep the rounds' activity and state out of the operator's real directories, also when this script
+# runs directly rather than under tests/run-all (which sets the root to the module's own subtree).
+export TAUCETI_TEST_STATE_ROOT="${TAUCETI_TEST_STATE_ROOT:-$LIFECYCLE_TMP/state}"
+isolation="$("$PY" tests/_isolated_state.py --exports)" || exit 1
+eval "$isolation"
 pass=0; fail=0
 ok()  { echo "  [PASS] $1"; pass=$((pass+1)); }
 no()  { echo "  [FAIL] $1"; fail=$((fail+1)); }

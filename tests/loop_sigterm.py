@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Compose-style SIGTERM tears down the active round before the loop exits 143."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import faulthandler
 import os
 import signal

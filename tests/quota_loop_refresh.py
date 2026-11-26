@@ -5,6 +5,9 @@ Claude shares a twenty-minute sample between rounds/workers, and valid samples s
 transient endpoint failure for up to the cache TTL. This pins the integration without network.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import shutil
 import sys

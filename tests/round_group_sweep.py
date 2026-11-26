@@ -12,6 +12,9 @@ and pins that the sweep clears it, plus a direct check that it reaches a whole m
 Exit 0 = swept as expected; 1 = a straggler survived.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import shutil
 import signal

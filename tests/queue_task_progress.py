@@ -1,5 +1,8 @@
 """Repair progress is independent of private task size and never controls the repair."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import sys
 import tempfile

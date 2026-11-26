@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Service age independence, conditional results, outage fallback, and cutoff configuration."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import http.client
 import io
 import json

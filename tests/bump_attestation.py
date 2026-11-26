@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A pushed bump head is labelled self-tested only after the worker verifies that exact commit."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys

@@ -3,6 +3,9 @@
 repoints it at the per-worker copy, and the bubble path does not block a non-default value
 (bubble honors the var itself)."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import shutil

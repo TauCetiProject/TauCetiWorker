@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """External review CLI metadata shares successful reads without caching failures or live PRs."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import os

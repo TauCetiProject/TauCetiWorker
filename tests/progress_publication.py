@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Retained progress resumes apply with identical bodies/window and original actor."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import errno
 import hashlib
 import json

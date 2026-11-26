@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Authoring profiles are explicit, provider-specific, and backend-independent."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import sys
 from pathlib import Path

@@ -10,6 +10,9 @@ path end-to-end, so attribute-name drift across textual versions is caught), the
 redraw, prefs persistence + env-override precedence, and the stale-survey load-token guard.
 Exit 0 = all checks pass, 1 = a failure."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import asyncio
 import json
 import os

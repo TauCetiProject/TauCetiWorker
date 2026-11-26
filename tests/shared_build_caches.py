@@ -18,6 +18,9 @@ These assertions pin that split, the sentinel path a round child takes, and the 
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import tempfile
 import types

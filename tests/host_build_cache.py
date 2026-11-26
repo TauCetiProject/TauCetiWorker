@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Host coding rounds fetch both caches before launch and stop on download failures."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json

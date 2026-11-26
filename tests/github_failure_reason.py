@@ -10,6 +10,9 @@ Dependency-free: the survey is stubbed, so no network and no gh.
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import types
 from pathlib import Path

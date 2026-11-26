@@ -1,5 +1,8 @@
 """Between-rounds relinking: the build-tree lock, the stop handshake and the loop's child."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import fcntl
 import io

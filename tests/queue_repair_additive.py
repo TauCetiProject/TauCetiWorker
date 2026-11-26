@@ -9,6 +9,9 @@ block open is refused. ``resolve`` reads the three versions from a repository.
 
 from __future__ import annotations
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import subprocess
 import sys
 import tempfile

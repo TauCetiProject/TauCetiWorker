@@ -13,6 +13,9 @@ Usage:
 Exit 0 = all selectors agree; 1 = a mismatch (prints the diff).
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import subprocess
 import sys

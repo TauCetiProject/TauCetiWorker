@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Real-Git operator acceptance, single-send recovery and exact-candidate promotion."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import hashlib
 import json
 import os

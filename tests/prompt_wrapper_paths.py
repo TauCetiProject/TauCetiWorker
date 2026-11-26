@@ -26,6 +26,9 @@ This harness pins the four properties that keep that true:
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import re
 import subprocess

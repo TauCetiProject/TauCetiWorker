@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Private operator files never discover GitHub tokens or send a bearer through redirects."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import os

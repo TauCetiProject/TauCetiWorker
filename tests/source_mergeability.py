@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Exact native snapshots, unavailable proof and concurrent head/base changes."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import fcntl
 import os

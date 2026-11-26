@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Sealed successor membership, background ownership and promotion against real Git chains."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 from unittest.mock import patch

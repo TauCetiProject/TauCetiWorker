@@ -5,6 +5,9 @@ User-Agent, POST, JSON content type and Accept, the given URL and timeout, the p
 without depending on either token endpoint's live CDN rules. Both endpoints and two non-default
 timeouts are exercised, so a helper that hard-coded either would be caught."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import io
 import json
 import sys

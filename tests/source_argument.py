@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """--source validation and loop propagation, without GitHub or model access."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys

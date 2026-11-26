@@ -1,5 +1,8 @@
 """Shared Mathlib: one read-only source tree per revision, one build per key, per-round views."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import concurrent.futures
 import contextlib
 import json

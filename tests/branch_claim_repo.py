@@ -8,6 +8,9 @@ the hard guard). The claim remains cooperative and fail-open. These tests stub o
 and the namespace resolver, so they can pin repository selection without touching GitHub.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys

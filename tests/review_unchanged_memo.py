@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """An engine "already published at this head" result stops partial-history PRs being re-dispatched."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib
 import json
 import sys

@@ -7,6 +7,9 @@ conflict and the clean-state guarantee, replay onto an advanced base, validation
 broken chains, compare's provenance and append-only message check, and the CLI JSON round trip.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

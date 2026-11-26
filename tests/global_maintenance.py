@@ -1,5 +1,8 @@
 """Global maintenance precedes roadmap choice without expanding GitHub reads."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import importlib
 import os

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """M8: verify the host agent argv is byte-for-byte what round.sh's run_agent builds."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import io
 import os
 import sys

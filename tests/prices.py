@@ -8,6 +8,9 @@ is one this module's billing math can read without a KeyError on a real report.
 
 from __future__ import annotations
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 

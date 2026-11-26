@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Total-admission limits reserve the third worker exclusively for head work."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import threading
 import unittest

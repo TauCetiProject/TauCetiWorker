@@ -13,6 +13,9 @@ reserve and stops early when the quota runs out mid-way; `due` follows
 `reconcile-approvals` command.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json

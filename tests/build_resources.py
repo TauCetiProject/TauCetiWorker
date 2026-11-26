@@ -1,5 +1,8 @@
 """Resource failures defer retained work; queue ownership cancels existing agents."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json

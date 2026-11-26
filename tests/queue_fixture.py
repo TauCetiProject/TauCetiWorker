@@ -6,6 +6,9 @@ a controllable clock and no inference. The tests are named after the acceptance 
 `docs/redesign/specs/ai-merge-queue.md`; the mapping is in `docs/queue/controller.md`.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import io
 import json
 import sys

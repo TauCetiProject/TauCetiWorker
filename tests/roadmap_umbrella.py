@@ -1,6 +1,9 @@
 """Umbrellas for --roadmap-only (docs/umbrellas.md): the file, the draw, maintenance scope, the prompt and the
 displays, over a fake roadmap snapshot and fake GitHub reads. No network."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import argparse
 import base64
 import contextlib
