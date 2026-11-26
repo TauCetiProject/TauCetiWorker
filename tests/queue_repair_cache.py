@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +15,11 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tauceti_queue import repair_cache as cache
+from tauceti_queue import repair_sandbox
+
+# Fork pull requests run on hosted runners without bubblewrap. There the fetch views copy back
+# unsandboxed, so these tests still cover the views; the fleet runners also cover the sandboxed copy.
+FETCH_ENV = {} if shutil.which("bwrap") else {repair_sandbox.DISABLE_VARIABLE: "0"}
 
 
 class BatchPools(unittest.TestCase):
@@ -517,7 +523,7 @@ class Retention(unittest.TestCase):
     def test_concurrent_fetch_views_share_archives_but_isolate_temporary_files(self):
         cache.register(self.root, self.root.parent / "worker")
         archive = self.artifact(1)
-        env = {"LAKE_CACHE_DIR": str(self.pool)}
+        env = {"LAKE_CACHE_DIR": str(self.pool), **FETCH_ENV}
         with cache.downloads(env) as first, cache.downloads(env) as second:
             left, right = Path(first["LAKE_CACHE_DIR"]), Path(second["LAKE_CACHE_DIR"])
             self.assertNotEqual(left, right)
@@ -540,7 +546,7 @@ class Retention(unittest.TestCase):
         payload = self.artifact(1)
         old = self.snapshot(1, [[f"{1:016x}", payload.name]], age=86400)
         stamp = old.stat().st_mtime_ns
-        with cache.downloads({"LAKE_CACHE_DIR": str(self.pool)}) as env:
+        with cache.downloads({"LAKE_CACHE_DIR": str(self.pool), **FETCH_ENV}) as env:
             view = Path(env["LAKE_CACHE_DIR"])
             self.assertFalse((view / "revisions").exists())
             fresh = view / "revisions/TauCeti" / ("a" * 40 + ".jsonl")
