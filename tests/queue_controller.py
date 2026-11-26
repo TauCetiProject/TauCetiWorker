@@ -4780,6 +4780,24 @@ class SprintMode(ControllerCase):
         self.assertEqual((row["state"], row["last_probe"]), ("waiting", "sprint-label"))
         self.assertEqual(self.controller.store.count("members"), 0)
 
+    def test_an_emergency_request_without_the_label_still_gets_its_batch(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.controller.tick()
+        head = self.controller.store.row("batches", {"state": "head"})
+        self.controller.set_setting("sprint_label", "grh", "operator")
+        self.controller.set_setting("emergency_enabled", True, "operator")
+        self.approve(102, {"B.lean": "b\n"})
+        accepted = self.controller.request_emergency(PROJECT, 102, "admin-worker", surface="test")
+        self.assertTrue(accepted["accepted"], accepted)
+        for _ in range(3):
+            self.controller.tick()
+        row = self.controller.input_for(PROJECT, 102)
+        self.assertEqual(row["state"], "inserted", self.controller._reasons)
+        emergency = self.controller.store.row("batches", {"id": row["batch_id"]})
+        self.assertEqual(emergency["urgent"], 2)
+        self.assertEqual(self.controller.store.count("journal", {"kind": "emergency-ended"}), 0, "no churn")
+        self.assertEqual(self.controller.store.row("batches", {"id": head["id"]})["state"], "head")
+
     def test_a_head_the_emergency_batch_evicted_is_kept(self):
         self.approve(101, {"A.lean": "a\n"})
         self.controller.tick()
