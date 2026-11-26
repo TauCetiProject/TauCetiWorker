@@ -22,6 +22,9 @@ import tempfile
 from pathlib import Path
 
 ROOT_VARIABLE = "TAUCETI_TEST_STATE_ROOT"
+# Production locations a worker's shell may export. CI never sets them, so the tests run without
+# them; an inherited value would point fixtures at the host's real shared or legacy state.
+UNSET = ("TAUCETI_GITHUB_SHARED_DIR", "TAUCETI_LEGACY_DATA_ROOT")
 
 
 def settings(root):
@@ -59,6 +62,8 @@ def isolate():
         os.environ[ROOT_VARIABLE] = root
     (Path(root) / "activity").mkdir(parents=True, exist_ok=True)
     os.environ.update(settings(root))
+    for name in UNSET:
+        os.environ.pop(name, None)
     return Path(root)
 
 
@@ -70,5 +75,6 @@ if __name__ == "__main__":
     root = os.environ[ROOT_VARIABLE]
     for name, value in {ROOT_VARIABLE: root, **settings(root)}.items():
         print(f"export {name}={shlex.quote(value)}")
+    print("unset " + " ".join(UNSET))
 else:
     ROOT = isolate()

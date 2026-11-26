@@ -112,6 +112,32 @@ class DirectRunIsolationTests(unittest.TestCase):
         for name, value in _isolated_state.settings(root).items():
             self.assertEqual(os.environ[name], value)
         self.assertTrue(Path(os.environ["TAUCETI_ACTIVITY_DIR"]).is_relative_to(root))
+        for name in _isolated_state.UNSET:
+            self.assertNotIn(name, os.environ)
+
+    def test_inherited_production_locations_are_unset(self):
+        env = bare_environment(self.home, self.scratch)
+        env.update({name: str(self.home / name) for name in _isolated_state.UNSET})
+        code = "import _isolated_state, os, sys; sys.exit(any(n in os.environ for n in _isolated_state.UNSET))"
+        subprocess.run([sys.executable, "-c", code], cwd=TESTS, env=env, check=True, timeout=60)
+        env[_isolated_state.ROOT_VARIABLE] = str(self.scratch / "root")
+        exports = subprocess.run(
+            [sys.executable, str(TESTS / "_isolated_state.py"), "--exports"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout
+        shell = subprocess.run(
+            ["bash", "-c", exports + '\nprintf "%s" "${TAUCETI_GITHUB_SHARED_DIR-}${TAUCETI_LEGACY_DATA_ROOT-}"'],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        ).stdout
+        self.assertEqual(shell, "")
 
 
 if __name__ == "__main__":
