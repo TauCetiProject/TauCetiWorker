@@ -346,7 +346,7 @@ def reports(db, now):
     profiles.setdefault((None, None), [])
     db.execute("DELETE FROM attribution_reports")
     windows = {w: WINDOW_SECONDS[w] for w in COST_WINDOWS}
-    all_values = dict(a.calculate(profiles[None, None], now, windows))
+    all_values = dict(a.calculate(profiles[None, None], now, windows, identities=True))
     reference = dict(
         production=Decimal(all_values["total"]["production_usd_per_loc"])
         if all_values["total"]["production_usd_per_loc"] is not None
@@ -361,7 +361,11 @@ def reports(db, now):
         },
     )
     for profile, rows in profiles.items():
-        values = all_values if profile == (None, None) else dict(a.calculate(rows, now, windows, reference))
+        values = (
+            all_values
+            if profile == (None, None)
+            else dict(a.calculate(rows, now, windows, reference, identities=profile[0] == "scope"))
+        )
         db.execute("INSERT INTO attribution_reports VALUES (?,?,?)", (json.dumps(profile), json.dumps(values), next_at))
 
 

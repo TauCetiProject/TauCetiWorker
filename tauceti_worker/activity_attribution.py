@@ -407,7 +407,16 @@ def prepare_reviews(db, now, priority=()):
             break
 
 
-def calculate(records, now, windows, reference=None):
+def pr_identities(records, known):
+    """Compact landed PR identities: {"known"|"missing": {repo: [numbers]}}."""
+    value = dict(known={}, missing={})
+    for r in records:
+        repo, number = r["key"]
+        value["known" if known(r) else "missing"].setdefault(repo, set()).add(number)
+    return {state: {repo: sorted(numbers) for repo, numbers in repos.items()} for state, repos in value.items()}
+
+
+def calculate(records, now, windows, reference=None, identities=False):
     """Estimate one local accounting scope from compact, prepared PR facts."""
     review_costs, review_dates = {}, {}
     for row in records:
@@ -461,9 +470,16 @@ def calculate(records, now, windows, reference=None):
     for name, seconds in windows.items():
         selected = [r for r in records if seconds is None or r["landed"] >= now - seconds]
         known = [r for r in selected if r["credited"] is not None]
+        extra = {}
+        if identities:
+            # Host and machine-scope totals name their landed PRs so fleet totals
+            # can count a PR that several hosts touched once; per-worker
+            # profiles stay compact.
+            extra["attribution_prs"] = pr_identities(selected, lambda r: r["credited"] is not None)
         yield (
             name,
             dict(
+                **extra,
                 attribution_version=1,
                 attributed_loc=str(sum((r["credited"] for r in known), Decimal(0))),
                 attribution_known_prs=len(known),
