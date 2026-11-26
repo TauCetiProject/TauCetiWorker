@@ -13,6 +13,10 @@ sys.path.insert(0, str(REPO))
 import tauceti_worker as tc
 from tauceti_worker import build_affinity, work_units
 
+# These records' fixtures use a fixed future clock while touched files keep real mtimes, so the
+# occasional prune would delete a record just written.
+build_affinity.random = types.SimpleNamespace(random=lambda: 1.0)
+
 NOW = 2_000_000_000
 GRACE = build_affinity.FIX_AFFINITY_GRACE_S
 fails = 0
