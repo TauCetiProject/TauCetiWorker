@@ -556,6 +556,50 @@ class AttributionTests(unittest.TestCase):
         self.assertGreater(Decimal(row["attributed_loc"]), before)
         self.assertTrue(row["attribution_preparing"])
 
+    def test_waited_round_requeues_only_sessions_before_the_next_round(self):
+        # A session starting with the next round belongs to that round.
+        for index, at in enumerate((10, 20, 25, 30, 40)):
+            self.db.execute(
+                "INSERT INTO cost_sessions(id,worker,scope,started,ordinal,data) VALUES (?,?,?,?,?,'{}')",
+                (f"s{index}", "worker", "machine", self.now - 100 + at, index),
+            )
+        self.db.executemany(
+            "INSERT INTO rounds(id,worker,scope,kind,started,finished,outcome) VALUES (?,?,?,?,?,?,?)",
+            [
+                ("waited", "worker", "machine", "unknown", self.now - 95, None, "waiting"),
+                ("later", "worker", "machine", "fix", self.now - 75, None, None),
+            ],
+        )
+        self.db.execute("DELETE FROM attribution_dirty")
+        adapter.round_sessions(self.db, "waited", self.now)
+        queued = {json.loads(r[0])[0] for r in self.db.execute("SELECT key FROM attribution_dirty")}
+        self.assertEqual(queued, {"s0", "s1"})
+        self.db.execute("DELETE FROM attribution_dirty")
+        adapter.round_sessions(self.db, "later", self.now)
+        queued = {json.loads(r[0])[0] for r in self.db.execute("SELECT key FROM attribution_dirty")}
+        self.assertEqual(queued, {"s2", "s3", "s4"})
+
+    def test_earlier_backlog_does_not_starve_pr_facts(self):
+        self.example()
+        self.prepare()
+        self.db.execute("DELETE FROM attribution_prs")
+        adapter.queue(self.db, "pr", [REPO, 1])
+        for i in range(100):
+            adapter.queue(self.db, "round", [f"missing-{i}"])
+        clock = [0.0]
+
+        def slow_round(*_):
+            clock[0] += 0.1  # The round backlog alone would exceed the budget.
+
+        with (
+            patch.object(adapter.time, "monotonic", side_effect=lambda: clock[0]),
+            patch.object(adapter, "round_sessions", side_effect=slow_round),
+            patch.object(attr, "prepare_reviews"),
+        ):
+            adapter.prepare(self.db, self.now)
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM attribution_prs WHERE number=1").fetchone())
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM attribution_dirty WHERE source='round'").fetchone())
+
     def test_cached_shared_counters_work_without_any_local_archive(self):
         self.example()
         for number, count in ((1, 3), (2, 24)):
