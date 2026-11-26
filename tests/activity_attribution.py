@@ -557,7 +557,8 @@ class AttributionTests(unittest.TestCase):
         self.assertTrue(row["attribution_preparing"])
 
     def test_waited_round_requeues_only_sessions_before_the_next_round(self):
-        for index, at in enumerate((10, 20, 30, 40)):
+        # A session starting with the next round belongs to that round.
+        for index, at in enumerate((10, 20, 25, 30, 40)):
             self.db.execute(
                 "INSERT INTO cost_sessions(id,worker,scope,started,ordinal,data) VALUES (?,?,?,?,?,'{}')",
                 (f"s{index}", "worker", "machine", self.now - 100 + at, index),
@@ -576,7 +577,7 @@ class AttributionTests(unittest.TestCase):
         self.db.execute("DELETE FROM attribution_dirty")
         adapter.round_sessions(self.db, "later", self.now)
         queued = {json.loads(r[0])[0] for r in self.db.execute("SELECT key FROM attribution_dirty")}
-        self.assertEqual(queued, {"s2", "s3"})
+        self.assertEqual(queued, {"s2", "s3", "s4"})
 
     def test_earlier_backlog_does_not_starve_pr_facts(self):
         self.example()

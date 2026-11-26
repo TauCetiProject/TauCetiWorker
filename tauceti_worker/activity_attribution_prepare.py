@@ -115,9 +115,11 @@ def round_sessions(db, rid, now, source="cost"):
             "SELECT MIN(started) FROM rounds WHERE worker=? AND started>?", (round[0], round[1])
         ).fetchone()[0]
         end = round[2] if round[2] is not None else now
+        # Bound the indexed range itself, not just the rows it returns.
+        bound = "started<?" if later is not None and later <= end else "started<=?"
         for row in db.execute(
-            "SELECT id FROM cost_sessions WHERE worker=? AND started>=? AND started<=? AND (? IS NULL OR started<?)",
-            (round[0], round[1], end, later, later),
+            f"SELECT id FROM cost_sessions WHERE worker=? AND started>=? AND {bound}",
+            (round[0], round[1], later if bound == "started<?" else end),
         ):
             if (
                 source == "legacy_cost"
