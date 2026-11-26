@@ -832,6 +832,22 @@ def _summary(db, now, column=None, identity=None):
         attribution["attribution_missing_prs"] += max(
             0, row["landed_prs"] - attribution.get("attribution_authored_prs", 0)
         )
+        identities = attribution.get("attribution_prs")
+        if identities is not None:
+            # Authored landed PRs with no attribution record yet are missing too.
+            listed = {
+                (repo, number) for state in identities.values() for repo, numbers in state.items() for number in numbers
+            }
+            seconds = WINDOWS[window]
+            missing = {repo: set(numbers) for repo, numbers in identities["missing"].items()}
+            for repo, number in db.execute(
+                f"SELECT repo,number FROM prs {where} {'AND' if where else 'WHERE'} landed IS NOT NULL AND landed<=?"
+                + ("" if seconds is None else " AND landed>=?"),
+                [*args, now] + ([] if seconds is None else [now - seconds]),
+            ):
+                if (repo, number) not in listed:
+                    missing.setdefault(repo, set()).add(number)
+            identities["missing"] = {repo: sorted(numbers) for repo, numbers in missing.items()}
         row.update(attribution)
     raw_observed = minimum("prs", "observed")
     raw_checked = minimum("prs", "checked")
