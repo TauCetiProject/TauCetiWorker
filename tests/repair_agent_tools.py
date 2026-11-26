@@ -239,6 +239,100 @@ class Shims(Fixture):
         self.assertEqual(self.bwrap_calls(), [])
 
 
+class LeanJobs(Fixture):
+    """Decision 219, option B: every repair build runs with ``LEAN_NUM_THREADS`` capped."""
+
+    def setenv(self, argv: list[str]) -> dict[str, str]:
+        return {argv[i + 1]: argv[i + 2] for i, a in enumerate(argv[:-2]) if a == "--setenv"}
+
+    def argv(self, env: dict, **options) -> list[str]:
+        return repair_sandbox.sandbox_argv(["true"], self.worktree, env, bwrap=str(self.bin / "bwrap"), **options)
+
+    def test_an_offline_build_gets_the_default_cap(self):
+        self.assertEqual(self.setenv(self.argv(self.env))["LEAN_NUM_THREADS"], str(repair_sandbox.DEFAULT_LEAN_JOBS))
+        self.assertEqual(repair_sandbox.DEFAULT_LEAN_JOBS, 8)
+
+    def test_the_setting_overrides_the_cap_and_zero_removes_it(self):
+        variable = repair_sandbox.LEAN_JOBS_VARIABLE
+        self.assertEqual(self.setenv(self.argv({**self.env, variable: " 6 "}))["LEAN_NUM_THREADS"], "6")
+        self.assertNotIn("LEAN_NUM_THREADS", self.setenv(self.argv({**self.env, variable: "0"})))
+        for bad in ("many", "-3", "2.5"):
+            with self.assertLogs("tauceti_queue.repair_sandbox", "WARNING"):
+                self.assertEqual(self.setenv(self.argv({**self.env, variable: bad}))["LEAN_NUM_THREADS"], "8")
+
+    def test_the_build_environment_never_reaches_the_sandbox(self):
+        argv = self.argv({**self.env, "LEAN_NUM_THREADS": "96"})
+        self.assertEqual(self.setenv(argv)["LEAN_NUM_THREADS"], "8")
+
+    def test_fetches_and_opted_out_checks_are_not_capped(self):
+        self.assertNotIn("LEAN_NUM_THREADS", self.setenv(self.argv(self.env, network=True)))
+        self.assertNotIn("LEAN_NUM_THREADS", self.setenv(self.argv(self.env, cap_jobs=False)))
+        # A caller's own value wins, and is the only one set.
+        argv = self.argv(self.env, extra_env={"LEAN_NUM_THREADS": "2"})
+        self.assertEqual([argv[i + 2] for i, a in enumerate(argv[:-2]) if argv[i + 1] == "LEAN_NUM_THREADS"], ["2"])
+
+    def test_the_agents_lake_runs_capped(self):
+        run = self.run_agent("lake build X", self.worktree, **{repair_sandbox.LEAN_JOBS_VARIABLE: "5"})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        (call,) = self.bwrap_calls()
+        self.assertEqual(self.setenv(["bwrap", *call["argv"]])["LEAN_NUM_THREADS"], "5")
+
+    def test_the_disabled_sandbox_is_capped_too(self):
+        def assignments(**options) -> list[str]:
+            with self.assertLogs("tauceti_queue.repair_sandbox", "WARNING"):
+                argv = repair_sandbox.sandboxed_lake(["lake", "build"], self.worktree, self.env, **options)
+            return [a for a in argv if a.startswith("LEAN_NUM_THREADS=")]
+
+        with patch.dict(os.environ, {repair_sandbox.DISABLE_VARIABLE: "0"}):
+            self.assertEqual(assignments(), ["LEAN_NUM_THREADS=8"])
+            self.assertEqual(assignments(cap_jobs=False), [])
+            self.assertEqual(assignments(network=True), [])
+            # extra_env reaches the command through the caller's process environment: not overridden.
+            self.assertEqual(assignments(extra_env={"LEAN_NUM_THREADS": "2"}), [])
+
+    def test_verification_builds_are_capped_and_the_audit_and_lint_are_not(self):
+        from tauceti_queue import repair_audit
+
+        seen = []
+
+        def wrapped(argv, worktree, env, **options):
+            seen.append(options.get("cap_jobs"))
+            return ["true"]
+
+        with patch.object(repair_audit.repair_sandbox, "sandboxed_lake", side_effect=wrapped):
+            repair_audit._sandboxed(["lake", "build"], self.worktree, self.env, None, self.tmp / "a.log", 30)
+            repair_audit._sandboxed(["true"], self.worktree, self.env, None, self.tmp / "b.log", 30, cap_jobs=False)
+        self.assertEqual(seen, [True, False])
+        # Every opt-out in the verifier is a driver of the audit or a lint, never a `lake build`.
+        import ast
+        import inspect
+
+        from tauceti_queue import repair_targeted
+
+        opted_out, builds = [], []
+        for module in (repair_audit, repair_targeted):
+            for node in ast.walk(ast.parse(inspect.getsource(module))):
+                if not isinstance(node, ast.Call):
+                    continue
+                names = [ast.unparse(node.func), *(ast.unparse(a) for a in node.args[:1])]
+                if not any(n.endswith("_sandboxed") for n in names):
+                    continue
+                text = ast.unparse(node)
+                off = any(k.arg == "cap_jobs" and ast.unparse(k.value) == "False" for k in node.keywords)
+                (opted_out if off else builds).append(text)
+        self.assertEqual(len(opted_out), 4, opted_out)
+        self.assertFalse([t for t in opted_out if "'build'" in t], opted_out)
+        self.assertTrue([t for t in builds if "'build'" in t and "verify-build.log" in t], builds)
+        self.assertTrue([t for t in builds if "'build'" in t and "'build.log'" in t], builds)
+
+    def test_the_agent_inherits_the_workers_cap(self):
+        variable = repair_sandbox.LEAN_JOBS_VARIABLE
+        for value, expected in ((None, "8"), ("12", "12"), ("0", "0")):
+            env = {**self.env, **({variable: value} if value is not None else {})}
+            with patch.dict(os.environ, env, clear=True):
+                self.assertEqual(repair.isolation_env(self.root, {}, "claude")[variable], expected)
+
+
 class ShellGuard(Fixture):
     def test_a_toolchain_executable_named_by_path_is_refused(self):
         for command in (

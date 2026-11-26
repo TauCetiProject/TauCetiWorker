@@ -54,6 +54,19 @@ BACKGROUND_VARIABLE = "TAUCETI_REPAIR_BACKGROUND"
 LOGGER = logging.getLogger("tauceti_queue.repair_sandbox")
 PRESSURE_WRAPPER = "/opt/tauceti/tauceti-lean"
 
+# The cap on concurrent Lean jobs in each repair build (decision 219, option B). Lake has no jobs
+# flag: its build tasks run on the Lean runtime's thread pool, sized by ``LEAN_NUM_THREADS`` (with a
+# cap of 4 Lake runs at most 4 ``lean`` processes at once; without one, all it can schedule), and each
+# ``lean`` it starts inherits the same value for its own threads. Unset, a build on tauchonki2's 96
+# cores ran 55 ``lean`` processes at once and reached 42 GB RSS (plus 63 GB swap), about 0.75 to 1 GB
+# per job. The repair slice's ``memory.high`` there is about 52 GB, shared by three workers, and one
+# of them may hold the heavy-check lock with the audit at about 33 GB while the other two build:
+# 52 - 33 leaves about 19 GB, less the workers' and agents' own few GB, for two builds, so 8 jobs
+# each (6 to 8 GB a build, 45 to 49 GB with the audit). ``TAUCETI_REPAIR_LEAN_JOBS`` overrides the
+# default; 0 leaves the thread pool uncapped.
+LEAN_JOBS_VARIABLE = "TAUCETI_REPAIR_LEAN_JOBS"
+DEFAULT_LEAN_JOBS = 8
+
 # Read-only system roots, bound when present. A symlinked root (``/bin -> usr/bin``) is recreated as
 # the same symlink, the way CI's ``--symlink usr/bin /bin`` does.
 SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/nix", "/run/current-system")
@@ -132,6 +145,36 @@ READ_ONLY_VARIABLE = "TAUCETI_SANDBOX_READONLY"
 
 class SandboxUnavailable(RuntimeError):
     """``bwrap`` is required (the sandbox is not disabled) but is not on PATH."""
+
+
+def lean_jobs(env: dict | None = None) -> int | None:
+    """The concurrent Lean job cap for repair builds (``LEAN_JOBS_VARIABLE``), None for uncapped. An
+    unreadable or negative value is logged and the default used."""
+    value = ((os.environ if env is None else env).get(LEAN_JOBS_VARIABLE) or "").strip()
+    if not value:
+        return DEFAULT_LEAN_JOBS
+    try:
+        jobs = int(value)
+    except ValueError:
+        jobs = -1
+    if jobs < 0:
+        LOGGER.warning("%s=%r is not a job count; using %d", LEAN_JOBS_VARIABLE, value, DEFAULT_LEAN_JOBS)
+        return DEFAULT_LEAN_JOBS
+    return jobs or None
+
+
+def jobs_env(env: dict | None = None) -> dict[str, str]:
+    """``LEAN_NUM_THREADS`` set to the cap (:func:`lean_jobs`), or nothing when uncapped."""
+    jobs = lean_jobs(env)
+    return {"LEAN_NUM_THREADS": str(jobs)} if jobs else {}
+
+
+def _capped(env: dict | None, extra_env: dict | None, cap_jobs: bool, network: bool) -> dict[str, str]:
+    """The cap's variables for one command: none for a fetch (``network``) or with ``cap_jobs`` false,
+    and none that ``extra_env`` sets itself, which wins in both the sandboxed and the disabled path."""
+    if not cap_jobs or network:
+        return {}
+    return {k: v for k, v in jobs_env(env).items() if k not in (extra_env or {})}
 
 
 def disabled(env: dict | None = None) -> bool:
@@ -415,11 +458,14 @@ def sandbox_argv(
     extra_env: dict | None = None,
     cwd: Path | None = None,
     network: bool = False,
+    cap_jobs: bool = True,
 ) -> list[str]:
     """``argv`` wrapped in the offline sandbox (with ``network``, the same sandbox online, for the
     worker's cache fetches: no ``--unshare-net``, no ``LAKE_NO_CACHE``, ``NETWORK_ENV`` passed and
     Mathlib's cache directory ``MATHLIB_CACHE_DIR`` writable), run from ``worktree`` (or ``cwd``, a directory inside
-    it), with ``extra_env`` set inside it (the audit and lint scripts' inputs, ``repair_audit``). Raises
+    it), with ``extra_env`` set inside it (the audit and lint scripts' inputs, ``repair_audit``). An
+    offline command with ``cap_jobs`` gets the Lean job cap (:func:`jobs_env`), which ``extra_env`` may
+    override. Raises
     :class:`SandboxUnavailable` when ``bwrap`` is not on PATH, when ``cwd`` lies outside ``worktree``
     or when a bound tree lies inside a credential directory."""
     env = dict(os.environ if env is None else env)
@@ -475,6 +521,8 @@ def sandbox_argv(
     for key in PASSED_ENV + ((*NETWORK_ENV, MATHLIB_CACHE_VARIABLE) if network else ()):
         if env.get(key):
             args += ["--setenv", key, env[key]]
+    for key, value in _capped(env, extra_env, cap_jobs, network).items():
+        args += ["--setenv", key, value]
     for key, value in (extra_env or {}).items():
         args += ["--setenv", key, str(value)]
     for key, value in _pressure_env(worktree, PRESSURE_WRAPPER).items():
@@ -503,11 +551,13 @@ def sandboxed_lake(
     extra_env: dict | None = None,
     cwd: Path | None = None,
     network: bool = False,
+    cap_jobs: bool = True,
 ) -> list[str]:
     """The command to run for ``argv`` (a ``lake build ...``) from ``worktree``: wrapped in the
     sandbox, or an environment wrapper with a logged warning when ``TAUCETI_QUEUE_SANDBOX=0``
-    (the caller then passes ``extra_env`` in the process environment). Both paths gate compilation
-    and run at the task's priority (:func:`prioritized`)."""
+    (the caller then passes ``extra_env`` in the process environment). Both paths gate compilation,
+    cap an offline command's Lean jobs unless ``cap_jobs`` is false (:func:`jobs_env`) and run at the
+    task's priority (:func:`prioritized`)."""
     if disabled():
         warn_disabled(argv)
         worktree = Path(worktree).resolve()
@@ -517,6 +567,7 @@ def sandboxed_lake(
                 shutil.which("env") or "/usr/bin/env",
                 "-u",
                 "LEAN_SYSROOT",
+                *(f"{key}={value}" for key, value in _capped(env, extra_env, cap_jobs, network).items()),
                 *(
                     f"{key}={value}"
                     for key, value in _pressure_env(worktree, str(_pressure_executable(worktree))).items()
@@ -524,7 +575,9 @@ def sandboxed_lake(
                 *argv,
             ]
         )
-    return prioritized(sandbox_argv(argv, worktree, env, extra_env=extra_env, cwd=cwd, network=network))
+    return prioritized(
+        sandbox_argv(argv, worktree, env, extra_env=extra_env, cwd=cwd, network=network, cap_jobs=cap_jobs)
+    )
 
 
 # Files name resolution and TLS read, bound read-only into an online sandbox wherever they resolve

@@ -496,6 +496,17 @@ has a time budget holds because the service re-exposes the task.
    worktree's `.lake/build` takes its full size on disk until the worktree is removed. When `bwrap`
    is missing the build fails closed; `TAUCETI_QUEUE_SANDBOX=0` runs builds unsandboxed, logging a
    warning for every build and reporting the sandbox as DISABLED in `--check`.
+   Every offline sandboxed command (the worker's builds, the agent's `lake`, `lean` and scoped
+   builds, and `TAUCETI_QUEUE_SANDBOX=0` builds too) runs with `LEAN_NUM_THREADS` set to the repair
+   Lean job cap, `TAUCETI_REPAIR_LEAN_JOBS` (default 8, `0` for none; decision 219, option B). Lake
+   has no jobs flag: its build tasks share the Lean runtime's thread pool, so the cap is the number of
+   `lean` processes a build runs at once. Uncapped on tauchonki2's 96 cores, one build ran 55 and
+   reached 42 GB RSS plus 63 GB swap (about 0.75 to 1 GB per job). The repair slice's `memory.high`
+   there is about 52 GB for three workers, and one may be running the audit (about 33 GB) under the
+   heavy-check lock while the other two build: 8 jobs (6 to 8 GB a build) keep that 45 to 49 GB.
+   Final verification's build and the drivers' builds are capped; cache fetches and the audit and lint
+   drivers themselves are not, since `lint-env.sh` picks its shards' threads and the heavy-check lock
+   bounds those checks.
 4. **Agent.** The prompt (`repair.compose_prompt`) opens with the task's instruction verbatim, then
    says what happened in plain words (for a rebase conflict: the queue is replaying this batch onto the
    current `main` commit with git, the replay stopped at PR N's commit with conflicts in these files,

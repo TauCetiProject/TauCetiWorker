@@ -168,6 +168,7 @@ def run(root: Path) -> int:
                     None,
                     logdir / "lint.log",
                     None,
+                    cap_jobs=False,
                 )
                 record["lint"] = {k: v for k, v in lint.items() if k != "output"}
                 print(lint["output"], end="", flush=True)
@@ -185,6 +186,7 @@ def run(root: Path) -> int:
                     None,
                     logdir / "duplicates.log",
                     None,
+                    cap_jobs=False,
                 )
                 record["duplicates"] = {k: v for k, v in duplicates.items() if k != "output"}
                 print(duplicates["output"], end="", flush=True)

@@ -2496,6 +2496,8 @@ def isolation_env(
     from tauceti_queue import repair_agent_tools, repair_sandbox
 
     changes[repair_sandbox.HIDDEN_VARIABLE] = os.pathsep.join(str(p) for p in repair_sandbox.credential_paths())
+    # The worker's Lean job cap, so the agent's builds take the same one (0: uncapped).
+    changes[repair_sandbox.LEAN_JOBS_VARIABLE] = str(repair_sandbox.lean_jobs() or 0)
     changes.update(repair_agent_tools.agent_environment(root))
     changes["OPENAI_API_KEY"] = None
     if provider == "api":
