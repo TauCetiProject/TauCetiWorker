@@ -295,15 +295,19 @@ def _sandboxed(
     read_only_build: bool = False,
     ro_binds: tuple[Path, ...] = (),
     rw_binds: tuple[Path, ...] = (),
+    cap_jobs: bool = True,
 ) -> dict:
     """``argv`` in the build sandbox with ``extra`` set inside it; output to ``log``. ``ro_binds`` and
     ``rw_binds`` are host directories outside the worktree made visible inside it, read-only or writable,
-    at the same paths (the verifier's own directories)."""
+    at the same paths (the verifier's own directories). Builds keep the repair Lean job cap; the audit
+    and lint drivers pass ``cap_jobs=False`` (decision 219, option B): ``lint-env.sh`` picks its shards'
+    threads itself (16 unless ``LEAN_NUM_THREADS`` says otherwise), and the heavy-check lock, not the
+    cap, bounds those checks' memory."""
     extra = {k: str(v) for k, v in (extra or {}).items()}
     run_env = {**env, **extra}
-    # No Lean job cap (decision 219, option B): lint-env.sh picks its shards' threads itself (16 unless
-    # LEAN_NUM_THREADS says otherwise), and the heavy-check lock, not the cap, bounds these checks' memory.
-    wrapped = repair_sandbox.sandboxed_lake([str(a) for a in argv], worktree, run_env, extra_env=extra, cap_jobs=False)
+    wrapped = repair_sandbox.sandboxed_lake(
+        [str(a) for a in argv], worktree, run_env, extra_env=extra, cap_jobs=cap_jobs
+    )
     if (ro_binds or rw_binds) and "--remount-ro" in wrapped:
         # Before the root becomes read-only: bwrap creates the mount points on it.
         at = wrapped.index("--remount-ro")
@@ -927,6 +931,7 @@ def _check(
                         timeout,
                         read_only_build=read_only,
                         ro_binds=(verifier, drivers),
+                        cap_jobs=False,
                     )
                     for _, _, argv, extra, log, read_only in jobs
                 ]
@@ -958,6 +963,7 @@ def _check(
                         timeout,
                         read_only_build=True,
                         ro_binds=(verifier, drivers),
+                        cap_jobs=False,
                     )
                     found["lint"] = findings_of("lint", "lint-env", runs["lint"])
                     scope = "full"

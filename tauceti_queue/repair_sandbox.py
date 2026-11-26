@@ -58,13 +58,14 @@ PRESSURE_WRAPPER = "/opt/tauceti/tauceti-lean"
 # flag: its build tasks run on the Lean runtime's thread pool, sized by ``LEAN_NUM_THREADS`` (with a
 # cap of 4 Lake runs at most 4 ``lean`` processes at once; without one, all it can schedule), and each
 # ``lean`` it starts inherits the same value for its own threads. Unset, a build on tauchonki2's 96
-# cores ran 55 ``lean`` processes at once and reached 42 GB RSS plus 63 GB swap, about 0.75 to 1 GB
+# cores ran 55 ``lean`` processes at once and reached 42 GB RSS (plus 63 GB swap), about 0.75 to 1 GB
 # per job. The repair slice's ``memory.high`` there is about 52 GB, shared by three workers, and one
-# of them may hold the heavy-check lock with the audit at about 33 GB: 16 jobs (12 to 16 GB) leave a
-# build beside the audit, or three builds together, under it. ``TAUCETI_REPAIR_LEAN_JOBS`` overrides
-# the default; 0 leaves the thread pool uncapped.
+# of them may hold the heavy-check lock with the audit at about 33 GB while the other two build:
+# 52 - 33 leaves about 19 GB, less the workers' and agents' own few GB, for two builds, so 8 jobs
+# each (6 to 8 GB a build, 45 to 49 GB with the audit). ``TAUCETI_REPAIR_LEAN_JOBS`` overrides the
+# default; 0 leaves the thread pool uncapped.
 LEAN_JOBS_VARIABLE = "TAUCETI_REPAIR_LEAN_JOBS"
-DEFAULT_LEAN_JOBS = 16
+DEFAULT_LEAN_JOBS = 8
 
 # Read-only system roots, bound when present. A symlinked root (``/bin -> usr/bin``) is recreated as
 # the same symlink, the way CI's ``--symlink usr/bin /bin`` does.
@@ -166,6 +167,14 @@ def jobs_env(env: dict | None = None) -> dict[str, str]:
     """``LEAN_NUM_THREADS`` set to the cap (:func:`lean_jobs`), or nothing when uncapped."""
     jobs = lean_jobs(env)
     return {"LEAN_NUM_THREADS": str(jobs)} if jobs else {}
+
+
+def _capped(env: dict | None, extra_env: dict | None, cap_jobs: bool, network: bool) -> dict[str, str]:
+    """The cap's variables for one command: none for a fetch (``network``) or with ``cap_jobs`` false,
+    and none that ``extra_env`` sets itself, which wins in both the sandboxed and the disabled path."""
+    if not cap_jobs or network:
+        return {}
+    return {k: v for k, v in jobs_env(env).items() if k not in (extra_env or {})}
 
 
 def disabled(env: dict | None = None) -> bool:
@@ -512,7 +521,7 @@ def sandbox_argv(
     for key in PASSED_ENV + ((*NETWORK_ENV, MATHLIB_CACHE_VARIABLE) if network else ()):
         if env.get(key):
             args += ["--setenv", key, env[key]]
-    for key, value in (jobs_env(env) if cap_jobs and not network else {}).items():
+    for key, value in _capped(env, extra_env, cap_jobs, network).items():
         args += ["--setenv", key, value]
     for key, value in (extra_env or {}).items():
         args += ["--setenv", key, str(value)]
@@ -558,7 +567,7 @@ def sandboxed_lake(
                 shutil.which("env") or "/usr/bin/env",
                 "-u",
                 "LEAN_SYSROOT",
-                *(f"{key}={value}" for key, value in (jobs_env(env) if cap_jobs and not network else {}).items()),
+                *(f"{key}={value}" for key, value in _capped(env, extra_env, cap_jobs, network).items()),
                 *(
                     f"{key}={value}"
                     for key, value in _pressure_env(worktree, str(_pressure_executable(worktree))).items()
