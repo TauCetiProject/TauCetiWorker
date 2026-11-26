@@ -1,3 +1,30 @@
+# Shared Mathlib builds need bubblewrap with --overlay support (0.12 or newer); Bookworm ships
+# 0.8, so build a pinned release from source and copy only the binary into the runtime image.
+FROM debian:bookworm-slim AS bubblewrap
+ARG BUBBLEWRAP_VERSION=0.13.1
+ARG BUBBLEWRAP_SHA256=0e85c8702248b8dd64144f594147553650cdd0e4c951690345faace79c217c4d
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gcc \
+        libc6-dev \
+        libcap-dev \
+        meson \
+        ninja-build \
+        pkg-config \
+        xz-utils \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN curl -fsSL "https://github.com/containers/bubblewrap/releases/download/v${BUBBLEWRAP_VERSION}/bubblewrap-${BUBBLEWRAP_VERSION}.tar.xz" \
+        -o bubblewrap.tar.xz \
+    && echo "${BUBBLEWRAP_SHA256}  bubblewrap.tar.xz" | sha256sum -c - \
+    && tar -xJf bubblewrap.tar.xz --strip-components=1 \
+    && meson setup build --prefix=/usr/local -Dman=disabled -Dtests=false -Dselinux=disabled \
+    && meson compile -C build \
+    && meson install -C build --destdir /out
+
 # A disposable Linux host for the Tau Ceti worker. The agent runs in host mode inside this
 # container; it does not use the more restrictive Bubble sandbox.
 FROM node:22-bookworm
@@ -15,6 +42,7 @@ RUN apt-get update \
         curl \
         git \
         jq \
+        libcap2 \
         python3 \
         python3-requests \
         ripgrep \
@@ -26,6 +54,8 @@ RUN apt-get update \
     && apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=bubblewrap /out/usr/local/bin/bwrap /usr/local/bin/bwrap
 
 # Lean (elan/lake) and uv/uvx. Both installers select binaries for the build architecture.
 RUN curl -fsSL https://elan.lean-lang.org/elan-init.sh | sh -s -- -y \
