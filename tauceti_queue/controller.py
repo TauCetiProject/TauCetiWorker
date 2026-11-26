@@ -95,6 +95,13 @@ BASE_CACHE_ANCESTORS = 20
 # `batches.urgent` of an emergency batch, which dispatches without waiting for a published base: it
 # is the means of publishing `main` again after an out-of-queue push.
 URGENT_EMERGENCY = 2
+# An emergency request whose allocation ends empty without a refusal (`_build_emergency`) is retried on
+# the next pass once; each further consecutive empty allocation for the same accepted head waits
+# `EMERGENCY_RETRY_BASE_SECONDS * 2**(n - 2)` seconds, at most `EMERGENCY_RETRY_CAP_SECONDS`, before
+# the next allocation (`evidence.emergency.retry`), so a persistent probe failure is not reallocated
+# every pass.
+EMERGENCY_RETRY_BASE_SECONDS = 15
+EMERGENCY_RETRY_CAP_SECONDS = 300
 # `batches.lane` of the control-file lane batch (`_lane_batch`): GitHub PRs whose own diff leaves the
 # native path policy, staged ahead of the ordinary open batches while `control_lane_enabled` is on.
 LANE_CONTROL = "control"
@@ -5564,8 +5571,11 @@ class Controller:
         batch = self._emergency_batch()
         if batch is not None:
             if batch["state"] == BATCH_OPEN and not self._members(batch["id"]):
-                # A crash after allocation, or a probe that did not insert: the request is retried.
-                self._end_emergency(batch, "empty-allocation", now, keep_request=True)
+                # A crash after allocation, or an error the probe did not handle: the request is kept
+                # and retried, backing off if this keeps happening.
+                self._end_emergency(
+                    batch, "empty-allocation", now, keep_request=True, retry_reason="no member after the allocation"
+                )
                 batch = None
             elif not self._active_members(batch):
                 self._end_emergency(batch, "emptied", now)
@@ -5573,6 +5583,10 @@ class Controller:
             elif batch["state"] == BATCH_OPEN and (self._mixed_inert_batch(batch) or self._inert_ci_batch(batch)):
                 self._end_emergency(batch, "inert", now)
                 batch = None
+            elif (input_id := self._emergency_input(batch)) is not None:
+                # A built batch ends its request's empty-allocation streak, also after a crash between
+                # the insertion and the clearing that follows it.
+                self._clear_emergency_retry(input_id, now)
         if batch is None:
             batch = self._pick_emergency(now)
         if batch is None or batch["state"] != BATCH_OPEN:
@@ -5605,7 +5619,22 @@ class Controller:
                 continue  # held with every Forgejo input while placement is paused; the request is kept
             if row["state"] == INPUT_WAITING and self._label_blocked(row):
                 continue  # held while a blocking label stays; the request is kept
+            retry = self._emergency_retry(row)
+            if retry is not None and now < retry["next_at"]:
+                # Only a request whose batch failed to build has a streak: a waiting input's empty
+                # allocation, or an inserted input's singleton replay error. Its PR stays where it is
+                # (waiting, or in its open batch) and a younger request may be served meanwhile.
+                self._reasons.append(
+                    f"emergency request #{row['number']} backs off after {retry['failures']} failed attempts "
+                    f"({retry['reason']}); next at {repair_stall.clock(retry['next_at'])}"
+                )
+                continue
             if row["state"] == INPUT_WAITING:
+                if self.admission is not None and not self.admission.is_current(row["number"], row["head_sha"]):
+                    # Its probe would end `admission-pending`: no batch is allocated until admission
+                    # has evaluated the accepted head.
+                    self._reasons.append(f"emergency request #{row['number']} waits for admission to evaluate it")
+                    continue
                 return self._build_emergency(row, now)
             owner = self.store.row("batches", {"id": row["batch_id"]}) if row["batch_id"] is not None else None
             if owner is None or owner["state"] not in (BATCH_OPEN, BATCH_HEAD):
@@ -5627,8 +5656,8 @@ class Controller:
 
         `_probe` runs unlocked; no transaction is held across it. Its refusals refuse the request
         (`conflicts-with-main` and `missing-source` also cancel the input, as for any probe); a
-        transient failure (`probe-error`, `batch-moved`, `admission-pending`) ends the allocation and
-        keeps the request for the next pass."""
+        transient failure (`probe-error`, `batch-moved`, `admission-recheck`) ends the allocation and
+        keeps the request, which backs off if it keeps failing (`_record_emergency_retry`)."""
         canonical = self._canonical
         if canonical is None:
             return None
@@ -5645,6 +5674,7 @@ class Controller:
         if current is None or current["state"] not in (BATCH_OPEN, BATCH_HEAD):
             return None  # cancelled while the probe ran
         if inserted:
+            self._clear_emergency_retry(row["id"], now)
             return current
         fresh = self.store.row("inputs", {"id": row["id"]}) or row
         refused = None
@@ -5657,8 +5687,92 @@ class Controller:
         if refused is not None:
             self._end_emergency(current, "empty-allocation", now, refused=refused)
         else:
-            self._end_emergency(current, "empty-allocation", now, keep_request=True)
+            reason = str(fresh["last_probe"] or "") or "the probe inserted nothing"
+            self._end_emergency(current, "empty-allocation", now, keep_request=True, retry_reason=reason)
         return None
+
+    def _emergency_retry(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        """The request's empty-allocation streak (`evidence.emergency.retry`) for its accepted head, or
+        None: no streak, or one recorded for an earlier head."""
+        record = loads(row["evidence"], {}).get("emergency") or {}
+        retry = record.get("retry")
+        if not isinstance(retry, dict) or retry.get("head_sha") != row["head_sha"]:
+            return None
+        return retry
+
+    def _record_emergency_retry(self, row: dict[str, Any], reason: str, now: float) -> None:
+        """Count a failed attempt to build the request's emergency batch (an empty allocation without a
+        refusal, a singleton replay error) and set when the next one may start.
+
+        The first retries on the next pass (a transient failure clears then); from the second in a row
+        for the same accepted head the request backs off exponentially, and the streak raises one
+        journal entry and one progress alert, not one per attempt. Joins the caller's transaction."""
+        fresh = self.store.row("inputs", {"id": row["id"]})
+        if fresh is None or not self._emergency_requested(fresh):
+            return
+        previous = self._emergency_retry(fresh) or {}
+        failures = int(previous.get("failures") or 0) + 1
+        delay = (
+            0 if failures < 2 else min(EMERGENCY_RETRY_CAP_SECONDS, EMERGENCY_RETRY_BASE_SECONDS * 2 ** (failures - 2))
+        )
+        reason = reason[:200]
+        retry = {
+            "head_sha": fresh["head_sha"],
+            "failures": failures,
+            "since": previous.get("since", now),
+            "last_at": now,
+            "next_at": now + delay,
+            "reason": reason,
+            "alerted_at": previous.get("alerted_at"),
+        }
+        evidence = loads(fresh["evidence"], {})
+        with self.store.transaction():
+            if failures >= 2 and retry["alerted_at"] is None:
+                retry["alerted_at"] = now
+                self.store.journal(
+                    now, "emergency-backoff", None, number=fresh["number"], failures=failures, reason=reason
+                )
+                self._count("emergency_backoffs")
+                marker = (
+                    "tauceti-queue-"
+                    + hashlib.sha256(
+                        f"emergency-backoff:{fresh['id']}:{fresh['head_sha']}:{retry['since']}".encode()
+                    ).hexdigest()[:24]
+                )
+                lines = [
+                    f"**Tau Ceti merge queue: emergency request #{fresh['number']} backs off**",
+                    "",
+                    f"Why: {escalation.quote(f'{failures} attempts in a row to build its batch failed: {reason}', 500)}",
+                    "What the queue did: kept the request and retries with exponential backoff "
+                    f"(at most {EMERGENCY_RETRY_CAP_SECONDS} s); one alert for this streak.",
+                ]
+                if self.public_url:
+                    lines += ["", f"Status: {self.public_url.rstrip('/')}/status"]
+                lines += ["", f"Alert ID: {marker}"]
+                self._enqueue(
+                    "progress-alert",
+                    f"progress-alert:emergency-backoff:{fresh['id']}:{fresh['head_sha']}:{retry['since']}",
+                    {"marker": marker, "content": "\n".join(lines)},
+                )
+            evidence["emergency"]["retry"] = retry
+            self.store.update("inputs", {"id": fresh["id"]}, evidence=dumps(evidence))
+
+    def _clear_emergency_retry(self, input_id: int, now: float) -> None:
+        """The request's allocation inserted its member: its empty-allocation streak is over."""
+        row = self.store.row("inputs", {"id": input_id})
+        if row is None:
+            return
+        evidence = loads(row["evidence"], {})
+        record = evidence.get("emergency")
+        if not isinstance(record, dict) or "retry" not in record:
+            return
+        retry = record.pop("retry")
+        with self.store.transaction():
+            self.store.update("inputs", {"id": input_id}, evidence=dumps(evidence))
+            if isinstance(retry, dict) and retry.get("alerted_at") is not None:
+                self.store.journal(
+                    now, "emergency-backoff-cleared", None, number=row["number"], failures=retry.get("failures")
+                )
 
     def _emergency_singleton(self, row: dict[str, Any], owner: dict[str, Any], now: float) -> dict[str, Any] | None:
         """Build the emergency batch for a PR inserted in open batch `owner` (the prospective singleton).
@@ -5671,6 +5785,7 @@ class Controller:
             return None  # refused, or something moved while the replay ran; the next pass tries again
         with self.store.transaction():
             batch = self._insert_singleton(row, owner, built, now)
+        self._clear_emergency_retry(row["id"], now)
         return self.store.row("batches", {"id": batch["id"]})
 
     def _singleton_chain(self, row: dict[str, Any], owner: dict[str, Any], now: float) -> dict[str, Any] | None:
@@ -5698,7 +5813,9 @@ class Controller:
         finally:
             chain.delete_chain_ref(self.clone, chain_id)
         if failure is not None:
-            self.store.journal(now, "emergency-build-error", owner["id"], number=row["number"], error=str(failure))
+            with self.store.transaction():
+                self.store.journal(now, "emergency-build-error", owner["id"], number=row["number"], error=str(failure))
+                self._record_emergency_retry(row, f"emergency-build-error: {failure}", now)
             self._reasons.append(f"emergency batch for #{row['number']} could not be built: {failure}")
             return None
         assert result is not None
@@ -6059,6 +6176,7 @@ class Controller:
         now: float,
         *,
         keep_request: bool = False,
+        retry_reason: str | None = None,
         refused: str | None = None,
         actor: str | None = None,
     ) -> None:
@@ -6066,8 +6184,8 @@ class Controller:
 
         In one transaction: its members leave it (`_return_members`, so `_emergency_exit`: back to a
         live displaced slot, else waiting at the original age); an input its own probe holds reserved
-        waits again; the request is cleared unless `keep_request` (a transient `empty-allocation`, retried
-        next pass); its open tasks are superseded and its claims released; pre-rebases onto its tips are
+        waits again; the request is cleared unless `keep_request` (an `empty-allocation` without a refusal,
+        retried; with `retry_reason` it counts towards the request's backoff, `_record_emergency_retry`); its open tasks are superseded and its claims released; pre-rebases onto its tips are
         discarded; it is removed; and a durable cancel intent is written for every unsettled attempt of
         it at any version (`_write_cancel_intents`). The intents are then settled at once."""
         input_id = self._emergency_input(batch)
@@ -6086,6 +6204,8 @@ class Controller:
                     row = self.store.row("inputs", {"id": row["id"]}) or row
                 if not keep_request and self._emergency_requested(row):
                     self._clear_emergency_request(row)
+                elif retry_reason is not None and self._emergency_requested(row):
+                    self._record_emergency_retry(row, retry_reason, now)
             for stale in self.store.rows("tasks", {"batch_id": batch["id"], "state": TASK_OPEN}):
                 self.store.update(
                     "tasks", {"id": stale["id"]}, state=TASK_SUPERSEDED, resolved_at=now, resolution="emergency-ended"
@@ -6371,6 +6491,7 @@ class Controller:
                 **self._public_pull_identity(row["number"]),
                 "state": row["state"],
                 **{key: record.get(key) for key in ("actor", "requested_at", "surface", "reason")},
+                "retry": self._emergency_retry_status(row),
             }
 
         batch = self._emergency_batch()
@@ -6404,6 +6525,31 @@ class Controller:
                 {"attempt_id": attempt_id, **intent} for attempt_id, intent in self._cancel_intents().items()
             ],
         }
+
+    def _emergency_retry_status(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        """`status.emergency`'s view of a request's empty-allocation streak, or None."""
+        retry = self._emergency_retry(row)
+        if retry is None:
+            return None
+        return {key: retry.get(key) for key in ("failures", "reason", "since", "last_at", "next_at")}
+
+    def _emergency_alerts(self, now: float) -> list[str]:
+        """One status alert per emergency request backing off after repeated empty allocations."""
+        alerts = []
+        for row in self._flagged_inputs():
+            retry = self._emergency_retry(row)
+            if retry is None or retry.get("alerted_at") is None:
+                continue
+            alerts.append(
+                f"emergency request #{row['number']}: {retry['failures']} failed attempts in a row to build its batch since "
+                f"{repair_stall.clock(retry['since'])} ({retry['reason']}); "
+                + (
+                    f"next allocation at {repair_stall.clock(retry['next_at'])}"
+                    if now < retry["next_at"]
+                    else "next allocation on the next pass"
+                )
+            )
+        return alerts
 
     # --- sealing -----------------------------------------------------------------------------------
 
@@ -12151,6 +12297,7 @@ class Controller:
                     f"CI infrastructure backoff since {backoff['since']:.0f}: {backoff['retries']} automatic retries"
                 )
             alerts.extend(self._progress_alerts(now))
+            alerts.extend(self._emergency_alerts(now))
             loop_termination = {
                 "infrastructure_backoff": backoff or None,
                 "repair_stalls": list(self._repair_stalls().values()),
