@@ -8,22 +8,30 @@ so GitHub numbers and Forgejo numbers count separately.
 
 The first pass lists every PR (the backfill); later passes list only PRs updated since
 the previous complete pass. Each pass reads the issue listing (state, merge and close
-times) and fetches a PR once, when it is first seen, for its branch.
+times) and fetches a PR once, when it is first seen, for its branch. Once a PR lands,
+`measure` records its Lean LOC and review passes, which the GitHub state service
+supplies for GitHub PRs.
 """
 
 import json
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 
 from tauceti_tools.forge import Forge, RepositoryRef
+from tauceti_tools.survey_facts import SPEC
 
 BORS_MERGED_PREFIX = "[Merged by Bors] - "
 INTERVAL = 300
 SLACK = 600
 DEADLINE = 30
+# Measurements of landed PRs: a per-pass time budget and batch, and the retry delay.
+MEASURE_SECONDS = 10
+MEASURE_LIMIT = 200
+RETRY = 3600
 WORKER = re.compile(r"-(fleet-[0-9a-f]{8}-[0-9]+)$")
 
 
@@ -121,4 +129,106 @@ def refresh(db, machine, now, errors, env):
         db.execute(
             "UPDATE prs SET observed=?,checked=? WHERE repo=? AND landed IS NULL AND state IS NOT 'CLOSED'",
             (now, now, key),
+        )
+
+
+def _pages(repo, path):
+    rows = []
+    for page in range(1, 1000):
+        batch = _get(repo, f"{path}?limit=50&page={page}")
+        if not batch:
+            return rows
+        rows.extend(batch)
+    raise ValueError("unbounded listing")
+
+
+def lean_loc(pull, files):
+    """Lean lines of a PR's file listing, if it accounts for the PR's whole diff."""
+    if (
+        sum(f["additions"] for f in files) != pull["additions"]
+        or sum(f["deletions"] for f in files) != pull["deletions"]
+    ):
+        return None  # A truncated listing must not pass for an exact count.
+    lean = [f for f in files if f["filename"].endswith(".lean")]
+    return dict(added=sum(f["additions"] for f in lean), deleted=sum(f["deletions"] for f in lean))
+
+
+def review_passes(comments, head):
+    """The scoreboards' cumulative round counters, as the GitHub state service reports them."""
+    count = boards = 0
+    current = False
+    for comment in comments:
+        body = comment.get("body") or ""
+        found = re.findall(SPEC["meta_pattern"], body)
+        if SPEC["scoreboard"] not in body or not found:
+            continue
+        meta = json.loads(found[-1])
+        if not isinstance(meta, dict) or meta.get("mode") == "init":
+            continue
+        value = meta.get("round")
+        if type(value) is not int or value < 0:
+            return None
+        count += value
+        boards += 1
+        current = current or bool(head and meta.get("head_sha") == head)
+    return count if boards and current else None
+
+
+def measure(db, now, errors, env):
+    """Record LOC and review passes for this host's landed Forgejo PRs.
+
+    The GitHub state service supplies these for GitHub PRs. Each landed PR costs three
+    reads, once: its final head and diff totals, its file listing and its comments.
+    An incomplete measurement is retried after RETRY seconds.
+    """
+    repo = repository(env)
+    key = repo.key
+    stop = time.monotonic() + MEASURE_SECONDS
+    due = db.execute(
+        """SELECT p.number,p.head FROM prs p LEFT JOIN pr_review_counts c ON c.repo=p.repo AND c.number=p.number
+           WHERE p.repo=? AND p.landed IS NOT NULL AND (
+             c.repo IS NULL OR c.head IS NOT p.head
+             OR ((c.count IS NULL OR NOT EXISTS (SELECT 1 FROM pr_loc l
+                    WHERE l.repo=p.repo AND l.number=p.number AND l.head=p.head))
+                 AND c.checked<?))
+           ORDER BY p.landed DESC LIMIT ?""",
+        (key, now - RETRY, MEASURE_LIMIT),
+    ).fetchall()
+    for number, head in due:
+        if time.monotonic() > stop:
+            break
+        loc = count = None
+        try:
+            pull = _get(repo, f"/pulls/{number}")
+            head = pull["head"]["sha"] or head
+            loc = lean_loc(pull, _pages(repo, f"/pulls/{number}/files"))
+            # Forgejo returns all of an issue's comments at once; it ignores paging here.
+            count = review_passes(_get(repo, f"/issues/{number}/comments"), head)
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                errors.append("Forgejo PR measurements unavailable; normal refresh will retry")
+                return
+        except OSError:
+            errors.append("Forgejo PR measurements unavailable; normal refresh will retry")
+            return
+        except (ValueError, KeyError, TypeError, AttributeError):
+            pass  # This PR's data is malformed; retry it later without blocking the others.
+        db.execute("UPDATE prs SET head=? WHERE repo=? AND number=? AND head IS NOT ?", (head, key, number, head))
+        if loc is not None:
+            db.execute(
+                "INSERT OR REPLACE INTO pr_loc VALUES (?,?,?,?,?,?)",
+                (key, number, head, loc["added"], loc["deleted"], now),
+            )
+        db.execute(
+            "INSERT OR REPLACE INTO pr_review_counts(repo,number,head,count,observed,checked,basis) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                key,
+                number,
+                head,
+                count,
+                now if count is not None else None,
+                now,
+                "scoreboard-round-counters" if count is not None else "unavailable",
+            ),
         )

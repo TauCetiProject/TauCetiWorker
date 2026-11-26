@@ -643,7 +643,11 @@ class ActivityTests(unittest.TestCase):
             fleet_events.mutation(  # GitHub PR #5 is a different PR from Forgejo #5.
                 {"argv": ["pr", "create"]}, SimpleNamespace(stdout="https://github.com/TauCetiProject/TauCeti/pull/5")
             )
-            with patch.object(activity_forgejo, "_get", side_effect=get), patch.object(a, "observe", return_value=None):
+            with (
+                patch.object(activity_forgejo, "_get", side_effect=get),
+                patch.object(a, "observe", return_value=None),
+                patch.object(activity_forgejo, "measure"),  # Landed PRs' measurements are tested separately.
+            ):
                 a.prepare(config, now=self.now + 1)
                 self.assertEqual(sum(p.startswith("/pulls/") for p in requests), 3)
                 s = a.cached(group=machine)["summary"]
@@ -657,6 +661,74 @@ class ActivityTests(unittest.TestCase):
                 a.prepare(config, now=self.now + 1 + activity_forgejo.INTERVAL)
                 self.assertEqual([p for p in requests if p.startswith("/pulls/")], [])
                 self.assertIn("since=", requests[0])
+
+    def test_landed_forgejo_prs_record_lean_loc_and_review_passes_once(self):
+        from tauceti_worker import activity_forgejo
+
+        machine = "11e2756f00000000"
+        config = Path(self.tmp.name) / "workers.toml"
+        config.write_text('version = 1\n[[workers]]\nid = "w"\nforgejo = true\nnew_pr_forge = "forgejo"\n')
+
+        def iso(at):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(at))
+
+        def board(round, head):
+            meta = json.dumps(dict(round=round, head_sha=head, mode="commit"))
+            return dict(body=f"<!--tauceti-scoreboard-->\nScores\n<!--tauceti-meta:v1 {meta}-->")
+
+        bors = activity_forgejo.BORS_MERGED_PREFIX
+        landed = dict(state="closed", closed_at=iso(self.now - 1800), pull_request=dict(merged=False))
+        issues = [dict(landed, number=n, title=bors + "feat: x") for n in (6, 8)]
+        files = {
+            6: [
+                dict(filename="A.lean", additions=300, deletions=2),
+                dict(filename="B.lean", additions=50, deletions=0),
+                dict(filename="README.md", additions=7, deletions=1),
+            ],
+            8: [dict(filename="C.lean", additions=10, deletions=0)],  # The listing misses a file.
+        }
+        totals = {6: (357, 3), 8: (20, 0)}
+        comments = {6: [dict(body="LGTM"), board(1, "old"), board(2, "final")], 8: [board(1, "final")]}
+        requests = []
+
+        def get(repo, path):
+            requests.append(path)
+            if path.startswith("/issues?"):
+                return issues if "page=1" in path else []
+            number = int(path.split("/")[2].split("?")[0])
+            if path.endswith("/files?limit=50&page=1"):
+                return files[number]
+            if path.endswith("/comments"):
+                return comments[number]
+            if "?" in path:
+                return []
+            head = dict(label=f"roadmap/x-fleet-11e2756f-{number}", ref=f"refs/pull/{number}/head", sha="final")
+            additions, deletions = totals[number]
+            return dict(
+                number=number, created_at=iso(self.now - 3600), head=head, additions=additions, deletions=deletions
+            )
+
+        with (
+            patch.dict(os.environ, {"TAUCETI_FLEET_MACHINE_ID": machine}),
+            patch.object(activity_forgejo, "_get", side_effect=get),
+            patch.object(a, "observe", return_value=None),
+        ):
+            a.prepare(config, now=self.now + 1)
+            costs = a.cached(group=machine)["summary"]["costs"]["windows"]["24h"]
+            self.assertEqual((costs["known_loc_prs"], costs["missing_loc_prs"]), (1, 1))
+            self.assertEqual(costs["landed_loc_added"], 350)
+            with contextlib.closing(a._connect()) as db:
+                counts = dict(db.execute("SELECT number,count FROM pr_review_counts").fetchall())
+            self.assertEqual(counts, {6: 3, 8: 1})
+            # Measured PRs are not read again; the incomplete one waits for its retry.
+            requests.clear()
+            a.prepare(config, now=self.now + 2)
+            self.assertEqual([p for p in requests if p.startswith("/pulls/")], [])
+            files[8].append(dict(filename="D.lean", additions=10, deletions=0))
+            a.prepare(config, now=self.now + 2 + activity_forgejo.RETRY)
+            costs = a.cached(group=machine)["summary"]["costs"]["windows"]["24h"]
+            self.assertEqual((costs["known_loc_prs"], costs["missing_loc_prs"]), (2, 0))
+            self.assertEqual(costs["landed_loc_added"], 370)
 
     def test_missing_finishes_show_start_windows_latest_round_and_scope(self):
         # These were all discovered together. Recent counts must use their

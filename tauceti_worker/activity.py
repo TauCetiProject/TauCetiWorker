@@ -934,6 +934,7 @@ def prepare(config=None, *, import_history=False, history_roots=(), now=None):
                 forgejo = next((s for s in (load_worker_specs(config) if config else []) if s.forgejo), None)
                 if machine and forgejo:
                     activity_forgejo.refresh(db, machine, now, errors, dict(forgejo.env))
+                    activity_forgejo.measure(db, now, errors, dict(forgejo.env))
                 _bors(db, errors)
                 try:
                     activity_attribution.prepare(db, now)
