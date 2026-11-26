@@ -3493,6 +3493,15 @@ def _do_progress_inner(w, opts) -> int | None:
     receipt = publication.save(w.cfg, me(), PROGRESS_REF)
     shutil.rmtree(writing, ignore_errors=True)  # the receipted canonical bodies now retain the paid output
     receipt = publication.defer(w.cfg, receipt)
+    return _publish_written_progress(w, run_tool, roadmap_dir, work, receipt)
+
+
+def _publish_written_progress(w, run_tool, roadmap_dir, work, receipt):
+    # `apply` reads the live cursor from origin/main, last fetched before planning. Another operator's
+    # report for this window can land while the agent writes; fetching here makes `apply` stop rather
+    # than open a duplicate the gate refuses as a rewrite (TauCetiRoadmap#2974, after #2968).
+    if subprocess.run(["git", "-C", str(roadmap_dir), "fetch", "-q", "origin"]).returncode:
+        return _defer_progress_publication(w, receipt, f"temporary fetch failure in {roadmap_dir}")
     return _apply_prepared_progress(w, run_tool, roadmap_dir, work, receipt)
 
 
