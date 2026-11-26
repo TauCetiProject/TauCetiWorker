@@ -703,11 +703,19 @@ intents, ends a dead emergency batch E (`empty-allocation`: no member after a cr
 probe failure, retried; `emptied`: no active member; `inert`: a member from a disabled source), and,
 when no E is live, builds one for the oldest request: a waiting input is probed (`_probe`) into a
 new open batch on `main` with `batches.urgent = 2` (`conflicts-with-main`, `missing-source`,
-`missing-source-in-flight` and `source-ci-scope` refuse the request; `probe-error`, `batch-moved` and
-`admission-pending` keep it for the next pass); an input inserted in an open batch B is replayed onto
+`missing-source-in-flight` and `source-ci-scope` refuse the request; any other probe outcome that
+inserts nothing, such as `probe-error`, `batch-moved` or `admission-recheck`, keeps it); an input inserted in an open batch B is replayed onto
 `main` without the lock with the same checks and then, in one transaction, inserted into a new E
 whose ownership of the input (`inputs.batch_id`) replaces B's (the prospective singleton; a refusal
-leaves it in B). A request whose PR is in the running head waits for that head to land, unless
+leaves it in B). A waiting input admission has not evaluated at its accepted head gets no allocation
+until it has (its probe would end `admission-pending`). A kept request is allocated again on the next
+pass once; each further empty allocation in a row for the same accepted head backs off
+exponentially, 15 s doubling up to 300 s (`evidence.emergency.retry`: `failures`, `reason` from
+`last_probe`, `since`, `next_at`), so a persistent failure (a fetch that keeps failing, an insertion
+check that keeps holding) does not allocate a batch every pass. The second in a row journals
+`emergency-backoff` and raises one progress alert for the streak; a status alert stays while it
+lasts, and an insertion ends it (`emergency-backoff-cleared`). Meanwhile a younger request may be
+served. A request whose PR is in the running head waits for that head to land, unless
 eviction (below) displaces it. One E is live at a time; later requests queue behind it, first in
 first out. E is never evicted. With `emergency_evict` off E waits for the running head to land
 (`emergency-waits`).
@@ -1085,7 +1093,8 @@ repairs), `no_repair_withdrawals`, `problem_anticipated_needs_rebase`,
 `head_cycle_seconds` (first dispatch to landing); `insertion_passes`; `max_passes_waited`;
 `emergency` (`enabled`; `batch`, null or the live emergency batch: `batch_id`, `stage` (`waiting` or
 `head`), `waiting_for`, and the request's `number`, `state`, `actor`, `requested_at`, `surface`,
-`reason`; `queued`, the requests behind it; `cancel_intents`, the open intents with `attempt_id`,
+`reason`, and `retry`, null or its empty-allocation backoff (`failures`, `reason`, `since`, `last_at`,
+`next_at`); `queued`, the requests behind it; `cancel_intents`, the open intents with `attempt_id`,
 `batch_id`, `reason`, `at`, and after a failure `tries` and `retry_at`). Every batch summary
 carries `emergency` (`urgent == 2`) and `lane` (`control` for the control-file lane batch, else
 empty); `waiting.control` counts the waiting control-file inputs, and each waiting input carries

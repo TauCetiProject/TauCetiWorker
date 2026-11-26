@@ -4475,6 +4475,95 @@ class EmergencyLane(QueueFixture):
         live = self.controller._emergency_batch()
         self.assertEqual([m["number"] for m in self.members(live)], [103])
 
+    def persistent_empty_allocations(self, number, reason_prefix):
+        """Three passes of a persistent probe failure allocate twice (the allocation and its one
+        immediate retry), then the request backs off: one journal entry, one alert, the reason in status."""
+        self.tick(3)
+        self.assertEqual(
+            [b["state"] for b in self.emergency_batches()], ["removed", "removed"], "no batch per pass any more"
+        )
+        row = self.controller.input_for(PROJECT, number)
+        self.assertEqual((row["state"], row["urgent"]), ("waiting", 2), "the request is kept")
+        status = self.controller.status()
+        [queued] = status["emergency"]["queued"]
+        retry = queued["retry"]
+        self.assertEqual(retry["failures"], 2)
+        self.assertTrue(retry["reason"].startswith(reason_prefix), retry)
+        self.assertEqual(retry["next_at"], self.clock() + 15)
+        self.assertEqual(len([a for a in status["alerts"] if f"emergency request #{number}" in a]), 1)
+        self.assertEqual(len(self.journal("emergency-backoff")), 1)
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "progress-alert"}), 1)
+        # The backoff doubles; still one alert and one journal entry for the streak.
+        self.clock.advance(15)
+        self.tick(3)
+        self.assertEqual(len(self.emergency_batches()), 3)
+        retry = self.controller.status()["emergency"]["queued"][0]["retry"]
+        self.assertEqual((retry["failures"], retry["next_at"]), (3, self.clock() + 30))
+        self.clock.advance(30)
+        self.tick()
+        self.assertEqual(len(self.emergency_batches()), 4)
+        self.assertEqual(len(self.journal("emergency-backoff")), 1)
+        self.assertEqual(self.controller.store.count("outbox", {"kind": "progress-alert"}), 1)
+        self.assertEqual(len([e for e in self.journal("emergency-ended") if e["cause"] == "empty-allocation"]), 4)
+
+    def test_a_persistent_fetch_failure_backs_off_and_clears_once_inserted(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.emergency(102)
+        with patch.object(self.controller, "_fetch_head", return_value=False):
+            self.persistent_empty_allocations(102, "error: accepted head")
+        # Capped at a few minutes.
+        for _ in range(8):
+            self.controller._record_emergency_retry(self.controller.input_for(PROJECT, 102), self.clock())
+        retry = self.controller.status()["emergency"]["queued"][0]["retry"]
+        self.assertEqual(retry["next_at"], self.clock() + 300)
+        self.clock.advance(300)
+        self.tick()
+        live = self.controller._emergency_batch()
+        self.assertEqual([m["number"] for m in self.members(live)], [102])
+        evidence = json.loads(self.controller.input_for(PROJECT, 102)["evidence"])
+        self.assertNotIn("retry", evidence["emergency"])
+        self.assertEqual(len(self.journal("emergency-backoff-cleared")), 1)
+        self.assertFalse(any("emergency request #102" in a for a in self.controller.status()["alerts"]))
+
+    def test_a_persistent_insertion_check_refusal_backs_off(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.emergency(102)
+        admission = types.SimpleNamespace(
+            is_current=lambda number, head: True,
+            insertion_check=lambda number, head: "unavailable: read failed",
+            withdraw=lambda number, head: None,
+            policy=types.SimpleNamespace(revision="policy"),
+            state=types.SimpleNamespace(summary=lambda: {}),
+        )
+        with patch.object(self.controller, "admission", admission):
+            self.persistent_empty_allocations(102, "admission-recheck")
+
+    def test_an_emergency_request_waits_for_admission_without_allocating(self):
+        self.approve(101, {"A.lean": "a\n"})
+        self.tick()
+        self.approve(102, {"B.lean": "b\n"})
+        self.emergency(102)
+        current = {"value": False}
+        admission = types.SimpleNamespace(
+            is_current=lambda number, head: current["value"] or number != 102,
+            insertion_check=lambda number, head: None,
+            withdraw=lambda number, head: None,
+            policy=types.SimpleNamespace(revision="policy"),
+            state=types.SimpleNamespace(summary=lambda: {}),
+        )
+        with patch.object(self.controller, "admission", admission):
+            reasons = self.tick(3)
+            self.assertEqual(self.emergency_batches(), [])
+            self.assertIn("emergency request #102 waits for admission to evaluate it", reasons)
+            current["value"] = True
+            self.tick()
+        live = self.controller._emergency_batch()
+        self.assertEqual([m["number"] for m in self.members(live)], [102])
+
     def test_crash_after_allocation_and_a_probe_refusal(self):
         self.approve(101, {"A.lean": "a\n"})
         self.tick()
