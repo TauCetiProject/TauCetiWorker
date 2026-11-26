@@ -17,6 +17,18 @@ namespace that overlays each package's published build onto its read-only ``.lak
 private upper under ``.lake/tauceti-mathlib/<generation>/`` that the next round discards. Outside a
 view the build directories are empty and read-only, so a build fails rather than copying Mathlib.
 
+macOS has no rootless mount namespaces or overlays, so there a view is made of APFS clones instead
+(``backend()`` is ``"clone"``): every closure package's shared source and published build are cloned
+with ``clonefile(2)`` into ``.lake/tauceti-mathlib/<generation>/<package>/``, and for the life of the
+view the checkout's package links name those clones (through ``.lake/tauceti-mathlib/current``, a
+link to the generation, so the link targets do not change from round to round). A clone shares its
+original's blocks copy-on-write, so the host still stores one Mathlib build per version, and a
+round's writes land only in its own clone. ``clonefile`` never falls back to copying bytes: where
+it is unavailable (not APFS, or the pool and the checkout on different volumes) the round is
+refused. Published builds have every write bit removed there, because no read-only mount protects
+them. When the view ends the links name the shared sources again, with their empty read-only build
+directories, and the generation is discarded.
+
 Agent workspaces are NEVER publication sources. Locks outside entries protect publication and
 leases against eviction and collection; no root or daemon.
 """
@@ -26,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import functools
 import hashlib
 import json
 import math
@@ -175,7 +188,16 @@ def mode(env):
 
 
 def boot_id():
+    if platform.system() == "Darwin":
+        from .usage_lifecycle import darwin_boot
+
+        return darwin_boot()
     return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
+def backend():
+    """How this host gives a round its view: "overlay" (Linux), "clone" (macOS), else None."""
+    return {"Linux": "overlay", "Darwin": "clone"}.get(platform.system())
 
 
 def overlay_preload():
@@ -246,8 +268,182 @@ def overlay_command(lower, upper, work, target, pool, *, lease_fd=None):
     return view_command([(lower, upper, work, target)], pool, lease_fd=lease_fd)
 
 
+CLONE_MARKER = "clone.json"  # in a generation made of clones: written once cloning has finished
+CLONE_CURRENT = "current"  # under .lake/tauceti-mathlib: a link to the clone view's generation
+
+
+@functools.cache
+def _clonefile():
+    import ctypes
+
+    function = getattr(ctypes.CDLL(None, use_errno=True), "clonefile", None)
+    if function is None:
+        return None
+    function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
+    function.restype = ctypes.c_int
+    return function
+
+
+def clone_file(source, destination):
+    """clonefile(2): a new file that shares ``source``'s blocks copy-on-write.
+
+    The one platform primitive of the macOS backend (tests replace it). It never copies bytes: on a
+    filesystem without clones (anything but APFS) it fails with ENOTSUP, and across volumes with
+    EXDEV. ``destination`` must not exist; a symlink is not followed."""
+    import ctypes
+
+    function = _clonefile() if platform.system() == "Darwin" else None
+    if function is None:
+        raise OSError(errno.ENOTSUP, "clonefile(2) is unavailable on this system", str(source))
+    if function(os.fsencode(source), os.fsencode(destination), 1):  # CLONE_NOFOLLOW
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(source), None, str(destination))
+
+
+def _clone_tree(source, destination, *, prune=None, writable=None, file_bits=0):
+    """A private copy-on-write copy of the tree ``source`` at ``destination``, which must not exist.
+
+    Directories are created, regular files cloned and symlinks recreated; anything else is
+    refused. A directory gets mode 0755 when ``writable`` is None or accepts its path relative to
+    ``source`` (a tuple of parts), and its original's mode otherwise. Files keep their mode, plus
+    ``file_bits``, and their modification time (set explicitly: Lake compares times, and a build
+    that looked stale would be compiled again in the round). The directory ``prune`` is left out."""
+    source, destination = os.fspath(source), os.fspath(destination)
+    prune = None if prune is None else os.fspath(prune)
+    modes = []
+    for here, directories, files in os.walk(source, followlinks=False):
+        relative = os.path.relpath(here, source)
+        parts = () if relative == "." else tuple(relative.split(os.sep))
+        target = os.path.join(destination, *parts)
+        os.mkdir(target, 0o700)
+        modes.append((target, 0o755 if writable is None or writable(parts) else stat.S_IMODE(os.lstat(here).st_mode)))
+        kept = []
+        for name in directories:
+            path = os.path.join(here, name)
+            if path == prune:
+                continue
+            if os.path.islink(path):
+                os.symlink(os.readlink(path), os.path.join(target, name))
+            else:
+                kept.append(name)
+        directories[:] = kept
+        for name in files:
+            path, copy = os.path.join(here, name), os.path.join(target, name)
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode):
+                os.symlink(os.readlink(path), copy)
+            elif stat.S_ISREG(info.st_mode):
+                clone_file(path, copy)
+                if file_bits:
+                    os.chmod(copy, stat.S_IMODE(info.st_mode) | file_bits)
+                os.utime(copy, ns=(info.st_atime_ns, info.st_mtime_ns))
+            else:
+                raise Unavailable(f"cannot clone {path}: neither a regular file, a directory nor a symlink")
+    for target, mode in reversed(modes):
+        os.chmod(target, mode)
+
+
+def _same_volume(first, second):
+    """clonefile(2) works only within one volume."""
+    return os.stat(first).st_dev == os.stat(second).st_dev
+
+
+def _clone_source(source, target):
+    """A private clone of one shared package source, without its build directory.
+
+    As in an overlay view, the round may create files beside the inputs (Lake writes `.hash`
+    files there), so directories become writable; files keep their read-only mode, and `.git`
+    stays read-only throughout, so Git can neither fetch nor move the checkout. A clone is a new
+    inode, so the index is refreshed once here and Lake's `git diff` need not rehash the tree."""
+    source, target = Path(source), Path(target)
+    _clone_tree(source, target, prune=source / ".lake/build", writable=lambda parts: parts[:1] != (".git",))
+    (target / ".lake/build").mkdir(parents=True, exist_ok=True)
+    dotgit = target / ".git"
+    if dotgit.is_dir() and not dotgit.is_symlink():
+        mode = stat.S_IMODE(dotgit.stat().st_mode)
+        os.chmod(dotgit, mode | 0o700)  # index.lock is created beside the index
+        try:
+            subprocess.run(
+                ["git", "-C", str(target), "update-index", "-q", "--refresh"], capture_output=True, timeout=300
+            )
+        finally:
+            with contextlib.suppress(OSError):  # the rewritten index is a new, writable file
+                os.chmod(dotgit / "index", stat.S_IMODE((dotgit / "index").stat().st_mode) & ~0o222)
+            os.chmod(dotgit, mode)
+
+
+def _clone_package(source, build, target):
+    """One closure package of a clone view: its source, and its published build made writable."""
+    _clone_source(source, target)
+    os.rmdir(Path(target) / ".lake/build")
+    _clone_tree(build, Path(target) / ".lake/build", file_bits=0o200)
+
+
+def clone_view_command(generation):
+    """The argv prefix of a clone view.
+
+    There is no namespace to enter: the checkout's package links already name the round's clones.
+    Callers and the agent's `lake` wrapper only test the prefix for emptiness to know that a
+    command runs in a view, so this one just records the generation in the command's environment."""
+    return ["/usr/bin/env", "TAUCETI_SHARED_MATHLIB_CLONE=" + str(generation)]
+
+
+def _clone_capability(directory=None):
+    """Exercise clonefile(2) on the filesystem that holds ``directory`` (default: the pool's)."""
+    if directory is None:
+        directory = root()
+        while not directory.is_dir() and directory != directory.parent:
+            directory = directory.parent
+    try:
+        with tempfile.TemporaryDirectory(prefix="tauceti-clone-probe-", dir=directory) as raw:
+            original, private = Path(raw) / "original", Path(raw) / "private"
+            (original / "nested").mkdir(parents=True)
+            (original / "nested/probe").write_text("shared")
+            _freeze(original)
+            try:
+                try:
+                    _clone_tree(original, private, file_bits=0o200)
+                except OSError as error:
+                    if error.errno not in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                        raise
+                    return (
+                        False,
+                        f"the filesystem holding {directory} cannot clone files (clonefile: {error.strerror});"
+                        " shared Mathlib on macOS needs the pool and the worker checkouts on one APFS volume",
+                    )
+                probe = private / "nested/probe"
+                cloned = (
+                    probe.read_text() == "shared" and probe.stat().st_ino != (original / "nested/probe").stat().st_ino
+                )
+                if cloned:
+                    probe.write_text("private")
+                    (private / "nested/new").write_text("private")
+                if (original / "nested/probe").read_text() != "shared" or (original / "nested/new").exists():
+                    return (
+                        False,
+                        "isolation failure: clone probe modified its immutable original; stop sharing and investigate",
+                    )
+                if not cloned or probe.read_text() != "private":
+                    return (
+                        False,
+                        f"APFS clone probe failed: a clone under {directory} is not a private copy of its original;"
+                        " use a local APFS volume for the pool and the worker checkouts",
+                    )
+            finally:
+                remove_tree(original)
+        return True, "APFS clones work; immutable original with private copy-on-write builds"
+    except (Unavailable, OSError) as error:
+        return (
+            False,
+            f"APFS clones unavailable: {error}; shared Mathlib on macOS needs the pool and the worker checkouts"
+            " on one local APFS volume",
+        )
+
+
 def capability(directory=None):
     """Exercise the actual filesystem, namespace, OverlayFS and bwrap flag support."""
+    if platform.system() == "Darwin":
+        return _clone_capability(directory)
     if platform.system() != "Linux":
         return (
             False,
@@ -996,6 +1192,39 @@ def attach(cwd, P, revision, closure):
             )
 
 
+def _point(link, want):
+    """Make ``link`` a symlink to ``want``, atomically."""
+    link = Path(link)
+    temporary = link.with_name(f".{link.name}.tauceti-{uuid.uuid4().hex}")
+    os.symlink(str(want), temporary)
+    os.replace(temporary, link)
+
+
+def _leave_clone_view(cwd, P, revision, closure, generation):
+    """End a clone view, so that outside it the checkout holds no usable Mathlib build.
+
+    The package links name the shared sources again: their build directories are empty and
+    read-only, so a build fails rather than copying Mathlib, as outside an overlay view. The
+    generation is then discarded, unless a surviving process of the round still holds its lease;
+    an unused clone would otherwise keep its version's blocks allocated after an eviction. A
+    worker killed before this point leaves both to the next round's attach and discard."""
+    from .config import log
+
+    try:
+        current = _meta(cwd) / CLONE_CURRENT
+        if generation is not None and closure:
+            for name in closure:
+                link = Path(cwd) / ".lake/packages" / name
+                if link.is_symlink() and os.readlink(link) == str(current / name):
+                    _point(link, source_dir(P, revision) / name)
+        if generation is not None:
+            if current.is_symlink() and os.readlink(current) == generation.name:
+                current.unlink()
+            discard_private_state(cwd)
+    except OSError as error:
+        log(f"shared Mathlib: could not leave the clone view of {cwd}: {error}; the next round repairs it")
+
+
 def layout_ok(cwd, P, revision, names):
     """Exactly the attached layout: the checkout's own .lake, packages and metadata directories, and
     each closure package a symlink to its read-only, owner-owned shared source. Nothing else."""
@@ -1211,8 +1440,27 @@ def discard_private_state(cwd, *, keep=None):
             _discard_scratch(child)
 
 
+def _clone_usage(generation, marker):
+    """What a round wrote into its clones: the regular files changed after cloning finished.
+
+    A clone has no upper directory to list. Every cloned file's ctime predates the marker's, and
+    the round cannot set a ctime back, so later ones are the files it created or rewrote. The
+    unchanged rest shares its blocks with the pool."""
+    since = marker.lstat().st_ctime_ns
+    count = size = 0
+    for here, directories, files in os.walk(generation):
+        directories[:] = [name for name in directories if name != ".git"]
+        for name in files:
+            info = os.lstat(os.path.join(here, name))
+            if stat.S_ISREG(info.st_mode) and info.st_ctime_ns > since:
+                count, size = count + 1, size + info.st_size
+    return dict(upper_files=count, upper_bytes=size)
+
+
 def upper_usage(generation):
     try:
+        if generation and (marker := Path(generation) / CLONE_MARKER).is_file():
+            return _clone_usage(Path(generation), marker)
         files = [path.lstat() for path in Path(generation).glob("*/upper/**/*")] if generation else []
         regular = [info for info in files if stat.S_ISREG(info.st_mode)]
         return dict(upper_files=len(regular), upper_bytes=sum(info.st_size for info in regular))
@@ -1518,12 +1766,33 @@ def _stage_root(project, graph, closure, source):
         (project / ".lake/packages" / name).symlink_to(source / name, target_is_directory=True)
 
 
+def _clone_extract(fetch, project, builds, closure, env, output):
+    """Extraction for the clone backend: ``project``'s packages are private clones of the shared
+    source, so ``cache get`` fills their own build directories, which then become the staging build."""
+    try:
+        for wanted in (65536, 10240):  # macOS refuses a soft limit above kern.maxfilesperproc
+            with contextlib.suppress(ValueError, OSError):
+                raise_open_file_limit(wanted)
+                break
+        rc = fetch(["lake", "exe", "cache", "get"], project, env, output, None)
+        if not rc:
+            builds.mkdir()
+            for name in closure:
+                os.replace(project / ".lake/packages" / name / ".lake/build", builds / name)
+        return rc
+    finally:
+        remove_tree(project)  # the cloned `.git` directories are read-only
+
+
 def publish(P, key, spec, graph, closure, env, logdir, fetch):
     """Called under exclusive key lock. A failed download never publishes a lower.
 
     Extraction runs from a staging workspace whose packages are the shared source tree, with each
     package's read-only ``.lake/build`` bound to a writable staging directory, so Mathlib's
-    ``cache get`` fills the staging build of the whole closure and nothing else."""
+    ``cache get`` fills the staging build of the whole closure and nothing else.
+
+    The clone backend has no bind mounts: the staging workspace's packages are clones of the
+    shared source, and each one's ``.lake/build`` is moved into the staging build afterwards."""
     P = Path(P)
     pool = P.parent
     entry = P / "entries" / key
@@ -1543,8 +1812,13 @@ def publish(P, key, spec, graph, closure, env, logdir, fetch):
         stage = Path(raw)
         project, builds = stage / "root", stage / "build"
         _stage_root(project, graph, closure, source)
+        clone = backend() == "clone"
         binds = []
         for name in closure:
+            if clone:
+                (project / ".lake/packages" / name).unlink()
+                _clone_source(source / name, project / ".lake/packages" / name)
+                continue
             (builds / name).mkdir(parents=True)
             binds += ["--bind", str(builds / name), str(source / name / ".lake/build")]
         logdir.mkdir(parents=True, exist_ok=True)
@@ -1569,8 +1843,11 @@ def publish(P, key, spec, graph, closure, env, logdir, fetch):
                 *binds,
                 "--",
             ]
-            raise_open_file_limit()  # leantar opens thousands of archives at once (EMFILE at 1024)
-            rc = fetch([*prefix, "lake", "exe", "cache", "get"], project, env, output, None)
+            if clone:
+                rc = _clone_extract(fetch, project, builds, closure, env, output)
+            else:
+                raise_open_file_limit()  # leantar opens thousands of archives at once (EMFILE at 1024)
+                rc = fetch([*prefix, "lake", "exe", "cache", "get"], project, env, output, None)
         if rc:
             raise Unavailable(f"fresh Mathlib extraction failed (exit {rc}); see {log}")
         count = verify(builds / "mathlib", source / "mathlib", spec["artifacts"])
@@ -1579,6 +1856,9 @@ def publish(P, key, spec, graph, closure, env, logdir, fetch):
         ready = stage / "ready"
         ready.mkdir()
         os.replace(builds, ready / "build")
+        if clone:
+            # No read-only mount protects a published build here; its clones get their write bits back.
+            _freeze(ready / "build")
         files = inventory(ready / "build")
         durable_tree(ready / "build")
         atomic_json(
@@ -1735,6 +2015,7 @@ def view(cwd, env, logdir, fetch):
         raise
     started = time.monotonic()
     prefix, generation = [], None
+    clone, revision, closure = backend() == "clone", None, None
     safety_stop_recorded = None
     with contextlib.ExitStack() as stack:
         try:
@@ -1801,7 +2082,16 @@ def view(cwd, env, logdir, fetch):
             fcntl.flock(generation_lease, fcntl.LOCK_SH)
             source = source_dir(P, revision)
             layers = []
-            for name in closure:
+            if clone:
+                if not _same_volume(P, generation):
+                    raise Unavailable(
+                        f"the shared Mathlib pool {pool} and the checkout {cwd} are on different volumes;"
+                        " clonefile cannot cross volumes, so keep both on one APFS volume"
+                    )
+                for name in closure:
+                    _clone_package(source / name, entry / "build" / name, generation / name)
+                atomic_json(generation / CLONE_MARKER, dict(key=key, rev=revision, cloned_at=time.time()))
+            for name in () if clone else closure:
                 for part in ("source-upper", "source-work", "upper", "work"):
                     (generation / name / part).mkdir(parents=True)
                 writable_directories(source / name, generation / name / "source-upper")
@@ -1835,11 +2125,13 @@ def view(cwd, env, logdir, fetch):
                     packages=sorted(closure),
                     boot_id=boot_id(),
                     activated_at=time.time(),
+                    **(dict(backend="clone") if clone else {}),
                 ),
             )
-            candidate = view_command(layers, pool, lease_fd=lease.fileno())
+            candidate = clone_view_command(generation) if clone else view_command(layers, pool, lease_fd=lease.fileno())
             fds = (lease.fileno(), source_lease.fileno(), generation_lease.fileno())
-            build = source / "mathlib/.lake/build"
+            # A clone view has no mount to probe through: the build is checked in the clone itself.
+            build = (generation if clone else source) / "mathlib/.lake/build"
             probe = subprocess.run(
                 candidate + ["sh", "-c", 'test -f "$1/lib/lean/Mathlib.olean" || exit 42', "sh", str(build)],
                 capture_output=True,
@@ -1847,12 +2139,21 @@ def view(cwd, env, logdir, fetch):
                 pass_fds=fds,
             )
             if probe.returncode == 42:
+                if clone:
+                    raise IntegrityFailure("verified build missing from its fresh clone; stop sharing and investigate")
                 raise IntegrityFailure("verified lower missing through fresh overlay; stop sharing and investigate")
             if probe.returncode:
                 raise Unavailable(
                     "shared Mathlib view unavailable: " + ends(probe.stderr.decode(errors="replace"), 300)
                 )
             lease_lock(lease, fcntl.LOCK_SH, timeout=LOCK_WAIT_SECONDS)
+            if clone:
+                # The view itself: for as long as it lasts, the checkout's packages are the clones.
+                # The package links go through one link to the generation, so their targets are the
+                # same in every round (verification records them) and all packages switch at once.
+                _point(meta / CLONE_CURRENT, generation.name)
+                for name in closure:
+                    _point(Path(cwd) / ".lake/packages" / name, meta / CLONE_CURRENT / name)
             prefix = candidate
             env["TAUCETI_SHARED_MATHLIB_LEASE_FD"] = ",".join(str(fd) for fd in fds)
             env["TAUCETI_SHARED_MATHLIB_KEY"] = key
@@ -1878,6 +2179,8 @@ def view(cwd, env, logdir, fetch):
                 safety_stop_recorded=safety_stop_recorded,
             )
             stack.close()
+            if clone:
+                _leave_clone_view(cwd, P, revision, closure, generation)
             _clear_env(env)
             if isinstance(error, Unavailable):
                 raise
@@ -1900,6 +2203,8 @@ def view(cwd, env, logdir, fetch):
                 safety_stop_recorded=safety_stop_recorded,
                 **upper_usage(generation),
             )
+            if clone:
+                _leave_clone_view(cwd, P, revision, closure, generation)
             previous = read_json(
                 pool
                 / "status"

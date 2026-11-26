@@ -57,7 +57,11 @@ claude auth login      # for --agent claude, or auto
 kiro-cli login         # for explicit --agent kiro
 ```
 
-Code-writing phases on the host also need an `elan`/`lake` toolchain. The
+Code-writing phases on the host also need an `elan`/`lake` toolchain, and a
+host that can [share one Mathlib between rounds](docs/shared-mathlib.md): Linux
+with unprivileged user namespaces and bubblewrap 0.12 or newer, or macOS with the
+Mathlib pool and the worker checkouts on one APFS volume. `tauceti doctor` checks
+this. The
 OpenRouter agents need an exported `OPENROUTER_API_KEY` instead, plus the `pi`
 runner for host rounds; Bubble includes `pi`. The `--bubble` sandbox has
 additional requirements; see [the sandbox notes](docs/sandbox.md).

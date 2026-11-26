@@ -18,6 +18,12 @@ Run `tauceti doctor` to exercise Linux user namespaces, bubblewrap overlay suppo
 private copy-up. No root daemon is required. A host without them runs no rounds that need
 Mathlib; the reason names the administrator action.
 
+On macOS, which has neither rootless mount namespaces nor overlays, a view is made of APFS
+clones instead ([macOS](#macos-views-made-of-apfs-clones)). There `tauceti doctor` clones a
+small read-only tree on the pool's filesystem, writes to the clone and checks that the
+original is unchanged. The pool and the worker checkouts must be on the same APFS volume.
+Any other system runs no rounds that need Mathlib.
+
 ## Layout
 
 Everything below lives in the pool's `v4/` directory and is written only by the worker's
@@ -80,6 +86,53 @@ directory is empty and read-only, so an unprefixed build fails instead of copyin
 deliberately no PID namespace: agents and their tools see ordinary host PIDs and `/proc`.
 The upper uses OverlayFS `volatile` mode; a small mount helper is compiled once with `cc`
 beside the pool and its preload is removed before running agent commands.
+
+### macOS: views made of APFS clones
+
+`clonefile(2)` gives the two properties the overlay gives: the host stores one build of
+Mathlib per version, because a clone shares its original's blocks copy-on-write, and a
+round writes only to its own copy. A view there is prepared like this:
+
+- Each closure package's shared source (without its build directory) and its published build
+  are cloned file by file into `.lake/tauceti-mathlib/<generation>/<package>/`, the build at
+  `.lake/build` inside it. Directories become writable and build files regain owner write;
+  source files keep their read-only mode, and `.git` stays read-only throughout, so Git can
+  neither fetch nor move the checkout. The index is refreshed once, because a clone is a new
+  inode. `clone.json` in the generation marks the end of cloning.
+- `.lake/tauceti-mathlib/current` is then pointed at the generation, and each
+  `.lake/packages/<package>` at `.lake/tauceti-mathlib/current/<package>`. The link targets are
+  therefore the same in every round. This is the view: there is no namespace, and the argv
+  prefix only sets `TAUCETI_SHARED_MATHLIB_CLONE` to the generation (callers and the agent's
+  `lake` wrapper know a view by its non-empty prefix, as on Linux).
+- When the view ends, the package links name the shared sources again, whose build
+  directories are empty and read-only, and the generation is deleted unless a surviving
+  process still holds its lease. So outside a view an unprefixed build fails instead of
+  copying, as on Linux. A worker killed inside a view runs no cleanup: its checkout keeps
+  the links to the dead round's clones until the next round in that checkout attaches (which
+  replaces the links) and deletes the generation.
+
+Cloning never falls back to copying bytes. Where `clonefile` fails (a filesystem other than
+APFS, or the pool and the checkout on different volumes) the round does not start, and the
+reason says so. Publication has no bind mounts either: the staging workspace's packages are
+clones of the shared source, `lake exe cache get` fills their own build directories, and
+those are moved into the staging build, verified and published as on Linux.
+
+What is weaker than on Linux:
+
+- No read-only mount protects the pool. A published build has every write bit removed
+  instead (its clones get owner write back), and nothing in a checkout names the pool's
+  builds. This guards against accidents, as file modes do; the inventory in `ready.json`
+  still detects a changed file at the next reuse and stops sharing.
+- Eviction cannot find and kill the rounds that hold a version, because that uses `/proc`.
+  A round that must evict a version another round still leases waits, then stops with the
+  reason; the eviction completes once the holder has ended.
+- A clone keeps its original's blocks allocated. Deleting an entry frees its space only once
+  no clone of it remains, which is why a round keeps its leases for its whole life (leased
+  entries are never collected) and why a generation is deleted when its view ends. The
+  receipts' upper file counts and bytes are the regular files a round created or rewrote in
+  its clones (changed after `clone.json` was written). The per-round private-bytes cap
+  (docs/workers.md) sees the clones as ordinary private files at their full size; they are
+  part of the baseline taken before the agent starts.
 
 Each round starts from a fresh generation; the previous one is deleted once no namespace
 holds its lease. Running readers hold shared leases on the source and on the build; the
