@@ -4707,8 +4707,9 @@ class Controller:
                 )
                 self._release_claim(claim, "blocked-label", now)
             return False
-        if not self._sprint_inputs([fresh]):
-            # Sprint mode began, or the sprint label went, while the probe ran: it waits, unplaced.
+        if batch["urgent"] != URGENT_EMERGENCY and not self._sprint_inputs([fresh]):
+            # Sprint mode began, or the sprint label went, while the probe ran: it waits, unplaced. The
+            # emergency batch is exempt: an emergency request lands whatever its labels.
             with self.store.transaction():
                 self.store.update(
                     "inputs", {"id": row["id"]}, state=INPUT_WAITING, batch_id=None, last_probe="sprint-label"
