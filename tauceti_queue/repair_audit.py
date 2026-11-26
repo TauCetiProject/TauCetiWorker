@@ -301,7 +301,9 @@ def _sandboxed(
     at the same paths (the verifier's own directories)."""
     extra = {k: str(v) for k, v in (extra or {}).items()}
     run_env = {**env, **extra}
-    wrapped = repair_sandbox.sandboxed_lake([str(a) for a in argv], worktree, run_env, extra_env=extra)
+    # No Lean job cap (decision 219, option B): lint-env.sh picks its shards' threads itself (16 unless
+    # LEAN_NUM_THREADS says otherwise), and the heavy-check lock, not the cap, bounds these checks' memory.
+    wrapped = repair_sandbox.sandboxed_lake([str(a) for a in argv], worktree, run_env, extra_env=extra, cap_jobs=False)
     if (ro_binds or rw_binds) and "--remount-ro" in wrapped:
         # Before the root becomes read-only: bwrap creates the mount points on it.
         at = wrapped.index("--remount-ro")

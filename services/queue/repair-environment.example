@@ -98,3 +98,7 @@ TAUCETI_QUEUE_PROVIDERS=claude,codex,api
 # Configure install-repair-cleanup.sh --cache-root with the identical path to migrate idle
 # private pools and apply retention to the shared cache.
 #TAUCETI_QUEUE_CACHE_ROOT=/home/operator/TauCetiQueue-data/repair-shared
+
+# Concurrent Lean jobs per repair build (LEAN_NUM_THREADS inside the build sandbox; 0 for no cap).
+# The default, 16, fits three workers on a 125 GB host (docs/queue/repair-task.md, decision 219).
+#TAUCETI_REPAIR_LEAN_JOBS=16
