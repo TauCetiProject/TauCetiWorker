@@ -5,6 +5,9 @@ GitHub execution/evidence is deterministic here. Forgejo uses the stock HTTPS
 server, native actor IDs, protected retention refs, and the actual Git transport.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import dataclasses
 import json

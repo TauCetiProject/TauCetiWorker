@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Parallel isolated audit batches advance the cursor strictly in order."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

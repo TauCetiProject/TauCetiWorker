@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The worker labels a round's pushed head self-tested only with this round's receipt for that exact commit."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

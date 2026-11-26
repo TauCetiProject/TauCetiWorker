@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Native source transport exercises the common persistent self-tested worker flow."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import json
 import multiprocessing

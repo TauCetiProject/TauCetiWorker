@@ -6,6 +6,9 @@ still blocking in `states` (the #229 stranding bug). The fix stage's eligibility
 must agree with CI's close (which also reads `states`). Dependency-free.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 

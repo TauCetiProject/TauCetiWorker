@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A rebase retry budget renews only at a distinct, verified healthy checkpoint."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib
 import tempfile
 from dataclasses import replace

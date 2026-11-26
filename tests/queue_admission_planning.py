@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Real Git evidence and speculative repair races, with no inference or network."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import subprocess
 import sys

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Telemetry outages permit explicit unpaced work, with auditable, bounded HTTP attempts."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import fcntl
 import io
 import json

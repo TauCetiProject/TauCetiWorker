@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Bubble rounds must use the stable release containing SSH and artifact-cache fixes."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 from types import SimpleNamespace

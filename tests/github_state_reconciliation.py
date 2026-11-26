@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Independent coverage comparisons, private continuation, and quota model assumptions."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib.util
 import io
 import json

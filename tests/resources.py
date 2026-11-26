@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys

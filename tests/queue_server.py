@@ -10,6 +10,9 @@ restarts, revalidated in the background, revocable), the controller
 error mapping (403, 404, 400, 500), the urgent-lane request validation and the emergency endpoints.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import http.client
 import json

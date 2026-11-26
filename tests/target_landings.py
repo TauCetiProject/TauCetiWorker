@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Source-bound queue landing proofs, entirely over recorded API responses."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import sys
 import unittest

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The actual source survey uses native IDs and never native build authority."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import importlib
 import json

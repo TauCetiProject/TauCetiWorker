@@ -1,5 +1,8 @@
 """Inventory regressions use committed Git fixtures, independent of live accounts."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib.util
 import os
 import subprocess

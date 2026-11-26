@@ -1,5 +1,8 @@
 """Free-choice GitHub authors use their worker namespace without changing other claim routes."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib
 import os
 import subprocess

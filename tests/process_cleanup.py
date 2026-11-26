@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Host execution ignores old containment state and cleans only its owned groups."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import os
 import signal

@@ -8,6 +8,9 @@ deliveries, the real repair task runner claiming and submitting through the HTTP
 restart mid-head, feed validation and chain validation after every landing. No network, no inference.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import re

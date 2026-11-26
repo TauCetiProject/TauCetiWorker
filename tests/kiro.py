@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Kiro model selection is exact, entitlement-checked, and API-key deterministic."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sqlite3

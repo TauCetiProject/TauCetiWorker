@@ -4,6 +4,9 @@
 All GitHub calls hit a temporary fake gh executable; no real credentials or network are used.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import json
 import os

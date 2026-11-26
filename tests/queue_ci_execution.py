@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """GitHub execution adapter boundaries, single sends and ownership evidence."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import copy
 import dataclasses

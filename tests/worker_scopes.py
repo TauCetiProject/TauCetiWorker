@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Two disposable workers exercise native containment; no API calls or memory pressure."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import json
 import os

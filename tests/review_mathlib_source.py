@@ -1,5 +1,8 @@
 """Bubble reviewers receive sources at the PR's dependency pin or do not start."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import json
 import os

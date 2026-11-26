@@ -1,5 +1,8 @@
 """A code upgrade must reuse worker state, credentials, recovery and cleanup ownership."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import json
 import os

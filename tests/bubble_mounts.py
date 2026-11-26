@@ -6,6 +6,9 @@ shared roadmap and review-engine checkouts are attached. Checked through run_in_
 as tests/bubble_cache.py does. Exit 0 = the argv agrees; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import os

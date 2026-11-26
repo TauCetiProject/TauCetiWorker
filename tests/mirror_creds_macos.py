@@ -14,6 +14,9 @@ The platform is simulated, so this runs and means the same thing on every host â
 was previously reachable by no test on Linux CI, which is how the gap survived. Exit 0 = pass.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import shutil
 import sys

@@ -8,6 +8,9 @@ This test drives do_review with a minimal fake Worker and the engine + sync stub
 network and no real store. Exit 0 = every case agrees; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import tempfile
 import types

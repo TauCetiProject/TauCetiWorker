@@ -11,6 +11,9 @@ The line replaced a bare non-draft / build-green count with totals bucketed by T
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 

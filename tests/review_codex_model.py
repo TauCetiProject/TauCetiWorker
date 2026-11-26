@@ -5,6 +5,9 @@ Only $TAUCETI_REVIEW_CODEX_MODEL is forwarded to the engine; authoring model
 overrides must leave its default/fallback policy untouched.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import os
 import sys

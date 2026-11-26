@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Exercise quota wake scheduling with real provider policy and no live requests."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import json
 import os

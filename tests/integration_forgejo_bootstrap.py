@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Actual native Service startup over disposable Forgejo HTTPS and fresh ACLs."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import json
 import os

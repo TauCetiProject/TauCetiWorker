@@ -1,5 +1,8 @@
 """Canonical build outputs: one inode per host, sha256-checked convergence, and safe eviction."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import errno
 import hashlib
 import json

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Trusted workflow credentials: resource scope, live launch and single sends."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import io
 import json

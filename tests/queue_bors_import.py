@@ -15,6 +15,9 @@ becoming an ancestor of it, or as Bors closing the members; a re-import whose fe
 the batch (or `release_head`) releases the members to approved inputs. Finally the CLI command.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import copy
 import io

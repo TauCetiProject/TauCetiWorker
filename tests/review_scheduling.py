@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Reviewer first refusal and age-weighted review selection."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import random
 import sys
 import types

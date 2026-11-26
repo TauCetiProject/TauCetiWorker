@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Regression guard for roadmap-scoped authoring backpressure."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib
 import os
 import sys

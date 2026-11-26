@@ -10,6 +10,9 @@ real process: `serve` in fallback mode answering /status, /healthz and /settings
 admin writes, verified by `status --expect-revision`, then stopped cleanly by SIGTERM.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json

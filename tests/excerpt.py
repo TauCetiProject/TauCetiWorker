@@ -1,5 +1,8 @@
 """Long diagnostics keep both ends, so the failure's name survives truncation."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import unittest
 from pathlib import Path

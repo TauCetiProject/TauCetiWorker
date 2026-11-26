@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Idle retention preserves future cache hits and excludes live or ambiguous owners."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sqlite3

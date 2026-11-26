@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A GitHub PR whose refs/pull/<n>/head is missing is checked out from its head branch instead."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import subprocess
 import sys
 import tempfile

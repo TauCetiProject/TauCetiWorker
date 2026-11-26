@@ -1,5 +1,8 @@
 """Safety and attribution checks for the one-day sizing script (no fleet access)."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib.util
 import json
 import tempfile

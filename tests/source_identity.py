@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Source users and ACLs never borrow a GitHub login or cached authority."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import sys
 import unittest

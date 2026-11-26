@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Native source admission at parity with GitHub, recovery holds and qualified task metadata."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import json
 import subprocess

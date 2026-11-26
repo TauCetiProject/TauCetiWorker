@@ -5,6 +5,9 @@ production-launcher test; its scripted local API uses no inference or credential
 
 from __future__ import annotations
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import http.server
 import json

@@ -1,5 +1,8 @@
 """One explicitly scoped foreign repair; no live reads, pushes, or paid agents."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import importlib
 import json

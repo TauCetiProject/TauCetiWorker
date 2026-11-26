@@ -1,5 +1,8 @@
 """Recovery CLI request contracts; all service calls are mocked."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import importlib.util
 import io

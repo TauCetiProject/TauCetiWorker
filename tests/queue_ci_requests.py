@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Frozen source request recovery, configuration upgrades and real Git GC."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import concurrent.futures
 import hashlib
 import json

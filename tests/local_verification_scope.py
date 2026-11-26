@@ -20,6 +20,9 @@ The worker passes the policy from surveyed labels/branch; `scope_policy` is chec
 Exit 0 = all assertions hold; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import re
 import subprocess

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Public export invariants using actual queue records and attributed Git history."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import io
 import json
 import os

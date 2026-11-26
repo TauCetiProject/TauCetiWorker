@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Exact receipts, failure propagation and concurrent execution with local Git/fake Lean fixtures only."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json

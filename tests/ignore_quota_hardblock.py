@@ -5,6 +5,9 @@ Explicitly classified transient telemetry failures are covered by quota_outage_a
 Exhaustion, auth errors, malformed windows and missing snapshots must stay blocking.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import time
 from pathlib import Path

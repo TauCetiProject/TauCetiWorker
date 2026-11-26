@@ -4,6 +4,9 @@
 FORGEJO_BINARY=/path/to/stock/forgejo python tests/integration_forgejo_git.py
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys

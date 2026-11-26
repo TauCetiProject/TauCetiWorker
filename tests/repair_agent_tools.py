@@ -1,5 +1,8 @@
 """The repair agent's toolchain commands run in the build sandbox, and no credential is visible there."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import shutil

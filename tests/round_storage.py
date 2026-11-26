@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Per-round private bytes: incremental measurement, the cap, abandonment and view validation."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json

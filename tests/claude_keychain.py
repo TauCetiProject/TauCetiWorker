@@ -4,6 +4,9 @@ keychain-first, marked from_keychain so the 401 path never refreshes a token sha
 claude). For bubble rounds, where the in-container claude needs a .credentials.json, the credential is
 staged from the Keychain in a private, transient CLAUDE_CONFIG_DIR without touching the host file."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import shutil

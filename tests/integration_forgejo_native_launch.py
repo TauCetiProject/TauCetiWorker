@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Run and restart the actual native queue CLI on disposable Forgejo HTTPS."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import hashlib
 import json
 import os

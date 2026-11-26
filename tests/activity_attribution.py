@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Measured cost shares, unchanged spending, bounded local records and cheap readers."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import io
 import json

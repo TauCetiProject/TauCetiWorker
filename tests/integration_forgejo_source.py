@@ -5,6 +5,9 @@ CI observations are deterministic fixtures; the full hosted execution rehearsal
 is separate. Every source read/write and protection hook uses the real server.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import json
 import os

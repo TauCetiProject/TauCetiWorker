@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Publication survives REST exhaustion, process restart, and ambiguous acknowledgements."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

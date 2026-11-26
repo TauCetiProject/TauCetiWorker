@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """An explicit unchanged review immediately selects other work without counting a review."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sys

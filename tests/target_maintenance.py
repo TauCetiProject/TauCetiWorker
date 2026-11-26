@@ -1,5 +1,8 @@
 """Target-list priority stays inside each stage and this account's own slots."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import importlib
 import io

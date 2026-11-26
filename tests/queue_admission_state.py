@@ -1,5 +1,8 @@
 """Pending intake survives process lifetime and never acknowledges a racing input change."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sqlite3
 import sys
 import tempfile

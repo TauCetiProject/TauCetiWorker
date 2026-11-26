@@ -2,6 +2,9 @@
 """--roadmap-targets: the list format, live statuses, selection, the claim, the prompt and the wiring,
 without GitHub or model access. The fixture is the example in docs/target-lists.md."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import importlib
 import io

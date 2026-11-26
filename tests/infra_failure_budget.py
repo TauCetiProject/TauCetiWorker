@@ -11,6 +11,9 @@ dead credential must stay charged and stay loud), and the refund hands the count
 round rather than letting the loop march on. Exit 0 = every case agrees; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import tempfile
 from pathlib import Path

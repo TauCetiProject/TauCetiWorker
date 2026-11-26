@@ -7,6 +7,9 @@ stale numbers until the (1-hour, for claude) TTL lapses, which used to leave wor
 account's exhausted-looking quota. Dependency-free; no network.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import tempfile
 import time

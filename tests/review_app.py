@@ -1,5 +1,8 @@
 """A share of GitHub reviews posts as the review App, inert until configured."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import stat

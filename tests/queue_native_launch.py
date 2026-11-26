@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Native launches use explicit private snapshots without credential discovery."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import hashlib
 import io

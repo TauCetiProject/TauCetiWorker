@@ -12,6 +12,9 @@ tuples and a stubbed sleep records the waits.
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import subprocess
 import sys
 from pathlib import Path

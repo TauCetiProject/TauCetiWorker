@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Stale repair-lock recovery cannot remove a newly acquired live lock."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import shutil
 import sys

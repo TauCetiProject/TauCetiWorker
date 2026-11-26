@@ -9,6 +9,9 @@
 - An unreadable roadmap board still refuses to author, but through a Die that names the cause.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import io
 import os
 import sys

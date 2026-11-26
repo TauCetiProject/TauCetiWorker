@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Ordinary idle-Claude selection/launch retains GitHub preflight and no-work behaviour."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import tempfile
 import time

@@ -1,5 +1,8 @@
 """Fold real Git group commits without losing empty members or original messages."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import subprocess
 import sys
 import tempfile

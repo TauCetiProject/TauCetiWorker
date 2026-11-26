@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """A trusted head-bound request reaches only the tending worker, with bounded retries."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib
 import sys
 import tempfile

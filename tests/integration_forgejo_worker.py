@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Exercise native worker scheduling, gh routing and retained publication on stock Forgejo."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import dataclasses
 import json

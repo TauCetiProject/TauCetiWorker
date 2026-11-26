@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Real-Git main mirror leases, divergence refusal and lost-response recovery."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import subprocess
 import sys
 import unittest

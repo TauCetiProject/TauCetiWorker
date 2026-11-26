@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Lean pressure gating and compiler handoff; no installed toolchain is modified."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import importlib.machinery
 import importlib.util

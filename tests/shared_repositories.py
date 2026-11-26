@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Shared read-only snapshots retain old rounds and Git provenance inside sandbox mounts."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import subprocess
 import sys

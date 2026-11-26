@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Workers share Claude observations and Retry-After without external services or scripts."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import fcntl
 import multiprocessing
 import os

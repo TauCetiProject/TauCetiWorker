@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Private queue credentials are loaded from one checked source-bound snapshot."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import json
 import os

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Source task identities survive restart and never become GitHub authority."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import contextlib
 import copy
 import json

@@ -10,6 +10,9 @@ approvals, unapprove and cancel, the emergency lane's `emergency` and `emergency
 reply idempotency markers.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import unittest
 from pathlib import Path

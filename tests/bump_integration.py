@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Only stopped exact-head singleton failures justify an integration repair editor."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import importlib
 import io

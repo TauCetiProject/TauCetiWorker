@@ -6,6 +6,9 @@ placeholder (codex-cli >=0.139 won't parse auth.json without the field, but neve
 access token). Never refreshes, never blanks a good copy on a torn source read, and follows an operator
 account switch even when the new account's token carries an earlier expiry."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import shutil

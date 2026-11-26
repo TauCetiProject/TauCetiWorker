@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The actual Service wires native source and separately scoped execution."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import socket
 import sys

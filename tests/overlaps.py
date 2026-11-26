@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Shared-state races, coverage validation, retry publication and phase integration."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import signal

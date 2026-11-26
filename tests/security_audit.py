@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Cursor invariants, complete history coverage, authorization, and reviewer isolation."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import hashlib
 import io
 import json

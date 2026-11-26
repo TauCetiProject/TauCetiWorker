@@ -5,6 +5,9 @@ $TAUCETI_PACE. Verify which curve each provider's reader classifies and schedule
 flags and variables are validated and installed like --pace, and the workers.toml spelling.
 Dependency-free; no network."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import sys
 import time

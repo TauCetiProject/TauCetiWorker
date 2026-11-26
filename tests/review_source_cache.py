@@ -1,5 +1,8 @@
 """Host review cache configuration survives old Review versions and explicit overrides."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import os
 import sys
 import tempfile

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Queue source/CI separation and durable, single-send dispatch recovery."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import concurrent.futures
 import json
 import sys

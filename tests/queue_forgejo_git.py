@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Native source Git refuses cross-binding, unsafe refs and unconfirmed publication."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import base64
 import os
 import subprocess

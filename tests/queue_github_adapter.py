@@ -11,6 +11,9 @@ parent, retained-ref updates, idempotent marked comments, labels, permission che
 identity, the rate limit, the token-free `git fetch` argv, and the polling fallback's bounds.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

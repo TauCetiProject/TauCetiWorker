@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Only identities that can push to canonical tend its bot PRs."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import importlib
 import sys
 from pathlib import Path

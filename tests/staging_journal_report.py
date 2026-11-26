@@ -7,6 +7,9 @@ against the raw snapshots: dispatch and terminal timestamps, member counts, retr
 partition and repair events of each candidate.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import copy
 import json
 import sys

@@ -1,5 +1,8 @@
 """Admission evidence cache and its shadow comparison: inert when off, ordered, never deciding."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import json
 import sys

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Process ownership and live-use observations that protect trees from cleanup (Linux and macOS)."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import subprocess

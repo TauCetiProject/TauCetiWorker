@@ -14,6 +14,9 @@ what authorizes a mutation. No network: a fake GitHub counts fetches over a temp
 Exit 0 = all cases agree; 1 = a mismatch.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import json
 import os
 import sys

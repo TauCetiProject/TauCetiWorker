@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The queue store (tauceti_queue.store): schema, transactions, row helpers, settings, journal."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sqlite3
 import sys
 import tempfile

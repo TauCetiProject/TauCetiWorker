@@ -7,6 +7,9 @@ NOT the same as an exhausted or unknown window (a hard block, red ✗). The old 
 looked out of quota. Dependency-free.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 from pathlib import Path
 

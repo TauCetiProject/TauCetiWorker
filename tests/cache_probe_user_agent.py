@@ -4,6 +4,9 @@ synthetic 404 a healthy bucket gives, so the test pins the OUTGOING request (a R
 worker's User-Agent, GET, the revisions URL, a 30 s timeout) without depending on the CDN's live rules.
 The probe is lru-cached, so the cache is cleared before and after, as bubble_cache.py does."""
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import sys
 import urllib.error
 import urllib.request as ur

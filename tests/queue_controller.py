@@ -5,6 +5,9 @@ The end-to-end flows are in tests/queue_fixture.py; this file checks the control
 decisions against the fake GitHub without driving whole head cycles.
 """
 
+import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
+
+# isort: split
 import dataclasses
 import json
 import sqlite3
