@@ -691,7 +691,7 @@ class ActivityTests(unittest.TestCase):
         comments = {6: [dict(body="LGTM"), board(1, "old"), board(2, "final")], 8: [board(1, "final")]}
         requests = []
 
-        def get(repo, path):
+        def get(repo, path, timeout=10):
             requests.append(path)
             if path.startswith("/issues?"):
                 return issues if "page=1" in path else []
@@ -729,6 +729,53 @@ class ActivityTests(unittest.TestCase):
             costs = a.cached(group=machine)["summary"]["costs"]["windows"]["24h"]
             self.assertEqual((costs["known_loc_prs"], costs["missing_loc_prs"]), (2, 0))
             self.assertEqual(costs["landed_loc_added"], 370)
+
+    def test_forgejo_review_passes_skip_malformed_boards_and_reject_unsafe_counters(self):
+        from tauceti_worker.activity_forgejo import review_passes
+
+        def board(meta):
+            return dict(body=f"<!--tauceti-scoreboard-->\n<!--tauceti-meta:v1 {meta}-->")
+
+        good = board(json.dumps(dict(round=2, head_sha="h")))
+        self.assertEqual(review_passes([board("{not json"), good], "h"), 2)
+        self.assertIsNone(review_passes([good], "other"))
+        self.assertIsNone(review_passes([board(json.dumps(dict(round=2**63, head_sha="h")))], "h"))
+        self.assertIsNone(review_passes([good, board(json.dumps(dict(round=2**53 - 2, head_sha="h")))], "h"))
+
+    def test_failing_forgejo_measurement_does_not_block_older_landings(self):
+        import urllib.error
+
+        from tauceti_worker import activity_forgejo
+
+        with contextlib.closing(a._connect()) as db, db:
+            for number, age in ((1, 100), (2, 200)):
+                db.execute(
+                    "INSERT INTO prs(repo,number,worker,scope,created,landed,state) VALUES (?,?,?,?,?,?,'CLOSED')",
+                    ("forgejo:x", number, "w", "m", self.now - 1000, self.now - age),
+                )
+        reads = []
+
+        def get(repo, path, timeout=10):
+            reads.append(path)
+            if path.startswith("/pulls/1"):
+                raise urllib.error.HTTPError(path, 500, "server error", {}, None)
+            if path == "/pulls/2":
+                return dict(head=dict(sha="h2"), additions=1, deletions=0)
+            if path.startswith("/pulls/2/files"):
+                return [dict(filename="A.lean", additions=1, deletions=0)] if "page=1" in path else []
+            return []
+
+        env = dict(TAUCETI_FORGEJO_ORIGIN="https://forge.invalid")
+        with (
+            contextlib.closing(a._connect()) as db,
+            patch.object(activity_forgejo, "repository", return_value=SimpleNamespace(key="forgejo:x")),
+            patch.object(activity_forgejo, "_get", side_effect=get),
+        ):
+            for at in (self.now, self.now + 1):
+                activity_forgejo.measure(db, at, [], env)
+            self.assertEqual([tuple(r) for r in db.execute("SELECT number,added FROM pr_loc")], [(2, 1)])
+        # The failed PR waits for its retry instead of being read on every pass.
+        self.assertEqual(reads.count("/pulls/1"), 1)
 
     def test_missing_finishes_show_start_windows_latest_round_and_scope(self):
         # These were all discovered together. Recent counts must use their

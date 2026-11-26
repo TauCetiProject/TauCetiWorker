@@ -45,12 +45,12 @@ def is_forgejo(repo):
     return repo.startswith("forgejo:")
 
 
-def _get(repo, path):
+def _get(repo, path, timeout=10):
     request = urllib.request.Request(
         repo.forge.api_url + "/repos/" + repo.name + path,
         headers={"Accept": "application/json", "User-Agent": "TauCetiWorker/1.0 (activity)"},
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
 
@@ -132,10 +132,24 @@ def refresh(db, machine, now, errors, env):
         )
 
 
-def _pages(repo, path):
+SAFE = 2**53 - 1  # The state service's counters are JSON-safe integers.
+
+
+class _Deadline(Exception):
+    pass
+
+
+def _read(repo, path, stop):
+    left = stop - time.monotonic()
+    if left <= 0:
+        raise _Deadline
+    return _get(repo, path, timeout=min(10, left))
+
+
+def _pages(repo, path, stop):
     rows = []
     for page in range(1, 1000):
-        batch = _get(repo, f"{path}?limit=50&page={page}")
+        batch = _read(repo, f"{path}?limit=50&page={page}", stop)
         if not batch:
             return rows
         rows.extend(batch)
@@ -154,7 +168,7 @@ def lean_loc(pull, files):
 
 
 def review_passes(comments, head):
-    """The scoreboards' cumulative round counters, as the GitHub state service reports them."""
+    """The scoreboards' cumulative round counters, reduced as the GitHub state service does."""
     count = boards = 0
     current = False
     for comment in comments:
@@ -162,13 +176,18 @@ def review_passes(comments, head):
         found = re.findall(SPEC["meta_pattern"], body)
         if SPEC["scoreboard"] not in body or not found:
             continue
-        meta = json.loads(found[-1])
+        try:
+            meta = json.loads(found[-1])
+        except ValueError:
+            continue  # An unparsable scoreboard carries no counter.
         if not isinstance(meta, dict) or meta.get("mode") == "init":
             continue
         value = meta.get("round")
-        if type(value) is not int or value < 0:
+        if type(value) is not int or not 0 <= value <= SAFE:
             return None
         count += value
+        if count > SAFE:
+            return None
         boards += 1
         current = current or bool(head and meta.get("head_sha") == head)
     return count if boards and current else None
@@ -177,9 +196,10 @@ def review_passes(comments, head):
 def measure(db, now, errors, env):
     """Record LOC and review passes for this host's landed Forgejo PRs.
 
-    The GitHub state service supplies these for GitHub PRs. Each landed PR costs three
+    The GitHub state service supplies these for GitHub PRs. Each landed PR costs a few
     reads, once: its final head and diff totals, its file listing and its comments.
-    An incomplete measurement is retried after RETRY seconds.
+    PRs never attempted come first; an incomplete or failed measurement is retried
+    after RETRY seconds, oldest attempt first, so no PR blocks the others.
     """
     repo = repository(env)
     key = repo.key
@@ -191,28 +211,26 @@ def measure(db, now, errors, env):
              OR ((c.count IS NULL OR NOT EXISTS (SELECT 1 FROM pr_loc l
                     WHERE l.repo=p.repo AND l.number=p.number AND l.head=p.head))
                  AND c.checked<?))
-           ORDER BY p.landed DESC LIMIT ?""",
+           ORDER BY c.repo IS NOT NULL AND c.head IS p.head, c.checked, p.landed DESC LIMIT ?""",
         (key, now - RETRY, MEASURE_LIMIT),
     ).fetchall()
     for number, head in due:
-        if time.monotonic() > stop:
-            break
         loc = count = None
+        unavailable = False
         try:
-            pull = _get(repo, f"/pulls/{number}")
+            pull = _read(repo, f"/pulls/{number}", stop)
             head = pull["head"]["sha"] or head
-            loc = lean_loc(pull, _pages(repo, f"/pulls/{number}/files"))
+            loc = lean_loc(pull, _pages(repo, f"/pulls/{number}/files", stop))
             # Forgejo returns all of an issue's comments at once; it ignores paging here.
-            count = review_passes(_get(repo, f"/issues/{number}/comments"), head)
-        except urllib.error.HTTPError as error:
-            if error.code != 404:
-                errors.append("Forgejo PR measurements unavailable; normal refresh will retry")
-                return
-        except OSError:
-            errors.append("Forgejo PR measurements unavailable; normal refresh will retry")
+            count = review_passes(_read(repo, f"/issues/{number}/comments", stop), head)
+        except _Deadline:
             return
+        except urllib.error.HTTPError:
+            pass  # This PR's reads failed; retry it later without blocking the others.
+        except OSError:
+            unavailable = True
         except (ValueError, KeyError, TypeError, AttributeError):
-            pass  # This PR's data is malformed; retry it later without blocking the others.
+            pass  # This PR's data is malformed; retry it later.
         db.execute("UPDATE prs SET head=? WHERE repo=? AND number=? AND head IS NOT ?", (head, key, number, head))
         if loc is not None:
             db.execute(
@@ -232,3 +250,6 @@ def measure(db, now, errors, env):
                 "scoreboard-round-counters" if count is not None else "unavailable",
             ),
         )
+        if unavailable:
+            errors.append("Forgejo PR measurements unavailable; normal refresh will retry")
+            return
