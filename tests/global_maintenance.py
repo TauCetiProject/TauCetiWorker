@@ -56,6 +56,11 @@ class GlobalMaintenance(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
+        # Records here carry fixed timestamps while their files keep real mtimes, so the occasional
+        # stale-record sweep would delete the record just written.
+        sweeps = patch("tauceti_worker.peer_claims.random.random", return_value=1.0)
+        sweeps.start()
+        self.addCleanup(sweeps.stop)
         root = Path(self.tmp.name)
         cfg = SimpleNamespace(wid="test", sbcache=root / "sb", store_dir=root / "review", state=root)
 
