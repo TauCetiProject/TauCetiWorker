@@ -781,27 +781,38 @@ class ActivityTests(unittest.TestCase):
         from tauceti_worker import activity_forgejo
 
         with contextlib.closing(a._connect()) as db, db:
-            db.execute(
-                "INSERT INTO prs(repo,number,worker,scope,created,landed,state) VALUES (?,?,?,?,?,?,'CLOSED')",
-                ("forgejo:x", 1, "w", "m", self.now - 1000, self.now - 100),
-            )
+            for number, age in ((1, 100), (2, 200)):
+                db.execute(
+                    "INSERT INTO prs(repo,number,worker,scope,created,landed,state) VALUES (?,?,?,?,?,?,'CLOSED')",
+                    ("forgejo:x", number, "w", "m", self.now - 1000, self.now - age),
+                )
         clock = [0.0]
 
         def get(repo, path, timeout=10):
-            clock[0] += timeout  # The read times out exactly at the end of the budget.
+            if path.startswith("/pulls/1") or path.startswith("/issues/1"):
+                clock[0] += 3  # PR 1 is slow but completes; PR 2's read then meets the budget.
+                if path == "/pulls/1":
+                    return dict(head=dict(sha="h1"), additions=0, deletions=0)
+                return []
+            clock[0] += timeout
             raise TimeoutError("timed out")
 
-        errors = []
-        with (
-            contextlib.closing(a._connect()) as db,
-            patch.object(activity_forgejo, "repository", return_value=SimpleNamespace(key="forgejo:x")),
-            patch.object(activity_forgejo, "_get", side_effect=get),
-            patch.object(activity_forgejo.time, "monotonic", side_effect=lambda: clock[0]),
-        ):
-            activity_forgejo.measure(db, self.now, errors, {})
-            self.assertEqual(errors, [])
-            # No attempt is recorded, so the next pass reads this PR again.
-            self.assertIsNone(db.execute("SELECT 1 FROM pr_review_counts").fetchone())
+        def run():
+            errors = []
+            with (
+                contextlib.closing(a._connect()) as db,
+                patch.object(activity_forgejo, "repository", return_value=SimpleNamespace(key="forgejo:x")),
+                patch.object(activity_forgejo, "_get", side_effect=get),
+                patch.object(activity_forgejo.time, "monotonic", side_effect=lambda: clock[0]),
+                db,
+            ):
+                activity_forgejo.measure(db, self.now, errors, {})
+                return errors, [r[0] for r in db.execute("SELECT number FROM pr_review_counts ORDER BY number")]
+
+        # PR 2 is cut short by the budget: no error, and no attempt recorded.
+        self.assertEqual(run(), ([], [1]))
+        # Next pass PR 2 comes first with a whole budget; it still cannot finish, so it backs off.
+        self.assertEqual(run(), (["Forgejo PR measurements unavailable; normal refresh will retry"], [1, 2]))
 
     def test_missing_finishes_show_start_windows_latest_round_and_scope(self):
         # These were all discovered together. Recent counts must use their

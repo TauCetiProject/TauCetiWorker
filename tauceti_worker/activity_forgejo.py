@@ -146,8 +146,8 @@ def _read(repo, path, stop):
     try:
         return _get(repo, path, timeout=min(10, left))
     except OSError:
-        if time.monotonic() >= stop:
-            raise _Deadline from None  # The pass's budget cut this read short; the PR did not fail.
+        if left < 10 and time.monotonic() >= stop:
+            raise _Deadline from None  # The pass's budget, not Forgejo, cut this read short.
         raise
 
 
@@ -219,7 +219,7 @@ def measure(db, now, errors, env):
            ORDER BY c.repo IS NOT NULL AND c.head IS p.head, c.checked, p.landed DESC LIMIT ?""",
         (key, now - RETRY, MEASURE_LIMIT),
     ).fetchall()
-    for number, head in due:
+    for index, (number, head) in enumerate(due):
         loc = count = None
         unavailable = False
         try:
@@ -229,7 +229,9 @@ def measure(db, now, errors, env):
             # Forgejo returns all of an issue's comments at once; it ignores paging here.
             count = review_passes(_read(repo, f"/issues/{number}/comments", stop), head)
         except _Deadline:
-            return
+            if index:
+                return  # A later pass measures this PR with a fresh budget.
+            # Not even a whole pass suffices: back off as for a failure rather than block the others.
         except urllib.error.HTTPError:
             pass  # This PR's reads failed; retry it later without blocking the others.
         except OSError:
@@ -257,4 +259,6 @@ def measure(db, now, errors, env):
         )
         if unavailable:
             errors.append("Forgejo PR measurements unavailable; normal refresh will retry")
+            return
+        if time.monotonic() >= stop:
             return
