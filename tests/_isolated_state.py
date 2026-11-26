@@ -44,6 +44,9 @@ def settings(root):
         # Rounds start a background cleanup collector on hosts without the systemd timer. Fixtures
         # must never launch one against the checkout's or the host's real data.
         "TAUCETI_BACKGROUND_CLEANUP": "off",
+        # The repair checks' host-wide memory lock: the module's own, never the host's real one that
+        # an inherited TAUCETI_QUEUE_TASK_ROOT would name.
+        "TAUCETI_QUEUE_HEAVY_CHECK_LOCK": str(activity / "heavy-checks.lock"),
     }
 
 
