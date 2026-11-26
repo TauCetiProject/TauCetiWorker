@@ -180,7 +180,9 @@ class StreamingBuild:
         audit=None,
     ) -> None:
         self.worktree = worktree
-        self.audit = audit  # called once a green build ends, holding the lock; ``repair_audit.check``'s record
+        # Called once a green build ends, holding the lock, with ``cancel`` the event `stop` sets (which ends
+        # a wait for the host's heavy-check lock); ``repair_audit.check``'s record.
+        self.audit = audit
         self.findings: list[dict] = []  # its audit and lint findings
         self.audit_record: dict | None = None
         self.directory = directory
@@ -412,7 +414,7 @@ class StreamingBuild:
         from tauceti_queue import repair_audit
 
         try:
-            record = self.audit()
+            record = self.audit(cancel=self._stop)
         except Exception as error:  # the build's own record must still be finished
             self.audit_record = {"status": "unavailable", "reason": f"{type(error).__name__}: {error}"}
             return

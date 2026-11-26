@@ -1112,7 +1112,9 @@ lock file is `$TAUCETI_QUEUE_HEAVY_CHECK_LOCK`, else `heavy-checks.lock` beside 
 worker that has to wait says so in its log (`[repair-audit] waiting for ...`, every five minutes
 while it waits, and when it takes the lock) and in `heavy-lock-wait.json` in the task's log
 directory while it waits; `checks.heavy_lock` in the verification record (and `checks-timing.json`)
-gives the lock path and the seconds waited and held.
+gives the lock path and the seconds waited and held. A task stopped or losing its claim while it
+waits stops waiting and runs no check (`checks.cancelled`). A lock file that cannot be opened is
+logged and recorded, and the checks then run without it rather than stop every repair.
 
 The worker tests submission Git access before inference. A verified tip whose push/submission fails
 stays in the existing `delivery_pending` checkpoint and retained ref; polling renews its claim and

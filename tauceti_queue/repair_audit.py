@@ -96,6 +96,10 @@ class Unavailable(RuntimeError):
     """A check could not run at all (as opposed to running and reporting a finding)."""
 
 
+class Cancelled(Unavailable):
+    """The task was cancelled (stopped, or its claim lost) while waiting for the heavy-check lock."""
+
+
 def enabled(environ: dict | None = None) -> bool:
     value = (os.environ if environ is None else environ).get(ENABLE_VARIABLE, "1").strip().lower()
     return value not in ("0", "false", "no", "off")
@@ -396,11 +400,14 @@ def _say(message: str) -> None:
 
 
 @contextlib.contextmanager
-def heavy_lock(env: dict, record: dict, logdir: Path):
+def heavy_lock(env: dict, record: dict, logdir: Path, cancel=None):
     """Hold the host-wide heavy-check lock (``heavy_lock_path``) for the block, waiting for as long as
-    another worker holds it. ``record["heavy_lock"]`` gets its path, the seconds waited and held, and the
-    wait is printed to the worker's log when it starts, every few minutes and when it ends, and written
-    to ``logdir/heavy-lock-wait.json`` while it lasts, so a waiting task is visible."""
+    another worker holds it, or until ``cancel`` (an event) is set, which raises `Cancelled`.
+    ``record["heavy_lock"]`` gets its path, the seconds waited and held, and the wait is printed to the
+    worker's log when it starts, every few minutes and when it ends, and written to
+    ``logdir/heavy-lock-wait.json`` while it lasts, so a waiting task is visible. A lock file that
+    cannot be opened is logged and recorded, and the checks run without it: a broken lock path must
+    not stop every repair."""
     path = heavy_lock_path(env)
     if path is None:
         record["heavy_lock"] = {"skipped": "no lock path"}
@@ -427,6 +434,12 @@ def heavy_lock(env: dict, record: dict, logdir: Path):
                 break
             except BlockingIOError:
                 now = time.monotonic()
+                if cancel is not None and cancel.is_set():
+                    info["waited_seconds"] = round(now - waited_from, 1)
+                    _say(f"stopped waiting for {path}: the task was cancelled")
+                    with contextlib.suppress(OSError):
+                        marker.unlink(missing_ok=True)
+                    raise Cancelled(f"cancelled while waiting for the heavy-check lock {path}") from None
                 if not waiting:
                     waiting = True
                     _say(f"waiting for {path}: another repair worker is running its heavy checks")
@@ -436,7 +449,10 @@ def heavy_lock(env: dict, record: dict, logdir: Path):
                 elif now - reported >= HEAVY_LOCK_REPORT_SECONDS:
                     reported = now
                     _say(f"still waiting for {path} after {round(now - waited_from)}s")
-                time.sleep(HEAVY_LOCK_POLL_SECONDS)
+                if cancel is not None:
+                    cancel.wait(HEAVY_LOCK_POLL_SECONDS)
+                else:
+                    time.sleep(HEAVY_LOCK_POLL_SECONDS)
         info["waited_seconds"] = round(time.monotonic() - waited_from, 1)
         if waiting:
             _say(f"took {path} after waiting {info['waited_seconds']}s")
@@ -705,6 +721,7 @@ def check(
     logdir: Path,
     lake: tuple[str, ...] = ("lake",),
     timeout: float | None = None,
+    cancel=None,
 ) -> dict:
     """Staging's checks over the environment already built in ``worktree``, all at once; the caller
     holds the build lock. These are the audit driver (import, duplicates, axioms), the module-system
@@ -712,7 +729,8 @@ def check(
     the modules changed since ``base`` first and the whole library once nothing else is found, so
     ``lint.scope`` is ``changed`` only on a failed round. ``status`` is ``passed``, ``failed``
     (``diagnostics`` lists every check's findings in the controller's shape) or ``unavailable``
-    (``reason``)."""
+    (``reason``). ``cancel``, an event, ends a wait for the host-wide heavy-check lock (`heavy_lock`)
+    with ``unavailable`` and ``cancelled`` set."""
     verifier_root = tools_root / VERIFIER_DIR
     verifier_root.mkdir(parents=True, exist_ok=True)
     verifier = Path(tempfile.mkdtemp(prefix="check-", dir=verifier_root))
@@ -726,6 +744,7 @@ def check(
             lake=lake,
             timeout=timeout,
             verifier=verifier,
+            cancel=cancel,
         )
     finally:
         remove_tree(verifier)
@@ -741,6 +760,7 @@ def _check(
     lake: tuple[str, ...],
     timeout: float | None,
     verifier: Path,
+    cancel=None,
 ) -> dict:
     """`check`, with ``verifier`` the host-only directory for this check's scripts and scope files."""
     started = time.monotonic()
@@ -891,53 +911,59 @@ def _check(
         ("dot_notation", "lint", dot_notation, None, "lint-dot-notation.log", False),
     ]
     # The audit and the lints together, then the whole-library lint: one worker on the host at a time.
-    with heavy_lock(env, record, logdir):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-            futures = [
-                pool.submit(
-                    _sandboxed,
-                    argv,
-                    worktree,
-                    env,
-                    extra,
-                    logdir / log,
-                    timeout,
-                    read_only_build=read_only,
-                    ro_binds=(verifier, drivers),
-                )
-                for _, _, argv, extra, log, read_only in jobs
-            ]
-            runs = {job[0]: future.result() for job, future in zip(jobs, futures, strict=True)}
-        # Read the markers through the host-only hard link in the log directory, never through the path under
-        # `.lake`: candidate code could have replaced that with a link to any host file meanwhile.
-        record["audit_phases"] = audit_phases(phase_record, runs["audit"])
-        with contextlib.suppress(OSError):
-            shutil.copyfile(phase_record, logdir / "audit-phases.tsv")
-        found = {name: findings_of(kind, log.removesuffix(".log"), runs[name]) for name, kind, _, _, log, _ in jobs}
-        scope = "full"
-        if modules is not None:
-            scope = "changed"
-            # A changed-only run that failed in its own driver, naming no module, gives the repair
-            # nothing to fix; the whole-library lint replaces it whatever the other checks found.
-            driver_failed = driver_failure(runs["lint"], found["lint"])
-            if driver_failed or not any(found.values()):
-                record["changed_lint"] = {k: v for k, v in runs["lint"].items() if k != "output"} | {
-                    "modules": len(modules)
-                }
-                if driver_failed:
-                    record["changed_lint"]["skipped"] = "driver_failure"
-                runs["lint"] = _sandboxed(
-                    ["bash", scripts / "lint-env.sh"],
-                    worktree,
-                    env,
-                    full_lint_env,
-                    logdir / "lint-env.log",
-                    timeout,
-                    read_only_build=True,
-                    ro_binds=(verifier, drivers),
-                )
-                found["lint"] = findings_of("lint", "lint-env", runs["lint"])
-                scope = "full"
+    try:
+        with heavy_lock(env, record, logdir, cancel):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+                futures = [
+                    pool.submit(
+                        _sandboxed,
+                        argv,
+                        worktree,
+                        env,
+                        extra,
+                        logdir / log,
+                        timeout,
+                        read_only_build=read_only,
+                        ro_binds=(verifier, drivers),
+                    )
+                    for _, _, argv, extra, log, read_only in jobs
+                ]
+                runs = {job[0]: future.result() for job, future in zip(jobs, futures, strict=True)}
+            # Read the markers through the host-only hard link in the log directory, never through the path under
+            # `.lake`: candidate code could have replaced that with a link to any host file meanwhile.
+            record["audit_phases"] = audit_phases(phase_record, runs["audit"])
+            with contextlib.suppress(OSError):
+                shutil.copyfile(phase_record, logdir / "audit-phases.tsv")
+            found = {name: findings_of(kind, log.removesuffix(".log"), runs[name]) for name, kind, _, _, log, _ in jobs}
+            scope = "full"
+            if modules is not None:
+                scope = "changed"
+                # A changed-only run that failed in its own driver, naming no module, gives the repair
+                # nothing to fix; the whole-library lint replaces it whatever the other checks found.
+                driver_failed = driver_failure(runs["lint"], found["lint"])
+                if driver_failed or not any(found.values()):
+                    record["changed_lint"] = {k: v for k, v in runs["lint"].items() if k != "output"} | {
+                        "modules": len(modules)
+                    }
+                    if driver_failed:
+                        record["changed_lint"]["skipped"] = "driver_failure"
+                    runs["lint"] = _sandboxed(
+                        ["bash", scripts / "lint-env.sh"],
+                        worktree,
+                        env,
+                        full_lint_env,
+                        logdir / "lint-env.log",
+                        timeout,
+                        read_only_build=True,
+                        ro_binds=(verifier, drivers),
+                    )
+                    found["lint"] = findings_of("lint", "lint-env", runs["lint"])
+                    scope = "full"
+    except Cancelled as error:  # raised only while waiting, before any check started
+        record.update(
+            status="unavailable", reason=str(error), cancelled=True, seconds=round(time.monotonic() - started, 1)
+        )
+        return record
     for name, *_ in jobs:
         record[name] = {k: v for k, v in runs[name].items() if k != "output"} | {"findings": len(found[name])}
         record["diagnostics"] += found[name]
@@ -1025,6 +1051,7 @@ def verify(
     timeout: float | None = None,
     lock: Path | None = None,
     audits: bool = True,
+    cancel=None,
 ) -> dict:
     """The worker's verification: hold the build lock, run the whole-library ``lake build --iofail`` in
     the sandbox and, when it is green and ``audits``, ``check``. ``ok`` is false when the build failed or a
@@ -1060,6 +1087,7 @@ def verify(
                 logdir=logdir,
                 lake=lake,
                 timeout=timeout,
+                cancel=cancel,
             )
             record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
             record["diagnostics"] = checks["diagnostics"]

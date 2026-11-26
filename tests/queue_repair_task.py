@@ -6546,8 +6546,10 @@ class WorkerAudits(Fixture):
                     self.content.clone, env, base=self.content.base, tools_root=self.root / "tools", logdir=logdir
                 )
 
-        thread = threading.Thread(target=run)
+        thread = threading.Thread(target=run, daemon=True)
         thread.start()
+        self.addCleanup(thread.join, 120)
+        self.addCleanup(fcntl.flock, holder, fcntl.LOCK_UN)
         marker = logdir / "heavy-lock-wait.json"
         deadline = time.monotonic() + 60
         while not marker.exists() and time.monotonic() < deadline:
@@ -6567,6 +6569,33 @@ class WorkerAudits(Fixture):
         self.assertIn(f"[repair-audit] took {lock} after waiting", output.getvalue())
         timing = json.loads((logdir / "checks-timing.json").read_text())
         self.assertEqual(timing["heavy_lock"]["path"], str(lock))
+
+    def test_a_cancelled_task_stops_waiting_for_the_host_lock_and_runs_no_check(self):
+        lock = self.root / "shared" / "heavy-checks.lock"
+        lock.parent.mkdir(parents=True)
+        env = {**repair.lake_env(self.config().root), repair_audit.HEAVY_LOCK_VARIABLE: str(lock)}
+        holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        cancel = threading.Event()
+        timer = threading.Timer(0.5, cancel.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            checks = repair_audit.check(
+                self.content.clone,
+                env,
+                base=self.content.base,
+                tools_root=self.root / "tools",
+                logdir=self.root / "logs",
+                cancel=cancel,
+            )
+        self.assertEqual((checks["status"], checks["cancelled"]), ("unavailable", True), checks)
+        self.assertIn("heavy-check lock", checks["reason"])
+        self.assertIsNone(repair_task.attestation(self.content.clone, self.content.tip, checks))
+        self.assertFalse((self.stub_dir / "audit-runs.log").exists(), "no check ran")
+        self.assertFalse((self.root / "logs" / "heavy-lock-wait.json").exists())
+        self.assertIn("stopped waiting", output.getvalue())
 
     def test_a_failed_final_build_is_still_rejected(self):
         cfg = self.config(verify_retries=0)
