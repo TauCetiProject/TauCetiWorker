@@ -749,6 +749,30 @@ def _worker_scope(db, worker):
     return machine if machine and worker.startswith("fleet-" + machine[:8] + "-") else "local"
 
 
+def _landed_touches(db, now, column=None, identity=None):
+    """Landed PRs a scope authored or did meaningful work on, with landing times."""
+    from .activity_rollup_sources import MEANINGFUL
+
+    args = [identity] if column else []
+    touches = {
+        (repo, number): landed
+        for repo, number, landed in db.execute(
+            "SELECT repo,number,landed FROM prs WHERE landed IS NOT NULL AND landed<=?"
+            + (f" AND {column}=?" if column else ""),
+            [now, *args],
+        )
+    }
+    kinds = sorted(MEANINGFUL)
+    for repo, number, landed in db.execute(
+        "SELECT o.repo,o.number,o.landed FROM pr_observations o WHERE o.landed IS NOT NULL AND o.landed<=? "
+        "AND EXISTS(SELECT 1 FROM pr_contributions c WHERE c.repo=o.repo AND c.number=o.number "
+        f"AND c.activity IN ({','.join('?' for _ in kinds)})" + (f" AND c.{column}=?)" if column else ")"),
+        [now, *kinds, *args],
+    ):
+        touches.setdefault((repo, number), landed)
+    return touches
+
+
 def _summary(db, now, column=None, identity=None):
     local_row = db.execute("SELECT value FROM meta WHERE key='local_coordination'").fetchone()
     local_buckets = json.loads(local_row[0]) if local_row else {}
@@ -827,6 +851,7 @@ def _summary(db, now, column=None, identity=None):
         )
         row["loc_basis"] = "landed_at"
         row.update(activity_summary.loc_estimate(row))
+    landed_touches = None
     for window, attribution in activity_attribution.summarize(db, now, activity_costs.COST_WINDOWS, column, identity):
         row = costs["windows"][window]
         attribution["attribution_missing_prs"] += max(
@@ -834,20 +859,21 @@ def _summary(db, now, column=None, identity=None):
         )
         identities = attribution.get("attribution_prs")
         if identities is not None:
-            # Authored landed PRs with no attribution record yet are missing too.
+            if landed_touches is None:
+                landed_touches = _landed_touches(db, now, column, identity)
+            # Landed PRs this scope authored or worked on but has no attribution
+            # record for (no linked cost yet, or not yet prepared) are missing too.
             listed = {
                 (repo, number) for state in identities.values() for repo, numbers in state.items() for number in numbers
             }
             seconds = WINDOWS[window]
             missing = {repo: set(numbers) for repo, numbers in identities["missing"].items()}
-            for repo, number in db.execute(
-                f"SELECT repo,number FROM prs {where} {'AND' if where else 'WHERE'} landed IS NOT NULL AND landed<=?"
-                + ("" if seconds is None else " AND landed>=?"),
-                [*args, now] + ([] if seconds is None else [now - seconds]),
-            ):
-                if (repo, number) not in listed:
+            for (repo, number), landed in landed_touches.items():
+                if (seconds is None or landed >= now - seconds) and (repo, number) not in listed:
                     missing.setdefault(repo, set()).add(number)
             identities["missing"] = {repo: sorted(numbers) for repo, numbers in missing.items()}
+            attribution["attribution_known_prs"] = sum(len(n) for n in identities["known"].values())
+            attribution["attribution_missing_prs"] = sum(len(n) for n in identities["missing"].values())
         row.update(attribution)
     raw_observed = minimum("prs", "observed")
     raw_checked = minimum("prs", "checked")

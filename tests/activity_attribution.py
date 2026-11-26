@@ -147,22 +147,29 @@ class AttributionTests(unittest.TestCase):
             self.assertAlmostEqual(Decimal(activity_summary.attributed_rate(row)), 37 / expected)
             self.assertEqual(row["landed_loc_added"], 15000)
 
-    def test_host_total_names_landed_prs_for_fleet_deduplication(self):
+    def test_host_and_machine_totals_name_landed_prs_for_fleet_deduplication(self):
         self.example()
         self.pr(3, 15000)
         self.cost("author-3", 3, "roadmap", 10)
         self.reviews(3, 0, 3, rid="unused", archived=False)
+        # Worked on here but with no linked cost: no attribution record.
+        self.pr(5, 100, owned=False)
+        # Landed two days ago: in the 7d and total windows only.
+        self.pr(6, 100, owned=False, age=2 * 86400)
         self.prepare()
         # An authored landed PR that has no attribution record yet is still named.
         self.db.execute(
             "INSERT INTO prs (repo,number,head,state,landed,worker,scope,created) VALUES (?,?,?,?,?,?,?,?)",
             ("other/repo", 9, "head", "MERGED", self.now - 50, "worker", "machine", self.now - 1000),
         )
-        summary = a._summary(self.db, self.now)
-        for row in summary["costs"]["windows"].values():
-            self.assertEqual(row["attribution_prs"], dict(known={REPO: [1, 2]}, missing={REPO: [3], "other/repo": [9]}))
-            self.assertEqual(row["attribution_known_prs"], 2)
-            self.assertEqual(row["attribution_missing_prs"], 2)
+        for summary in (a._summary(self.db, self.now), a._summary(self.db, self.now, "scope", "machine")):
+            for window, row in summary["costs"]["windows"].items():
+                missing = [3, 5] + ([] if window == "24h" else [6])
+                self.assertEqual(
+                    row["attribution_prs"], dict(known={REPO: [1, 2]}, missing={REPO: missing, "other/repo": [9]})
+                )
+                self.assertEqual(row["attribution_known_prs"], 2)
+                self.assertEqual(row["attribution_missing_prs"], len(missing) + 1)
         worker = a._summary(self.db, self.now, "worker", "worker")
         self.assertNotIn("attribution_prs", worker["costs"]["windows"]["total"])
 

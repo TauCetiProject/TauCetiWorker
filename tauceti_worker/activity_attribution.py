@@ -416,7 +416,7 @@ def pr_identities(records, known):
     return {state: {repo: sorted(numbers) for repo, numbers in repos.items()} for state, repos in value.items()}
 
 
-def calculate(records, now, windows, reference=None):
+def calculate(records, now, windows, reference=None, identities=False):
     """Estimate one local accounting scope from compact, prepared PR facts."""
     review_costs, review_dates = {}, {}
     for row in records:
@@ -471,9 +471,10 @@ def calculate(records, now, windows, reference=None):
         selected = [r for r in records if seconds is None or r["landed"] >= now - seconds]
         known = [r for r in selected if r["credited"] is not None]
         extra = {}
-        if reference is None:
-            # The host total names its landed PRs so fleet totals can count a PR
-            # that several hosts touched once; per-worker profiles stay compact.
+        if identities:
+            # Host and machine-scope totals name their landed PRs so fleet totals
+            # can count a PR that several hosts touched once; per-worker
+            # profiles stay compact.
             extra["attribution_prs"] = pr_identities(selected, lambda r: r["credited"] is not None)
         yield (
             name,
