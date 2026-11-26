@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -77,8 +78,26 @@ TAIL_LINES = 30
 TAIL_CHARS = 2000
 
 
+# The host-wide lock that lets one repair worker at a time run the checks' memory-heavy part: the
+# audit and the environment lint together, then the whole-library lint (decision 219, option C). On
+# tauchonki2 the whole-library lint peaked at about 72 GB RSS and the audit at about 33 GB; three
+# repair workers running them at once on the 125 GB host pushed it into swap until systemd-oomd
+# killed a repair unit, losing its claimed work. The lock is a flock on ``HEAVY_LOCK_VARIABLE``'s
+# path, else ``HEAVY_LOCK_FILE`` in the parent of the task root (``TAUCETI_QUEUE_TASK_ROOT``), which
+# the workers on one host share (``~/TauCetiQueue-data``). With neither set, or when the file
+# cannot be opened, the checks run unserialized and the record says why.
+HEAVY_LOCK_VARIABLE = "TAUCETI_QUEUE_HEAVY_CHECK_LOCK"
+HEAVY_LOCK_FILE = "heavy-checks.lock"
+HEAVY_LOCK_POLL_SECONDS = 5.0
+HEAVY_LOCK_REPORT_SECONDS = 300.0
+
+
 class Unavailable(RuntimeError):
     """A check could not run at all (as opposed to running and reporting a finding)."""
+
+
+class Cancelled(Unavailable):
+    """The task was cancelled (stopped, or its claim lost) while waiting for the heavy-check lock."""
 
 
 def enabled(environ: dict | None = None) -> bool:
@@ -367,6 +386,91 @@ def process_tree_rss(pid: int) -> int:
     return total
 
 
+def heavy_lock_path(env: dict) -> Path | None:
+    """Where the host-wide lock on the checks' memory-heavy part lives, or ``None`` for no lock."""
+    explicit = (env.get(HEAVY_LOCK_VARIABLE) or "").strip()
+    if explicit:
+        return None if explicit.lower() in ("0", "off", "none") else Path(explicit)
+    task_root = (env.get("TAUCETI_QUEUE_TASK_ROOT") or "").strip()
+    return Path(task_root).resolve().parent / HEAVY_LOCK_FILE if task_root else None
+
+
+def _say(message: str) -> None:
+    print(f"[repair-audit] {message}", flush=True)
+
+
+@contextlib.contextmanager
+def heavy_lock(env: dict, record: dict, logdir: Path, cancel=None):
+    """Hold the host-wide heavy-check lock (``heavy_lock_path``) for the block, waiting for as long as
+    another worker holds it, or until ``cancel`` (an event) is set, which raises `Cancelled`.
+    ``record["heavy_lock"]`` gets its path, the seconds waited and held, and the wait is printed to the
+    worker's log when it starts, every few minutes and when it ends, and written to
+    ``logdir/heavy-lock-wait.json`` while it lasts, so a waiting task is visible. A lock file that
+    cannot be opened is logged and recorded, and the checks run without it: a broken lock path must
+    not stop every repair."""
+    path = heavy_lock_path(env)
+    if path is None:
+        record["heavy_lock"] = {"skipped": "no lock path"}
+        yield
+        return
+    info: dict = {"path": str(path)}
+    record["heavy_lock"] = info
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as error:
+        info["skipped"] = f"cannot open the lock: {error}"
+        _say(f"heavy checks run without the host lock: {info['skipped']}")
+        yield
+        return
+    marker = logdir / "heavy-lock-wait.json"
+    try:
+        waited_from = time.monotonic()
+        waiting = False
+        reported = waited_from
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                now = time.monotonic()
+                if cancel is not None and cancel.is_set():
+                    info["waited_seconds"] = round(now - waited_from, 1)
+                    _say(f"stopped waiting for {path}: the task was cancelled")
+                    with contextlib.suppress(OSError):
+                        marker.unlink(missing_ok=True)
+                    raise Cancelled(f"cancelled while waiting for the heavy-check lock {path}") from None
+                if not waiting:
+                    waiting = True
+                    _say(f"waiting for {path}: another repair worker is running its heavy checks")
+                    with contextlib.suppress(OSError):
+                        logdir.mkdir(parents=True, exist_ok=True)
+                        marker.write_text(json.dumps({"path": str(path), "since": time.time()}) + "\n")
+                elif now - reported >= HEAVY_LOCK_REPORT_SECONDS:
+                    reported = now
+                    _say(f"still waiting for {path} after {round(now - waited_from)}s")
+                if cancel is not None:
+                    cancel.wait(HEAVY_LOCK_POLL_SECONDS)
+                else:
+                    time.sleep(HEAVY_LOCK_POLL_SECONDS)
+        info["waited_seconds"] = round(time.monotonic() - waited_from, 1)
+        if waiting:
+            _say(f"took {path} after waiting {info['waited_seconds']}s")
+            with contextlib.suppress(OSError):
+                marker.unlink(missing_ok=True)
+        with contextlib.suppress(OSError):
+            os.ftruncate(descriptor, 0)
+            os.write(descriptor, f"{os.getpid()}\n".encode())
+        held_from = time.monotonic()
+        try:
+            yield
+        finally:
+            info["held_seconds"] = round(time.monotonic() - held_from, 1)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
 def _driver_key(worktree: Path, ref: str) -> str:
     digest = hashlib.sha256(ref.encode())
     # A pristine driver root (`pristine_driver_root`) also names the seed packages it builds against.
@@ -617,6 +721,7 @@ def check(
     logdir: Path,
     lake: tuple[str, ...] = ("lake",),
     timeout: float | None = None,
+    cancel=None,
 ) -> dict:
     """Staging's checks over the environment already built in ``worktree``, all at once; the caller
     holds the build lock. These are the audit driver (import, duplicates, axioms), the module-system
@@ -624,7 +729,8 @@ def check(
     the modules changed since ``base`` first and the whole library once nothing else is found, so
     ``lint.scope`` is ``changed`` only on a failed round. ``status`` is ``passed``, ``failed``
     (``diagnostics`` lists every check's findings in the controller's shape) or ``unavailable``
-    (``reason``)."""
+    (``reason``). ``cancel``, an event, ends a wait for the host-wide heavy-check lock (`heavy_lock`)
+    with ``unavailable`` and ``cancelled`` set."""
     verifier_root = tools_root / VERIFIER_DIR
     verifier_root.mkdir(parents=True, exist_ok=True)
     verifier = Path(tempfile.mkdtemp(prefix="check-", dir=verifier_root))
@@ -638,6 +744,7 @@ def check(
             lake=lake,
             timeout=timeout,
             verifier=verifier,
+            cancel=cancel,
         )
     finally:
         remove_tree(verifier)
@@ -653,6 +760,7 @@ def _check(
     lake: tuple[str, ...],
     timeout: float | None,
     verifier: Path,
+    cancel=None,
 ) -> dict:
     """`check`, with ``verifier`` the host-only directory for this check's scripts and scope files."""
     started = time.monotonic()
@@ -802,52 +910,60 @@ def _check(
         ("style_lint", "lint", ["bash", scripts / "lint-style.sh"], project, "lint-style.log", False),
         ("dot_notation", "lint", dot_notation, None, "lint-dot-notation.log", False),
     ]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
-        futures = [
-            pool.submit(
-                _sandboxed,
-                argv,
-                worktree,
-                env,
-                extra,
-                logdir / log,
-                timeout,
-                read_only_build=read_only,
-                ro_binds=(verifier, drivers),
-            )
-            for _, _, argv, extra, log, read_only in jobs
-        ]
-        runs = {job[0]: future.result() for job, future in zip(jobs, futures, strict=True)}
-    # Read the markers through the host-only hard link in the log directory, never through the path under
-    # `.lake`: candidate code could have replaced that with a link to any host file meanwhile.
-    record["audit_phases"] = audit_phases(phase_record, runs["audit"])
-    with contextlib.suppress(OSError):
-        shutil.copyfile(phase_record, logdir / "audit-phases.tsv")
-    found = {name: findings_of(kind, log.removesuffix(".log"), runs[name]) for name, kind, _, _, log, _ in jobs}
-    scope = "full"
-    if modules is not None:
-        scope = "changed"
-        # A changed-only run that failed in its own driver, naming no module, gives the repair
-        # nothing to fix; the whole-library lint replaces it whatever the other checks found.
-        driver_failed = driver_failure(runs["lint"], found["lint"])
-        if driver_failed or not any(found.values()):
-            record["changed_lint"] = {k: v for k, v in runs["lint"].items() if k != "output"} | {
-                "modules": len(modules)
-            }
-            if driver_failed:
-                record["changed_lint"]["skipped"] = "driver_failure"
-            runs["lint"] = _sandboxed(
-                ["bash", scripts / "lint-env.sh"],
-                worktree,
-                env,
-                full_lint_env,
-                logdir / "lint-env.log",
-                timeout,
-                read_only_build=True,
-                ro_binds=(verifier, drivers),
-            )
-            found["lint"] = findings_of("lint", "lint-env", runs["lint"])
+    # The audit and the lints together, then the whole-library lint: one worker on the host at a time.
+    try:
+        with heavy_lock(env, record, logdir, cancel):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+                futures = [
+                    pool.submit(
+                        _sandboxed,
+                        argv,
+                        worktree,
+                        env,
+                        extra,
+                        logdir / log,
+                        timeout,
+                        read_only_build=read_only,
+                        ro_binds=(verifier, drivers),
+                    )
+                    for _, _, argv, extra, log, read_only in jobs
+                ]
+                runs = {job[0]: future.result() for job, future in zip(jobs, futures, strict=True)}
+            # Read the markers through the host-only hard link in the log directory, never through the path under
+            # `.lake`: candidate code could have replaced that with a link to any host file meanwhile.
+            record["audit_phases"] = audit_phases(phase_record, runs["audit"])
+            with contextlib.suppress(OSError):
+                shutil.copyfile(phase_record, logdir / "audit-phases.tsv")
+            found = {name: findings_of(kind, log.removesuffix(".log"), runs[name]) for name, kind, _, _, log, _ in jobs}
             scope = "full"
+            if modules is not None:
+                scope = "changed"
+                # A changed-only run that failed in its own driver, naming no module, gives the repair
+                # nothing to fix; the whole-library lint replaces it whatever the other checks found.
+                driver_failed = driver_failure(runs["lint"], found["lint"])
+                if driver_failed or not any(found.values()):
+                    record["changed_lint"] = {k: v for k, v in runs["lint"].items() if k != "output"} | {
+                        "modules": len(modules)
+                    }
+                    if driver_failed:
+                        record["changed_lint"]["skipped"] = "driver_failure"
+                    runs["lint"] = _sandboxed(
+                        ["bash", scripts / "lint-env.sh"],
+                        worktree,
+                        env,
+                        full_lint_env,
+                        logdir / "lint-env.log",
+                        timeout,
+                        read_only_build=True,
+                        ro_binds=(verifier, drivers),
+                    )
+                    found["lint"] = findings_of("lint", "lint-env", runs["lint"])
+                    scope = "full"
+    except Cancelled as error:  # raised only while waiting, before any check started
+        record.update(
+            status="unavailable", reason=str(error), cancelled=True, seconds=round(time.monotonic() - started, 1)
+        )
+        return record
     for name, *_ in jobs:
         record[name] = {k: v for k, v in runs[name].items() if k != "output"} | {"findings": len(found[name])}
         record["diagnostics"] += found[name]
@@ -935,6 +1051,7 @@ def verify(
     timeout: float | None = None,
     lock: Path | None = None,
     audits: bool = True,
+    cancel=None,
 ) -> dict:
     """The worker's verification: hold the build lock, run the whole-library ``lake build --iofail`` in
     the sandbox and, when it is green and ``audits``, ``check``. ``ok`` is false when the build failed or a
@@ -970,6 +1087,7 @@ def verify(
                 logdir=logdir,
                 lake=lake,
                 timeout=timeout,
+                cancel=cancel,
             )
             record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
             record["diagnostics"] = checks["diagnostics"]

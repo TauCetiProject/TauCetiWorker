@@ -927,6 +927,7 @@ def repair_groups(
                         logdir=logdir,
                         lake=tuple(cfg.lake),
                         timeout=cfg.build_timeout,
+                        cancel=cancel,
                     )
                     record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
                     check_findings = checks["diagnostics"]

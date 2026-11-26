@@ -3889,7 +3889,11 @@ def _run_task(
                     lake=tuple(cfg.lake),
                     timeout=cfg.build_timeout,
                     audits=True,
+                    cancel=cancel,
                 )
+                if cancel.is_set():
+                    # Stopped or the claim lost, perhaps while waiting for the host's heavy-check lock.
+                    return cancelled("cancelled while verifying")
                 outcome.setdefault("verification", []).append(
                     {k: v for k, v in verification.items() if k != "diagnostics"}
                     | {"tip": tip, "findings": len(verification["diagnostics"])}

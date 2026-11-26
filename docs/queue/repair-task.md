@@ -1103,6 +1103,19 @@ linting every second declaration with the same verdicts; on chungus2 that took t
 from 514 s to 234 s for about 2 GB more PSS. With `TAUCETI_QUEUE_SANDBOX=0` it stays one process,
 since nothing outside bwrap's PID namespace would collect the shards after a timeout. These timing observations never authorize a pass.
 
+The checks' memory-heavy part (the audit and the lints together, then the whole-library lint) runs
+under a host-wide flock, so only one repair worker on a host runs it at a time (decision 219, option
+C: on tauchonki2 the whole-library lint peaked at about 72 GB RSS and the audit at about 33 GB, and
+three workers running them at once on the 125 GB host led systemd-oomd to kill repair units). The
+lock file is `$TAUCETI_QUEUE_HEAVY_CHECK_LOCK`, else `heavy-checks.lock` beside the task root
+(`~/TauCetiQueue-data/heavy-checks.lock` for the three tauchonki2 workers); `off` disables it. A
+worker that has to wait says so in its log (`[repair-audit] waiting for ...`, every five minutes
+while it waits, and when it takes the lock) and in `heavy-lock-wait.json` in the task's log
+directory while it waits; `checks.heavy_lock` in the verification record (and `checks-timing.json`)
+gives the lock path and the seconds waited and held. A task stopped or losing its claim while it
+waits stops waiting and runs no check (`checks.cancelled`). A lock file that cannot be opened is
+logged and recorded, and the checks then run without it rather than stop every repair.
+
 The worker tests submission Git access before inference. A verified tip whose push/submission fails
 stays in the existing `delivery_pending` checkpoint and retained ref; polling renews its claim and
 retries delivery with bounded individual attempts. Unchanged source and checking identity reuse

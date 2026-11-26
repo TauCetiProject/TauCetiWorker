@@ -29,6 +29,7 @@ import _isolated_state  # noqa: F401  (first: see tests/_isolated_state.py)
 # isort: split
 import contextlib
 import dataclasses
+import fcntl
 import io
 import json
 import os
@@ -6469,6 +6470,132 @@ class WorkerAudits(Fixture):
             .read_text()
         )
         self.assertEqual((settings["linters"], settings["unchecked"]), (["simpNF"], True))
+
+    def test_the_lock_path_comes_from_the_setting_else_beside_the_task_root(self):
+        path = repair_audit.heavy_lock_path
+        self.assertEqual(path({repair_audit.HEAVY_LOCK_VARIABLE: "/x/y.lock"}), Path("/x/y.lock"))
+        self.assertIsNone(path({repair_audit.HEAVY_LOCK_VARIABLE: "off", "TAUCETI_QUEUE_TASK_ROOT": "/d/repair"}))
+        root = self.root / "data" / "repair-2"
+        self.assertEqual(
+            path({"TAUCETI_QUEUE_TASK_ROOT": str(root)}), root.resolve().parent / repair_audit.HEAVY_LOCK_FILE
+        )
+        self.assertIsNone(path({}))
+
+    def test_the_audit_and_every_lint_run_hold_the_host_lock(self):
+        """Decision 219 C: the audit, the changed-module lint and the whole-library lint after it all run
+        while this worker holds the host-wide lock, so another worker cannot run them at the same time."""
+        lock = self.root / "shared" / "heavy-checks.lock"
+        env = {**repair.lake_env(self.config().root), repair_audit.HEAVY_LOCK_VARIABLE: str(lock)}
+        run = repair_audit._sandboxed
+        held = {}
+
+        def probe(argv, *args, **kwargs):
+            if not lock.exists():  # the driver builds, before the checks
+                return run(argv, *args, **kwargs)
+            descriptor = os.open(lock, os.O_RDWR)
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                locked = False
+            except BlockingIOError:
+                locked = True
+            finally:
+                os.close(descriptor)
+            held.setdefault(Path(str(argv[-1])).name, []).append(locked)
+            return run(argv, *args, **kwargs)
+
+        with patch.object(repair_audit, "_sandboxed", side_effect=probe):
+            checks = repair_audit.check(
+                self.content.clone,
+                env,
+                base=self.content.base,
+                tools_root=self.root / "tools",
+                logdir=self.root / "logs",
+            )
+        self.assertEqual(checks["status"], "passed", checks)
+        self.assertEqual(checks["lint"]["scope"], "full")
+        self.assertEqual(held["lint-env.sh"], [True, True], "the changed-module lint and the whole-library lint")
+        self.assertEqual(held["audit-driver"], [True])
+        self.assertEqual((checks["heavy_lock"]["path"], checks["heavy_lock"]["waited_seconds"] < 5), (str(lock), True))
+        self.assertIn("held_seconds", checks["heavy_lock"])
+        descriptor = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released afterwards
+        finally:
+            os.close(descriptor)
+
+    def test_a_worker_waits_for_the_host_lock_and_says_so(self):
+        """While another worker holds the lock, the checks do not start; the wait is in the worker's log and
+        the task's log directory, and its length in the record."""
+        lock = self.root / "shared" / "heavy-checks.lock"
+        lock.parent.mkdir(parents=True)
+        env = {**repair.lake_env(self.config().root), repair_audit.HEAVY_LOCK_VARIABLE: str(lock)}
+        logdir = self.root / "logs"
+        holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        result = {}
+        output = io.StringIO()
+        poll = patch.object(repair_audit, "HEAVY_LOCK_POLL_SECONDS", 0.05)
+        poll.start()
+        self.addCleanup(poll.stop)
+
+        def run():
+            with contextlib.redirect_stdout(output):
+                result["checks"] = repair_audit.check(
+                    self.content.clone, env, base=self.content.base, tools_root=self.root / "tools", logdir=logdir
+                )
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 120)
+        self.addCleanup(fcntl.flock, holder, fcntl.LOCK_UN)
+        marker = logdir / "heavy-lock-wait.json"
+        deadline = time.monotonic() + 60
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(json.loads(marker.read_text())["path"], str(lock))
+        time.sleep(0.5)
+        self.assertFalse((self.stub_dir / "audit-runs.log").exists(), "no check starts while the lock is held")
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        thread.join(120)
+        self.assertFalse(thread.is_alive())
+        checks = result["checks"]
+        self.assertEqual(checks["status"], "passed", checks)
+        self.assertGreaterEqual(checks["heavy_lock"]["waited_seconds"], 0.5)
+        self.assertTrue((self.stub_dir / "audit-runs.log").exists())
+        self.assertFalse(marker.exists(), "the marker goes once the lock is taken")
+        self.assertIn(f"[repair-audit] waiting for {lock}", output.getvalue())
+        self.assertIn(f"[repair-audit] took {lock} after waiting", output.getvalue())
+        timing = json.loads((logdir / "checks-timing.json").read_text())
+        self.assertEqual(timing["heavy_lock"]["path"], str(lock))
+
+    def test_a_cancelled_task_stops_waiting_for_the_host_lock_and_runs_no_check(self):
+        lock = self.root / "shared" / "heavy-checks.lock"
+        lock.parent.mkdir(parents=True)
+        env = {**repair.lake_env(self.config().root), repair_audit.HEAVY_LOCK_VARIABLE: str(lock)}
+        holder = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        cancel = threading.Event()
+        timer = threading.Timer(0.5, cancel.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            checks = repair_audit.check(
+                self.content.clone,
+                env,
+                base=self.content.base,
+                tools_root=self.root / "tools",
+                logdir=self.root / "logs",
+                cancel=cancel,
+            )
+        self.assertEqual((checks["status"], checks["cancelled"]), ("unavailable", True), checks)
+        self.assertIn("heavy-check lock", checks["reason"])
+        self.assertIsNone(repair_task.attestation(self.content.clone, self.content.tip, checks))
+        self.assertFalse((self.stub_dir / "audit-runs.log").exists(), "no check ran")
+        self.assertFalse((self.root / "logs" / "heavy-lock-wait.json").exists())
+        self.assertIn("stopped waiting", output.getvalue())
 
     def test_a_failed_final_build_is_still_rejected(self):
         cfg = self.config(verify_retries=0)
