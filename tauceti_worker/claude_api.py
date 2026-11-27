@@ -217,6 +217,9 @@ class ClaudeAPIContext:
         shim.write_text(text)
         shim.chmod(0o700)
         self.config = dict(command=real, key=str(keyfile), bridge=str(self.directory), wait=False, usage_dir=str(usage))
+        if deadline := os.environ.get("TAUCETI_ROUND_DEADLINE"):
+            # Sandboxed shims copy this config without the host environment; they bound capacity holds by it.
+            self.config["deadline"] = float(deadline)
         atomic(self.bin / "config.json", self.config)
         os.environ["PATH"] = f"{self.bin}:{self.previous_path}"
         os.environ["TAUCETI_API_CONTEXT"] = str(self.directory)

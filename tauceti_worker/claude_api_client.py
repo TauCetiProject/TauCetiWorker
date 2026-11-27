@@ -133,7 +133,7 @@ def main():
     # takes minutes for fix and rebase rounds. Hold the prepared work for capacity to reopen
     # instead of discarding it, leaving the round most of its time budget.
     hold_until = time.time() + CAPACITY_HOLD_SECONDS
-    if deadline := os.environ.get("TAUCETI_ROUND_DEADLINE"):
+    if deadline := config.get("deadline") or os.environ.get("TAUCETI_ROUND_DEADLINE"):
         hold_until = min(hold_until, float(deadline) - CAPACITY_HOLD_RESERVE_SECONDS)
     while True:
         admission = request(

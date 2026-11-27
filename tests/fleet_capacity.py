@@ -185,16 +185,22 @@ class FleetTests(unittest.TestCase):
             (root / "config.json").write_text(json.dumps({**config, "usage_dir": str(root / "usage")}))
             capacity = dict(allowed=False, reason="host memory headroom low", capacity=True)
             funding = dict(allowed=False, reason="waiting for funding")
-            for answers, deadline, sleeps, rc in (
+            for answers, deadline, sleeps, rc, configured in (
                 # Capacity reopens after two polls: the prepared work launches.
-                ([capacity, capacity, dict(allowed=True, id="i" * 32)], None, 2, 0),
+                ([capacity, capacity, dict(allowed=True, id="i" * 32)], None, 2, 0, False),
                 # Capacity stays closed: the hold ends and the round waits outside it.
-                ([capacity] * 1000, None, client.CAPACITY_HOLD_SECONDS // client.CAPACITY_POLL_SECONDS - 1, 75),
+                ([capacity] * 1000, None, client.CAPACITY_HOLD_SECONDS // client.CAPACITY_POLL_SECONDS - 1, 75, False),
                 # Too little round time left to hold.
-                ([capacity] * 1000, 1000 + client.CAPACITY_HOLD_RESERVE_SECONDS, 0, 75),
-                ([funding], None, 0, 75),
+                ([capacity] * 1000, 1000 + client.CAPACITY_HOLD_RESERVE_SECONDS, 0, 75, False),
+                # A sandboxed shim has no host environment; the bridge config carries the deadline.
+                ([capacity] * 1000, 1000 + client.CAPACITY_HOLD_RESERVE_SECONDS, 0, 75, True),
+                ([funding], None, 0, 75, False),
             ):
-                with self.subTest(answers=answers[0], deadline=deadline):
+                with self.subTest(answers=answers[0], deadline=deadline, configured=configured):
+                    settings = {**config, "usage_dir": str(root / "usage")}
+                    if configured:
+                        settings["deadline"] = deadline
+                    (root / "config.json").write_text(json.dumps(settings))
                     clock = [1000.0]
                     replies = iter(answers)
 
@@ -209,7 +215,7 @@ class FleetTests(unittest.TestCase):
                         admits.append(action)
                         return next(replies)
 
-                    env = {"TAUCETI_ROUND_DEADLINE": str(deadline)} if deadline else {}
+                    env = {"TAUCETI_ROUND_DEADLINE": str(deadline)} if deadline and not configured else {}
                     with (
                         patch.object(client, "__file__", str(root / "shim.py")),
                         patch.object(sys, "argv", ["claude", "-p", "hello", "--model", "opus"]),
@@ -222,7 +228,7 @@ class FleetTests(unittest.TestCase):
                         patch.object(client.time, "sleep", side_effect=sleep) as slept,
                         patch.object(client.subprocess, "Popen", side_effect=OSError("fake launch")) as popen,
                     ):
-                        if not deadline:
+                        if not env:
                             os.environ.pop("TAUCETI_ROUND_DEADLINE", None)
                         if rc == 75:
                             self.assertEqual(client.main(), 75)
