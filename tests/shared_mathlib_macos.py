@@ -23,6 +23,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from shared_mathlib import Fixture, git, writable_bits  # the Linux module's fixture checkout
 
+from tauceti_worker import round_storage
 from tauceti_worker import shared_mathlib as s
 from tauceti_worker.runtime_status import read_json
 
@@ -248,11 +249,228 @@ class PublishTests(MacFixture):
         self.assertFalse((self.P / "entries" / key).exists())
         self.assertEqual(list((self.P / "staging").iterdir()), [])
 
+    def test_outputs_hard_linked_into_the_lake_cache_are_published_as_files_of_their_own(self):
+        """Lake's artifact cache links a built executable into LAKE_CACHE_DIR (and restores by link)."""
+        cache = self.root / "lake-cache/artifacts/cache-executable"
+        cache.parent.mkdir(parents=True)
+
+        def extract(command, cwd, env, output, timeout):
+            rc = self.extract(command, cwd, env, output, timeout)
+            binary = cwd / ".lake/packages/mathlib/.lake/build/bin/cache"
+            binary.parent.mkdir()
+            binary.write_bytes(b"cache executable")
+            os.chmod(binary, 0o555)  # as Lake leaves a cached artifact
+            os.utime(binary, ns=(1_000_000_000, 1_000_000_000))
+            os.link(binary, cache)
+            return rc
+
+        graph, closure = self.attach()
+        key, spec = s.signature(self.cwd, self.env, closure)
+        with s.key_lock(self.P, key):
+            entry, hit = s.publish(self.P, key, spec, graph, closure, self.env, self.root / "logs", extract)
+        self.assertFalse(hit)
+        published = entry / "build/mathlib/bin/cache"
+        self.assertEqual(published.read_bytes(), b"cache executable")
+        self.assertEqual(published.stat().st_nlink, 1)
+        self.assertEqual(published.stat().st_mode & 0o777, 0o555)
+        self.assertEqual(published.stat().st_mtime_ns, 1_000_000_000)
+        # The cache keeps its own file; nothing outside the pool names a published inode.
+        self.assertEqual(cache.read_bytes(), b"cache executable")
+        self.assertEqual(cache.stat().st_nlink, 1)
+        self.assertNotEqual(cache.stat().st_ino, published.stat().st_ino)
+        self.assertEqual([p.name for p in published.parent.iterdir()], ["cache"])  # no temporary left
+        self.assertTrue(s.ready_entry(entry, key, spec))
+        # The check itself is unchanged: an alias made later is still refused.
+        os.link(published, self.root / "alias")
+        with self.assertRaisesRegex(s.IntegrityFailure, "hardlink alias: mathlib/bin/cache"):
+            s.ready_entry(entry, key, spec)
+
+    def test_a_file_that_cannot_be_given_its_own_inode_blocks_publication(self):
+        def extract(command, cwd, env, output, timeout):
+            rc = self.extract(command, cwd, env, output, timeout)
+            os.link(cwd / ".lake/packages/mathlib/.lake/build/lib/lean/Mathlib.olean", self.root / "alias")
+            self.clone_error = OSError(errno.ENOTSUP, os.strerror(errno.ENOTSUP))
+            return rc
+
+        if REAL:
+            self.skipTest("needs a failing primitive")
+        graph, closure = self.attach()
+        key, spec = s.signature(self.cwd, self.env, closure)
+        with s.key_lock(self.P, key), self.assertRaises(OSError):
+            s.publish(self.P, key, spec, graph, closure, self.env, self.root / "logs", extract)
+        self.assertFalse((self.P / "entries" / key).exists())
+        self.assertEqual(list((self.P / "staging").iterdir()), [])
+
     def test_an_unused_entry_is_collected_like_any_other(self):
         key, _, entry, _, _, _ = self.published()
         self.assertEqual(s.collect(self.pool, max_age=0, now=time.time() + 10), [str(entry), str(self.source)])
         self.assertFalse(entry.exists())
         self.assertEqual(list((self.P / "trash").iterdir()), [])
+
+
+class IntegrityTests(MacFixture):
+    """macOS was seen updating the ctime, and nothing else, of published files: content decides."""
+
+    NAME = "mathlib/lib/lean/Mathlib.olean"
+
+    def setUp(self):
+        super().setUp()
+        self.key, self.spec, self.entry, _, _, _ = self.published()
+        self.file = self.entry / "build" / self.NAME
+        self.record = read_json(self.entry / "ready.json")
+
+    def touch(self, path=None):
+        """Change a file's ctime and nothing else."""
+        path = path or self.file
+        before = path.stat()
+        time.sleep(0.01)
+        os.chmod(path, before.st_mode & 0o7777)
+        after = path.stat()
+        self.assertNotEqual(after.st_ctime_ns, before.st_ctime_ns)
+        self.assertEqual(s._fields(after)[:5], s._fields(before)[:5])
+
+    def rewrite(self, content, *, keep_mtime=True):
+        """Overwrite the published file in place, as its owner can."""
+        before = self.file.stat()
+        os.chmod(self.file, 0o644)
+        with self.file.open("r+b") as out:
+            out.write(content)
+            out.truncate()
+        if keep_mtime:
+            os.utime(self.file, ns=(before.st_atime_ns, before.st_mtime_ns))
+        os.chmod(self.file, before.st_mode & 0o7777)
+
+    def assert_refused(self, pattern="snapshot integrity failure"):
+        with patch.object(s, "_content", side_effect=AssertionError("content must not decide this")):
+            with self.assertRaisesRegex(s.IntegrityFailure, pattern):
+                s.ready_entry(self.entry, self.key, self.spec)
+        self.assertEqual(read_json(self.entry / "ready.json"), self.record)  # never refreshed
+
+    def test_publication_records_a_digest_of_every_file(self):
+        self.assertEqual(self.record["digest"], "sha256")
+        self.assertEqual(self.record["digests"].keys(), self.record["inventory"].keys())
+        self.assertEqual(self.record["inventory"], s.inventory(self.entry / "build"))
+        import hashlib
+
+        self.assertEqual(self.record["digests"][self.NAME], hashlib.sha256(self.artifact).hexdigest())
+
+    def test_an_untouched_entry_is_reused_without_reading_any_content(self):
+        with patch.object(s, "_content", side_effect=AssertionError("no file should be read")):
+            self.assertTrue(s.ready_entry(self.entry, self.key, self.spec))
+
+    def test_a_ctime_only_change_with_intact_content_is_accepted_and_paid_for_once(self):
+        self.touch()
+        other = self.entry / "build/batteries/lib/lean/Batteries.olean"
+        self.touch(other)
+        with patch.object(s, "_content", wraps=s._content) as content:
+            self.assertTrue(s.ready_entry(self.entry, self.key, self.spec))
+        self.assertEqual(sorted(call.args[0] for call in content.call_args_list), sorted([self.file, other]))
+        refreshed = read_json(self.entry / "ready.json")
+        self.assertEqual(refreshed["inventory"], s.inventory(self.entry / "build"))
+        self.assertEqual(refreshed["digests"], self.record["digests"])
+        self.assertEqual((refreshed["key"], refreshed["spec"]), (self.key, self.spec))
+        # The new ctimes are recorded: the next reuse reads nothing.
+        with patch.object(s, "_content", side_effect=AssertionError("no file should be read again")):
+            self.assertTrue(s.ready_entry(self.entry, self.key, self.spec))
+        self.assertFalse((self.pool / "safety-stop.json").exists())
+
+    def test_a_round_starts_after_a_ctime_only_change(self):
+        for path in (self.entry / "build").rglob("*"):
+            if path.is_file():
+                self.touch(path)
+        with self.view():
+            self.assertEqual((self.link() / ".lake/build/lib/lean/Mathlib.olean").read_bytes(), self.artifact)
+        self.assertEqual(self.downloads, 1)
+        self.assertFalse((self.pool / "safety-stop.json").exists())
+
+    def test_the_round_start_validation_accepts_a_ctime_only_change_too(self):
+        self.touch()
+        env = {**self.env, "TAUCETI_SHARED_MATHLIB_KEY": self.key}
+        self.assertEqual(
+            round_storage.validate_shared_views(env, enforce=True), dict(shared_mathlib="matches ready.json")
+        )
+        self.rewrite(b"X" * len(self.artifact))
+        with self.assertRaisesRegex(round_storage.SharedViewMismatch, "differs from its published digest"):
+            round_storage.validate_shared_views(env, enforce=True)
+
+    def test_changed_content_of_the_same_size_and_mtime_is_refused(self):
+        before = s._fields(self.file.stat())
+        self.rewrite(b"X" * len(self.artifact))
+        after = s._fields(self.file.stat())
+        self.assertEqual(after[:5], before[:5])  # only the ctime tells, and macOS moves that by itself
+        self.assertNotEqual(after[5], before[5])
+        with self.assertRaisesRegex(s.IntegrityFailure, f"content of {self.NAME} differs from its published digest"):
+            s.ready_entry(self.entry, self.key, self.spec)
+        self.assertEqual(read_json(self.entry / "ready.json"), self.record)
+        with self.assertRaisesRegex(s.Unavailable, "integrity failure"):
+            with self.view():
+                self.fail("round started on a changed entry")
+        self.assertTrue((self.pool / "safety-stop.json").exists())
+
+    def test_a_changed_mtime_is_refused_as_before(self):
+        self.rewrite(self.artifact, keep_mtime=False)  # even with the content intact
+        self.assert_refused()
+
+    def test_a_changed_size_is_refused_as_before(self):
+        self.rewrite(self.artifact + b"!")
+        self.assert_refused()
+
+    def test_a_changed_mode_is_refused_as_before(self):
+        os.chmod(self.file, 0o644)
+        self.assert_refused()
+
+    def test_a_replaced_file_is_refused_as_before(self):
+        before = self.file.stat()
+        os.chmod(self.file.parent, 0o755)
+        replacement = self.file.with_name("replacement")
+        shutil.copy2(self.file, replacement)  # same content, mode, size and mtime; another inode
+        os.replace(replacement, self.file)
+        os.chmod(self.file.parent, 0o555)
+        self.assertNotEqual(self.file.stat().st_ino, before.st_ino)
+        self.assertEqual(s._fields(self.file.stat())[1:5], s._fields(before)[1:5])
+        self.assert_refused()
+
+    def test_a_second_link_is_refused_as_before(self):
+        os.link(self.file, self.root / "alias")
+        self.assert_refused("hardlink alias")
+
+    def test_a_missing_or_additional_file_is_refused_as_before(self):
+        self.touch()
+        os.chmod(self.file.parent, 0o755)
+        (self.file.parent / "Extra.olean").write_bytes(b"extra")
+        self.assert_refused()
+        (self.file.parent / "Extra.olean").unlink()
+        (self.file.parent / "Mathlib.ilean").unlink()
+        self.assert_refused()
+
+    def test_an_entry_published_without_digests_is_refused_on_a_ctime_change(self):
+        legacy = {name: value for name, value in self.record.items() if name not in ("digest", "digests")}
+        (self.entry / "ready.json").write_text(json.dumps(legacy))
+        self.record = legacy
+        self.assertTrue(s.ready_entry(self.entry, self.key, self.spec))
+        self.touch()
+        self.assert_refused()
+
+    def test_linux_never_accepts_a_ctime_change_whatever_the_record_holds(self):
+        self.touch()
+        with patch.object(s.platform, "system", return_value="Linux"):
+            self.assert_refused()
+
+    def test_a_file_that_keeps_changing_while_it_is_read_is_refused(self):
+        self.touch()
+        real = os.fstat
+        ticks = iter(range(1, 100))
+
+        def moving(fd):
+            info = list(real(fd))
+            return os.stat_result([*info[:9], info[9] + next(ticks)])  # st_ctime in whole seconds
+
+        def fields(info):
+            return [info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime, info.st_ctime]
+
+        with patch.object(s.os, "fstat", side_effect=moving), patch.object(s, "_fields", side_effect=fields):
+            with self.assertRaisesRegex(s.Unavailable, "keeps changing while it is read"):
+                s._content(self.file)
 
 
 class ViewTests(MacFixture):

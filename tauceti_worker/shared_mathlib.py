@@ -26,8 +26,9 @@ original's blocks copy-on-write, so the host still stores one Mathlib build per 
 round's writes land only in its own clone. ``clonefile`` never falls back to copying bytes: where
 it is unavailable (not APFS, or the pool and the checkout on different volumes) the round is
 refused. Published builds have every write bit removed there, because no read-only mount protects
-them. When the view ends the links name the shared sources again, with their empty read-only build
-directories, and the generation is discarded.
+them, and their ``ready.json`` also records a digest of every file's content, which decides a
+reuse when only ctimes have moved (``entry_intact``). When the view ends the links name the shared
+sources again, with their empty read-only build directories, and the generation is discarded.
 
 Agent workspaces are NEVER publication sources. Locks outside entries protect publication and
 leases against eviction and collection; no root or daemon.
@@ -1507,15 +1508,80 @@ def inventory(build):
             if info.st_dev != device or (stat.S_ISREG(info.st_mode) and info.st_nlink != 1):
                 raise Unavailable(f"snapshot file has a mount or hardlink alias: {path.relative_to(build)}")
             if stat.S_ISREG(info.st_mode):
-                result[str(path.relative_to(build))] = [
-                    info.st_ino,
-                    info.st_mode,
-                    info.st_nlink,
-                    info.st_size,
-                    info.st_mtime_ns,
-                    info.st_ctime_ns,
-                ]
+                result[str(path.relative_to(build))] = _fields(info)
     return result
+
+
+def _fields(info):
+    """What the inventory records of a regular file; ctime is last."""
+    return [info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+DIGEST = "sha256"  # of file content, recorded by the clone backend beside the inventory
+
+
+def _content(path):
+    """A regular file's inventory fields and content digest, the fields unchanged across the read."""
+    for _ in range(3):
+        with open(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+            before = _fields(os.fstat(stream.fileno()))
+            digest = hashlib.file_digest(stream, DIGEST).hexdigest()
+            if _fields(os.fstat(stream.fileno())) == before:
+                return before, digest
+    raise Unavailable(f"snapshot file keeps changing while it is read: {path}")
+
+
+def _digests(build, files, names):
+    """{name: content digest} for ``names``; ``files`` gets the fields each content was read under.
+
+    Only a ctime may differ from what ``files`` holds; any other difference is refused."""
+    result = {}
+    for name in names:
+        fields, result[name] = _content(build / name)
+        if fields[:5] != files[name][:5]:
+            raise Unavailable(f"snapshot file changed while it was read: {name}")
+        files[name] = fields
+    return result
+
+
+def entry_intact(entry, ready):
+    """Whether ``entry``'s build is the one its ready record ``ready`` describes.
+
+    Everywhere: the inventories are equal. The clone backend (macOS) has one more way, because
+    there something outside the worker was observed updating the ctime, and only the ctime, of
+    most files of an entry minutes after publication. An entry it published also records each
+    file's content digest. When the same files are present and each differs from its record in
+    ctime at most, the content of every file whose ctime moved is read and compared with its
+    digest. If all match, the entry is intact, and the record is rewritten with the new ctimes,
+    so a touch costs one read of the touched files and not one per round. A file whose inode,
+    mode, link count, size or mtime differs, a missing or additional file, a record without
+    digests and content that differs are refused as before. Raises Unavailable or OSError like
+    ``inventory``."""
+    build = entry / "build"
+    current, recorded = inventory(build), ready["inventory"]
+    if current == recorded:
+        return True
+    digests = ready.get("digests")
+    if backend() != "clone" or ready.get("digest") != DIGEST or not isinstance(digests, dict):
+        return False
+    if not isinstance(recorded, dict) or current.keys() != recorded.keys() or current.keys() != digests.keys():
+        return False
+    touched = [name for name, fields in current.items() if fields != recorded[name]]
+    if any(
+        not isinstance(recorded[name], list) or len(recorded[name]) != 6 or current[name][:5] != recorded[name][:5]
+        for name in touched
+    ):
+        return False
+    for name, digest in _digests(build, current, touched).items():
+        if digest != digests[name]:
+            raise Unavailable(f"content of {name} differs from its published digest")
+    try:
+        atomic_json(entry / "ready.json", {**ready, "inventory": current, "content_verified_at": time.time()})
+    except OSError as error:  # the next reuse reads the touched files again
+        from .config import log
+
+        log(f"shared Mathlib: verified ctimes of {entry.name} not recorded: {error}")
+    return True
 
 
 def ready_entry(entry, key, spec):
@@ -1531,7 +1597,7 @@ def ready_entry(entry, key, spec):
             and (entry / "build").is_dir()
             and not (entry / "build").is_symlink()
             and all((entry / "build" / name).is_dir() for name in spec.get("closure", {}))
-            and inventory(entry / "build") == ready["inventory"]
+            and entry_intact(entry, ready)
         )
     except (OSError, Unavailable) as error:
         raise IntegrityFailure(
@@ -1779,9 +1845,38 @@ def _clone_extract(fetch, project, builds, closure, env, output):
             builds.mkdir()
             for name in closure:
                 os.replace(project / ".lake/packages" / name / ".lake/build", builds / name)
+            _unalias(builds)
         return rc
     finally:
         remove_tree(project)  # the cloned `.git` directories are read-only
+
+
+def _unalias(tree):
+    """Give every regular file under ``tree`` that has another name its own inode, as a clone.
+
+    Lake's artifact cache hard-links a new build output into ``LAKE_CACHE_DIR`` and restores a
+    cached one by hard link (``Lake/Build/Common.lean``). Under the overlay backend the staging
+    build is a bind mount, and no such link has been seen there; here nothing separates the
+    staging tree from the cache, the link succeeds, and a published file would share its inode
+    with a file outside the pool, through which it could be changed. A clone shares the blocks but
+    not the inode, copies no bytes and leaves the cache's own file alone. ``inventory`` still
+    refuses any alias that remains."""
+    for here, _, files in os.walk(tree):
+        for name in files:
+            path = os.path.join(here, name)
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink == 1:
+                continue
+            temporary = os.path.join(here, f".{name}.tauceti-{uuid.uuid4().hex}")
+            try:
+                clone_file(path, temporary)
+                os.chmod(temporary, stat.S_IMODE(info.st_mode))
+                os.utime(temporary, ns=(info.st_atime_ns, info.st_mtime_ns))
+                os.replace(temporary, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(temporary)
+                raise
 
 
 def publish(P, key, spec, graph, closure, env, logdir, fetch):
@@ -1861,10 +1956,11 @@ def publish(P, key, spec, graph, closure, env, logdir, fetch):
             _freeze(ready / "build")
         files = inventory(ready / "build")
         durable_tree(ready / "build")
-        atomic_json(
-            ready / "ready.json",
-            dict(key=key, spec=spec, files_verified=count, inventory=files, published_at=time.time()),
-        )
+        record = dict(key=key, spec=spec, files_verified=count, inventory=files, published_at=time.time())
+        if clone:
+            # macOS was seen updating ctimes in a published entry: see `entry_intact`.
+            record.update(digest=DIGEST, digests=_digests(ready / "build", files, list(files)))
+        atomic_json(ready / "ready.json", record)
         collect(pool, protect=(key,), held=(key,))
         usage = shutil.disk_usage(P)
         if usage.free < disk_reserve(usage):

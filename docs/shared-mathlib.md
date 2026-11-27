@@ -70,7 +70,8 @@ fills the staging build of the whole closure and nothing else; Mathlib's `.olean
 `.ilean` outputs are verified before the tree is synced and renamed into `entries/`. It never
 publishes an agent's build directory. A per-key publisher lock serializes builders separately
 from reader leases. `ready.json` records each regular file's inode, mode, link count, size,
-mtime and ctime; every reuse checks that inventory. Links, special files and hardlink aliases
+mtime and ctime; every reuse checks that inventory (on macOS a content digest backs it:
+see [below](#macos-views-made-of-apfs-clones)). Links, special files and hardlink aliases
 are rejected. A damaged published lower is preserved for evidence and writes
 `safety-stop.json`, which blocks every later round until an operator investigates, removes
 the stop file and restores the policy.
@@ -115,7 +116,38 @@ Cloning never falls back to copying bytes. Where `clonefile` fails (a filesystem
 APFS, or the pool and the checkout on different volumes) the round does not start, and the
 reason says so. Publication has no bind mounts either: the staging workspace's packages are
 clones of the shared source, `lake exe cache get` fills their own build directories, and
-those are moved into the staging build, verified and published as on Linux.
+those are moved into the staging build, verified and published as on Linux. One step is
+added before that: Lake's artifact cache hard-links outputs it builds (Mathlib's `cache`
+executable, for one) into `LAKE_CACHE_DIR`, and restores cached outputs by hard link. With
+the staging tree and the Lake cache on one volume those links succeed, so every staged file
+with more than one name is replaced by a clone of itself, which has its own inode and
+shares the blocks. The inventory's refusal of hardlink aliases is unchanged and still
+applies to the result.
+
+**Integrity of an entry.** On one Mac (macOS 26.5.1, APFS) something outside the worker
+updated the ctime, and only the ctime, of most files of an entry a few minutes after each
+publication; the cause is not known. The inventory comparison alone would then stop
+sharing on every such host. So on macOS `ready.json` also records the SHA-256 of every
+file's content (`digest`, `digests`), taken at publication. A reuse first compares the
+inventory as everywhere. If that differs, and the same files are present, and each differs
+from its record in ctime at most, the content of every file whose ctime moved is read and
+compared with its digest. If all match, the entry is accepted and `ready.json` is rewritten
+with the new ctimes (and `content_verified_at`), so the reading is paid once per touch and
+not once per round. Any other difference (inode, mode, link count, size, mtime, a missing
+or additional file), content that differs, and an entry published without digests are an
+integrity failure and a safety stop, as on Linux. Linux records carry no digests and Linux
+never takes this path.
+
+Cost, for one Mathlib build (137,345 files, 7.3 GB), measured on a Linux x86-64 host with
+SHA extensions: about 6 s to hash everything from the page cache, 24 to 72 s from a cold
+cache on a busy disk; `ready.json` grows from 25 MB to 45 MB. Not yet measured on a Mac.
+Publication pays it once more than before, and a reuse only after a touch.
+
+What this does and does not detect: any write to a published file moves its ctime, which
+the file's owner cannot set, so a changed file is always read and compared, including one
+whose size and mtime were restored. As on Linux, it does not detect damage that leaves a
+file's status untouched (failing storage), and it does not defend against the host's owner,
+who can rewrite `ready.json` itself.
 
 What is weaker than on Linux:
 
@@ -132,7 +164,9 @@ What is weaker than on Linux:
   receipts' upper file counts and bytes are the regular files a round created or rewrote in
   its clones (changed after `clone.json` was written). The per-round private-bytes cap
   (docs/workers.md) sees the clones as ordinary private files at their full size; they are
-  part of the baseline taken before the agent starts.
+  part of the baseline taken before the agent starts. If macOS updates the ctimes of a
+  round's clones as it was seen to do in the pool, those receipts overstate what the round
+  wrote; nothing but reporting depends on them.
 
 Each round starts from a fresh generation; the previous one is deleted once no namespace
 holds its lease. Running readers hold shared leases on the source and on the build; the

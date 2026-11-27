@@ -330,7 +330,7 @@ def validate_shared_views(env, *, enforce: bool) -> dict:
             ready = read_json(entry / "ready.json")
             if ready.get("key") != key or not ready.get("inventory"):
                 problem = "ready.json does not describe this entry"
-            elif shared_mathlib.inventory(entry / "build") != ready["inventory"]:
+            elif not shared_mathlib.entry_intact(entry, ready):
                 problem = "files differ from the published inventory"
     except (OSError, shared_mathlib.Unavailable) as error:
         problem = str(error)
