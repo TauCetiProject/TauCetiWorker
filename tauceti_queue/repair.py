@@ -1122,6 +1122,35 @@ def _skipped_summary(attempts: list[dict], base: str) -> list[str]:
     return reasons
 
 
+def _warm_fetches(
+    worktree: Path,
+    warm: tuple[tuple[str, str], ...],
+    env: dict,
+    fetch_env: dict,
+    logdir: Path,
+    *,
+    repository: str,
+    lake: tuple[str, ...],
+) -> list[dict]:
+    """Every ``(service, revision)`` of ``warm``, without repeats, each restoring its outputs when it has a mapping."""
+    attempts: list[dict] = []
+    for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
+        fetch = _fetch_mapping(
+            worktree,
+            revision,
+            fetch_env,
+            logdir,
+            repository=repository,
+            lake=lake,
+            mappings_only=False,
+            service=service,
+        )
+        fetch["distance"] = None
+        attempts.append(fetch)
+        _note_seed(env, fetch, worktree)
+    return attempts
+
+
 def prepare_artifacts(
     worktree: Path,
     base: str,
@@ -1169,8 +1198,12 @@ def prepare_artifacts(
     the agent edits, and rebase tasks build the resulting chain after replay.
 
     ``fetch=False`` is a batch tree a previous task built with the same toolchain and dependencies
-    (``repair_cleanup.adopt``): nothing is fetched, the tree's own ``.lake`` is the warm state and
-    Lake compiles what changed (``warm_tree``).
+    (``repair_cleanup.adopt``): the tree's own ``.lake`` is the warm state and Lake compiles what
+    changed (``warm_tree``), so there is no Mathlib cache, ``preferred`` or public fetch. The ``warm``
+    fetches still run: the tree holds only what its earlier tasks built, and a ``pre_rebase`` builds
+    nothing, so without them a ``prepare`` on the head's tip recompiles every module the head changed
+    although the head's tip is published (batch 1362, 2026-11-27). A warm miss only means Lake
+    compiles that module.
     """
     record: dict = {}
     seconds = 0.0
@@ -1179,6 +1212,12 @@ def prepare_artifacts(
 
     if not fetch:
         record.update(warm_tree=True, cache_revision=None, cache_attempts=[], warm_attempts=[], warmed_from=[])
+        if warm:
+            with downloads(env) as fetch_env:
+                warm_attempts = _warm_fetches(worktree, warm, env, fetch_env, logdir, repository=repository, lake=lake)
+            record["warm_attempts"] = warm_attempts
+            record["warmed_from"] = [fetch["revision"] for fetch in warm_attempts if fetch["mapping_found"]]
+            seconds += sum(fetch["seconds"] for fetch in warm_attempts)
     else:
         with downloads(env) as fetch_env:
             if mathlib_cache:
@@ -1194,22 +1233,8 @@ def prepare_artifacts(
                 seconds += deps["seconds"]
                 if deps["rc"] != 0:
                     reasons.append(f"lake exe cache get exited {deps['rc']}")
-            warm_attempts: list[dict] = []
-            for service, revision in dict.fromkeys((service, revision) for service, revision in warm if revision):
-                fetch = _fetch_mapping(
-                    worktree,
-                    revision,
-                    fetch_env,
-                    logdir,
-                    repository=repository,
-                    lake=lake,
-                    mappings_only=False,
-                    service=service,
-                )
-                fetch["distance"] = None
-                warm_attempts.append(fetch)
-                seconds += fetch["seconds"]
-                _note_seed(env, fetch, worktree)
+            warm_attempts = _warm_fetches(worktree, warm, env, fetch_env, logdir, repository=repository, lake=lake)
+            seconds += sum(fetch["seconds"] for fetch in warm_attempts)
             warmed = [fetch for fetch in warm_attempts if fetch["mapping_found"]]
             record["warm_attempts"] = warm_attempts
             record["warmed_from"] = [fetch["revision"] for fetch in warmed]

@@ -3375,7 +3375,7 @@ def _run_task(
             )
             outcome["sources"]["worktree_reused"] = checkout_worktree(cfg.clone, start_tip, worktree)
             # The batch's tree from an earlier task on this worker: its `.lake` is the warm state, so
-            # nothing is fetched and Lake compiles only what changed since.
+            # only the warm revisions' repair outputs are fetched and Lake compiles what changed since.
             warm = warm_tree(worktree, task, parked_at, start_tip)
             outcome["sources"]["batch_tree"] = "warm" if warm else "adopted" if parked_at else "new"
             if parked_at is not None or outcome["sources"]["worktree_reused"]:
