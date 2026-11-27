@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from queue_controller import PROJECT, ControllerCase
 
 from tauceti_queue import server
-from tauceti_queue.statistics import snapshot
+from tauceti_queue.statistics import landings, snapshot
 
 
 class Statistics(ControllerCase):
@@ -105,6 +105,85 @@ class Statistics(ControllerCase):
         handler.server.source_authority = object()
         with self.assertRaises(ValueError):
             handler._statistics()
+
+
+class Landings(ControllerCase):
+    """Per-PR landing and first-approval times, for the opening-to-land breakdown."""
+
+    land = Statistics.land
+
+    def feed(self, days=1):
+        return landings(self.controller.store.path, PROJECT, days=days, now=self.clock())
+
+    def test_a_landed_pr_reports_its_first_approval_and_landing(self):
+        approved = self.clock()
+        self.land()
+        d = self.feed()
+        json.dumps(d)
+        self.assertEqual(d["fields"], ["forge", "number", "first_approved_at", "landed_at"])
+        [(forge, number, first, landed)] = d["landings"]
+        self.assertEqual((forge, number), ("github", 101))
+        self.assertAlmostEqual(first, approved, places=2)
+        row = self.controller.store.row("inputs", {"number": 101})
+        self.assertAlmostEqual(landed, row["landed_at"], places=2)
+        self.assertLessEqual(first, landed)
+
+    def test_an_earlier_admission_of_another_head_is_the_first_approval(self):
+        self.land()
+        row = self.controller.store.row("inputs", {"number": 101})
+        earlier = row["approved_at"] - 500
+        self.controller.store.insert(
+            "inputs", repository=PROJECT, number=101, head_sha="0" * 40, state="cancelled",
+            approved_at=earlier, reason="superseded-by-new-approval")
+        [(_, _, first, _)] = self.feed()["landings"]
+        self.assertAlmostEqual(first, earlier, places=2)
+
+    def test_window_and_receipts_bound_the_feed(self):
+        self.land()
+        self.clock.advance(86400 + 1)
+        self.assertEqual(self.feed(1)["landings"], [])
+        self.assertEqual(len(self.feed(2)["landings"]), 1)
+        self.controller.store.update("inputs", {"number": 101}, landed_at=None)
+        self.assertEqual(self.feed(2)["landings"], [])
+
+    def test_a_forgejo_input_is_named_by_its_forge(self):
+        self.land()
+        identity = json.dumps({"forge": {"kind": "forgejo", "url": "https://git.example"}, "id": 1, "name": PROJECT})
+        self.controller.store.update("inputs", {"number": 101}, source_identity=identity)
+        self.assertEqual(self.feed()["landings"][0][0], "forgejo")
+
+    def test_days_are_bounded(self):
+        for days in (0, 36, "7"):
+            with self.assertRaises(ValueError):
+                self.feed(days)
+
+    def test_landings_route_answers_over_http(self):
+        import http.client
+
+        from queue_server import FakeAdapter
+
+        self.land()
+        config = server.ServerConfig(
+            webhook_secret=b"test", repositories={1: PROJECT}, adapter=FakeAdapter(),
+            host="127.0.0.1", port=0, clock=self.clock,
+        )
+        srv = server.create_server(self.controller, config)
+        server.serve_in_thread(srv)
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            connection.request("GET", "/statistics/landings?days=2")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            body = json.loads(response.read())
+            self.assertEqual((body["days"], body["landings"][0][1]), (2, 101))
+            connection.request("GET", "/statistics/landings?days=x")
+            response = connection.getresponse()
+            self.assertGreaterEqual(response.status, 400)
+            response.read()
+            connection.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

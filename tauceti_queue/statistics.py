@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
 
 SCHEMA = "tauceti-queue.statistics/v1"
+LANDINGS_SCHEMA = "tauceti-queue.landings/v1"
+LANDINGS_MAX_DAYS = 35
 WINDOWS = (("1h", 3600), ("3h", 10800), ("24h", 86400), ("7d", 604800))
 
 
@@ -106,4 +109,63 @@ def snapshot(database, repository, branch, *, now=None):
             prs=len({m["number"] for m in members if m["batch_id"] == last["id"] and m["state"] == "landed"}),
         ),
         duration_definition="CI workflow run duration, including setup, reporting and publication; not build-only runtime",
+    )
+
+
+def _forge(identity):
+    """`github` for a primary-source input (no identity), else the identity's forge kind."""
+    if not identity:
+        return "github"
+    kind = ((json.loads(identity) or {}).get("forge") or {}).get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise ValueError("input source identity names no forge")
+    return kind
+
+
+def landings(database, repository, *, days, now=None):
+    """Each pull request landed in the last `days` days, with when the queue first approved it.
+
+    Approval is the queue admitting a head of the pull request after an all-green review, and a
+    pull request admitted more than once (a new head, a withdrawal) keeps its first admission, so
+    opening-to-approval plus approval-to-land is its whole opening-to-land time. Landing uses the
+    same positive evidence as `snapshot`: the input's landing receipt, the first if there are two.
+    Opening times are the forges' and are not held here.
+    """
+    if type(days) is not int or not 1 <= days <= LANDINGS_MAX_DAYS:
+        raise ValueError(f"days must be an integer from 1 to {LANDINGS_MAX_DAYS}")
+    now = time.time() if now is None else now
+    lower = now - days * 86400
+    with closing(sqlite3.connect(Path(database).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as c, c:
+        c.execute("PRAGMA query_only=ON")
+        c.execute("BEGIN")
+        if c.execute("SELECT 1 FROM settings WHERE key='source-ci:binding'").fetchone():
+            raise ValueError("qualified source statistics need an explicit public policy")
+        rows = c.execute(
+            "SELECT i.number, i.source_identity, min(i.landed_at), f.first FROM inputs i "
+            "JOIN (SELECT number, source_identity, min(approved_at) AS first FROM inputs "
+            "      WHERE repository=? GROUP BY number, source_identity) f "
+            "  ON f.number=i.number AND f.source_identity=i.source_identity "
+            "WHERE i.repository=? AND i.state='landed' AND i.landed_at IS NOT NULL "
+            "  AND i.landed_at > ? AND i.landed_at <= ? "
+            "GROUP BY i.number, i.source_identity",
+            (repository, repository, lower, now),
+        ).fetchall()
+    entries = sorted(
+        ([_forge(identity), number, round(first, 3), round(landed, 3)] for number, identity, landed, first in rows),
+        key=lambda entry: (entry[3], entry[0], entry[1]),
+    )
+    return dict(
+        schema=LANDINGS_SCHEMA,
+        repository=repository,
+        observed_at=now,
+        coverage="controller_ledger",
+        since=lower,
+        days=days,
+        fields=["forge", "number", "first_approved_at", "landed_at"],
+        definition=(
+            "pull requests whose queue input recorded a landing in (since, observed_at]; "
+            "first_approved_at is the earliest queue admission of any head of the pull request, "
+            "after an all-green review; times are unix seconds"
+        ),
+        landings=entries,
     )

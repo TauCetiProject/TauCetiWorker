@@ -153,6 +153,15 @@ are triggered. The retired Bors `/repositories/1/statistics` snapshot is histori
 and must not be presented as current queue history. Native source statistics require
 an explicit qualified public scope and are not exposed by this endpoint.
 
+`GET /statistics/landings?days=N` (N from 1 to 35, default 14) lists each pull
+request whose input recorded a landing in the last N days, as
+`[forge, number, first_approved_at, landed_at]` (`tauceti-queue.landings/v1`).
+`first_approved_at` is the earliest queue admission of any head of that pull
+request, after an all-green review, so opening-to-approval plus approval-to-land
+is its whole opening-to-land time. The statistics generator in TauCetiTools joins
+it with the forges' opening times for the health page's time-to-merge chart. It
+reads the same ledger snapshot rules as `/statistics` and makes no provider calls.
+
 Live repair activity can be sampled independently of worker checkpoints with
 `python -m tauceti_queue.task_activity --root ROOT --follow` (the provided user
 unit observes all three standard roots). The observer reads only known local

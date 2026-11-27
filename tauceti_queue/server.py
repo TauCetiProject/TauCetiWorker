@@ -590,6 +590,8 @@ class Handler(BaseHTTPRequestHandler):
             self._call(self._status_summary)
         elif path == "/statistics":
             self._call(self._statistics)
+        elif path == "/statistics/landings":
+            self._call(lambda: self._landings(query))
         elif path == "/healthz":
             self._call(self._healthz)
         elif path == "/settings":
@@ -772,6 +774,20 @@ class Handler(BaseHTTPRequestHandler):
         if repository not in self.server.config.repositories.values():
             raise ValueError("repository statistics are not public")
         return snapshot(controller.store.path, repository, controller.canonical_branch, now=self.server.config.clock())
+
+    def _landings(self, query: dict) -> dict:
+        from .statistics import landings
+
+        controller = self.server.controller
+        if self.server.source_authority is not None or not hasattr(controller, "store"):
+            raise ValueError("controller ledger statistics are unavailable")
+        repository = getattr(controller, "repository", None)
+        if repository not in self.server.config.repositories.values():
+            raise ValueError("repository statistics are not public")
+        raw = (query.get("days") or ["14"])[-1]
+        if not raw.isdigit():
+            raise ValueError("days must be an integer")
+        return landings(controller.store.path, repository, days=int(raw), now=self.server.config.clock())
 
     def _feed_reply(self, which: str, repo: str, query: dict) -> None:
         if self.server.source_authority is not None:
