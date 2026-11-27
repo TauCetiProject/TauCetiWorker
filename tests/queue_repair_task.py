@@ -4046,6 +4046,50 @@ class PublishOutputs(Fixture):
         self.assertIn(repair.CACHE_SENTENCE, prompt)
         self.assertIn("Do not run a whole-library `lake build`", prompt, "a pre-rebase resolves conflicts only")
 
+    def test_a_warm_batch_tree_still_fetches_the_published_warm_revs(self):
+        """Production batch 1362's prepare, task 1678: it adopted the tree its pre-rebase had parked,
+        which never built the head's tip, so skipping every fetch recompiled the modules the head
+        changed although the head's tip was published. A warm tree asks the repair namespace for its
+        warm revisions, and nothing else."""
+        cfg = self.config(publish=self.settings())
+        self.service.tasks = {1: self.content.task()}
+        first = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(first["status"], "adopted", first)
+        self.published()
+        self.assertTrue((cfg.root / "worktrees" / "batch-7").is_dir(), "the publisher parked the tree")
+        fetched = len(self.lake_calls())
+        head_tip = "8" * 40
+        raw = self.content.task(task_id=2)
+        raw["warm_revs"] = [head_tip, self.content.base]
+        self.service.tasks = {2: raw}
+        os.environ["STUB_LAKE_REPAIR_REVS"] = head_tip
+        lines: list[str] = []
+        original = repair_task.log
+        repair_task.log = lines.append
+        self.addCleanup(setattr, repair_task, "log", original)
+        second = repair_task.claim_and_run(cfg, self.client(cfg))
+        self.assertEqual(second["status"], "adopted", second)
+        self.assertEqual(second["sources"]["batch_tree"], "warm")
+        artifacts = second["artifacts"]
+        self.assertTrue(artifacts["warm_tree"])
+        self.assertTrue(artifacts["available"])
+        self.assertEqual(artifacts["warmed_from"], [head_tip])
+        self.assertEqual(artifacts["cache_attempts"], [], "no public walk on a warm tree")
+        later = self.lake_calls()[fetched:]
+        fetches = [c for c in later if c.startswith("cache get")]
+        self.assertTrue(fetches and all("--service tauceti-repair " in c for c in fetches), fetches)
+        self.assertEqual(
+            [c.split("--rev=")[1] for c in fetches],
+            [head_tip, self.content.base, self.content.tip],
+            "the warm revisions, then the task's own revisions, each once",
+        )
+        self.assertFalse([c for c in later if c.startswith("exe cache get")], "no Mathlib cache on a warm tree")
+        self.assertTrue(any(c.startswith("build --iofail") for c in later))
+        self.assertTrue(
+            any(line.startswith(f"task 2: repair outputs warmed the tree from {head_tip[:12]}") for line in lines),
+            lines,
+        )
+
     def test_warm_revs_alone_make_the_artifacts_available(self):
         raw = self.content.rebase_task()
         raw["kind"] = "pre_rebase"

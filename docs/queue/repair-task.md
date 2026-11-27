@@ -380,8 +380,9 @@ has a time budget holds because the service re-exposes the task.
    its `.lake` outputs stay warm). When this worker has a parked tree for the task's batch, it is
    moved to `task-<id>` first (`repair_cleanup.adopt`, [One tree per batch](#one-tree-per-batch)).
    Checkpoint `sources_ready`.
-3. **Artifacts.** On a warm batch tree (below) nothing is fetched: the tree's own `.lake` is the
-   warm state, the record carries `warm_tree`, and any build here or later compiles only what changed.
+3. **Artifacts.** On a warm batch tree (below) the tree's own `.lake` is the warm state, the record
+   carries `warm_tree`, only the warm revisions are fetched (below), and any build here or later
+   compiles only what changed.
    Otherwise `repair.prepare_artifacts`, exactly the experiment's recipe: `lake exe cache get`
    for Mathlib (or a shared extracted `.lake/packages` through `--seed-packages`, the experiment's
    stand-in for the shared Mathlib view), `lake cache get --service tauceti-public --repo <repository>
@@ -724,8 +725,12 @@ the checkout then re-points the tree to the task's starting tip as for any reuse
 
 The adopted tree is warm when `lean-toolchain` and `lake-manifest.json` are unchanged between the
 commit it was parked at and every revision the task builds (its starting tip, and `onto` for a
-rebase). A warm tree fetches nothing: no Mathlib cache, no repair or public outputs, no ancestor
-walk. A miss means Lake compiles that module; it never releases the task. A tree whose toolchain or
+rebase). A warm tree fetches only the repair namespace's outputs for its warm revisions
+(`repair_publish.warm`): no Mathlib cache, no public outputs, no ancestor walk. The tree holds only
+what its earlier tasks built, and a `pre_rebase` builds nothing, so without those fetches the
+batch's `prepare` on the head's tip recompiled every module the head had changed although the head's
+tip was published (batch 1362's task 1678, 2026-11-27: about a quarter of its 20,000 compiled modules).
+A miss means Lake compiles that module; it never releases the task. A tree whose toolchain or
 dependencies changed, or a batch's first task on this worker, prepares artifacts as described above.
 `outcome.sources.batch_tree` is `warm`, `adopted` (re-prepared) or `new`.
 
