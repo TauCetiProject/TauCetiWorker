@@ -65,7 +65,7 @@ RERUN = "rerun"
 #   error: no such file or directory (error code: 2)
 #     file: /path/to/worktree/TauCeti/B.lean
 # Neither stops the build, which ends with only the summary's failed targets naming them, so they are
-# recorded at line 1, column 0 of the file to keep them in the error list.
+# recorded at line 1, column 0 of the file with ``unlocated`` set, so two of them in one file stay apart.
 BAD_IMPORT = re.compile(r"^error: (" + PATH + r"): (bad import '[^']{1,512}')$")
 RUNNING = re.compile(r"^✖\s*\[\d+/\d+\] Running (" + MODULE + r")(?: \([^)]*\))?$")
 NO_SUCH_FILE = "error: no such file or directory (error code: 2)"
@@ -188,7 +188,7 @@ class ErrorParser:
         if ("unlocated", path, message) in self._seen:
             return closed
         self._seen.add(("unlocated", path, message))
-        error = {"module": module_of(path), "file": path, "line": 1, "column": 0, "message": message}
+        error = {"module": module_of(path), "file": path, "line": 1, "column": 0, "message": message, "unlocated": True}
         self.errors.append(error)
         return [*closed, error]
 

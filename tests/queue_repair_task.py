@@ -5606,6 +5606,16 @@ class ErrorParsing(unittest.TestCase):
         ]
         self.assertEqual([(e["module"], e["file"], e["line"], e["column"], e["message"]) for e in found], expected)
         self.assertEqual(found, parser.errors)
+        # Two bad imports in one file, and a located error at its line 1, column 0, all stay apart.
+        two = ["error: TauCeti/A.lean: bad import 'TauCeti.B'", "error: TauCeti/A.lean: bad import 'TauCeti.C'"]
+        errors = repair_stream.parse_errors([*two, "error: TauCeti/A.lean:1:0: unexpected token"])
+        findings = {"compiler_errors": [], "failed_modules": [], "duplicate_declarations": [], "import_collisions": []}
+        findings["lint"] = {"findings": []}
+        merged = repair_parallel.merge_errors(findings, errors)
+        self.assertEqual(
+            [e["message"] for e in merged["compiler_errors"]],
+            ["bad import 'TauCeti.B'", "bad import 'TauCeti.C'", "unexpected token"],
+        )
         # Without a root the missing file is the `Running` module's path.
         self.assertEqual(
             [(e["file"], e["message"]) for e in repair_stream.parse_errors(lines)],

@@ -296,13 +296,18 @@ def merge_errors(findings: dict, errors: list[dict]) -> dict:
     located = {(e["path"], int(e.get("line") or 0), int(e.get("column") or 0)) for e in merged["compiler_errors"]}
     for error in errors:
         path = str(error["file"])
-        key = (path, int(error.get("line") or 0), int(error.get("column") or 0))
+        line, column, message = (
+            int(error.get("line") or 0),
+            int(error.get("column") or 0),
+            str(error.get("message") or ""),
+        )
+        # Lake's unlocated errors (``repair_stream``'s bad imports and missing sources) share line 1,
+        # column 0, so their message tells them apart, from each other and from a located error there.
+        key = (path, line, column, message) if error.get("unlocated") else (path, line, column)
         if key in located:
             continue
         located.add(key)
-        merged["compiler_errors"].append(
-            {"path": path, "line": key[1], "column": key[2], "message": str(error.get("message") or "")}
-        )
+        merged["compiler_errors"].append({"path": path, "line": line, "column": column, "message": message})
         if path not in merged["failed_modules"]:
             merged["failed_modules"].append(path)
     return merged
