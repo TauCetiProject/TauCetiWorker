@@ -8,11 +8,14 @@
 # user units pointing at the release, reloads, restarts the service and then verifies through
 # /status that the running revision is the release's and that the process runs from it. Nothing is
 # drained; the restart is the only interruption, and the service finishes its current
-# reconciliation step before it exits (SIGTERM handling in tauceti_queue/__main__.py). The repair
-# workers and monitoring keep running from their own release directories. Unused release
-# directories are then removed (services/queue/release.sh).
+# reconciliation step before it exits (SIGTERM handling in tauceti_queue/__main__.py). Before the
+# restart it waits for a safe point: no promotion, landing, CI dispatch or controller replay in
+# flight (services/queue/safepoint.py). That wait times a restart of seconds; it pauses no
+# admissions. The repair workers and monitoring keep running from their own release directories.
+# Unused release directories are then removed (services/queue/release.sh).
 #
-# Usage: services/queue/install.sh [--revision REF | --release DIR] [--checkout DIR] [--no-restart] [--wait SECONDS]
+# Usage: services/queue/install.sh [--revision REF | --release DIR] [--checkout DIR]
+#                                  [--no-restart | --no-safepoint | --safepoint-timeout SECONDS] [--wait SECONDS]
 #
 #   --revision REF   commit, branch or tag to install (default: origin/main). A revision that does
 #                    not descend from the one the service runs now fails rather than being forced.
@@ -20,6 +23,11 @@
 #   --checkout DIR   the shared clone releases are made from (default: ~/TauCetiQueue).
 #   --no-restart     install files and units but leave the running service alone (the next
 #                    restart picks up the new release; verification then reports the old one).
+#   --no-safepoint   restart at once, without waiting for a safe point (for a controller that is
+#                    wedged in one of the busy states; the restart is still crash-safe).
+#   --safepoint-timeout SECONDS
+#                    how long to wait for a safe point (default: 1800; 0 waits as long as it takes).
+#                    When it passes, the installer exits 3 without installing units or restarting.
 #   --wait SECONDS   how long to wait for /status after the restart (default: 90).
 #
 # WARNING: the controller runs origin/main HEAD, each install in its own ~/TauCetiQueue-releases
@@ -29,7 +37,8 @@
 # whoever does it must rerun this script with no arguments as soon as their change lands on main.
 #
 # Exit status: 0 when the service answers with the installed revision; 1 on a setup failure;
-# 2 when the service answers with a different revision (or not at all).
+# 2 when the service answers with a different revision (or not at all); 3 when no safe point came
+# within --safepoint-timeout (nothing was restarted).
 set -euo pipefail
 
 REPO_URL="https://github.com/TauCetiProject/TauCetiWorker.git"
@@ -37,6 +46,8 @@ CHECKOUT="${TAUCETI_QUEUE_CHECKOUT:-$HOME/TauCetiQueue}"
 REVISION="origin/main"
 RELEASE_ARG=""
 RESTART=1
+SAFEPOINT=1
+SAFEPOINT_TIMEOUT=1800
 WAIT=90
 UNIT_DIR="$HOME/.config/systemd/user"
 CONFIG_DIR="$HOME/.config/tauceti-queue"
@@ -48,11 +59,15 @@ while [ $# -gt 0 ]; do
     --release) RELEASE_ARG="$2"; shift 2 ;;
     --checkout) CHECKOUT="$2"; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
+    --no-safepoint) SAFEPOINT=0; shift ;;
+    --safepoint-timeout) SAFEPOINT_TIMEOUT="$2"; shift 2 ;;
     --wait) WAIT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
     *) echo "install.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
+
+[[ "$SAFEPOINT_TIMEOUT" =~ ^(0|[1-9][0-9]*)$ ]] || { echo "install.sh: --safepoint-timeout takes a number of seconds" >&2; exit 1; }
 
 RELEASE_SCRIPT="install.sh"
 # shellcheck source=services/queue/release.sh
@@ -121,6 +136,23 @@ fi
 # strand its lock; tauceti-queue-clone-maintenance.timer maintains the clone instead.
 if git -C "$content_clone" rev-parse --git-dir >/dev/null 2>&1; then
   git -C "$content_clone" config maintenance.auto false
+fi
+
+# --- safe point -----------------------------------------------------------------------------------
+# Restart only when nothing a restart would cut off is in flight (services/queue/safepoint.py; the
+# conditions are in its header and in docs/queue/operations.md, "Install and update"). Waiting here,
+# after the build and before the units change, keeps the gap between the check and the restart to
+# seconds, and a timeout leaves the installed units and the running service as they were.
+if [ "$RESTART" = 1 ] && [ "$SAFEPOINT" = 1 ] && systemctl --user is-active --quiet tauceti-queue.service; then
+  database="$(uv run tauceti-queue check-config --print database)"
+  [ -n "$database" ] || die "check-config printed no database path"
+  if ! release_wait_safepoint "$database" "$SAFEPOINT_TIMEOUT"; then
+    log "no safe point within ${SAFEPOINT_TIMEOUT}s; tauceti-queue.service was not restarted and its units were not changed"
+    log "rerun later, or pass --no-safepoint to restart now (services/queue/release.sh safepoint shows what is in flight)"
+    exit 3
+  fi
+elif [ "$RESTART" = 1 ] && [ "$SAFEPOINT" = 0 ]; then
+  log "--no-safepoint: restarting without waiting for a safe point"
 fi
 
 # --- units ----------------------------------------------------------------------------------------
