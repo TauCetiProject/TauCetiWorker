@@ -592,6 +592,8 @@ class Handler(BaseHTTPRequestHandler):
             self._call(self._statistics)
         elif path == "/statistics/landings":
             self._call(lambda: self._landings(query))
+        elif path == "/claims/forgejo-landers":
+            self._forgejo_landers()
         elif path == "/healthz":
             self._call(self._healthz)
         elif path == "/settings":
@@ -788,6 +790,26 @@ class Handler(BaseHTTPRequestHandler):
         if not raw.isdigit():
             raise ValueError("days must be an integer")
         return landings(controller.store.path, repository, days=int(raw), now=self.server.config.clock())
+
+    def _forgejo_landers(self) -> None:
+        """The GitHub accounts of the Forgejo authors the queue landed, as `tauceti_queue.claims_access`
+        last wrote them next to the ledger, for TauCeti's `claims-access` workflow. Served as written:
+        this process holds no Forgejo admin credential and does no attribution itself. 503 until the
+        file exists and is well formed, which the workflow reads as "nothing from Forgejo this run"."""
+        from .claims_access import OUTPUT_NAME, SCHEMA
+
+        controller = self.server.controller
+        if self.server.source_authority is not None or not hasattr(controller, "store"):
+            self._error(404, "claim attribution is unavailable")
+            return
+        try:
+            document = json.loads(pathlib.Path(controller.store.path).with_name(OUTPUT_NAME).read_text())
+        except (OSError, ValueError):
+            document = None
+        if not isinstance(document, dict) or document.get("schema") != SCHEMA:
+            self._error(503, "claim attribution is not available")
+            return
+        self._json(200, document)
 
     def _feed_reply(self, which: str, repo: str, query: dict) -> None:
         if self.server.source_authority is not None:

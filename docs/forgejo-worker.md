@@ -98,16 +98,32 @@ Nobody edits that team by hand. On the queue host, `tauceti-queue-forgejo-team-s
 `python -m tauceti_queue.forgejo_team_sync` every ten minutes, which makes the team's members
 exactly the Forgejo accounts whose GitHub sign-in belongs to a direct collaborator of
 `TauCetiProject/tauceti-claims`: the people TauCeti's `claims-access` workflow admitted to
-shared claims on GitHub (anyone with a landed PR), minus anyone a maintainer removed there. It
-matches on the GitHub user ID that Forgejo records for accounts created by signing in with
-GitHub; any other Forgejo account is skipped and listed in the log. Run it with `--dry-run` to
-see what it would change.
+shared claims on GitHub (anyone with a PR landed on either forge), minus anyone a maintainer
+removed there. It matches on the GitHub user ID that Forgejo records for accounts created by
+signing in with GitHub; any other Forgejo account is skipped and listed in the log. Run it with
+`--dry-run` to see what it would change.
 
-`services/queue/install-monitoring.sh` installs the timer. It reads GitHub with
-`gh auth token --user tauceti-ai-for-science`, and Forgejo with
+The workflow reads only GitHub, so `tauceti-queue-claims-access.timer` feeds it from the queue
+host every ten minutes (`python -m tauceti_queue.claims_access`). For each Forgejo author of a
+PR the queue's ledger records as landed, it reads that PR's poster's numeric Forgejo user ID (a
+login can be renamed and reused; the ID cannot), and that account's GitHub user ID from the
+site-admin record of a GitHub sign-in, the same field the team sync matches. It writes the
+result to `~/TauCetiQueue-data/claims-forgejo-landers.json`, which the queue server publishes at
+`GET /claims/forgejo-landers` and the workflow reads, inviting each listed GitHub account like
+any other landed author. It also dispatches the workflow as the queue's App when the ledger
+shows a landed author it has not dispatched for, and otherwise hourly: GitHub starts the
+workflow's own hourly schedule only every few hours, and that schedule remains the fallback. So
+a contributor's first landing, on either forge, is followed by an invitation usually within an
+hour (a workflow run takes up to about twenty minutes), and once their worker accepts it, by the
+Forgejo team within ten minutes more.
+
+`services/queue/install-monitoring.sh` installs both timers. They read Forgejo with
 `~/.config/tauceti-queue/forgejo-team-sync-token`, a token of the dedicated site-admin account
-`tauceti-team-sync` limited to the `read:admin` and `write:organization` scopes. See its log with
-`journalctl --user -u tauceti-queue-forgejo-team-sync`.
+`tauceti-team-sync` limited to the `read:admin` and `write:organization` scopes (pull requests
+are read anonymously). The team sync reads GitHub with `gh auth token --user
+tauceti-ai-for-science`; the dispatch uses the queue App's credentials with a token limited to
+`actions: write`. See their logs with `journalctl --user -u tauceti-queue-forgejo-team-sync`
+and `journalctl --user -u tauceti-queue-claims-access`.
 
 ## Scheduling and recovery
 

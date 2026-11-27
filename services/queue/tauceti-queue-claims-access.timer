@@ -1,0 +1,13 @@
+# Every ten minutes, run tauceti-queue-claims-access.service (docs/forgejo-worker.md).
+
+[Unit]
+Description=Feed Tau Ceti claim access from the merge queue every ten minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=10min
+RandomizedDelaySec=30
+Unit=tauceti-queue-claims-access.service
+
+[Install]
+WantedBy=timers.target
