@@ -20,7 +20,6 @@ from tauceti_worker.source_identity import SourceActor
 
 from . import diff_guard, ports
 from .admission import AdmissionPolicy, digest, policy, relevant_comment
-from .eligibility import KEEP
 from .forgejo_git import ForgejoGitSource
 from .github_adapter import comment_marker
 from .task_identity import NATIVE_GIT_REFS
@@ -457,21 +456,9 @@ class ForgejoSourceAdapter(ForgejoGitSource):
         for member in frozen.request.accepted_members:
             if getattr(member, "source", None) is not None and member.source != self.repository_identity:
                 raise ports.PromotionRefused("native-only promotion cannot authorize another source's member")
-            snapshot = self.admission_snapshot(self.repository.name, member.pr)
-            if (
-                snapshot.pull.state != "open"
-                or snapshot.pull.draft
-                or snapshot.pull.head_sha != member.head
-                or snapshot.pull.base_ref != frozen.policy.base_branch
-                or set(s.lower() for s in snapshot.pull.labels) & KEEP
-            ):
-                raise ports.PromotionRefused("native member no longer matches its accepted source")
-            result, *_ = self.admission_policy.evaluate(snapshot)
-            # The caller has just verified the frozen candidate's trusted build,
-            # scope and bump results. Repaired candidates need not turn the
-            # original PR head's failed build green. Recheck source review here.
-            if not result["review_safe"] or member.head in result["recovery_heads"]:
-                raise ports.PromotionRefused("current native review policy refuses promotion")
+        # Admission freezes the contribution, not the mutable original PR: later pushes, closure,
+        # relabelling and re-review belong to follow-up work, as in the mixed path
+        # (ai-merge-queue.md, "Staging membership").
 
     def _upsert_comment(self, number, full, marker, actor):
         hidden = comment_marker(marker)
