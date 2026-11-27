@@ -113,12 +113,21 @@ def snapshot(database, repository, branch, *, now=None):
 
 
 def _forge(identity):
-    """`github` for a primary-source input (no identity), else the identity's forge kind."""
+    """`github` for a primary-source input (no identity), else the identity's forge kind.
+
+    A malformed stored identity is the ledger's fault, not the caller's, so it raises
+    RuntimeError (a server error), never ValueError (which the server answers as a bad request).
+    """
     if not identity:
         return "github"
-    kind = ((json.loads(identity) or {}).get("forge") or {}).get("kind")
+    try:
+        parsed = json.loads(identity)
+    except ValueError as error:
+        raise RuntimeError("input source identity is not JSON") from error
+    forge = parsed.get("forge") if isinstance(parsed, dict) else None
+    kind = forge.get("kind") if isinstance(forge, dict) else None
     if not isinstance(kind, str) or not kind:
-        raise ValueError("input source identity names no forge")
+        raise RuntimeError("input source identity names no forge")
     return kind
 
 
@@ -140,14 +149,17 @@ def landings(database, repository, *, days, now=None):
         c.execute("BEGIN")
         if c.execute("SELECT 1 FROM settings WHERE key='source-ci:binding'").fetchone():
             raise ValueError("qualified source statistics need an explicit public policy")
+        # The earliest receipt across the whole ledger, then the window: a pull request with a
+        # second receipt inside the window landed before it, and does not belong to it.
         rows = c.execute(
-            "SELECT i.number, i.source_identity, min(i.landed_at), f.first FROM inputs i "
+            "SELECT l.number, l.source_identity, l.landed, f.first FROM "
+            "(SELECT number, source_identity, min(landed_at) AS landed FROM inputs "
+            "  WHERE repository=? AND state='landed' AND landed_at IS NOT NULL "
+            "  GROUP BY number, source_identity) l "
             "JOIN (SELECT number, source_identity, min(approved_at) AS first FROM inputs "
-            "      WHERE repository=? GROUP BY number, source_identity) f "
-            "  ON f.number=i.number AND f.source_identity=i.source_identity "
-            "WHERE i.repository=? AND i.state='landed' AND i.landed_at IS NOT NULL "
-            "  AND i.landed_at > ? AND i.landed_at <= ? "
-            "GROUP BY i.number, i.source_identity",
+            "  WHERE repository=? GROUP BY number, source_identity) f "
+            "  ON f.number=l.number AND f.source_identity=l.source_identity "
+            "WHERE l.landed > ? AND l.landed <= ?",
             (repository, repository, lower, now),
         ).fetchall()
     entries = sorted(

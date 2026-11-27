@@ -161,6 +161,8 @@ request, after an all-green review, so opening-to-approval plus approval-to-land
 is its whole opening-to-land time. The statistics generator in TauCetiTools joins
 it with the forges' opening times for the health page's time-to-merge chart. It
 reads the same ledger snapshot rules as `/statistics` and makes no provider calls.
+Like `/status`, which already lists waiting inputs of every source with their
+numbers and approval times, it covers all of the controller's sources.
 
 Live repair activity can be sampled independently of worker checkpoints with
 `python -m tauceti_queue.task_activity --root ROOT --follow` (the provided user

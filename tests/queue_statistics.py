@@ -133,8 +133,14 @@ class Landings(ControllerCase):
         row = self.controller.store.row("inputs", {"number": 101})
         earlier = row["approved_at"] - 500
         self.controller.store.insert(
-            "inputs", repository=PROJECT, number=101, head_sha="0" * 40, state="cancelled",
-            approved_at=earlier, reason="superseded-by-new-approval")
+            "inputs",
+            repository=PROJECT,
+            number=101,
+            head_sha="0" * 40,
+            state="cancelled",
+            approved_at=earlier,
+            reason="superseded-by-new-approval",
+        )
         [(_, _, first, _)] = self.feed()["landings"]
         self.assertAlmostEqual(first, earlier, places=2)
 
@@ -152,6 +158,60 @@ class Landings(ControllerCase):
         self.controller.store.update("inputs", {"number": 101}, source_identity=identity)
         self.assertEqual(self.feed()["landings"][0][0], "forgejo")
 
+    def test_a_second_receipt_does_not_move_a_landing_into_the_window(self):
+        self.land()
+        row = self.controller.store.row("inputs", {"number": 101})
+        self.clock.advance(2 * 86400)
+        self.controller.store.insert(
+            "inputs",
+            repository=PROJECT,
+            number=101,
+            head_sha="1" * 40,
+            state="landed",
+            approved_at=self.clock() - 60,
+            landed_at=self.clock() - 30,
+        )
+        self.assertEqual(self.feed(1)["landings"], [])
+        [(_, _, _, landed)] = self.feed(3)["landings"]
+        self.assertAlmostEqual(landed, row["landed_at"], places=2)
+
+    def test_the_same_number_on_two_forges_is_two_pull_requests(self):
+        self.land()
+        row = self.controller.store.row("inputs", {"number": 101})
+        identity = json.dumps({"forge": {"kind": "forgejo", "url": "https://git.example"}, "id": 1, "name": PROJECT})
+        self.controller.store.insert(
+            "inputs",
+            repository=PROJECT,
+            number=101,
+            head_sha="2" * 40,
+            state="landed",
+            approved_at=row["approved_at"] + 5,
+            landed_at=row["landed_at"],
+            source_identity=identity,
+        )
+        self.assertEqual(sorted(e[0] for e in self.feed()["landings"]), ["forgejo", "github"])
+
+    def test_another_repository_s_inputs_are_not_listed(self):
+        self.land()
+        row = self.controller.store.row("inputs", {"number": 101})
+        self.controller.store.insert(
+            "inputs",
+            repository="Other/Repo",
+            number=7,
+            head_sha="3" * 40,
+            state="landed",
+            approved_at=row["approved_at"],
+            landed_at=row["landed_at"],
+        )
+        self.assertEqual([e[1] for e in self.feed()["landings"]], [101])
+
+    def test_a_malformed_stored_identity_is_a_server_error(self):
+        self.land()
+        for identity in ("not json", '{"forge": [1]}'):
+            self.controller.store.update("inputs", {"number": 101}, source_identity=identity)
+            with self.subTest(identity=identity), self.assertRaises(RuntimeError):
+                self.feed()
+
     def test_days_are_bounded(self):
         for days in (0, 36, "7"):
             with self.assertRaises(ValueError):
@@ -164,8 +224,12 @@ class Landings(ControllerCase):
 
         self.land()
         config = server.ServerConfig(
-            webhook_secret=b"test", repositories={1: PROJECT}, adapter=FakeAdapter(),
-            host="127.0.0.1", port=0, clock=self.clock,
+            webhook_secret=b"test",
+            repositories={1: PROJECT},
+            adapter=FakeAdapter(),
+            host="127.0.0.1",
+            port=0,
+            clock=self.clock,
         )
         srv = server.create_server(self.controller, config)
         server.serve_in_thread(srv)
@@ -178,7 +242,7 @@ class Landings(ControllerCase):
             self.assertEqual((body["days"], body["landings"][0][1]), (2, 101))
             connection.request("GET", "/statistics/landings?days=x")
             response = connection.getresponse()
-            self.assertGreaterEqual(response.status, 400)
+            self.assertEqual(response.status, 400)
             response.read()
             connection.close()
         finally:
