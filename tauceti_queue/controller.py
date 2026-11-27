@@ -7884,7 +7884,8 @@ class Controller:
     def _supersede_stale_pre_rebased_prepare(self, now: float) -> None:
         """Supersede (releasing its claims) a preparation of a pre-rebased chain that no longer
         describes its open batch: the head's tip changed (a repair round, a rebase of the head), or the
-        pre-rebase was redone, discarded or hit a conflict. A sealed batch's is superseded by `_seal`."""
+        pre-rebase was redone, discarded or hit a conflict. Once the batch becomes the head, `_make_head`
+        supersedes its preparation instead."""
         for task in self.store.rows("tasks", {"state": TASK_OPEN, "kind": TASK_PREPARE}):
             if not self._pre_rebased_prepare(task):
                 continue
@@ -7909,10 +7910,10 @@ class Controller:
 
         The chain must be a usable pre-rebase that is up to date (on the head's tip, covering the
         batch's tip) and not yet prepared, on a head `_pre_rebase_blocked` allows (its tip moves only
-        after a failed CI round), for a batch that own-base preparation applies to and that is prepared
-        at its current version (`_pre_rebase_waits_for_prepare`: a later own-base preparation would
-        rewrite the chain under it). No other background task of the batch may be open, and a
-        preparation of the same chain that was adopted, released clean or failed is not repeated."""
+        after a failed CI round), for a batch with no open own-base preparation
+        (`_pre_rebase_waits_for_prepare`: that preparation would rewrite the chain under it). No other
+        background task of the batch may be open, and a preparation of the same chain that was
+        adopted, released clean or failed is not repeated."""
         if not self.setting("prepare_pre_rebased") or not self.setting("prepare_open_batches"):
             return "prepare_pre_rebased is off"
         if self._preserved_tasks(batch):
@@ -7962,31 +7963,37 @@ class Controller:
         """Create a `prepare` task for the oldest open batch's pre-rebased chain on the head's tip.
 
         Nothing is created until `_pre_rebased_prepare_blocked` allows it. `_pre_rebase` must first
-        have replayed the batch onto the head's current tip, covering the batch's tip, and that
-        replay waits for the head to be dispatched to CI with no open task or claim of its own. A
-        worker must also have verified exactly the head's tip clean (`_head_tip_verified`: the
-        head's own task, or the preparation it sealed from; a CI pass alone does not count), and the
-        head's CI must not have passed yet (`_head_landing`). So the batch is prepared while the head's
-        CI runs, never earlier, and the head lands without waiting for it. Creating the task seals
-        the batch's membership.
+        have replayed the batch onto the head's current tip, covering the batch's tip, and that replay
+        waits for the head to be based on `main` and dispatched to CI, with no open task or claim of its
+        own (a speculative check of the head excepted, `_pre_rebase_blocked`). A worker must also have
+        verified exactly the head's tip clean (`_head_tip_verified`: the head's own task, or the
+        preparation it sealed from; a CI pass alone does not count), and the head's current CI attempt
+        must not have passed (`_head_landing`). So the batch is prepared while the head waits for its CI
+        verdict, never earlier, and the head lands without waiting for it. Other conditions there keep
+        it from competing with the batch's other background work or repeating a settled preparation.
+        Creating the task seals the batch's membership.
 
-        The worker builds the chain warm from the outputs published for the head's tip, repairs what
-        fails in place, runs the audits, submits, and publishes the outputs of the tip it submitted;
-        `_adopt_prepared_pre_rebase` records the result as the batch's pre-rebase, prepared on that
-        tip (a clean release, `_settle_pre_rebased_release`, marks it prepared unchanged). When the
-        head lands as the tip the chain was prepared on, the batch seals from the chain without a
-        replay (`_seal_from_pre_rebase`), so its CI round fetches the published outputs for its exact
-        tip.
+        The worker builds the chain warm, using the outputs published for the head's tip when there
+        are any, repairs what fails in place, runs the audits, and either submits the repaired tip,
+        which `_adopt_prepared_pre_rebase` records as the batch's pre-rebase prepared on the head's
+        tip, or releases the chain clean and unchanged (`_settle_pre_rebased_release` marks it
+        prepared). It publishes the outputs of the tip it verified. When the head lands as exactly the
+        tip the chain was prepared on and the chain still covers the batch's tip, the batch seals as
+        that tip without a replay (`_seal_from_pre_rebase`), so its CI round can reuse those outputs
+        (or adopt the run `_early_staging` sent); otherwise the chain is carried onto `main` by replay.
 
-        The task is background work (`_choose_task`): one claim per batch, at most
-        `repair_concurrency - 1` claims on open batches, started only while fewer than
-        `background_start_limit` claims are live, and ranked with `pre_rebase` ahead of later batches'
-        own-base preparations. It is superseded when the head's tip moves, CI fails that tip, or the pre-rebase
-        is redone, discarded or hits a conflict (`_supersede_stale_pre_rebased_prepare`). Sealing does
-        wait for it once it is claimed: a preparation still claimed when the head lands is preserved
-        (`_preserve_successor_tasks`), and the batch stays open until its owner releases it
-        (`_seal_blocked`). An unclaimed one is not claimed once the head's CI passes, and is superseded
-        when the batch seals."""
+        The task is background work (`_choose_task`): one claim per batch and at most
+        `repair_concurrency - 1` claims on open batches. It starts while fewer than
+        `background_start_limit` claims are live, or else takes the slot of a later batch's newest
+        own-base preparation, and it ranks with `pre_rebase` ahead of those preparations. It is
+        superseded when it stops describing the batch (`_pre_rebased_prepare_current`): the head's tip
+        moves or is no longer known-good, CI fails that tip on the source, or the pre-rebase is
+        redone, discarded or hits a conflict so that it no longer extends the task's chain. Sealing
+        does wait for it once it is claimed: a preparation still claimed when the head lands is
+        preserved (`_preserve_successor_tasks`), and the batch stays open while that claim is live
+        (`_seal_blocked`), until the owner submits or releases or the claim expires. An unclaimed one
+        is not newly claimed while the head's current CI attempt has passed (`_claimable_tasks`), and
+        `_make_head` supersedes it when the batch becomes the head."""
         self._supersede_stale_pre_rebased_prepare(now)
         if self._state("inference_hold"):
             return
@@ -8006,7 +8013,7 @@ class Controller:
             if not batch["sealed"]:
                 # Decision 174, step 3: the verification is a frozen snapshot of the batch. Sealing its
                 # membership now lets the run finish on exactly what the next head will be, and sends
-                # later arrivals to the following batch, so the head seals only what was verified.
+                # later arrivals to the following batch, so no member joins after the snapshot.
                 self.store.update("batches", {"id": batch["id"]}, sealed=1, sealed_at=now)
                 self._count("successors_sealed_for_verification")
                 self.store.journal(
