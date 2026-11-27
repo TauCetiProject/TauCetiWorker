@@ -56,10 +56,12 @@ def write(directory: Path, *, candidate: str, findings: dict) -> Path:
     script = directory / FILE
     project = str(Path(__file__).resolve().parent.parent)
     script.write_text(
-        "#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\n"
-        f"sys.path.insert(0, {project!r})\n"
-        "from tauceti_queue.repair_targeted import run\n"
-        "raise SystemExit(run(Path(__file__).resolve().parent.parent))\n"
+        repair_tools.interpreter_line()
+        + repair_tools.interpreter_guard()
+        + "import sys\nfrom pathlib import Path\n"
+        + f"sys.path.insert(0, {project!r})\n"
+        + "from tauceti_queue.repair_targeted import run\n"
+        + "raise SystemExit(run(Path(__file__).resolve().parent.parent))\n"
     )
     script.chmod(0o755)
     return script

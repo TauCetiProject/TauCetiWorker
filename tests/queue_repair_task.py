@@ -7754,12 +7754,13 @@ class BuildScript(unittest.TestCase):
         )
         lake.chmod(0o755)
 
-    def build(self, *args: str, status: int = 0) -> tuple[int, str]:
+    def build(self, *args: str, status: int = 0, via: tuple[str, ...] = ()) -> tuple[int, str]:
         env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_LAKE_LOG": str(self.log)}
         env["FAKE_LAKE_STATUS"] = str(status)
         env[repair_sandbox.DISABLE_VARIABLE] = "0"  # SandboxedBuilds runs the script through bwrap
-        result = subprocess.run([str(self.script), *args], cwd=self.root, env=env, text=True, capture_output=True)
-        return result.returncode, result.stdout
+        env.pop("PYTHONPATH", None)
+        result = subprocess.run([*via, str(self.script), *args], cwd=self.root, env=env, text=True, capture_output=True)
+        return result.returncode, result.stdout + result.stderr
 
     def lake_calls(self) -> list[list[str]]:
         return [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -7792,6 +7793,55 @@ class BuildScript(unittest.TestCase):
         self.build("TauCeti.A", "--dependents")
         self.assertEqual(self.lake_calls()[-1][:3], ["build", "--iofail", "TauCeti.A"], "the named modules come first")
         self.assertEqual(set(self.lake_calls()[-1][3:]), {"TauCeti", "TauCeti.B", "TauCeti.C", "TauCeti.D"})
+
+    def test_the_helpers_run_under_the_release_venv_even_as_python3_helper(self):
+        """A release-shaped layout: the package copied into a release directory, with a ``.venv`` whose
+        site-packages alone hold ``tauceti_tools``. Written by that venv's python, as the repair unit
+        runs, the build helper imports ``tauceti_tools`` (``repair_publish`` -> ``diff_guard``) both run
+        directly and as ``python3 .tauceti-repair/build`` under an interpreter without the venv."""
+        import site
+        import sysconfig
+
+        import tauceti_tools
+
+        system = Path(getattr(sys, "_base_executable", sys.executable))
+        if subprocess.run([str(system), "-I", "-c", "import tauceti_tools"], capture_output=True).returncode == 0:
+            self.skipTest("the base interpreter itself has tauceti_tools")
+        release = scratch(self, "release-")
+        ignore = shutil.ignore_patterns("__pycache__")
+        for part in ("tauceti_queue", "tauceti_worker", "scripts"):
+            shutil.copytree(REPO / part, release / part, ignore=ignore, symlinks=True)
+        subprocess.run([str(system), "-m", "venv", "--without-pip", str(release / ".venv")], check=True)
+        python = release / ".venv" / "bin" / "python"
+        purelib = subprocess.run(
+            [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        # The release's installed dependencies: this test run's own, visible to the venv alone.
+        deps = [Path(tauceti_tools.__file__).resolve().parent.parent, *site.getsitepackages()]
+        deps.append(sysconfig.get_path("purelib"))
+        (Path(purelib) / "release-deps.pth").write_text("".join(f"{d}\n" for d in dict.fromkeys(map(str, deps))))
+        write = (
+            f"import sys; sys.path.insert(0, {str(release)!r})\n"
+            "from pathlib import Path\n"
+            "from tauceti_queue import repair, repair_targeted, repair_tools\n"
+            f"root = Path({str(self.root)!r}) / repair_tools.TOOLS_DIR\n"
+            "repair_tools.write_build_script(root)\n"
+            "print(repair.check_script('0' * 40, 'o/r').splitlines()[0])\n"
+            "print(repair_targeted.write(root, candidate='0' * 40, findings={}).read_text().splitlines()[0])\n"
+        )
+        shebangs = subprocess.run(
+            [str(python), "-I", "-c", write], check=True, capture_output=True, text=True
+        ).stdout.splitlines()
+        self.assertEqual(self.script.read_text().splitlines()[0], f"#!{python} -I")
+        self.assertEqual(shebangs, [f"#!{python} -I"] * 2, "check and check-findings run under the venv too")
+        for via in ((), (str(system),)):  # run directly, and as `python3 build` (it re-runs under the venv)
+            rc, out = self.build("TauCeti/A.lean" if not via else "TauCeti/B.lean", via=via)
+            self.assertEqual(rc, 0, out)
+            self.assertNotIn("Error", out)
+        self.assertEqual(self.lake_calls(), [["build", "--iofail", "TauCeti.A"], ["build", "--iofail", "TauCeti.B"]])
 
     def test_the_build_waits_for_the_lock_and_takes_it(self):
         lock = self.root / ".tauceti-repair" / "build.lock"

@@ -1498,8 +1498,7 @@ def member_records(
     return records
 
 
-CHECK_SCRIPT = '''#!/usr/bin/env python3
-"""Check the repaired chain in this worktree: prints the first problem, or `ok`.
+CHECK_SCRIPT = '''"""Check the repaired chain in this worktree: prints the first problem, or `ok`.
 
 Written by the queue's repair worker; it verifies what the queue's own validation will: a linear
 chain on the target commit, one commit per recorded member in the recorded order, the `Source-PR:`
@@ -1507,7 +1506,7 @@ and `Accepted-Head:` trailers and the ` (#N)` subject suffix kept, every origina
 as a prefix of the new one, no rebase in progress and a clean working tree; then what staging's
 member review-size policy will: each member's commit against its parent within the caps.
 """
-import json
+{guard}import json
 import re
 import subprocess
 import sys
@@ -1630,7 +1629,9 @@ print("ok")
 
 
 def check_script(target: str, repository: str) -> str:
-    return CHECK_SCRIPT.format(target=target, repository=repository)
+    return repair_tools.interpreter_line() + CHECK_SCRIPT.format(
+        target=target, repository=repository, guard=repair_tools.interpreter_guard()
+    )
 
 
 def resolving(context: PromptContext) -> bool:
