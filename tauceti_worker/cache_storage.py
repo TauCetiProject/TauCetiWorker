@@ -267,6 +267,7 @@ def admit(cfg):
                 marker.unlink(missing_ok=True)
 
 
+_PRESSURE = ("free space", "cap")  # reasons for a full inventory that also make deletion urgent
 _INVENTORY_KEYS = ("managed_bytes", "externally_linked_bytes", "protected_bytes", "named_bytes", "unique_inodes")
 
 
@@ -379,9 +380,10 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None, run_dead
         conservative = False
         # The walk gets half the time, so deletion always has the rest. A cold walk can need more,
         # and a full inventory is rare: after a deferred one it may use the whole run but a minute,
-        # leaving this run's deletions and per-worker phases to the next run.
+        # leaving this run's deletions and per-worker phases to the next run. Never under pressure:
+        # then deletion, which needs no inventory, must not wait.
         walk = None if deadline is None else time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
-        if walk is not None and run_deadline is not None and _retry_wait(record):
+        if walk is not None and run_deadline is not None and _retry_wait(record) and reason not in _PRESSURE:
             walk = max(walk, run_deadline - min(60.0, max(0.0, run_deadline - time.monotonic()) / 20))
         try:
             before = inventory(

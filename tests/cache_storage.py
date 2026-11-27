@@ -516,6 +516,16 @@ class Storage(unittest.TestCase):
             )
         self.assertGreaterEqual(walked.call_args.kwargs["deadline"], start + 940)
         self.assertEqual(result["inventory"]["mode"], "full")
+        with patch.object(storage, "inventory", side_effect=storage.InventoryDeferred("inventory deadline")):
+            storage.collect([], now=time.time() + 2 * storage.INVENTORY_INTERVAL)
+        total = shutil.disk_usage(self.root).total
+        low = shutil._ntuple_diskusage(total, total, storage.headroom(total, storage.TARGET) - 1)
+        with (
+            patch.object(storage.shutil, "disk_usage", return_value=low),
+            patch.object(storage, "inventory", wraps=storage.inventory) as walked,
+        ):
+            storage.collect([], deadline=start + 400, run_deadline=start + 1000)
+        self.assertLess(walked.call_args.kwargs["deadline"], start + 400)  # deletion is urgent: no extension
 
     def test_a_dry_run_records_no_inventory(self):
         storage.collect([], dry=True)
