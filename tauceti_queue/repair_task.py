@@ -4479,6 +4479,52 @@ def write_heartbeat(cfg: RunnerConfig, summary: dict, state: str, **fields) -> N
         atomic_json(heartbeat_path(cfg), summary, durable=False)
 
 
+def claim_hold_path(cfg: RunnerConfig) -> Path:
+    return cfg.root / "claim-hold.json"
+
+
+def claim_hold_lock_path(cfg: RunnerConfig) -> Path:
+    return cfg.root / "claim-hold.lock"
+
+
+def active_claim_hold(cfg: RunnerConfig) -> dict | None:
+    """The hold ``install-repair.sh --when-idle`` places on new claims before restarting the worker.
+
+    The installer holds an exclusive flock on ``<root>/claim-hold.lock`` for as long as the hold
+    lasts and names a ``token`` in ``<root>/claim-hold.json``. While the lock is taken the worker
+    claims nothing and echoes the token in ``worker.json`` (state ``held``), which tells the
+    installer the worker has passed its last claim. The lock ends with the installer's process
+    however it ends, so a killed installer leaves no hold behind. A lock file that exists but cannot
+    be probed holds, as does a hold whose token cannot be read yet (``token`` None).
+    """
+    import fcntl
+
+    try:
+        fd = os.open(claim_hold_lock_path(cfg), os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return {"token": None}
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass  # an installer holds it
+        except OSError:
+            return {"token": None}
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+    finally:
+        os.close(fd)
+    try:
+        hold = json.loads(claim_hold_path(cfg).read_text())
+    except (OSError, ValueError):
+        return {"token": None}
+    token = hold.get("token") if isinstance(hold, dict) else None
+    return {"token": token if isinstance(token, str) else None}
+
+
 def provider_attempts_of(outcome: dict) -> list[dict]:
     """Every provider tried or skipped across the task's agent runs, in order."""
     return [dict(entry) for run in outcome.get("agent") or [] for entry in run.get("provider_attempts") or []]
@@ -4618,6 +4664,9 @@ def serve(
         # The code this process was started from (its release's baked revision), for the installer's
         # check and the operator; read once, so it never follows later changes on disk.
         "revision": STARTUP_REVISION,
+        # The lock this worker probes for the installer's hold on new claims (active_claim_hold);
+        # its presence tells the installer the running worker honours one.
+        "claim_hold": str(claim_hold_lock_path(cfg)),
         "started_at": time.time(),
         "tasks": 0,
         "outcomes": {},
@@ -4692,6 +4741,16 @@ def serve(
             settled = retry_releases(cfg, client, stop=stop)
             if settled:
                 summary["releases_settled"] = summary.get("releases_settled", 0) + len(settled)
+            # Checked last before the claim, in this one thread: once worker.json echoes a hold's
+            # token, no claim follows until the hold is gone.
+            hold = active_claim_hold(cfg)
+            if hold is not None:
+                if summary.get("hold") != hold.get("token") or summary.get("state") != "held":
+                    log(f"holding new claims for the installer (token {hold.get('token')})")
+                write_heartbeat(cfg, summary, "held", hold=hold.get("token"))
+                stop.wait(cfg.poll_seconds)
+                continue
+            summary.pop("hold", None)
             write_heartbeat(cfg, summary, "claiming")
             outcome = claim_and_run(cfg, client, admin, stop=stop)
         except (Die, NoProgress) as error:

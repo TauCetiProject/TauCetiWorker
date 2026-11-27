@@ -783,9 +783,22 @@ started does not misname it; a unit with no running process has nothing to wait 
 claims it is waiting for, checks every 60 seconds, and waits for as long as it takes unless
 `--idle-timeout SECONDS` is given, after which it exits 3 without restarting. Anything it cannot read
 counts as busy. It waits before choosing the revision, so a long wait installs origin/main as it is
-when the wait ends, and checks once more right before the restart, without holding the releases lock.
-This is best effort: the worker has no switch to stop claiming, so a claim made between the last
-check and the restart is interrupted like any restart (below). Neither the unit's processes nor
+when the wait ends. Right before the restart, without holding the releases lock, it holds new
+claims: it takes an exclusive flock on `<task root>/claim-hold.lock` (a second installer for the
+same unit waits for it) and writes a token to `claim-hold.json`. The worker probes that lock in its
+serve loop immediately before every claim; while it is taken the worker claims nothing and
+`worker.json` reports state `held` with the token in `hold`. The installer restarts only once the
+running process's `worker.json` echoes its token and the queue shows no claim, so a claim made just
+before the hold landed is waited for rather than cut off, and none can start after. A unit with no
+running process needs no confirmation: a process systemd starts meanwhile runs the installed
+release and finds the hold. The hold is lifted right after the restart and ends with the
+installer's process however it exits (including `--idle-timeout`), so a killed installer leaves
+none behind. One case stays outside it: a claim request that timed out on the worker's side but
+that the controller commits later is a claim no process is running, so the restart cuts off no
+work; the new process releases it (`release_stale_claims`) or it expires. A worker whose
+`worker.json` has no `claim_hold` field predates holds: the installer warns and falls back to the
+queue check alone, where a claim made between the last check and the restart is
+interrupted like any restart (below). Neither the unit's processes nor
 `worker.json` tell idle from busy: between rounds of a task the worker runs for minutes with no child
 process, and `worker.json` stays `claiming` while a claimed task runs. `--when-idle` is parsed by the
 copy of the installer you start, so start one that has it (fast-forward `~/TauCetiQueue` with
@@ -815,7 +828,7 @@ jq . "$(. ~/.config/tauceti-queue/repair-environment; echo "$TAUCETI_QUEUE_TASK_
 
 `--check` prints one line per host requirement and exits 1 when any fails, naming the token's source
 and the login, never the token, and whether the api key is set, never the key. `worker.json` is the
-worker's heartbeat: `pid`, `revision` (read once at startup from the release), `state` (`starting`, `claiming`, `running`, `idle`, `stopping`, `stopped`),
+worker's heartbeat: `pid`, `revision` (read once at startup from the release), `state` (`starting`, `claiming`, `running`, `idle`, `held`, `stopping`, `stopped`), `claim_hold` (the hold lock it probes) and `hold` (the token while held),
 `tasks`, `outcomes` by status, `providers` (per provider: `ran`, `skipped`, `failed` counts), `errors`
 and `last_error`, `last_outcome` (with the task's `provider` and `provider_attempts`), `started_at` and
 `updated_at`. The service side of the same facts is
