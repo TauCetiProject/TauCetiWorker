@@ -8,7 +8,8 @@ not depend on the prefix.
 
 When the replay first conflicts, the worker starts a ``Lookahead``: up to ``lookahead_helpers``
 helpers (``TAUCETI_QUEUE_LOOKAHEAD_HELPERS``, default 16, half that for background work such as an open
-batch's rebase onto ``main``, so the head's task comes first), each resolving a later member's commit on ``onto`` alone, in a worktree of its own and a child
+batch's rebase onto ``main``, so the head's task comes first, and at most what the Lean job budget
+allows, below), each resolving a later member's commit on ``onto`` alone, in a worktree of its own and a child
 process (``python -m tauceti_queue.repair_lookahead run <job>``, as ``repair_parallel``'s group agents
 run, since the agent path keeps per-process state). A helper runs ``repair_task.resolve_one``, the
 serial path's own code for one conflict: the additive and numproj pre-passes, then the agent with its attempts and
@@ -30,7 +31,10 @@ the replay); one that does not merge or is not acceptable is resolved by the ser
 The submitted chain goes through the queue's checks and staging as any other.
 
 Builds: each helper's worktree has its own build lock, so the helpers' scoped builds run concurrently
-(about half of an agent's time is its builds). An agent's scoped build is small: on batch 457 a repair
+(about half of an agent's time is its builds). Together with the serial path's build they stay within
+the task's Lean job budget (``TAUCETI_REPAIR_LEAN_JOB_BUDGET``, default 16; decision 219): the serial
+build keeps the per-build cap (``TAUCETI_REPAIR_LEAN_JOBS``, default 8) and ``plan`` gives the helpers
+the rest, which bounds both their number and each one's cap (by default 8 helpers at 1 job each). An agent's scoped build is small: on batch 457 a repair
 unit running three agents peaked at about 4 GB of anonymous memory, against 55 to 64 GiB for the
 worker's whole-library verification build, and the worker refuses an agent's whole-library build.
 The repair slice's shared memory ceiling is the backstop for the rare large ``--dependents`` build.
@@ -81,13 +85,39 @@ def changes_dependencies(clone: Path, task) -> bool:
     return bool(git(clone, "log", "--format=%H", f"{task.base}..{task.tip}", "--", *DEPENDENCY_FILES).strip())
 
 
-def helper_count(cfg, task) -> int:
-    """The task's helpers: ``cfg.lookahead_helpers`` for the head's task, half that (at least one) for
-    background work, which leaves the head's task the larger share of agents."""
+def configured_helpers(cfg, task) -> int:
+    """``cfg.lookahead_helpers`` for the head's task, half that (at least one) for background work,
+    which leaves the head's task the larger share of agents."""
     from tauceti_queue import repair_task
 
     helpers = int(cfg.lookahead_helpers)
     return max(1, helpers // 2 if repair_task.background_task(task) else helpers)
+
+
+def plan(cfg, task, env: dict | None = None) -> tuple[int, int | None]:
+    """The task's helpers and each helper build's Lean job cap (None: uncapped), within the task's Lean
+    job budget (``repair_sandbox.lean_job_budget``). The serial path's build keeps the per-build cap
+    and runs beside the helpers' builds, so the helpers share what the budget leaves: at most that many
+    helpers (``configured_helpers`` at most), each capped at the per-build cap or an equal share of
+    the rest, whichever is smaller. With the defaults (16 helpers, 8 jobs a build, a budget of 16) that
+    is 8 helpers at 1 job each. A budget no larger than the per-build cap still leaves one helper at
+    one job. Without a per-build cap or without a budget the configured helpers run at the per-build
+    cap, as before."""
+    from tauceti_queue import repair_sandbox
+
+    helpers = configured_helpers(cfg, task)
+    per_build = repair_sandbox.lean_jobs(env)
+    budget = repair_sandbox.lean_job_budget(env)
+    if per_build is None or budget is None:
+        return helpers, per_build
+    share = max(1, budget - per_build)
+    helpers = min(helpers, share)
+    return helpers, max(1, min(per_build, share // helpers))
+
+
+def helper_count(cfg, task, env: dict | None = None) -> int:
+    """The task's helpers (``plan``)."""
+    return plan(cfg, task, env)[0]
 
 
 class Lookahead:
@@ -123,9 +153,12 @@ class Lookahead:
         from tauceti_queue import repair_task
 
         self.providers, _skipped = repair_task.select_providers(cfg)
-        self.pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=helper_count(cfg, task), thread_name_prefix="lookahead"
-        )
+        helpers, jobs = plan(cfg, task, self.environment)
+        if jobs is not None:
+            # Each helper's agent and its builds take this cap (``repair.agent_environment``).
+            self.environment[repair_sandbox.LEAN_JOBS_VARIABLE] = str(jobs)
+        log(f"lookahead: {helpers} helper(s), {jobs or 'uncapped'} Lean job(s) per helper build")
+        self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=helpers, thread_name_prefix="lookahead")
         if not cfg.seed_packages:
             self._cache_packages()
         self.feeder = threading.Thread(target=self._feed, args=(after,), name="lookahead-feeder", daemon=True)

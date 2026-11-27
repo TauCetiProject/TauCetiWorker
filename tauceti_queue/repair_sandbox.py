@@ -66,6 +66,13 @@ PRESSURE_WRAPPER = "/opt/tauceti/tauceti-lean"
 # default; 0 leaves the thread pool uncapped.
 LEAN_JOBS_VARIABLE = "TAUCETI_REPAIR_LEAN_JOBS"
 DEFAULT_LEAN_JOBS = 8
+# The cap on concurrent Lean jobs across one task's concurrent builds: the serial path's build and
+# its lookahead helpers' builds, each in a worktree of its own (``repair_lookahead``). Without it a
+# task's 16 helpers at 8 jobs each could run 128 ``lean`` processes beside the serial build's 8. The
+# serial build keeps the per-build cap and the helpers share the rest (``repair_lookahead.plan``),
+# so the default, 16, is the serial build's 8 plus 8 helpers at 1 job each. 0 turns it off.
+LEAN_JOB_BUDGET_VARIABLE = "TAUCETI_REPAIR_LEAN_JOB_BUDGET"
+DEFAULT_LEAN_JOB_BUDGET = 16
 
 # Read-only system roots, bound when present. A symlinked root (``/bin -> usr/bin``) is recreated as
 # the same symlink, the way CI's ``--symlink usr/bin /bin`` does.
@@ -161,6 +168,22 @@ def lean_jobs(env: dict | None = None) -> int | None:
         LOGGER.warning("%s=%r is not a job count; using %d", LEAN_JOBS_VARIABLE, value, DEFAULT_LEAN_JOBS)
         return DEFAULT_LEAN_JOBS
     return jobs or None
+
+
+def lean_job_budget(env: dict | None = None) -> int | None:
+    """The concurrent Lean job budget of one task (``LEAN_JOB_BUDGET_VARIABLE``), None for none. An
+    unreadable or negative value is logged and the default used."""
+    value = ((os.environ if env is None else env).get(LEAN_JOB_BUDGET_VARIABLE) or "").strip()
+    if not value:
+        return DEFAULT_LEAN_JOB_BUDGET
+    try:
+        budget = int(value)
+    except ValueError:
+        budget = -1
+    if budget < 0:
+        LOGGER.warning("%s=%r is not a job count; using %d", LEAN_JOB_BUDGET_VARIABLE, value, DEFAULT_LEAN_JOB_BUDGET)
+        return DEFAULT_LEAN_JOB_BUDGET
+    return budget or None
 
 
 def jobs_env(env: dict | None = None) -> dict[str, str]:

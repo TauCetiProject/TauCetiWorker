@@ -102,3 +102,6 @@ TAUCETI_QUEUE_PROVIDERS=claude,codex,api
 # Concurrent Lean jobs per repair build (LEAN_NUM_THREADS inside the build sandbox; 0 for no cap).
 # The default, 8, fits three workers on a 125 GB host (docs/queue/repair-task.md, decision 219).
 #TAUCETI_REPAIR_LEAN_JOBS=8
+# Concurrent Lean jobs across one task's builds: the serial build keeps the cap above and its
+# lookahead helpers share the rest, which bounds their number too (0 for no budget).
+#TAUCETI_REPAIR_LEAN_JOB_BUDGET=16

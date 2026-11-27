@@ -504,6 +504,10 @@ has a time budget holds because the service re-exposes the task.
    reached 42 GB RSS plus 63 GB swap (about 0.75 to 1 GB per job). The repair slice's `memory.high`
    there is about 52 GB for three workers, and one may be running the audit (about 33 GB) under the
    heavy-check lock while the other two build: 8 jobs (6 to 8 GB a build) keep that 45 to 49 GB.
+   A rebase task's lookahead helpers build concurrently with the serial path, so the task as a whole
+   has a budget, `TAUCETI_REPAIR_LEAN_JOB_BUDGET` (default 16, `0` for none): the serial build keeps
+   the per-build cap and the helpers share the rest, at most that many helpers at an equal share
+   each (by default 8 helpers at 1 job each, where 16 helpers at 8 could have run 128 jobs).
    Final verification's build and the drivers' builds are capped; cache fetches and the audit and lint
    drivers themselves are not, since `lint-env.sh` picks its shards' threads and the heavy-check lock
    bounds those checks.
