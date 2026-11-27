@@ -128,6 +128,7 @@ esac
 case "$*" in
   *"check-config --print content_clone"*) echo "$HOME/content" ;;
   *"check-config --print repository"*) echo "TauCetiProject/TauCeti" ;;
+  *"check-config --print database"*) echo "$HOME/TauCetiQueue-data/queue.sqlite3" ;;
   *"status"*"--expect-revision"*)
     expected="${*: -1}"
     pid="$(cat "$FAKE_SYSTEMD/tauceti-queue.service.pid")"
@@ -194,7 +195,10 @@ class Releases(unittest.TestCase):
         (self.home / "content/HEAD").write_text("")
         (self.home / "TauCetiQueue-data/monitoring").mkdir(parents=True)
         (self.home / "TauCetiQueue-data/monitoring/token").write_text("")
-        (self.home / "TauCetiQueue-data/queue.sqlite3").write_text("")
+        # the controller's database with its real schema and no records
+        from tauceti_queue.store import Store
+
+        Store(str(self.home / "TauCetiQueue-data/queue.sqlite3")).close()
         self.releases = self.home / "TauCetiQueue-releases"
 
     # --- helpers ---------------------------------------------------------------------------------
@@ -557,6 +561,87 @@ class Releases(unittest.TestCase):
         log = self.run_script("install-repair.sh", "--when-idle", expect=1)
         self.assertIn("does not exist", log)
         self.assertFalse(self.releases.exists())
+
+    def controller_replay(self):
+        """The controller's database (its real schema) while the controller replays a chain: an
+        unreleased claim of worker `controller` (services/queue/safepoint.py). Returns the store."""
+        from tauceti_queue.store import Store
+
+        path = self.home / "TauCetiQueue-data/queue.sqlite3"
+        path.unlink()
+        store = Store(str(path))
+        self.addCleanup(store.close)
+        store.insert(
+            "claims",
+            batch_id=4,
+            batch_version=1,
+            operation="rebase",
+            worker="controller",
+            token="t",
+            starting_tip="t" * 40,
+            created_at=time.time(),
+            expires_at=time.time() + 900,
+        )
+        return store
+
+    def test_controller_install_waits_for_a_safe_point_and_changes_nothing_when_none_comes(self):
+        self.old_layout()
+        pid = self.pid("tauceti-queue.service")
+        unit = (self.units / "tauceti-queue.service").read_text()
+        self.controller_replay()
+        self.env["TAUCETI_QUEUE_SAFEPOINT_INTERVAL"] = "0.2"
+        log = self.run_script("install.sh", "--safepoint-timeout", "1", "--wait", "5", expect=3)
+        self.assertIn("waiting for a safe point to restart the controller", log)
+        self.assertIn("busy: controller replay: claim 1 (rebase) on batch 4", log)
+        self.assertEqual(log.count("busy: controller replay"), 1, "an unchanged state is printed once")
+        self.assertIn("no safe point within 1s; tauceti-queue.service was not restarted", log)
+        self.assertEqual(self.pid("tauceti-queue.service"), pid)
+        self.assertEqual((self.units / "tauceti-queue.service").read_text(), unit)
+        # a running controller whose database cannot be found is not at a safe point either
+        (self.home / "TauCetiQueue-data/queue.sqlite3").unlink()
+        log = self.run_script("install.sh", "--safepoint-timeout", "1", "--wait", "5", expect=3)
+        self.assertIn("unknown: no queue database at", log)
+        self.assertEqual(self.pid("tauceti-queue.service"), pid)
+
+    def test_controller_install_restarts_once_the_safe_point_comes(self):
+        self.old_layout()
+        pid = self.pid("tauceti-queue.service")
+        store = self.controller_replay()
+        self.env["TAUCETI_QUEUE_SAFEPOINT_INTERVAL"] = "0.2"
+
+        def release_the_claim():
+            # once the installer has reported the wait
+            deadline = time.time() + 60
+            calls = self.state / "uv-calls"
+            while time.time() < deadline and not (calls.exists() and "--print database" in calls.read_text()):
+                time.sleep(0.1)
+            time.sleep(1)
+            store.update("claims", {"id": 1}, released_at=time.time(), release_reason="done")
+
+        thread = threading.Thread(target=release_the_claim)
+        thread.start()
+        try:
+            log = self.run_script("install.sh", "--wait", "5")
+        finally:
+            thread.join()
+        self.assertIn("busy: controller replay", log)
+        self.assertIn("safe point: nothing in flight", log)
+        [release] = self.release_dirs(self.first)
+        self.assertNotEqual(self.pid("tauceti-queue.service"), pid)
+        self.assertEqual(self.cwd("tauceti-queue.service"), str(release))
+
+    def test_no_safepoint_restarts_at_once_and_no_restart_never_waits(self):
+        self.old_layout()
+        self.controller_replay()
+        log = self.run_script("install.sh", "--no-restart", "--wait", "1", expect=2)
+        self.assertNotIn("safe point", log)
+        pid = self.pid("tauceti-queue.service")
+        log = self.run_script("install.sh", "--no-safepoint", "--wait", "5")
+        self.assertIn("--no-safepoint: restarting without waiting for a safe point", log)
+        self.assertNotIn("busy:", log)
+        self.assertNotEqual(self.pid("tauceti-queue.service"), pid)
+        log = self.run_script("install.sh", "--safepoint-timeout", "soon", expect=1)
+        self.assertIn("--safepoint-timeout takes a number of seconds", log)
 
     def test_repair_workers_run_in_the_low_priority_slice(self):
         """Every repair unit the installer writes runs niced, at the lowest best-effort IO priority and in tauceti-repair.slice, below

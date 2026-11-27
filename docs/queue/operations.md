@@ -183,6 +183,7 @@ git clone https://github.com/TauCetiProject/TauCetiWorker.git ~/TauCetiQueue
 ~/TauCetiQueue/services/queue/install.sh                     # origin/main
 ~/TauCetiQueue/services/queue/install.sh --revision <sha>    # a pinned revision
 services/queue/release.sh status                             # what each unit names and runs
+services/queue/release.sh safepoint                          # is the controller at a safe point to restart?
 ```
 
 **One release directory per install.** Each install materialises the requested revision as its own
@@ -239,14 +240,65 @@ visible.
 `services/queue/install.sh` is idempotent. It fetches into the shared clone, refuses a target that
 does not descend from the revision the service runs now (rather than forcing it), creates the
 release, runs `uv sync` there, bakes the revision into the release's `tauceti_queue/_revision.py`,
-writes `config.toml` and `environment` from the examples when absent, runs `check-config`, installs
-`tauceti-queue.service` and the backup service and timer pointing at the release, `systemctl --user
-daemon-reload`, enables and restarts `tauceti-queue.service` and the backup timer, and then verifies
-the deployment by reading `/status` until the service answers, comparing the reported
-`service.revision` with the release and checking that the service's main process runs from the
-release. Exit 0 means the running service is the installed release; exit 2 means it answered with a
+writes `config.toml` and `environment` from the examples when absent, runs `check-config`, waits for
+a safe point (below), installs `tauceti-queue.service` and the backup service and timer pointing at
+the release, `systemctl --user daemon-reload`, enables and restarts `tauceti-queue.service` and the
+backup timer, and then verifies the deployment by reading `/status` until the service answers,
+comparing the reported `service.revision` with the release and checking that the service's main
+process runs from the release. Exit 0 means the running service is the installed release; exit 2 means it answered with a
 different revision, from another directory, or not at all, and the next step is `journalctl --user
--u tauceti-queue -n 50`.
+-u tauceti-queue -n 50`; exit 3 means no safe point came within `--safepoint-timeout`.
+
+**Safe point.** `install.sh` restarts the controller only at a safe point, and waits for one by
+default. The wait is about the timing of a restart that takes seconds: admissions, workers and CI
+carry on throughout, and nothing is drained or paused. A restart sends SIGTERM; the loop finishes
+its current pass, but only for 90 seconds (`DEFAULT_STOP_GRACE`), after which the pass is killed
+where it stands. Store writes are transactions and `recover` on start releases the controller's
+own claims, so a kill never corrupts the records, but it can cut off a side effect made on GitHub
+before it is recorded, or throw away long work. The controller is busy, and the installer waits,
+while any of these is in flight:
+
+- a promotion: a pending `promote` outbox entry that is due while publication is enabled. It
+  pushes the canonical branch and then records the landing, which reads every member's landed
+  commit (about a second each, so minutes for a large batch). Cut off after the push, the landing
+  is recorded again on the next start, and with mixed sources the unsettled send is
+  `landing-uncertain` until reconciled.
+- a CI dispatch: an attempt in `dispatch_state` `sending` sent in the last 5 minutes. Cut off
+  before GitHub's acknowledgement is recorded, its outcome stays unknown: the head waits until the
+  run is discovered or, with none, `dispatch_timeout_seconds` (600) turns it into an infrastructure
+  outcome that is retried, delaying the head's CI by about ten minutes.
+- a controller replay: an unexpired, unreleased claim of worker `controller`, held while an
+  insertion probe or a head rebase replays a chain. A restart releases it (`released` in the
+  `restart` journal entry) and the replay starts again.
+
+These are not busy, and the check only reports them: the head's repair-worker claims and open task
+(a restart keeps worker claims, and workers retry renewals every 15 seconds and a result for
+minutes), a head CI run executing on GitHub (its run id is recorded and the controller re-reads it by
+polling, so a missed webhook costs at most `polling_interval_seconds`), and pending outbox entries
+(persisted and resumed). A dispatch still `sending` after 5 minutes was left by an earlier
+interruption; a restart does not make it worse, so it is reported as stale and does not block.
+
+The check reads records, not the running process, so it lowers the odds of cutting work off rather
+than ruling it out. The pass running when SIGTERM arrives finishes, and can start new work after
+the check. Some work leaves no record to see: replays that take no controller claim (pre-rebase,
+sealing from a pre-rebase or a clean prefix, main-integration removal), a landing found by
+observing the canonical branch rather than by a promotion, and the main-integration and Forgejo
+PR-build dispatches (cut off, these cost a duplicate CI run at worst). A controller claim leaked by
+an unexpected exception reads as busy until it expires (`claim_ttl_seconds`, 900 by default).
+
+`services/queue/release.sh safepoint [--database FILE]` runs the same check
+(`services/queue/safepoint.py`, which reads the database read-only in one snapshot, default
+`~/TauCetiQueue-data/queue.sqlite3`) and prints a `busy:` line per operation and `info:` lines for
+the rest; it exits 0 at a safe point, 1 when busy and 2 when it cannot read the database. The
+installer runs it every 5 seconds on the database `check-config` names, after building the release
+and before changing any unit, and restarts within seconds of a safe point. While the controller
+runs, a missing database or one without the queue's tables counts as unreadable, so as busy. It prints the state
+whenever what is busy changes. Busy states last seconds, so a wait is normally short; after
+`--safepoint-timeout SECONDS` (default 1800; 0 waits as long as it takes) it exits 3 with the units
+and the running service unchanged. `--no-safepoint` restarts at once, for a controller wedged in a
+busy state (the restart is still crash-safe); `--no-restart` restarts nothing and so waits for
+nothing; with the service not running there is nothing to wait for. Like `--when-idle`, the flags
+are parsed by the copy of the installer you start, so an older copy stops with `unknown argument`.
 
 **Rollback** points a unit back at a previous release directory and restarts only it, without
 rebuilding anything: list the candidates with `ls ~/TauCetiQueue-releases` (or `release.sh status`

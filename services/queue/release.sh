@@ -8,6 +8,10 @@
 #   services/queue/release.sh status   which release each installed queue unit names, and which one
 #                                      its running process actually runs from
 #   services/queue/release.sh gc       remove release directories nothing uses (as after an install)
+#   services/queue/release.sh safepoint [--database FILE]
+#                                      whether the controller is at a safe point for a restart (what is
+#                                      in flight, from its database read-only; services/queue/safepoint.py);
+#                                      exit 0 safe, 1 busy, 2 unreadable
 #
 # Each install materialises the requested revision as a detached git worktree of the shared clone
 # (~/TauCetiQueue by default) in ~/TauCetiQueue-releases/<sha>-<UTC time>/, builds its own uv
@@ -271,11 +275,49 @@ release_status() {
   done
 }
 
+# release_safepoint [--require-queue] DATABASE: print what the controller has in flight; 0 at a safe
+# point for a restart, 1 busy, 2 when the database cannot be read (services/queue/safepoint.py).
+release_safepoint() {
+  python3 -I "$(dirname "${BASH_SOURCE[0]}")/safepoint.py" "$@"
+}
+
+# release_wait_safepoint DATABASE TIMEOUT: wait until the running controller is at a safe point (a
+# missing or empty database counts as unreadable, so busy), checking every
+# $TAUCETI_QUEUE_SAFEPOINT_INTERVAL seconds (default 5) and printing the state whenever it changes.
+# TIMEOUT 0 waits as long as it takes. Returns 0 at a safe point, 3 when TIMEOUT passes first.
+release_wait_safepoint() {
+  local database="$1" timeout="$2" interval="${TAUCETI_QUEUE_SAFEPOINT_INTERVAL:-5}" start=$SECONDS out status key last=""
+  while :; do
+    status=0
+    out="$(release_safepoint --require-queue "$database" 2>&1)" || status=$?
+    if [ "$status" = 0 ]; then
+      _release_log "$(tail -n 1 <<<"$out")"
+      return 0
+    fi
+    # What is busy, without the ages, decides whether the state changed since it was last printed.
+    key="$status $(grep '^busy:' <<<"$out" | sed -E 's/[0-9]+s ago//g' || true)"
+    if [ "$key" != "$last" ]; then
+      _release_log "waiting for a safe point to restart the controller:"
+      sed 's/^/  /' <<<"$out" >&2
+      last="$key"
+    fi
+    if [ "$timeout" != 0 ] && [ $((SECONDS - start)) -ge "$timeout" ]; then
+      return 3
+    fi
+    sleep "$interval"
+  done
+}
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   set -euo pipefail
   case "${1:-}" in
     status) release_status ;;
     gc) release_gc ;;
-    *) echo "usage: services/queue/release.sh status|gc" >&2; exit 1 ;;
+    safepoint)
+      database="$HOME/TauCetiQueue-data/queue.sqlite3"
+      if [ "${2:-}" = --database ] && [ -n "${3:-}" ]; then database="$3"
+      elif [ -n "${2:-}" ]; then echo "usage: services/queue/release.sh safepoint [--database FILE]" >&2; exit 2; fi
+      release_safepoint "$database" ;;  # standalone: a missing database is a safe point
+    *) echo "usage: services/queue/release.sh status|gc|safepoint [--database FILE]" >&2; exit 1 ;;
   esac
 fi
