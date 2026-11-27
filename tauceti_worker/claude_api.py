@@ -244,7 +244,8 @@ class ClaudeAPIContext:
                 self.blocked_reason = reason
                 self.wait_state = "waiting-capacity"
                 report_runtime(self.wait_state, detail=reason)
-                return dict(allowed=False, reason=reason)
+                # The shim holds prepared work for fleet capacity; other refusals end the round.
+                return dict(allowed=False, reason=reason, capacity=True)
             ticket = request["id"]
             if not isinstance(ticket, str) or len(ticket) != 32 or not isinstance(request["model"], str):
                 raise BudgetError("invalid admission request")

@@ -175,6 +175,66 @@ class FleetTests(unittest.TestCase):
                 context.handle(dict(action="admit", id="c" * 32, model="test", process=identity()))["allowed"]
             )
 
+    def test_shim_holds_prepared_work_for_fleet_capacity_but_not_for_funding(self):
+        from tauceti_worker import claude_api_client as client
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "key").write_text("test-key")
+            config = {"bridge": str(root), "command": ["fake-claude"], "key": str(root / "key")}
+            (root / "config.json").write_text(json.dumps({**config, "usage_dir": str(root / "usage")}))
+            capacity = dict(allowed=False, reason="host memory headroom low", capacity=True)
+            funding = dict(allowed=False, reason="waiting for funding")
+            for answers, deadline, sleeps, rc in (
+                # Capacity reopens after two polls: the prepared work launches.
+                ([capacity, capacity, dict(allowed=True, id="i" * 32)], None, 2, 0),
+                # Capacity stays closed: the hold ends and the round waits outside it.
+                ([capacity] * 1000, None, client.CAPACITY_HOLD_SECONDS // client.CAPACITY_POLL_SECONDS - 1, 75),
+                # Too little round time left to hold.
+                ([capacity] * 1000, 1000 + client.CAPACITY_HOLD_RESERVE_SECONDS, 0, 75),
+                ([funding], None, 0, 75),
+            ):
+                with self.subTest(answers=answers[0], deadline=deadline):
+                    clock = [1000.0]
+                    replies = iter(answers)
+
+                    def sleep(seconds, clock=clock):
+                        clock[0] += seconds
+
+                    admits = []
+
+                    def request(_bridge, action, admits=admits, replies=replies, **_fields):
+                        if action != "admit":
+                            return dict(ok=True)
+                        admits.append(action)
+                        return next(replies)
+
+                    env = {"TAUCETI_ROUND_DEADLINE": str(deadline)} if deadline else {}
+                    with (
+                        patch.object(client, "__file__", str(root / "shim.py")),
+                        patch.object(sys, "argv", ["claude", "-p", "hello", "--model", "opus"]),
+                        patch.dict(os.environ, env),
+                        patch.object(client, "api_environment", return_value={}),
+                        patch.object(client, "authenticate"),
+                        patch.object(client, "request", side_effect=request),
+                        patch.object(client, "warning"),
+                        patch.object(client.time, "time", side_effect=lambda clock=clock: clock[0]),
+                        patch.object(client.time, "sleep", side_effect=sleep) as slept,
+                        patch.object(client.subprocess, "Popen", side_effect=OSError("fake launch")) as popen,
+                    ):
+                        if not deadline:
+                            os.environ.pop("TAUCETI_ROUND_DEADLINE", None)
+                        if rc == 75:
+                            self.assertEqual(client.main(), 75)
+                            popen.assert_not_called()
+                        else:
+                            # Admitted on the third poll; the launch itself is exercised elsewhere,
+                            # so this fake launch fails and settles as launch-failed.
+                            client.main()
+                            self.assertEqual(len(admits), 3)
+                        holds = [c for c in slept.call_args_list if c.args == (client.CAPACITY_POLL_SECONDS,)]
+                        self.assertEqual(len(holds), sleeps)
+
     def test_context_start_refuses_capacity_before_setup(self):
         context = ClaudeAPIContext("worker", "review")
         with (

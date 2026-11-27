@@ -37,6 +37,11 @@ def atomic(path, value):
             pass
 
 
+CAPACITY_HOLD_SECONDS = 600
+CAPACITY_HOLD_RESERVE_SECONDS = 2400
+CAPACITY_POLL_SECONDS = 10
+
+
 def warning(message):
     try:
         print(message, file=sys.stderr)
@@ -124,6 +129,12 @@ def main():
                 raise RuntimeError("API accounting requires an explicit provider session ID")
             resume = args[index + 1]
     previous_reason = None
+    # Fleet capacity can close while a round prepares (checkout, build caches, builds), which
+    # takes minutes for fix and rebase rounds. Hold the prepared work for capacity to reopen
+    # instead of discarding it, leaving the round most of its time budget.
+    hold_until = time.time() + CAPACITY_HOLD_SECONDS
+    if deadline := os.environ.get("TAUCETI_ROUND_DEADLINE"):
+        hold_until = min(hold_until, float(deadline) - CAPACITY_HOLD_RESERVE_SECONDS)
     while True:
         admission = request(
             bridge,
@@ -140,6 +151,9 @@ def main():
         if admission["reason"] != previous_reason:
             warning("tauceti-local-admission: " + admission["reason"])
             previous_reason = admission["reason"]
+        if admission.get("capacity") and time.time() + CAPACITY_POLL_SECONDS < hold_until:
+            time.sleep(CAPACITY_POLL_SECONDS)
+            continue
         return 75  # Funding waits belong to the outer loop, outside the round timeout.
     output_format = "text"
     if "--output-format" in args:
