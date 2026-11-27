@@ -7961,13 +7961,32 @@ class Controller:
     def _prepare_pre_rebased(self, now: float) -> None:
         """Create a `prepare` task for the oldest open batch's pre-rebased chain on the head's tip.
 
-        The worker builds that chain warm from the outputs published for the head's tip, repairs what
+        Nothing is created until `_pre_rebased_prepare_blocked` allows it. `_pre_rebase` must first
+        have replayed the batch onto the head's current tip, covering the batch's tip, and that
+        replay waits for the head to be dispatched to CI with no open task or claim of its own. A
+        worker must also have verified exactly the head's tip clean (`_head_tip_verified`: the
+        head's own task, or the preparation it sealed from; a CI pass alone does not count), and the
+        head's CI must not have passed yet (`_head_landing`). So the batch is prepared while the head's
+        CI runs, never earlier, and the head lands without waiting for it. Creating the task seals
+        the batch's membership.
+
+        The worker builds the chain warm from the outputs published for the head's tip, repairs what
         fails in place, runs the audits, submits, and publishes the outputs of the tip it submitted;
         `_adopt_prepared_pre_rebase` records the result as the batch's pre-rebase, prepared on that
-        tip. A head that lands as that tip seals with the chain unchanged, so its CI round fetches the
-        published outputs for its exact tip. The task is a background task like any other (one claim
-        per batch, `repair_concurrency - 1` in total), superseded when the head's tip changes, and
-        sealing never waits for it."""
+        tip (a clean release, `_settle_pre_rebased_release`, marks it prepared unchanged). When the
+        head lands as the tip the chain was prepared on, the batch seals from the chain without a
+        replay (`_seal_from_pre_rebase`), so its CI round fetches the published outputs for its exact
+        tip.
+
+        The task is background work (`_choose_task`): one claim per batch, at most
+        `repair_concurrency - 1` claims on open batches, started only while fewer than
+        `background_start_limit` claims are live, and ranked with `pre_rebase` ahead of later batches'
+        own-base preparations. It is superseded when the head's tip moves, CI fails that tip, or the pre-rebase
+        is redone, discarded or hits a conflict (`_supersede_stale_pre_rebased_prepare`). Sealing does
+        wait for it once it is claimed: a preparation still claimed when the head lands is preserved
+        (`_preserve_successor_tasks`), and the batch stays open until its owner releases it
+        (`_seal_blocked`). An unclaimed one is not claimed once the head's CI passes, and is superseded
+        when the batch seals."""
         self._supersede_stale_pre_rebased_prepare(now)
         if self._state("inference_hold"):
             return
