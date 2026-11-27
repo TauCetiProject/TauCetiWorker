@@ -226,6 +226,29 @@ class Controller(unittest.TestCase):
         self.assertEqual(self.check()[0], [])
 
 
+class Snapshot(unittest.TestCase):
+    def test_every_query_reads_one_snapshot(self):
+        """A write committed between two of the check's queries is not seen by the later ones."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "queue.sqlite3"
+            store = Store(str(path))
+            self.addCleanup(store.close)
+            store.set_setting("publication_enabled", True)
+            real_check = safepoint.check
+
+            def check(db, now):
+                # the first query of main() has run; a promotion is enqueued now
+                store.insert(
+                    "outbox", kind="promote", key="promote:1:1:t", payload="{}", next_attempt_at=0, created_at=0
+                )
+                return real_check(db, now)
+
+            with patch.object(safepoint, "check", check), patch("sys.stdout"):
+                self.assertEqual(safepoint.main(["safepoint.py", str(path)]), 0)
+            with patch("sys.stdout"):
+                self.assertEqual(safepoint.main(["safepoint.py", str(path)]), 1)
+
+
 class Command(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -240,10 +263,14 @@ class Command(unittest.TestCase):
         result = self.run_script(str(path))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("safe: no queue database", result.stdout)
+        result = self.run_script("--require-queue", str(path))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("unknown: no queue database", result.stdout)
         path.write_text("")
         result = self.run_script(str(path))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("holds no queue records", result.stdout)
+        self.assertEqual(self.run_script("--require-queue", str(path)).returncode, 2)
         path.unlink()
         store = Store(str(path))
         result = self.run_script(str(path))

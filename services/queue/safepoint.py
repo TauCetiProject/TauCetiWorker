@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Whether the queue controller is at a safe point for a restart (docs/queue/operations.md, "Install and update").
 
-    python3 -I services/queue/safepoint.py DATABASE
+    python3 -I services/queue/safepoint.py [--require-queue] DATABASE
 
 Reads the controller's database read-only and prints what is in flight. Exit 0: nothing a restart
 would cut off; 1: busy, with a `busy:` line per operation; 2: the database cannot be read (counts
-as busy). `services/queue/release.sh safepoint` runs it, and `install.sh` waits for exit 0 before
-restarting the controller. Standard library only, so it runs from any checkout without an
+as busy). A missing database, or one without the queue's tables, is a safe point (a first install)
+unless `--require-queue` is given, which `install.sh` passes while the controller is running: then
+it cannot be read either. All reads share one snapshot. `services/queue/release.sh safepoint` runs
+it, and `install.sh` waits for exit 0 before restarting the controller. Standard library only, so it runs from any checkout without an
 environment.
 
 A restart is SIGTERM: the loop finishes its current pass and the process exits, but only within
@@ -23,8 +25,9 @@ made on GitHub but not yet recorded, or long work thrown away. Busy, therefore, 
   canonical branch on the next start, and mixed sources call the unsettled send
   `landing-uncertain` and refuse to change primary until it is reconciled.
 - a CI dispatch in flight: an attempt in `dispatch_state` `sending` sent recently. Killed between
-  the send and its acknowledgement, it stays unknown; normal passes never retransmit it, so it waits
-  for the run to be discovered or for an operator's `retry_ci`.
+  the send and its acknowledgement, its outcome stays unknown: the head waits until the run is
+  discovered or, with none, `dispatch_timeout_seconds` (600 s) turns it into an infrastructure
+  outcome that is retried, so the head's CI is delayed by about ten minutes.
 - a controller replay: an unreleased, unexpired claim of worker `controller` (an insertion probe or
   a head rebase replaying a chain). The restart releases it (`released` in the `restart` journal
   entry) and the replay is redone.
@@ -35,6 +38,13 @@ minutes), a head CI run executing on GitHub (its run id is recorded and the cont
 by polling, so a missed webhook costs at most one polling interval), and pending outbox entries
 (persisted and resumed). A dispatch still `sending` after the window below is left over from an earlier
 interruption; a restart does not make it worse, so it is reported as stale, not busy.
+
+Limits: this reads records, not the running process, so it lowers the odds of cutting work off
+rather than ruling it out. The pass running when SIGTERM arrives finishes and can start new work
+after the check; replays that take no controller claim (pre-rebase, sealing from a pre-rebase or a
+clean prefix, main-integration removal), a landing found by observing the canonical branch, and the
+main-integration and Forgejo PR-build dispatches are invisible here. A controller claim leaked by
+an unexpected exception reads as busy until it expires (`claim_ttl_seconds`, 900 s by default).
 """
 
 from __future__ import annotations
@@ -128,26 +138,42 @@ def check(db: sqlite3.Connection, now: float) -> tuple[list[str], list[str]]:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 2 or argv[1].startswith("-"):
-        print("usage: safepoint.py DATABASE", file=sys.stderr)
+    args = argv[1:]
+    require = args[:1] == ["--require-queue"]
+    if require:
+        args = args[1:]
+    if len(args) != 1 or args[0].startswith("-"):
+        print("usage: safepoint.py [--require-queue] DATABASE", file=sys.stderr)
         return 2
-    path = pathlib.Path(argv[1]).expanduser()
+    path = pathlib.Path(args[0]).expanduser()
     now = time.time()
     stamp = time.strftime("%H:%M:%S %Z", time.localtime(now))
     if not path.exists():
+        if require:
+            print(f"{stamp} unknown: no queue database at {path}, though the controller is running")
+            return 2
         print(f"{stamp} safe: no queue database at {path}, nothing to interrupt")
         return 0
+    db = None
     try:
-        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+        db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30, isolation_level=None)
         db.row_factory = sqlite3.Row
+        # One read transaction: every query below sees the same committed state.
+        db.execute("BEGIN")
         present = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not present & set(TABLES):
+            if require:
+                print(f"{stamp} unknown: {path} holds no queue records, though the controller is running")
+                return 2
             print(f"{stamp} safe: {path} holds no queue records, nothing to interrupt")
             return 0
         busy, info = check(db, now)
     except sqlite3.Error as error:
         print(f"{stamp} unknown: cannot read {path}: {error}")
         return 2
+    finally:
+        if db is not None:
+            db.close()
     for line in busy:
         print(f"busy: {line}")
     for line in info:

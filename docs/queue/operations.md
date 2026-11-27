@@ -264,8 +264,9 @@ while any of these is in flight:
   is recorded again on the next start, and with mixed sources the unsettled send is
   `landing-uncertain` until reconciled.
 - a CI dispatch: an attempt in `dispatch_state` `sending` sent in the last 5 minutes. Cut off
-  before GitHub's acknowledgement is recorded, its outcome stays unknown; normal passes never resend
-  it, so the head waits for the run to be discovered or for an operator's `retry_ci`.
+  before GitHub's acknowledgement is recorded, its outcome stays unknown: the head waits until the
+  run is discovered or, with none, `dispatch_timeout_seconds` (600) turns it into an infrastructure
+  outcome that is retried, delaying the head's CI by about ten minutes.
 - a controller replay: an unexpired, unreleased claim of worker `controller`, held while an
   insertion probe or a head rebase replays a chain. A restart releases it (`released` in the
   `restart` journal entry) and the replay starts again.
@@ -277,12 +278,21 @@ polling, so a missed webhook costs at most `polling_interval_seconds`), and pend
 (persisted and resumed). A dispatch still `sending` after 5 minutes was left by an earlier
 interruption; a restart does not make it worse, so it is reported as stale and does not block.
 
+The check reads records, not the running process, so it lowers the odds of cutting work off rather
+than ruling it out. The pass running when SIGTERM arrives finishes, and can start new work after
+the check. Some work leaves no record to see: replays that take no controller claim (pre-rebase,
+sealing from a pre-rebase or a clean prefix, main-integration removal), a landing found by
+observing the canonical branch rather than by a promotion, and the main-integration and Forgejo
+PR-build dispatches (cut off, these cost a duplicate CI run at worst). A controller claim leaked by
+an unexpected exception reads as busy until it expires (`claim_ttl_seconds`, 900 by default).
+
 `services/queue/release.sh safepoint [--database FILE]` runs the same check
-(`services/queue/safepoint.py`, which reads the database read-only, default
+(`services/queue/safepoint.py`, which reads the database read-only in one snapshot, default
 `~/TauCetiQueue-data/queue.sqlite3`) and prints a `busy:` line per operation and `info:` lines for
 the rest; it exits 0 at a safe point, 1 when busy and 2 when it cannot read the database. The
-installer runs it on the database `check-config` names, every 5 seconds, after building the release
-and before changing any unit, then restarts within seconds of a safe point. It prints the state
+installer runs it every 5 seconds on the database `check-config` names, after building the release
+and before changing any unit, and restarts within seconds of a safe point. While the controller
+runs, a missing database or one without the queue's tables counts as unreadable, so as busy. It prints the state
 whenever what is busy changes. Busy states last seconds, so a wait is normally short; after
 `--safepoint-timeout SECONDS` (default 1800; 0 waits as long as it takes) it exits 3 with the units
 and the running service unchanged. `--no-safepoint` restarts at once, for a controller wedged in a

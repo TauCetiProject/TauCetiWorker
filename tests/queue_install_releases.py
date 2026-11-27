@@ -195,7 +195,10 @@ class Releases(unittest.TestCase):
         (self.home / "content/HEAD").write_text("")
         (self.home / "TauCetiQueue-data/monitoring").mkdir(parents=True)
         (self.home / "TauCetiQueue-data/monitoring/token").write_text("")
-        (self.home / "TauCetiQueue-data/queue.sqlite3").write_text("")
+        # the controller's database with its real schema and no records
+        from tauceti_queue.store import Store
+
+        Store(str(self.home / "TauCetiQueue-data/queue.sqlite3")).close()
         self.releases = self.home / "TauCetiQueue-releases"
 
     # --- helpers ---------------------------------------------------------------------------------
@@ -594,6 +597,11 @@ class Releases(unittest.TestCase):
         self.assertIn("no safe point within 1s; tauceti-queue.service was not restarted", log)
         self.assertEqual(self.pid("tauceti-queue.service"), pid)
         self.assertEqual((self.units / "tauceti-queue.service").read_text(), unit)
+        # a running controller whose database cannot be found is not at a safe point either
+        (self.home / "TauCetiQueue-data/queue.sqlite3").unlink()
+        log = self.run_script("install.sh", "--safepoint-timeout", "1", "--wait", "5", expect=3)
+        self.assertIn("unknown: no queue database at", log)
+        self.assertEqual(self.pid("tauceti-queue.service"), pid)
 
     def test_controller_install_restarts_once_the_safe_point_comes(self):
         self.old_layout()

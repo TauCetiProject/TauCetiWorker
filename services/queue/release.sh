@@ -275,20 +275,21 @@ release_status() {
   done
 }
 
-# release_safepoint DATABASE: print what the controller has in flight; 0 at a safe point for a restart,
-# 1 busy, 2 when the database cannot be read (services/queue/safepoint.py).
+# release_safepoint [--require-queue] DATABASE: print what the controller has in flight; 0 at a safe
+# point for a restart, 1 busy, 2 when the database cannot be read (services/queue/safepoint.py).
 release_safepoint() {
-  python3 -I "$(dirname "${BASH_SOURCE[0]}")/safepoint.py" "$1"
+  python3 -I "$(dirname "${BASH_SOURCE[0]}")/safepoint.py" "$@"
 }
 
-# release_wait_safepoint DATABASE TIMEOUT: wait until the controller is at a safe point, checking every
+# release_wait_safepoint DATABASE TIMEOUT: wait until the running controller is at a safe point (a
+# missing or empty database counts as unreadable, so busy), checking every
 # $TAUCETI_QUEUE_SAFEPOINT_INTERVAL seconds (default 5) and printing the state whenever it changes.
 # TIMEOUT 0 waits as long as it takes. Returns 0 at a safe point, 3 when TIMEOUT passes first.
 release_wait_safepoint() {
   local database="$1" timeout="$2" interval="${TAUCETI_QUEUE_SAFEPOINT_INTERVAL:-5}" start=$SECONDS out status key last=""
   while :; do
     status=0
-    out="$(release_safepoint "$database" 2>&1)" || status=$?
+    out="$(release_safepoint --require-queue "$database" 2>&1)" || status=$?
     if [ "$status" = 0 ]; then
       _release_log "$(tail -n 1 <<<"$out")"
       return 0
@@ -316,7 +317,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       database="$HOME/TauCetiQueue-data/queue.sqlite3"
       if [ "${2:-}" = --database ] && [ -n "${3:-}" ]; then database="$3"
       elif [ -n "${2:-}" ]; then echo "usage: services/queue/release.sh safepoint [--database FILE]" >&2; exit 2; fi
-      release_safepoint "$database" ;;
+      release_safepoint "$database" ;;  # standalone: a missing database is a safe point
     *) echo "usage: services/queue/release.sh status|gc|safepoint [--database FILE]" >&2; exit 1 ;;
   esac
 fi
