@@ -327,6 +327,70 @@ class Retention(unittest.TestCase):
         self.assertEqual(self.collect()["snapshots_retained"], 1)
         self.assertTrue(path.exists())
 
+    def publish(self, outputs_jsonl, *, upload_rc=0):
+        """Run the native publisher on a stage holding `outputs_jsonl`, the upload stubbed, and write
+        its record where the background publisher writes it."""
+        from tauceti_queue import repair_publish
+
+        stage = Path(self.temp.name) / "stage"
+        stage.mkdir()
+        (stage / "outputs.jsonl").write_text(outputs_jsonl)
+        logdir = self.root / "tasks/7/logs/publications" / ("a" * 40)
+        logdir.mkdir(parents=True)
+        key = Path(self.temp.name) / "key"
+        key.write_text("id:secret")
+        settings = repair_publish.Settings(url="https://repair.invalid", key_file=key, upload_record="off")
+        put = {"rc": upload_rc, "seconds": 0.1, "timed_out": False, "log": "x"}
+        spec = {
+            "settings": settings.to_json(),
+            "frozen": {
+                "path": str(stage),
+                "artifacts": 1,
+                "bytes": 10,
+                "outputs_check": {},
+                "toolchain": "leanprover/lean4:v4.37.0-rc1",
+            },
+            "revision": "a" * 40,
+            "repository": "TauCetiProject/TauCeti",
+            "logdir": str(logdir),
+        }
+        with patch.object(repair_publish.repair_upload, "upload", return_value=put):
+            record = repair_publish.publish_frozen(spec)
+        (logdir / "publish.json").write_text(json.dumps(record))
+        self.assertFalse(stage.exists())
+        return record, logdir
+
+    def test_a_published_build_stays_in_the_pool_after_its_task_ends(self):
+        # Batch 1361 (27 Nov 2026): a preparation built and published the batch's outputs, ended without
+        # submitting, and the collection before the next task kept only the fetched base maps.
+        built = self.artifact(1, "olean")
+        self.output(1, {"o": [built.name]})
+        base = self.artifact(2)
+        # Two fetched base maps, older than the publication, as the task fetched them before it built.
+        self.snapshot(2, [[f"{2:016x}", base.name]], age=3600)
+        self.snapshot(3, [[f"{2:016x}", base.name], [f"{3:016x}", base.name]], age=3600)
+        record, logdir = self.publish("\n".join(map(json.dumps, ["2026-03-17", [f"{1:016x}", f"{9:016x}.ltar"]])))
+        self.assertTrue(record["published"])
+        self.assertTrue(record["local_snapshot"])
+        self.assertTrue((logdir / "repair-outputs.jsonl").is_file())
+        self.collect()
+        self.assertTrue(built.exists(), "the published build's own outputs were collected")
+        self.assertTrue((self.pool / f"outputs/TauCeti/{1:016x}.json").exists())
+
+    def test_an_invalid_published_map_is_not_kept_as_a_snapshot(self):
+        record, logdir = self.publish('"2026-03-17"\n["not a hash", "x"]\n')
+        self.assertTrue(record["published"])
+        self.assertFalse(record["local_snapshot"])
+        self.assertFalse((logdir / "repair-outputs.jsonl").exists())
+        self.assertEqual(self.collect()["state"], "collected")
+
+    def test_a_failed_upload_keeps_no_local_snapshot(self):
+        record, logdir = self.publish(
+            "\n".join(map(json.dumps, ["2026-03-17", [f"{1:016x}", f"{9:016x}.ltar"]])), upload_rc=1
+        )
+        self.assertFalse(record["published"])
+        self.assertFalse((logdir / "repair-outputs.jsonl").exists())
+
     def test_failed_publication_is_not_a_reusable_snapshot(self):
         path = self.artifact(1)
         self.write(
@@ -473,6 +537,26 @@ class Retention(unittest.TestCase):
         (logs / "repair-outputs.jsonl").write_text(
             "\n".join(map(json.dumps, ["2026-03-17", [f"{1:016x}", payload.name]]))
         )
+        (other / "tasks/7/cache-root.json").write_text(json.dumps({"root": str(self.root)}))
+        self.assertEqual(self.collect()["snapshots_retained"], 1)
+        self.assertTrue(payload.exists())
+
+    def test_another_pools_publications_take_no_snapshot_slot(self):
+        # A worker serves several batches: its tasks for another pool must not crowd this pool's maps out.
+        other = self.root.parent / "other"
+        cache.register(self.root, other)
+        payload = self.artifact(1)
+        self.snapshot(1, [[f"{1:016x}", payload.name]], age=3600)
+        for task in (8, 9):
+            logs = other / f"tasks/{task}/logs"
+            logs.mkdir(parents=True)
+            (logs / "publish.json").write_text(json.dumps({"published": True, "revision": f"{task:040x}"}))
+            (logs / "repair-outputs.jsonl").write_text(
+                "\n".join(map(json.dumps, ["2026-03-17", [f"{task:016x}", f"{task:016x}.ltar"]]))
+            )
+            (other / f"tasks/{task}/cache-root.json").write_text(
+                json.dumps({"root": str(self.root.parent / "elsewhere")})
+            )
         self.assertEqual(self.collect()["snapshots_retained"], 1)
         self.assertTrue(payload.exists())
 
