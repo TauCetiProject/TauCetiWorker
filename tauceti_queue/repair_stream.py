@@ -4,7 +4,8 @@ The first production repair spent its whole first ``lake build --iofail`` pass c
 before touching anything. Here the worker runs that build itself, in the background, in the task's
 worktree: the log goes to ``.tauceti-repair/build.log``, the worker tails it and appends each compiler
 error to ``.tauceti-repair/errors.jsonl`` as it appears (module, file, line, column, the message with
-its continuation lines, and the member whose squash commit last touched the file), and
+its continuation lines, and the member whose squash commit last touched the file; Lake's unlocated
+"bad import" and missing-source errors at line 1, column 0), and
 ``.tauceti-repair/build.lock`` exists while the build runs. The agent is launched at the first error,
 or when the build ends, whichever comes first, with a "Build in progress" prompt section naming the
 files and the rule that exactly one ``lake build`` runs at a time: no build of its own while the lock
@@ -37,7 +38,7 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from tauceti_queue import repair_sandbox, repair_tools
-from tauceti_queue.diagnostics import ANSI, LAKE, PATH, SOURCE, STAMP, module_of
+from tauceti_queue.diagnostics import ANSI, LAKE, MODULE, PATH, SOURCE, STAMP, module_of, path_of
 
 BUILD_LOG = "build.log"
 ERRORS_FILE = "errors.jsonl"
@@ -57,6 +58,19 @@ SUMMARY = ("Some required targets logged failures:", "Build completed", "Build f
 CHANGED_HEAD = "error: module source file:"
 CHANGED_TAIL = "changed since build began; rerun the build"
 RERUN = "rerun"
+# Lake's errors for modules it could not read, which name no line. The importer of a missing module:
+#   error: TauCeti/A.lean: bad import 'TauCeti.B'
+# and the missing module itself, after its job line:
+#   ✖ [12/40] Running TauCeti.B
+#   error: no such file or directory (error code: 2)
+#     file: /path/to/worktree/TauCeti/B.lean
+# Neither stops the build, which ends with only the summary's failed targets naming them, so they are
+# recorded at line 1, column 0 of the file with ``unlocated`` set, so two of them in one file stay apart.
+BAD_IMPORT = re.compile(r"^error: (" + PATH + r"): (bad import '[^']{1,512}')$")
+RUNNING = re.compile(r"^✖\s*\[\d+/\d+\] Running (" + MODULE + r")(?: \([^)]*\))?$")
+NO_SUCH_FILE = "error: no such file or directory (error code: 2)"
+MISSING_FILE = re.compile(r"^\s+file: (\S{1,4096})$")
+MISSING_MESSAGE = "no such file or directory: Lake could not read this module's source, which another module imports"
 
 
 class ErrorParser:
@@ -73,6 +87,8 @@ class ErrorParser:
         self._seen: set[tuple] = set()
         self._roots = [] if root is None else list(dict.fromkeys([Path(root), Path(root).resolve()]))
         self._changed: list[str] | None = None  # the lines after CHANGED_HEAD, while one is being read
+        self._running: str | None = None  # the module of the last `Running` job line
+        self._missing = False  # the last line was NO_SUCH_FILE
 
     def feed(self, raw: str) -> list[dict]:
         line = STAMP.sub("", ANSI.sub("", raw.rstrip("\r\n").lstrip("﻿")))
@@ -84,10 +100,26 @@ class ErrorParser:
             if path is not None and line.strip() == CHANGED_TAIL:
                 return self._rerun(path)
             # Not the expected shape: read the line as any other.
+        if self._missing:
+            self._missing = False
+            missing = MISSING_FILE.match(line)
+            path = self._missing_path(missing.group(1)) if missing else None
+            if path is not None:
+                return self._unlocated(path, MISSING_MESSAGE)
+            # Not the expected shape: read the line as any other.
+        if JOB_LINE.match(line):
+            running = RUNNING.match(line)
+            self._running = running.group(1) if running else None
         if line.rstrip() == CHANGED_HEAD:
             closed = self._close()
             self._changed = []
             return closed
+        if line.rstrip() == NO_SUCH_FILE:
+            self._missing = True
+            return self._close()
+        bad = BAD_IMPORT.match(line)
+        if bad:
+            return self._unlocated(bad.group(1), bad.group(2))
         source = SOURCE.match(line) or LAKE.match(line)
         if source and len(source.group(1)) <= 512:
             closed = self._close()
@@ -137,6 +169,28 @@ class ErrorParser:
         }
         self.reruns.append(entry)
         return [entry]
+
+    def _missing_path(self, printed: str) -> str | None:
+        """The project path of a missing file Lake printed (absolute, in the build's worktree), or None
+        when it is no project module: relative to a root, or else the path of the `Running` module."""
+        for root in self._roots:
+            try:
+                path = Path(printed).relative_to(root).as_posix()
+            except ValueError:
+                continue
+            return path if re.fullmatch(PATH, path) else None
+        if self._running is not None and printed.endswith("/" + path_of(self._running)):
+            return path_of(self._running)
+        return None
+
+    def _unlocated(self, path: str, message: str) -> list[dict]:
+        closed = self._close()
+        if ("unlocated", path, message) in self._seen:
+            return closed
+        self._seen.add(("unlocated", path, message))
+        error = {"module": module_of(path), "file": path, "line": 1, "column": 0, "message": message, "unlocated": True}
+        self.errors.append(error)
+        return [*closed, error]
 
     def _close(self) -> list[dict]:
         error, self._open = self._open, None
