@@ -481,8 +481,8 @@ def choose_model(
 
     This is a pure READ: choosing a model never spends quota. In particular an `auto` selection that
     inspects Claude and then picks codex makes no Claude request. `renew` is separate from that promise
-    and off by default — it lets a caller that is about to run something rotate an expiring Claude
-    access token, which spends no quota but does consume the operator's single-use refresh token."""
+    and off by default — it lets a caller that is about to run something rotate an expiring Claude or
+    Codex access token, which spends no quota but does consume the operator's single-use refresh token."""
     if quota_cmd:
         import shlex
 
@@ -521,7 +521,10 @@ def _credential_hint(agent: str, prov: Provider | None) -> str:
     if "usage HTTP 401" not in error and "token expired; refresh left to the operator" not in error:
         return ""
     if agent != "claude":
-        return ". Run `codex login` to renew the credential"
+        return (
+            ". Run `codex login` to renew the credential, or --auto-refresh to let an unattended worker"
+            " rotate it (see docs/quota.md)"
+        )
     usage = claude_usage_credentials()
     if usage is not None:
         return (

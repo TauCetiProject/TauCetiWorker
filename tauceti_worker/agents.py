@@ -50,6 +50,7 @@ from .processes import run as run_process
 from .quota import (
     Quota,
     _claude_keychain_creds_interactive,
+    _codex_store_setting,
     _read_json_file,
     _safe_exists,
     _write_json_atomic,
@@ -271,8 +272,14 @@ def _codex_model_probe(cfg: Config, model: str) -> subprocess.CompletedProcess[s
         "--ephemeral",
         "--ignore-user-config",
         "--ignore-rules",
-        _CODEX_MODEL_ACCESS_PROMPT,
     ]
+    # --ignore-user-config also drops the user's credential store, leaving the system or workspace
+    # default to choose it. Repeat an explicit `file` only when no project layer above a launch
+    # directory sets the store: a -c override outranks project layers, which authoring honours.
+    quota = Quota(cfg)
+    if _codex_store_setting(codex_dir(cfg.home) / "config.toml") == "file" and quota._codex_project_store() is None:
+        command += ["-c", 'cli_auth_credentials_store="file"']
+    command.append(_CODEX_MODEL_ACCESS_PROMPT)
     try:
         return run_process(
             command,
