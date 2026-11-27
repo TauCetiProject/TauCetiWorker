@@ -32,7 +32,8 @@ On the queue host these commands run as systemd user units from their own releas
 installs `tauceti-queue-monitoring.service` (the live publisher above),
 `tauceti-queue-task-activity.service` (the repair-phase observer below), and
 `tauceti-queue-monitoring-history.service` with its hourly timer (the history report below), and
-`tauceti-queue-forgejo-team-sync.timer` (docs/forgejo-worker.md, "Claim access for contributor fleets"),
+`tauceti-queue-forgejo-team-sync.timer` and `tauceti-queue-claims-access.timer` (docs/forgejo-worker.md,
+"Claim access for contributor fleets"),
 then restarts the two long-running units. Host-specific extra arguments, such as retired workers' task
 roots, go in `~/.config/tauceti-queue/monitoring-environment` as `TAUCETI_QUEUE_MONITORING_ARGS`
 (`services/queue/monitoring-environment.example`). Never use systemd drop-ins for these units, and
@@ -164,6 +165,12 @@ it with the forges' opening times for the health page's time-to-merge chart. It
 reads the same ledger snapshot rules as `/statistics` and makes no provider calls.
 Like `/status`, which already lists waiting inputs of every source with their
 numbers and approval times, it covers all of the controller's sources.
+
+`GET /claims/forgejo-landers` serves `~/TauCetiQueue-data/claims-forgejo-landers.json`
+(`tauceti-queue.claims-forgejo-landers/v1`) as `tauceti_queue.claims_access` last wrote it: the
+GitHub user ID of each Forgejo author the queue landed, with one landed pull request each, for
+TauCeti's `claims-access` workflow (docs/forgejo-worker.md, "Claim access for contributor
+fleets"). The server only reads the file, and answers 503 until a well-formed one exists.
 
 Live repair activity can be sampled independently of worker checkpoints with
 `python -m tauceti_queue.task_activity --root ROOT --follow` (the provided user
