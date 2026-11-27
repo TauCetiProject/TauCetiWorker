@@ -1942,7 +1942,7 @@ class RebaseArtifacts(Fixture):
         sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
         self.raw["onto"] = self.onto = moved
         cfg = self.config(lookahead_helpers=1)
-        with patch.dict(os.environ, {"TAUCETI_REPAIR_LEAN_JOB_BUDGET": "10"}):
+        with patch.dict(os.environ, {"TAUCETI_REPAIR_LEAN_JOB_BUDGET": "18"}):
             outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2", f"{PROJECT}#3"])
@@ -1951,13 +1951,13 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(len(calls), 2, "one agent per conflict")
         ahead = [c for c in calls if f"PR #3's commit `{self.content.members[2]['commit'][:12]}`" in c["prompt"]]
         self.assertEqual(len(ahead), 1)
-        # The serial agent keeps the per-build cap; the helper gets what the budget of 10 leaves, in
+        # The serial agent keeps the per-build cap; the helper gets what the budget of 18 leaves, in
         # its agent's environment and in the one for the builds it runs itself.
         self.assertEqual(ahead[0]["env"]["TAUCETI_REPAIR_LEAN_JOBS"], "2")
         jobs = list((cfg.tasks_dir / "1" / "lookahead").glob("*/job.json"))
         self.assertEqual(len(jobs), 1)
         self.assertEqual(json.loads(jobs[0].read_text())["env_lake"]["TAUCETI_REPAIR_LEAN_JOBS"], "2")
-        self.assertEqual([c["env"]["TAUCETI_REPAIR_LEAN_JOBS"] for c in calls if c is not ahead[0]], ["8"])
+        self.assertEqual([c["env"]["TAUCETI_REPAIR_LEAN_JOBS"] for c in calls if c is not ahead[0]], ["16"])
         self.assertNotIn(f"PR #2's commit `{self.content.members[1]['commit'][:12]}`", ahead[0]["prompt"])
         self.assertEqual(len(outcome["agent"]), 2, "the lookahead's agent run is recorded with the task's")
         one, two, three = self.submitted_chain()
@@ -1986,7 +1986,7 @@ class RebaseArtifacts(Fixture):
         least)."""
         from tauceti_queue import repair_lookahead, repair_sandbox
 
-        self.assertEqual(repair_sandbox.DEFAULT_LEAN_JOB_BUDGET, 16)
+        self.assertEqual(repair_sandbox.DEFAULT_LEAN_JOB_BUDGET, 24)
         head = types.SimpleNamespace(kind="rebase_conflict", extra={})
         background = types.SimpleNamespace(kind="rebase_conflict", extra={"background": True})
 
@@ -1997,20 +1997,20 @@ class RebaseArtifacts(Fixture):
             }
             return repair_lookahead.plan(self.config(lookahead_helpers=helpers), task, env)
 
-        self.assertEqual(plan(16), (8, 1), "the defaults: 8 + 8 x 1 = 16 jobs, not 8 + 16 x 8 = 136")
+        self.assertEqual(plan(16), (8, 1), "the defaults: 16 + 8 x 1 = 24 jobs, not 16 + 16 x 16 = 272")
         self.assertEqual(plan(16, background), (8, 1))
         self.assertEqual(plan(2), (2, 4))
-        self.assertEqual(plan(1), (1, 8), "never above the per-build cap")
-        self.assertEqual(plan(3, budget="32"), (3, 8))
+        self.assertEqual(plan(1, budget="40"), (1, 16), "never above the per-build cap")
+        self.assertEqual(plan(3, budget="40"), (3, 8))
         self.assertEqual(plan(16, budget="32"), (16, 1))
-        self.assertEqual(plan(4, budget="13"), (4, 1))
-        self.assertEqual(plan(16, budget="8"), (1, 1), "a budget at the per-build cap still leaves one helper")
+        self.assertEqual(plan(4, budget="21"), (4, 1))
+        self.assertEqual(plan(16, budget="16"), (1, 1), "a budget at the per-build cap still leaves one helper")
         self.assertEqual(plan(16, jobs="4", budget="12"), (8, 1))
-        self.assertEqual(plan(16, budget="0"), (16, 8), "no budget: the configured helpers at the per-build cap")
+        self.assertEqual(plan(16, budget="0"), (16, 16), "no budget: the configured helpers at the per-build cap")
         self.assertEqual(plan(16, jobs="0"), (16, None), "uncapped builds: no budget to share")
         self.assertEqual(plan(16, budget="many"), (8, 1), "an unreadable budget takes the default")
         for helpers in range(1, 20):
-            for budget in range(9, 40):
+            for budget in range(repair_sandbox.DEFAULT_LEAN_JOBS + 1, 60):
                 count, jobs = plan(helpers, budget=str(budget))
                 self.assertLessEqual(count, helpers)
                 self.assertLessEqual(repair_sandbox.DEFAULT_LEAN_JOBS + count * jobs, budget)

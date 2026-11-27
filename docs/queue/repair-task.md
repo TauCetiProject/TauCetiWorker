@@ -498,16 +498,18 @@ has a time budget holds because the service re-exposes the task.
    warning for every build and reporting the sandbox as DISABLED in `--check`.
    Every offline sandboxed command (the worker's builds, the agent's `lake`, `lean` and scoped
    builds, and `TAUCETI_QUEUE_SANDBOX=0` builds too) runs with `LEAN_NUM_THREADS` set to the repair
-   Lean job cap, `TAUCETI_REPAIR_LEAN_JOBS` (default 8, `0` for none; decision 219, option B). Lake
+   Lean job cap, `TAUCETI_REPAIR_LEAN_JOBS` (default 16, `0` for none; decisions 219 and 231, option B). Lake
    has no jobs flag: its build tasks share the Lean runtime's thread pool, so the cap is the number of
    `lean` processes a build runs at once. Uncapped on tauchonki2's 96 cores, one build ran 55 and
    reached 42 GB RSS plus 63 GB swap (about 0.75 to 1 GB per job). The repair slice's `memory.high`
    there is about 52 GB for three workers, and one may be running the audit (about 33 GB) under the
-   heavy-check lock while the other two build: 8 jobs (6 to 8 GB a build) keep that 45 to 49 GB.
+   heavy-check lock while the other two build: 8 jobs (6 to 8 GB a build) kept that 45 to 49 GB.
+   At 8 a whole-library prepare build ran at about 225 modules a minute against about 700 uncapped;
+   with the docs slot off the host and the full lint run by one worker at a time, the cap is 16.
    A rebase task's lookahead helpers build concurrently with the serial path, so the task as a whole
-   has a budget, `TAUCETI_REPAIR_LEAN_JOB_BUDGET` (default 16, `0` for none): the serial build keeps
+   has a budget, `TAUCETI_REPAIR_LEAN_JOB_BUDGET` (default 24, `0` for none): the serial build keeps
    the per-build cap and the helpers share the rest, at most that many helpers at an equal share
-   each (by default 8 helpers at 1 job each, where 16 helpers at 8 could have run 128 jobs).
+   each (by default 8 helpers at 1 job each, where 16 helpers at 16 could have run 256 jobs).
    Final verification's build and the drivers' builds are capped; cache fetches and the audit and lint
    drivers themselves are not, since `lint-env.sh` picks its shards' threads and the heavy-check lock
    bounds those checks.

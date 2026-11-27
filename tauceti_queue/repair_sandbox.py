@@ -62,17 +62,19 @@ PRESSURE_WRAPPER = "/opt/tauceti/tauceti-lean"
 # per job. The repair slice's ``memory.high`` there is about 52 GB, shared by three workers, and one
 # of them may hold the heavy-check lock with the audit at about 33 GB while the other two build:
 # 52 - 33 leaves about 19 GB, less the workers' and agents' own few GB, for two builds, so 8 jobs
-# each (6 to 8 GB a build, 45 to 49 GB with the audit). ``TAUCETI_REPAIR_LEAN_JOBS`` overrides the
-# default; 0 leaves the thread pool uncapped.
+# each (6 to 8 GB a build, 45 to 49 GB with the audit). At 8 a whole-library prepare build ran at
+# about 225 modules a minute against about 700 uncapped, and since then the docs slot has left the
+# host and only one worker runs the full lint at a time, so the default is 16 (decision 231, option
+# B). ``TAUCETI_REPAIR_LEAN_JOBS`` overrides the default; 0 leaves the thread pool uncapped.
 LEAN_JOBS_VARIABLE = "TAUCETI_REPAIR_LEAN_JOBS"
-DEFAULT_LEAN_JOBS = 8
+DEFAULT_LEAN_JOBS = 16
 # The cap on concurrent Lean jobs across one task's concurrent builds: the serial path's build and
 # its lookahead helpers' builds, each in a worktree of its own (``repair_lookahead``). Without it a
-# task's 16 helpers at 8 jobs each could run 128 ``lean`` processes beside the serial build's 8. The
-# serial build keeps the per-build cap and the helpers share the rest (``repair_lookahead.plan``),
-# so the default, 16, is the serial build's 8 plus 8 helpers at 1 job each. 0 turns it off.
+# task's 16 helpers at 16 jobs each could run 256 ``lean`` processes beside the serial build's 16.
+# The serial build keeps the per-build cap and the helpers share the rest (``repair_lookahead.plan``),
+# so the default, 24, is the serial build's 16 plus 8 helpers at 1 job each. 0 turns it off.
 LEAN_JOB_BUDGET_VARIABLE = "TAUCETI_REPAIR_LEAN_JOB_BUDGET"
-DEFAULT_LEAN_JOB_BUDGET = 16
+DEFAULT_LEAN_JOB_BUDGET = 24
 
 # Read-only system roots, bound when present. A symlinked root (``/bin -> usr/bin``) is recreated as
 # the same symlink, the way CI's ``--symlink usr/bin /bin`` does.

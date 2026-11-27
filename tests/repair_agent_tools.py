@@ -250,7 +250,7 @@ class LeanJobs(Fixture):
 
     def test_an_offline_build_gets_the_default_cap(self):
         self.assertEqual(self.setenv(self.argv(self.env))["LEAN_NUM_THREADS"], str(repair_sandbox.DEFAULT_LEAN_JOBS))
-        self.assertEqual(repair_sandbox.DEFAULT_LEAN_JOBS, 8)
+        self.assertEqual(repair_sandbox.DEFAULT_LEAN_JOBS, 16)
 
     def test_the_setting_overrides_the_cap_and_zero_removes_it(self):
         variable = repair_sandbox.LEAN_JOBS_VARIABLE
@@ -258,11 +258,14 @@ class LeanJobs(Fixture):
         self.assertNotIn("LEAN_NUM_THREADS", self.setenv(self.argv({**self.env, variable: "0"})))
         for bad in ("many", "-3", "2.5"):
             with self.assertLogs("tauceti_queue.repair_sandbox", "WARNING"):
-                self.assertEqual(self.setenv(self.argv({**self.env, variable: bad}))["LEAN_NUM_THREADS"], "8")
+                self.assertEqual(
+                    self.setenv(self.argv({**self.env, variable: bad}))["LEAN_NUM_THREADS"],
+                    str(repair_sandbox.DEFAULT_LEAN_JOBS),
+                )
 
     def test_the_build_environment_never_reaches_the_sandbox(self):
         argv = self.argv({**self.env, "LEAN_NUM_THREADS": "96"})
-        self.assertEqual(self.setenv(argv)["LEAN_NUM_THREADS"], "8")
+        self.assertEqual(self.setenv(argv)["LEAN_NUM_THREADS"], str(repair_sandbox.DEFAULT_LEAN_JOBS))
 
     def test_fetches_and_opted_out_checks_are_not_capped(self):
         self.assertNotIn("LEAN_NUM_THREADS", self.setenv(self.argv(self.env, network=True)))
@@ -284,7 +287,7 @@ class LeanJobs(Fixture):
             return [a for a in argv if a.startswith("LEAN_NUM_THREADS=")]
 
         with patch.dict(os.environ, {repair_sandbox.DISABLE_VARIABLE: "0"}):
-            self.assertEqual(assignments(), ["LEAN_NUM_THREADS=8"])
+            self.assertEqual(assignments(), [f"LEAN_NUM_THREADS={repair_sandbox.DEFAULT_LEAN_JOBS}"])
             self.assertEqual(assignments(cap_jobs=False), [])
             self.assertEqual(assignments(network=True), [])
             # extra_env reaches the command through the caller's process environment: not overridden.
@@ -327,7 +330,7 @@ class LeanJobs(Fixture):
 
     def test_the_agent_inherits_the_workers_cap(self):
         variable = repair_sandbox.LEAN_JOBS_VARIABLE
-        for value, expected in ((None, "8"), ("12", "12"), ("0", "0")):
+        for value, expected in ((None, "16"), ("12", "12"), ("0", "0")):
             env = {**self.env, **({variable: value} if value is not None else {})}
             with patch.dict(os.environ, env, clear=True):
                 self.assertEqual(repair.isolation_env(self.root, {}, "claude")[variable], expected)
