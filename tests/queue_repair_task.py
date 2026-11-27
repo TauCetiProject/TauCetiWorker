@@ -3498,6 +3498,43 @@ class Serve(Fixture):
         self.assertEqual(repair_task.retry_deliveries(cfg, self.client(cfg)), [])
         self.assertEqual(len(self.agent_calls()), 1)
 
+    def test_an_installer_hold_stops_new_claims_until_it_is_lifted(self):
+        """install-repair.sh --when-idle restarts only once worker.json echoes its hold's token: from
+        then on the worker claims nothing, and it resumes when the hold goes."""
+        cfg = self.config(poll_seconds=0.1)
+        hold = repair_task.claim_hold_path(cfg)
+        hold.parent.mkdir(parents=True, exist_ok=True)
+        hold.write_text(json.dumps({"pid": os.getpid(), "token": "t1"}))
+        stop = repair_task.Stop()
+        thread, _ = self.serve_in_thread(cfg, stop)
+        self.wait_for(
+            lambda: repair_task.heartbeat_path(cfg).exists() and self.heartbeat(cfg).get("hold") == "t1",
+            "the worker confirms the hold",
+        )
+        beat = self.heartbeat(cfg)
+        self.assertEqual(beat["state"], "held")
+        self.assertEqual(beat["claim_hold"], str(hold))
+        time.sleep(0.5)  # several polls
+        self.assertEqual(self.service.claim_attempts, [], "no claim while held")
+        hold.unlink()
+        self.wait_for(lambda: self.service.claim_attempts, "the worker claims again once the hold is lifted")
+        self.wait_for(lambda: "hold" not in self.heartbeat(cfg), "the heartbeat drops the hold")
+        stop.set("done")
+        thread.join(30)
+
+    def test_a_hold_whose_installer_is_gone_is_ignored_and_an_unreadable_one_holds(self):
+        cfg = self.config()
+        hold = repair_task.claim_hold_path(cfg)
+        hold.parent.mkdir(parents=True, exist_ok=True)
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        hold.write_text(json.dumps({"pid": dead.pid, "token": "gone"}))
+        self.assertIsNone(repair_task.active_claim_hold(cfg))
+        hold.write_text('{"pid": ')
+        self.assertEqual(repair_task.active_claim_hold(cfg), {"token": None})
+        hold.write_text(json.dumps({"pid": os.getpid(), "token": "live"}))
+        self.assertEqual(repair_task.active_claim_hold(cfg)["token"], "live")
+
     def test_stop_before_a_claim_does_not_claim(self):
         cfg = self.config(poll_seconds=0.1)
         stop = repair_task.Stop()

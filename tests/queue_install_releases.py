@@ -19,6 +19,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -432,6 +433,89 @@ class Releases(unittest.TestCase):
         self.assertNotEqual(self.pid("tauceti-queue-repair@2.service"), pid)
         [release] = self.release_dirs(second)
         self.assertEqual(self.cwd("tauceti-queue-repair@2.service"), str(release))
+
+    def holding_worker(self, unit="tauceti-queue-repair@2.service", root="repair-2"):
+        """Make the running fake worker advertise a claim hold, as serve's heartbeat does; return its
+        heartbeat path and the hold file it names."""
+        heartbeat = self.home / "TauCetiQueue-data" / root / "worker.json"
+        hold = heartbeat.parent / "claim-hold.json"
+        beat = json.loads(heartbeat.read_text())
+        self.assertEqual(beat["pid"], self.pid(unit))
+        heartbeat.write_text(json.dumps({**beat, "claim_hold": str(hold)}))
+        self.env["TAUCETI_INSTALL_HOLD_POLL"] = "1"
+        return heartbeat, hold
+
+    def test_when_idle_restarts_only_after_the_worker_confirms_the_hold(self):
+        """The installer holds new claims and restarts only once worker.json echoes its token and the
+        queue shows no claim: a claim taken just before the hold landed is waited for, not cut off."""
+        import sqlite3
+
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        unit = "tauceti-queue-repair@2.service"
+        pid = self.pid(unit)
+        second = self.commit("second")
+        heartbeat, hold = self.holding_worker()
+        self.claims()
+        seen: dict = {}
+
+        def worker():
+            """The running worker: it has just claimed when the hold appears, so it confirms the hold
+            only after that task ends, and the queue then releases the claim."""
+            deadline = time.monotonic() + 60
+            while not hold.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            token = json.loads(hold.read_text())["token"]
+            seen["token"] = token
+            with sqlite3.connect(self.home / "TauCetiQueue-data/queue.sqlite3") as db:
+                db.execute(
+                    "INSERT INTO claims (operation, worker, task_id, expires_at, released_at)"
+                    " VALUES ('repair', 'repair-2@host', 8, ?, NULL)",
+                    (time.time() + 900,),
+                )
+            time.sleep(2.5)
+            seen["pid_before_ack"] = self.pid(unit)
+            beat = json.loads(heartbeat.read_text())
+            heartbeat.write_text(json.dumps({**beat, "state": "held", "hold": token}))
+            time.sleep(2.5)
+            seen["pid_while_claimed"] = self.pid(unit)
+            with sqlite3.connect(self.home / "TauCetiQueue-data/queue.sqlite3") as db:
+                db.execute("UPDATE claims SET released_at = ? WHERE task_id = 8", (time.time(),))
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--wait", "10")
+        thread.join(10)
+        self.assertEqual(seen["pid_before_ack"], pid, "not restarted before the worker confirmed the hold")
+        self.assertEqual(seen["pid_while_claimed"], pid, "not restarted while the worker held a claim")
+        self.assertIn(f"holding new claims for {unit}", log)
+        self.assertIn("it has not confirmed the hold yet", log)
+        self.assertIn("repair-2@host holds claim", log)
+        self.assertIn(f"{unit} confirms the hold and holds no claim", log)
+        self.assertIn("lifted the hold", log)
+        self.assertNotEqual(self.pid(unit), pid)
+        [release] = self.release_dirs(second)
+        self.assertEqual(self.cwd(unit), str(release))
+        self.assertFalse(hold.exists(), "the hold is lifted after the restart")
+
+    def test_when_idle_timeout_lifts_a_hold_the_worker_never_confirmed(self):
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        unit = "tauceti-queue-repair@2.service"
+        pid = self.pid(unit)
+        self.commit("second")
+        _, hold = self.holding_worker()
+        self.claims()
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--idle-timeout", "3", expect=3)
+        self.assertIn("it has not confirmed the hold yet (worker.json shows state idle)", log)
+        self.assertIn("was not restarted", log)
+        self.assertEqual(self.pid(unit), pid)
+        self.assertFalse(hold.exists(), "the worker resumes claiming when the installer gives up")
+
+    def test_when_idle_warns_that_a_worker_without_holds_is_best_effort(self):
+        self.run_script("install-repair.sh", "--instance", "2", "--wait", "10")
+        self.claims()
+        log = self.run_script("install-repair.sh", "--instance", "2", "--when-idle", "--wait", "10")
+        self.assertIn("predates claim holds", log)
+        self.assertNotIn("holding new claims", log)
 
     def test_when_idle_needs_a_restart_and_a_readable_database(self):
         log = self.run_script("install-repair.sh", "--when-idle", "--no-restart", expect=1)
