@@ -154,9 +154,13 @@ class Lookahead:
 
         self.providers, _skipped = repair_task.select_providers(cfg)
         helpers, jobs = plan(cfg, task, self.environment)
+        # Each helper's agent and its builds take this cap (``repair.agent_environment``), and so do the
+        # builds the helper runs itself with ``env_lake`` (the numproj pre-pass, ``repair_numproj``).
+        self.helper_env_lake = env_lake
         if jobs is not None:
-            # Each helper's agent and its builds take this cap (``repair.agent_environment``).
             self.environment[repair_sandbox.LEAN_JOBS_VARIABLE] = str(jobs)
+            if env_lake is not None:
+                self.helper_env_lake = {**env_lake, repair_sandbox.LEAN_JOBS_VARIABLE: str(jobs)}
         log(f"lookahead: {helpers} helper(s), {jobs or 'uncapped'} Lean job(s) per helper build")
         self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=helpers, thread_name_prefix="lookahead")
         if not cfg.seed_packages:
@@ -306,7 +310,7 @@ class Lookahead:
             "logdir": str(logdir),
             "state_dir": str(directory),
             "result": str(result_path),
-            "env_lake": self.env_lake,
+            "env_lake": self.helper_env_lake,
             "artifacts": self.artifacts,
             "providers": list(providers),
         }

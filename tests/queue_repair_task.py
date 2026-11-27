@@ -1951,8 +1951,12 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(len(calls), 2, "one agent per conflict")
         ahead = [c for c in calls if f"PR #3's commit `{self.content.members[2]['commit'][:12]}`" in c["prompt"]]
         self.assertEqual(len(ahead), 1)
-        # The serial agent keeps the per-build cap; the helper gets what the budget of 10 leaves.
+        # The serial agent keeps the per-build cap; the helper gets what the budget of 10 leaves, in
+        # its agent's environment and in the one for the builds it runs itself.
         self.assertEqual(ahead[0]["env"]["TAUCETI_REPAIR_LEAN_JOBS"], "2")
+        jobs = list((cfg.tasks_dir / "1" / "lookahead").glob("*/job.json"))
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(json.loads(jobs[0].read_text())["env_lake"]["TAUCETI_REPAIR_LEAN_JOBS"], "2")
         self.assertEqual([c["env"]["TAUCETI_REPAIR_LEAN_JOBS"] for c in calls if c is not ahead[0]], ["8"])
         self.assertNotIn(f"PR #2's commit `{self.content.members[1]['commit'][:12]}`", ahead[0]["prompt"])
         self.assertEqual(len(outcome["agent"]), 2, "the lookahead's agent run is recorded with the task's")
@@ -8227,6 +8231,18 @@ class NumprojImports(NumprojBase):
         builds = [c for c in self.lake_calls() if c.startswith("build")]
         self.assertIn("build TauCeti.A", builds)
         self.assertFalse([b for b in builds if "Mathlib" in b], builds)
+
+    def test_the_tools_concurrent_runs_share_the_lean_job_cap(self):
+        """The tool starts its own ``lean`` processes, so its runs at once share the repair Lean job cap."""
+        with patch.dict(os.environ, {repair_sandbox.LEAN_JOBS_VARIABLE: "6"}):
+            self.run_task(self.IMPORTING + NEW_P)
+        calls = self.numproj_calls()
+        self.assertTrue(calls)
+        jobs = [int(re.search(r"--jobs (\d+)", call).group(1)) for call in calls]
+        self.assertEqual(sum(jobs), 6, calls)
+        self.assertEqual(repair_numproj.tool_jobs({repair_sandbox.LEAN_JOBS_VARIABLE: "8"}, 2), 4)
+        self.assertEqual(repair_numproj.tool_jobs({repair_sandbox.LEAN_JOBS_VARIABLE: "1"}, 2), 1)
+        self.assertEqual(repair_numproj.tool_jobs({repair_sandbox.LEAN_JOBS_VARIABLE: "0"}, 2), 4)
 
     def test_the_header_is_parsed_with_comments_and_modifiers(self):
         text = (

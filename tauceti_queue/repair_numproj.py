@@ -50,6 +50,8 @@ TIMEOUT_SECONDS = 1800.0
 # copies); a larger Lean file is left to the agent. TauCeti's largest sources are well below this.
 MAX_BYTES = 256_000
 LOG_BYTES = 64_000  # of a tool log, for the sites it reports to the agent
+# The tool's concurrent elaborations when the builds are uncapped; otherwise the repair Lean job cap
+# (``repair_sandbox.lean_jobs``), shared by the groups that run at once (``tool_jobs``).
 JOBS = 8
 # A numeric projection as written: digits after a `.` that follows an identifier or a closing bracket.
 # A file without one has nothing for the tool to rewrite.
@@ -235,10 +237,18 @@ def _read(directory: int, name: str) -> bytes:
         return handle.read(2 * MAX_BYTES + 1)
 
 
-def _run_tool(worktree: Path, env: dict, tool: Path, files: list[Path], cache: Path, log: Path, timeout: float) -> dict:
+def tool_jobs(env: dict | None, groups: int) -> int:
+    """Each of ``groups`` concurrent tool runs' ``--jobs``: the tool starts its own ``lean``
+    processes, which ``LEAN_NUM_THREADS`` does not bound, so the runs share the caller's cap."""
+    return max(1, (repair_sandbox.lean_jobs(env) or JOBS) // max(1, groups))
+
+
+def _run_tool(
+    worktree: Path, env: dict, tool: Path, files: list[Path], cache: Path, log: Path, timeout: float, jobs: int = JOBS
+) -> dict:
     from tauceti_queue import repair
 
-    argv = ["python3", "-I", str(tool / "numproj_fix.py"), "--jobs", str(JOBS), *[str(f) for f in files]]
+    argv = ["python3", "-I", str(tool / "numproj_fix.py"), "--jobs", str(jobs), *[str(f) for f in files]]
     extra = {"TAUCETI_NUMPROJ_CACHE": str(cache)}
     run_env = {**env, **extra}
     try:
@@ -392,8 +402,10 @@ def rewrite_blobs(
             for target, data in zip(files[group], blobs, strict=True):
                 target.write_bytes(data)
 
+        jobs = tool_jobs(env, len(groups))
+
         def run(group: str) -> dict:
-            return _run_tool(worktree, env, copy, files[group], cache, logs[group], timeout)
+            return _run_tool(worktree, env, copy, files[group], cache, logs[group], timeout, jobs)
 
         with ThreadPoolExecutor(max_workers=len(groups)) as pool:  # each group elaborates its own files
             runs = dict(zip(groups, pool.map(run, groups), strict=True))
