@@ -64,9 +64,10 @@ round under the ordinary rebase budget, with the request as its brief, even when
 no conflict. Unset, no Forgejo recovery request is trusted.
 
 The same IDs are the only accounts whose `build` commit status a worker trusts on Forgejo. The
-merge queue runs TauCeti's pr-build on GitHub Actions for each Forgejo PR head that is not
-`self-tested` and posts the result as `build` (TauCeti decision 215). With the IDs set and
-`TAUCETI_FORGEJO_PR_CI=1` (turn it on once the queue posts `build`), a survey
+merge queue builds each Forgejo PR head that is not `self-tested` on the project's self-hosted
+Fleet PR runners, dispatched through GitHub Actions as a `main-integration` build
+(`tauceti_queue/forgejo_pr_build.py`), and posts the result as `build` (TauCeti decision 215).
+With the IDs set and `TAUCETI_FORGEJO_PR_CI=1` (turn it on once the queue posts `build`), a survey
 reads that status for each non-draft, non-self-tested head (`tauceti_worker/forgejo_builds.py`;
 a final verdict is read once per head and kept in `forgejo-builds.json` in the worker's state
 directory). Review then waits for a green `build` or `self-tested`, as on GitHub, and a red
