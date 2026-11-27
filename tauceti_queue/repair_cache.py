@@ -341,9 +341,16 @@ def _collect(root: Path, *, apply: bool, now: float, max_bytes: int, max_age: fl
     sizes = {name: path.stat().st_size for name, path in artifacts.items()}
     mappings = _files(pool / "revisions", "*/*.jsonl")
     candidates = [(p.stat().st_mtime, p.parent.name, p, False) for p in mappings]
-    # Previous successful publishers did not save their new maps under revisions/. Treat
-    # their manifests as snapshots too, so deploying retention cannot discard new outputs.
-    publications = [p for source in participants(root) for p in _files(source / "tasks", "*/logs/**/publish.json")]
+    # A publisher does not save its map under revisions/; it keeps it beside its record
+    # (`repair_publish.keep_local_snapshot`). Treat those as snapshots too, so a batch's own
+    # published builds outlive a collection between its tasks.
+    # Only this pool's own tasks: another batch's publications would take its snapshot slots.
+    publications = [
+        p
+        for source in participants(root)
+        for p in _files(source / "tasks", "*/logs/**/publish.json")
+        if _uses_cache(source, p.relative_to(source / "tasks").parts[0], root)
+    ]
     for publication in publications:
         record = _record(publication)
         mapping = publication.with_name("repair-outputs.jsonl")

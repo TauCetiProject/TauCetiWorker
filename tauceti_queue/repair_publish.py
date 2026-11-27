@@ -15,6 +15,7 @@ uses the same native path and removes its source worktree when finished.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -456,6 +457,42 @@ def start_early(worktree: Path, env: dict) -> dict | None:
             shutil.rmtree(frozen["path"], ignore_errors=True)
 
 
+LOCAL_SNAPSHOT = "repair-outputs.jsonl"  # beside the record: the published map, for pool retention
+
+
+def keep_local_snapshot(stage: Path, logdir: Path) -> bool:
+    """Save the published map beside the publication's record, where pool retention
+    (``repair_cache._collect``) finds it, so the batch pool keeps these outputs as one of its
+    recent snapshots. Without it a collection between tasks keeps only fetched maps and drops
+    the build's own outputs, and the batch's next task on this host compiles them again even
+    when the task that built them ended without submitting (batch 1361, 27 Nov 2026). The
+    stage is validated and outside candidate-writable paths; a map that is not a valid
+    snapshot is not saved, since retention refuses to collect around one. Never raises."""
+    from tauceti_queue import repair_cache
+
+    target = logdir / LOCAL_SNAPSHOT
+    temporary = logdir / (LOCAL_SNAPSHOT + ".tmp")
+    try:
+        fd = os.open(stage / "outputs.jsonl", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return False
+            raw = handle.read(16 * 1024**2 + 1)
+        if len(raw) > 16 * 1024**2:
+            return False
+        if temporary.is_symlink() or target.is_symlink():
+            return False
+        temporary.write_bytes(raw)
+        repair_cache._mapping(temporary)
+        temporary.replace(target)
+        return True
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+        log(f"the published map was not kept as a local snapshot ({type(error).__name__}: {error})")
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
+        return False
+
+
 def publish_frozen(spec: dict) -> dict:
     settings = Settings.from_json(spec["settings"])
     frozen = spec["frozen"]
@@ -493,6 +530,7 @@ def publish_frozen(spec: dict) -> dict:
             record["error"] = f"cache upload exited {put['rc']}"
         else:
             record["published"] = True
+            record["local_snapshot"] = keep_local_snapshot(stage, Path(spec["logdir"]))
     except Exception as error:
         record["error"] = f"{type(error).__name__}: {error}"
     finally:
