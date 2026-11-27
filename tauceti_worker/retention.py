@@ -864,7 +864,13 @@ def _stamp(value):
     return value if 0 <= value <= time.time() + 60 else 0
 
 
-def request_cleanup(*, fallback=False):
+# Starts of the installed collector service a request may trigger: every round start asks, which on
+# a host with dozens of workers would otherwise run the collector back to back.
+ROUND_REQUEST_SPACING = 1200
+PRESSURE_REQUEST_SPACING = 300  # low disk headroom (cache_storage.admit)
+
+
+def request_cleanup(*, fallback=False, spacing=PRESSURE_REQUEST_SPACING):
     """Ask the collector to run asynchronously, without a disk scan.
 
     Most installations have no collector service (macOS, Docker, one-off rounds, Linux without
@@ -886,7 +892,7 @@ def request_cleanup(*, fallback=False):
             marker = directory / "cleanup-request.json"
             previous = read_json(marker)
             now = time.time()
-            start = now - previous.get("started_at", previous.get("at", 0)) >= 300
+            start = now - previous.get("started_at", previous.get("at", 0)) >= spacing
             atomic_json(
                 marker, dict(at=now, started_at=now if start else previous.get("started_at", previous.get("at", 0)))
             )

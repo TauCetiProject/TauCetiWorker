@@ -16,6 +16,13 @@ LOW = 0.15
 TARGET = 0.20
 CRITICAL = 0.05
 MIN_PRIVATE_RECLAIM = 256 * 1024**2
+# The full inventory stats every file of the pool and of every worker's build trees (tens of
+# millions on a fleet host), which keeps that much filesystem metadata cached, so the kernel
+# reports the memory as unavailable. Collections in between reuse the last complete inventory,
+# grown by the device's own growth since, and do a full one at once when free space nears the
+# target or that estimate reaches the cap.
+INVENTORY_INTERVAL = 12 * 3600
+INVENTORY_RETRY = 3600  # after a full inventory that did not finish within its run's deadline
 
 
 def headroom(total, fraction):
@@ -260,6 +267,57 @@ def admit(cfg):
                 marker.unlink(missing_ok=True)
 
 
+_INVENTORY_KEYS = ("managed_bytes", "externally_linked_bytes", "protected_bytes", "named_bytes", "unique_inodes")
+
+
+def _recorded_at(record):
+    from .retention import _stamp
+
+    return _stamp(record.get("at")) if isinstance(record, dict) else 0
+
+
+def _retry_wait(record):
+    """After consecutive full inventories that missed their deadline: 1, 2, 4... hours, up to the
+    interval. A host whose walk never fits its run's budget must not repeat the futile walk hourly."""
+    deferrals = record.get("deferrals", 0) if isinstance(record, dict) else 0
+    if isinstance(deferrals, bool) or not isinstance(deferrals, int) or deferrals <= 0:
+        return 0
+    return min(INVENTORY_INTERVAL, INVENTORY_RETRY * 2 ** min(deferrals - 1, 16))
+
+
+def _plan(record, pool, observed, now):
+    """("full", why), ("estimated", per-device totals) or ("unknown", None).
+
+    Estimated totals come from the last complete inventory: a device's cache can have grown by at
+    most the device's own growth since, unless other data on it shrank meanwhile; the interval
+    bounds how long such an underestimate can last. "unknown" is a deferred inventory's view: no
+    totals, and a full inventory is retried only after _retry_wait."""
+    from .retention import _stamp
+
+    if any(usage.free < headroom(usage.total, TARGET) for _, usage, _ in observed.values()):
+        return "full", "free space"
+    attempted = _stamp(record.get("attempted_at")) if isinstance(record, dict) else 0
+    waiting = now - attempted < _retry_wait(record)
+    at = _recorded_at(record)
+    if not at or record.get("pool") != str(pool) or not isinstance(record.get("devices"), dict):
+        return ("unknown", None) if waiting else ("full", "no inventory")
+    estimate = {}
+    for device, (_, usage, cap) in observed.items():
+        row = record["devices"].get(str(device))
+        if not isinstance(row, dict) or not all(
+            isinstance(row.get(key), int) and not isinstance(row.get(key), bool)
+            for key in (*_INVENTORY_KEYS, "used_bytes")
+        ):
+            return ("unknown", None) if waiting else ("full", "new filesystem")
+        growth = max(0, usage.total - usage.free - row["used_bytes"])
+        estimate[device] = dict({key: row[key] for key in _INVENTORY_KEYS}, managed_bytes=row["managed_bytes"] + growth)
+        if estimate[device]["managed_bytes"] > cap:
+            return "full", "cap"
+    if now - at >= INVENTORY_INTERVAL and not waiting:
+        return "full", "interval"
+    return "estimated", estimate
+
+
 def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
     from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, past, remove, workspace_idle
 
@@ -292,31 +350,64 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
     # Pool copies are deleted only while no process holds them open (open fds add no link).
     guard = Guard(opened=opened or ())
     details, private_candidates = {}, {}
-    # The walk gets half the time, so deletion always has the rest.
-    walk = None if deadline is None else time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
-    try:
-        before = inventory(
-            paths, protected=protected, owners=owners, details=details, private=private_candidates, deadline=walk
-        )
-    except InventoryDeferred:
-        # Without the full picture, still delete oldest-first: each candidate's own link counts and
-        # locks decide, and urgency comes from free space alone. Private reclamation waits for a
-        # complete walk.
+    # Free space is observed before any walk, so growth during the walk counts as later growth.
+    observed = {}
+    for path in paths:
+        if not path.exists():
+            continue
+        device = path.stat().st_dev
+        if device not in observed:
+            observed[device] = (path, *limits(path))
+    record_path = activity_root() / "cache-inventory.json"
+    record = read_json(record_path)
+    if not isinstance(record, dict):
+        record = {}
+    mode, plan = _plan(record, pool, observed, now)
+    reason = plan if mode == "full" else None
+    if mode == "estimated":
+        before = plan
+        # Entries a checkout links are kept until a full inventory tells busy from idle checkouts,
+        # but only while one is recent: where full inventories keep missing their deadline, expiry
+        # falls back to each candidate's own links, as a deferred inventory's does.
+        conservative = now - _recorded_at(record) < 2 * INVENTORY_INTERVAL
+    elif mode == "unknown":
         report.setdefault("deferred", []).append("shared-cache-inventory")
-        before, details, private_candidates = {}, {}, {}
+        before, conservative = {}, False
+    else:
+        conservative = False
+        # The walk gets half the time, so deletion always has the rest.
+        walk = None if deadline is None else time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
+        try:
+            before = inventory(
+                paths, protected=protected, owners=owners, details=details, private=private_candidates, deadline=walk
+            )
+            recorded = dict(at=now, attempted_at=now, pool=str(pool), devices={})
+            for device, (_, usage, _) in observed.items():
+                row = before.get(device, {})
+                row = {key: row.get(key, 0) for key in _INVENTORY_KEYS}
+                recorded["devices"][str(device)] = dict(row, used_bytes=usage.total - usage.free)
+        except InventoryDeferred:
+            # Without the full picture, still delete oldest-first: each candidate's own link counts and
+            # locks decide, and urgency comes from free space alone. Private reclamation waits for a
+            # complete walk.
+            report.setdefault("deferred", []).append("shared-cache-inventory")
+            mode, before, details, private_candidates = "deferred", {}, {}, {}
+            deferrals = record.get("deferrals", 0)
+            deferrals = deferrals if isinstance(deferrals, int) and not isinstance(deferrals, bool) else 0
+            recorded = dict(record, attempted_at=now, deferrals=max(0, deferrals) + 1)
+        if not dry:
+            try:
+                atomic_json(record_path, recorded)
+            except OSError as error:
+                note(report, "errors", f"{record_path}: {error}")
+    report["inventory"] = dict(mode=mode, reason=reason, at=now if mode == "full" else _recorded_at(record))
     for (device, _), (size, _, _, busy, labels) in details.items():
         if not busy and labels:
             for worker in labels:
                 key = device, worker
                 private_candidates[key] = private_candidates.get(key, 0) + size // len(labels)
     devices = {}
-    for path in paths:
-        if not path.exists():
-            continue
-        device = path.stat().st_dev
-        if device in devices:
-            continue
-        usage, cap = limits(path)
+    for device, (path, usage, cap) in observed.items():
         devices[device] = dict(
             before[device] if device in before else dict(managed_bytes=0),
             device=device,
@@ -410,10 +501,20 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
                 # deleting a pool name, so don't churn warm entries.
                 from .canonical_store import pool_aliases, release
 
+                aliases = [len(pool_aliases(pool, p.name, i)) for p, i in zip(payload, infos, strict=True)]
+                if (
+                    conservative
+                    and not disposable_stage
+                    and any(i.st_nlink > 1 + count for i, count in zip(infos, aliases, strict=True))
+                ):
+                    # Without this run's inventory a checkout's link cannot be told busy from idle:
+                    # keep the entry until the next full inventory decides.
+                    note(report, "protected", f"{entry}: linked outside the pool; the next full inventory decides")
+                    continue
                 reclaimable = sum(
                     i.st_blocks * 512
-                    for p, i in zip(payload, infos, strict=True)
-                    if i.st_nlink <= (1 if entry.is_dir() else 0) + max(1, len(pool_aliases(pool, p.name, i)))
+                    for i, count in zip(infos, aliases, strict=True)
+                    if i.st_nlink <= (1 if entry.is_dir() else 0) + max(1, count)
                 )
                 if not disposable_stage and urgent and now - stamp((clock, entry, key)) < LIFETIME and not reclaimable:
                     continue
