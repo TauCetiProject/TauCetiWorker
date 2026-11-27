@@ -26,6 +26,11 @@ ADMINISTRATIVE_HOLD_LABEL = "administrative-hold"
 # The area is matched client-side (in_area), so every open intention must be listed, not gh's 200.
 INTENTION_LIMIT = 1000
 _FIELDS = ["number", "url", "title", "body", "assignees", "labels"]
+# The board is read from GitHub directly (github-state does not mirror TauCetiRoadmap) and shared by
+# every worker on a host for this long, so a new hold or claim reaches a host's rounds within 10
+# minutes. This bounds the board's cost to about two GraphQL pages per label set per host per
+# 10 minutes.
+INTENTION_CACHE_SECONDS = 600
 
 
 @dataclass
@@ -174,7 +179,9 @@ def avoid_list(gh: GitHub, area: str | None, respect: bool) -> str:
     want_claims = bool(area) and respect
     labels = ["intention"] if want_claims else ["intention", ADMINISTRATIVE_HOLD_LABEL]
     try:
-        issues = gh.issue_list(ROADMAP, labels=labels, fields=_FIELDS, limit=INTENTION_LIMIT)
+        issues = gh.issue_list(
+            ROADMAP, labels=labels, fields=_FIELDS, limit=INTENTION_LIMIT, ttl=INTENTION_CACHE_SECONDS
+        )
     except GitHubError as e:
         raise Die(f"roadmap: cannot read administrative holds on {ROADMAP} ({one_line(str(e))}); not authoring") from e
     if area:

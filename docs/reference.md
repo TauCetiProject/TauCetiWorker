@@ -122,7 +122,9 @@ An assigned intention with the maintainer-applied `administrative-hold` label is
 worker avoids its scope, even when authenticated as the assignee and even with `--ignore-claims`.
 Reading these holds is fail-closed, so a GitHub error stops roadmap authoring. The hold remains tied
 to the normal intentions lifecycle: when its dated claim expires, the bot clears the assignee and
-the hold becomes inactive.
+the hold becomes inactive. Workers read the board from GitHub and share each read on their host
+for 10 minutes, so a new hold or claim reaches a host's rounds within 10 minutes; a round that
+already started keeps the list it began with.
 
 ## Codex model selection
 

@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 
 from . import github_transport as transport
+from .constants import ROADMAP
 from .paths import ensure_ssl_cert_file
 
 
@@ -34,6 +35,18 @@ class StateQueryError(ValueError):
 DEPENDENCY = "github-state"
 DEFAULT_URL = "https://github-state.taucetiproject.org"
 PUBLIC_REPOSITORY = "TauCetiProject/TauCeti"
+# Repositories github-state no longer mirrors: TauCetiRoadmap, whose only reader was the open
+# intentions list. Their reads go to GitHub without asking the service, so its
+# `repository_unavailable` answer for a removed repository never sets the host's fallback marker.
+UNMIRRORED_REPOSITORIES = frozenset({"taucetiproject/taucetiroadmap"})
+
+
+def mirrored(repo: str) -> bool:
+    """Whether github-state may hold `repo`; False sends every read, refresh and activity report
+    for it elsewhere without a request."""
+    return repo.lower() not in UNMIRRORED_REPOSITORIES and repo.lower() != ROADMAP.lower()
+
+
 # Reasons a caller can act on. Authentication/configuration needs an operator; the rest recover.
 ACTIONABLE = frozenset({"client_auth_configuration"})
 _last_failure: contextvars.ContextVar[dict | None] = contextvars.ContextVar("github_state_failure", default=None)
@@ -197,7 +210,7 @@ def refresh_pr(repo: str, number: int, expected: str, observed: str = "") -> dic
     unavailable = dict(status="unavailable", reason="refresh_unavailable", retry_at=time.time() + 30)
     try:
         url = _url()
-        if not url or not re.fullmatch(r"[a-f0-9]{40}", expected):
+        if not url or not mirrored(repo) or not re.fullmatch(r"[a-f0-9]{40}", expected):
             return unavailable
         # Public repositories accept anonymous refreshes, as they accept anonymous reads; a
         # configured client token is still sent, and private repositories still require one.
@@ -356,6 +369,8 @@ def read(repo: str, operation: str, *, _allow_observed=False, _with_metadata=Fal
     _last_failure.set(None)
     _planning_survey.set(None)
     if transport.direct_reads():
+        return False, None
+    if not mirrored(repo):
         return False, None
     url = _url()
     if not url:
