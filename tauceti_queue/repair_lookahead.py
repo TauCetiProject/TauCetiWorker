@@ -32,8 +32,8 @@ The submitted chain goes through the queue's checks and staging as any other.
 
 Builds: each helper's worktree has its own build lock, so the helpers' scoped builds run concurrently
 (about half of an agent's time is its builds). Together with the serial path's build they stay within
-the task's Lean job budget (``TAUCETI_REPAIR_LEAN_JOB_BUDGET``, default 16; decision 219): the serial
-build keeps the per-build cap (``TAUCETI_REPAIR_LEAN_JOBS``, default 8) and ``plan`` gives the helpers
+the task's Lean job budget (``TAUCETI_REPAIR_LEAN_JOB_BUDGET``, default 24; decisions 219 and 231): the serial
+build keeps the per-build cap (``TAUCETI_REPAIR_LEAN_JOBS``, default 16) and ``plan`` gives the helpers
 the rest, which bounds both their number and each one's cap (by default 8 helpers at 1 job each). An agent's scoped build is small: on batch 457 a repair
 unit running three agents peaked at about 4 GB of anonymous memory, against 55 to 64 GiB for the
 worker's whole-library verification build, and the worker refuses an agent's whole-library build.
@@ -99,7 +99,7 @@ def plan(cfg, task, env: dict | None = None) -> tuple[int, int | None]:
     job budget (``repair_sandbox.lean_job_budget``). The serial path's build keeps the per-build cap
     and runs beside the helpers' builds, so the helpers share what the budget leaves: at most that many
     helpers (``configured_helpers`` at most), each capped at the per-build cap or an equal share of
-    the rest, whichever is smaller. With the defaults (16 helpers, 8 jobs a build, a budget of 16) that
+    the rest, whichever is smaller. With the defaults (16 helpers, 16 jobs a build, a budget of 24) that
     is 8 helpers at 1 job each. A budget no larger than the per-build cap still leaves one helper at
     one job. Without a per-build cap or without a budget the configured helpers run at the per-build
     cap, as before."""
