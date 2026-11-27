@@ -138,6 +138,33 @@ class GenerationRetryTests(unittest.TestCase):
         self.assertEqual(self.values[PROGRESS_ERROR_KEY], 1)
         self.assert_uncharged()
 
+    def test_written_report_refetches_before_apply(self):
+        # A report for this window can land while the agent writes; apply must see it.
+        receipt = {"files": {}}
+        seen = []
+
+        def apply(w, run_tool, roadmap_dir, work, value):
+            seen.append(self.fetch.call_count)
+            return EX_NOPROGRESS
+
+        with patch.object(wu, "_apply_prepared_progress", side_effect=apply):
+            self.assertEqual(
+                wu._publish_written_progress(self.worker, None, self.roadmap, self.work, receipt), EX_NOPROGRESS
+            )
+        self.assertEqual(seen, [1])
+
+    def test_failed_refetch_defers_publication_without_apply(self):
+        self.fetch.side_effect = None
+        self.fetch.return_value = subprocess.CompletedProcess([], 1)
+        receipt = {"files": {}}
+        with (
+            patch.object(wu, "_apply_prepared_progress") as apply,
+            patch.object(wu, "_defer_progress_publication", return_value=None) as defer,
+        ):
+            self.assertIsNone(wu._publish_written_progress(self.worker, None, self.roadmap, self.work, receipt))
+        apply.assert_not_called()
+        defer.assert_called_once_with(self.worker, receipt, f"temporary fetch failure in {self.roadmap}")
+
     def pages_fixture(self):
         bundle = b"exact compressed generation bytes"
         digest = hashlib.sha256(bundle).hexdigest()
