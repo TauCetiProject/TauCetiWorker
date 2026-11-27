@@ -217,6 +217,9 @@ class ClaudeAPIContext:
         shim.write_text(text)
         shim.chmod(0o700)
         self.config = dict(command=real, key=str(keyfile), bridge=str(self.directory), wait=False, usage_dir=str(usage))
+        if deadline := os.environ.get("TAUCETI_ROUND_DEADLINE"):
+            # Sandboxed shims copy this config without the host environment; they bound capacity holds by it.
+            self.config["deadline"] = float(deadline)
         atomic(self.bin / "config.json", self.config)
         os.environ["PATH"] = f"{self.bin}:{self.previous_path}"
         os.environ["TAUCETI_API_CONTEXT"] = str(self.directory)
@@ -244,7 +247,8 @@ class ClaudeAPIContext:
                 self.blocked_reason = reason
                 self.wait_state = "waiting-capacity"
                 report_runtime(self.wait_state, detail=reason)
-                return dict(allowed=False, reason=reason)
+                # The shim holds prepared work for fleet capacity; other refusals end the round.
+                return dict(allowed=False, reason=reason, capacity=True)
             ticket = request["id"]
             if not isinstance(ticket, str) or len(ticket) != 32 or not isinstance(request["model"], str):
                 raise BudgetError("invalid admission request")
