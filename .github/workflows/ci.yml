@@ -234,6 +234,36 @@ jobs:
             set -e
             ! printf "%s\n" "$claude_output" | grep -F "cannot be used with root/sudo privileges"
           '
+      # compose.shared-mathlib.yaml is the opt-in for rounds that need Mathlib (docs/docker.md).
+      # Docker's defaults must keep refusing the worker's own capability probe with its reason, and
+      # the documented settings, with no capability added, must pass it and build real views.
+      - name: Shared Mathlib needs, and works with, the documented opt-in
+        run: |
+          # The seccomp profile stays the pinned Docker default plus exactly one rule.
+          curl -fsSL https://raw.githubusercontent.com/moby/moby/v28.0.4/profiles/seccomp/default.json \
+            -o "$RUNNER_TEMP/seccomp-default.json"
+          diff <(jq -S 'del(.syscalls[-1])' docker/seccomp-shared-mathlib.json) <(jq -S . "$RUNNER_TEMP/seccomp-default.json")
+          test "$(jq -c '.syscalls[-1] | del(.comment)' docker/seccomp-shared-mathlib.json)" = \
+            '{"names":["clone","mount","mount_setattr","pivot_root","umount2","unshare"],"action":"SCMP_ACT_ALLOW"}'
+          opt_in=(docker compose -f compose.yaml -f compose.shared-mathlib.yaml)
+          "${opt_in[@]}" config --format json | jq -e '.services.tauceti
+            | (.security_opt | length) == 2
+              and ([has("cap_add"), has("privileged"), has("devices"), has("pid"), has("userns_mode")] | any | not)'
+          row() { grep -F "shared Mathlib" <<<"$1"; }
+          doctor="$(docker compose run --rm --no-deps tauceti ./tauceti doctor 2>&1 || true)"
+          row "$doctor"
+          row "$doctor" | grep -F "[MISSING] shared Mathlib rootless OverlayFS probe failed" >/dev/null
+          sudo apparmor_parser --replace docker/apparmor-shared-mathlib
+          doctor="$("${opt_in[@]}" run --rm --no-deps tauceti ./tauceti doctor 2>&1 || true)"
+          row "$doctor"
+          row "$doctor" | grep -F "[ok     ] shared Mathlib" >/dev/null
+          if grep -F "tauceti-userns:" <<<"$doctor"; then exit 1; fi
+          # The worker's overlay views themselves, on fixtures: published, leased, discarded.
+          views="$("${opt_in[@]}" run --rm --no-deps -v "$PWD:/workspace:ro" -w /workspace \
+            -e TMPDIR=/root/.cache/tauceti -e TAUCETI_SKIP_GIT_IDENTITY=1 \
+            tauceti python3 -B tests/shared_mathlib.py ViewTests 2>&1)" || { tail -n 60 <<<"$views"; exit 1; }
+          tail -n 4 <<<"$views"
+          if grep -F "skipped" <<<"$views"; then exit 1; fi
       # Exercise the pinned native CLI through the queue launcher, with a local
       # scripted API and an isolated home: no model calls or credentials needed.
       - name: Queue Claude stdin regression
