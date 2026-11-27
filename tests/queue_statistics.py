@@ -212,6 +212,13 @@ class Landings(ControllerCase):
             with self.subTest(identity=identity), self.assertRaises(RuntimeError):
                 self.feed()
 
+    def test_coverage_starts_no_earlier_than_the_ledger(self):
+        self.land()
+        first = self.controller.store.row("batches", {"id": 1})["created_at"]
+        self.assertEqual(self.feed(30)["since"], first)
+        self.clock.advance(3 * 86400)
+        self.assertEqual(self.feed(1)["since"], self.clock() - 86400)
+
     def test_days_are_bounded(self):
         for days in (0, 36, "7"):
             with self.assertRaises(ValueError):

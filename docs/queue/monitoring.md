@@ -155,7 +155,8 @@ an explicit qualified public scope and are not exposed by this endpoint.
 
 `GET /statistics/landings?days=N` (N from 1 to 35, default 14) lists each pull
 request whose input recorded a landing in the last N days, as
-`[forge, number, first_approved_at, landed_at]` (`tauceti-queue.landings/v1`).
+`[forge, number, first_approved_at, landed_at]` (`tauceti-queue.landings/v1`);
+`since` is the start of the window or of the ledger, whichever is later.
 `first_approved_at` is the earliest queue admission of any head of that pull
 request, after an all-green review, so opening-to-approval plus approval-to-land
 is its whole opening-to-land time. The statistics generator in TauCetiTools joins

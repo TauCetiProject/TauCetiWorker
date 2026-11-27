@@ -162,6 +162,10 @@ def landings(database, repository, *, days, now=None):
             "WHERE l.landed > ? AND l.landed <= ?",
             (repository, repository, lower, now),
         ).fetchall()
+        first_batch = c.execute("SELECT min(created_at) FROM batches WHERE repository=?", (repository,)).fetchone()[0]
+    # Coverage starts where the ledger does, not before: a window reaching past the queue's first
+    # batch would otherwise read as days on which nothing landed.
+    since = lower if first_batch is None else max(lower, first_batch)
     entries = sorted(
         ([_forge(identity), number, round(first, 3), round(landed, 3)] for number, identity, landed, first in rows),
         key=lambda entry: (entry[3], entry[0], entry[1]),
@@ -171,7 +175,7 @@ def landings(database, repository, *, days, now=None):
         repository=repository,
         observed_at=now,
         coverage="controller_ledger",
-        since=lower,
+        since=since,
         days=days,
         fields=["forge", "number", "first_approved_at", "landed_at"],
         definition=(
