@@ -8,6 +8,7 @@ the worker uses:
                                        of `gh` and of the other sources a round sees
     inventory_keys(rows)               the items a multi-source round's open-PR inventory names
     candidates(targets, only, skip)    the eligible items, in the order a worker tries to claim them
+    NothingOffered                     what `candidates` raises when the list, once read, has none
     landed_pr(item, gh)                the merged pull request that completed an item, at any age
     open_pr(item, gh)                  an open pull request for an item that a bounded listing missed
     GitHubMarkerReads()                the GitHub repository's marked pull requests, for a round
@@ -58,6 +59,11 @@ class MergedPRs(list):
     def __init__(self, rows=(), *, complete=False):
         super().__init__(rows)
         self.complete = complete
+
+
+class NothingOffered(NoProgress):
+    """The list was read, and under its live statuses it has no item this round can take. A list
+    that cannot be read, or pull requests that cannot be, raise something else."""
 
 
 @dataclass(frozen=True)
@@ -518,7 +524,7 @@ def candidates(
     outside `skip`, shuffled so that workers started together spread out, in file order within an
     area. `within`, for an umbrella (docs/umbrellas.md), keeps only those of the umbrella's areas that
     are roadmap areas now, which are then taken like all areas; `only` is the umbrella's name.
-    NoProgress, saying why, when the list offers nothing."""
+    NothingOffered, saying why, when the list offers nothing."""
     pinned = within is None and only not in ("auto", "any", "")
     within = None if within is None else set(within)
 
@@ -541,7 +547,7 @@ def candidates(
     else:
         why = "no open items"
     named = only not in ("auto", "any", "")
-    raise NoProgress(f"roadmap: the target list offers nothing to author{f' in {only}' if named else ''} ({why})")
+    raise NothingOffered(f"roadmap: the target list offers nothing to author{f' in {only}' if named else ''} ({why})")
 
 
 def render_item(targets: Targets, item: TargetItem) -> str:

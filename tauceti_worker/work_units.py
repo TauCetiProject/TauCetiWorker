@@ -67,6 +67,7 @@ from .config import (
     roadmap_only,
     roadmap_skip,
     roadmap_targets,
+    roadmap_targets_fallback,
     warn_red,
 )
 from .constants import (
@@ -137,6 +138,7 @@ from .survey import (
 )
 from .targets import (
     GitHubMarkerReads,
+    NothingOffered,
     TargetItem,
     Targets,
     candidates,
@@ -3683,7 +3685,8 @@ def _open_link(item, source) -> str | None:
 
 def assign_target(w, path: Path, only: str, skip: list[str], within=None) -> tuple[Targets, TargetItem]:
     """Choose and claim this round's item of the operator's target list (docs/target-lists.md).
-    Returns the list under its live statuses and the item; NoProgress when there is none to take.
+    Returns the list under its live statuses and the item. NothingOffered when the list has no item
+    this round can take; NoProgress when pull requests cannot be read; Die when the file cannot be.
     `within` restricts the list to an umbrella's areas, which `only` then names (targets.candidates)."""
     from .config import SourceUnavailable
 
@@ -3722,7 +3725,7 @@ def assign_target(w, path: Path, only: str, skip: list[str], within=None) -> tup
             return live, item
     except (GitHubError, SourceUnavailable) as e:
         raise NoProgress(f"roadmap: cannot read pull requests for the target list ({e})") from None
-    raise NoProgress(
+    raise NothingOffered(
         f"roadmap: none of the {min(len(offered), MAX_TARGET_TRIES)} eligible target(s) of {path.name} tried this "
         f"round can be taken ({len(offered)} eligible; each is claimed by another worker or has landed)"
     )
@@ -3737,12 +3740,23 @@ def do_roadmap(w, sv, c, opts, bubble) -> int:
     # An umbrella round (docs/umbrellas.md) brings the member it drew as `c.reason`; a target list
     # chooses among the umbrella's areas instead. Either way the area is then treated as pinned.
     umbrella = getattr(sv, "umbrella", None)
+    taken = None
     if targets_path is not None:
         # An umbrella's list items count only in members that are roadmap areas now; the others wait.
         within = None
         if umbrella is not None:
             within = umbrella.current or frozenset(m.area for m in umbrella_members_now(w, umbrella))
-        live, item = assign_target(w, targets_path, only, skip, within)
+        try:
+            taken = assign_target(w, targets_path, only, skip, within)
+        except NothingOffered as e:
+            if not roadmap_targets_fallback():
+                raise
+            why = str(e).removeprefix("roadmap: ")
+            log(f"→ ROADMAP open work (--roadmap-targets-fallback): {why}")
+            report_runtime(target=f"new PR (open work: {why})", roadmap_target=None)
+            os.environ.pop("TAUCETI_TARGET_MARKER", None)
+    if taken is not None:
+        live, item = taken
         only = item.area
         assignment = render_assignment(live, item)
         os.environ["TAUCETI_TARGET_MARKER"] = "\n".join(target_markers(item))

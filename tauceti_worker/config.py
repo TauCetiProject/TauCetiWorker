@@ -107,6 +107,13 @@ def roadmap_targets() -> Path | None:
     return Path(raw) if raw else None
 
 
+def roadmap_targets_fallback() -> bool:
+    """Whether a roadmap round that the target list offers nothing authors as a worker without a
+    list would (see docs/target-lists.md), read live from TAUCETI_ROADMAP_TARGETS_FALLBACK so
+    --roadmap-targets-fallback is inherited by loop children. Off unless it is 1."""
+    return os.environ.get("TAUCETI_ROADMAP_TARGETS_FALLBACK", "0").strip() == "1"
+
+
 EXTRA_ROADMAP_PROMPT_MAX_CHARS = 4096
 
 

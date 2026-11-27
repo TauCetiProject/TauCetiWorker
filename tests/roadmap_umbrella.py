@@ -578,6 +578,18 @@ class Prompt(unittest.TestCase):
         self.claims.begin_target_work.assert_not_called()
         self.assertEqual(self.prompts, [], "no model started")
 
+    def test_with_the_fallback_a_list_with_nothing_in_the_umbrella_draws_a_member(self):
+        with (
+            self.target_list((LATER, "future"), ("Other", "outside")),
+            patch.dict(os.environ, {"TAUCETI_ROADMAP_TARGETS_FALLBACK": "1"}),
+        ):
+            prompt = self.author("GRH", grh_round(current=(ANT, RH)))
+        self.claims.begin_target_work.assert_not_called()
+        self.assertNotIn("Your target is assigned", prompt)
+        self.assertRegex(
+            prompt, f"Start with `({ANT}|{RH})`, the roadmap you were assigned. It is a member of the umbrella"
+        )
+
 
 class Visibility(unittest.TestCase):
     def test_status_lines_and_the_dashboard_show_the_umbrella(self):

@@ -168,6 +168,7 @@ environment (each flag overrides its matching variable; full reference linked be
   TAUCETI_ROADMAP_SKIP   comma-separated roadmap areas to exclude from selection
   TAUCETI_EXTRA_ROADMAP_PROMPT   extra guidance for roadmap rounds; default for --extra-roadmap-prompt
   TAUCETI_ROADMAP_TARGETS        operator target list for roadmap rounds; default for --roadmap-targets
+  TAUCETI_ROADMAP_TARGETS_FALLBACK=1   same as --roadmap-targets-fallback
   TAUCETI_PR             comma-separated PR numbers; default for --pr
   TAUCETI_QUOTA_CMD      default for --quota-cmd
   TAUCETI_PACE           pacing curve "t:b,..." (default = 60:40); see --pace
@@ -408,6 +409,16 @@ def add_work_flags(p: argparse.ArgumentParser) -> None:
         "item whose needs have landed, claims it, and hands it to the agent; with nothing eligible it "
         "authors nothing. --roadmap-only and --roadmap-skip narrow the areas it draws from. The file "
         "is re-read each round. Empty string = no list. Overrides $TAUCETI_ROADMAP_TARGETS for this run",
+    )
+    p.add_argument(
+        "--roadmap-targets-fallback",
+        dest="roadmap_targets_fallback",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="with --roadmap-targets: a roadmap round the list offers nothing (every open item done, in "
+        "flight, claimed or waiting on its needs) authors as a worker without a list would, under "
+        "--max-open-prs; the next round asks the list again. A list or pull requests that cannot be "
+        "read still author nothing. Overrides $TAUCETI_ROADMAP_TARGETS_FALLBACK for this run",
     )
     p.add_argument(
         "--self-tested",
@@ -1099,6 +1110,7 @@ def main(argv: list[str] | None = None) -> int:
                     "activity": 1,
                     "roadmap_focus": 1,
                     "roadmap_targets": 1,
+                    "roadmap_targets_fallback": 1,
                     "targets_inspect": 1,
                     "self_tested": 1,
                     "source_selection": 1,
@@ -1461,6 +1473,8 @@ def cmd_work(args, *, only: list[str], agent: str, one_round: bool, prs: tuple[i
         from .targets import load_targets
 
         load_targets(roadmap_targets())
+    if getattr(args, "roadmap_targets_fallback", None) is not None:
+        os.environ["TAUCETI_ROADMAP_TARGETS_FALLBACK"] = "1" if args.roadmap_targets_fallback else "0"
     # Persist the operator's choice into loop children and recovery rounds.
     if getattr(args, "self_tested", None) is not None:
         os.environ["TAUCETI_SELF_TESTED"] = "1" if args.self_tested else "0"
