@@ -5575,6 +5575,43 @@ class ErrorParsing(unittest.TestCase):
         self.assertEqual(len(found), 3)
         self.assertEqual(repair_stream.parse_errors(lines), parser.errors)
 
+    def test_lake_unlocated_import_errors(self):
+        # Lake's errors for a missing module and its importer, as captured from task 1669's stream build:
+        # neither names a line, and the build carried on to a summary naming only the failed targets.
+        lines = [
+            "✖ [41410/41874] Running TauCeti.G.Lang",
+            "error: no such file or directory (error code: 2)",
+            "  file: /w/TauCeti/G/Lang.lean",
+            "✔ [41411/41874] Built TauCeti.G.Other (691ms)",
+            "✖ [41496/42104] Running TauCeti.G.Lang.Fiber",
+            "error: TauCeti/G/Lang/Fiber.lean: bad import 'TauCeti.G.Lang'",
+            "✖ [41497/42104] Running TauCeti.Dep",
+            "error: no such file or directory (error code: 2)",
+            "  file: /elsewhere/lib/Dep.lean",
+            "error: TauCeti/A.lean:3:4: unknown identifier 'x'",
+            "✖ [108093/108093] Running TauCeti/TauCeti:default",
+            "error: TauCeti: some modules have bad imports or could not be read",
+            "Some required targets logged failures:",
+            "- TauCeti.G.Lang",
+            "- TauCeti.G.Lang.Fiber",
+            "error: TauCeti/G/Lang/Fiber.lean: bad import 'TauCeti.G.Lang'",
+            "error: build failed",
+        ]
+        parser = repair_stream.ErrorParser(root=Path("/w"))
+        found = [entry for line in lines for entry in parser.feed(line)] + parser.finish()
+        expected = [
+            ("TauCeti.G.Lang", "TauCeti/G/Lang.lean", 1, 0, repair_stream.MISSING_MESSAGE),
+            ("TauCeti.G.Lang.Fiber", "TauCeti/G/Lang/Fiber.lean", 1, 0, "bad import 'TauCeti.G.Lang'"),
+            ("TauCeti.A", "TauCeti/A.lean", 3, 4, "unknown identifier 'x'"),
+        ]
+        self.assertEqual([(e["module"], e["file"], e["line"], e["column"], e["message"]) for e in found], expected)
+        self.assertEqual(found, parser.errors)
+        # Without a root the missing file is the `Running` module's path.
+        self.assertEqual(
+            [(e["file"], e["message"]) for e in repair_stream.parse_errors(lines)],
+            [(f, m) for _, f, _, _, m in expected],
+        )
+
 
 class Records(unittest.TestCase):
     def test_a_pathless_verification_finding_reaches_the_next_repair_prompt(self):

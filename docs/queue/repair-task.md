@@ -750,7 +750,10 @@ ready it starts `lake build --iofail` in the worktree in the background with its
 `.tauceti-repair/build.log`, holds `.tauceti-repair/build.lock` while it runs, tails the log and
 appends each compiler error (`file:line:col: error: ...` with its continuation lines) to
 `.tauceti-repair/errors.jsonl` as it appears, as one JSON object with `module`, `file`, `line`,
-`column`, `message`, `member` (the PR whose squash commit last touched the file) and `commit`. The agent
+`column`, `message`, `member` (the PR whose squash commit last touched the file) and `commit`. Lake's
+errors for a module it could not read, which carry no line, are recorded at line 1, column 0: an
+importer's `error: TauCeti/A.lean: bad import 'TauCeti.B'`, and a missing source file (`no such file or
+directory` after the module's `Running` job line), attributed to the member that deleted it. The agent
 is launched at the first error, or when the build ends, whichever comes first, with a "Build in
 progress" section before the verification advice: the build is running in the background, its log and
 error list are at those paths and grow, modules that have already failed may be edited now, no `lake
