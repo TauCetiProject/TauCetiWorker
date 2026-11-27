@@ -297,6 +297,21 @@ def capability(directory=None):
         )
 
 
+def pool_capability(env=None):
+    """``capability`` in the pool, where a round runs it first.
+
+    The default temporary directory can sit on another filesystem and give the wrong answer either
+    way: in a container it is the container's own overlay, which cannot hold an overlay's upper."""
+    if platform.system() != "Linux" or not shutil.which("bwrap"):
+        return capability()
+    pool = root(env)
+    try:
+        pool.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as error:
+        return False, f"rootless OverlayFS unavailable: cannot create the shared Mathlib pool: {error}"
+    return capability(pool)
+
+
 def git(path, *args):
     p = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=30)
     if p.returncode:
