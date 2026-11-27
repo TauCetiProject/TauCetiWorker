@@ -5673,6 +5673,82 @@ class ErrorParsing(unittest.TestCase):
             [(f, m) for _, f, _, _, m in expected],
         )
 
+    def test_verification_prompt_keeps_lake_messages_and_names_moved_modules(self):
+        # Task 1669's verification build: modules moved below the batch and by its members, whose
+        # importers then fail. The retry prompt named each as `Module:0:0`, "no commit of this batch
+        # modifies this file", with the summary's target line for message.
+        repo = scratch(self, "moved-")
+        sh(repo, "init", "--quiet", "-b", "main")
+        sh(repo, "config", "user.name", "Fixture")
+        sh(repo, "config", "user.email", "fixture@example.invalid")
+        lean = "theorem t : True := trivial\n" * 5
+        commit(repo, "add", {f"TauCeti/{n}.lean": lean.replace("t ", f"{n.lower()} ") for n in ("Old", "R", "Gone")})
+
+        def move(source: str, target: str) -> None:
+            (repo / target).parent.mkdir(parents=True, exist_ok=True)
+            sh(repo, "mv", source, target)
+
+        def member(number: int) -> None:
+            message = f"pr {number} (#{number})\n\nSource-PR: {PROJECT}#{number}\nAccepted-Head: {'a' * 40}\n"
+            sh(repo, "commit", "--quiet", "-m", message)
+
+        move("TauCeti/Old.lean", "TauCeti/Old/Basic.lean")
+        sh(repo, "commit", "--quiet", "-m", "feat: split Old (#40)")
+        base = sh(repo, "rev-parse", "HEAD")
+        move("TauCeti/R.lean", "TauCeti/R/Basic.lean")
+        member(1)
+        (repo / "TauCeti/Imp.lean").write_text("import TauCeti.Old\n")
+        sh(repo, "add", "TauCeti/Imp.lean")
+        member(2)
+        sh(repo, "rm", "--quiet", "TauCeti/Gone.lean")
+        member(3)
+        chain = repair.read_chain(repo, base, sh(repo, "rev-parse", "HEAD"))
+        self.assertEqual([c.pr for c in chain], [1, 2, 3])
+        log = [
+            "✖ [10/90] Running TauCeti.Old",
+            "error: no such file or directory (error code: 2)",
+            "  file: /w/TauCeti/Old.lean",
+            "✖ [11/90] Running TauCeti.Imp",
+            "error: TauCeti/Imp.lean: bad import 'TauCeti.Old'",
+            "✖ [12/90] Running TauCeti.R",
+            "error: no such file or directory (error code: 2)",
+            "  file: /w/TauCeti/R.lean",
+            "✖ [13/90] Running TauCeti.Gone",
+            "error: no such file or directory (error code: 2)",
+            "  file: /w/TauCeti/Gone.lean",
+            "error: TauCeti/A.lean:12:3: unknown identifier 'x'",
+            "error: TauCeti: some modules have bad imports or could not be read",
+            "Some required targets logged failures:",
+            "- TauCeti.Old",
+            "- TauCeti.Imp",
+            "- TauCeti.R",
+            "- TauCeti.Gone",
+            "error: build failed",
+        ]
+        findings = repair.findings_from_diagnostics(queue_diagnostics.parse_log(log))
+        missing = queue_diagnostics.MISSING_MESSAGE
+        self.assertEqual(
+            [(e["path"], e["line"], e["message"]) for e in findings["compiler_errors"]],
+            [
+                ("TauCeti/Old.lean", 0, missing),
+                ("TauCeti/Imp.lean", 0, "bad import 'TauCeti.Old'"),
+                ("TauCeti/R.lean", 0, missing),
+                ("TauCeti/Gone.lean", 0, missing),
+                ("TauCeti/A.lean", 12, "unknown identifier 'x'"),
+            ],
+        )
+        self.assertEqual(
+            [repair.compiler_error_line(repo, chain, e) for e in findings["compiler_errors"]],
+            [
+                "- `TauCeti/Old.lean` (no commit of this batch modifies this file; the base's commit "
+                f"`{base[:12]}` (feat: split Old (#40)) moved this file to `TauCeti/Old/Basic.lean`, below this batch)",
+                f"- `TauCeti/Imp.lean` (PR #2's commit `{chain[1].sha[:12]}` modifies this file)",
+                f"- `TauCeti/R.lean` (PR #1's commit `{chain[0].sha[:12]}` moved this file to `TauCeti/R/Basic.lean`)",
+                f"- `TauCeti/Gone.lean` (PR #3's commit `{chain[2].sha[:12]}` deleted this file)",
+                "- `TauCeti/A.lean:12:3` (no commit of this batch modifies this file)",
+            ],
+        )
+
 
 class Records(unittest.TestCase):
     def test_a_pathless_verification_finding_reaches_the_next_repair_prompt(self):

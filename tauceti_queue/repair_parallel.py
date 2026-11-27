@@ -358,10 +358,7 @@ def group_prompt(context: PromptContext, group: Group, chain: list[ChainCommit],
     if findings["compiler_errors"]:
         lines += ["Compiler errors:", ""]
         for error in findings["compiler_errors"]:
-            owners = repair.owners_of(clone, chain, _path(error["path"]))
-            lines.append(
-                f"- `{error['path']}:{error.get('line', 0)}:{error.get('column', 0)}` ({repair._owner_text(owners, chain)})"
-            )
+            lines.append(repair.compiler_error_line(clone, chain, error))
             lines += [f"      {text}" for text in str(error.get("message", "")).splitlines()]
         lines.append("")
     if findings["failed_modules"] and not findings["compiler_errors"]:

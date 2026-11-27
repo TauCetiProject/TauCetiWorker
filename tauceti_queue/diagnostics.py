@@ -15,6 +15,8 @@ defining module path):
 | `LINT-ENV-LOCATIONS {...}` (the environment linter's JSON findings) | `lint` on the defining path, `unknown` kept when the linter could not locate it |
 | `TauCeti/A/B.lean:12:0: error: dot-notation namespace lint: D puts ...` | `lint` (`dot-notation`) on `TauCeti.A.B`, declaration `D` |
 | `error: TauCeti/A/B.lean:12: ...` (the style lint's text linters, which give no column) | `lint` (`style`) on `TauCeti.A.B` |
+| `error: TauCeti/A.lean: bad import 'TauCeti.B'` | `compiler` (`bad_import`, no line) on `TauCeti.A`, with Lake's message |
+| `✖ [N/M] Running TauCeti.B` then `error: no such file or directory (error code: 2)` and `  file: .../TauCeti/B.lean` | `compiler` (`missing_source`, no line) on `TauCeti.B` |
 | `Some required targets logged failures:` followed by `- TauCeti.A.B` lines | `compiler` on each target, only when no located finding exists |
 | `TauCeti/A.lean: missing project import ...` and other located import-header findings | `compiler` on the importing module |
 | `MEMBER-POLICY-REJECTED {...}` (the source member review-size policy's JSON record of one member) | `policy` naming that member by its accepted head and source identity |
@@ -78,6 +80,18 @@ IMPORT_HEADER = re.compile(
     r"(?:missing project import |Lean import header does not parse|Lake import header does not parse|"
     r"does not opt into the module system|`meta import |direct metaprogramming import |ambiguous project imports:)"
 )
+# Lake's errors for modules it could not read, which name no line. The importer of a missing module:
+#   error: TauCeti/A.lean: bad import 'TauCeti.B'
+# and the missing module itself, after its job line:
+#   ✖ [12/40] Running TauCeti.B
+#   error: no such file or directory (error code: 2)
+#     file: /path/to/worktree/TauCeti/B.lean
+BAD_IMPORT = re.compile(r"^error: (" + PATH + r"): (bad import '[^']{1,512}')$")
+RUNNING = re.compile(r"^✖\s*\[\d+/\d+\] Running (" + MODULE + r")(?: \([^)]*\))?$")
+JOB = re.compile(r"^(?:[✔✖⚠ℹ✓×!]\s*)?\[\d+/\d+\] ")
+NO_SUCH_FILE = "error: no such file or directory (error code: 2)"
+MISSING_FILE = re.compile(r"^\s+file: (\S{1,4096})$")
+MISSING_MESSAGE = "no such file or directory: Lake could not read this module's source, which another module imports"
 FAILED_TARGETS_HEADER = "Some required targets logged failures:"
 FAILED_TARGET = re.compile(r"- (TauCeti(?:\.[A-Za-z_][A-Za-z0-9_']*)+)")
 # TauCetiTools' Lean watchdog reports a Lean process SIGKILLed before its wall-clock deadline, almost
@@ -114,10 +128,35 @@ def parse_log(lines: Iterable[str]) -> list[dict]:
     in_targets = False
     runner_lost: dict | None = None
     killed: dict[str, dict] = {}
+    running: str | None = None  # the module of the last failed `Running` job line
+    missing = False  # the last line was NO_SUCH_FILE
     for raw in lines:
         if len(located) >= MAX_FINDINGS:
             break
         line = STAMP.sub("", ANSI.sub("", raw.rstrip("\r\n").lstrip("﻿")))
+        if missing:
+            missing = False
+            printed = MISSING_FILE.match(line)
+            if printed and running is not None and printed.group(1).endswith("/" + path_of(running)):
+                path = path_of(running)
+                located.setdefault(
+                    ("compiler", path, "missing_source"),
+                    _finding("compiler", running, MISSING_MESSAGE, path=path, reason="missing_source"),
+                )
+                continue
+        if JOB.match(line):
+            job = RUNNING.match(line)
+            running = job.group(1) if job else None
+        if line == NO_SUCH_FILE:
+            missing = True
+            continue
+        if bad := BAD_IMPORT.match(line):
+            path = bad.group(1)
+            located.setdefault(
+                ("compiler", path, bad.group(2)),
+                _finding("compiler", module_of(path), bad.group(2), path=path, reason="bad_import"),
+            )
+            continue
         if line.startswith(MEMBER_POLICY_REJECTED):
             finding = member_policy_finding(line[len(MEMBER_POLICY_REJECTED) :])
             if finding is not None:

@@ -520,7 +520,10 @@ has a time budget holds because the service re-exposes the task.
    with the git refs the agent needs named once (base, target, the conflicting commit, the clean
    prefix, and for every file the owning commit: "PR N's commit `sha` modifies this file, and `main`
    has changed it since the batch's base"; for a repair the compiler, audit and lint findings with
-   their owning commits), the result the queue expects (a linear chain on `onto` with one commit per
+   their owning commits, each compiler error at its file, with its line when it has one; Lake's errors
+   for a module it could not read keep Lake's message (`bad import 'TauCeti.B'`, `no such file or
+   directory`), and a missing source names the member, or else the base's commit, that moved or
+   deleted it), the result the queue expects (a linear chain on `onto` with one commit per
    PR in the same order, each keeping its `Source-PR:` and `Accepted-Head:` trailers and its ` (#N)`
    subject suffix; the queue reads it from the worktree, validates it and runs CI itself, so there is
    nothing to push or report and `gh` is not needed; no changes introduced to the build configuration,
