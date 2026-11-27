@@ -984,7 +984,14 @@ and for at most 15 minutes, unless the systemd timer installed by `workers
 service install` already collects that data root. The collector expires logs
 and verification runs older than three days, idle checkouts, and shared build
 pools, and deletes the data roots of earlier installations once no worker or
-round holds their locks. It also deletes, for every worker and at every round
+round holds their locks. Sizing the shared build pools means stating every file
+in them and in every worker's build trees, so the collector does that at most
+every 12 hours, or at once when free space nears its target or the pools may
+have reached their cap; runs in between estimate the pools' size from that
+inventory and the disk's growth since, and keep any expired pool entry that a
+checkout still links until the next full inventory. With the systemd service
+installed, rounds start it at most every 20 minutes, and every 5 minutes while
+disk headroom is low. It also deletes, for every worker and at every round
 start, the recovery records, retained checkouts, cleanup queues, verification
 checkpoints and continuation state that older releases kept: rounds are
 all-or-nothing, so this legacy data is deleted, never migrated.

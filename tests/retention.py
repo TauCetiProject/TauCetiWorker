@@ -794,6 +794,17 @@ class Retention(unittest.TestCase):
         again.assert_not_called()
         self.assertEqual(read_json(directory / "cleanup-request.json"), dict(at=1001, started_at=1000))
 
+    def test_round_starts_request_the_service_less_often_than_disk_pressure(self):
+        directory = activity.root()
+        atomic_json(directory / "cleanup-service.json", dict(installed=True))
+        with patch.object(subprocess, "run") as run, patch.object(retention.time, "time", return_value=10000):
+            retention.request_cleanup(spacing=retention.ROUND_REQUEST_SPACING)
+        with patch.object(subprocess, "run") as round_start, patch.object(retention.time, "time", return_value=10400):
+            retention.request_cleanup(spacing=retention.ROUND_REQUEST_SPACING)
+        with patch.object(subprocess, "run") as pressure, patch.object(retention.time, "time", return_value=10400):
+            retention.request_cleanup()
+        self.assertEqual((run.call_count, round_start.call_count, pressure.call_count), (1, 0, 1))
+
     def test_daily_timer_is_persistent_and_low_priority(self):
         with (
             patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "xdg")}),

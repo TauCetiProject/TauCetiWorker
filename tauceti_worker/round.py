@@ -89,9 +89,9 @@ class RoundContext:
             # Every run mode passes here (one-off rounds, --loop, Docker, managed workers), so the
             # collector reaches hosts without an installed service, at most hourly.
             try:
-                from .retention import request_cleanup
+                from .retention import ROUND_REQUEST_SPACING, request_cleanup
 
-                request_cleanup(fallback=True)
+                request_cleanup(fallback=True, spacing=ROUND_REQUEST_SPACING)
             except Exception as error:
                 log(f"retention: cleanup request deferred: {error}")
         if self.record_activity:

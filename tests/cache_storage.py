@@ -56,6 +56,14 @@ class Storage(unittest.TestCase):
         os.utime(path / "entry.json", (time.time() - age,) * 2)
         return path
 
+    @property
+    def inventory_record(self):
+        return self.root / "activity/cache-inventory.json"
+
+    def age_inventory(self, **seconds):
+        record = json.loads(self.inventory_record.read_text())
+        atomic_json(self.inventory_record, dict(record, **{key: record[key] - value for key, value in seconds.items()}))
+
     def test_ownership_and_symlinks(self):
         foreign = self.root / "operator"
         foreign.mkdir()
@@ -120,8 +128,11 @@ class Storage(unittest.TestCase):
         self.assertEqual(result["deferred"], ["shared-cache-inventory", "shared-cache-deletion"])
         self.assertEqual(result["removed"], [])
         self.assertTrue(old.exists())
+        self.assertEqual(json.loads(self.inventory_record.read_text())["deferrals"], 1)
+        self.age_inventory(attempted_at=storage.INVENTORY_RETRY)  # the next attempt waits an hour
         self.assertFalse(storage.collect([], deadline=time.monotonic() + 600).get("deferred"))
         self.assertFalse(old.exists())
+        self.assertNotIn("deferrals", json.loads(self.inventory_record.read_text()))
 
     def test_a_deferred_walk_still_deletes_expired_entries(self):
         old = self.entry(age=4 * 86400)
@@ -405,6 +416,95 @@ class Storage(unittest.TestCase):
         storage.collect([])
         self.assertFalse(pending.exists())
         self.assertEqual((operator / "old.ltar").read_text(), "keep")
+
+    def test_collections_between_full_inventories_reuse_the_last_one(self):
+        storage.collect([])
+        record = json.loads((self.root / "activity/cache-inventory.json").read_text())
+        self.assertEqual(record["pool"], str(self.pool))
+        with patch.object(storage, "inventory", side_effect=AssertionError("walked")):
+            result = storage.collect([])
+        self.assertEqual(result["inventory"]["mode"], "estimated")
+        self.assertIn("managed_bytes", result)
+        later = time.time() + storage.INVENTORY_INTERVAL
+        with patch.object(storage, "inventory", wraps=storage.inventory) as walked:
+            result = storage.collect([], now=later)
+        self.assertEqual((walked.call_count, result["inventory"]["reason"]), (1, "interval"))
+
+    def test_low_free_space_or_growth_past_the_cap_takes_a_full_inventory(self):
+        storage.collect([])
+        total = shutil.disk_usage(self.root).total
+        near = shutil._ntuple_diskusage(total, total - storage.headroom(total, storage.TARGET) + 1, 0)
+        near = near._replace(free=storage.headroom(total, storage.TARGET) - 1)
+        with (
+            patch.object(storage.shutil, "disk_usage", return_value=near),
+            patch.object(storage, "inventory", wraps=storage.inventory) as walked,
+        ):
+            result = storage.collect([])
+        self.assertEqual((walked.call_count, result["inventory"]["reason"]), (1, "free space"))
+        record = json.loads((self.root / "activity/cache-inventory.json").read_text())
+        row = next(iter(record["devices"].values()))
+        usage, cap = storage.limits(self.pool)
+        row["used_bytes"] = usage.total - usage.free - cap  # as if the device had since grown by the cap
+        atomic_json(self.root / "activity/cache-inventory.json", record)
+        with patch.object(storage, "inventory", wraps=storage.inventory) as walked:
+            result = storage.collect([])
+        self.assertEqual((walked.call_count, result["inventory"]["reason"]), (1, "cap"))
+
+    def test_an_estimated_collection_keeps_entries_linked_outside_the_pool(self):
+        storage.collect([])
+        entry = self.entry(age=4 * 86400)
+        lone = self.entry("b" * 16, age=4 * 86400)
+        private = self.root / "private"
+        os.link(entry / "data", private)
+        result = storage.collect([])
+        self.assertEqual(result["inventory"]["mode"], "estimated")
+        self.assertTrue(entry.exists())  # a checkout may still be using it: the full inventory decides
+        self.assertFalse(lone.exists())  # expiry of unlinked entries does not wait
+        storage.collect([], now=time.time() + storage.INVENTORY_INTERVAL)
+        self.assertFalse(entry.exists())
+        self.assertEqual(private.read_bytes(), b"x" * 8192)
+
+    def test_a_deferred_full_inventory_is_retried_after_a_growing_pause(self):
+        storage.collect([])
+        self.age_inventory(at=storage.INVENTORY_INTERVAL, attempted_at=storage.INVENTORY_INTERVAL)
+        deferred = patch.object(storage, "inventory", side_effect=storage.InventoryDeferred("inventory deadline"))
+        with deferred:
+            self.assertEqual(storage.collect([])["inventory"]["mode"], "deferred")
+        with patch.object(storage, "inventory", side_effect=AssertionError("walked")):
+            self.assertEqual(storage.collect([])["inventory"]["mode"], "estimated")
+        self.age_inventory(attempted_at=storage.INVENTORY_RETRY)
+        with deferred:
+            self.assertEqual(storage.collect([])["inventory"]["mode"], "deferred")
+        self.age_inventory(attempted_at=storage.INVENTORY_RETRY)  # the second wait is two hours
+        with patch.object(storage, "inventory", side_effect=AssertionError("walked")):
+            storage.collect([])
+        self.age_inventory(attempted_at=storage.INVENTORY_RETRY)
+        with patch.object(storage, "inventory", wraps=storage.inventory) as walked:
+            storage.collect([])
+        self.assertEqual(walked.call_count, 1)
+
+    def test_entries_linked_outside_the_pool_still_expire_without_a_recent_inventory(self):
+        with patch.object(storage, "inventory", side_effect=storage.InventoryDeferred("inventory deadline")):
+            storage.collect([])  # never a complete inventory, as on a host whose walk never fits
+        entry = self.entry(age=4 * 86400)
+        os.link(entry / "data", self.root / "private")
+        with patch.object(storage, "inventory", side_effect=AssertionError("walked")):
+            result = storage.collect([])
+        self.assertEqual(result["inventory"]["mode"], "unknown")
+        self.assertFalse(entry.exists())
+        self.inventory_record.unlink()
+        storage.collect([])  # a complete inventory, then only deferred ones for a day
+        self.age_inventory(at=2 * storage.INVENTORY_INTERVAL)
+        atomic_json(self.inventory_record, dict(json.loads(self.inventory_record.read_text()), deferrals=1))
+        stale = self.entry("b" * 16, age=4 * 86400)
+        os.link(stale / "data", self.root / "private2")
+        with patch.object(storage, "inventory", side_effect=AssertionError("walked")):
+            self.assertEqual(storage.collect([])["inventory"]["mode"], "estimated")
+        self.assertFalse(stale.exists())
+
+    def test_a_dry_run_records_no_inventory(self):
+        storage.collect([], dry=True)
+        self.assertFalse((self.root / "activity/cache-inventory.json").exists())
 
 
 if __name__ == "__main__":
