@@ -632,6 +632,10 @@ succeeds before then continues the claim.
 - **Lookahead helpers.** `TAUCETI_QUEUE_LOOKAHEAD_HELPERS` (default 16, half for background work; 0 turns it off) is the number of
   helper agents resolving a rebase task's later conflicts on its target while the replay works on the
   current one (`tauceti_queue/repair_lookahead.py`). Each helper builds in its own worktree.
+  `TAUCETI_REPAIR_LEAN_JOB_BUDGET` (default 16; 0 for none) bounds the Lean jobs of the serial
+  build and the helpers' builds together: the serial build keeps `TAUCETI_REPAIR_LEAN_JOBS` and the
+  helpers share the rest, which caps both their number and each one's jobs (by default 8 helpers at
+  1 job each; decision 219).
 - The content clone named by `TAUCETI_QUEUE_CLONE` (the installer creates it).
 
 ### Terminal repair worktree cleanup

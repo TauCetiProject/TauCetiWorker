@@ -279,7 +279,7 @@ launch = {
 }
 started = time.time()
 with calls.open("a") as handle:
-    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "TAUCETI_QUEUE_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS", "TAUCETI_PR_CACHE_INSTALLED")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
+    handle.write(json.dumps({"call": call, "agent": agent, "mode": mode, "resume": resume, "started": started, "argv": args[:1] + [a for a in args[1:] if a != prompt], "prompt": prompt, "prompt_via": prompt_via, "prompt_chars": len(prompt), "cwd": os.getcwd(), "launch": launch, "env": {k: os.environ.get(k) for k in ("GH_TOKEN", "GITHUB_TOKEN", "TAUCETI_QUEUE_TOKEN", "GIT_CONFIG_VALUE_0", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TAUCETI_CLAUDE_BILLING", "BASH_MAX_TIMEOUT_MS", "TAUCETI_SHELL_LIMIT_SECONDS", "LAKE_CACHE_KEY", "TAUCETI_PR_CACHE_MISS", "TAUCETI_PR_CACHE_INSTALLED", "TAUCETI_REPAIR_LEAN_JOBS")}, "claude_credentials": bool(config_dir) and os.path.exists(os.path.join(config_dir, ".credentials.json")), "codex_credentials": bool(codex_home) and os.path.exists(os.path.join(codex_home, "auth.json"))}) + "\n")
 fcntl.flock(call_lock, fcntl.LOCK_UN)
 call_lock.close()
 session = ("sess-" if agent == "claude" else "thread-") + str(call)
@@ -1942,7 +1942,8 @@ class RebaseArtifacts(Fixture):
         sh(seed, "push", "--quiet", "--force", "origin", f"{moved}:refs/heads/queue/batch-1/onto")
         self.raw["onto"] = self.onto = moved
         cfg = self.config(lookahead_helpers=1)
-        outcome = repair_task.claim_and_run(cfg, self.client(cfg))
+        with patch.dict(os.environ, {"TAUCETI_REPAIR_LEAN_JOB_BUDGET": "10"}):
+            outcome = repair_task.claim_and_run(cfg, self.client(cfg))
         self.assertEqual(outcome["status"], "adopted", outcome)
         self.assertEqual([c["source_pr"] for c in outcome["conflicts"]], [f"{PROJECT}#2", f"{PROJECT}#3"])
         self.assertEqual([c.get("lookahead", False) for c in outcome["conflicts"]], [False, True])
@@ -1950,6 +1951,13 @@ class RebaseArtifacts(Fixture):
         self.assertEqual(len(calls), 2, "one agent per conflict")
         ahead = [c for c in calls if f"PR #3's commit `{self.content.members[2]['commit'][:12]}`" in c["prompt"]]
         self.assertEqual(len(ahead), 1)
+        # The serial agent keeps the per-build cap; the helper gets what the budget of 10 leaves, in
+        # its agent's environment and in the one for the builds it runs itself.
+        self.assertEqual(ahead[0]["env"]["TAUCETI_REPAIR_LEAN_JOBS"], "2")
+        jobs = list((cfg.tasks_dir / "1" / "lookahead").glob("*/job.json"))
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(json.loads(jobs[0].read_text())["env_lake"]["TAUCETI_REPAIR_LEAN_JOBS"], "2")
+        self.assertEqual([c["env"]["TAUCETI_REPAIR_LEAN_JOBS"] for c in calls if c is not ahead[0]], ["8"])
         self.assertNotIn(f"PR #2's commit `{self.content.members[1]['commit'][:12]}`", ahead[0]["prompt"])
         self.assertEqual(len(outcome["agent"]), 2, "the lookahead's agent run is recorded with the task's")
         one, two, three = self.submitted_chain()
@@ -1967,9 +1975,45 @@ class RebaseArtifacts(Fixture):
         cfg = self.config(lookahead_helpers=16)
         head = types.SimpleNamespace(kind="rebase_conflict", extra={})
         background = types.SimpleNamespace(kind="rebase_conflict", extra={"background": True})
-        self.assertEqual(repair_lookahead.helper_count(cfg, head), 16)
-        self.assertEqual(repair_lookahead.helper_count(cfg, background), 8)
-        self.assertEqual(repair_lookahead.helper_count(self.config(lookahead_helpers=1), background), 1)
+        unbudgeted = {"TAUCETI_REPAIR_LEAN_JOB_BUDGET": "0"}
+        self.assertEqual(repair_lookahead.helper_count(cfg, head, unbudgeted), 16)
+        self.assertEqual(repair_lookahead.helper_count(cfg, background, unbudgeted), 8)
+        self.assertEqual(repair_lookahead.helper_count(self.config(lookahead_helpers=1), background, unbudgeted), 1)
+
+    def test_the_helpers_share_the_tasks_lean_job_budget(self):
+        """Decision 219: the serial build keeps the per-build cap and the helpers share the rest of the
+        task's budget, so a task never runs more Lean jobs than the budget (one helper at one job at
+        least)."""
+        from tauceti_queue import repair_lookahead, repair_sandbox
+
+        self.assertEqual(repair_sandbox.DEFAULT_LEAN_JOB_BUDGET, 16)
+        head = types.SimpleNamespace(kind="rebase_conflict", extra={})
+        background = types.SimpleNamespace(kind="rebase_conflict", extra={"background": True})
+
+        def plan(helpers, task=head, **env):
+            env = {
+                {"jobs": repair_sandbox.LEAN_JOBS_VARIABLE, "budget": repair_sandbox.LEAN_JOB_BUDGET_VARIABLE}[k]: v
+                for k, v in env.items()
+            }
+            return repair_lookahead.plan(self.config(lookahead_helpers=helpers), task, env)
+
+        self.assertEqual(plan(16), (8, 1), "the defaults: 8 + 8 x 1 = 16 jobs, not 8 + 16 x 8 = 136")
+        self.assertEqual(plan(16, background), (8, 1))
+        self.assertEqual(plan(2), (2, 4))
+        self.assertEqual(plan(1), (1, 8), "never above the per-build cap")
+        self.assertEqual(plan(3, budget="32"), (3, 8))
+        self.assertEqual(plan(16, budget="32"), (16, 1))
+        self.assertEqual(plan(4, budget="13"), (4, 1))
+        self.assertEqual(plan(16, budget="8"), (1, 1), "a budget at the per-build cap still leaves one helper")
+        self.assertEqual(plan(16, jobs="4", budget="12"), (8, 1))
+        self.assertEqual(plan(16, budget="0"), (16, 8), "no budget: the configured helpers at the per-build cap")
+        self.assertEqual(plan(16, jobs="0"), (16, None), "uncapped builds: no budget to share")
+        self.assertEqual(plan(16, budget="many"), (8, 1), "an unreadable budget takes the default")
+        for helpers in range(1, 20):
+            for budget in range(9, 40):
+                count, jobs = plan(helpers, budget=str(budget))
+                self.assertLessEqual(count, helpers)
+                self.assertLessEqual(repair_sandbox.DEFAULT_LEAN_JOBS + count * jobs, budget)
 
     def test_a_chain_that_changes_the_dependencies_gets_no_lookahead(self):
         """Helpers share packages prepared at ``onto``: a member changing ``lake-manifest.json`` turns them off."""
@@ -8187,6 +8231,18 @@ class NumprojImports(NumprojBase):
         builds = [c for c in self.lake_calls() if c.startswith("build")]
         self.assertIn("build TauCeti.A", builds)
         self.assertFalse([b for b in builds if "Mathlib" in b], builds)
+
+    def test_the_tools_concurrent_runs_share_the_lean_job_cap(self):
+        """The tool starts its own ``lean`` processes, so its runs at once share the repair Lean job cap."""
+        with patch.dict(os.environ, {repair_sandbox.LEAN_JOBS_VARIABLE: "6"}):
+            self.run_task(self.IMPORTING + NEW_P)
+        calls = self.numproj_calls()
+        self.assertTrue(calls)
+        jobs = [int(re.search(r"--jobs (\d+)", call).group(1)) for call in calls]
+        self.assertEqual(sum(jobs), 6, calls)
+        self.assertEqual(repair_numproj.tool_jobs({repair_sandbox.LEAN_JOBS_VARIABLE: "8"}, 2), 4)
+        self.assertEqual(repair_numproj.tool_jobs({repair_sandbox.LEAN_JOBS_VARIABLE: "1"}, 2), 1)
+        self.assertEqual(repair_numproj.tool_jobs({repair_sandbox.LEAN_JOBS_VARIABLE: "0"}, 2), 4)
 
     def test_the_header_is_parsed_with_comments_and_modifiers(self):
         text = (
