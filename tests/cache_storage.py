@@ -502,6 +502,60 @@ class Storage(unittest.TestCase):
             self.assertEqual(storage.collect([])["inventory"]["mode"], "estimated")
         self.assertFalse(stale.exists())
 
+    def test_after_a_deferred_inventory_the_walk_may_use_the_whole_run(self):
+        start = time.monotonic()
+        with patch.object(storage, "inventory", wraps=storage.inventory) as walked:
+            storage.collect([], deadline=start + 400, run_deadline=start + 1000)
+        self.assertLess(walked.call_args.kwargs["deadline"], start + 400)  # half the collection's slice
+        with patch.object(storage, "inventory", side_effect=storage.InventoryDeferred("inventory deadline")):
+            storage.collect([], now=time.time() + storage.INVENTORY_INTERVAL)
+        self.age_inventory(attempted_at=storage.INVENTORY_RETRY)
+        with patch.object(storage, "inventory", wraps=storage.inventory) as walked:
+            result = storage.collect(
+                [], now=time.time() + storage.INVENTORY_INTERVAL, deadline=start + 400, run_deadline=start + 1000
+            )
+        self.assertGreaterEqual(walked.call_args.kwargs["deadline"], start + 940)
+        self.assertEqual(result["inventory"]["mode"], "full")
+        with patch.object(storage, "inventory", side_effect=storage.InventoryDeferred("inventory deadline")):
+            storage.collect([], now=time.time() + 2 * storage.INVENTORY_INTERVAL)
+        total = shutil.disk_usage(self.root).total
+        low = shutil._ntuple_diskusage(total, total, storage.headroom(total, storage.TARGET) - 1)
+        with (
+            patch.object(storage.shutil, "disk_usage", return_value=low),
+            patch.object(storage, "inventory", wraps=storage.inventory) as walked,
+        ):
+            storage.collect([], deadline=start + 400, run_deadline=start + 1000)
+        self.assertLess(walked.call_args.kwargs["deadline"], start + 400)  # deletion is urgent: no extension
+
+    def test_space_running_short_stops_a_long_walk_and_gives_deletion_the_run(self):
+        storage.collect([])
+        with patch.object(storage, "inventory", side_effect=storage.InventoryDeferred("inventory deadline")):
+            storage.collect([], now=time.time() + storage.INVENTORY_INTERVAL)
+        self.age_inventory(attempted_at=storage.INVENTORY_RETRY)
+        old = self.entry(age=4 * 86400)
+        total = shutil.disk_usage(self.root).total
+        low = shutil._ntuple_diskusage(total, total, storage.headroom(total, storage.TARGET) - 1)
+        seen = {}
+
+        def walk(*args, abort=None, **kwargs):
+            with patch.object(storage.shutil, "disk_usage", return_value=low):
+                seen["aborted"] = abort is not None and abort()
+            raise storage.InventoryDeferred("disk pressure")
+
+        start = time.monotonic()
+        with (
+            patch.object(storage, "INVENTORY_PRESSURE_CHECK", 0),
+            patch.object(storage, "inventory", side_effect=walk),
+        ):
+            # The collection's own slice is already over, as after a long walk; the run's is not.
+            result = storage.collect(
+                [], now=time.time() + storage.INVENTORY_INTERVAL, deadline=start - 1, run_deadline=start + 600
+            )
+        self.assertTrue(seen["aborted"])
+        self.assertEqual(result["inventory"]["mode"], "deferred")
+        self.assertNotIn("shared-cache-deletion", result["deferred"])
+        self.assertFalse(old.exists())
+
     def test_a_dry_run_records_no_inventory(self):
         storage.collect([], dry=True)
         self.assertFalse((self.root / "activity/cache-inventory.json").exists())

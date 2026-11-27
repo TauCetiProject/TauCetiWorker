@@ -682,6 +682,7 @@ def sweep(*, dry=False, now=None, diagnostics_only=False, shared=True, shared_co
                     now=now,
                     opened=opened,
                     deadline=shared_deadline,
+                    run_deadline=deadline,
                 )
                 merge_report(report, storage)
                 report.update(

@@ -22,6 +22,7 @@ MIN_PRIVATE_RECLAIM = 256 * 1024**2
 # grown by the device's own growth since, and do a full one at once when free space nears the
 # target or that estimate reaches the cap.
 INVENTORY_INTERVAL = 12 * 3600
+INVENTORY_PRESSURE_CHECK = 30  # seconds between free-space checks during a walk that may use the whole run
 INVENTORY_RETRY = 3600  # after a full inventory that did not finish within its run's deadline
 
 
@@ -82,11 +83,13 @@ INVENTORY_CHECK_EVERY = 4096  # entries between deadline checks: cheap, yet well
 class _Clock:
     """One deadline counter for a whole inventory, across every root it walks."""
 
-    def __init__(self, deadline):
-        self.deadline, self.entries = deadline, 0
+    def __init__(self, deadline, abort=None):
+        self.deadline, self.entries, self.abort = deadline, 0, abort
 
     def check(self, *, now=False):
         self.entries += 1
+        if (now or self.entries % INVENTORY_CHECK_EVERY == 0) and self.abort is not None and self.abort():
+            raise InventoryDeferred("disk pressure")
         if (now or self.entries % INVENTORY_CHECK_EVERY == 0) and self.deadline is not None:
             if time.monotonic() >= self.deadline:
                 raise InventoryDeferred("inventory deadline")
@@ -154,7 +157,7 @@ def _overlapping(roots):
     return len(unique) < len(resolved) or any(parent in unique for root in unique for parent in root.parents)
 
 
-def inventory(paths, *, protected=(), owners=None, details=None, private=None, deadline=None):
+def inventory(paths, *, protected=(), owners=None, details=None, private=None, deadline=None, abort=None):
     """Allocated bytes, deduplicated by inode across both pool and private hard links.
 
     `named_bytes` counts every name, as `du --count-links` would: hard-linked files count once per
@@ -170,7 +173,7 @@ def inventory(paths, *, protected=(), owners=None, details=None, private=None, d
     before, during and after the walk."""
     seen, result = {}, {}
     owners = owners or {}
-    clock = _Clock(deadline)
+    clock = _Clock(deadline, abort)
     clock.check(now=True)
     roots = [root for root in paths if root.is_dir() and not root.is_symlink()]
     remember_all = _overlapping(roots)
@@ -267,6 +270,7 @@ def admit(cfg):
                 marker.unlink(missing_ok=True)
 
 
+_PRESSURE = ("free space", "cap")  # reasons for a full inventory that also make deletion urgent
 _INVENTORY_KEYS = ("managed_bytes", "externally_linked_bytes", "protected_bytes", "named_bytes", "unique_inodes")
 
 
@@ -318,7 +322,9 @@ def _plan(record, pool, observed, now):
     return "estimated", estimate
 
 
-def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
+def collect(configs, *, dry=False, now=None, opened=..., deadline=None, run_deadline=None):
+    """``deadline`` bounds this collection; ``run_deadline`` (both time.monotonic()), the whole
+    collector run, which a full inventory may use up once a shorter one has missed its deadline."""
     from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, past, remove, workspace_idle
 
     now = time.time() if now is None else now
@@ -375,11 +381,38 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
         before, conservative = {}, False
     else:
         conservative = False
-        # The walk gets half the time, so deletion always has the rest.
+        # The walk gets half the time, so deletion always has the rest. A cold walk can need more,
+        # and a full inventory is rare: after a deferred one it may use the whole run but a minute,
+        # leaving this run's deletions and per-worker phases to the next run. Never under pressure:
+        # then deletion, which needs no inventory, must not wait.
         walk = None if deadline is None else time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
+        abort, pressured_walk = None, []
+        if walk is not None and run_deadline is not None and _retry_wait(record) and reason not in _PRESSURE:
+            walk = max(walk, run_deadline - min(60.0, max(0.0, run_deadline - time.monotonic()) / 20))
+            checked = [time.monotonic()]
+
+            def abort():
+                # Space can run short during a long walk: stop it, and deletion gets the run's rest.
+                if time.monotonic() - checked[0] < INVENTORY_PRESSURE_CHECK:
+                    return False
+                checked[0] = time.monotonic()
+                for path, _, _ in observed.values():
+                    with contextlib.suppress(OSError):
+                        usage = shutil.disk_usage(path)
+                        if usage.free < headroom(usage.total, TARGET):
+                            pressured_walk.append(path)
+                            return True
+                return False
+
         try:
             before = inventory(
-                paths, protected=protected, owners=owners, details=details, private=private_candidates, deadline=walk
+                paths,
+                protected=protected,
+                owners=owners,
+                details=details,
+                private=private_candidates,
+                deadline=walk,
+                abort=abort,
             )
             recorded = dict(at=now, attempted_at=now, pool=str(pool), devices={})
             for device, (_, usage, _) in observed.items():
@@ -395,6 +428,8 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
             deferrals = record.get("deferrals", 0)
             deferrals = deferrals if isinstance(deferrals, int) and not isinstance(deferrals, bool) else 0
             recorded = dict(record, attempted_at=now, deferrals=max(0, deferrals) + 1)
+            if pressured_walk:
+                deadline = max(deadline, run_deadline)
         if not dry:
             try:
                 atomic_json(record_path, recorded)
