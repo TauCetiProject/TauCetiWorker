@@ -35,8 +35,8 @@ class StateQueryError(ValueError):
 DEPENDENCY = "github-state"
 DEFAULT_URL = "https://github-state.taucetiproject.org"
 PUBLIC_REPOSITORY = "TauCetiProject/TauCeti"
-# Repositories github-state no longer mirrors (TauCetiRoadmap, whose only reader was the open intentions
-# list). Their reads go to GitHub without asking the service, so its
+# Repositories github-state no longer mirrors: TauCetiRoadmap, whose only reader was the open
+# intentions list. Their reads go to GitHub without asking the service, so its
 # `repository_unavailable` answer for a removed repository never sets the host's fallback marker.
 UNMIRRORED_REPOSITORIES = frozenset({"taucetiproject/taucetiroadmap"})
 # Reasons a caller can act on. Authentication/configuration needs an operator; the rest recover.
