@@ -939,11 +939,19 @@ class GitHub:
         return transport.shared_read(["target_queue_landed", self.repo, number, branch], fetch, ttl=120)
 
     def issue_list(
-        self, repo: str, *, labels: list[str] | None = None, fields: list[str], state: str = "open", limit: int = 200
+        self,
+        repo: str,
+        *,
+        labels: list[str] | None = None,
+        fields: list[str],
+        state: str = "open",
+        limit: int = 200,
+        ttl: float = 120,
     ) -> list[dict]:
         """List issues in `repo` (explicit, since the client is bound to its own repo), filtered by
         ALL of `labels` (repeated --label = AND; gh handles slashes in label names). Each dict has
-        the requested `fields`. Raises GitHubError on failure."""
+        the requested `fields`; a direct read is shared on the host for `ttl` seconds. Raises
+        GitHubError on failure."""
         from .github_state import read
 
         if state == "open":
@@ -964,7 +972,7 @@ class GitHub:
                 raise GitHubError(f"gh issue list failed: {p.stderr.strip()}")
             return json.loads(p.stdout or "[]")
 
-        return transport.shared_read(["issue_list", repo, fields, labels, state, limit], fetch, ttl=120)
+        return transport.shared_read(["issue_list", repo, fields, labels, state, limit], fetch, ttl=ttl)
 
     def pr_view(self, pr: int, fields: list[str]) -> dict | None:
         from .github_state import read

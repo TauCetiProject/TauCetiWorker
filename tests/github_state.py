@@ -198,6 +198,19 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
         assert state.read(state.PUBLIC_REPOSITORY, "issue_comments", number=7) == (False, None)
         assert state.last_failure()["reason"] == "client_auth_configuration"
         fetch.assert_not_called()
+    # TauCetiRoadmap is not mirrored: a configured client goes to GitHub without asking, so the
+    # server's answer for a removed repository cannot set the host's fallback marker.
+    roadmap_token = Path(tmp) / "roadmap-token"
+    roadmap_token.write_text("client-token\n")
+    with (
+        patch.dict(os.environ, {"TAUCETI_GITHUB_STATE_TOKEN_FILE": str(roadmap_token)}),
+        patch.object(state.urllib.request, "urlopen") as fetch,
+        patch.object(state, "_unavailable", side_effect=AssertionError("not a failure")),
+    ):
+        for repository in ("TauCetiProject/TauCetiRoadmap", "taucetiproject/taucetiroadmap"):
+            assert state.read(repository, "open_issues") == (False, None)
+        assert state.last_failure() is None
+        fetch.assert_not_called()
 
     # A public 429 is shared across operations, then expires without an operator.
     with tempfile.TemporaryDirectory() as limited, patch.dict(os.environ, {"TAUCETI_GITHUB_SHARED_DIR": limited}):

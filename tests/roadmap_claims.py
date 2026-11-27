@@ -181,10 +181,11 @@ check("names match case-sensitively", not it.in_area(issue("Left and right Fuete
 # --- avoid_list: one read per round, no area label in the query --------------
 class FakeGH:
     def __init__(self, issues, error=None):
-        self.issues, self.error, self.calls = issues, error, []
+        self.issues, self.error, self.calls, self.ttls = issues, error, [], []
 
-    def issue_list(self, repo, *, labels=None, fields, state="open", limit=200):
+    def issue_list(self, repo, *, labels=None, fields, state="open", limit=200, ttl=120):
         self.calls.append((list(labels or []), limit))
+        self.ttls.append(ttl)
         if self.error:
             raise self.error
         return [i for i in self.issues if all(lb in it._label_names(i) for lb in labels or [])]
@@ -228,6 +229,9 @@ check("a hold applies through either area label", round_("IntegralLattices")[1] 
 check("a hold does not reach other areas", round_("AlgebraicCurves")[1] == [12])
 check("an unpinned round reads only the holds and gets all of them", round_(None) == ([HOLDS], [14]))
 check("an ignore-claims round reads only the holds", round_("RepresentationTheory", respect=False) == ([HOLDS], []))
+ttl_gh = FakeGH(board)
+it.avoid_list(ttl_gh, "PDE", True)
+check("the board is shared on the host for ten minutes", ttl_gh.ttls == [600])
 check("nothing to avoid renders as none", it.avoid_list(FakeGH([]), "PDE", True) == "none")
 
 try:
