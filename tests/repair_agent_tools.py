@@ -258,7 +258,10 @@ class LeanJobs(Fixture):
         self.assertNotIn("LEAN_NUM_THREADS", self.setenv(self.argv({**self.env, variable: "0"})))
         for bad in ("many", "-3", "2.5"):
             with self.assertLogs("tauceti_queue.repair_sandbox", "WARNING"):
-                self.assertEqual(self.setenv(self.argv({**self.env, variable: bad}))["LEAN_NUM_THREADS"], str(repair_sandbox.DEFAULT_LEAN_JOBS))
+                self.assertEqual(
+                    self.setenv(self.argv({**self.env, variable: bad}))["LEAN_NUM_THREADS"],
+                    str(repair_sandbox.DEFAULT_LEAN_JOBS),
+                )
 
     def test_the_build_environment_never_reaches_the_sandbox(self):
         argv = self.argv({**self.env, "LEAN_NUM_THREADS": "96"})
