@@ -5748,6 +5748,23 @@ class ErrorParsing(unittest.TestCase):
                 "- `TauCeti/A.lean:12:3` (no commit of this batch modifies this file)",
             ],
         )
+        # The streaming build's error list reports the same errors at line 1: merged, they appear once,
+        # with no line and their reason.
+        streamed = repair_stream.parse_errors(log)
+        self.assertEqual(
+            repair_parallel.merge_errors(findings, streamed)["compiler_errors"], findings["compiler_errors"]
+        )
+        alone = repair_parallel.merge_errors({**findings, "compiler_errors": []}, streamed)
+        self.assertEqual(
+            [(e["path"], e["line"], e.get("reason")) for e in alone["compiler_errors"]],
+            [(e["path"], e["line"], e.get("reason")) for e in findings["compiler_errors"]],
+        )
+        # After a parallel repair, a module the verification build could not read keeps Lake's message.
+        unlocated = [e for e in findings["compiler_errors"] if e.get("reason")]
+        empty = repair.findings_from_diagnostics([])
+        remaining = repair_parallel.remaining_findings(empty, [], ["TauCeti/Imp.lean", "TauCeti/B.lean"], unlocated)
+        self.assertEqual(remaining["compiler_errors"], [findings["compiler_errors"][1]])
+        self.assertEqual([f["module"] for f in remaining["other"]], ["TauCeti/B.lean"])
 
 
 class Records(unittest.TestCase):
