@@ -483,6 +483,8 @@ time.sleep(float(os.environ.get('FAKE_POST_RESULT_DELAY', '0')))
                 "ANTHROPIC_API_KEY": "fake-api-key",
                 "CLAUDE_CODE_OAUTH_TOKEN": "subscription-token",
                 "TAUCETI_API_WAIT": "0",
+                # These refusals check the round's exit, not the shim's hold for capacity to reopen.
+                "TAUCETI_CAPACITY_HOLD_SECONDS": "0",
             },
         )
         self.env.start()

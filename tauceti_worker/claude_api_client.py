@@ -132,7 +132,7 @@ def main():
     # Fleet capacity can close while a round prepares (checkout, build caches, builds), which
     # takes minutes for fix and rebase rounds. Hold the prepared work for capacity to reopen
     # instead of discarding it, leaving the round most of its time budget.
-    hold_until = time.time() + CAPACITY_HOLD_SECONDS
+    hold_until = time.time() + float(os.environ.get("TAUCETI_CAPACITY_HOLD_SECONDS", CAPACITY_HOLD_SECONDS))
     if deadline := config.get("deadline") or os.environ.get("TAUCETI_ROUND_DEADLINE"):
         hold_until = min(hold_until, float(deadline) - CAPACITY_HOLD_RESERVE_SECONDS)
     while True:
