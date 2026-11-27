@@ -502,6 +502,21 @@ class Storage(unittest.TestCase):
             self.assertEqual(storage.collect([])["inventory"]["mode"], "estimated")
         self.assertFalse(stale.exists())
 
+    def test_after_a_deferred_inventory_the_walk_may_use_the_whole_run(self):
+        start = time.monotonic()
+        with patch.object(storage, "inventory", wraps=storage.inventory) as walked:
+            storage.collect([], deadline=start + 400, run_deadline=start + 1000)
+        self.assertLess(walked.call_args.kwargs["deadline"], start + 400)  # half the collection's slice
+        with patch.object(storage, "inventory", side_effect=storage.InventoryDeferred("inventory deadline")):
+            storage.collect([], now=time.time() + storage.INVENTORY_INTERVAL)
+        self.age_inventory(attempted_at=storage.INVENTORY_RETRY)
+        with patch.object(storage, "inventory", wraps=storage.inventory) as walked:
+            result = storage.collect(
+                [], now=time.time() + storage.INVENTORY_INTERVAL, deadline=start + 400, run_deadline=start + 1000
+            )
+        self.assertGreaterEqual(walked.call_args.kwargs["deadline"], start + 940)
+        self.assertEqual(result["inventory"]["mode"], "full")
+
     def test_a_dry_run_records_no_inventory(self):
         storage.collect([], dry=True)
         self.assertFalse((self.root / "activity/cache-inventory.json").exists())

@@ -318,7 +318,9 @@ def _plan(record, pool, observed, now):
     return "estimated", estimate
 
 
-def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
+def collect(configs, *, dry=False, now=None, opened=..., deadline=None, run_deadline=None):
+    """``deadline`` bounds this collection; ``run_deadline`` (both time.monotonic()), the whole
+    collector run, which a full inventory may use up once a shorter one has missed its deadline."""
     from .retention import LIFETIME, cache_roots, fresh_report, note, open_files, past, remove, workspace_idle
 
     now = time.time() if now is None else now
@@ -375,8 +377,12 @@ def collect(configs, *, dry=False, now=None, opened=..., deadline=None):
         before, conservative = {}, False
     else:
         conservative = False
-        # The walk gets half the time, so deletion always has the rest.
+        # The walk gets half the time, so deletion always has the rest. A cold walk can need more,
+        # and a full inventory is rare: after a deferred one it may use the whole run but a minute,
+        # leaving this run's deletions and per-worker phases to the next run.
         walk = None if deadline is None else time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
+        if walk is not None and run_deadline is not None and _retry_wait(record):
+            walk = max(walk, run_deadline - min(60.0, max(0.0, run_deadline - time.monotonic()) / 20))
         try:
             before = inventory(
                 paths, protected=protected, owners=owners, details=details, private=private_candidates, deadline=walk
