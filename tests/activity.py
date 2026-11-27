@@ -1003,6 +1003,24 @@ class ActivityTests(unittest.TestCase):
         )
         self.assertIn("Retrying in background", output.getvalue())
 
+    def test_unmirrored_repository_is_not_observed_and_leaves_refresh_work(self):
+        a.emit("pr_created", repository="TauCetiProject/TauCetiRoadmap", pr=7)
+        env = {
+            "TAUCETI_GITHUB_STATE_URL": "https://state.example",
+            "TAUCETI_GITHUB_STATE_TOKEN_FILE": "/not-read-by-mock",
+        }
+        with (
+            patch.dict(os.environ, env),
+            patch.object(a, "observe", side_effect=AssertionError("github-state no longer holds Roadmap")),
+        ):
+            a.prepare(now=self.now + 1)
+        with contextlib.closing(a._connect()) as db:
+            pending = db.execute(
+                "SELECT 1 FROM report_pr_refresh WHERE repo='TauCetiProject/TauCetiRoadmap' AND next_at IS NOT NULL"
+            ).fetchall()
+        self.assertEqual(pending, [])
+        self.assertEqual(a.cached()["errors"], [])
+
     def test_observation_errors_expire_without_refresh_work_and_survive_retry_delay(self):
         a.emit("pr_created", repository="org/roadmap", pr=7)
         a.prepare(now=self.now)

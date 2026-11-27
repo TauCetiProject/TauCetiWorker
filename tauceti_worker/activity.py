@@ -23,7 +23,15 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from . import activity_attribution, activity_ci, activity_costs, activity_forgejo, activity_git, activity_summary
+from . import (
+    activity_attribution,
+    activity_ci,
+    activity_costs,
+    activity_forgejo,
+    activity_git,
+    activity_summary,
+    github_state,
+)
 from .constants import WORK_TASKS
 from .runtime_status import atomic_json, read_json
 
@@ -510,6 +518,10 @@ def _refresh_prs(db, config, now, errors):
         key = (repo, number)
         if activity_forgejo.is_forgejo(repo):
             # activity_forgejo observes these from Forgejo, not the GitHub state service.
+            db.execute("UPDATE report_pr_refresh SET next_at=NULL WHERE repo=? AND number=?", key)
+            continue
+        if not github_state.mirrored(repo):
+            # The state service no longer holds this repository, so it has nothing to observe.
             db.execute("UPDATE report_pr_refresh SET next_at=NULL WHERE repo=? AND number=?", key)
             continue
         db.execute("INSERT OR IGNORE INTO pr_observations(repo,number) VALUES (?,?)", key)

@@ -209,6 +209,7 @@ with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"TAUCETI_GITH
     ):
         for repository in ("TauCetiProject/TauCetiRoadmap", "taucetiproject/taucetiroadmap"):
             assert state.read(repository, "open_issues") == (False, None)
+            assert state.refresh_pr(repository, 7, "a" * 40)["status"] == "unavailable"
         assert state.last_failure() is None
         fetch.assert_not_called()
 
