@@ -159,9 +159,9 @@ class Attribution(unittest.TestCase):
             document["landers"],
             [{"forgejo_pr": 11, "github_id": 477956}, {"forgejo_pr": 9, "github_id": 56166236}],
         )
-        # the newest landing is read first, and one confirmed PR is enough
+        # each author's landed PRs, newest first, each attributed on its own
         pulls = [url.rsplit("/", 1)[1] for url in self.forgejo.calls if "/pulls/" in url]
-        self.assertEqual(pulls, ["9", "15", "11", "16", "17"])
+        self.assertEqual(pulls, ["9", "7", "15", "11", "16", "17"])
 
     def test_an_unreadable_pr_falls_back_to_an_older_landing(self):
         del self.forgejo.pulls[9]
@@ -188,9 +188,50 @@ class Attribution(unittest.TestCase):
             raise RuntimeError("HTTP 502")
 
         self.assertEqual(self.run_job(dispatcher=broken), 1)
-        self.assertFalse((self.root / "claims-access-state.json").exists())
         self.run_job(now=10_060.0)
         self.assertEqual(len(self.dispatched), 1)
+
+    def test_a_reused_login_attributes_each_pr_to_its_own_poster(self):
+        # `alice` landed PR 7 and renamed; a local account, then Bob, took the login and landed 9 and 10.
+        with closing(sqlite3.connect(self.root / "queue.sqlite3")) as c, c:
+            c.execute(
+                "INSERT INTO inputs (repository, number, author, state, landed_at, source_identity) VALUES (?,?,?,?,?,?)",
+                (PROJECT, 10, "alice", "landed", 210.0, SOURCE),
+            )
+        self.forgejo.pulls[10] = pull((21, "alice"))
+        self.forgejo.pulls[9] = pull((30, "alice"))
+        self.run_job()
+        landers = self.written()["landers"]
+        self.assertIn({"forgejo_pr": 7, "github_id": 56166236}, landers)
+        self.assertIn({"forgejo_pr": 10, "github_id": 477956}, landers)
+
+    def test_posters_are_read_once(self):
+        self.run_job()
+        before = len([url for url in self.forgejo.calls if "/pulls/" in url])
+        self.run_job(now=10_060.0)
+        again = [url.rsplit("/", 1)[1] for url in self.forgejo.calls if "/pulls/" in url][before:]
+        # only the PR that did not belong to the repository, whose poster was never kept, is read again
+        self.assertEqual(again, ["17"])
+
+    def test_a_forgejo_outage_keeps_the_attribution_and_still_dispatches(self):
+        self.run_job()
+        written = self.written()
+
+        def down(url, token):
+            raise OSError("forge down")
+
+        with closing(sqlite3.connect(self.root / "queue.sqlite3")) as c, c:
+            c.execute(
+                "INSERT INTO inputs (repository, number, author, state, landed_at) VALUES (?,?,?,?,?)",
+                (PROJECT, 46002, "newcomer", "landed", 300.0),
+            )
+        status = claims_access.run(args(self.root), now=10_060.0, get=down, dispatcher=self.dispatcher)
+        self.assertEqual(status, 1)
+        self.assertEqual(self.written(), written)
+        self.assertEqual(len(self.dispatched), 2)
+        # and the outage alone is not news
+        claims_access.run(args(self.root), now=10_120.0, get=down, dispatcher=self.dispatcher)
+        self.assertEqual(len(self.dispatched), 2)
 
     def test_dry_run_writes_and_dispatches_nothing(self):
         self.run_job(dry_run=True)

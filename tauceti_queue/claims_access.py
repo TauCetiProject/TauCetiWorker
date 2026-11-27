@@ -35,6 +35,7 @@ credential directory (docs/queue/operations.md). Neither is written anywhere or 
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import os
 import sqlite3
@@ -120,31 +121,38 @@ def forgejo_users(base, token, get=forgejo_get):
         page += 1
 
 
-def attribute(landed, base, repository, repository_id, token, source_id, get=forgejo_get, tries=3):
-    """[{github_id, forgejo_pr}] for each Forgejo author in `landed` whose landed PR was posted by an
-    account signed in with GitHub. An author whose PRs cannot be read is skipped this run."""
+def attribute(landed, base, repository, repository_id, token, source_id, get=forgejo_get, posters=None, tries=3):
+    """[{github_id, forgejo_pr}]: each landed PR, up to `tries` per ledger author, attributed by its
+    poster's numeric ID, deduplicated by GitHub ID. The ledger's author is a login, which can be renamed
+    and then taken by another account, so it only selects PRs to read: every one read is attributed
+    independently, and a PR by an account that is not a GitHub sign-in skips that PR alone. `posters`,
+    {PR number: poster ID}, caches what is immutable, and is updated in place. A PR that cannot be read
+    is skipped this run."""
+    posters = {} if posters is None else posters
     users = forgejo_users(base, token, get)
     found = {}
     for author in sorted(landed):
         for number in landed[author][:tries]:
-            try:
-                pr = get(f"{base}/api/v1/repos/{quote(repository, safe='/')}/pulls/{number}", None)
-            except (urllib.error.URLError, OSError, ValueError) as error:
-                log(f"could not read Forgejo PR {number} of {author}: {error}")
-                continue
-            base_repo = ((pr or {}).get("base") or {}).get("repo") or {}
-            poster = (pr or {}).get("user") or {}
-            if base_repo.get("id") != repository_id or type(poster.get("id")) is not int:
-                log(f"Forgejo PR {number} of {author} is not a PR of repository {repository_id}; skipped")
-                continue
-            account = users.get(poster["id"])
+            poster = posters.get(str(number))
+            if poster is None:
+                try:
+                    pr = get(f"{base}/api/v1/repos/{quote(repository, safe='/')}/pulls/{number}", None)
+                except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as error:
+                    log(f"could not read Forgejo PR {number} of {author}: {error}")
+                    continue
+                base_repo = ((pr or {}).get("base") or {}).get("repo") or {}
+                poster = ((pr or {}).get("user") or {}).get("id")
+                if base_repo.get("id") != repository_id or type(poster) is not int:
+                    log(f"Forgejo PR {number} of {author} is not a PR of repository {repository_id}; skipped")
+                    continue
+                posters[str(number)] = poster
+            account = users.get(poster)
             name = str((account or {}).get("login_name") or "")
             if not account or account.get("source_id") != source_id or not name.isdigit():
-                log(f"Forgejo PR {number} was posted by {poster.get('login')!r}, not a GitHub sign-in; skipped")
-                break
+                log(f"Forgejo PR {number} was posted by Forgejo user {poster}, not a GitHub sign-in; skipped")
+                continue
             github_id = int(name)
             found.setdefault(github_id, {"github_id": github_id, "forgejo_pr": number})
-            break
     return sorted(found.values(), key=lambda row: row["github_id"])
 
 
@@ -202,51 +210,70 @@ def run(args, now=None, get=forgejo_get, dispatcher=dispatch):
     now = time.time() if now is None else now
     base = args.forgejo_url.rstrip("/")
     landed, github_authors = ledger_landings(args.database, args.repository, base, args.forgejo_repository_id)
-    landers = attribute(
-        landed,
-        base,
-        args.forgejo_repository,
-        args.forgejo_repository_id,
-        args.forgejo_token,
-        args.github_source_id,
-        get,
-    )
     output = Path(args.output) if args.output else Path(args.database).with_name(OUTPUT_NAME)
-    document = {
-        "schema": SCHEMA,
-        "generated_at": round(now, 3),
-        "repository": args.repository,
-        "forgejo": {"url": base, "repository": args.forgejo_repository, "id": args.forgejo_repository_id},
-        "definition": (
-            "the GitHub user ID of the poster of a Forgejo pull request the merge queue landed, read from the "
-            "site-admin record of a Forgejo account created by signing in with GitHub; one pull request each"
-        ),
-        "landers": landers,
-    }
-    if args.dry_run:
-        log(f"would write {output}: {len(landers)} Forgejo lander(s): {json.dumps(landers)}")
+    state_path = Path(args.state) if args.state else Path(args.database).with_name("claims-access-state.json")
+    state = read_state(state_path)
+    posters = dict(state.get("posters") or {})
+    status = 0
+    try:
+        landers = attribute(
+            landed,
+            base,
+            args.forgejo_repository,
+            args.forgejo_repository_id,
+            args.forgejo_token,
+            args.github_source_id,
+            get,
+            posters,
+        )
+    except Exception as error:  # noqa: BLE001 - a Forgejo outage must not stop the dispatch below
+        # The previous attribution stays published: it was true when written, and grants are monotone.
+        log(f"FAILED to attribute Forgejo landings, keeping {output} as it is: {error}")
+        landers, status = None, 1
+    if landers is not None:
+        document = {
+            "schema": SCHEMA,
+            "generated_at": round(now, 3),
+            "repository": args.repository,
+            "forgejo": {"url": base, "repository": args.forgejo_repository, "id": args.forgejo_repository_id},
+            "definition": (
+                "the GitHub user ID of the poster of a Forgejo pull request the merge queue landed, read from the "
+                "site-admin record of a Forgejo account created by signing in with GitHub; one pull request each"
+            ),
+            "landers": landers,
+        }
+        if args.dry_run:
+            log(f"would write {output}: {len(landers)} Forgejo lander(s): {json.dumps(landers)}")
+        else:
+            write_json(output, document)
+            log(f"wrote {output}: {len(landers)} Forgejo lander(s) of {len(landed)} Forgejo author(s)")
     else:
-        write_json(output, document)
-        log(f"wrote {output}: {len(landers)} Forgejo lander(s) of {len(landed)} Forgejo author(s)")
+        # Keep the authors already dispatched for, so that the outage alone does not look like news.
+        landers = [
+            {"github_id": int(a.split(":", 1)[1])} for a in state.get("authors") or [] if a.startswith("github-id:")
+        ]
     authors = sorted(
         {f"github:{login}" for login in github_authors} | {f"github-id:{row['github_id']}" for row in landers}
     )
-    state_path = Path(args.state) if args.state else Path(args.database).with_name("claims-access-state.json")
-    state = read_state(state_path)
     reason = due(state, authors, now, args.dispatch_interval)
-    if reason is None:
-        return 0
-    if args.dry_run:
+    dispatched_at, dispatched_for = state.get("dispatched_at") or 0, state.get("authors") or []
+    if reason is not None and args.dry_run:
         log(f"would dispatch {args.workflow} on {args.repository}@{args.ref}: {reason}")
-        return 0
-    try:
-        dispatcher(args.repository, args.workflow, args.ref, args.config)
-    except Exception as error:  # noqa: BLE001 - reported, and retried on the next run
-        log(f"FAILED to dispatch {args.workflow}: {error}")
-        return 1
-    write_json(state_path, {"schema": STATE_SCHEMA, "dispatched_at": round(now, 3), "authors": authors})
-    log(f"dispatched {args.workflow} on {args.repository}@{args.ref}: {reason}")
-    return 0
+    elif reason is not None:
+        try:
+            dispatcher(args.repository, args.workflow, args.ref, args.config)
+        except Exception as error:  # noqa: BLE001 - reported, and retried on the next run
+            log(f"FAILED to dispatch {args.workflow}: {error}")
+            status = 1
+        else:
+            dispatched_at, dispatched_for = round(now, 3), authors
+            log(f"dispatched {args.workflow} on {args.repository}@{args.ref}: {reason}")
+    if not args.dry_run:
+        write_json(
+            state_path,
+            {"schema": STATE_SCHEMA, "dispatched_at": dispatched_at, "authors": dispatched_for, "posters": posters},
+        )
+    return status
 
 
 def main(argv=None):
