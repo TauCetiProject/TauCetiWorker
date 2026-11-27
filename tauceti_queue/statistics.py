@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from contextlib import closing
 from pathlib import Path
 
 SCHEMA = "tauceti-queue.statistics/v1"
+LANDINGS_SCHEMA = "tauceti-queue.landings/v1"
+LANDINGS_MAX_DAYS = 35
 WINDOWS = (("1h", 3600), ("3h", 10800), ("24h", 86400), ("7d", 604800))
 
 
@@ -106,4 +109,79 @@ def snapshot(database, repository, branch, *, now=None):
             prs=len({m["number"] for m in members if m["batch_id"] == last["id"] and m["state"] == "landed"}),
         ),
         duration_definition="CI workflow run duration, including setup, reporting and publication; not build-only runtime",
+    )
+
+
+def _forge(identity):
+    """`github` for a primary-source input (no identity), else the identity's forge kind.
+
+    A malformed stored identity is the ledger's fault, not the caller's, so it raises
+    RuntimeError (a server error), never ValueError (which the server answers as a bad request).
+    """
+    if not identity:
+        return "github"
+    try:
+        parsed = json.loads(identity)
+    except ValueError as error:
+        raise RuntimeError("input source identity is not JSON") from error
+    forge = parsed.get("forge") if isinstance(parsed, dict) else None
+    kind = forge.get("kind") if isinstance(forge, dict) else None
+    if not isinstance(kind, str) or not kind:
+        raise RuntimeError("input source identity names no forge")
+    return kind
+
+
+def landings(database, repository, *, days, now=None):
+    """Each pull request landed in the last `days` days, with when the queue first approved it.
+
+    Approval is the queue admitting a head of the pull request after an all-green review, and a
+    pull request admitted more than once (a new head, a withdrawal) keeps its first admission, so
+    opening-to-approval plus approval-to-land is its whole opening-to-land time. Landing uses the
+    same positive evidence as `snapshot`: the input's landing receipt, the first if there are two.
+    Opening times are the forges' and are not held here.
+    """
+    if type(days) is not int or not 1 <= days <= LANDINGS_MAX_DAYS:
+        raise ValueError(f"days must be an integer from 1 to {LANDINGS_MAX_DAYS}")
+    now = time.time() if now is None else now
+    lower = now - days * 86400
+    with closing(sqlite3.connect(Path(database).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as c, c:
+        c.execute("PRAGMA query_only=ON")
+        c.execute("BEGIN")
+        if c.execute("SELECT 1 FROM settings WHERE key='source-ci:binding'").fetchone():
+            raise ValueError("qualified source statistics need an explicit public policy")
+        # The earliest receipt across the whole ledger, then the window: a pull request with a
+        # second receipt inside the window landed before it, and does not belong to it.
+        rows = c.execute(
+            "SELECT l.number, l.source_identity, l.landed, f.first FROM "
+            "(SELECT number, source_identity, min(landed_at) AS landed FROM inputs "
+            "  WHERE repository=? AND state='landed' AND landed_at IS NOT NULL "
+            "  GROUP BY number, source_identity) l "
+            "JOIN (SELECT number, source_identity, min(approved_at) AS first FROM inputs "
+            "  WHERE repository=? GROUP BY number, source_identity) f "
+            "  ON f.number=l.number AND f.source_identity=l.source_identity "
+            "WHERE l.landed > ? AND l.landed <= ?",
+            (repository, repository, lower, now),
+        ).fetchall()
+        first_batch = c.execute("SELECT min(created_at) FROM batches WHERE repository=?", (repository,)).fetchone()[0]
+    # Coverage starts where the ledger does, not before: a window reaching past the queue's first
+    # batch would otherwise read as days on which nothing landed.
+    since = lower if first_batch is None else max(lower, first_batch)
+    entries = sorted(
+        ([_forge(identity), number, round(first, 3), round(landed, 3)] for number, identity, landed, first in rows),
+        key=lambda entry: (entry[3], entry[0], entry[1]),
+    )
+    return dict(
+        schema=LANDINGS_SCHEMA,
+        repository=repository,
+        observed_at=now,
+        coverage="controller_ledger",
+        since=since,
+        days=days,
+        fields=["forge", "number", "first_approved_at", "landed_at"],
+        definition=(
+            "pull requests whose queue input recorded a landing in (since, observed_at]; "
+            "first_approved_at is the earliest queue admission of any head of the pull request, "
+            "after an all-green review; times are unix seconds"
+        ),
+        landings=entries,
     )
