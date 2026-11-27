@@ -38,7 +38,20 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from tauceti_queue import repair_sandbox, repair_tools
-from tauceti_queue.diagnostics import ANSI, LAKE, MODULE, PATH, SOURCE, STAMP, module_of, path_of
+from tauceti_queue.diagnostics import (
+    ANSI,
+    BAD_IMPORT,
+    LAKE,
+    MISSING_FILE,
+    MISSING_MESSAGE,
+    NO_SUCH_FILE,
+    PATH,
+    RUNNING,
+    SOURCE,
+    STAMP,
+    module_of,
+    path_of,
+)
 
 BUILD_LOG = "build.log"
 ERRORS_FILE = "errors.jsonl"
@@ -58,19 +71,10 @@ SUMMARY = ("Some required targets logged failures:", "Build completed", "Build f
 CHANGED_HEAD = "error: module source file:"
 CHANGED_TAIL = "changed since build began; rerun the build"
 RERUN = "rerun"
-# Lake's errors for modules it could not read, which name no line. The importer of a missing module:
-#   error: TauCeti/A.lean: bad import 'TauCeti.B'
-# and the missing module itself, after its job line:
-#   ✖ [12/40] Running TauCeti.B
-#   error: no such file or directory (error code: 2)
-#     file: /path/to/worktree/TauCeti/B.lean
-# Neither stops the build, which ends with only the summary's failed targets naming them, so they are
-# recorded at line 1, column 0 of the file with ``unlocated`` set, so two of them in one file stay apart.
-BAD_IMPORT = re.compile(r"^error: (" + PATH + r"): (bad import '[^']{1,512}')$")
-RUNNING = re.compile(r"^✖\s*\[\d+/\d+\] Running (" + MODULE + r")(?: \([^)]*\))?$")
-NO_SUCH_FILE = "error: no such file or directory (error code: 2)"
-MISSING_FILE = re.compile(r"^\s+file: (\S{1,4096})$")
-MISSING_MESSAGE = "no such file or directory: Lake could not read this module's source, which another module imports"
+# Lake's errors for modules it could not read, which name no line (``diagnostics.BAD_IMPORT``,
+# ``RUNNING``, ``NO_SUCH_FILE`` and ``MISSING_FILE``). Neither stops the build, which ends with only the
+# summary's failed targets naming them, so they are recorded at line 1, column 0 of the file with
+# ``unlocated`` set, so two of them in one file stay apart.
 
 
 class ErrorParser:

@@ -56,6 +56,7 @@ from pathlib import Path
 
 from tauceti_queue import chain as chain_tool
 from tauceti_queue import (
+    diagnostics,
     repair,
     repair_audit,
     repair_context,
@@ -293,7 +294,14 @@ def merge_errors(findings: dict, errors: list[dict]) -> dict:
     merged.setdefault("other", [])
     merged["other"] += [f for f in checks["other"] if f not in merged["other"]]
     errors = [e for e in errors if e.get("kind") not in CHECK_KINDS]
-    located = {(e["path"], int(e.get("line") or 0), int(e.get("column") or 0)) for e in merged["compiler_errors"]}
+    # Lake's unlocated errors (bad imports and missing sources: ``repair_stream``'s at line 1, column 0
+    # with ``unlocated`` set, a verification's with a ``reason`` and no line) are told apart by message.
+    located = {
+        (e["path"], e["message"])
+        if e.get("reason") in repair.UNLOCATED_REASONS
+        else (e["path"], int(e.get("line") or 0), int(e.get("column") or 0))
+        for e in merged["compiler_errors"]
+    }
     for error in errors:
         path = str(error["file"])
         line, column, message = (
@@ -301,13 +309,15 @@ def merge_errors(findings: dict, errors: list[dict]) -> dict:
             int(error.get("column") or 0),
             str(error.get("message") or ""),
         )
-        # Lake's unlocated errors (``repair_stream``'s bad imports and missing sources) share line 1,
-        # column 0, so their message tells them apart, from each other and from a located error there.
-        key = (path, line, column, message) if error.get("unlocated") else (path, line, column)
+        key = (path, message) if error.get("unlocated") else (path, line, column)
         if key in located:
             continue
         located.add(key)
-        merged["compiler_errors"].append({"path": path, "line": line, "column": column, "message": message})
+        entry = {"path": path, "line": line, "column": column, "message": message}
+        if error.get("unlocated"):
+            reason = "missing_source" if message == diagnostics.MISSING_MESSAGE else "bad_import"
+            entry.update(line=0, column=0, reason=reason)
+        merged["compiler_errors"].append(entry)
         if path not in merged["failed_modules"]:
             merged["failed_modules"].append(path)
     return merged
@@ -358,10 +368,7 @@ def group_prompt(context: PromptContext, group: Group, chain: list[ChainCommit],
     if findings["compiler_errors"]:
         lines += ["Compiler errors:", ""]
         for error in findings["compiler_errors"]:
-            owners = repair.owners_of(clone, chain, _path(error["path"]))
-            lines.append(
-                f"- `{error['path']}:{error.get('line', 0)}:{error.get('column', 0)}` ({repair._owner_text(owners, chain)})"
-            )
+            lines.append(repair.compiler_error_line(clone, chain, error))
             lines += [f"      {text}" for text in str(error.get("message", "")).splitlines()]
         lines.append("")
     if findings["failed_modules"] and not findings["compiler_errors"]:
@@ -717,15 +724,24 @@ def fold_fixups(worktree: Path, base: str, tip: str, groups: list[Group]) -> dic
     return record
 
 
-def remaining_findings(findings: dict, groups: list[Group], failed_modules: list[str]) -> dict:
+def remaining_findings(
+    findings: dict, groups: list[Group], failed_modules: list[str], unlocated: list[dict] | None = None
+) -> dict:
     """What the sequential path still has to repair: the findings of every group not folded, plus a
-    ``build`` finding for each module the verification build failed outside those groups."""
+    ``build`` finding for each module the verification build failed outside those groups, or Lake's own
+    errors for it when the build could not read it (``unlocated``, compiler errors with a ``reason``)."""
     paths = {path for group in groups if group.status != "folded" for path in group.paths}
     remaining = restrict_findings(findings, paths)
     folded = {path for group in groups if group.status == "folded" for path in group.files}
     for module in failed_modules:
         path = _path(module)
         if path in paths:
+            continue
+        lake = [e for e in unlocated or [] if e["path"] == path]
+        if lake:
+            remaining["compiler_errors"] += [e for e in lake if e not in remaining["compiler_errors"]]
+            if path not in remaining["failed_modules"]:
+                remaining["failed_modules"].append(path)
             continue
         remaining["other"].append(
             {
@@ -893,6 +909,7 @@ def repair_groups(
         record["groups"] = [group.summary() for group in groups]
         folded_tip = record["fold"].get("tip")
         failed_modules: list[str] = []
+        unlocated: list[dict] = []
         check_findings: list[dict] = []
         if folded_tip:
             report = repair.chain_report(
@@ -937,7 +954,15 @@ def repair_groups(
                     record["checks"] = {k: v for k, v in checks.items() if k != "diagnostics"}
                     check_findings = checks["diagnostics"]
                     repair_audit.append_errors(worktree / repair_tools.TOOLS_DIR, check_findings)
-                build.update(repair.parse_lake_build_log(Path(build["log"]).read_text(errors="replace")))
+                text = Path(build["log"]).read_text(errors="replace")
+                build.update(repair.parse_lake_build_log(text))
+                unlocated = [
+                    e
+                    for e in repair.findings_from_diagnostics(
+                        [d for d in diagnostics.parse_log(text.splitlines()) if d["kind"] == "compiler"]
+                    )["compiler_errors"]
+                    if e.get("reason")
+                ]
                 record["build"] = {k: v for k, v in build.items() if "load" not in k}
                 failed_modules = list(build["failed_modules"])
                 if build["rc"] != 0 and not failed_modules:
@@ -957,7 +982,7 @@ def repair_groups(
             record["verified_tip"] = folded_tip  # the task's assigned worker verification completed
     else:
         record["status"] = "partial"
-        record["remaining"] = remaining_findings(findings, groups, failed_modules)
+        record["remaining"] = remaining_findings(findings, groups, failed_modules, unlocated)
         if check_findings:
             # The folded chain builds; what is left is the checks' findings, as the controller would report them.
             remaining = repair.findings_from_diagnostics(check_findings)

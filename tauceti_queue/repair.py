@@ -152,6 +152,8 @@ DIAGNOSTIC_KINDS = {
     "environment_linter": "lint",
 }
 LOCATION = re.compile(r"^(?P<path>\S+?\.lean):(?P<line>\d+):(?P<column>\d+):?\s*(?P<rest>.*)$", re.S)
+# Lake's errors for a module it could not read, which name no line (``diagnostics.parse_log``).
+UNLOCATED_REASONS = ("bad_import", "missing_source")
 
 
 def findings_from_diagnostics(entries: list | dict | None) -> dict:
@@ -215,17 +217,22 @@ def findings_from_diagnostics(entries: list | dict | None) -> dict:
             continue
         family = DIAGNOSTIC_KINDS.get(kind)
         if family == "compiler":
-            entry = {"path": module, "line": raw.get("line", 0), "column": raw.get("column", 0), "message": message}
-            located = LOCATION.match(message)
-            if located and (
-                not module or located.group("path").endswith(module) or module.endswith(located.group("path"))
-            ):
+            # ``diagnostics.parse_log`` names the module (``TauCeti.A.B``) and the file (``path``): the
+            # prompt names the file, which is what ownership and the agent's edits are keyed on.
+            path = str(raw.get("path") or "")
+            path = path if path.endswith(".lean") else module
+            line = raw.get("line", raw.get("line_number", 0))
+            entry = {"path": path, "line": line, "column": raw.get("column", 0), "message": message}
+            located = LOCATION.match(message.removeprefix("error: "))
+            if located and (not path or located.group("path").endswith(path) or path.endswith(located.group("path"))):
                 entry.update(
-                    path=module or located.group("path"),
+                    path=path or located.group("path"),
                     line=int(located.group("line")),
                     column=int(located.group("column")),
-                    message=located.group("rest").strip(),
+                    message=re.sub(r"^error:\s*", "", located.group("rest").strip()),
                 )
+            if raw.get("reason") in UNLOCATED_REASONS:
+                entry["reason"] = raw["reason"]
             if entry not in findings["compiler_errors"]:
                 findings["compiler_errors"].append(entry)
             if module and module not in findings["failed_modules"]:
@@ -1666,6 +1673,57 @@ def _owner_text(owners: list[int], chain: list[ChainCommit]) -> str:
     return " and ".join(named) + " modify this file"
 
 
+def _removal(clone: Path, parent: str, sha: str, path: str) -> str | None:
+    """How ``sha`` removed ``path`` against ``parent``: ``moved this file to `new` `` or ``deleted this
+    file``, or None when it did not remove it."""
+    out = git(clone, "diff-tree", "-r", "-M", "--name-status", "--no-commit-id", parent, sha, check=False)
+    for row in out.splitlines():
+        fields = row.split("\t")
+        if len(fields) == 3 and fields[0].startswith("R") and fields[1] == path:
+            return f"moved this file to `{fields[2]}`"
+        if len(fields) == 2 and fields[0] == "D" and fields[1] == path:
+            return "deleted this file"
+    return None
+
+
+def _missing_text(clone: Path, chain: list[ChainCommit], path: str) -> str:
+    """Who removed a module Lake found no source for: the last commit of the batch that moved or deleted
+    it, or else the commit of the batch's base that did, with the ownership text as a fallback."""
+    owners = owners_of(clone, chain, path)
+    for commit in reversed(chain):
+        if commit.pr is None or commit.pr not in owners:
+            continue
+        removal = _removal(clone, commit.parent, commit.sha, path)
+        if removal:
+            return f"PR #{commit.pr}'s commit `{commit.sha[:12]}` {removal}"
+    text = _owner_text(owners, chain)
+    if not chain:
+        return text
+    base = chain[0].parent
+    found = git(clone, "log", "-1", "--diff-filter=D", "--format=%H%x00%s", base, "--", path, check=False).strip()
+    if "\x00" not in found:
+        return text
+    sha, subject = found.split("\x00", 1)
+    removal = _removal(clone, f"{sha}^", sha, path) if sha else None
+    if removal:
+        return f"{text}; the base's commit `{sha[:12]}` ({subject[:120]}) {removal}, below this batch"
+    return text
+
+
+def compiler_error_line(clone: Path, chain: list[ChainCommit], error: dict) -> str:
+    """The prompt's line for a compiler error: its file, with the line and column when it has one, and
+    who modifies the file, or for a missing source who moved or deleted it."""
+    path = str(error.get("path") or "")
+    file = path if path.endswith(".lean") else module_to_path(path)
+    line = int(error.get("line") or 0)
+    where = f"{path}:{line}:{error.get('column', 0)}" if line else path
+    if error.get("reason") == "missing_source":
+        owner = _missing_text(clone, chain, file)
+    else:
+        owner = _owner_text(owners_of(clone, chain, file), chain)
+    return f"- `{where}` ({owner})"
+
+
 def _inline_listing(context: PromptContext, chain: list[ChainCommit], landed: dict[int, str | None]) -> list[str]:
     """The member listings in the prompt itself, for a prompt composed without a worktree to write
     the listings file into (the experiment's prompt preview)."""
@@ -2231,12 +2289,8 @@ def compose_prompt(context: PromptContext, findings: dict, chain: list[ChainComm
         lines.append("Compiler errors:")
         lines.append("")
         for error in findings["compiler_errors"]:
-            path = error.get("path") or ""
-            if path:
-                owners = owners_of(clone, chain, path)
-                lines.append(
-                    f"- `{path}:{error.get('line', 0)}:{error.get('column', 0)}` ({_owner_text(owners, chain)})"
-                )
+            if error.get("path"):
+                lines.append(compiler_error_line(clone, chain, error))
             else:
                 lines.append("- Build/verification diagnostic (no file path):")
             for text in str(error.get("message", "")).splitlines():
