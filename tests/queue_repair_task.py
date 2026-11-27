@@ -3498,13 +3498,24 @@ class Serve(Fixture):
         self.assertEqual(repair_task.retry_deliveries(cfg, self.client(cfg)), [])
         self.assertEqual(len(self.agent_calls()), 1)
 
+    def installer_hold(self, cfg: repair_task.RunnerConfig, token: str | None):
+        """What install-repair.sh does: an exclusive flock on the lock, the token beside it."""
+        import fcntl
+
+        lock = repair_task.claim_hold_lock_path(cfg)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock, "a")  # noqa: SIM115 (held across the test)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        self.addCleanup(handle.close)
+        if token is not None:
+            repair_task.claim_hold_path(cfg).write_text(json.dumps({"pid": os.getpid(), "token": token}))
+        return handle
+
     def test_an_installer_hold_stops_new_claims_until_it_is_lifted(self):
         """install-repair.sh --when-idle restarts only once worker.json echoes its hold's token: from
         then on the worker claims nothing, and it resumes when the hold goes."""
         cfg = self.config(poll_seconds=0.1)
-        hold = repair_task.claim_hold_path(cfg)
-        hold.parent.mkdir(parents=True, exist_ok=True)
-        hold.write_text(json.dumps({"pid": os.getpid(), "token": "t1"}))
+        handle = self.installer_hold(cfg, "t1")
         stop = repair_task.Stop()
         thread, _ = self.serve_in_thread(cfg, stop)
         self.wait_for(
@@ -3513,27 +3524,30 @@ class Serve(Fixture):
         )
         beat = self.heartbeat(cfg)
         self.assertEqual(beat["state"], "held")
-        self.assertEqual(beat["claim_hold"], str(hold))
+        self.assertEqual(beat["claim_hold"], str(repair_task.claim_hold_lock_path(cfg)))
         time.sleep(0.5)  # several polls
         self.assertEqual(self.service.claim_attempts, [], "no claim while held")
-        hold.unlink()
+        handle.close()  # the installer exits: its lock, and so the hold, ends with it
         self.wait_for(lambda: self.service.claim_attempts, "the worker claims again once the hold is lifted")
         self.wait_for(lambda: "hold" not in self.heartbeat(cfg), "the heartbeat drops the hold")
         stop.set("done")
         thread.join(30)
 
-    def test_a_hold_whose_installer_is_gone_is_ignored_and_an_unreadable_one_holds(self):
+    def test_only_a_taken_lock_holds(self):
         cfg = self.config()
-        hold = repair_task.claim_hold_path(cfg)
-        hold.parent.mkdir(parents=True, exist_ok=True)
-        dead = subprocess.Popen(["true"])
-        dead.wait()
-        hold.write_text(json.dumps({"pid": dead.pid, "token": "gone"}))
         self.assertIsNone(repair_task.active_claim_hold(cfg))
-        hold.write_text('{"pid": ')
+        cfg.root.mkdir(parents=True, exist_ok=True)
+        # a token left by an installer that is gone: the lock is free, so no hold
+        repair_task.claim_hold_lock_path(cfg).write_text("")
+        repair_task.claim_hold_path(cfg).write_text(json.dumps({"pid": 1, "token": "gone"}))
+        self.assertIsNone(repair_task.active_claim_hold(cfg))
+        handle = self.installer_hold(cfg, None)
+        repair_task.claim_hold_path(cfg).write_text('{"tok')  # being written
         self.assertEqual(repair_task.active_claim_hold(cfg), {"token": None})
-        hold.write_text(json.dumps({"pid": os.getpid(), "token": "live"}))
-        self.assertEqual(repair_task.active_claim_hold(cfg)["token"], "live")
+        repair_task.claim_hold_path(cfg).write_text(json.dumps({"token": "live"}))
+        self.assertEqual(repair_task.active_claim_hold(cfg), {"token": "live"})
+        handle.close()
+        self.assertIsNone(repair_task.active_claim_hold(cfg))
 
     def test_stop_before_a_claim_does_not_claim(self):
         cfg = self.config(poll_seconds=0.1)

@@ -4483,33 +4483,46 @@ def claim_hold_path(cfg: RunnerConfig) -> Path:
     return cfg.root / "claim-hold.json"
 
 
+def claim_hold_lock_path(cfg: RunnerConfig) -> Path:
+    return cfg.root / "claim-hold.lock"
+
+
 def active_claim_hold(cfg: RunnerConfig) -> dict | None:
     """The hold ``install-repair.sh --when-idle`` places on new claims before restarting the worker.
 
-    ``<root>/claim-hold.json`` names the installer's ``pid`` and a ``token``. While the file exists
-    and that process lives, the worker claims nothing and echoes the token in ``worker.json`` (state
-    ``held``), which tells the installer the worker has passed its last claim. A hold whose process
-    is gone (an installer killed before it could remove it) is ignored; a file that cannot be read
-    holds, so a half-written or damaged file never lets a claim through.
+    The installer holds an exclusive flock on ``<root>/claim-hold.lock`` for as long as the hold
+    lasts and names a ``token`` in ``<root>/claim-hold.json``. While the lock is taken the worker
+    claims nothing and echoes the token in ``worker.json`` (state ``held``), which tells the
+    installer the worker has passed its last claim. The lock ends with the installer's process
+    however it ends, so a killed installer leaves no hold behind. A lock file that exists but cannot
+    be probed holds, as does a hold whose token cannot be read yet (``token`` None).
     """
-    path = claim_hold_path(cfg)
+    import fcntl
+
     try:
-        hold = json.loads(path.read_text())
+        fd = os.open(claim_hold_lock_path(cfg), os.O_RDONLY)
     except FileNotFoundError:
         return None
+    except OSError:
+        return {"token": None}
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass  # an installer holds it
+        except OSError:
+            return {"token": None}
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return None
+    finally:
+        os.close(fd)
+    try:
+        hold = json.loads(claim_hold_path(cfg).read_text())
     except (OSError, ValueError):
         return {"token": None}
-    if not isinstance(hold, dict):
-        return {"token": None}
-    pid = hold.get("pid")
-    if isinstance(pid, int) and pid > 0:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return None
-        except OSError:
-            pass  # alive under another user, or not ours to signal: still a hold
-    return hold
+    token = hold.get("token") if isinstance(hold, dict) else None
+    return {"token": token if isinstance(token, str) else None}
 
 
 def provider_attempts_of(outcome: dict) -> list[dict]:
@@ -4651,9 +4664,9 @@ def serve(
         # The code this process was started from (its release's baked revision), for the installer's
         # check and the operator; read once, so it never follows later changes on disk.
         "revision": STARTUP_REVISION,
-        # Where this worker looks for the installer's hold on new claims (active_claim_hold); its
-        # presence tells the installer the running worker honours one.
-        "claim_hold": str(claim_hold_path(cfg)),
+        # The lock this worker probes for the installer's hold on new claims (active_claim_hold);
+        # its presence tells the installer the running worker honours one.
+        "claim_hold": str(claim_hold_lock_path(cfg)),
         "started_at": time.time(),
         "tasks": 0,
         "outcomes": {},

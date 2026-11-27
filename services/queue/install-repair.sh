@@ -33,9 +33,10 @@
 #                    for the TAUCETI_QUEUE_WORKER the unit's process runs as with released_at unset
 #                    (an expired claim counts until the controller releases it, since a renewal
 #                    waiting for its lock keeps it). It checks every 60s before installing
-#                    anything. Before the restart it then holds new claims (<task root>/claim-hold.json,
-#                    which the worker honours while this script runs), waits for worker.json to
-#                    confirm the hold and for the queue to show no claim, restarts, and lifts the hold.
+#                    anything. Before the restart it then holds new claims (an exclusive flock on
+#                    <task root>/claim-hold.lock for as long as it runs, token in claim-hold.json),
+#                    waits for worker.json to confirm the hold and for the queue to show no claim,
+#                    restarts, and lifts the hold.
 #   --idle-timeout SECONDS  give up waiting after SECONDS (default: wait for as long as it takes).
 #   --wait SECONDS   how long to wait for the restarted worker to report serving (default: 60).
 #
@@ -80,7 +81,7 @@ while [ $# -gt 0 ]; do
     --wait) WAIT="$2"; shift 2 ;;
     --when-idle) WHEN_IDLE=1; shift ;;
     --idle-timeout) IDLE_TIMEOUT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,51p' "$0"; exit 0 ;;
     *) echo "install-repair.sh: unknown argument $1" >&2; exit 1 ;;
   esac
 done
@@ -135,21 +136,21 @@ if rows:
     print(f"{worker} holds " + "; ".join(f"claim {i} (task {t}, {op}, expires_at {e - now:+.0f}s)" for i, t, op, e in rows))
 PY
 }
-# --when-idle, before the restart: the running worker's acknowledgement of this installer's hold on
-# new claims (active_claim_hold in tauceti_queue/repair_task.py). Prints the hold file's path when the
-# worker's heartbeat advertises one (claim_hold), legacy when the worker predates holds and none when
-# the unit has no running process; fails when it cannot tell. With a token, it instead succeeds only when
-# worker.json, written by the unit's running process, reports state held with that token, and
-# otherwise prints what the heartbeat shows.
+# --when-idle, before the restart: where the unit's running process stands on this installer's hold
+# on new claims (active_claim_hold in tauceti_queue/repair_task.py), given the hold's token. Prints
+# ready when the unit has no running process (one systemd starts meanwhile runs the installed
+# release, which honours the hold), held when the running process's worker.json reports state held
+# with the token, and legacy when that heartbeat has no claim_hold field (the worker predates holds);
+# otherwise fails, printing what the heartbeat shows.
 hold_status() {
   local pid
   pid="$(systemctl --user show -p MainPID --value "$UNIT")" && [ -n "$pid" ] || return 1
-  python3 - "$pid" "${1:-}" <<'PY'
+  python3 - "$pid" "$1" <<'PY'
 import json, pathlib, sys
 pid, token = sys.argv[1], sys.argv[2]
 if pid == "0":
-    print("none" if not token else "the unit has no running process")
-    sys.exit(0 if not token else 1)
+    print("ready")
+    sys.exit(0)
 env = dict(
     entry.split("=", 1)
     for entry in pathlib.Path(f"/proc/{pid}/environ").read_text().split("\0")
@@ -164,13 +165,13 @@ try:
 except (OSError, ValueError):
     beat = {}
 if str(beat.get("pid")) != pid:
-    beat = {}  # another process's heartbeat says nothing about this one
-if not token:
-    if not beat:
-        sys.exit(1)  # not written by this process yet, or unreadable: cannot tell
-    print(beat.get("claim_hold") or "legacy")
+    print("no heartbeat from the running process yet")
+    sys.exit(1)
+if not beat.get("claim_hold"):
+    print("legacy")
     sys.exit(0)
 if beat.get("state") == "held" and beat.get("hold") == token:
+    print("held")
     sys.exit(0)
 print(f"worker.json shows state {beat.get('state', 'unknown')}" + (f" (hold {beat['hold']})" if beat.get("hold") else ""))
 sys.exit(1)
@@ -178,59 +179,65 @@ PY
 }
 HOLD_FILE=""
 HOLD_TOKEN=""
-# Remove this installer's hold, and only its own: another installer's token is left in place.
+# The hold is this process's exclusive flock on <task root>/claim-hold.lock (fd 7), with the token in
+# claim-hold.json beside it. The worker holds while the lock is taken, so the hold ends with this
+# process however it ends, and a second installer waits for the first's hold to end before placing its own.
 release_hold() {
-  if [ -n "$HOLD_FILE" ] && [ -f "$HOLD_FILE" ] && grep -qF "\"$HOLD_TOKEN\"" "$HOLD_FILE" 2>/dev/null; then
+  if [ -n "$HOLD_FILE" ]; then
     rm -f "$HOLD_FILE"
+    exec 7>&-
+    HOLD_FILE=""
   fi
-  HOLD_FILE=""
 }
-# place_hold FILE: ask the running worker to claim nothing more while this installer lives.
+# place_hold ROOT: ask the worker running from ROOT to claim nothing more while this installer holds the lock.
 place_hold() {
-  HOLD_FILE="$1"
+  local lock="$1/claim-hold.lock" bound=()
+  mkdir -p "$1"
+  exec 7>>"$lock"
+  if ! flock -x -n 7; then
+    log "another installer holds new claims for $UNIT ($lock); waiting for it to finish"
+    [ -z "$IDLE_TIMEOUT" ] || bound=(-w "$IDLE_TIMEOUT")
+    if ! flock -x "${bound[@]}" 7; then
+      log "the other installer still holds $lock after ${IDLE_TIMEOUT}s; $UNIT was not restarted"
+      exit 3
+    fi
+  fi
+  HOLD_FILE="$1/claim-hold.json"
   HOLD_TOKEN="install-repair-$$-$(date +%s)-$RANDOM"
   trap release_hold EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   printf '{"pid": %d, "token": "%s", "unit": "%s", "at": %d}\n' "$$" "$HOLD_TOKEN" "$UNIT" "$(date +%s)" > "$HOLD_FILE.tmp.$$"
   mv "$HOLD_FILE.tmp.$$" "$HOLD_FILE"
-  log "holding new claims for $UNIT ($HOLD_FILE, token $HOLD_TOKEN)"
+  log "holding new claims for $UNIT ($lock, token $HOLD_TOKEN)"
 }
-# wait_until_idle [hold]: return once the queue shows no unreleased claim for the running worker. With
-# hold, and a worker that honours one, it first asks the worker to claim nothing more and also waits
-# for the worker to confirm it has (worker.json), so no claim can start between the last check and the
-# restart. Never returns early on anything it cannot read; exits 3 after --idle-timeout (the hold is
-# removed on exit, and the worker resumes claiming).
+# wait_until_idle [ROOT]: return once the queue shows no unreleased claim for the running worker. With
+# ROOT, the task root of the release being installed, it first holds new claims (place_hold) and also
+# waits for the running worker to confirm the hold (worker.json), so no claim can start between the
+# last check and the restart. A worker that predates holds cannot confirm one; it is restarted on the
+# queue check alone, with a warning. Never returns early on anything it cannot read; exits 3 after
+# --idle-timeout (the hold ends on exit, and the worker resumes claiming).
 wait_until_idle() {
-  local claims deadline="" left hold_file ack poll="$IDLE_POLL" want_hold=0
+  local claims deadline="" left ack poll="$IDLE_POLL"
   [ -z "$IDLE_TIMEOUT" ] || deadline=$(( $(date +%s) + IDLE_TIMEOUT ))
-  [ "${1:-}" != hold ] || want_hold=1
+  if [ -n "${1:-}" ]; then
+    place_hold "$1"
+    poll="$HOLD_POLL"  # the worker answers within its own poll interval
+  fi
   while :; do
-    if [ "$want_hold" = 1 ] && [ -z "$HOLD_FILE" ]; then
-      if hold_file="$(hold_status)"; then
-        want_hold=0
-        case "$hold_file" in
-          none) ;;  # no running process: nothing can claim
-          legacy)
-            log "WARNING: $UNIT's running worker predates claim holds, so a claim it makes between the"
-            log "WARNING: last check and the restart is interrupted; check that it is idle first" ;;
-          *)
-            place_hold "$hold_file"
-            poll="$HOLD_POLL" ;;  # the worker answers within its own poll interval
-        esac
-      fi
-    fi
-    if [ "$want_hold" = 1 ] && [ -z "$HOLD_FILE" ]; then
-      log "cannot read the heartbeat of $UNIT's running process to hold its claims; treating it as busy"
-    elif [ -n "$HOLD_FILE" ] && ! ack="$(hold_status "$HOLD_TOKEN")"; then
-      log "waiting before restarting $UNIT: it has not confirmed the hold yet (${ack:-no heartbeat})"
+    ack=""
+    if [ -n "$HOLD_FILE" ] && ! ack="$(hold_status "$HOLD_TOKEN")"; then
+      log "waiting before restarting $UNIT: it has not confirmed the hold yet (${ack:-cannot read its state})"
     elif claims="$(live_claims)"; then
       if [ -z "$claims" ]; then
-        if [ -n "$HOLD_FILE" ]; then
-          log "$UNIT confirms the hold and holds no claim in $QUEUE_DB"
-        else
-          log "$UNIT holds no claim in $QUEUE_DB"
+        if [ "$ack" = legacy ]; then
+          log "WARNING: $UNIT's running worker predates claim holds, so a claim it makes between this"
+          log "WARNING: check and the restart is interrupted; check that it is idle first"
         fi
+        case "$ack" in
+          held) log "$UNIT confirms the hold and holds no claim in $QUEUE_DB" ;;
+          *) log "$UNIT holds no claim in $QUEUE_DB" ;;
+        esac
         return 0
       fi
       log "waiting before restarting $UNIT: $claims"
@@ -354,7 +361,7 @@ if [ "$RESTART" = 1 ]; then
   # collection, and is given up so that a long wait does not hold up other installs' collection.
   if [ "$WHEN_IDLE" = 1 ]; then
     flock -u 9 2>/dev/null || true
-    wait_until_idle hold
+    wait_until_idle "${TAUCETI_QUEUE_TASK_ROOT:-$HOME/.local/state/tauceti/queue-repair}"
   fi
   log "restarting $UNIT"
   systemctl --user restart "$UNIT"
