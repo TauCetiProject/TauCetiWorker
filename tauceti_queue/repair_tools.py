@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 from pathlib import Path
 
@@ -101,8 +102,7 @@ def imports(root: Path) -> dict[str, list[str]]:
     return table
 
 
-BUILD_HEADER = '''#!/usr/bin/env python3
-"""Build only the named modules, one lake build at a time. Written by the queue's repair worker.
+BUILD_HEADER = '''"""Build only the named modules, one lake build at a time. Written by the queue's repair worker.
 
 Usage: .tauceti-repair/build [--dependents] [--no-audit] [TauCeti.Foo.Bar | TauCeti/Foo/Bar.lean ...]; no
 arguments builds the whole library and, when it is green, runs staging's audits and full-library
@@ -149,18 +149,44 @@ finally:
 """
 
 
+REEXEC_VARIABLE = "TAUCETI_HELPER_REEXEC"
+
+
+def interpreter_line() -> str:
+    """The ``#!`` line of a helper the worker writes for the agent: this worker's own interpreter,
+    isolated (``-I``). That is the release's ``.venv/bin/python``, named unresolved so Python finds the
+    venv beside it and its site-packages (``tauceti_tools``, which ``tauceti_queue`` imports); a
+    system ``python3`` has none of them. The agent runs on the host, where the release is readable."""
+    return f"#!{sys.executable} -I\n"
+
+
+def interpreter_guard() -> str:
+    """The helper's first statements: run as ``python3 <helper>`` (the prompts say so), it re-executes
+    itself under ``interpreter_line``'s interpreter, once (``REEXEC_VARIABLE``, dropped again at once,
+    so nothing the helper starts inherits it)."""
+    python = sys.executable
+    return (
+        "import os as _os, sys as _sys\n\n"
+        f"if _os.environ.pop({REEXEC_VARIABLE!r}, None) is None and _sys.prefix != {sys.prefix!r}:\n"
+        "    # Not the worker's interpreter, so without its venv's site-packages: run under that one.\n"
+        f"    _os.execve({python!r}, [{python!r}, '-I', __file__, *_sys.argv[1:]], "
+        f"dict(_os.environ, {REEXEC_VARIABLE}='1'))\n"
+    )
+
+
 def build_script(lock: Path | None = None, *, worker_verifies: bool = False) -> str:
     """The agent's build script: the lock helpers and ``imports`` verbatim, the lock (the worktree's own
     ``.tauceti-repair/build.lock``, or ``lock`` when several worktrees of one repair share one) and the
     main, which runs Lake through ``repair_sandbox.sandboxed_lake`` imported from this checkout of the
     package."""
-    sandbox = (
+    sandbox = interpreter_guard() + (
         f"sys.path.insert(0, {str(Path(__file__).resolve().parent.parent)!r})\n"
         "from tauceti_queue.repair_sandbox import sandboxed_lake\n\n"
     )
     where = f"LOCK = Path({str(lock)!r})\n" if lock else 'LOCK = ROOT / ".tauceti-repair" / "build.lock"\n'
     return (
-        BUILD_HEADER
+        interpreter_line()
+        + BUILD_HEADER
         + sandbox
         + "\n\n".join(inspect.getsource(f) for f in (reclaim_dead_lock, take_lock, imports))
         + "\n"
