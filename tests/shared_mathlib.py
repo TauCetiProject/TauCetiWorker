@@ -644,6 +644,10 @@ class PublishTests(Fixture):
             *_, entry, hit, _graph, _closure = self.published()
         self.assertFalse(hit)
         self.assertTrue((entry / "ready.json").is_file())
+        # Content digests belong to the macOS clone backend; a Linux record is what it always was.
+        self.assertEqual(
+            sorted(read_json(entry / "ready.json")), ["files_verified", "inventory", "key", "published_at", "spec"]
+        )
 
 
 class LegacyTests(Fixture):

@@ -673,7 +673,9 @@ and filesystem free space. `status` prints all three; checkout size alone proves
 ### Per-round private-bytes cap
 
 A host round's private bytes are the bytes of files whose links all lie inside the round's own
-writable roots: its checkout (including `.lake` and the shared-Mathlib overlay upper), the
+writable roots: its checkout (including `.lake` and the shared-Mathlib overlay upper or, on macOS,
+the round's clones of the shared Mathlib, which count at their full size although they share
+blocks with the pool), the
 worker's `LAKE_CACHE_DIR` and `MATHLIB_CACHE_DIR`, and a private `TMPDIR`. A file hard-linked to a
 shared store is not private; a file written, unpacked or copied there is. A walk before the agent
 starts records the baseline the round inherits. While the agent runs, a monitor thread measures

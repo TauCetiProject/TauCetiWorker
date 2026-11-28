@@ -18,6 +18,12 @@ Run `tauceti doctor` to exercise Linux user namespaces, bubblewrap overlay suppo
 private copy-up. No root daemon is required. A host without them runs no rounds that need
 Mathlib; the reason names the administrator action.
 
+On macOS, which has neither rootless mount namespaces nor overlays, a view is made of APFS
+clones instead ([macOS](#macos-views-made-of-apfs-clones)). There `tauceti doctor` clones a
+small read-only tree on the pool's filesystem, writes to the clone and checks that the
+original is unchanged. The pool and the worker checkouts must be on the same APFS volume.
+Any other system runs no rounds that need Mathlib.
+
 ## Layout
 
 Everything below lives in the pool's `v4/` directory and is written only by the worker's
@@ -64,7 +70,8 @@ fills the staging build of the whole closure and nothing else; Mathlib's `.olean
 `.ilean` outputs are verified before the tree is synced and renamed into `entries/`. It never
 publishes an agent's build directory. A per-key publisher lock serializes builders separately
 from reader leases. `ready.json` records each regular file's inode, mode, link count, size,
-mtime and ctime; every reuse checks that inventory. Links, special files and hardlink aliases
+mtime and ctime; every reuse checks that inventory (on macOS a content digest backs it:
+see [below](#macos-views-made-of-apfs-clones)). Links, special files and hardlink aliases
 are rejected. A damaged published lower is preserved for evidence and writes
 `safety-stop.json`, which blocks every later round until an operator investigates, removes
 the stop file and restores the policy.
@@ -80,6 +87,86 @@ directory is empty and read-only, so an unprefixed build fails instead of copyin
 deliberately no PID namespace: agents and their tools see ordinary host PIDs and `/proc`.
 The upper uses OverlayFS `volatile` mode; a small mount helper is compiled once with `cc`
 beside the pool and its preload is removed before running agent commands.
+
+### macOS: views made of APFS clones
+
+`clonefile(2)` gives the two properties the overlay gives: the host stores one build of
+Mathlib per version, because a clone shares its original's blocks copy-on-write, and a
+round writes only to its own copy. A view there is prepared like this:
+
+- Each closure package's shared source (without its build directory) and its published build
+  are cloned file by file into `.lake/tauceti-mathlib/<generation>/<package>/`, the build at
+  `.lake/build` inside it. Directories become writable and build files regain owner write;
+  source files keep their read-only mode, and `.git` stays read-only throughout, so Git can
+  neither fetch nor move the checkout. The index is refreshed once, because a clone is a new
+  inode. `clone.json` in the generation marks the end of cloning.
+- `.lake/tauceti-mathlib/current` is then pointed at the generation, and each
+  `.lake/packages/<package>` at `.lake/tauceti-mathlib/current/<package>`. The link targets are
+  therefore the same in every round. This is the view: there is no namespace, and the argv
+  prefix only sets `TAUCETI_SHARED_MATHLIB_CLONE` to the generation (callers and the agent's
+  `lake` wrapper know a view by its non-empty prefix, as on Linux).
+- When the view ends, the package links name the shared sources again, whose build
+  directories are empty and read-only, and the generation is deleted unless a surviving
+  process still holds its lease. So outside a view an unprefixed build fails instead of
+  copying, as on Linux. A worker killed inside a view runs no cleanup: its checkout keeps
+  the links to the dead round's clones until the next round in that checkout attaches (which
+  replaces the links) and deletes the generation.
+
+Cloning never falls back to copying bytes. Where `clonefile` fails (a filesystem other than
+APFS, or the pool and the checkout on different volumes) the round does not start, and the
+reason says so. Publication has no bind mounts either: the staging workspace's packages are
+clones of the shared source, `lake exe cache get` fills their own build directories, and
+those are moved into the staging build, verified and published as on Linux. One step is
+added before that: Lake's artifact cache hard-links outputs it builds (Mathlib's `cache`
+executable, for one) into `LAKE_CACHE_DIR`, and restores cached outputs by hard link. With
+the staging tree and the Lake cache on one volume those links succeed, so every staged file
+with more than one name is replaced by a clone of itself, which has its own inode and
+shares the blocks. The inventory's refusal of hardlink aliases is unchanged and still
+applies to the result.
+
+**Integrity of an entry.** On one Mac (macOS 26.5.1, APFS) something outside the worker
+updated the ctime, and only the ctime, of most files of an entry a few minutes after each
+publication; the cause is not known. The inventory comparison alone would then stop
+sharing on every such host. So on macOS `ready.json` also records the SHA-256 of every
+file's content (`digest`, `digests`), taken at publication. A reuse first compares the
+inventory as everywhere. If that differs, and the same files are present, and each differs
+from its record in ctime at most, the content of every file whose ctime moved is read and
+compared with its digest. If all match, the entry is accepted and `ready.json` is rewritten
+with the new ctimes (and `content_verified_at`), so the reading is paid once per touch and
+not once per round. Any other difference (inode, mode, link count, size, mtime, a missing
+or additional file), content that differs, and an entry published without digests are an
+integrity failure and a safety stop, as on Linux. Linux records carry no digests and Linux
+never takes this path.
+
+Cost, for one Mathlib build (137,345 files, 7.3 GB), measured on a Linux x86-64 host with
+SHA extensions: about 6 s to hash everything from the page cache, 24 to 72 s from a cold
+cache on a busy disk; `ready.json` grows from 25 MB to 45 MB. Not yet measured on a Mac.
+Publication pays it once more than before, and a reuse only after a touch.
+
+What this does and does not detect: any write to a published file moves its ctime, which
+the file's owner cannot set, so a changed file is always read and compared, including one
+whose size and mtime were restored. As on Linux, it does not detect damage that leaves a
+file's status untouched (failing storage), and it does not defend against the host's owner,
+who can rewrite `ready.json` itself.
+
+What is weaker than on Linux:
+
+- No read-only mount protects the pool. A published build has every write bit removed
+  instead (its clones get owner write back), and nothing in a checkout names the pool's
+  builds. This guards against accidents, as file modes do; the inventory in `ready.json`
+  still detects a changed file at the next reuse and stops sharing.
+- Eviction cannot find and kill the rounds that hold a version, because that uses `/proc`.
+  A round that must evict a version another round still leases waits, then stops with the
+  reason; the eviction completes once the holder has ended.
+- A clone keeps its original's blocks allocated. Deleting an entry frees its space only once
+  no clone of it remains, which is why a round keeps its leases for its whole life (leased
+  entries are never collected) and why a generation is deleted when its view ends. The
+  receipts' upper file counts and bytes are the regular files a round created or rewrote in
+  its clones (changed after `clone.json` was written). The per-round private-bytes cap
+  (docs/workers.md) sees the clones as ordinary private files at their full size; they are
+  part of the baseline taken before the agent starts. If macOS updates the ctimes of a
+  round's clones as it was seen to do in the pool, those receipts overstate what the round
+  wrote; nothing but reporting depends on them.
 
 Each round starts from a fresh generation; the previous one is deleted once no namespace
 holds its lease. Running readers hold shared leases on the source and on the build; the

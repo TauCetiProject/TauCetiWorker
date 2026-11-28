@@ -110,6 +110,9 @@ jobs:
         run: ./tauceti --help
       - name: Check native macOS live-use observations
         run: uv run python tests/live_use.py
+      # The only place the shared Mathlib clone backend meets a real clonefile(2) and APFS.
+      - name: Check shared Mathlib views made of APFS clones
+        run: uv run python tests/shared_mathlib_macos.py
 
   prices:
     runs-on: ${{ vars.FLEET_INFRA_CI == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('{"group":"TauCetiInfra","labels":["self-hosted","linux","x64","tauceti-fleet-infra"]}') || 'ubuntu-24.04' }}

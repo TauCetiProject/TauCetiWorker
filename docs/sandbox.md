@@ -50,7 +50,9 @@ refreshes a selected container through another account's active login.
 
 Before the work agent starts, a host coding round attaches the host's shared Mathlib
 (sources and the builds of Mathlib and its dependencies; see
-[shared-mathlib.md](shared-mathlib.md)) and fetches TauCeti's own main-built outputs with
+[shared-mathlib.md](shared-mathlib.md): a rootless mount namespace on Linux, APFS clones on
+macOS, where the pool and the checkouts must share one APFS volume) and fetches TauCeti's own
+main-built outputs with
 `lake cache get`. It does this after selecting the target branch, using the anonymous public
 service at `cache.taucetiproject.org` and a private per-worker artifact store. Bubble rounds
 still fetch Mathlib's prebuilt outputs with `lake exe cache get` inside the container. Lake searches up to 100 revisions for a published
