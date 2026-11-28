@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# compose.shared-mathlib.yaml asks for the worker to run as root of an identity-mapped user
+# namespace, where bubblewrap can build shared Mathlib views without any added capability.
+# Re-run this entrypoint inside it first, so that everything below, and every command given to the
+# container, sees the same environment. tauceti-userns sets the marker, also when it could not
+# create the namespace and continues without it.
+if [[ "${TAUCETI_USER_NAMESPACE:-0}" == 1 && -z "${TAUCETI_IN_USER_NAMESPACE:-}" ]]; then
+  exec tauceti-userns "$0" "$@"
+fi
+
 # Prefer the authenticated GitHub identity for commits. The image-level fallback still lets
 # setup and CI run before `gh auth login` has populated the persistent credential volume.
 if [[ "${TAUCETI_SKIP_GIT_IDENTITY:-0}" != 1 ]]; then

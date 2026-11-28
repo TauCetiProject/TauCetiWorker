@@ -779,6 +779,41 @@ class PolicyTests(Fixture):
             self.assert_blocked("enable user namespaces")
         self.assertEqual(self.downloads, 0)
 
+    def test_doctor_probes_the_pool_not_the_default_temporary_directory(self):
+        # In a container the default temporary directory is the container's own overlay, which
+        # cannot hold an overlay's upper, while the pool is on a volume that can (and conversely).
+        pool = self.root / "elsewhere" / "pool"
+        env = {"TAUCETI_SHARED_MATHLIB_ROOT": str(pool)}
+        with (
+            patch.object(s.platform, "system", return_value="Linux"),
+            patch.object(s.shutil, "which", return_value="/usr/bin/bwrap"),
+            patch.object(s, "capability", return_value=(True, "works")) as probe,
+        ):
+            self.assertEqual(s.pool_capability(env), (True, "works"))
+        probe.assert_called_once_with(pool)
+        self.assertTrue(pool.is_dir())
+        blocker = self.root / "file"
+        blocker.write_text("")
+        with (
+            patch.object(s.platform, "system", return_value="Linux"),
+            patch.object(s.shutil, "which", return_value="/usr/bin/bwrap"),
+            patch.object(s, "capability", side_effect=AssertionError("probed without a pool")),
+        ):
+            ok, reason = s.pool_capability({"TAUCETI_SHARED_MATHLIB_ROOT": str(blocker / "pool")})
+        self.assertFalse(ok)
+        self.assertIn("cannot create the shared Mathlib pool", reason)
+        # Without bubblewrap, or off Linux, the existing reason is reported and nothing is created.
+        missing = self.root / "untouched"
+        with (
+            patch.object(s.shutil, "which", return_value=None),
+            patch.object(s, "capability", return_value=(False, "install bubblewrap")) as probe,
+        ):
+            self.assertEqual(
+                s.pool_capability({"TAUCETI_SHARED_MATHLIB_ROOT": str(missing)}), (False, "install bubblewrap")
+            )
+        probe.assert_called_once_with()
+        self.assertFalse(missing.exists())
+
 
 class ViewTests(Fixture):
     def setUp(self):

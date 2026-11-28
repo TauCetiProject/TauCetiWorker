@@ -1,0 +1,29 @@
+# Opt-in override: lets the worker container run the rounds that need Mathlib (new PRs, fixes,
+# rebases). The default compose.yaml runs review rounds only. Use both files together:
+#
+#   sudo apparmor_parser --replace docker/apparmor-shared-mathlib   # hosts with AppArmor
+#   docker compose -f compose.yaml -f compose.shared-mathlib.yaml up -d
+#
+# It adds no capability and is not privileged. docs/docker.md ("Rounds that need Mathlib") says
+# exactly what the two security options relax and why each is needed.
+services:
+  tauceti:
+    security_opt:
+      # Docker's default profile plus six system calls (clone, unshare, mount, umount2,
+      # pivot_root, mount_setattr) for processes without CAP_SYS_ADMIN, which can then use them
+      # only inside a user namespace of their own.
+      - seccomp=docker/seccomp-shared-mathlib.json
+      # Docker's default profile with `deny mount` replaced by `mount, pivot_root`. Delete this
+      # line on a host without AppArmor.
+      - apparmor=tauceti-shared-mathlib
+    environment:
+      # The entrypoint re-runs itself as root of an identity-mapped user namespace.
+      TAUCETI_USER_NAMESPACE: "1"
+    volumes:
+      # The shared Mathlib pool. The worker probes OverlayFS there, an overlay's writable layer
+      # cannot live on the container's own overlay filesystem, and a volume keeps Mathlib across
+      # image updates.
+      - shared-mathlib:/root/.cache/tauceti
+
+volumes:
+  shared-mathlib:

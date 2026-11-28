@@ -15,8 +15,10 @@ allowlist (or `workers` in `policy.json`) blocks the workers it leaves out. `pol
 also accepts an `expires_at` UTC epoch with `expiry_mode` (default `required`).
 
 Run `tauceti doctor` to exercise Linux user namespaces, bubblewrap overlay support and
-private copy-up. No root daemon is required. A host without them runs no rounds that need
-Mathlib; the reason names the administrator action.
+private copy-up, in the pool, as a round does first. No root daemon is required. A host
+without them runs no rounds that need Mathlib; the reason names the administrator action.
+The Docker deployment needs an opt-in for this: see
+[Rounds that need Mathlib](docker.md#rounds-that-need-mathlib).
 
 ## Layout
 

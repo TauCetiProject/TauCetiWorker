@@ -1783,7 +1783,7 @@ def cmd_host_doctor(args) -> int:
     rows.append(("lake", _have("lake"), "host authoring (the default) builds with it"))
     from . import shared_mathlib
 
-    shared_ok, shared_note = shared_mathlib.capability()
+    shared_ok, shared_note = shared_mathlib.pool_capability()
     rows.append(
         (
             "shared Mathlib",
